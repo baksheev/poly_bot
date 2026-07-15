@@ -1,3 +1,4 @@
+pub mod alchemy;
 pub mod binance;
 
 use std::{sync::Arc, time::Instant};

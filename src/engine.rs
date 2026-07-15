@@ -4,8 +4,9 @@ use serde_json::json;
 
 use crate::{
     config::AppConfig,
+    dex::mirror::{DexMirror, LogApplyResult},
     domain::config::LoadedDomainConfig,
-    market_data::MarketEvent,
+    market_data::{MarketEvent, alchemy::DexStreamEvent},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
@@ -14,6 +15,7 @@ pub struct TradingEngine {
     config: AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
     state: RuntimeState,
+    dex: DexMirror,
     telemetry: TelemetryHandle,
 }
 
@@ -21,6 +23,7 @@ impl TradingEngine {
     pub fn new(
         config: AppConfig,
         domain_config: Arc<LoadedDomainConfig>,
+        dex: DexMirror,
         telemetry: TelemetryHandle,
     ) -> Self {
         let symbols = domain_config
@@ -31,6 +34,7 @@ impl TradingEngine {
             config,
             domain_config,
             state: RuntimeState::new(symbols),
+            dex,
             telemetry,
         }
     }
@@ -48,8 +52,48 @@ impl TradingEngine {
                 "domain_config_path": self.domain_config.path().display().to_string(),
                 "pair_ids": self.domain_config.pair_ids(),
                 "binance_symbols": self.domain_config.binance_symbols(),
+                "dex_pools": self.dex.pool_count(),
+                "dex_unavailable_pools": self.dex.unavailable_count(),
+                "world_chain_block": self.dex.latest_head().number,
             }),
         );
+    }
+
+    pub fn on_dex_event(&mut self, event: DexStreamEvent) -> anyhow::Result<()> {
+        match event {
+            DexStreamEvent::Log { log, received_at } => {
+                if let LogApplyResult::Applied { pool_index, kind } = self.dex.apply_log(&log)? {
+                    let pool = self.dex.pool(pool_index)?;
+                    self.telemetry.emit(
+                        "dex_pool_event",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "pair_id": pool.pair_id,
+                            "identity": format!("{:?}", pool.identity),
+                            "kind": kind,
+                            "block_number": log.block_number,
+                            "transaction_index": log.transaction_index,
+                            "log_index": log.log_index,
+                            "engine_queue_age_us": received_at.elapsed().as_micros(),
+                        }),
+                    );
+                }
+            }
+            DexStreamEvent::Head { head, received_at } => {
+                if self.dex.apply_head(head)? {
+                    self.telemetry.emit(
+                        "world_chain_head",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "block_number": head.number,
+                            "engine_queue_age_us": received_at.elapsed().as_micros(),
+                        }),
+                    );
+                }
+            }
+        }
+        self.refresh_phase(Instant::now());
+        Ok(())
     }
 
     pub fn on_market_event(&mut self, event: MarketEvent) {
@@ -134,9 +178,10 @@ impl TradingEngine {
 
     fn refresh_phase(&mut self, now: Instant) {
         let previous = self.state.phase;
+        let dex_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms);
         let current = self
             .state
-            .refresh_phase(now, self.config.market_data_max_age_ms);
+            .refresh_phase(now, self.config.market_data_max_age_ms, dex_ready);
         if previous != current {
             tracing::info!(?previous, ?current, "runtime phase changed");
             self.telemetry.emit(

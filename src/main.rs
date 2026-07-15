@@ -4,10 +4,17 @@ use anyhow::{Context, bail, ensure};
 use arb_bot::{
     chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
-    dex::hydration::DexHydrator,
+    dex::{
+        events::build_log_filters,
+        hydration::DexHydrator,
+        mirror::{DexMirror, LogApplyResult},
+    },
     domain::config::LoadedDomainConfig,
     engine::TradingEngine,
-    market_data::binance::spawn_book_ticker_connectors,
+    market_data::{
+        alchemy::{AlchemyDexStream, connect_dex_stream},
+        binance::spawn_book_ticker_connectors,
+    },
     telemetry::TelemetryWriter,
 };
 use clap::Parser;
@@ -110,6 +117,11 @@ async fn run(
     config: config::AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
 ) -> anyhow::Result<()> {
+    let initialized_dex = initialize_dex(&config, domain_config.as_ref()).await?;
+    let AlchemyDexStream {
+        receiver: mut dex_receiver,
+        task: mut dex_task,
+    } = initialized_dex.stream;
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
     let writer_task = tokio::spawn(writer.run());
     let (market_sender, mut market_receiver) =
@@ -119,7 +131,12 @@ async fn run(
         spawn_book_ticker_connectors(&config, &binance_symbols, market_sender.clone());
     drop(market_sender);
 
-    let mut engine = TradingEngine::new(config.clone(), Arc::clone(&domain_config), telemetry);
+    let mut engine = TradingEngine::new(
+        config.clone(),
+        Arc::clone(&domain_config),
+        initialized_dex.mirror,
+        telemetry,
+    );
     engine.start();
 
     tracing::info!(
@@ -151,6 +168,16 @@ async fn run(
                 };
                 engine.on_market_event(event);
             }
+            event = dex_receiver.recv() => {
+                let Some(event) = event else {
+                    bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
+                };
+                engine.on_dex_event(event)?;
+            }
+            result = &mut dex_task => {
+                result.context("Alchemy DEX connector task failed")??;
+                bail!("Alchemy DEX connector stopped; process restart will rehydrate state");
+            }
         }
     }
 
@@ -159,11 +186,102 @@ async fn run(
         task.abort();
         let _ = task.await;
     }
+    dex_task.abort();
+    let _ = dex_task.await;
     drop(engine);
 
     writer_task.await??;
     tracing::info!("read-only arbitrage shadow service stopped");
     Ok(())
+}
+
+struct InitializedDex {
+    mirror: DexMirror,
+    stream: AlchemyDexStream,
+}
+
+async fn initialize_dex(
+    config: &config::AppConfig,
+    domain_config: &LoadedDomainConfig,
+) -> anyhow::Result<InitializedDex> {
+    let (rpc_endpoint, ws_endpoint) = chain_endpoints(domain_config)?;
+    let rpc = JsonRpcClient::new(rpc_endpoint)?;
+    let hydrated = DexHydrator::new(&rpc)
+        .hydrate(domain_config.snapshot())
+        .await?;
+    let hydration_block = hydrated.block;
+    let filters = build_log_filters(domain_config.snapshot(), &hydrated)?;
+    let stream =
+        connect_dex_stream(&ws_endpoint, &filters, config.dex_event_channel_capacity).await?;
+
+    // The subscription is live before the upper backfill bound is captured.
+    // Logs emitted during hydration/subscription are recovered over HTTP;
+    // duplicate WSS notifications at or below this bound are ignored.
+    let backfill_head = rpc.latest_block().await?;
+    let mut backfill = Vec::new();
+    if backfill_head.number > hydration_block.number {
+        for filter in &filters {
+            backfill.extend(
+                rpc.get_logs(filter, hydration_block.number + 1, backfill_head.number)
+                    .await?,
+            );
+        }
+    }
+    backfill.sort_unstable_by_key(|log| log.position());
+    backfill.dedup_by(|right, left| {
+        right.position() == left.position()
+            && right.address == left.address
+            && right.block_hash == left.block_hash
+    });
+
+    let mut mirror = DexMirror::new(hydrated)?;
+    let mut applied = 0_usize;
+    for log in &backfill {
+        if matches!(mirror.apply_log(log)?, LogApplyResult::Applied { .. }) {
+            applied += 1;
+        }
+    }
+    mirror.finish_backfill(backfill_head)?;
+    tracing::info!(
+        hydration_block = hydration_block.number,
+        ready_block = backfill_head.number,
+        backfill_logs = backfill.len(),
+        applied_logs = applied,
+        pools = mirror.pool_count(),
+        unavailable = mirror.unavailable_count(),
+        rpc = ?rpc.stats(),
+        "DEX mirror hydrated, backfilled, and subscribed"
+    );
+    Ok(InitializedDex { mirror, stream })
+}
+
+fn chain_endpoints(domain_config: &LoadedDomainConfig) -> anyhow::Result<(String, String)> {
+    let mut enabled = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .filter(|pair| pair.market_data_enabled);
+    let first = enabled.next().context("no enabled pair RPC endpoint")?;
+    ensure!(
+        enabled.all(|pair| {
+            pair.chain.rpc_url_env == first.chain.rpc_url_env
+                && pair.chain.ws_url_env == first.chain.ws_url_env
+        }),
+        "run currently requires one shared chain RPC/WSS endpoint"
+    );
+    let rpc = std::env::var(&first.chain.rpc_url_env).with_context(|| {
+        format!(
+            "required environment variable {} is not set",
+            first.chain.rpc_url_env
+        )
+    })?;
+    let ws = std::env::var(&first.chain.ws_url_env).with_context(|| {
+        format!(
+            "required environment variable {} is not set",
+            first.chain.ws_url_env
+        )
+    })?;
+    Ok((rpc, ws))
 }
 
 fn init_tracing() {

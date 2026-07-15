@@ -164,12 +164,18 @@ impl RuntimeState {
         QuoteApplyResult::Accepted
     }
 
-    pub fn refresh_phase(&mut self, now: Instant, max_age_ms: u64) -> RuntimePhase {
+    pub fn refresh_phase(
+        &mut self,
+        now: Instant,
+        max_age_ms: u64,
+        external_ready: bool,
+    ) -> RuntimePhase {
         if self.phase == RuntimePhase::Stopping {
             return self.phase;
         }
 
-        let ready = !self.binance_feeds.is_empty()
+        let ready = external_ready
+            && !self.binance_feeds.is_empty()
             && self.binance_feeds.values().all(|feed| {
                 feed.connected
                     && feed.book.as_ref().is_some_and(|book| {
@@ -246,14 +252,17 @@ mod tests {
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
 
         state.on_connected("WLDUSDC", 1);
-        assert_eq!(state.refresh_phase(now, 5_000), RuntimePhase::Starting);
+        assert_eq!(
+            state.refresh_phase(now, 5_000, true),
+            RuntimePhase::Starting
+        );
         assert_eq!(
             state.apply_quote(quote(10, 1, now)),
             QuoteApplyResult::Accepted
         );
-        assert_eq!(state.refresh_phase(now, 5_000), RuntimePhase::Ready);
+        assert_eq!(state.refresh_phase(now, 5_000, true), RuntimePhase::Ready);
         assert_eq!(
-            state.refresh_phase(now + Duration::from_secs(6), 5_000),
+            state.refresh_phase(now + Duration::from_secs(6), 5_000, true),
             RuntimePhase::Degraded
         );
     }

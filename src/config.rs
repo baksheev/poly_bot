@@ -59,6 +59,12 @@ pub struct AppConfig {
     #[arg(long, env = "MARKET_DATA_MAX_AGE_MS", default_value_t = 5_000)]
     pub market_data_max_age_ms: u64,
 
+    #[arg(long, env = "DEX_EVENT_CHANNEL_CAPACITY", default_value_t = 8192)]
+    pub dex_event_channel_capacity: usize,
+
+    #[arg(long, env = "DEX_HEAD_MAX_AGE_MS", default_value_t = 10_000)]
+    pub dex_head_max_age_ms: u64,
+
     #[arg(long, env = "CLICKHOUSE_URL", default_value = "")]
     pub clickhouse_url: String,
 
@@ -95,6 +101,14 @@ impl AppConfig {
         ensure!(
             self.market_data_max_age_ms > 0,
             "MARKET_DATA_MAX_AGE_MS must be greater than zero"
+        );
+        ensure!(
+            self.dex_event_channel_capacity > 0,
+            "DEX_EVENT_CHANNEL_CAPACITY must be greater than zero"
+        );
+        ensure!(
+            self.dex_head_max_age_ms > 0,
+            "DEX_HEAD_MAX_AGE_MS must be greater than zero"
         );
         ensure!(
             self.telemetry_channel_capacity > 0,
@@ -185,6 +199,8 @@ mod tests {
             domain_config_path: "config/strategies/usdc-wld-world-chain.v1.json".into(),
             market_event_channel_capacity: 8192,
             market_data_max_age_ms: 5_000,
+            dex_event_channel_capacity: 8192,
+            dex_head_max_age_ms: 10_000,
             clickhouse_url: String::new(),
             clickhouse_database: "arb_bot".into(),
             clickhouse_user: "default".into(),

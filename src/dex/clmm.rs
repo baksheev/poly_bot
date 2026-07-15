@@ -78,6 +78,10 @@ impl ClmmPool {
         self.ticks.len()
     }
 
+    pub fn tick_liquidity(&self, index: i32) -> Option<TickLiquidity> {
+        self.ticks.get(&index).copied()
+    }
+
     /// Installs an absolute initialized-tick snapshot during hydration.
     pub fn set_tick(&mut self, index: i32, gross: u128, net: i128) -> anyhow::Result<()> {
         ensure!(
@@ -128,6 +132,56 @@ impl ClmmPool {
         self.sqrt_price_x96 = sqrt_price_x96;
         self.tick = tick;
         self.liquidity = liquidity;
+        Ok(())
+    }
+
+    /// Applies a Mint/Burn/ModifyLiquidity delta to the two range boundaries
+    /// and to active liquidity when the current tick is inside the range.
+    pub fn apply_liquidity_delta(
+        &mut self,
+        tick_lower: i32,
+        tick_upper: i32,
+        delta: i128,
+    ) -> anyhow::Result<()> {
+        ensure!(tick_lower < tick_upper, "liquidity range is empty");
+        ensure!(
+            tick_lower % self.tick_spacing == 0 && tick_upper % self.tick_spacing == 0,
+            "liquidity range does not align to tick spacing"
+        );
+        ensure!(
+            (MIN_TICK..=MAX_TICK).contains(&tick_lower)
+                && (MIN_TICK..=MAX_TICK).contains(&tick_upper),
+            "liquidity range is out of bounds"
+        );
+        if delta == 0 {
+            return Ok(());
+        }
+
+        let amount = delta.unsigned_abs();
+        let lower = updated_boundary(
+            self.ticks.get(&tick_lower).copied(),
+            amount,
+            delta,
+            delta > 0,
+        )?;
+        let upper_net_delta = delta.checked_neg().context("liquidity delta overflow")?;
+        let upper = updated_boundary(
+            self.ticks.get(&tick_upper).copied(),
+            amount,
+            upper_net_delta,
+            delta > 0,
+        )?;
+        let active_liquidity = if tick_lower <= self.tick && self.tick < tick_upper {
+            Some(add_delta(self.liquidity, delta).context("active liquidity update failed")?)
+        } else {
+            None
+        };
+
+        self.set_tick(tick_lower, lower.gross, lower.net)?;
+        self.set_tick(tick_upper, upper.gross, upper.net)?;
+        if let Some(active_liquidity) = active_liquidity {
+            self.liquidity = active_liquidity;
+        }
         Ok(())
     }
 
@@ -259,6 +313,35 @@ impl ClmmPool {
     }
 }
 
+fn updated_boundary(
+    current: Option<TickLiquidity>,
+    amount: u128,
+    net_delta: i128,
+    adding: bool,
+) -> anyhow::Result<TickLiquidity> {
+    let current = current.unwrap_or(TickLiquidity { gross: 0, net: 0 });
+    let gross = if adding {
+        current
+            .gross
+            .checked_add(amount)
+            .context("gross tick liquidity overflow")?
+    } else {
+        current
+            .gross
+            .checked_sub(amount)
+            .context("removed more gross tick liquidity than hydrated")?
+    };
+    let net = current
+        .net
+        .checked_add(net_delta)
+        .context("net tick liquidity overflow")?;
+    ensure!(
+        gross != 0 || net == 0,
+        "zero gross tick liquidity has non-zero net liquidity"
+    );
+    Ok(TickLiquidity { gross, net })
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{U256, uint};
@@ -350,6 +433,37 @@ mod tests {
         assert_eq!(pool.initialized_tick_count(), count + 1);
         pool.set_tick(120, 0, 0).unwrap();
         assert_eq!(pool.initialized_tick_count(), count);
+    }
+
+    #[test]
+    fn liquidity_events_update_both_boundaries_and_remove_them_atomically() {
+        let mut pool = pool();
+        let initial_count = pool.initialized_tick_count();
+        let initial_liquidity = pool.liquidity;
+
+        pool.apply_liquidity_delta(-120, 120, 500).unwrap();
+        assert_eq!(pool.liquidity, initial_liquidity + 500);
+        assert_eq!(
+            pool.tick_liquidity(-120).unwrap(),
+            super::TickLiquidity {
+                gross: 500,
+                net: 500
+            }
+        );
+        assert_eq!(
+            pool.tick_liquidity(120).unwrap(),
+            super::TickLiquidity {
+                gross: 500,
+                net: -500
+            }
+        );
+        assert_eq!(pool.initialized_tick_count(), initial_count + 2);
+
+        pool.apply_liquidity_delta(-120, 120, -500).unwrap();
+        assert_eq!(pool.liquidity, initial_liquidity);
+        assert_eq!(pool.tick_liquidity(-120), None);
+        assert_eq!(pool.tick_liquidity(120), None);
+        assert_eq!(pool.initialized_tick_count(), initial_count);
     }
 
     #[test]

@@ -59,16 +59,18 @@ is not being implemented. The evidence is retained in
 
 ## Current status
 
-The first clone component is implemented in read-only shadow mode: persistent
+The first clone components are implemented in read-only shadow mode: persistent
 Binance USD-M Futures `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
 parsing, reconnect generations, freshness/readiness state, a single in-memory
 state owner, and non-blocking ClickHouse telemetry. Startup now loads a
 fail-closed, versioned snapshot of the active production World Chain
 `USDC-WLD` configuration and reports its SHA-256 fingerprint. It has no private
 Binance, wallet, signing, or trading credentials and cannot place orders. The
-first DEX slice now includes the shared hookless V3/V4 concentrated-liquidity
-calculation core, including tick bitmap traversal and initialized-tick crossing;
-chain hydration and event ingestion are still pending.
+DEX slice includes pinned-block V3/V4 hydration, an HTTP log backfill after WSS
+subscription, ordered Alchemy `logs`/`newHeads` ingestion, and the shared
+hookless concentrated-liquidity calculation core. `Swap`, `Mint`, `Burn`, and
+`ModifyLiquidity` update the same single-owner pool mirrors used by local
+quotes; no RPC call is made on the event or quote hot path.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:
@@ -134,15 +136,15 @@ all ClickHouse and Alchemy credentials in Secret Manager.
 
 ## Planned implementation slices
 
-1. Hydrate V3/V4 pool heads, bitmap words, and initialized ticks at one pinned
-   World Chain block, then maintain them from Alchemy WSS logs.
-2. Prove local quote parity against V3/V4 Quoter calls sampled outside the hot
+1. Prove local quote parity against V3/V4 Quoter calls sampled outside the hot
    path and add release-mode latency/allocation benchmarks.
-3. Derive token-B sizing from the in-memory Binance ask and calculate both DEX
+2. Derive token-B sizing from the in-memory Binance ask and calculate both DEX
    directions locally on every accepted market update.
-4. Port both `profit_token_a` opportunity calculations as pure fixed-point
+3. Port both `profit_token_a` opportunity calculations as pure fixed-point
    functions and run
    synchronized shadow comparisons.
+4. Add in-process WSS reconnect/gap repair; the current fail-closed path exits
+   on a DEX discontinuity so the Worker Pool restarts from a fresh snapshot.
 5. Add isolated account/wallet hydration, then paper execution and forced
    recovery tests before any live credentials are provisioned.
 

@@ -10,6 +10,8 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::chain::logs::{ChainLog, EthLogFilter, WireChainLog};
+
 const DEFAULT_BATCH_SIZE: usize = 100;
 const MAX_RATE_LIMIT_RETRIES: u32 = 6;
 const BASE_RETRY_DELAY_MS: u64 = 100;
@@ -187,6 +189,27 @@ impl JsonRpcClient {
             }
         }
         Ok(results)
+    }
+
+    pub async fn get_logs(
+        &self,
+        filter: &EthLogFilter,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Vec<ChainLog>> {
+        ensure!(
+            from_block <= to_block,
+            "eth_getLogs from_block exceeds to_block"
+        );
+        let value = self
+            .request(
+                "eth_getLogs",
+                json!([filter.range_json(from_block, to_block)]),
+            )
+            .await?;
+        let logs: Vec<WireChainLog> =
+            serde_json::from_value(value).context("eth_getLogs returned invalid logs")?;
+        logs.into_iter().map(ChainLog::try_from).collect()
     }
 
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {

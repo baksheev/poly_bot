@@ -18,6 +18,8 @@
         "DOMAIN_CONFIG_PATH": "config/strategies/usdc-wld-world-chain.v1.json",
         "MARKET_EVENT_CHANNEL_CAPACITY": "8192",
         "MARKET_DATA_MAX_AGE_MS": "5000",
+        "DEX_EVENT_CHANNEL_CAPACITY": "8192",
+        "DEX_HEAD_MAX_AGE_MS": "10000",
         "CLICKHOUSE_DATABASE": "arb_bot_prod",
         "TELEMETRY_CHANNEL_CAPACITY": "8192",
         "TELEMETRY_BATCH_SIZE": "200",

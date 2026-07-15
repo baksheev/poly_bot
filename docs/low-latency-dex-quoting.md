@@ -1,6 +1,6 @@
 # Low-latency Uniswap quoting
 
-Status: first local calculation slice implemented  
+Status: pinned hydration and ordered Alchemy event ingestion implemented
 Last reviewed: 2026-07-15
 
 ## Decision
@@ -63,14 +63,17 @@ discovery remains authoritative because a new candidate can be created later.
 
 ## Race-free startup
 
-1. Connect WSS and start buffering matching logs and heads.
-2. Choose a canonical block `B` and hydrate every candidate at exactly `B` over
+1. Choose a canonical block `B` and hydrate every candidate at exactly `B` over
    HTTP. V3 reads the pool head, bitmap words, and initialized ticks; V4 reads
    the equivalent state through StateView.
-3. Apply buffered logs after `B` in `(block, transaction_index, log_index)`
-   order, verifying the parent/hash chain.
-4. Mark DEX state ready only when all enabled candidates are coherent at the
-   same observed head. Until then, new live entries remain disabled.
+2. Subscribe to narrowly filtered V3/V4 logs and `newHeads` over WSS.
+3. After every subscription is acknowledged, capture canonical head `C`, fetch
+   matching logs for `(B, C]` over HTTP, and apply them in
+   `(block, transaction_index, log_index)` order. WSS is already buffering, so
+   events after `C` cannot fall into the snapshot/subscription race window.
+4. Ignore buffered duplicates at or below `C` and mark DEX state ready only
+   when all candidates are coherent at the same observed head. Until then, new
+   live entries remain disabled.
 
 V3 `Swap` replaces the head fields. `Mint` and `Burn` update the two boundary
 ticks and bitmap. V4 `Swap` replaces the head fields; `ModifyLiquidity` updates
@@ -79,11 +82,13 @@ decision is accepted.
 
 ## Gaps and reorgs
 
-A WSS reconnect, subscription error, block discontinuity, removed log, unknown
-tick, or parent-hash mismatch immediately makes DEX quoting unavailable. The
-service repairs the exact missing block range with `eth_getLogs` or fully
-rehydrates at a new pinned block. It never mixes head data from one block with
-ticks from another.
+A WSS disconnect, subscription error, block discontinuity, removed log, invalid
+liquidity delta, or parent-hash mismatch immediately makes DEX quoting
+unavailable. The current read-only implementation exits so the Worker Pool
+restarts, fully hydrates at a new pinned block, and backfills the startup gap
+with `eth_getLogs`. In-process reconnect and exact-range repair are the next
+recovery slice. The service never continues with a plausible but unverified
+pool mirror.
 
 This intentionally prefers a short fail-closed interval over a plausible but
 incorrect quote. A small block journal may later support cheap rollback, but is
