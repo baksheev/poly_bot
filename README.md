@@ -165,3 +165,5 @@ service account.
 
 See [the local DEX quoting design](docs/low-latency-dex-quoting.md) for the
 hot-path contract, hydration boundary, reorg handling, and latency budget.
+See [the concurrent execution design](docs/concurrent-execution.md) for parallel
+DEX/CEX dispatch, orphan-leg recovery, exposure accounting, and paper rollout.
