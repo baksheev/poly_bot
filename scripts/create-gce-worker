@@ -45,6 +45,11 @@ engine_id="arb-bot-rust-shadow-gce-${source_revision}"
   --member="serviceAccount:${runtime_service_account}" \
   --role=roles/artifactregistry.reader \
   --quiet >/dev/null
+"${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="serviceAccount:${runtime_service_account}" \
+  --role=roles/logging.logWriter \
+  --condition=None \
+  --quiet >/dev/null
 
 if ! "${gcloud_local}" compute networks describe "${network}" >/dev/null 2>&1; then
   "${gcloud_local}" compute networks create "${network}" \
@@ -97,4 +102,3 @@ fi
   --quiet
 
 echo "created ${instance} (${machine_type}, ${zone}) with ${image}"
-

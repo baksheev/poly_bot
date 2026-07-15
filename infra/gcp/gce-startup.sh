@@ -74,10 +74,14 @@ umask 077
 chmod 0600 "${env_file}"
 
 registry="${region}-docker.pkg.dev"
+export DOCKER_CONFIG=/run/arb-bot/docker
+install -d -m 0700 "${DOCKER_CONFIG}"
 printf '%s' "${access_token}" \
   | docker login --username oauth2accesstoken --password-stdin \
     "https://${registry}"
 docker pull "${image}"
+docker logout "https://${registry}"
+rm -rf "${DOCKER_CONFIG}"
 
 cat >/etc/systemd/system/arb-bot.service <<EOF
 [Unit]
@@ -104,4 +108,3 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now arb-bot.service
-
