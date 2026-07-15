@@ -57,5 +57,5 @@ Select an already authenticated account:
 ```
 
 Use `./scripts/gcloud-local` for all local GCP commands in this repository.
-Production Cloud Run should use an attached service account and metadata-server
-ADC; it must not depend on this local directory or a long-lived JSON key.
+Production Compute Engine uses an attached service account and metadata-server
+tokens; it must not depend on this local directory or a long-lived JSON key.

@@ -16,62 +16,56 @@ The selected ClickHouse endpoint and password live only in ignored local env
 files and GCP Secret Manager. Credential-bearing URLs and passwords must never
 be committed or logged.
 
-## Cutover plan
+## Runtime layout
 
-The new Singapore ClickHouse service is independent of the existing pump bot
-service in `us-east1`. Do not move or delete the pump bot database as part of
-this clone.
+The trading runtime is VM `arb-bot-rust-shadow-gce` in
+`asia-southeast1-b`. It uses `c4-highcpu-8`, Container-Optimized OS, a 20 GB
+balanced Hyperdisk boot disk, and a digest-pinned container image. This gives
+the process eight dedicated vCPUs and 16 GiB RAM without Cloud Run's shared
+scheduler. It is still a normal VM, not a sole-tenant physical host.
 
-1. Create `arb_bot_prod` tables in the Singapore service with `cargo run --
-   migrate` using `.env.production`.
-2. Write shadow telemetry only to Singapore and verify inserts, batching,
-   overflow counters, and retention.
-3. If old clone telemetry needs to be retained, copy it asynchronously after
-   schema validation. Historical backfill is operational work, never a runtime
-   dependency.
-4. Update GCP Secret Manager secret versions for `CLICKHOUSE_URL` and
-   `CLICKHOUSE_PASSWORD` with `scripts/sync-gcp-secrets`; configure the Worker
-   Pool to reference those secrets.
-5. Deploy one read-only instance in `asia-southeast1`, confirm Binance and
-   ClickHouse health, then retire any obsolete clone-only US deployment.
-6. Keep the old ClickHouse service until row counts and required historical
-   data are reconciled. The pump bot service is out of scope and stays intact.
+The VM is attached to the isolated custom VPC `arb-bot-low-latency`, subnet
+`arb-bot-singapore` (`10.42.0.0/24`). There are no ingress firewall rules. Its
+Premium-tier static egress IP is `34.21.220.162`; use that address for future
+exchange allowlists.
+
+The attached runtime service account obtains short-lived metadata-server
+tokens. The boot script reads ClickHouse and Alchemy values directly from
+Secret Manager, writes a root-only environment file, authenticates to Artifact
+Registry with an ephemeral Docker config, and removes that config after the
+image pull. No long-lived service-account key or credential is stored in
+instance metadata.
+
+systemd owns the container and restarts it after a process failure. Docker uses
+host networking and forwards `SIGINT` for graceful shutdown. The service has a
+large file-descriptor limit, elevated scheduler priority, and a strongly
+negative OOM score. Live trading remains disabled and no wallet, signing, or
+Binance execution secrets are attached.
+
+Provision a committed, already-published image with:
+
+```bash
+scripts/create-gce-worker IMAGE SOURCE_REVISION
+```
+
+The script refuses a dirty worktree or replacement of an existing VM. It
+creates the isolated network, subnet, static address, IAM bindings, and VM when
+missing. Replacing the production instance must be an explicit blue/green
+operation; do not silently mutate it in place.
 
 ## Production checks
 
-- Binance WebSocket connects from the actual Worker Pool egress and remains
+- Binance WebSocket connects from the actual VM egress and remains
   fresh across reconnects.
-- Alchemy p50/p95/p99 latency is measured from the same Worker Pool before DEX
+- Alchemy p50/p95/p99 latency is measured from the same VM before DEX
   quoting becomes a readiness dependency.
 - ClickHouse slowdown or outage increments telemetry drop/failure metrics but
   does not increase market-event queue age or stop the engine.
 - No trading secrets are attached while the service is read-only.
 
-## Worker sizing
-
-The initial Worker Pool runs exactly one instance with 8 vCPU and 16 GiB RAM.
-This is the largest Cloud Run CPU allocation and intentionally leaves headroom
-for Tokio network tasks, TLS, telemetry compression, reconnect recovery, and
-the latency-sensitive state owner. Revisit the allocation only after production
-CPU and latency histograms are available; cost optimization is secondary to the
-first performance baseline.
-
-Deploy a committed revision with:
-
-```bash
-scripts/deploy-gcp-worker
-```
-
-The script enables the required APIs, creates the Artifact Registry repository
-and dedicated runtime service account when absent, synchronizes non-trading
-secrets, builds an image tagged with the git SHA, and deploys one read-only
-Worker Pool instance. It refuses to deploy a dirty worktree. `ENGINE_ID` also
-contains that source SHA so telemetry from old and new processes remains
-attributable during a rolling deployment.
-
 ## Current production baseline
 
-The verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
+The pre-migration baseline was Worker Pool `arb-bot-rust-shadow`, revision
 `arb-bot-rust-shadow-direct-dcfc5e0`, from source revision `dcfc5e056dae` and
 image digest
 `sha256:2b51afd185e012893d6904aa4ae5346d7774c494f1493a513197dd41f75d26cc`.
@@ -141,8 +135,35 @@ image digest
   fail-closed refresh interval remains below one millisecond in this sample.
 - Compared with the immediately preceding prepared-curve revision, removing
   the Binance channel improved decision latency by 10.2x at p50, 5.8x at p95,
-  and 4.0x at p99. Both production latency contracts now pass on the existing
-  8-vCPU Cloud Run Worker Pool, so dedicated compute is not yet justified by
-  the measured tail.
-- No Worker Pool warning or error logs appeared during the startup check.
+  and 4.0x at p99. Both production latency contracts passed on the 8-vCPU
+  Cloud Run Worker Pool. Dedicated compute was selected anyway because the
+  execution phase needs explicit CPU placement, process priority, host
+  networking, and a stable exchange-allowlist IP.
+- No Worker Pool warning or error logs appeared during its startup check.
 - No wallet, signing, or Binance trading credentials are attached.
+
+## Compute Engine cutover
+
+The dedicated VM runs the same `dcfc5e056dae` binary and immutable image digest
+as the final Cloud Run baseline. Its telemetry identity is
+`arb-bot-rust-shadow-gce-dcfc5e056dae`, so the two runtimes were compared over
+the same external market window without mixing rows.
+
+The fixed comparison window from `2026-07-15 22:46:30 UTC` through
+`22:50:20 UTC` contained 531 unique Binance Spot updates on each runtime with
+no duplicate update IDs. The 526 fully warm rows produced:
+
+- Compute Engine: calculation 3/6/6 us p50/p95/p99, 9 us maximum; complete
+  decision 9/17/18 us, 53 us maximum.
+- Cloud Run: calculation 2/8/17 us p50/p95/p99, 73 us maximum; complete
+  decision 7/18/39 us, 124 us maximum.
+
+The VM therefore kept median decision latency within 2 us while improving
+decision p99 by 2.2x and the observed maximum by 2.3x. No VM decision exceeded
+100 us. Both runtimes also saw five state-driven rebuild rows; VM rebuild
+calculation was 14/25/25 us p50/p95/p99 versus 15/26/26 us on Cloud Run.
+
+After verifying current Binance, World Chain, DEX preparation, and ClickHouse
+telemetry on the VM, the stateless Cloud Run Worker Pool was deleted on
+2026-07-16. The digest-pinned image and deployment script remain available for
+rollback, but only the GCE runtime is active.

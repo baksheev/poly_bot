@@ -140,10 +140,13 @@ Use `./scripts/gcloud-local` for all local Google Cloud commands. Its
 repository-local configuration does not mutate the global gcloud account,
 project, or ADC state. See [local GCP authentication](docs/gcp-local-auth.md).
 
-Production is a single read-only Cloud Run Worker Pool instance in Singapore
-with 8 vCPU and 16 GiB RAM. After committing the exact revision, deploy it with
-`scripts/deploy-gcp-worker`; the script builds a git-SHA-tagged image and keeps
-all ClickHouse and Alchemy credentials in Secret Manager.
+Production is a single read-only Compute Engine VM in Singapore. The current
+machine is `c4-highcpu-8` (8 dedicated vCPUs, 16 GiB RAM) in
+`asia-southeast1-b`, running Container-Optimized OS and a digest-pinned image.
+Provision a new VM from an already published image with
+`scripts/create-gce-worker IMAGE SOURCE_REVISION`. ClickHouse and Alchemy
+credentials remain in Secret Manager and are read at boot through the attached
+service account.
 
 ## Planned implementation slices
 
@@ -155,7 +158,8 @@ all ClickHouse and Alchemy credentials in Secret Manager.
    functions and run
    synchronized shadow comparisons.
 4. Add in-process WSS reconnect/gap repair; the current fail-closed path exits
-   on a DEX discontinuity so the Worker Pool restarts from a fresh snapshot.
+   on a DEX discontinuity so systemd restarts the container from a fresh
+   snapshot.
 5. Add isolated account/wallet hydration, then paper execution and forced
    recovery tests before any live credentials are provisioned.
 

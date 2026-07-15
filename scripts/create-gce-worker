@@ -38,7 +38,19 @@ runtime_service_account="arb-bot-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.c
 engine_id="arb-bot-rust-shadow-gce-${source_revision}"
 
 "${gcloud_local}" config set project "${GCP_PROJECT_ID}" >/dev/null
-"${gcloud_local}" services enable compute.googleapis.com --quiet
+"${gcloud_local}" services enable \
+  artifactregistry.googleapis.com \
+  compute.googleapis.com \
+  logging.googleapis.com \
+  secretmanager.googleapis.com \
+  --quiet
+
+if ! "${gcloud_local}" iam service-accounts describe \
+  "${runtime_service_account}" >/dev/null 2>&1; then
+  "${gcloud_local}" iam service-accounts create arb-bot-runtime \
+    --display-name="Arb Bot runtime" \
+    --quiet
+fi
 
 "${gcloud_local}" artifacts repositories add-iam-policy-binding poly-bot \
   --location="${GCP_REGION}" \
@@ -48,6 +60,11 @@ engine_id="arb-bot-rust-shadow-gce-${source_revision}"
 "${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
   --member="serviceAccount:${runtime_service_account}" \
   --role=roles/logging.logWriter \
+  --condition=None \
+  --quiet >/dev/null
+"${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="serviceAccount:${runtime_service_account}" \
+  --role=roles/secretmanager.secretAccessor \
   --condition=None \
   --quiet >/dev/null
 

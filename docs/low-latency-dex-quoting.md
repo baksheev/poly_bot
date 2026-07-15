@@ -157,11 +157,11 @@ execution.
 
 A WSS disconnect, subscription error, block discontinuity, removed log, invalid
 liquidity delta, or parent-hash mismatch immediately makes DEX quoting
-unavailable. The current read-only implementation exits so the Worker Pool
-restarts, fully hydrates at a new pinned block, and backfills the startup gap
-with `eth_getLogs`. In-process reconnect and exact-range repair are the next
-recovery slice. The service never continues with a plausible but unverified
-pool mirror.
+unavailable. The current read-only implementation exits so systemd restarts
+the container, fully hydrates at a new pinned block, and backfills the startup
+gap with `eth_getLogs`. In-process reconnect and exact-range repair are the
+next recovery slice. The service never continues with a plausible but
+unverified pool mirror.
 
 This intentionally prefers a short fail-closed interval over a plausible but
 incorrect quote. A small block journal may later support cheap rollback, but is
@@ -181,8 +181,8 @@ V3 fee-3000 QuoterV2 output at World Chain block `0x1ee7069` exactly.
 
 ## Performance contract
 
-Measurements are made in an optimized container on the target Worker Pool CPU,
-not inferred from a laptop debug build. The initial budget is:
+Measurements are made in an optimized container on the target Compute Engine
+CPU, not inferred from a laptop debug build. The initial budget is:
 
 - zero network calls and zero locks per quote;
 - zero heap allocation in the steady-state calculation loop;
@@ -197,7 +197,7 @@ benchmark and production histograms must prove them before paper execution.
 The first local arm64 release baseline (2026-07-15, two million iterations,
 full-range fixture, hot `amount_out` path, no tick crossing) measured 550 ns for
 token0 to token1 and 291 ns for token1 to token0. Treat these as
-development-machine averages, not Worker Pool p99 results.
+development-machine averages, not production VM p99 results.
 
 After adding exact-output sizing, the 2026-07-16 local arm64 release benchmark
 measured 537/283 ns for exact-input and 395/386 ns for exact-output in the two
@@ -205,7 +205,7 @@ directions. A short live Spot release run over all five hydrated pools produced
 90 full baseline evaluations with calculation p50 288 us, p95 987 us, and p99
 3,711 us. No opportunity crossed the threshold, so those figures exclude the
 conditional binary sizing path. This development-machine end-to-end result is
-above the 100 us acceptance threshold; production Worker Pool histograms and
+above the 100 us acceptance threshold; production VM histograms and
 profiling must drive the next optimization rather than treating the single-call
 microbenchmark as sufficient evidence.
 
@@ -217,9 +217,9 @@ recorded 46 fully warm evaluations at p50 10 us, p95 52 us, p99/max 94 us. Four
 events recomputed one or more entries after startup or a pool update; including
 those cold events, the sample was p50 10 us, p95 78 us, and p99/max 2,445 us.
 These are development-machine measurements and did not replace the production
-baseline until the Worker Pool validation below.
+baseline until the Singapore production validation below.
 
-The Singapore Worker Pool validation used a fixed 666-evaluation window after
+The Singapore Cloud Run validation used a fixed 666-evaluation window after
 deploying source `c798349c8c8f`. Overall calculation latency fell from the
 pre-cache 453/560/911 us p50/p95/p99 to 12/25/630 us. The 628 fully warm
 evaluations measured 11/19/51 us and 94 us maximum. The 38 evaluations with a
@@ -251,8 +251,17 @@ revision-tagged Singapore production window then measured 460 unique updates:
 2/6/18 us calculation and 5/15/50 us decision p50/p95/p99. Calculation maxed at
 41 us and decision at 92 us; no event exceeded 100 us. The 457 fully warm rows
 were faster still at 2/6/9 us calculation and 5/15/45 us decision. Both latency
-acceptance thresholds therefore pass on the current 8-vCPU Worker Pool without
-moving to dedicated compute.
+acceptance thresholds passed on the former 8-vCPU Worker Pool. The service was
+subsequently moved to Compute Engine to remove Cloud Run scheduling from future
+execution work and make CPU placement, process priority, networking, and host
+tuning explicit.
+
+The same binary and image were then run concurrently on `c4-highcpu-8` and
+Cloud Run over 531 identical unique Spot updates. On the 526 fully warm rows,
+the dedicated VM measured 3/6/6 us calculation and 9/17/18 us complete decision
+p50/p95/p99. Cloud Run measured 2/8/17 us and 7/18/39 us respectively. VM
+decision latency maxed at 53 us with no row over 100 us, versus 124 us on Cloud
+Run. This fixed comparison justified the Compute Engine cutover.
 
 Run the allocation-free calculation baseline with:
 

@@ -6,7 +6,8 @@ a time.
 
 ## Runtime architecture
 
-- Production is one GCP Cloud Run Worker Pool process.
+- Production is one GCP Compute Engine process on a `c4-highcpu-8` VM in
+  `asia-southeast1-b`. Cloud Run is not the latency-sensitive runtime.
 - Keep Binance and DEX market data, strategy state, balances, reservations,
   nonces, positions, and execution context in memory.
 - Postgres and ClickHouse are never part of the critical trading path.
@@ -18,7 +19,7 @@ a time.
   proves another topology is better.
 - Load strategy/chain/token/instrument configuration once from a versioned,
   validated artifact. Rails Postgres is an operator-only export source and must
-  never be a runtime dependency or a GCP Worker Pool secret.
+  never be a runtime dependency or a GCE runtime secret.
 - Derive Binance subscriptions from the domain artifact; do not create a second
   symbol allowlist in environment variables.
 - Use fixed-point integer or validated decimal representations for financial

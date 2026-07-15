@@ -20,7 +20,7 @@ earlier Futures-feed experiment and is rejected by current runtime validation.
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven
 comparisons, but that credential must not be copied to GCP Secret Manager or
-attached to the Worker Pool.
+attached to the GCE VM.
 
 ## Captured behavior
 
