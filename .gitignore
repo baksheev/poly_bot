@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+.gcloud/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime output
+/logs/
+/tmp/
+*.log

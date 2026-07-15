@@ -1,0 +1,11 @@
+.git
+.github
+.gcloud
+.env
+.env.*
+!.env.example
+target
+logs
+tmp
+*.log
+.DS_Store

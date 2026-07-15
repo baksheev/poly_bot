@@ -1,0 +1,27 @@
+{
+  "project_id": "poly-bot-502515",
+  "region": "us-east1",
+  "artifact_repo": "poly-bot",
+  "image_name": "poly-bot",
+  "runtime_service_account": "REPLACE_WITH_RUNTIME_SERVICE_ACCOUNT",
+  "worker_pools": [
+    {
+      "name": "poly-bot-trading-engine",
+      "command": ["run"],
+      "instances": 1,
+      "cpu": "4",
+      "memory": "4Gi",
+      "env": {
+        "GCP_REGION": "us-east1",
+        "CLICKHOUSE_DATABASE": "poly_bot_prod",
+        "TELEMETRY_CHANNEL_CAPACITY": "8192",
+        "TELEMETRY_BATCH_SIZE": "200",
+        "TELEMETRY_FLUSH_INTERVAL_MS": "100"
+      },
+      "secrets": [
+        "CLICKHOUSE_URL",
+        "CLICKHOUSE_PASSWORD"
+      ]
+    }
+  ]
+}
