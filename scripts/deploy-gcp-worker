@@ -67,7 +67,8 @@ for secret in \
 done
 
 "${gcloud_local}" builds submit "${repo_root}" \
-  --tag="${image}" \
+  --config="${repo_root}/infra/gcp/cloudbuild.yaml" \
+  --substitutions="_IMAGE=${image}" \
   --quiet
 
 "${gcloud_local}" alpha run worker-pools deploy "${worker_pool}" \
