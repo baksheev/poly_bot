@@ -62,11 +62,18 @@ fi
   --role=roles/logging.logWriter \
   --condition=None \
   --quiet >/dev/null
-"${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
-  --member="serviceAccount:${runtime_service_account}" \
-  --role=roles/secretmanager.secretAccessor \
-  --condition=None \
-  --quiet >/dev/null
+for secret in \
+  CLICKHOUSE_URL \
+  CLICKHOUSE_PASSWORD \
+  ALCHEMY_WORLDCHAIN_RPC_URL \
+  ALCHEMY_WORLDCHAIN_WS_URL \
+  BINANCE_API_KEY \
+  BINANCE_SECRET_KEY; do
+  "${gcloud_local}" secrets add-iam-policy-binding "${secret}" \
+    --member="serviceAccount:${runtime_service_account}" \
+    --role=roles/secretmanager.secretAccessor \
+    --quiet >/dev/null
+done
 
 if ! "${gcloud_local}" compute networks describe "${network}" >/dev/null 2>&1; then
   "${gcloud_local}" compute networks create "${network}" \

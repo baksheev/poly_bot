@@ -7,5 +7,6 @@ pub mod engine;
 pub mod hot_telemetry;
 pub mod market_data;
 pub mod opportunity;
+pub mod rebalance;
 pub mod state;
 pub mod telemetry;

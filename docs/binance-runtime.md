@@ -1,6 +1,6 @@
 # Binance runtime parity and low-latency design
 
-Status: first authenticated read-only slice in progress
+Status: authenticated read-only slice deployed; execution and rebalance remain disabled
 Last reviewed: 2026-07-16
 
 ## Decisions
@@ -8,8 +8,8 @@ Last reviewed: 2026-07-16
 - Rust trades Spot, never USD-M Futures.
 - Rust uses a dedicated Binance subaccount and a dedicated EVM execution
   wallet. Rails keeps its current Binance account and wallets.
-- Rails remains responsible for capital rebalancing. Rust does not implement
-  Binance deposit, withdrawal, travel-rule, bridge, or wallet-rebalance flows.
+- Rust owns capital rebalancing for its subaccount and wallet. Rails must not
+  transfer their funds or submit transactions from the Rust wallet.
 - The initial credential check may use the existing Rails credentials, but
   live Rust execution receives a dedicated subaccount API key before entries
   are enabled.
@@ -43,8 +43,8 @@ arbitrage execution jobs in the Rails application.
 | `GET /api/v3/myTrades` | Missing in Rails | Add only for restart recovery when fills cannot be reconstructed from orders and the journal. |
 | `GET /api/v3/rateLimit/order` | Missing in Rails | Add outside the hot path for readiness and rate-limit telemetry. |
 
-The following Rails endpoints are rebalance-only and deliberately remain out
-of Rust:
+The following Rails endpoints stay out of the trading hot path but are needed
+by the Rust rebalance state machine:
 
 - `GET /sapi/v1/capital/deposit/address/list`;
 - `GET /sapi/v1/capital/config/getall`;
@@ -103,12 +103,16 @@ The production Rust subaccount should have:
 - IP restriction to the VM static address `34.21.220.162`;
 - a Rust-specific client order ID prefix, separate from Rails `arb...` IDs.
 
-Rails may rebalance capital through the master/subaccount transfer APIs and
-its existing deposit/withdraw flows. Rust only observes resulting account and
-wallet balance changes and pauses entries below its minimum inventory. A
-wallet-to-Binance transfer from the Rust execution wallet requires an explicit
-maintenance gate because it consumes that wallet's nonce. It must not run
-while Rust can submit DEX transactions.
+Use a second, IP-restricted treasury API key for withdrawals. It is loaded by
+the cold-path rebalance owner only and is never accepted by an order client.
+Withdrawal-address whitelisting is required if the Binance account supports
+it. Runtime capability discovery must fail closed if the subaccount cannot
+deposit and withdraw directly without master-account coordination.
+
+The same in-process owner serializes DEX and rebalance wallet nonces. The
+initial safe implementation pauses new entries before reserving a rebalance
+operation and resumes only after balances, nonce, and external transfer state
+are reconciled. See `docs/rebalancing.md`.
 
 ## Readiness gates before order placement
 
