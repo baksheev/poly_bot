@@ -86,7 +86,19 @@ The GCP project and repository keep their bootstrap names for now. See
 ```bash
 cp .env.example .env
 cargo run -- check
+cargo run -- hydrate
 cargo run -- run
+```
+
+`hydrate` requires the endpoint named by the domain snapshot
+(`ALCHEMY_WORLDCHAIN_RPC_URL` for the current pair). It discovers and loads all
+V3/V4 pool state at one canonical block, logs only public pool metadata, and
+exits without starting market data or execution.
+
+To use ignored production-local configuration explicitly:
+
+```bash
+ENV_FILE=.env.production cargo run -- hydrate
 ```
 
 Without `CLICKHOUSE_URL`, `run` uses log-only telemetry. To create the current
@@ -114,6 +126,11 @@ scripts/quality.sh
 Use `./scripts/gcloud-local` for all local Google Cloud commands. Its
 repository-local configuration does not mutate the global gcloud account,
 project, or ADC state. See [local GCP authentication](docs/gcp-local-auth.md).
+
+Production is a single read-only Cloud Run Worker Pool instance in Singapore
+with 8 vCPU and 16 GiB RAM. After committing the exact revision, deploy it with
+`scripts/deploy-gcp-worker`; the script builds a git-SHA-tagged image and keeps
+all ClickHouse and Alchemy credentials in Secret Manager.
 
 ## Planned implementation slices
 

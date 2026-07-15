@@ -1,8 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::bail;
+use anyhow::{Context, bail, ensure};
 use arb_bot::{
+    chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
+    dex::hydration::DexHydrator,
     domain::config::LoadedDomainConfig,
     engine::TradingEngine,
     market_data::binance::spawn_book_ticker_connectors,
@@ -14,7 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    load_dotenv()?;
     init_tracing();
 
     let cli = Cli::parse();
@@ -43,7 +45,65 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Hydrate => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            hydrate(&domain_config).await
+        }
     }
+}
+
+fn load_dotenv() -> anyhow::Result<()> {
+    if let Some(path) = std::env::var_os("ENV_FILE") {
+        dotenvy::from_path(&path)
+            .with_context(|| format!("failed to load ENV_FILE {}", path.to_string_lossy()))?;
+    } else {
+        dotenvy::dotenv().ok();
+    }
+    Ok(())
+}
+
+async fn hydrate(domain_config: &LoadedDomainConfig) -> anyhow::Result<()> {
+    let mut rpc_env_names = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .filter(|pair| pair.market_data_enabled)
+        .map(|pair| pair.chain.rpc_url_env.as_str());
+    let rpc_env_name = rpc_env_names
+        .next()
+        .context("no enabled pair RPC endpoint")?;
+    ensure!(
+        rpc_env_names.all(|candidate| candidate == rpc_env_name),
+        "hydrate command currently requires one shared RPC endpoint"
+    );
+    let endpoint = std::env::var(rpc_env_name)
+        .with_context(|| format!("required environment variable {rpc_env_name} is not set"))?;
+    let rpc = JsonRpcClient::new(endpoint)?;
+    let state = DexHydrator::new(&rpc)
+        .hydrate(domain_config.snapshot())
+        .await?;
+
+    for pool in &state.pools {
+        tracing::info!(
+            pair_id = %pool.pair_id,
+            identity = ?pool.identity,
+            token0 = %pool.token0,
+            token1 = %pool.token1,
+            tick = pool.pool.tick,
+            liquidity = pool.pool.liquidity,
+            initialized_ticks = pool.pool.initialized_tick_count(),
+            "DEX pool hydrated"
+        );
+    }
+    tracing::info!(
+        block_number = state.block.number,
+        block_hash = %state.block.hash,
+        pools = state.pools.len(),
+        unavailable = ?state.unavailable,
+        rpc = ?rpc.stats(),
+        "DEX hydration completed"
+    );
+    Ok(())
 }
 
 async fn run(

@@ -3,6 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-"${repo_root}/.gcloud"}"
+# Homebrew's gcloud alpha Worker Pools commands import grpc from the selected
+# Python environment. gcloud disables site-packages by default, so opt in for
+# this repository-local invocation only.
+export CLOUDSDK_PYTHON_SITEPACKAGES="${CLOUDSDK_PYTHON_SITEPACKAGES:-1}"
 
 mkdir -p "${CLOUDSDK_CONFIG}"
 exec gcloud "$@"

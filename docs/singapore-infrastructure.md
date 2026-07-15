@@ -1,6 +1,6 @@
 # Singapore deployment and ClickHouse cutover
 
-Status: region selected; application deployment pending  
+Status: production deployment configured; read-only worker pending verification
 Last reviewed: 2026-07-15
 
 ## Decision
@@ -46,3 +46,23 @@ this clone.
 - ClickHouse slowdown or outage increments telemetry drop/failure metrics but
   does not increase market-event queue age or stop the engine.
 - No trading secrets are attached while the service is read-only.
+
+## Worker sizing
+
+The initial Worker Pool runs exactly one instance with 8 vCPU and 16 GiB RAM.
+This is the largest Cloud Run CPU allocation and intentionally leaves headroom
+for Tokio network tasks, TLS, telemetry compression, reconnect recovery, and
+the latency-sensitive state owner. Revisit the allocation only after production
+CPU and latency histograms are available; cost optimization is secondary to the
+first performance baseline.
+
+Deploy a committed revision with:
+
+```bash
+scripts/deploy-gcp-worker
+```
+
+The script enables the required APIs, creates the Artifact Registry repository
+and dedicated runtime service account when absent, synchronizes non-trading
+secrets, builds an image tagged with the git SHA, and deploys one read-only
+Worker Pool instance. It refuses to deploy a dirty worktree.

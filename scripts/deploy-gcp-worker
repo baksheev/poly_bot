@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${1:-${repo_root}/.env.production}"
+
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+
+if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
+  echo "refusing to deploy a dirty worktree; commit the exact source first" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+: "${GCP_REGION:?GCP_REGION is required}"
+
+gcloud_local="${repo_root}/scripts/gcloud-local"
+artifact_repo="poly-bot"
+image_name="poly-bot"
+worker_pool="arb-bot-rust-shadow"
+runtime_service_account="arb-bot-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+git_sha="$(git -C "${repo_root}" rev-parse --short=12 HEAD)"
+image="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${artifact_repo}/${image_name}:${git_sha}"
+
+"${gcloud_local}" config set project "${GCP_PROJECT_ID}" >/dev/null
+"${gcloud_local}" services enable \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com \
+  secretmanager.googleapis.com \
+  --quiet
+
+if ! "${gcloud_local}" artifacts repositories describe "${artifact_repo}" \
+  --location="${GCP_REGION}" >/dev/null 2>&1; then
+  "${gcloud_local}" artifacts repositories create "${artifact_repo}" \
+    --location="${GCP_REGION}" \
+    --repository-format=docker \
+    --description="Low-latency arb bot images" \
+    --quiet
+fi
+
+if ! "${gcloud_local}" iam service-accounts describe \
+  "${runtime_service_account}" >/dev/null 2>&1; then
+  "${gcloud_local}" iam service-accounts create arb-bot-runtime \
+    --display-name="Arb bot production runtime" \
+    --quiet
+fi
+
+"${repo_root}/scripts/sync-gcp-secrets" "${env_file}"
+for secret in \
+  CLICKHOUSE_URL \
+  CLICKHOUSE_PASSWORD \
+  ALCHEMY_WORLDCHAIN_RPC_URL \
+  ALCHEMY_WORLDCHAIN_WS_URL; do
+  "${gcloud_local}" secrets add-iam-policy-binding "${secret}" \
+    --member="serviceAccount:${runtime_service_account}" \
+    --role=roles/secretmanager.secretAccessor \
+    --quiet >/dev/null
+done
+
+"${gcloud_local}" builds submit "${repo_root}" \
+  --tag="${image}" \
+  --quiet
+
+"${gcloud_local}" alpha run worker-pools deploy "${worker_pool}" \
+  --region="${GCP_REGION}" \
+  --image="${image}" \
+  --service-account="${runtime_service_account}" \
+  --cpu=8 \
+  --memory=16Gi \
+  --scaling=1 \
+  --args=run \
+  --set-env-vars="SERVICE_NAME=arb-bot-rust-shadow,ENGINE_ID=arb-bot-rust-shadow-gcp,GCP_PROJECT_ID=${GCP_PROJECT_ID},GCP_REGION=${GCP_REGION},BINANCE_WS_BASE_URL=wss://fstream.binance.com/public/ws,DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v1.json,MARKET_EVENT_CHANNEL_CAPACITY=8192,MARKET_DATA_MAX_AGE_MS=5000,CLICKHOUSE_DATABASE=arb_bot_prod,CLICKHOUSE_USER=default,TELEMETRY_CHANNEL_CAPACITY=8192,TELEMETRY_BATCH_SIZE=200,TELEMETRY_FLUSH_INTERVAL_MS=100,RUST_LOG=arb_bot=info" \
+  --set-secrets="CLICKHOUSE_URL=CLICKHOUSE_URL:latest,CLICKHOUSE_PASSWORD=CLICKHOUSE_PASSWORD:latest,ALCHEMY_WORLDCHAIN_RPC_URL=ALCHEMY_WORLDCHAIN_RPC_URL:latest,ALCHEMY_WORLDCHAIN_WS_URL=ALCHEMY_WORLDCHAIN_WS_URL:latest" \
+  --labels="component=trading-shadow,mode=read-only,source-revision=${git_sha}" \
+  --description="Read-only Rust arbitrage shadow worker" \
+  --quiet
+
+echo "deployed ${worker_pool} image ${image}"

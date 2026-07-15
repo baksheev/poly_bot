@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+chain_id="${1:-480}"
+
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+
+if [[ ! "${chain_id}" =~ ^[0-9]+$ ]] || [[ "${chain_id}" == "0" ]]; then
+  echo "chain id must be a positive integer" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${ARB_BOT_DATABASE_URL:?ARB_BOT_DATABASE_URL is required}"
+
+rpc_url="$({
+  echo "BEGIN TRANSACTION READ ONLY;"
+  echo "SELECT rpc_url FROM chains WHERE chain_id = ${chain_id};"
+  echo "COMMIT;"
+} | psql "${ARB_BOT_DATABASE_URL}" -X --no-psqlrc -v ON_ERROR_STOP=1 -qAt)"
+
+if [[ -z "${rpc_url}" ]] || [[ "${rpc_url}" == *$'\n'* ]]; then
+  echo "expected exactly one non-empty RPC URL for chain ${chain_id}" >&2
+  exit 1
+fi
+
+RPC_URL="${rpc_url}" ENV_FILE="${env_file}" CHAIN_ID="${chain_id}" ruby <<'RUBY'
+require "uri"
+
+rpc_url = ENV.fetch("RPC_URL")
+env_file = ENV.fetch("ENV_FILE")
+chain_id = ENV.fetch("CHAIN_ID")
+uri = URI.parse(rpc_url)
+raise "RPC URL must include a host" unless uri.host
+
+ws_uri = uri.dup
+ws_uri.scheme = case uri.scheme
+when "https" then "wss"
+when "http" then "ws"
+else raise "RPC URL must use HTTP or HTTPS"
+end
+
+updates = {
+  "ALCHEMY_WORLDCHAIN_RPC_URL" => rpc_url,
+  "ALCHEMY_WORLDCHAIN_WS_URL" => ws_uri.to_s,
+}
+seen = {}
+lines = File.readlines(env_file, chomp: true).map do |line|
+  key = updates.keys.find { |candidate| line.start_with?("#{candidate}=") }
+  next line unless key
+
+  raise "duplicate #{key} in env file" if seen[key]
+  seen[key] = true
+  "#{key}=#{updates.fetch(key)}"
+end
+updates.each do |key, value|
+  lines << "#{key}=#{value}" unless seen[key]
+end
+
+temporary = "#{env_file}.tmp.#{$$}"
+File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+  file.write(lines.join("\n"))
+  file.write("\n")
+end
+File.rename(temporary, env_file)
+File.chmod(0o600, env_file)
+
+puts "synced chain #{chain_id} RPC/WSS endpoints for host #{uri.host}"
+RUBY

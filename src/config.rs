@@ -21,6 +21,8 @@ pub enum Command {
     Migrate,
     /// Validate configuration without connecting to external systems.
     Check,
+    /// Hydrate DEX pools at one canonical block without starting the service.
+    Hydrate,
 }
 
 #[derive(Parser, Debug, Clone)]

@@ -9,8 +9,8 @@
       "name": "arb-bot-rust-shadow",
       "command": ["run"],
       "instances": 1,
-      "cpu": "4",
-      "memory": "4Gi",
+      "cpu": "8",
+      "memory": "16Gi",
       "env": {
         "ENGINE_ID": "arb-bot-rust-shadow-gcp",
         "GCP_REGION": "asia-southeast1",
@@ -25,7 +25,9 @@
       },
       "secrets": [
         "CLICKHOUSE_URL",
-        "CLICKHOUSE_PASSWORD"
+        "CLICKHOUSE_PASSWORD",
+        "ALCHEMY_WORLDCHAIN_RPC_URL",
+        "ALCHEMY_WORLDCHAIN_WS_URL"
       ]
     }
   ]
