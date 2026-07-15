@@ -13,13 +13,19 @@ update arrives.
 ```text
 Alchemy WSS logs ─> ordered pool-state updates ─┐
                                                 ├─> single state owner
-Binance bookTicker ─────────────────────────────┘          │
+Binance bookTicker WSS ─> direct socket poll ───┘          │
                                                           ├─> local V3/V4 quotes
                                                           ├─> opportunity
                                                           └─> execution gate
 
 Alchemy HTTP ─> startup hydration / gap repair / sampled parity only
 ```
+
+The Binance socket future is polled by the same Tokio task that owns strategy
+state. A parsed Spot frame is applied and evaluated immediately, without an
+intermediate market-data channel or a second task wakeup. DEX I/O, curve
+building, and telemetry remain outside that owner and communicate through
+bounded channels because they are not triggered for every Binance frame.
 
 Alchemy does not provide a stream of executable Uniswap quotes. The useful
 subscription primitive is `eth_subscribe` over WebSocket for logs and heads.
@@ -236,9 +242,17 @@ fully warm rows measured 3/7/10 us. This satisfies the 25 us calculation p99
 contract. Frame-receipt-to-decision latency measured 51/87/201 us. Slow rows
 were dominated by time waiting to enter the state owner: the 3,899 us maximum
 had a 3,911 us engine queue age and only 5 us of calculation. The next latency
-boundary is therefore the Binance-reader task/channel/Cloud Run scheduler, not
-CLMM math. A direct read-and-decide loop on a dedicated CPU is the next
-architecture experiment for a stable sub-100 us decision p99.
+boundary was therefore the Binance-reader task/channel, not CLMM math. This
+evidence motivated the direct socket-poll/state-owner path described above.
+
+A 339-event local live validation of that direct path measured 2/5/10 us for
+calculation and 7/12/60 us from accepted frame to completed decision. The clean
+revision-tagged Singapore production window then measured 460 unique updates:
+2/6/18 us calculation and 5/15/50 us decision p50/p95/p99. Calculation maxed at
+41 us and decision at 92 us; no event exceeded 100 us. The 457 fully warm rows
+were faster still at 2/6/9 us calculation and 5/15/45 us decision. Both latency
+acceptance thresholds therefore pass on the current 8-vCPU Worker Pool without
+moving to dedicated compute.
 
 Run the allocation-free calculation baseline with:
 

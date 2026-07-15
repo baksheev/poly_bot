@@ -65,18 +65,21 @@ scripts/deploy-gcp-worker
 The script enables the required APIs, creates the Artifact Registry repository
 and dedicated runtime service account when absent, synchronizes non-trading
 secrets, builds an image tagged with the git SHA, and deploys one read-only
-Worker Pool instance. It refuses to deploy a dirty worktree.
+Worker Pool instance. It refuses to deploy a dirty worktree. `ENGINE_ID` also
+contains that source SHA so telemetry from old and new processes remains
+attributable during a rolling deployment.
 
 ## Current production baseline
 
 The verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
-`arb-bot-rust-shadow-00006-9jv`, from source revision `3cdfc7fd9fc4` and image
-digest `sha256:52fd05aa51b65710814bbc159a8673c4844111fe261b2a6d41990a748feeacae`.
+`arb-bot-rust-shadow-direct-dcfc5e0`, from source revision `dcfc5e056dae` and
+image digest
+`sha256:2b51afd185e012893d6904aa4ae5346d7774c494f1493a513197dd41f75d26cc`.
 
 - Cloud Run reports the revision `Ready` with one manually scaled instance,
   8 vCPU, 16 GiB RAM, and CPU idle disabled.
 - The process hydrated five configured Uniswap pools at World Chain block
-  `32408833`, completed its race-free backfill, and
+  `32409580`, completed its race-free backfill, and
   established filtered Alchemy WebSocket subscriptions.
 - The process connected to the Binance Spot raw stream
   `wss://stream.binance.com:9443/ws/wldusdc@bookTicker`; both the market-data
@@ -120,8 +123,26 @@ digest `sha256:52fd05aa51b65710814bbc159a8673c4844111fe261b2a6d41990a748feeacae`
   Binance-task to state-owner wakeup and Cloud Run scheduling path.
 - Raw Binance and opportunity JSON formatting now runs behind separate bounded
   telemetry channels and is not included in the decision timer. Calculation
-  meets the 25 us p99 contract; stable sub-100 us decision p99 will require a
-  direct Binance-read/state-owner loop and validation on dedicated compute
-  rather than relying on shared Cloud Run scheduling.
+  meets the 25 us p99 contract. The remaining tail in this intermediate
+  revision motivated removal of the Binance task/channel handoff.
+- The direct-read revision polls the Binance WebSocket from the same Tokio task
+  that owns strategy state. Its revision-tagged fixed window from
+  `2026-07-15 22:33:21.184 UTC` through `22:35:45 UTC` contained 460 unique
+  Binance updates with no duplicate `update_id` values. Complete calculation
+  latency was 2/6/18 us p50/p95/p99 and 41 us maximum; frame receipt through
+  completed decision was 5/15/50 us and 92 us maximum. No event exceeded
+  100 us.
+- The 457 fully warm direct-path rows measured 2/6/9 us calculation and
+  5/15/45 us decision p50/p95/p99. Three state-driven rebuild rows measured
+  20/41/41 us calculation and 21/92/92 us decision. Across 4,590 baseline
+  lookups, 4,568 hit and 22 missed (99.52% hit rate).
+- Nine curve builds in the direct-path window measured 157/256/256 us
+  construction and 279/444/444 us request-to-publication p50/p95/p99. The
+  fail-closed refresh interval remains below one millisecond in this sample.
+- Compared with the immediately preceding prepared-curve revision, removing
+  the Binance channel improved decision latency by 10.2x at p50, 5.8x at p95,
+  and 4.0x at p99. Both production latency contracts now pass on the existing
+  8-vCPU Cloud Run Worker Pool, so dedicated compute is not yet justified by
+  the measured tail.
 - No Worker Pool warning or error logs appeared during the startup check.
 - No wallet, signing, or Binance trading credentials are attached.
