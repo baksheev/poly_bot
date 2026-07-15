@@ -13,7 +13,7 @@ use arb_bot::{
     engine::TradingEngine,
     market_data::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
-        binance::spawn_book_ticker_connectors,
+        binance::BookTickerFeed,
     },
     opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult},
     telemetry::TelemetryWriter,
@@ -125,12 +125,12 @@ async fn run(
     } = initialized_dex.stream;
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
     let writer_task = tokio::spawn(writer.run());
-    let (market_sender, mut market_receiver) =
-        tokio::sync::mpsc::channel(config.market_event_channel_capacity);
     let binance_symbols = domain_config.binance_symbols();
-    let connector_tasks =
-        spawn_book_ticker_connectors(&config, &binance_symbols, market_sender.clone());
-    drop(market_sender);
+    ensure!(
+        binance_symbols.len() == 1,
+        "direct Binance hot path currently requires exactly one enabled symbol"
+    );
+    let mut binance_feed = BookTickerFeed::new(&config, binance_symbols[0].clone());
 
     let (mut engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
@@ -161,17 +161,13 @@ async fn run(
         Duration::from_millis((config.market_data_max_age_ms / 4).clamp(100, 1_000));
     let mut health_tick = tokio::time::interval(health_interval);
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    health_tick.reset();
 
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             _ = health_tick.tick() => engine.refresh_health(),
-            event = market_receiver.recv() => {
-                let Some(event) = event else {
-                    bail!("all Binance market-data connector tasks stopped unexpectedly");
-                };
-                engine.on_market_event(event)?;
-            }
+            event = binance_feed.next_event() => engine.on_market_event(event)?,
             event = dex_receiver.recv() => {
                 let Some(event) = event else {
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
@@ -196,10 +192,6 @@ async fn run(
     }
 
     engine.shutdown();
-    for task in connector_tasks {
-        task.abort();
-        let _ = task.await;
-    }
     dex_task.abort();
     let _ = dex_task.await;
     drop(engine);

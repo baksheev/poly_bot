@@ -1,11 +1,11 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, ensure};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::{sync::mpsc, task::JoinHandle};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::time::Instant as TokioInstant;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::{config::AppConfig, market_data::MarketEvent, state::TopOfBook};
 
@@ -14,141 +14,155 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ROTATE_CONNECTION_AFTER: Duration = Duration::from_secs(23 * 60 * 60 + 55 * 60);
 
-pub fn spawn_book_ticker_connectors(
-    config: &AppConfig,
-    symbols: &[String],
-    sender: mpsc::Sender<MarketEvent>,
-) -> Vec<JoinHandle<()>> {
-    symbols
-        .iter()
-        .cloned()
-        .map(|symbol| {
-            let symbol: Arc<str> = Arc::from(symbol);
-            let base_url = config.binance_ws_base_url.trim_end_matches('/').to_owned();
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                run_symbol(base_url, symbol, sender).await;
-            })
-        })
-        .collect()
-}
+type BinanceSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn run_symbol(base_url: String, symbol: Arc<str>, sender: mpsc::Sender<MarketEvent>) {
-    let mut generation = 0_u64;
-    let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
-
-    loop {
-        generation = generation.saturating_add(1);
-        let result = run_connection(
-            &base_url,
-            Arc::clone(&symbol),
-            generation,
-            &sender,
-            &mut reconnect_delay,
-        )
-        .await;
-        let reason = result.err().map_or_else(
-            || "connection ended".to_owned(),
-            |error| format!("{error:#}"),
-        );
-
-        tracing::warn!(
-            symbol = symbol.as_ref(),
-            generation,
-            %reason,
-            reconnect_delay_ms = reconnect_delay.as_millis(),
-            "Binance bookTicker disconnected"
-        );
-
-        if sender
-            .send(MarketEvent::FeedDisconnected {
-                symbol: Arc::clone(&symbol),
-                generation,
-                reason,
-                observed_at: std::time::Instant::now(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        tokio::time::sleep(reconnect_delay).await;
-        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
-    }
-}
-
-async fn run_connection(
-    base_url: &str,
+/// Binance Spot reader polled directly by the single state-owner task.
+///
+/// Keeping the socket future and the opportunity engine in the same task
+/// removes the market-data mpsc hop and its scheduler wakeup from the decision
+/// path. Reconnects remain fail-closed through the normal feed state events.
+pub struct BookTickerFeed {
+    base_url: String,
     symbol: Arc<str>,
     generation: u64,
-    sender: &mpsc::Sender<MarketEvent>,
-    reconnect_delay: &mut Duration,
-) -> anyhow::Result<()> {
-    let url = format!("{}/{}@bookTicker", base_url, symbol.to_ascii_lowercase());
-    let (socket, response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url))
-        .await
-        .context("Binance WebSocket connect timed out")??;
+    socket: Option<BinanceSocket>,
+    reconnect_delay: Duration,
+    connect_not_before: TokioInstant,
+    rotate_at: TokioInstant,
+}
 
-    ensure!(
-        response.status().as_u16() == 101,
-        "Binance WebSocket upgrade returned {}",
-        response.status()
-    );
-    *reconnect_delay = INITIAL_RECONNECT_DELAY;
+impl BookTickerFeed {
+    pub fn new(config: &AppConfig, symbol: String) -> Self {
+        let now = TokioInstant::now();
+        Self {
+            base_url: config.binance_ws_base_url.trim_end_matches('/').to_owned(),
+            symbol: Arc::from(symbol),
+            generation: 0,
+            socket: None,
+            reconnect_delay: INITIAL_RECONNECT_DELAY,
+            connect_not_before: now,
+            rotate_at: now + ROTATE_CONNECTION_AFTER,
+        }
+    }
 
-    tracing::info!(symbol = symbol.as_ref(), generation, %url, "Binance Spot bookTicker connected");
-    sender
-        .send(MarketEvent::FeedConnected {
-            symbol: Arc::clone(&symbol),
-            generation,
-            observed_at: std::time::Instant::now(),
-        })
-        .await
-        .map_err(|_| anyhow!("market event receiver closed"))?;
-
-    let (mut writer, mut reader) = socket.split();
-    let rotation = tokio::time::sleep(ROTATE_CONNECTION_AFTER);
-    tokio::pin!(rotation);
-
-    loop {
-        tokio::select! {
-            _ = &mut rotation => bail!("scheduled connection rotation before Binance 24-hour limit"),
-            message = reader.next() => {
-                let message = message.context("Binance WebSocket stream ended")??;
-                match message {
-                    Message::Text(payload) => {
-                        forward_payload(payload.as_bytes(), Arc::clone(&symbol), generation, sender)?;
+    pub async fn next_event(&mut self) -> MarketEvent {
+        loop {
+            if self.socket.is_none() {
+                tokio::time::sleep_until(self.connect_not_before).await;
+                let next_generation = self.generation.saturating_add(1);
+                match self.connect(next_generation).await {
+                    Ok(socket) => {
+                        self.generation = next_generation;
+                        self.socket = Some(socket);
+                        self.reconnect_delay = INITIAL_RECONNECT_DELAY;
+                        self.rotate_at = TokioInstant::now() + ROTATE_CONNECTION_AFTER;
+                        return MarketEvent::FeedConnected {
+                            symbol: Arc::clone(&self.symbol),
+                            generation: self.generation,
+                            observed_at: std::time::Instant::now(),
+                        };
                     }
-                    Message::Binary(payload) => {
-                        forward_payload(payload.as_ref(), Arc::clone(&symbol), generation, sender)?;
+                    Err(error) => {
+                        return self.disconnect(format!("{error:#}"));
                     }
-                    Message::Ping(payload) => {
-                        writer.send(Message::Pong(payload)).await.context("failed to send Binance pong")?;
+                }
+            }
+
+            let socket = self.socket.as_mut().expect("socket checked above");
+            let rotation = tokio::time::sleep_until(self.rotate_at);
+            tokio::pin!(rotation);
+            tokio::select! {
+                _ = &mut rotation => {
+                    return self.disconnect(
+                        "scheduled connection rotation before Binance 24-hour limit".to_owned(),
+                    );
+                }
+                message = socket.next() => {
+                    let message = match message {
+                        Some(Ok(message)) => message,
+                        Some(Err(error)) => return self.disconnect(format!("{error:#}")),
+                        None => return self.disconnect("Binance WebSocket stream ended".to_owned()),
+                    };
+                    match message {
+                        Message::Text(payload) => match self.parse_payload(payload.as_bytes()) {
+                            Ok(event) => return event,
+                            Err(error) => return self.disconnect(format!("{error:#}")),
+                        },
+                        Message::Binary(payload) => match self.parse_payload(payload.as_ref()) {
+                            Ok(event) => return event,
+                            Err(error) => return self.disconnect(format!("{error:#}")),
+                        },
+                        Message::Ping(payload) => {
+                            if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                return self.disconnect(format!("failed to send Binance pong: {error:#}"));
+                            }
+                        }
+                        Message::Pong(_) => {}
+                        Message::Close(frame) => {
+                            return self.disconnect(format!("Binance closed WebSocket: {frame:?}"));
+                        }
+                        Message::Frame(_) => {}
                     }
-                    Message::Pong(_) => {}
-                    Message::Close(frame) => bail!("Binance closed WebSocket: {frame:?}"),
-                    Message::Frame(_) => {}
                 }
             }
         }
     }
-}
 
-fn forward_payload(
-    payload: &[u8],
-    symbol: Arc<str>,
-    generation: u64,
-    sender: &mpsc::Sender<MarketEvent>,
-) -> anyhow::Result<()> {
-    let received_at = std::time::Instant::now();
-    let received_unix_us = unix_timestamp_us();
-    let quote = parse_book_ticker(payload, symbol, generation, received_at, received_unix_us)?;
+    async fn connect(&self, generation: u64) -> anyhow::Result<BinanceSocket> {
+        let url = format!(
+            "{}/{}@bookTicker",
+            self.base_url,
+            self.symbol.to_ascii_lowercase()
+        );
+        let (socket, response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url))
+            .await
+            .context("Binance WebSocket connect timed out")??;
+        ensure!(
+            response.status().as_u16() == 101,
+            "Binance WebSocket upgrade returned {}",
+            response.status()
+        );
+        tracing::info!(
+            symbol = self.symbol.as_ref(),
+            generation,
+            %url,
+            "Binance Spot bookTicker connected"
+        );
+        Ok(socket)
+    }
 
-    sender
-        .try_send(MarketEvent::BinanceTopOfBook(quote))
-        .map_err(|error| anyhow!("critical market event channel unavailable: {error}"))?;
-    Ok(())
+    fn parse_payload(&self, payload: &[u8]) -> anyhow::Result<MarketEvent> {
+        let received_at = std::time::Instant::now();
+        let received_unix_us = unix_timestamp_us();
+        let quote = parse_book_ticker(
+            payload,
+            Arc::clone(&self.symbol),
+            self.generation,
+            received_at,
+            received_unix_us,
+        )?;
+        Ok(MarketEvent::BinanceTopOfBook(quote))
+    }
+
+    fn disconnect(&mut self, reason: String) -> MarketEvent {
+        self.socket = None;
+        let delay = self.reconnect_delay;
+        self.connect_not_before = TokioInstant::now() + delay;
+        self.reconnect_delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+        tracing::warn!(
+            symbol = self.symbol.as_ref(),
+            generation = self.generation,
+            %reason,
+            reconnect_delay_ms = delay.as_millis(),
+            "Binance bookTicker disconnected"
+        );
+        MarketEvent::FeedDisconnected {
+            symbol: Arc::clone(&self.symbol),
+            generation: self.generation,
+            reason,
+            observed_at: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

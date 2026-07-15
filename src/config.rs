@@ -53,9 +53,6 @@ pub struct AppConfig {
     )]
     pub domain_config_path: PathBuf,
 
-    #[arg(long, env = "MARKET_EVENT_CHANNEL_CAPACITY", default_value_t = 8192)]
-    pub market_event_channel_capacity: usize,
-
     #[arg(long, env = "MARKET_DATA_MAX_AGE_MS", default_value_t = 5_000)]
     pub market_data_max_age_ms: u64,
 
@@ -94,10 +91,6 @@ impl AppConfig {
         validate_non_empty("GCP_PROJECT_ID", &self.gcp_project_id)?;
         validate_non_empty("GCP_REGION", &self.gcp_region)?;
 
-        ensure!(
-            self.market_event_channel_capacity > 0,
-            "MARKET_EVENT_CHANNEL_CAPACITY must be greater than zero"
-        );
         ensure!(
             self.market_data_max_age_ms > 0,
             "MARKET_DATA_MAX_AGE_MS must be greater than zero"
@@ -210,7 +203,6 @@ mod tests {
             gcp_region: "asia-southeast1".into(),
             binance_ws_base_url: "wss://stream.binance.com:9443/ws".into(),
             domain_config_path: "config/strategies/usdc-wld-world-chain.v2.json".into(),
-            market_event_channel_capacity: 8192,
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,
             dex_head_max_age_ms: 10_000,
@@ -227,13 +219,6 @@ mod tests {
     #[test]
     fn default_shape_is_valid() {
         config().validate().unwrap();
-    }
-
-    #[test]
-    fn rejects_zero_sized_market_channel() {
-        let mut config = config();
-        config.market_event_channel_capacity = 0;
-        assert!(config.validate().is_err());
     }
 
     #[test]
