@@ -3,6 +3,7 @@ pub mod config;
 pub mod dex;
 pub mod domain;
 pub mod engine;
+pub mod hot_telemetry;
 pub mod market_data;
 pub mod opportunity;
 pub mod state;

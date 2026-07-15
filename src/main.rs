@@ -132,12 +132,13 @@ async fn run(
         spawn_book_ticker_connectors(&config, &binance_symbols, market_sender.clone());
     drop(market_sender);
 
-    let mut engine = TradingEngine::new(
+    let (mut engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
         initialized_dex.mirror,
         telemetry,
     )?;
+    let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     engine.start();
     let (prepared_sender, mut prepared_receiver, prepared_thread) =
         spawn_prepared_pool_builder(64)?;
@@ -208,6 +209,7 @@ async fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("prepared DEX builder thread panicked"))?;
 
+    hot_telemetry_task.await??;
     writer_task.await??;
     tracing::info!("read-only arbitrage shadow service stopped");
     Ok(())

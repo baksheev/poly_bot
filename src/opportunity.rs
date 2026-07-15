@@ -100,7 +100,7 @@ pub struct DirectionEvaluation {
     pub market_liquidity_capacity: Option<CapacityEvaluation>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PairEvaluation {
     pub pair_index: usize,
     pub baseline_token_b_amount: U256,
@@ -293,6 +293,10 @@ impl OpportunityEngine {
         self.pairs
             .get(index)
             .context("opportunity pair index is invalid")
+    }
+
+    pub fn pairs(&self) -> &[PairRuntime] {
+        &self.pairs
     }
 
     pub fn request_pool_refresh(
