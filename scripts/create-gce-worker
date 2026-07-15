@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+image="${1:-}"
+source_revision="${2:-}"
+
+if [[ -z "${image}" || -z "${source_revision}" ]]; then
+  echo "usage: scripts/create-gce-worker IMAGE SOURCE_REVISION" >&2
+  exit 1
+fi
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
+  echo "refusing to provision from a dirty worktree" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+: "${GCP_REGION:?GCP_REGION is required}"
+
+gcloud_local="${repo_root}/scripts/gcloud-local"
+zone="${GCE_ZONE:-${GCP_REGION}-b}"
+machine_type="${GCE_MACHINE_TYPE:-c4-highcpu-8}"
+network="arb-bot-low-latency"
+subnet="arb-bot-singapore"
+address="arb-bot-gce-egress"
+instance="arb-bot-rust-shadow-gce"
+runtime_service_account="arb-bot-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+engine_id="arb-bot-rust-shadow-gce-${source_revision}"
+
+"${gcloud_local}" config set project "${GCP_PROJECT_ID}" >/dev/null
+"${gcloud_local}" services enable compute.googleapis.com --quiet
+
+"${gcloud_local}" artifacts repositories add-iam-policy-binding poly-bot \
+  --location="${GCP_REGION}" \
+  --member="serviceAccount:${runtime_service_account}" \
+  --role=roles/artifactregistry.reader \
+  --quiet >/dev/null
+
+if ! "${gcloud_local}" compute networks describe "${network}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute networks create "${network}" \
+    --subnet-mode=custom \
+    --bgp-routing-mode=regional \
+    --quiet
+fi
+if ! "${gcloud_local}" compute networks subnets describe "${subnet}" \
+  --region="${GCP_REGION}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute networks subnets create "${subnet}" \
+    --network="${network}" \
+    --region="${GCP_REGION}" \
+    --range=10.42.0.0/24 \
+    --quiet
+fi
+if ! "${gcloud_local}" compute addresses describe "${address}" \
+  --region="${GCP_REGION}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute addresses create "${address}" \
+    --region="${GCP_REGION}" \
+    --network-tier=PREMIUM \
+    --quiet
+fi
+if "${gcloud_local}" compute instances describe "${instance}" \
+  --zone="${zone}" >/dev/null 2>&1; then
+  echo "instance already exists: ${instance}; refusing to replace it" >&2
+  exit 1
+fi
+
+"${gcloud_local}" compute instances create "${instance}" \
+  --zone="${zone}" \
+  --machine-type="${machine_type}" \
+  --provisioning-model=STANDARD \
+  --maintenance-policy=TERMINATE \
+  --restart-on-failure \
+  --network-tier=PREMIUM \
+  --subnet="${subnet}" \
+  --address="${address}" \
+  --image-family=cos-stable \
+  --image-project=cos-cloud \
+  --boot-disk-type=hyperdisk-balanced \
+  --boot-disk-size=20GB \
+  --service-account="${runtime_service_account}" \
+  --scopes=https://www.googleapis.com/auth/cloud-platform \
+  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION}" \
+  --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh" \
+  --shielded-secure-boot \
+  --shielded-vtpm \
+  --shielded-integrity-monitoring \
+  --labels="component=trading-shadow,mode=read-only,source-revision=${source_revision}" \
+  --quiet
+
+echo "created ${instance} (${machine_type}, ${zone}) with ${image}"
+
