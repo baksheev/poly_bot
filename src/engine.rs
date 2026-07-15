@@ -70,6 +70,7 @@ impl TradingEngine {
         match event {
             DexStreamEvent::Log { log, received_at } => {
                 if let LogApplyResult::Applied { pool_index, kind } = self.dex.apply_log(&log)? {
+                    self.opportunities.invalidate_pool(pool_index)?;
                     let pool = self.dex.pool(pool_index)?;
                     self.telemetry.emit(
                         "dex_pool_event",
@@ -178,8 +179,10 @@ impl TradingEngine {
                 if self.state.phase == RuntimePhase::Ready {
                     let calculation_started = Instant::now();
                     if let Some(evaluation) = self.opportunities.evaluate(&quote, &self.dex)? {
+                        let pair = self.opportunities.pair(evaluation.pair_index)?;
                         self.emit_arbitrage_evaluation(
                             &quote,
+                            pair,
                             &evaluation,
                             calculation_started.elapsed().as_micros(),
                         )?;
@@ -204,10 +207,10 @@ impl TradingEngine {
     fn emit_arbitrage_evaluation(
         &self,
         quote: &TopOfBook,
-        evaluation: &PairEvaluation<'_>,
+        pair: &PairRuntime,
+        evaluation: &PairEvaluation,
         calculation_time_us: u128,
     ) -> anyhow::Result<()> {
-        let pair = evaluation.pair;
         let decision_latency_us = quote.received_at.elapsed().as_micros();
         let directions = [
             self.direction_payload(pair, &evaluation.dex_buy_cex_sell)?,
@@ -234,6 +237,8 @@ impl TradingEngine {
                 "includes_binance_fee": false,
                 "includes_gas": false,
                 "includes_inventory": false,
+                "baseline_quote_cache_hits": evaluation.baseline_cache_hits,
+                "baseline_quote_cache_misses": evaluation.baseline_cache_misses,
                 "calculation_time_us": calculation_time_us,
                 "decision_latency_us": decision_latency_us,
                 "directions": directions,

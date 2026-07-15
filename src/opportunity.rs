@@ -26,6 +26,13 @@ impl ArbitrageDirection {
             Self::BuyTokenBOnCexSellOnDex => "buy_token_b_on_cex_sell_on_dex",
         }
     }
+
+    const fn cache_index(self) -> usize {
+        match self {
+            Self::BuyTokenBOnDexSellOnCex => 0,
+            Self::BuyTokenBOnCexSellOnDex => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +97,13 @@ pub struct DirectionEvaluation {
 }
 
 #[derive(Debug)]
-pub struct PairEvaluation<'pair> {
-    pub pair: &'pair PairRuntime,
+pub struct PairEvaluation {
+    pub pair_index: usize,
     pub baseline_token_b_amount: U256,
     pub dex_buy_cex_sell: DirectionEvaluation,
     pub cex_buy_dex_sell: DirectionEvaluation,
+    pub baseline_cache_hits: u16,
+    pub baseline_cache_misses: u16,
 }
 
 #[derive(Debug)]
@@ -115,37 +124,72 @@ pub struct PairRuntime {
 }
 
 pub struct OpportunityEngine {
-    pairs_by_symbol: HashMap<String, PairRuntime>,
+    pairs: Vec<PairRuntime>,
+    pair_indices_by_symbol: HashMap<String, usize>,
+    baseline_quote_cache: Vec<PoolBaselineQuoteCache>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DexQuoteOutcome {
+    Available(U256),
+    InsufficientLiquidity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BaselineQuoteCacheEntry {
+    token_b_amount: U256,
+    outcome: DexQuoteOutcome,
+}
+
+#[derive(Debug, Default)]
+struct PoolBaselineQuoteCache {
+    by_direction: [Option<BaselineQuoteCacheEntry>; 2],
+}
+
+#[derive(Debug, Default)]
+struct BaselineCacheUsage {
+    hits: u16,
+    misses: u16,
 }
 
 impl OpportunityEngine {
     pub fn new(snapshot: &DomainSnapshot, dex: &DexMirror) -> anyhow::Result<Self> {
-        let mut pairs_by_symbol = HashMap::new();
+        let mut pairs = Vec::new();
+        let mut pair_indices_by_symbol = HashMap::new();
         for pair in snapshot
             .pairs
             .iter()
             .filter(|pair| pair.market_data_enabled)
         {
             let runtime = PairRuntime::new(pair, dex)?;
+            let pair_index = pairs.len();
             ensure!(
-                pairs_by_symbol
-                    .insert(runtime.symbol.clone(), runtime)
+                pair_indices_by_symbol
+                    .insert(runtime.symbol.clone(), pair_index)
                     .is_none(),
                 "duplicate opportunity symbol {}",
                 pair.binance.symbol
             );
+            pairs.push(runtime);
         }
-        Ok(Self { pairs_by_symbol })
+        Ok(Self {
+            pairs,
+            pair_indices_by_symbol,
+            baseline_quote_cache: (0..dex.pool_count())
+                .map(|_| PoolBaselineQuoteCache::default())
+                .collect(),
+        })
     }
 
-    pub fn evaluate<'pair>(
-        &'pair self,
+    pub fn evaluate(
+        &mut self,
         quote: &TopOfBook,
         dex: &DexMirror,
-    ) -> anyhow::Result<Option<PairEvaluation<'pair>>> {
-        let Some(pair) = self.pairs_by_symbol.get(quote.symbol.as_ref()) else {
+    ) -> anyhow::Result<Option<PairEvaluation>> {
+        let Some(&pair_index) = self.pair_indices_by_symbol.get(quote.symbol.as_ref()) else {
             return Ok(None);
         };
+        let pair = &self.pairs[pair_index];
 
         let raw_baseline_token_b = token_a_to_token_b_floor(
             pair.baseline_token_a,
@@ -158,25 +202,47 @@ impl OpportunityEngine {
             !baseline_token_b_amount.is_zero(),
             "baseline token-B amount rounds to zero"
         );
+        let mut cache_usage = BaselineCacheUsage::default();
 
         Ok(Some(PairEvaluation {
-            pair,
+            pair_index,
             baseline_token_b_amount,
-            dex_buy_cex_sell: evaluate_direction(
+            dex_buy_cex_sell: evaluate_direction_with_cache(
                 pair,
                 dex,
                 quote,
                 baseline_token_b_amount,
                 ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                &mut self.baseline_quote_cache,
+                &mut cache_usage,
             )?,
-            cex_buy_dex_sell: evaluate_direction(
+            cex_buy_dex_sell: evaluate_direction_with_cache(
                 pair,
                 dex,
                 quote,
                 baseline_token_b_amount,
                 ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+                &mut self.baseline_quote_cache,
+                &mut cache_usage,
             )?,
+            baseline_cache_hits: cache_usage.hits,
+            baseline_cache_misses: cache_usage.misses,
         }))
+    }
+
+    pub fn pair(&self, index: usize) -> anyhow::Result<&PairRuntime> {
+        self.pairs
+            .get(index)
+            .context("opportunity pair index is invalid")
+    }
+
+    pub fn invalidate_pool(&mut self, pool_index: usize) -> anyhow::Result<()> {
+        let cache = self
+            .baseline_quote_cache
+            .get_mut(pool_index)
+            .context("opportunity pool cache index is invalid")?;
+        *cache = PoolBaselineQuoteCache::default();
+        Ok(())
     }
 }
 
@@ -233,12 +299,43 @@ impl PairRuntime {
     }
 }
 
+#[cfg(test)]
 fn evaluate_direction(
     pair: &PairRuntime,
     dex: &DexMirror,
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
+) -> anyhow::Result<DirectionEvaluation> {
+    evaluate_direction_impl(pair, dex, quote, baseline_token_b, direction, None)
+}
+
+fn evaluate_direction_with_cache(
+    pair: &PairRuntime,
+    dex: &DexMirror,
+    quote: &TopOfBook,
+    baseline_token_b: U256,
+    direction: ArbitrageDirection,
+    baseline_quote_cache: &mut [PoolBaselineQuoteCache],
+    cache_usage: &mut BaselineCacheUsage,
+) -> anyhow::Result<DirectionEvaluation> {
+    evaluate_direction_impl(
+        pair,
+        dex,
+        quote,
+        baseline_token_b,
+        direction,
+        Some((baseline_quote_cache, cache_usage)),
+    )
+}
+
+fn evaluate_direction_impl(
+    pair: &PairRuntime,
+    dex: &DexMirror,
+    quote: &TopOfBook,
+    baseline_token_b: U256,
+    direction: ArbitrageDirection,
+    mut cache: Option<(&mut [PoolBaselineQuoteCache], &mut BaselineCacheUsage)>,
 ) -> anyhow::Result<DirectionEvaluation> {
     let cex_top = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_quantity,
@@ -253,8 +350,24 @@ fn evaluate_direction(
     let mut best_capacity: Option<CapacityEvaluation> = None;
     if cex_top_token_b_amount >= baseline_token_b {
         for &pool_index in &pair.pool_indices {
-            let Some(baseline) =
-                evaluate_trade(pair, dex, quote, direction, pool_index, baseline_token_b)?
+            let dex_quote = if let Some((pool_caches, usage)) = cache.as_mut() {
+                let pool_cache = pool_caches
+                    .get_mut(pool_index)
+                    .context("baseline quote cache index is invalid")?;
+                pool_cache.quote(direction, baseline_token_b, usage, || {
+                    quote_dex(pair, dex, direction, pool_index, baseline_token_b)
+                })?
+            } else {
+                quote_dex(pair, dex, direction, pool_index, baseline_token_b)?
+            };
+            let Some(baseline) = evaluate_trade_with_dex_quote(
+                pair,
+                quote,
+                direction,
+                pool_index,
+                baseline_token_b,
+                dex_quote,
+            )?
             else {
                 continue;
             };
@@ -291,6 +404,32 @@ fn evaluate_direction(
         baseline: best_baseline,
         market_liquidity_capacity: best_capacity,
     })
+}
+
+impl PoolBaselineQuoteCache {
+    fn quote(
+        &mut self,
+        direction: ArbitrageDirection,
+        token_b_amount: U256,
+        usage: &mut BaselineCacheUsage,
+        load: impl FnOnce() -> anyhow::Result<DexQuoteOutcome>,
+    ) -> anyhow::Result<DexQuoteOutcome> {
+        let slot = &mut self.by_direction[direction.cache_index()];
+        if let Some(entry) = slot
+            && entry.token_b_amount == token_b_amount
+        {
+            usage.hits = usage.hits.saturating_add(1);
+            return Ok(entry.outcome);
+        }
+
+        let outcome = load()?;
+        *slot = Some(BaselineQuoteCacheEntry {
+            token_b_amount,
+            outcome,
+        });
+        usage.misses = usage.misses.saturating_add(1);
+        Ok(outcome)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,19 +507,60 @@ fn evaluate_trade(
     pool_index: usize,
     token_b_amount: U256,
 ) -> anyhow::Result<Option<TradeEvaluation>> {
+    let dex_quote = quote_dex(pair, dex, direction, pool_index, token_b_amount)?;
+    evaluate_trade_with_dex_quote(
+        pair,
+        quote,
+        direction,
+        pool_index,
+        token_b_amount,
+        dex_quote,
+    )
+}
+
+fn quote_dex(
+    pair: &PairRuntime,
+    dex: &DexMirror,
+    direction: ArbitrageDirection,
+    pool_index: usize,
+    token_b_amount: U256,
+) -> anyhow::Result<DexQuoteOutcome> {
     let hydrated = dex.pool(pool_index)?;
     let pool = &hydrated.pool;
 
-    let (dex_token_a_amount, cex_token_a_amount, cost_token_a, proceeds_token_a) = match direction {
+    let result = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
             let zero_for_one = hydrated.token0 == pair.token_a;
-            let dex_cost = match pool.quote_exact_out_amount_in(zero_for_one, token_b_amount) {
-                Ok(value) => value,
-                Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
+            pool.quote_exact_out_amount_in(zero_for_one, token_b_amount)
+        }
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
+            let zero_for_one = hydrated.token0 == pair.token_b;
+            pool.quote_exact_in_amount_out(zero_for_one, token_b_amount)
+        }
+    };
+    match result {
+        Ok(value) => Ok(DexQuoteOutcome::Available(value)),
+        Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => {
+            Ok(DexQuoteOutcome::InsufficientLiquidity)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn evaluate_trade_with_dex_quote(
+    pair: &PairRuntime,
+    quote: &TopOfBook,
+    direction: ArbitrageDirection,
+    pool_index: usize,
+    token_b_amount: U256,
+    dex_quote: DexQuoteOutcome,
+) -> anyhow::Result<Option<TradeEvaluation>> {
+    let DexQuoteOutcome::Available(dex_token_a_amount) = dex_quote else {
+        return Ok(None);
+    };
+
+    let (cex_token_a_amount, cost_token_a, proceeds_token_a) = match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
             let cex_proceeds = token_b_to_token_a(
                 token_b_amount,
                 quote.bid_price,
@@ -388,18 +568,10 @@ fn evaluate_trade(
                 pair.token_b_decimals,
                 false,
             )?;
-            let reserved_cost = add_bps_ceil(dex_cost, pair.dex_fee_reserve_bps)?;
-            (dex_cost, cex_proceeds, reserved_cost, cex_proceeds)
+            let reserved_cost = add_bps_ceil(dex_token_a_amount, pair.dex_fee_reserve_bps)?;
+            (cex_proceeds, reserved_cost, cex_proceeds)
         }
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            let zero_for_one = hydrated.token0 == pair.token_b;
-            let dex_proceeds = match pool.quote_exact_in_amount_out(zero_for_one, token_b_amount) {
-                Ok(value) => value,
-                Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
             let cex_cost = token_b_to_token_a(
                 token_b_amount,
                 quote.ask_price,
@@ -407,8 +579,9 @@ fn evaluate_trade(
                 pair.token_b_decimals,
                 true,
             )?;
-            let reserved_proceeds = subtract_bps_floor(dex_proceeds, pair.dex_fee_reserve_bps)?;
-            (dex_proceeds, cex_cost, cex_cost, reserved_proceeds)
+            let reserved_proceeds =
+                subtract_bps_floor(dex_token_a_amount, pair.dex_fee_reserve_bps)?;
+            (cex_cost, cex_cost, reserved_proceeds)
         }
     };
 
@@ -607,7 +780,8 @@ mod tests {
     };
 
     use super::{
-        ArbitrageDirection, CapacityLimiter, PairRuntime, decimal_to_base_units,
+        ArbitrageDirection, BaselineCacheUsage, CapacityLimiter, DexQuoteOutcome,
+        OpportunityEngine, PairRuntime, PoolBaselineQuoteCache, decimal_to_base_units,
         evaluate_direction, format_base_units, token_a_to_token_b_floor, token_b_to_token_a,
     };
 
@@ -679,6 +853,68 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn baseline_quote_cache_is_bounded_and_caches_insufficient_liquidity() {
+        let mut cache = PoolBaselineQuoteCache::default();
+        let mut usage = BaselineCacheUsage::default();
+        let direction = ArbitrageDirection::BuyTokenBOnDexSellOnCex;
+        let first_amount = U256::from(48_u8);
+
+        assert_eq!(
+            cache
+                .quote(direction, first_amount, &mut usage, || {
+                    Ok(DexQuoteOutcome::InsufficientLiquidity)
+                })
+                .unwrap(),
+            DexQuoteOutcome::InsufficientLiquidity
+        );
+        assert_eq!(
+            cache
+                .quote(direction, first_amount, &mut usage, || {
+                    panic!("a matching cached quote must not be recomputed")
+                })
+                .unwrap(),
+            DexQuoteOutcome::InsufficientLiquidity
+        );
+
+        let second_amount = U256::from(49_u8);
+        assert_eq!(
+            cache
+                .quote(direction, second_amount, &mut usage, || {
+                    Ok(DexQuoteOutcome::Available(U256::from(20_u8)))
+                })
+                .unwrap(),
+            DexQuoteOutcome::Available(U256::from(20_u8))
+        );
+        assert_eq!(usage.hits, 1);
+        assert_eq!(usage.misses, 2);
+        assert_eq!(
+            cache.by_direction[direction.cache_index()]
+                .unwrap()
+                .token_b_amount,
+            second_amount
+        );
+    }
+
+    #[test]
+    fn invalidating_one_pool_clears_both_direction_slots() {
+        let entry = super::BaselineQuoteCacheEntry {
+            token_b_amount: U256::from(48_u8),
+            outcome: DexQuoteOutcome::Available(U256::from(20_u8)),
+        };
+        let mut engine = OpportunityEngine {
+            pairs: Vec::new(),
+            pair_indices_by_symbol: std::collections::HashMap::new(),
+            baseline_quote_cache: vec![PoolBaselineQuoteCache {
+                by_direction: [Some(entry), Some(entry)],
+            }],
+        };
+
+        engine.invalidate_pool(0).unwrap();
+        assert_eq!(engine.baseline_quote_cache[0].by_direction, [None, None]);
+        assert!(engine.invalidate_pool(1).is_err());
     }
 
     #[test]

@@ -102,6 +102,15 @@ hydrated pool in both directions using a common token-B amount:
 5. Across qualifying pools, retain the capacity candidate with the greatest
    absolute token-A profit. No RPC, database call, lock, or pool clone occurs.
 
+The repeated baseline DEX quote is held in a fixed-size cache with exactly one
+entry per `(pool, direction)`. The token-B amount is part of the entry, so a new
+Binance-derived baseline replaces it. Both successful quotes and insufficient-
+liquidity results are cached. Any applied `Swap`, `Mint`, `Burn`, or
+`ModifyLiquidity` event clears both direction entries for only the affected
+pool before the next decision. Capacity-search quotes remain uncached. The
+cache is therefore bounded at two entries per hydrated pool and cannot hide a
+DEX state change or grow with observed Binance prices.
+
 Uniswap LP fees are already included by the CLMM swap math. The configured
 four-basis-point DEX reserve is then applied conservatively: costs round up and
 proceeds round down. All amount, threshold, and sizing math is checked integer
@@ -111,7 +120,8 @@ The service writes one `arbitrage_evaluation` for every calculation and a
 separate `arbitrage_opportunity` for each direction that clears the threshold.
 Each record contains baseline economics, selected pool, signed profit,
 hundredths-of-basis-point edge, capacity, limiter, calculation latency, and
-end-to-end decision latency.
+end-to-end decision latency. `baseline_quote_cache_hits` and
+`baseline_quote_cache_misses` make every recomputation visible in telemetry.
 
 The capacity is deliberately named `market_liquidity_capacity`, not executable
 size. Both market data and eventual execution use Binance Spot, but bookTicker
@@ -175,6 +185,16 @@ conditional binary sizing path. This development-machine end-to-end result is
 above the 100 us acceptance threshold; production Worker Pool histograms and
 profiling must drive the next optimization rather than treating the single-call
 microbenchmark as sufficient evidence.
+
+After adding the bounded baseline cache, a production-shaped local arm64
+benchmark over the five live hydrated pools measured 200.2 us with all ten
+pool-direction entries cold and 1.80 us with all ten entries hot, a 111x
+steady-state speedup. A separate 50-event live Binance Spot + Alchemy run
+recorded 46 fully warm evaluations at p50 10 us, p95 52 us, p99/max 94 us. Four
+events recomputed one or more entries after startup or a pool update; including
+those cold events, the sample was p50 10 us, p95 78 us, and p99/max 2,445 us.
+These are development-machine measurements. The cache must be deployed and
+measured on the Worker Pool before replacing the current production baseline.
 
 Run the allocation-free calculation baseline with:
 
