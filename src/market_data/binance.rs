@@ -16,11 +16,12 @@ const ROTATE_CONNECTION_AFTER: Duration = Duration::from_secs(23 * 60 * 60 + 55 
 
 pub fn spawn_book_ticker_connectors(
     config: &AppConfig,
+    symbols: &[String],
     sender: mpsc::Sender<MarketEvent>,
 ) -> Vec<JoinHandle<()>> {
-    config
-        .normalized_binance_symbols()
-        .into_iter()
+    symbols
+        .iter()
+        .cloned()
         .map(|symbol| {
             let symbol: Arc<str> = Arc::from(symbol);
             let base_url = config.binance_ws_base_url.trim_end_matches('/').to_owned();

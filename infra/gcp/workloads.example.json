@@ -15,7 +15,7 @@
         "ENGINE_ID": "arb-bot-rust-shadow-gcp",
         "GCP_REGION": "asia-southeast1",
         "BINANCE_WS_BASE_URL": "wss://fstream.binance.com/public/ws",
-        "BINANCE_SYMBOLS": "WLDUSDC",
+        "DOMAIN_CONFIG_PATH": "config/strategies/usdc-wld-world-chain.v1.json",
         "MARKET_EVENT_CHANNEL_CAPACITY": "8192",
         "MARKET_DATA_MAX_AGE_MS": "5000",
         "CLICKHOUSE_DATABASE": "arb_bot_prod",

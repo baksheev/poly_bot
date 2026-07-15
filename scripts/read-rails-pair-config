@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+binance_symbol="${1:-WLDUSDC}"
+
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+
+if [[ ! "${binance_symbol}" =~ ^[A-Z0-9]+$ ]]; then
+  echo "invalid Binance symbol: ${binance_symbol}" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${ARB_BOT_DATABASE_URL:?ARB_BOT_DATABASE_URL is required}"
+
+psql "${ARB_BOT_DATABASE_URL}" \
+  -X \
+  --no-psqlrc \
+  -v ON_ERROR_STOP=1 \
+  --set="binance_symbol=${binance_symbol}" \
+  -qAt \
+  -f "${repo_root}/scripts/sql/rails_pair_config.sql"

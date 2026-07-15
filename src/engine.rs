@@ -4,6 +4,7 @@ use serde_json::json;
 
 use crate::{
     config::AppConfig,
+    domain::config::LoadedDomainConfig,
     market_data::MarketEvent,
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
@@ -11,18 +12,24 @@ use crate::{
 
 pub struct TradingEngine {
     config: AppConfig,
+    domain_config: Arc<LoadedDomainConfig>,
     state: RuntimeState,
     telemetry: TelemetryHandle,
 }
 
 impl TradingEngine {
-    pub fn new(config: AppConfig, telemetry: TelemetryHandle) -> Self {
-        let symbols = config
-            .normalized_binance_symbols()
+    pub fn new(
+        config: AppConfig,
+        domain_config: Arc<LoadedDomainConfig>,
+        telemetry: TelemetryHandle,
+    ) -> Self {
+        let symbols = domain_config
+            .binance_symbols()
             .into_iter()
             .map(Arc::<str>::from);
         Self {
             config,
+            domain_config,
             state: RuntimeState::new(symbols),
             telemetry,
         }
@@ -36,7 +43,11 @@ impl TradingEngine {
                 "service": self.config.service_name,
                 "gcp_project_id": self.config.gcp_project_id,
                 "gcp_region": self.config.gcp_region,
-                "binance_symbols": self.config.normalized_binance_symbols(),
+                "domain_snapshot_id": self.domain_config.snapshot().snapshot_id,
+                "domain_config_sha256": self.domain_config.fingerprint_sha256(),
+                "domain_config_path": self.domain_config.path().display().to_string(),
+                "pair_ids": self.domain_config.pair_ids(),
+                "binance_symbols": self.domain_config.binance_symbols(),
             }),
         );
     }

@@ -95,6 +95,11 @@ Definition of done:
 - config has a stable hash/version included in every decision;
 - secrets and credential-bearing RPC URLs are not stored in the snapshot.
 
+Implementation status: the v1 World Chain `USDC-WLD` snapshot, strict loader,
+SHA-256 identity, production whitelist query, and Binance subscription wiring
+are complete. Account/wallet/rebalance fields stay out until their owning
+components are implemented.
+
 ### 2. Telemetry and deterministic replay
 
 Define normalized envelopes for input, state transition, decision, command,

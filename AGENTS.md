@@ -16,6 +16,11 @@ a time.
   clients. Do not construct clients inside per-tick or per-order code.
 - Preserve a single owner for latency-sensitive mutable state unless profiling
   proves another topology is better.
+- Load strategy/chain/token/instrument configuration once from a versioned,
+  validated artifact. Rails Postgres is an operator-only export source and must
+  never be a runtime dependency or a GCP Worker Pool secret.
+- Derive Binance subscriptions from the domain artifact; do not create a second
+  symbol allowlist in environment variables.
 - Use fixed-point integer or validated decimal representations for financial
   values. Do not use `f64` for strategy or execution math.
 - The production GCP region is `asia-southeast1` (Singapore). US regions are
@@ -49,6 +54,8 @@ a time.
 - Never commit or log private keys, API secrets, signing payloads, raw
   credential-bearing RPC URLs, or authenticated Binance requests.
 - Read-only clone stages must not receive trading or signing credentials.
+- `ARB_BOT_DATABASE_URL` is local migration tooling only. Never log it, commit
+  it, upload it to Secret Manager, or expose it to the production Rust service.
 - New live entries remain disabled until configuration, market data, wallet
   state, Binance state, reservations/nonces, and risk controls are hydrated and
   healthy.

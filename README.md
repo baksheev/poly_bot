@@ -62,8 +62,10 @@ is not being implemented. The evidence is retained in
 The first clone component is implemented in read-only shadow mode: persistent
 Binance USD-M Futures `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
 parsing, reconnect generations, freshness/readiness state, a single in-memory
-state owner, and non-blocking ClickHouse telemetry. It has no private Binance,
-wallet, signing, or trading credentials and cannot place orders.
+state owner, and non-blocking ClickHouse telemetry. Startup now loads a
+fail-closed, versioned snapshot of the active production World Chain
+`USDC-WLD` configuration and reports its SHA-256 fingerprint. It has no private
+Binance, wallet, signing, or trading credentials and cannot place orders.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:
@@ -91,6 +93,15 @@ telemetry table in a configured ClickHouse instance:
 cargo run -- migrate
 ```
 
+The committed domain snapshot is documented in
+[versioned domain configuration](docs/domain-configuration.md). A local,
+read-only comparison with the current Rails production pair is available when
+`ARB_BOT_DATABASE_URL` is set in ignored `.env.production`:
+
+```bash
+scripts/read-rails-pair-config WLDUSDC
+```
+
 Quality gate:
 
 ```bash
@@ -103,12 +114,12 @@ project, or ADC state. See [local GCP authentication](docs/gcp-local-auth.md).
 
 ## Planned implementation slices
 
-1. Validate the read-only Binance component against live `WLDUSDC` traffic and
-   capture comparable Rails/Rust fixtures.
-2. Export and validate a versioned non-secret configuration snapshot for the
-   current `USDC-WLD` strategy.
-3. Implement reusable Alchemy + `Multicall3` Uniswap V3/V4 quote adapters.
-4. Port both opportunity calculations as pure fixed-point functions and run
+1. Implement reusable Alchemy + `Multicall3` Uniswap V3/V4 quote adapters from
+   the committed World Chain snapshot.
+2. Derive the token-B quote amount continuously from the in-memory Binance ask
+   and issue both DEX quote directions in one RPC call.
+3. Port both `profit_token_a` opportunity calculations as pure fixed-point
+   functions and run
    synchronized shadow comparisons.
-5. Add isolated account/wallet hydration, then paper execution and forced
+4. Add isolated account/wallet hydration, then paper execution and forced
    recovery tests before any live credentials are provisioned.

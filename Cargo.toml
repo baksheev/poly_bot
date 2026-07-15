@@ -15,6 +15,7 @@ futures-util = { version = "0.3.31", default-features = false, features = ["sink
 rust_decimal = "1.42.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = { version = "0.11.0", default-features = false }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"

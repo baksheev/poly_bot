@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, ensure};
 use clap::{Parser, Subcommand};
 
@@ -44,11 +46,10 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        env = "BINANCE_SYMBOLS",
-        value_delimiter = ',',
-        default_value = "WLDUSDC"
+        env = "DOMAIN_CONFIG_PATH",
+        default_value = "config/strategies/usdc-wld-world-chain.v1.json"
     )]
-    pub binance_symbols: Vec<String>,
+    pub domain_config_path: PathBuf,
 
     #[arg(long, env = "MARKET_EVENT_CHANNEL_CAPACITY", default_value_t = 8192)]
     pub market_event_channel_capacity: usize,
@@ -112,12 +113,9 @@ impl AppConfig {
             &["ws", "wss"],
         )?;
         ensure!(
-            !self.binance_symbols.is_empty(),
-            "BINANCE_SYMBOLS must contain at least one symbol"
+            !self.domain_config_path.as_os_str().is_empty(),
+            "DOMAIN_CONFIG_PATH is empty"
         );
-        for symbol in &self.binance_symbols {
-            validate_binance_symbol(symbol)?;
-        }
 
         if self.clickhouse_enabled() {
             validate_url("CLICKHOUSE_URL", &self.clickhouse_url, &["http", "https"])?;
@@ -130,30 +128,10 @@ impl AppConfig {
     pub fn clickhouse_enabled(&self) -> bool {
         !self.clickhouse_url.trim().is_empty()
     }
-
-    pub fn normalized_binance_symbols(&self) -> Vec<String> {
-        self.binance_symbols
-            .iter()
-            .map(|symbol| symbol.trim().to_ascii_uppercase())
-            .collect()
-    }
 }
 
 fn validate_non_empty(name: &str, value: &str) -> anyhow::Result<()> {
     ensure!(!value.trim().is_empty(), "{name} is empty");
-    Ok(())
-}
-
-fn validate_binance_symbol(value: &str) -> anyhow::Result<()> {
-    let symbol = value.trim();
-    ensure!(
-        !symbol.is_empty(),
-        "BINANCE_SYMBOLS contains an empty symbol"
-    );
-    ensure!(
-        symbol.len() <= 32 && symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()),
-        "invalid Binance symbol {symbol}"
-    );
     Ok(())
 }
 
@@ -202,7 +180,7 @@ mod tests {
             gcp_project_id: "poly-bot-502515".into(),
             gcp_region: "asia-southeast1".into(),
             binance_ws_base_url: "wss://fstream.binance.com/public/ws".into(),
-            binance_symbols: vec!["wldusdc".into()],
+            domain_config_path: "config/strategies/usdc-wld-world-chain.v1.json".into(),
             market_event_channel_capacity: 8192,
             market_data_max_age_ms: 5_000,
             clickhouse_url: String::new(),
@@ -221,11 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn symbols_are_normalized_once_at_startup() {
-        assert_eq!(config().normalized_binance_symbols(), ["WLDUSDC"]);
-    }
-
-    #[test]
     fn rejects_zero_sized_market_channel() {
         let mut config = config();
         config.market_event_channel_capacity = 0;
@@ -233,9 +206,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_symbol() {
+    fn rejects_empty_domain_config_path() {
         let mut config = config();
-        config.binance_symbols = vec!["WLD/USDC".into()];
+        config.domain_config_path = "".into();
         assert!(config.validate().is_err());
     }
 
