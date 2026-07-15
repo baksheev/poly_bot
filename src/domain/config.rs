@@ -209,14 +209,18 @@ pub struct ChainConfig {
     pub name: String,
     pub chain_id: u64,
     pub rpc_url_env: String,
+    pub ws_url_env: String,
     pub binance_network_name: String,
     pub gas_symbol: String,
     pub gas_decimals: u8,
     pub multicall3_address: String,
+    pub uniswap_v3_factory_address: Option<String>,
     pub uniswap_v3_quoter_address: Option<String>,
     pub uniswap_v3_router_address: Option<String>,
     pub uniswap_v4_quoter_address: Option<String>,
     pub uniswap_v4_router_address: Option<String>,
+    pub uniswap_v4_pool_manager_address: Option<String>,
+    pub uniswap_v4_state_view_address: Option<String>,
 }
 
 impl ChainConfig {
@@ -224,10 +228,15 @@ impl ChainConfig {
         validate_non_empty("chain.name", &self.name)?;
         ensure!(self.chain_id > 0, "chain.chain_id must be positive");
         validate_env_name("chain.rpc_url_env", &self.rpc_url_env)?;
+        validate_env_name("chain.ws_url_env", &self.ws_url_env)?;
         validate_symbol("chain.binance_network_name", &self.binance_network_name)?;
         validate_symbol("chain.gas_symbol", &self.gas_symbol)?;
         ensure!(self.gas_decimals > 0, "chain.gas_decimals must be positive");
         validate_evm_address("chain.multicall3_address", &self.multicall3_address)?;
+        validate_optional_address(
+            "chain.uniswap_v3_factory_address",
+            self.uniswap_v3_factory_address.as_deref(),
+        )?;
         validate_optional_address(
             "chain.uniswap_v3_quoter_address",
             self.uniswap_v3_quoter_address.as_deref(),
@@ -243,6 +252,14 @@ impl ChainConfig {
         validate_optional_address(
             "chain.uniswap_v4_router_address",
             self.uniswap_v4_router_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.uniswap_v4_pool_manager_address",
+            self.uniswap_v4_pool_manager_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.uniswap_v4_state_view_address",
+            self.uniswap_v4_state_view_address.as_deref(),
         )?;
         Ok(())
     }
@@ -417,8 +434,8 @@ impl DexConfig {
 
         if unique.contains(&DexProvider::UniswapV3) {
             ensure!(
-                chain.uniswap_v3_quoter_address.is_some(),
-                "Uniswap V3 requires chain.uniswap_v3_quoter_address"
+                chain.uniswap_v3_factory_address.is_some(),
+                "Uniswap V3 requires chain.uniswap_v3_factory_address"
             );
             self.uniswap_v3
                 .as_ref()
@@ -433,8 +450,12 @@ impl DexConfig {
 
         if unique.contains(&DexProvider::UniswapV4) {
             ensure!(
-                chain.uniswap_v4_quoter_address.is_some(),
-                "Uniswap V4 requires chain.uniswap_v4_quoter_address"
+                chain.uniswap_v4_pool_manager_address.is_some(),
+                "Uniswap V4 requires chain.uniswap_v4_pool_manager_address"
+            );
+            ensure!(
+                chain.uniswap_v4_state_view_address.is_some(),
+                "Uniswap V4 requires chain.uniswap_v4_state_view_address"
             );
             self.uniswap_v4
                 .as_ref()
@@ -659,7 +680,7 @@ mod tests {
         assert_eq!(first.fingerprint_sha256(), second.fingerprint_sha256());
         assert_eq!(
             first.fingerprint_sha256(),
-            "8cd217065c822700e1b9158e2d48104cba54b5bdb744fc8bafe9eeab94e01e14"
+            "1285588f5fd53bf8a4408180bddd6192bbe543a0ba7e30c07164aff26be65443"
         );
     }
 

@@ -12,8 +12,8 @@ work to one another.
 
 ```text
 Binance WebSocket ─────────┐
-Alchemy RPC / Multicall ───┼─> one Rust process ─> in-memory state
-chain subscriptions ───────┘          │                 │
+Alchemy pool-log WSS ──────┼─> one Rust process ─> in-memory state
+Alchemy HTTP recovery ─────┘          │                 │
                                       │                 ├─> opportunity engine
                                       │                 ├─> risk / inventory
                                       │                 └─> execution (later)
@@ -37,7 +37,7 @@ The first useful chain of components reproduces the current `USDC-WLD` /
 `WLDUSDC` loop in read-only mode:
 
 1. Binance `bookTicker` WebSocket.
-2. Uniswap V3/V4 quotes through Alchemy and `Multicall3`.
+2. In-memory Uniswap V3/V4 pool mirrors and local exact-input quotes.
 3. Both arbitrage calculations in memory using fixed-point values.
 4. ClickHouse capture and deterministic replay.
 
@@ -65,7 +65,10 @@ parsing, reconnect generations, freshness/readiness state, a single in-memory
 state owner, and non-blocking ClickHouse telemetry. Startup now loads a
 fail-closed, versioned snapshot of the active production World Chain
 `USDC-WLD` configuration and reports its SHA-256 fingerprint. It has no private
-Binance, wallet, signing, or trading credentials and cannot place orders.
+Binance, wallet, signing, or trading credentials and cannot place orders. The
+first DEX slice now includes the shared hookless V3/V4 concentrated-liquidity
+calculation core, including tick bitmap traversal and initialized-tick crossing;
+chain hydration and event ingestion are still pending.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:
@@ -114,12 +117,17 @@ project, or ADC state. See [local GCP authentication](docs/gcp-local-auth.md).
 
 ## Planned implementation slices
 
-1. Implement reusable Alchemy + `Multicall3` Uniswap V3/V4 quote adapters from
-   the committed World Chain snapshot.
-2. Derive the token-B quote amount continuously from the in-memory Binance ask
-   and issue both DEX quote directions in one RPC call.
-3. Port both `profit_token_a` opportunity calculations as pure fixed-point
+1. Hydrate V3/V4 pool heads, bitmap words, and initialized ticks at one pinned
+   World Chain block, then maintain them from Alchemy WSS logs.
+2. Prove local quote parity against V3/V4 Quoter calls sampled outside the hot
+   path and add release-mode latency/allocation benchmarks.
+3. Derive token-B sizing from the in-memory Binance ask and calculate both DEX
+   directions locally on every accepted market update.
+4. Port both `profit_token_a` opportunity calculations as pure fixed-point
    functions and run
    synchronized shadow comparisons.
-4. Add isolated account/wallet hydration, then paper execution and forced
+5. Add isolated account/wallet hydration, then paper execution and forced
    recovery tests before any live credentials are provisioned.
+
+See [the local DEX quoting design](docs/low-latency-dex-quoting.md) for the
+hot-path contract, hydration boundary, reorg handling, and latency budget.

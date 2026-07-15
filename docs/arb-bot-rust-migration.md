@@ -57,7 +57,7 @@ runtime.
 
 ```text
 Binance public/private WS ──┐
-Alchemy RPC/subscriptions ──┼─> adapters ─> single state owner
+Alchemy WSS/HTTP recovery ──┼─> adapters ─> single state owner
 Binance REST control API ───┘                    │
                                                 ├─> quotes / opportunity
                                                 ├─> risk / reservations
@@ -129,20 +129,24 @@ Definition of done:
 
 ### 4. DEX quote adapters
 
-Clone `Dex::UniswapPoolBatchQuoteService` first: one reusable Alchemy client,
-one `Multicall3.tryAggregate` request for V3/V4 candidates in both directions,
-the same calldata, candidate decoding, and best-output selection.
+Clone the candidate set and best-output behavior of
+`Dex::UniswapPoolBatchQuoteService`, but remove RPC from the decision path.
+Hydrate V3/V4 concentrated-liquidity state at one pinned block, maintain it
+from ordered Alchemy WSS logs, and calculate every candidate locally in both
+directions. Reusable HTTP RPC and Quoter calls are recovery and sampled parity
+tools only.
 
 Add 0x as a separate provider component after V3/V4 parity. Provider failures
 remain isolated and explicit.
 
 Definition of done:
 
-- calldata and decoding match golden Rails fixtures byte-for-byte;
-- token base units, block identity, gas estimate, route metadata, and selected
-  candidate are recorded;
-- no-liquidity and partial-call failures are deterministic;
-- HTTP/RPC clients and ABI metadata are reused, not rebuilt per quote.
+- local integer output matches V3/V4 Quoter results at the same block and input;
+- token base units, block identity, pool-state fingerprint, route metadata, and
+  selected candidate are recorded;
+- missing ticks, gaps, reorgs, and no-liquidity cases fail closed;
+- no network call, lock, or allocation occurs in the steady-state quote loop;
+- HTTP/WSS clients and ABI metadata are reused, not rebuilt per event.
 
 ### 5. Opportunity engine
 

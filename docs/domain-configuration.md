@@ -23,7 +23,8 @@ attached to the Worker Pool.
 
 The v1 snapshot records:
 
-- World Chain `chain_id=480` and public contract addresses;
+- World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
+  routers, and other public contract addresses;
 - USDC as token A and WLD as token B, with base-unit decimals;
 - Binance `WLDUSDC`, exact step/tick size, USD-M Futures market data, and Spot
   execution parity with Rails;
@@ -36,7 +37,7 @@ The v1 snapshot records:
 
 Wallets, balances, bridge state, private keys, RPC URLs, and execution
 credentials are deliberately absent. The artifact contains only an environment
-variable name for the future Alchemy endpoint.
+variable names for the future Alchemy HTTP and WebSocket endpoints.
 
 ## Fail-closed validation
 
