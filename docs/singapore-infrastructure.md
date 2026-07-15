@@ -67,16 +67,21 @@ and dedicated runtime service account when absent, synchronizes non-trading
 secrets, builds an image tagged with the git SHA, and deploys one read-only
 Worker Pool instance. It refuses to deploy a dirty worktree.
 
-## Initial production baseline
+## Current production baseline
 
-The first verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
-`arb-bot-rust-shadow-00001-jm4`, from source revision `489713cbd931`.
+The verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
+`arb-bot-rust-shadow-00002-k4n`, from source revision `29aa3860a3b3` and image
+digest `sha256:db472da2deb93cb2d81d7c9a78487efcb292f768d6e73701f91df600e6564bfe`.
 
 - Cloud Run reports the revision `Ready` with one manually scaled instance,
   8 vCPU, 16 GiB RAM, and CPU idle disabled.
+- The process hydrated five configured Uniswap pools at World Chain block
+  `32405407`, completed its race-free backfill through block `32405408`, and
+  established filtered Alchemy WebSocket subscriptions.
 - The process connected to Binance `WLDUSDC` bookTicker from Singapore and the
   engine transitioned from `Starting` to `Ready`.
-- ClickHouse received `runtime_starting`, `binance_feed_connected`,
-  `binance_book_ticker`, and `runtime_phase_changed` telemetry.
+- During the first production verification window ClickHouse received 40
+  `world_chain_head` records, four applied `dex_pool_event` records, and 788
+  `binance_book_ticker` records from the new revision.
 - No Worker Pool warning or error logs appeared during the startup check.
 - No wallet, signing, or Binance trading credentials are attached.
