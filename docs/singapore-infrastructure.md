@@ -1,6 +1,6 @@
 # Singapore deployment and ClickHouse cutover
 
-Status: production deployment configured; read-only worker pending verification
+Status: read-only production worker deployed and verified
 Last reviewed: 2026-07-15
 
 ## Decision
@@ -66,3 +66,17 @@ The script enables the required APIs, creates the Artifact Registry repository
 and dedicated runtime service account when absent, synchronizes non-trading
 secrets, builds an image tagged with the git SHA, and deploys one read-only
 Worker Pool instance. It refuses to deploy a dirty worktree.
+
+## Initial production baseline
+
+The first verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
+`arb-bot-rust-shadow-00001-jm4`, from source revision `489713cbd931`.
+
+- Cloud Run reports the revision `Ready` with one manually scaled instance,
+  8 vCPU, 16 GiB RAM, and CPU idle disabled.
+- The process connected to Binance `WLDUSDC` bookTicker from Singapore and the
+  engine transitioned from `Starting` to `Ready`.
+- ClickHouse received `runtime_starting`, `binance_feed_connected`,
+  `binance_book_ticker`, and `runtime_phase_changed` telemetry.
+- No Worker Pool warning or error logs appeared during the startup check.
+- No wallet, signing, or Binance trading credentials are attached.
