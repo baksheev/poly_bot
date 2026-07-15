@@ -70,26 +70,36 @@ Worker Pool instance. It refuses to deploy a dirty worktree.
 ## Current production baseline
 
 The verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
-`arb-bot-rust-shadow-00003-tjp`, from source revision `dc003db54889` and image
-digest `sha256:bf2683b29c77f8f1ab3fc5892c6db09d838352a5b03e3a0544f4cc2b196cc347`.
+`arb-bot-rust-shadow-00004-tvb`, from source revision `c798349c8c8f` and image
+digest `sha256:5023049d0c4340f7eff2c2b06bdb12c159fb5eeee63cd7a8405e510e4e242d67`.
 
 - Cloud Run reports the revision `Ready` with one manually scaled instance,
   8 vCPU, 16 GiB RAM, and CPU idle disabled.
 - The process hydrated five configured Uniswap pools at World Chain block
-  `32406459`, completed its race-free backfill, and
+  `32407281`, completed its race-free backfill, and
   established filtered Alchemy WebSocket subscriptions.
 - The process connected to the Binance Spot raw stream
   `wss://stream.binance.com:9443/ws/wldusdc@bookTicker`; both the market-data
   and execution products in the active domain snapshot are `spot`.
-- In the fixed first production window from `2026-07-15 20:49:18 UTC` through
-  `20:52:00 UTC`, ClickHouse received 288 accepted Spot bookTicker records and
-  exactly 288 arbitrage evaluations. No candidate met the 20 bps threshold.
-- In that window in-memory opportunity calculation latency was 453 us p50,
-  560 us p95, 911 us p99, and 1,715 us maximum. This measures the complete
-  two-direction, five-pool evaluation including capacity search, not network
-  latency or telemetry insertion.
-- The latest sample in the verification window evaluated a 48.1 WLD baseline:
-  buying on the DEX and selling on Binance Spot was -21.10 bps, while buying on
-  Binance Spot and selling on the DEX was -53.64 bps.
+- Before the cache, the fixed production window from `2026-07-15 20:49:18 UTC`
+  through `20:52:00 UTC` contained 288 evaluations. In-memory opportunity
+  calculation latency was 453 us p50, 560 us p95, 911 us p99, and 1,715 us
+  maximum.
+- After the cache, the fixed window from `2026-07-15 21:16:50 UTC` through
+  `21:21:30 UTC` contained 666 evaluations. Overall calculation latency was
+  12 us p50, 25 us p95, 630 us p99, and 1,106 us maximum: 37.8x, 22.4x, and
+  1.45x faster at p50, p95, and p99 respectively.
+- Of those evaluations, 628 were fully warm: 11 us p50, 19 us p95, 51 us p99,
+  and 94 us maximum. Compared with the pre-cache distribution, the warm path
+  is 41.2x, 29.5x, and 17.9x faster at p50, p95, and p99.
+- The remaining 38 evaluations followed an applied DEX event and recomputed at
+  least one invalidated entry. They measured 25 us p50, 792 us p95, 1,106 us
+  p99/max. Across all 6,550 cache lookups, 6,382 hit and 168 missed (97.4% hit
+  rate). These visible, state-driven recomputations explain the overall p99;
+  capacity-search quotes remain deliberately uncached.
+- This calculation timer measures the complete two-direction, five-pool
+  evaluation including conditional capacity search, but excludes network
+  latency and telemetry insertion. Overall decision latency in the post-cache
+  window was 100 us p50, 235 us p95, and 715 us p99.
 - No Worker Pool warning or error logs appeared during the startup check.
 - No wallet, signing, or Binance trading credentials are attached.

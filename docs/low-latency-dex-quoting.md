@@ -193,8 +193,17 @@ steady-state speedup. A separate 50-event live Binance Spot + Alchemy run
 recorded 46 fully warm evaluations at p50 10 us, p95 52 us, p99/max 94 us. Four
 events recomputed one or more entries after startup or a pool update; including
 those cold events, the sample was p50 10 us, p95 78 us, and p99/max 2,445 us.
-These are development-machine measurements. The cache must be deployed and
-measured on the Worker Pool before replacing the current production baseline.
+These are development-machine measurements and did not replace the production
+baseline until the Worker Pool validation below.
+
+The Singapore Worker Pool validation used a fixed 666-evaluation window after
+deploying source `c798349c8c8f`. Overall calculation latency fell from the
+pre-cache 453/560/911 us p50/p95/p99 to 12/25/630 us. The 628 fully warm
+evaluations measured 11/19/51 us and 94 us maximum. The 38 evaluations with a
+state-driven cache miss measured 25/792/1,106 us; these recomputations now
+account for the overall p99. The observed cache hit rate was 97.4%. The warm
+p99 is much better but still above the 25 us all-candidate target, so the
+performance contract remains an active target rather than being relaxed.
 
 Run the allocation-free calculation baseline with:
 
