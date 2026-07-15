@@ -43,6 +43,36 @@ pub struct LocalQuote {
     pub initialized_ticks_crossed: u32,
 }
 
+/// A version-local, immutable representation of one CLMM quote direction.
+///
+/// Building the curve performs the same word-boundary traversal as the core
+/// swap loop. Quoting then needs only a binary search and at most one
+/// `compute_swap_step`, while preserving the boundary-by-boundary rounding of
+/// the on-chain algorithm.
+#[derive(Debug, Clone)]
+pub struct PreparedQuoteCurve {
+    kind: PreparedQuoteKind,
+    fee_pips: u32,
+    segments: Vec<PreparedQuoteSegment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedQuoteKind {
+    ExactInput,
+    ExactOutput,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedQuoteSegment {
+    specified_start: U256,
+    result_start: U256,
+    specified_end: U256,
+    result_end: U256,
+    sqrt_price_start_x96: U256,
+    sqrt_price_target_x96: U256,
+    liquidity: u128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InsufficientLiquidity;
 
@@ -313,6 +343,129 @@ impl ClmmPool {
         Ok(amount_in)
     }
 
+    /// Precomputes the exact-input path for one swap direction.
+    pub fn prepare_exact_input_curve(
+        &self,
+        zero_for_one: bool,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve(zero_for_one, PreparedQuoteKind::ExactInput)
+    }
+
+    /// Precomputes the exact-output path for one swap direction.
+    pub fn prepare_exact_output_curve(
+        &self,
+        zero_for_one: bool,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve(zero_for_one, PreparedQuoteKind::ExactOutput)
+    }
+
+    fn prepare_quote_curve(
+        &self,
+        zero_for_one: bool,
+        kind: PreparedQuoteKind,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        let sqrt_price_limit_x96 = if zero_for_one {
+            MIN_SQRT_RATIO + U256::ONE
+        } else {
+            MAX_SQRT_RATIO - U256::ONE
+        };
+        let maximum_specified = (U256::ONE << 255) - U256::ONE;
+        let specified_delta = match kind {
+            PreparedQuoteKind::ExactInput => I256::from_raw(maximum_specified),
+            PreparedQuoteKind::ExactOutput => -I256::from_raw(maximum_specified),
+        };
+        let mut segments = Vec::new();
+        let mut specified_total = U256::ZERO;
+        let mut result_total = U256::ZERO;
+        let mut sqrt_price_x96 = self.sqrt_price_x96;
+        let mut tick = self.tick;
+        let mut liquidity = self.liquidity;
+
+        while sqrt_price_x96 != sqrt_price_limit_x96 && liquidity != 0 {
+            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
+                &self.tick_bitmap,
+                tick,
+                self.tick_spacing,
+                zero_for_one,
+            )
+            .context("failed to find next initialized tick while preparing curve")?;
+            tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
+            let sqrt_price_next_x96 =
+                get_sqrt_ratio_at_tick(tick_next).context("failed to price prepared tick")?;
+            let target = if zero_for_one {
+                sqrt_price_next_x96.max(sqrt_price_limit_x96)
+            } else {
+                sqrt_price_next_x96.min(sqrt_price_limit_x96)
+            };
+            let (sqrt_after, step_in, step_out, fee_amount) = compute_swap_step(
+                sqrt_price_x96,
+                target,
+                liquidity,
+                specified_delta,
+                self.fee_pips,
+            )
+            .context("failed to build prepared swap segment")?;
+            let input_with_fee = step_in
+                .checked_add(fee_amount)
+                .context("prepared swap input overflow")?;
+            let (specified_step, result_step) = match kind {
+                PreparedQuoteKind::ExactInput => (input_with_fee, step_out),
+                PreparedQuoteKind::ExactOutput => (step_out, input_with_fee),
+            };
+            let specified_end = specified_total
+                .checked_add(specified_step)
+                .context("prepared specified amount overflow")?;
+            let result_end = result_total
+                .checked_add(result_step)
+                .context("prepared result amount overflow")?;
+            if !specified_step.is_zero() {
+                segments.push(PreparedQuoteSegment {
+                    specified_start: specified_total,
+                    result_start: result_total,
+                    specified_end,
+                    result_end,
+                    sqrt_price_start_x96: sqrt_price_x96,
+                    sqrt_price_target_x96: target,
+                    liquidity,
+                });
+            }
+            specified_total = specified_end;
+            result_total = result_end;
+            sqrt_price_x96 = sqrt_after;
+
+            if sqrt_after != sqrt_price_next_x96 {
+                break;
+            }
+            if initialized {
+                let tick_state = self
+                    .ticks
+                    .get(&tick_next)
+                    .with_context(|| format!("bitmap references missing tick {tick_next}"))?;
+                let liquidity_net = if zero_for_one {
+                    tick_state
+                        .net
+                        .checked_neg()
+                        .context("liquidity net overflow")?
+                } else {
+                    tick_state.net
+                };
+                liquidity = add_delta(liquidity, liquidity_net)
+                    .context("failed to cross prepared initialized tick")?;
+            }
+            tick = if zero_for_one {
+                tick_next.saturating_sub(1)
+            } else {
+                tick_next
+            };
+        }
+
+        Ok(PreparedQuoteCurve {
+            kind,
+            fee_pips: self.fee_pips,
+            segments,
+        })
+    }
+
     #[inline]
     fn quote_exact_in_impl<const INCLUDE_AFTER_STATE: bool>(
         &self,
@@ -413,6 +566,67 @@ impl ClmmPool {
             liquidity_after: liquidity,
             initialized_ticks_crossed,
         })
+    }
+}
+
+impl PreparedQuoteCurve {
+    /// Returns the exact result for `specified_amount`, or an immediate
+    /// insufficient-liquidity result when it exceeds the prepared curve.
+    #[inline]
+    pub fn quote(&self, specified_amount: U256) -> anyhow::Result<U256> {
+        ensure!(
+            !specified_amount.is_zero(),
+            "specified amount must be positive"
+        );
+        ensure!(
+            specified_amount < (U256::ONE << 255),
+            "specified amount exceeds int256"
+        );
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.specified_end < specified_amount);
+        let Some(segment) = self.segments.get(segment_index) else {
+            return Err(InsufficientLiquidity.into());
+        };
+        if specified_amount == segment.specified_end {
+            return Ok(segment.result_end);
+        }
+
+        let remaining = specified_amount
+            .checked_sub(segment.specified_start)
+            .context("prepared quote amount precedes segment")?;
+        let amount_remaining = match self.kind {
+            PreparedQuoteKind::ExactInput => I256::from_raw(remaining),
+            PreparedQuoteKind::ExactOutput => -I256::from_raw(remaining),
+        };
+        let (_, step_in, step_out, fee_amount) = compute_swap_step(
+            segment.sqrt_price_start_x96,
+            segment.sqrt_price_target_x96,
+            segment.liquidity,
+            amount_remaining,
+            self.fee_pips,
+        )
+        .context("failed to quote prepared swap segment")?;
+        let step_result = match self.kind {
+            PreparedQuoteKind::ExactInput => step_out,
+            PreparedQuoteKind::ExactOutput => step_in
+                .checked_add(fee_amount)
+                .context("prepared exact-output input overflow")?,
+        };
+        segment
+            .result_start
+            .checked_add(step_result)
+            .context("prepared quote result overflow")
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn specified_capacity(&self) -> U256 {
+        self.segments
+            .last()
+            .map_or(U256::ZERO, |segment| segment.specified_end)
     }
 }
 
@@ -528,6 +742,104 @@ mod tests {
                 assert!(previous < desired);
             }
         }
+    }
+
+    #[test]
+    fn prepared_curves_match_iterative_quotes_and_reject_above_capacity() {
+        let mut pool = ClmmPool::new(
+            3_000,
+            60,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        pool.set_tick(-120, 1_000_000_000, 1_000_000_000).unwrap();
+        pool.set_tick(120, 1_000_000_000, -1_000_000_000).unwrap();
+
+        for zero_for_one in [true, false] {
+            let exact_in = pool.prepare_exact_input_curve(zero_for_one).unwrap();
+            let exact_out = pool.prepare_exact_output_curve(zero_for_one).unwrap();
+            assert!(!exact_in.specified_capacity().is_zero());
+            assert!(!exact_out.specified_capacity().is_zero());
+            assert!(exact_in.segment_count() >= 1);
+            assert!(exact_out.segment_count() >= 1);
+
+            for amount in [U256::ONE, U256::from(1_000_u64), U256::from(10_000_u64)] {
+                assert_eq!(
+                    exact_in.quote(amount).unwrap(),
+                    pool.quote_exact_in_amount_out(zero_for_one, amount)
+                        .unwrap()
+                );
+                assert_eq!(
+                    exact_out.quote(amount).unwrap(),
+                    pool.quote_exact_out_amount_in(zero_for_one, amount)
+                        .unwrap()
+                );
+            }
+
+            assert!(
+                exact_in
+                    .quote(exact_in.specified_capacity() + U256::ONE)
+                    .is_err()
+            );
+            assert!(
+                exact_out
+                    .quote(exact_out.specified_capacity() + U256::ONE)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_curves_preserve_rounding_across_every_boundary() {
+        let mut pool = ClmmPool::new(
+            3_000,
+            60,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        pool.set_tick(-120, 500_000_000, 500_000_000).unwrap();
+        pool.set_tick(-60, 500_000_000, 500_000_000).unwrap();
+        pool.set_tick(120, 1_000_000_000, -1_000_000_000).unwrap();
+
+        for zero_for_one in [true, false] {
+            let exact_in = pool.prepare_exact_input_curve(zero_for_one).unwrap();
+            for segment in &exact_in.segments {
+                for amount in boundary_samples(segment.specified_start, segment.specified_end) {
+                    assert_eq!(
+                        exact_in.quote(amount).unwrap(),
+                        pool.quote_exact_in_amount_out(zero_for_one, amount)
+                            .unwrap()
+                    );
+                }
+            }
+
+            let exact_out = pool.prepare_exact_output_curve(zero_for_one).unwrap();
+            for segment in &exact_out.segments {
+                for amount in boundary_samples(segment.specified_start, segment.specified_end) {
+                    assert_eq!(
+                        exact_out.quote(amount).unwrap(),
+                        pool.quote_exact_out_amount_in(zero_for_one, amount)
+                            .unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    fn boundary_samples(start: U256, end: U256) -> Vec<U256> {
+        let mut samples = Vec::with_capacity(3);
+        if start < end {
+            samples.push(start + U256::ONE);
+            if end - start > U256::ONE {
+                samples.push(end - U256::ONE);
+            }
+            samples.push(end);
+        }
+        samples
     }
 
     #[test]

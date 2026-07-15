@@ -9,7 +9,7 @@ use crate::{
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{
         CapacityEvaluation, DirectionEvaluation, OpportunityEngine, PairEvaluation, PairRuntime,
-        TradeEvaluation, format_base_units,
+        PreparedPoolBuildRequest, PreparedPoolBuildResult, TradeEvaluation, format_base_units,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
@@ -66,11 +66,16 @@ impl TradingEngine {
         );
     }
 
-    pub fn on_dex_event(&mut self, event: DexStreamEvent) -> anyhow::Result<()> {
-        match event {
+    pub fn on_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+    ) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
+        let request = match event {
             DexStreamEvent::Log { log, received_at } => {
                 if let LogApplyResult::Applied { pool_index, kind } = self.dex.apply_log(&log)? {
-                    self.opportunities.invalidate_pool(pool_index)?;
+                    let request = self
+                        .opportunities
+                        .request_pool_refresh(pool_index, &self.dex)?;
                     let pool = self.dex.pool(pool_index)?;
                     self.telemetry.emit(
                         "dex_pool_event",
@@ -83,8 +88,13 @@ impl TradingEngine {
                             "transaction_index": log.transaction_index,
                             "log_index": log.log_index,
                             "engine_queue_age_us": received_at.elapsed().as_micros(),
+                            "prepared_generation": request.generation(),
+                            "prepared_state": "building",
                         }),
                     );
+                    Some(request)
+                } else {
+                    None
                 }
             }
             DexStreamEvent::Head { head, received_at } => {
@@ -98,9 +108,44 @@ impl TradingEngine {
                         }),
                     );
                 }
+                None
+            }
+        };
+        self.refresh_phase(Instant::now());
+        Ok(request)
+    }
+
+    pub fn on_prepared_pool(&mut self, result: PreparedPoolBuildResult) -> anyhow::Result<()> {
+        let Some(prepared) = self.opportunities.finish_pool_refresh(result)? else {
+            return Ok(());
+        };
+        let pool = self.dex.pool(prepared.pool_index)?;
+        self.telemetry.emit(
+            "dex_pool_prepared",
+            json!({
+                "engine_id": self.config.engine_id,
+                "pair_id": pool.pair_id,
+                "identity": format!("{:?}", pool.identity),
+                "pool_index": prepared.pool_index,
+                "prepared_generation": prepared.generation,
+                "prepared_exact_output_segments": prepared.exact_output_segments,
+                "prepared_exact_input_segments": prepared.exact_input_segments,
+                "build_time_us": prepared.build_time_us,
+                "total_time_us": prepared.total_time_us,
+            }),
+        );
+        self.refresh_phase(Instant::now());
+        if self.state.phase == RuntimePhase::Ready {
+            let books: Vec<_> = self
+                .state
+                .binance_feeds
+                .values()
+                .filter_map(|feed| feed.book.clone())
+                .collect();
+            for quote in books {
+                self.evaluate_ready_quote(&quote, "dex_prepared")?;
             }
         }
-        self.refresh_phase(Instant::now());
         Ok(())
     }
 
@@ -154,6 +199,16 @@ impl TradingEngine {
         let result = self.state.apply_quote(quote.clone());
         match result {
             QuoteApplyResult::Accepted => {
+                // The decision is evaluated only after all readiness inputs are
+                // fresh. The calculation itself performs no RPC, I/O, or locks.
+                self.refresh_phase(Instant::now());
+                if self.state.phase == RuntimePhase::Ready {
+                    self.evaluate_ready_quote(&quote, "binance_book_ticker")?;
+                }
+
+                // Raw market telemetry is deliberately serialized only after
+                // the opportunity decision. It must never delay detection or
+                // eventual order submission.
                 self.telemetry.emit(
                     "binance_book_ticker",
                     json!({
@@ -172,22 +227,6 @@ impl TradingEngine {
                         "engine_queue_age_us": quote.received_at.elapsed().as_micros(),
                     }),
                 );
-
-                // The decision is evaluated only after all readiness inputs are
-                // fresh. The calculation itself performs no RPC, I/O, or locks.
-                self.refresh_phase(Instant::now());
-                if self.state.phase == RuntimePhase::Ready {
-                    let calculation_started = Instant::now();
-                    if let Some(evaluation) = self.opportunities.evaluate(&quote, &self.dex)? {
-                        let pair = self.opportunities.pair(evaluation.pair_index)?;
-                        self.emit_arbitrage_evaluation(
-                            &quote,
-                            pair,
-                            &evaluation,
-                            calculation_started.elapsed().as_micros(),
-                        )?;
-                    }
-                }
             }
             rejected => self.telemetry.emit(
                 "binance_book_ticker_rejected",
@@ -204,12 +243,32 @@ impl TradingEngine {
         Ok(())
     }
 
+    fn evaluate_ready_quote(
+        &mut self,
+        quote: &TopOfBook,
+        trigger: &'static str,
+    ) -> anyhow::Result<()> {
+        let calculation_started = Instant::now();
+        if let Some(evaluation) = self.opportunities.evaluate(quote)? {
+            let pair = self.opportunities.pair(evaluation.pair_index)?;
+            self.emit_arbitrage_evaluation(
+                quote,
+                pair,
+                &evaluation,
+                calculation_started.elapsed().as_micros(),
+                trigger,
+            )?;
+        }
+        Ok(())
+    }
+
     fn emit_arbitrage_evaluation(
         &self,
         quote: &TopOfBook,
         pair: &PairRuntime,
         evaluation: &PairEvaluation,
         calculation_time_us: u128,
+        trigger: &'static str,
     ) -> anyhow::Result<()> {
         let decision_latency_us = quote.received_at.elapsed().as_micros();
         let directions = [
@@ -241,6 +300,7 @@ impl TradingEngine {
                 "baseline_quote_cache_misses": evaluation.baseline_cache_misses,
                 "calculation_time_us": calculation_time_us,
                 "decision_latency_us": decision_latency_us,
+                "evaluation_trigger": trigger,
                 "directions": directions,
             }),
         );
@@ -268,6 +328,7 @@ impl TradingEngine {
                         ],
                         "calculation_time_us": calculation_time_us,
                         "decision_latency_us": quote.received_at.elapsed().as_micros(),
+                        "evaluation_trigger": trigger,
                         "market_liquidity_capacity": self.capacity_payload(pair, capacity)?,
                     }),
                 );
@@ -364,7 +425,8 @@ impl TradingEngine {
 
     fn refresh_phase(&mut self, now: Instant) {
         let previous = self.state.phase;
-        let dex_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms);
+        let dex_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms)
+            && self.opportunities.is_ready();
         let current = self
             .state
             .refresh_phase(now, self.config.market_data_max_age_ms, dex_ready);

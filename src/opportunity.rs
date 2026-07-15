@@ -1,17 +1,21 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Instant};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 
 use crate::{
-    dex::{clmm::InsufficientLiquidity, mirror::DexMirror},
+    dex::{
+        clmm::{ClmmPool, InsufficientLiquidity, PreparedQuoteCurve},
+        mirror::DexMirror,
+    },
     domain::config::{DomainSnapshot, PairConfig},
     state::TopOfBook,
 };
 
 const BPS_DENOMINATOR: u64 = 10_000;
 const PROFIT_BPS_SCALE: u64 = 1_000_000;
+const BASELINE_CACHE_ENTRIES_PER_DIRECTION: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbitrageDirection {
@@ -126,7 +130,42 @@ pub struct PairRuntime {
 pub struct OpportunityEngine {
     pairs: Vec<PairRuntime>,
     pair_indices_by_symbol: HashMap<String, usize>,
+    pair_index_by_pool: Vec<Option<usize>>,
+    pool_generations: Vec<u64>,
+    prepared_pools: Vec<Option<PreparedPoolQuotes>>,
     baseline_quote_cache: Vec<PoolBaselineQuoteCache>,
+}
+
+#[derive(Debug)]
+struct PreparedPoolQuotes {
+    by_direction: [PreparedQuoteCurve; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedPoolRefresh {
+    pub pool_index: usize,
+    pub generation: u64,
+    pub exact_output_segments: usize,
+    pub exact_input_segments: usize,
+    pub build_time_us: u128,
+    pub total_time_us: u128,
+}
+
+pub struct PreparedPoolBuildRequest {
+    pool_index: usize,
+    generation: u64,
+    pool: ClmmPool,
+    exact_output_zero_for_one: bool,
+    exact_input_zero_for_one: bool,
+    requested_at: Instant,
+}
+
+pub struct PreparedPoolBuildResult {
+    pool_index: usize,
+    generation: u64,
+    prepared: PreparedPoolQuotes,
+    build_time_us: u128,
+    requested_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,9 +180,15 @@ struct BaselineQuoteCacheEntry {
     outcome: DexQuoteOutcome,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PoolBaselineQuoteCache {
-    by_direction: [Option<BaselineQuoteCacheEntry>; 2],
+    by_direction: [DirectionBaselineQuoteCache; 2],
+}
+
+#[derive(Debug)]
+struct DirectionBaselineQuoteCache {
+    entries: [Option<BaselineQuoteCacheEntry>; BASELINE_CACHE_ENTRIES_PER_DIRECTION],
+    next_replace: usize,
 }
 
 #[derive(Debug, Default)]
@@ -172,20 +217,34 @@ impl OpportunityEngine {
             );
             pairs.push(runtime);
         }
+        let mut pair_index_by_pool = vec![None; dex.pool_count()];
+        let mut prepared_pools: Vec<Option<PreparedPoolQuotes>> =
+            (0..dex.pool_count()).map(|_| None).collect();
+        for (pair_index, pair) in pairs.iter().enumerate() {
+            for &pool_index in &pair.pool_indices {
+                ensure!(
+                    pair_index_by_pool[pool_index].replace(pair_index).is_none(),
+                    "DEX pool belongs to more than one enabled pair"
+                );
+                prepared_pools[pool_index] = Some(prepare_pool_quotes(pair, dex, pool_index, 1)?);
+            }
+        }
         Ok(Self {
             pairs,
             pair_indices_by_symbol,
+            pair_index_by_pool,
+            pool_generations: prepared_pools
+                .iter()
+                .map(|prepared| u64::from(prepared.is_some()))
+                .collect(),
+            prepared_pools,
             baseline_quote_cache: (0..dex.pool_count())
                 .map(|_| PoolBaselineQuoteCache::default())
                 .collect(),
         })
     }
 
-    pub fn evaluate(
-        &mut self,
-        quote: &TopOfBook,
-        dex: &DexMirror,
-    ) -> anyhow::Result<Option<PairEvaluation>> {
+    pub fn evaluate(&mut self, quote: &TopOfBook) -> anyhow::Result<Option<PairEvaluation>> {
         let Some(&pair_index) = self.pair_indices_by_symbol.get(quote.symbol.as_ref()) else {
             return Ok(None);
         };
@@ -209,7 +268,7 @@ impl OpportunityEngine {
             baseline_token_b_amount,
             dex_buy_cex_sell: evaluate_direction_with_cache(
                 pair,
-                dex,
+                &self.prepared_pools,
                 quote,
                 baseline_token_b_amount,
                 ArbitrageDirection::BuyTokenBOnDexSellOnCex,
@@ -218,7 +277,7 @@ impl OpportunityEngine {
             )?,
             cex_buy_dex_sell: evaluate_direction_with_cache(
                 pair,
-                dex,
+                &self.prepared_pools,
                 quote,
                 baseline_token_b_amount,
                 ArbitrageDirection::BuyTokenBOnCexSellOnDex,
@@ -236,6 +295,69 @@ impl OpportunityEngine {
             .context("opportunity pair index is invalid")
     }
 
+    pub fn request_pool_refresh(
+        &mut self,
+        pool_index: usize,
+        dex: &DexMirror,
+    ) -> anyhow::Result<PreparedPoolBuildRequest> {
+        let pair_index = self
+            .pair_index_by_pool
+            .get(pool_index)
+            .copied()
+            .flatten()
+            .context("opportunity pool has no enabled pair")?;
+        let generation = self
+            .pool_generations
+            .get(pool_index)
+            .copied()
+            .context("opportunity pool generation index is invalid")?
+            .saturating_add(1);
+        self.pool_generations[pool_index] = generation;
+        self.prepared_pools[pool_index] = None;
+        self.invalidate_pool(pool_index)?;
+        let pair = &self.pairs[pair_index];
+        let hydrated = dex.pool(pool_index)?;
+        Ok(PreparedPoolBuildRequest {
+            pool_index,
+            generation,
+            pool: hydrated.pool.clone(),
+            exact_output_zero_for_one: hydrated.token0 == pair.token_a,
+            exact_input_zero_for_one: hydrated.token0 == pair.token_b,
+            requested_at: Instant::now(),
+        })
+    }
+
+    pub fn finish_pool_refresh(
+        &mut self,
+        result: PreparedPoolBuildResult,
+    ) -> anyhow::Result<Option<PreparedPoolRefresh>> {
+        let expected_generation = self
+            .pool_generations
+            .get(result.pool_index)
+            .copied()
+            .context("prepared pool result index is invalid")?;
+        if result.generation != expected_generation {
+            return Ok(None);
+        }
+        let refresh = PreparedPoolRefresh {
+            pool_index: result.pool_index,
+            generation: result.generation,
+            exact_output_segments: result.prepared.by_direction[0].segment_count(),
+            exact_input_segments: result.prepared.by_direction[1].segment_count(),
+            build_time_us: result.build_time_us,
+            total_time_us: result.requested_at.elapsed().as_micros(),
+        };
+        self.prepared_pools[result.pool_index] = Some(result.prepared);
+        Ok(Some(refresh))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.pair_index_by_pool
+            .iter()
+            .enumerate()
+            .all(|(index, pair)| pair.is_none() || self.prepared_pools[index].is_some())
+    }
+
     pub fn invalidate_pool(&mut self, pool_index: usize) -> anyhow::Result<()> {
         let cache = self
             .baseline_quote_cache
@@ -244,6 +366,77 @@ impl OpportunityEngine {
         *cache = PoolBaselineQuoteCache::default();
         Ok(())
     }
+}
+
+impl PreparedPoolBuildRequest {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn build(self) -> anyhow::Result<PreparedPoolBuildResult> {
+        let started = Instant::now();
+        let prepared = prepare_pool_quotes_from_pool(
+            &self.pool,
+            self.exact_output_zero_for_one,
+            self.exact_input_zero_for_one,
+            self.generation,
+        )?;
+        Ok(PreparedPoolBuildResult {
+            pool_index: self.pool_index,
+            generation: self.generation,
+            prepared,
+            build_time_us: started.elapsed().as_micros(),
+            requested_at: self.requested_at,
+        })
+    }
+}
+
+impl Default for PoolBaselineQuoteCache {
+    fn default() -> Self {
+        Self {
+            by_direction: std::array::from_fn(|_| DirectionBaselineQuoteCache::default()),
+        }
+    }
+}
+
+impl Default for DirectionBaselineQuoteCache {
+    fn default() -> Self {
+        Self {
+            entries: [None; BASELINE_CACHE_ENTRIES_PER_DIRECTION],
+            next_replace: 0,
+        }
+    }
+}
+
+fn prepare_pool_quotes(
+    pair: &PairRuntime,
+    dex: &DexMirror,
+    pool_index: usize,
+    generation: u64,
+) -> anyhow::Result<PreparedPoolQuotes> {
+    let hydrated = dex.pool(pool_index)?;
+    let exact_output_zero_for_one = hydrated.token0 == pair.token_a;
+    let exact_input_zero_for_one = hydrated.token0 == pair.token_b;
+    prepare_pool_quotes_from_pool(
+        &hydrated.pool,
+        exact_output_zero_for_one,
+        exact_input_zero_for_one,
+        generation,
+    )
+}
+
+fn prepare_pool_quotes_from_pool(
+    pool: &ClmmPool,
+    exact_output_zero_for_one: bool,
+    exact_input_zero_for_one: bool,
+    _generation: u64,
+) -> anyhow::Result<PreparedPoolQuotes> {
+    Ok(PreparedPoolQuotes {
+        by_direction: [
+            pool.prepare_exact_output_curve(exact_output_zero_for_one)?,
+            pool.prepare_exact_input_curve(exact_input_zero_for_one)?,
+        ],
+    })
 }
 
 impl PairRuntime {
@@ -307,12 +500,24 @@ fn evaluate_direction(
     baseline_token_b: U256,
     direction: ArbitrageDirection,
 ) -> anyhow::Result<DirectionEvaluation> {
-    evaluate_direction_impl(pair, dex, quote, baseline_token_b, direction, None)
+    let mut prepared_pools: Vec<Option<PreparedPoolQuotes>> =
+        (0..dex.pool_count()).map(|_| None).collect();
+    for &pool_index in &pair.pool_indices {
+        prepared_pools[pool_index] = Some(prepare_pool_quotes(pair, dex, pool_index, 1)?);
+    }
+    evaluate_direction_impl(
+        pair,
+        &prepared_pools,
+        quote,
+        baseline_token_b,
+        direction,
+        None,
+    )
 }
 
 fn evaluate_direction_with_cache(
     pair: &PairRuntime,
-    dex: &DexMirror,
+    prepared_pools: &[Option<PreparedPoolQuotes>],
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
@@ -321,7 +526,7 @@ fn evaluate_direction_with_cache(
 ) -> anyhow::Result<DirectionEvaluation> {
     evaluate_direction_impl(
         pair,
-        dex,
+        prepared_pools,
         quote,
         baseline_token_b,
         direction,
@@ -331,7 +536,7 @@ fn evaluate_direction_with_cache(
 
 fn evaluate_direction_impl(
     pair: &PairRuntime,
-    dex: &DexMirror,
+    prepared_pools: &[Option<PreparedPoolQuotes>],
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
@@ -349,23 +554,24 @@ fn evaluate_direction_impl(
     let mut best_baseline: Option<TradeEvaluation> = None;
     let mut best_capacity: Option<CapacityEvaluation> = None;
     if cex_top_token_b_amount >= baseline_token_b {
+        let baseline_cex_token_a = cex_token_a_amount(pair, quote, direction, baseline_token_b)?;
         for &pool_index in &pair.pool_indices {
             let dex_quote = if let Some((pool_caches, usage)) = cache.as_mut() {
                 let pool_cache = pool_caches
                     .get_mut(pool_index)
                     .context("baseline quote cache index is invalid")?;
                 pool_cache.quote(direction, baseline_token_b, usage, || {
-                    quote_dex(pair, dex, direction, pool_index, baseline_token_b)
+                    quote_dex(prepared_pools, direction, pool_index, baseline_token_b)
                 })?
             } else {
-                quote_dex(pair, dex, direction, pool_index, baseline_token_b)?
+                quote_dex(prepared_pools, direction, pool_index, baseline_token_b)?
             };
             let Some(baseline) = evaluate_trade_with_dex_quote(
                 pair,
-                quote,
                 direction,
                 pool_index,
                 baseline_token_b,
+                baseline_cex_token_a,
                 dex_quote,
             )?
             else {
@@ -373,7 +579,7 @@ fn evaluate_direction_impl(
             };
             if best_baseline
                 .as_ref()
-                .is_none_or(|best| baseline.profit_bps_x100 > best.profit_bps_x100)
+                .is_none_or(|best| trade_is_better(direction, &baseline, best))
             {
                 best_baseline = Some(baseline);
             }
@@ -383,7 +589,7 @@ fn evaluate_direction_impl(
 
             let capacity = size_pool(
                 pair,
-                dex,
+                prepared_pools,
                 quote,
                 direction,
                 pool_index,
@@ -396,6 +602,13 @@ fn evaluate_direction_impl(
                 best_capacity = Some(capacity);
             }
         }
+    }
+
+    if let Some(best) = best_baseline.as_mut() {
+        finalize_trade_profit(best)?;
+    }
+    if let Some(capacity) = best_capacity.as_mut() {
+        finalize_trade_profit(&mut capacity.trade)?;
     }
 
     Ok(DirectionEvaluation {
@@ -414,19 +627,24 @@ impl PoolBaselineQuoteCache {
         usage: &mut BaselineCacheUsage,
         load: impl FnOnce() -> anyhow::Result<DexQuoteOutcome>,
     ) -> anyhow::Result<DexQuoteOutcome> {
-        let slot = &mut self.by_direction[direction.cache_index()];
-        if let Some(entry) = slot
-            && entry.token_b_amount == token_b_amount
+        let direction_cache = &mut self.by_direction[direction.cache_index()];
+        if let Some(entry) = direction_cache
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.token_b_amount == token_b_amount)
         {
             usage.hits = usage.hits.saturating_add(1);
             return Ok(entry.outcome);
         }
 
         let outcome = load()?;
-        *slot = Some(BaselineQuoteCacheEntry {
+        direction_cache.entries[direction_cache.next_replace] = Some(BaselineQuoteCacheEntry {
             token_b_amount,
             outcome,
         });
+        direction_cache.next_replace =
+            (direction_cache.next_replace + 1) % BASELINE_CACHE_ENTRIES_PER_DIRECTION;
         usage.misses = usage.misses.saturating_add(1);
         Ok(outcome)
     }
@@ -435,7 +653,7 @@ impl PoolBaselineQuoteCache {
 #[allow(clippy::too_many_arguments)]
 fn size_pool(
     pair: &PairRuntime,
-    dex: &DexMirror,
+    prepared_pools: &[Option<PreparedPoolQuotes>],
     quote: &TopOfBook,
     direction: ArbitrageDirection,
     pool_index: usize,
@@ -460,8 +678,14 @@ fn size_pool(
     let max_amount = max_steps
         .checked_mul(pair.token_b_step)
         .context("maximum token-B amount overflow")?;
-    if let Some(at_max) = evaluate_trade(pair, dex, quote, direction, pool_index, max_amount)?
-        && at_max.meets_threshold
+    if let Some(at_max) = evaluate_trade(
+        pair,
+        prepared_pools,
+        quote,
+        direction,
+        pool_index,
+        max_amount,
+    )? && at_max.meets_threshold
     {
         return Ok(CapacityEvaluation {
             trade: at_max,
@@ -477,7 +701,7 @@ fn size_pool(
         let amount = mid
             .checked_mul(pair.token_b_step)
             .context("sized token-B amount overflow")?;
-        match evaluate_trade(pair, dex, quote, direction, pool_index, amount)? {
+        match evaluate_trade(pair, prepared_pools, quote, direction, pool_index, amount)? {
             Some(candidate) if candidate.meets_threshold => {
                 low = mid;
                 best = candidate;
@@ -489,7 +713,14 @@ fn size_pool(
     let next_amount = high
         .checked_mul(pair.token_b_step)
         .context("next token-B amount overflow")?;
-    let limiter = match evaluate_trade(pair, dex, quote, direction, pool_index, next_amount)? {
+    let limiter = match evaluate_trade(
+        pair,
+        prepared_pools,
+        quote,
+        direction,
+        pool_index,
+        next_amount,
+    )? {
         None => CapacityLimiter::DexLiquidity,
         Some(_) => CapacityLimiter::ProfitThreshold,
     };
@@ -501,43 +732,35 @@ fn size_pool(
 
 fn evaluate_trade(
     pair: &PairRuntime,
-    dex: &DexMirror,
+    prepared_pools: &[Option<PreparedPoolQuotes>],
     quote: &TopOfBook,
     direction: ArbitrageDirection,
     pool_index: usize,
     token_b_amount: U256,
 ) -> anyhow::Result<Option<TradeEvaluation>> {
-    let dex_quote = quote_dex(pair, dex, direction, pool_index, token_b_amount)?;
+    let dex_quote = quote_dex(prepared_pools, direction, pool_index, token_b_amount)?;
+    let cex_token_a_amount = cex_token_a_amount(pair, quote, direction, token_b_amount)?;
     evaluate_trade_with_dex_quote(
         pair,
-        quote,
         direction,
         pool_index,
         token_b_amount,
+        cex_token_a_amount,
         dex_quote,
     )
 }
 
 fn quote_dex(
-    pair: &PairRuntime,
-    dex: &DexMirror,
+    prepared_pools: &[Option<PreparedPoolQuotes>],
     direction: ArbitrageDirection,
     pool_index: usize,
     token_b_amount: U256,
 ) -> anyhow::Result<DexQuoteOutcome> {
-    let hydrated = dex.pool(pool_index)?;
-    let pool = &hydrated.pool;
-
-    let result = match direction {
-        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-            let zero_for_one = hydrated.token0 == pair.token_a;
-            pool.quote_exact_out_amount_in(zero_for_one, token_b_amount)
-        }
-        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            let zero_for_one = hydrated.token0 == pair.token_b;
-            pool.quote_exact_in_amount_out(zero_for_one, token_b_amount)
-        }
-    };
+    let prepared = prepared_pools
+        .get(pool_index)
+        .and_then(Option::as_ref)
+        .context("prepared DEX pool is unavailable")?;
+    let result = prepared.by_direction[direction.cache_index()].quote(token_b_amount);
     match result {
         Ok(value) => Ok(DexQuoteOutcome::Available(value)),
         Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => {
@@ -549,10 +772,10 @@ fn quote_dex(
 
 fn evaluate_trade_with_dex_quote(
     pair: &PairRuntime,
-    quote: &TopOfBook,
     direction: ArbitrageDirection,
     pool_index: usize,
     token_b_amount: U256,
+    cex_token_a_amount: U256,
     dex_quote: DexQuoteOutcome,
 ) -> anyhow::Result<Option<TradeEvaluation>> {
     let DexQuoteOutcome::Available(dex_token_a_amount) = dex_quote else {
@@ -561,27 +784,13 @@ fn evaluate_trade_with_dex_quote(
 
     let (cex_token_a_amount, cost_token_a, proceeds_token_a) = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-            let cex_proceeds = token_b_to_token_a(
-                token_b_amount,
-                quote.bid_price,
-                pair.token_a_decimals,
-                pair.token_b_decimals,
-                false,
-            )?;
             let reserved_cost = add_bps_ceil(dex_token_a_amount, pair.dex_fee_reserve_bps)?;
-            (cex_proceeds, reserved_cost, cex_proceeds)
+            (cex_token_a_amount, reserved_cost, cex_token_a_amount)
         }
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            let cex_cost = token_b_to_token_a(
-                token_b_amount,
-                quote.ask_price,
-                pair.token_a_decimals,
-                pair.token_b_decimals,
-                true,
-            )?;
             let reserved_proceeds =
                 subtract_bps_floor(dex_token_a_amount, pair.dex_fee_reserve_bps)?;
-            (cex_cost, cex_cost, reserved_proceeds)
+            (cex_token_a_amount, cex_token_a_amount, reserved_proceeds)
         }
     };
 
@@ -592,13 +801,57 @@ fn evaluate_trade_with_dex_quote(
         cex_token_a_amount,
         cost_token_a,
         proceeds_token_a,
-        profit_bps_x100: signed_profit_bps_x100(proceeds_token_a, cost_token_a)?,
+        profit_bps_x100: 0,
         meets_threshold: meets_threshold(
             proceeds_token_a,
             cost_token_a,
             pair.opportunity_threshold_bps,
         )?,
     }))
+}
+
+fn trade_is_better(
+    direction: ArbitrageDirection,
+    candidate: &TradeEvaluation,
+    current: &TradeEvaluation,
+) -> bool {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
+            candidate.cost_token_a < current.cost_token_a
+        }
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
+            candidate.proceeds_token_a > current.proceeds_token_a
+        }
+    }
+}
+
+fn finalize_trade_profit(trade: &mut TradeEvaluation) -> anyhow::Result<()> {
+    trade.profit_bps_x100 = signed_profit_bps_x100(trade.proceeds_token_a, trade.cost_token_a)?;
+    Ok(())
+}
+
+fn cex_token_a_amount(
+    pair: &PairRuntime,
+    quote: &TopOfBook,
+    direction: ArbitrageDirection,
+    token_b_amount: U256,
+) -> anyhow::Result<U256> {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => token_b_to_token_a(
+            token_b_amount,
+            quote.bid_price,
+            pair.token_a_decimals,
+            pair.token_b_decimals,
+            false,
+        ),
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => token_b_to_token_a(
+            token_b_amount,
+            quote.ask_price,
+            pair.token_a_decimals,
+            pair.token_b_decimals,
+            true,
+        ),
+    }
 }
 
 fn decimal_to_base_units(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
@@ -608,6 +861,12 @@ fn decimal_to_base_units(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
     );
     let mantissa = value.mantissa();
     ensure!(mantissa >= 0, "decimal mantissa must not be negative");
+    if let (Some(numerator_scale), Some(denominator)) =
+        (pow10_u128(decimals.into()), pow10_u128(value.scale()))
+        && let Some(numerator) = (mantissa as u128).checked_mul(numerator_scale)
+    {
+        return Ok(U256::from(numerator / denominator));
+    }
     let numerator = U256::from(mantissa as u128)
         .checked_mul(pow10(decimals.into())?)
         .context("decimal base-unit numerator overflow")?;
@@ -622,6 +881,20 @@ fn token_a_to_token_b_floor(
 ) -> anyhow::Result<U256> {
     let mantissa = positive_decimal_mantissa(price)?;
     let exponent = i32::from(token_b_decimals) + price.scale() as i32 - i32::from(token_a_decimals);
+    if let Ok(token_a_amount) = u128::try_from(token_a_amount) {
+        let fast = if exponent >= 0 {
+            pow10_u128(exponent as u32)
+                .and_then(|scale| token_a_amount.checked_mul(scale))
+                .map(|numerator| numerator / mantissa)
+        } else {
+            pow10_u128((-exponent) as u32)
+                .and_then(|scale| mantissa.checked_mul(scale))
+                .map(|denominator| token_a_amount / denominator)
+        };
+        if let Some(result) = fast {
+            return Ok(U256::from(result));
+        }
+    }
     if exponent >= 0 {
         let numerator = scale_up(token_a_amount, exponent)?;
         Ok(numerator / U256::from(mantissa))
@@ -641,10 +914,30 @@ fn token_b_to_token_a(
     round_up: bool,
 ) -> anyhow::Result<U256> {
     let mantissa = positive_decimal_mantissa(price)?;
+    let exponent = i32::from(token_b_decimals) + price.scale() as i32 - i32::from(token_a_decimals);
+    if let Ok(token_b_amount) = u128::try_from(token_b_amount)
+        && let Some(product) = token_b_amount.checked_mul(mantissa)
+    {
+        let fast = if exponent <= 0 {
+            pow10_u128((-exponent) as u32).and_then(|scale| product.checked_mul(scale))
+        } else {
+            pow10_u128(exponent as u32).and_then(|denominator| {
+                let quotient = product / denominator;
+                let remainder = product % denominator;
+                if round_up && remainder != 0 {
+                    quotient.checked_add(1)
+                } else {
+                    Some(quotient)
+                }
+            })
+        };
+        if let Some(result) = fast {
+            return Ok(U256::from(result));
+        }
+    }
     let product = token_b_amount
         .checked_mul(U256::from(mantissa))
         .context("token-B price product overflow")?;
-    let exponent = i32::from(token_b_decimals) + price.scale() as i32 - i32::from(token_a_decimals);
     if exponent <= 0 {
         return scale_up(product, -exponent).context("token-A price scaling overflow");
     }
@@ -685,11 +978,29 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
     Ok(value)
 }
 
+fn pow10_u128(exponent: u32) -> Option<u128> {
+    10_u128.checked_pow(exponent)
+}
+
 fn round_down_to_step(amount: U256, step: U256) -> U256 {
     (amount / step) * step
 }
 
 fn add_bps_ceil(amount: U256, bps: u16) -> anyhow::Result<U256> {
+    if let Ok(amount) = u128::try_from(amount)
+        && let Some(numerator) = amount.checked_mul(u128::from(BPS_DENOMINATOR + u64::from(bps)))
+    {
+        let denominator = u128::from(BPS_DENOMINATOR);
+        let quotient = numerator / denominator;
+        let rounded = if numerator % denominator == 0 {
+            Some(quotient)
+        } else {
+            quotient.checked_add(1)
+        };
+        if let Some(rounded) = rounded {
+            return Ok(U256::from(rounded));
+        }
+    }
     let numerator = amount
         .checked_mul(U256::from(BPS_DENOMINATOR + u64::from(bps)))
         .context("cost reserve overflow")?;
@@ -705,6 +1016,11 @@ fn add_bps_ceil(amount: U256, bps: u16) -> anyhow::Result<U256> {
 }
 
 fn subtract_bps_floor(amount: U256, bps: u16) -> anyhow::Result<U256> {
+    if let Ok(amount) = u128::try_from(amount)
+        && let Some(numerator) = amount.checked_mul(u128::from(BPS_DENOMINATOR - u64::from(bps)))
+    {
+        return Ok(U256::from(numerator / u128::from(BPS_DENOMINATOR)));
+    }
     amount
         .checked_mul(U256::from(BPS_DENOMINATOR - u64::from(bps)))
         .context("proceeds reserve overflow")
@@ -712,6 +1028,14 @@ fn subtract_bps_floor(amount: U256, bps: u16) -> anyhow::Result<U256> {
 }
 
 fn meets_threshold(proceeds: U256, cost: U256, threshold_bps: u16) -> anyhow::Result<bool> {
+    if let (Ok(proceeds), Ok(cost)) = (u128::try_from(proceeds), u128::try_from(cost))
+        && let (Some(left), Some(right)) = (
+            proceeds.checked_mul(u128::from(BPS_DENOMINATOR)),
+            cost.checked_mul(u128::from(BPS_DENOMINATOR + u64::from(threshold_bps))),
+        )
+    {
+        return Ok(left >= right);
+    }
     let left = proceeds
         .checked_mul(U256::from(BPS_DENOMINATOR))
         .context("threshold proceeds overflow")?;
@@ -723,6 +1047,17 @@ fn meets_threshold(proceeds: U256, cost: U256, threshold_bps: u16) -> anyhow::Re
 
 fn signed_profit_bps_x100(proceeds: U256, cost: U256) -> anyhow::Result<i64> {
     ensure!(!cost.is_zero(), "profit cost must be positive");
+    if let (Ok(proceeds), Ok(cost)) = (u128::try_from(proceeds), u128::try_from(cost)) {
+        let (positive, delta) = if proceeds >= cost {
+            (true, proceeds - cost)
+        } else {
+            (false, cost - proceeds)
+        };
+        if let Some(scaled) = delta.checked_mul(u128::from(PROFIT_BPS_SCALE)) {
+            let magnitude = i64::try_from(scaled / cost).unwrap_or(i64::MAX);
+            return Ok(if positive { magnitude } else { -magnitude });
+        }
+    }
     let (positive, delta) = if proceeds >= cost {
         (true, proceeds - cost)
     } else {
@@ -780,9 +1115,10 @@ mod tests {
     };
 
     use super::{
-        ArbitrageDirection, BaselineCacheUsage, CapacityLimiter, DexQuoteOutcome,
-        OpportunityEngine, PairRuntime, PoolBaselineQuoteCache, decimal_to_base_units,
-        evaluate_direction, format_base_units, token_a_to_token_b_floor, token_b_to_token_a,
+        ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
+        CapacityLimiter, DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache,
+        decimal_to_base_units, evaluate_direction, format_base_units, token_a_to_token_b_floor,
+        token_b_to_token_a,
     };
 
     fn hash(number: u64) -> B256 {
@@ -890,11 +1226,42 @@ mod tests {
         );
         assert_eq!(usage.hits, 1);
         assert_eq!(usage.misses, 2);
+        assert!(
+            cache.by_direction[direction.cache_index()]
+                .entries
+                .iter()
+                .flatten()
+                .any(|entry| entry.token_b_amount == first_amount)
+        );
+        assert!(
+            cache.by_direction[direction.cache_index()]
+                .entries
+                .iter()
+                .flatten()
+                .any(|entry| entry.token_b_amount == second_amount)
+        );
+
+        for amount in 50_u8..58 {
+            cache
+                .quote(direction, U256::from(amount), &mut usage, || {
+                    Ok(DexQuoteOutcome::InsufficientLiquidity)
+                })
+                .unwrap();
+        }
         assert_eq!(
             cache.by_direction[direction.cache_index()]
-                .unwrap()
-                .token_b_amount,
-            second_amount
+                .entries
+                .iter()
+                .flatten()
+                .count(),
+            BASELINE_CACHE_ENTRIES_PER_DIRECTION
+        );
+        assert!(
+            cache.by_direction[direction.cache_index()]
+                .entries
+                .iter()
+                .flatten()
+                .all(|entry| entry.token_b_amount != first_amount)
         );
     }
 
@@ -904,17 +1271,70 @@ mod tests {
             token_b_amount: U256::from(48_u8),
             outcome: DexQuoteOutcome::Available(U256::from(20_u8)),
         };
+        let populated_direction = super::DirectionBaselineQuoteCache {
+            entries: std::array::from_fn(|index| (index == 0).then_some(entry)),
+            next_replace: 1,
+        };
         let mut engine = OpportunityEngine {
             pairs: Vec::new(),
             pair_indices_by_symbol: std::collections::HashMap::new(),
+            pair_index_by_pool: vec![None],
+            pool_generations: vec![0],
+            prepared_pools: vec![None],
             baseline_quote_cache: vec![PoolBaselineQuoteCache {
-                by_direction: [Some(entry), Some(entry)],
+                by_direction: [
+                    populated_direction,
+                    super::DirectionBaselineQuoteCache {
+                        entries: std::array::from_fn(|index| (index == 0).then_some(entry)),
+                        next_replace: 1,
+                    },
+                ],
             }],
         };
 
         engine.invalidate_pool(0).unwrap();
-        assert_eq!(engine.baseline_quote_cache[0].by_direction, [None, None]);
+        assert!(
+            engine.baseline_quote_cache[0]
+                .by_direction
+                .iter()
+                .all(|direction| direction.entries.iter().all(Option::is_none))
+        );
         assert!(engine.invalidate_pool(1).is_err());
+    }
+
+    #[test]
+    fn prepared_pool_refresh_is_fail_closed_and_discards_superseded_generation() {
+        let (pair, mirror) = fixture();
+        let initial = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(initial)],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        assert!(engine.is_ready());
+
+        let superseded = engine.request_pool_refresh(0, &mirror).unwrap();
+        assert!(!engine.is_ready());
+        let current = engine.request_pool_refresh(0, &mirror).unwrap();
+        assert!(!engine.is_ready());
+
+        assert!(
+            engine
+                .finish_pool_refresh(superseded.build().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!engine.is_ready());
+        assert!(
+            engine
+                .finish_pool_refresh(current.build().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(engine.is_ready());
     }
 
     #[test]

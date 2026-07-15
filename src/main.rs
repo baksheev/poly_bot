@@ -15,6 +15,7 @@ use arb_bot::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::spawn_book_ticker_connectors,
     },
+    opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult},
     telemetry::TelemetryWriter,
 };
 use clap::Parser;
@@ -138,6 +139,8 @@ async fn run(
         telemetry,
     )?;
     engine.start();
+    let (prepared_sender, mut prepared_receiver, prepared_thread) =
+        spawn_prepared_pool_builder(64)?;
 
     tracing::info!(
         service = %config.service_name,
@@ -172,7 +175,17 @@ async fn run(
                 let Some(event) = event else {
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
                 };
-                engine.on_dex_event(event)?;
+                if let Some(request) = engine.on_dex_event(event)? {
+                    prepared_sender
+                        .try_send(request)
+                        .context("prepared DEX builder queue is full or closed")?;
+                }
+            }
+            result = prepared_receiver.recv() => {
+                let Some(result) = result else {
+                    bail!("prepared DEX builder stopped unexpectedly");
+                };
+                engine.on_prepared_pool(result?)?;
             }
             result = &mut dex_task => {
                 result.context("Alchemy DEX connector task failed")??;
@@ -189,10 +202,41 @@ async fn run(
     dex_task.abort();
     let _ = dex_task.await;
     drop(engine);
+    drop(prepared_sender);
+    drop(prepared_receiver);
+    prepared_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("prepared DEX builder thread panicked"))?;
 
     writer_task.await??;
     tracing::info!("read-only arbitrage shadow service stopped");
     Ok(())
+}
+
+type PreparedBuildResult = anyhow::Result<PreparedPoolBuildResult>;
+
+fn spawn_prepared_pool_builder(
+    capacity: usize,
+) -> anyhow::Result<(
+    tokio::sync::mpsc::Sender<PreparedPoolBuildRequest>,
+    tokio::sync::mpsc::Receiver<PreparedBuildResult>,
+    std::thread::JoinHandle<()>,
+)> {
+    let (request_sender, mut request_receiver) =
+        tokio::sync::mpsc::channel::<PreparedPoolBuildRequest>(capacity);
+    let (result_sender, result_receiver) =
+        tokio::sync::mpsc::channel::<PreparedBuildResult>(capacity);
+    let thread = std::thread::Builder::new()
+        .name("dex-curve-builder".into())
+        .spawn(move || {
+            while let Some(request) = request_receiver.blocking_recv() {
+                if result_sender.blocking_send(request.build()).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("failed to spawn prepared DEX builder thread")?;
+    Ok((request_sender, result_receiver, thread))
 }
 
 struct InitializedDex {
