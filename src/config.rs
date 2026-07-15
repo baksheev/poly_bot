@@ -23,6 +23,8 @@ pub enum Command {
     Check,
     /// Hydrate DEX pools at one canonical block without starting the service.
     Hydrate,
+    /// Validate Binance credentials and hydrate sanitized Spot account metadata.
+    BinanceAccount,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -45,6 +47,13 @@ pub struct AppConfig {
         default_value = "wss://stream.binance.com:9443/ws"
     )]
     pub binance_ws_base_url: String,
+
+    #[arg(
+        long,
+        env = "BINANCE_REST_BASE_URL",
+        default_value = "https://api.binance.com"
+    )]
+    pub binance_rest_base_url: String,
 
     #[arg(
         long,
@@ -122,6 +131,12 @@ impl AppConfig {
             &["ws", "wss"],
         )?;
         validate_binance_spot_ws_base_url(&self.binance_ws_base_url)?;
+        validate_url(
+            "BINANCE_REST_BASE_URL",
+            &self.binance_rest_base_url,
+            &["https"],
+        )?;
+        validate_binance_spot_rest_base_url(&self.binance_rest_base_url)?;
         ensure!(
             !self.domain_config_path.as_os_str().is_empty(),
             "DOMAIN_CONFIG_PATH is empty"
@@ -180,6 +195,23 @@ fn validate_binance_spot_ws_base_url(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_binance_spot_rest_base_url(value: &str) -> anyhow::Result<()> {
+    let normalized = value.trim_end_matches('/');
+    ensure!(
+        matches!(
+            normalized,
+            "https://api.binance.com"
+                | "https://api-gcp.binance.com"
+                | "https://api1.binance.com"
+                | "https://api2.binance.com"
+                | "https://api3.binance.com"
+                | "https://api4.binance.com"
+        ),
+        "BINANCE_REST_BASE_URL must use an official Binance Spot production endpoint"
+    );
+    Ok(())
+}
+
 fn validate_sql_identifier(name: &str, value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
@@ -202,6 +234,7 @@ mod tests {
             gcp_project_id: "poly-bot-502515".into(),
             gcp_region: "asia-southeast1".into(),
             binance_ws_base_url: "wss://stream.binance.com:9443/ws".into(),
+            binance_rest_base_url: "https://api.binance.com".into(),
             domain_config_path: "config/strategies/usdc-wld-world-chain.v2.json".into(),
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,

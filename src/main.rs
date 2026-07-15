@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
+    binance::account::{BinanceAccountClient, BinanceAccountState},
     chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
     dex::{
@@ -56,6 +57,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Hydrate => {
             let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
             hydrate(&domain_config).await
+        }
+        Command::BinanceAccount => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            let symbols = domain_config.binance_symbols();
+            ensure!(
+                symbols.len() == 1,
+                "Binance account check currently requires exactly one enabled symbol"
+            );
+            let mut client = BinanceAccountClient::from_env(&cli.config)?;
+            let state = client.hydrate(&symbols[0]).await?;
+            validate_binance_account(&state)?;
+            log_binance_account(&state);
+            Ok(())
         }
     }
 }
@@ -130,6 +144,9 @@ async fn run(
         binance_symbols.len() == 1,
         "direct Binance hot path currently requires exactly one enabled symbol"
     );
+    let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
+    let binance_account = binance_account_client.hydrate(&binance_symbols[0]).await?;
+    validate_binance_account(&binance_account)?;
     let mut binance_feed = BookTickerFeed::new(&config, binance_symbols[0].clone());
 
     let (mut engine, hot_telemetry) = TradingEngine::new(
@@ -151,8 +168,17 @@ async fn run(
         domain_snapshot_id = %domain_config.snapshot().snapshot_id,
         domain_config_sha256 = %domain_config.fingerprint_sha256(),
         binance_symbols = ?binance_symbols,
+        binance_account_type = %binance_account.account.account_type,
+        binance_can_trade = binance_account.account.can_trade,
+        binance_permissions = ?binance_account.account.permissions,
+        binance_nonzero_balances = binance_account.account.balances.len(),
+        binance_clock_offset_ms = binance_account.clock_offset_ms,
+        binance_standard_maker_fee = %binance_account.commission.standard_commission.maker,
+        binance_standard_taker_fee = %binance_account.commission.standard_commission.taker,
+        binance_wld_balance_present = binance_account.balance("WLD").is_some(),
+        binance_usdc_balance_present = binance_account.balance("USDC").is_some(),
         clickhouse_enabled = config.clickhouse_enabled(),
-        "read-only arbitrage shadow service started"
+        "read-only arbitrage shadow service started with authenticated Binance account state"
     );
 
     let shutdown = tokio::signal::ctrl_c();
@@ -205,6 +231,37 @@ async fn run(
     writer_task.await??;
     tracing::info!("read-only arbitrage shadow service stopped");
     Ok(())
+}
+
+fn validate_binance_account(state: &BinanceAccountState) -> anyhow::Result<()> {
+    ensure!(
+        state.account.account_type == "SPOT",
+        "Binance account type is {}, expected SPOT",
+        state.account.account_type
+    );
+    ensure!(
+        state.account.can_trade,
+        "Binance account does not permit trading"
+    );
+    Ok(())
+}
+
+fn log_binance_account(state: &BinanceAccountState) {
+    tracing::info!(
+        binance_account_type = %state.account.account_type,
+        binance_can_trade = state.account.can_trade,
+        binance_can_deposit = state.account.can_deposit,
+        binance_can_withdraw = state.account.can_withdraw,
+        binance_permissions = ?state.account.permissions,
+        binance_nonzero_balances = state.account.balances.len(),
+        binance_clock_offset_ms = state.clock_offset_ms,
+        symbol = %state.commission.symbol,
+        binance_standard_maker_fee = %state.commission.standard_commission.maker,
+        binance_standard_taker_fee = %state.commission.standard_commission.taker,
+        binance_wld_balance_present = state.balance("WLD").is_some(),
+        binance_usdc_balance_present = state.balance("USDC").is_some(),
+        "authenticated Binance Spot account hydrated"
+    );
 }
 
 type PreparedBuildResult = anyhow::Result<PreparedPoolBuildResult>;

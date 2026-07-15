@@ -51,6 +51,7 @@ umask 077
   printf 'GCP_PROJECT_ID=%s\n' "${project_id}"
   printf 'GCP_REGION=%s\n' "${region}"
   printf 'BINANCE_WS_BASE_URL=wss://stream.binance.com:9443/ws\n'
+  printf 'BINANCE_REST_BASE_URL=https://api.binance.com\n'
   printf 'DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v2.json\n'
   printf 'MARKET_DATA_MAX_AGE_MS=5000\n'
   printf 'DEX_EVENT_CHANNEL_CAPACITY=8192\n'
@@ -69,6 +70,10 @@ umask 077
   fetch_secret ALCHEMY_WORLDCHAIN_RPC_URL
   printf '\nALCHEMY_WORLDCHAIN_WS_URL='
   fetch_secret ALCHEMY_WORLDCHAIN_WS_URL
+  printf '\nBINANCE_API_KEY='
+  fetch_secret BINANCE_API_KEY
+  printf '\nBINANCE_SECRET_KEY='
+  fetch_secret BINANCE_SECRET_KEY
   printf '\n'
 } >"${env_file}"
 chmod 0600 "${env_file}"
