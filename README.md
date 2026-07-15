@@ -60,7 +60,7 @@ is not being implemented. The evidence is retained in
 ## Current status
 
 The first clone components are implemented in read-only shadow mode: persistent
-Binance USD-M Futures `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
+Binance Spot `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
 parsing, reconnect generations, freshness/readiness state, a single in-memory
 state owner, and non-blocking ClickHouse telemetry. Startup now loads a
 fail-closed, versioned snapshot of the active production World Chain
@@ -71,6 +71,17 @@ subscription, ordered Alchemy `logs`/`newHeads` ingestion, and the shared
 hookless concentrated-liquidity calculation core. `Swap`, `Mint`, `Burn`, and
 `ModifyLiquidity` update the same single-owner pool mirrors used by local
 quotes; no RPC call is made on the event or quote hot path.
+
+Every accepted Binance update now evaluates both arbitrage directions against
+all hydrated pools. The read-only opportunity engine uses exact-output DEX
+quotes when buying WLD, exact-input quotes when selling WLD, applies the
+configured 20 bps threshold and 4 bps reserve, and estimates the largest
+step-aligned WLD size supported by current DEX liquidity and the observed
+Binance top of book. It writes every evaluation and threshold-crossing
+opportunity asynchronously to ClickHouse. Market data and eventual execution
+now both use Spot. The estimate is still not execution-ready because
+bookTicker exposes only the best level; deeper Spot liquidity, fees, gas,
+balances, and inventory are not hydrated yet.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:

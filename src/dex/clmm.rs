@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error, fmt};
 
 use alloy_primitives::{I256, U256};
 use anyhow::{Context, ensure};
@@ -42,6 +42,17 @@ pub struct LocalQuote {
     pub liquidity_after: u128,
     pub initialized_ticks_crossed: u32,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsufficientLiquidity;
+
+impl fmt::Display for InsufficientLiquidity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("pool has insufficient hydrated liquidity")
+    }
+}
+
+impl Error for InsufficientLiquidity {}
 
 impl ClmmPool {
     pub fn new(
@@ -209,6 +220,99 @@ impl ClmmPool {
             .amount_out)
     }
 
+    /// Computes the input required for an exact output without mutating the pool.
+    ///
+    /// This is used to size the DEX-buy/CEX-sell leg to the exact Binance step,
+    /// avoiding an unhedged token-B remainder caused by rounding an exact-input
+    /// quote down after the fact.
+    #[inline]
+    pub fn quote_exact_out_amount_in(
+        &self,
+        zero_for_one: bool,
+        amount_out: U256,
+    ) -> anyhow::Result<U256> {
+        ensure!(!amount_out.is_zero(), "amount out must be positive");
+        ensure!(amount_out < (U256::ONE << 255), "amount out exceeds int256");
+
+        let sqrt_price_limit_x96 = if zero_for_one {
+            MIN_SQRT_RATIO + U256::ONE
+        } else {
+            MAX_SQRT_RATIO - U256::ONE
+        };
+        let mut amount_remaining = amount_out;
+        let mut amount_in = U256::ZERO;
+        let mut sqrt_price_x96 = self.sqrt_price_x96;
+        let mut tick = self.tick;
+        let mut liquidity = self.liquidity;
+
+        while !amount_remaining.is_zero() && sqrt_price_x96 != sqrt_price_limit_x96 {
+            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
+                &self.tick_bitmap,
+                tick,
+                self.tick_spacing,
+                zero_for_one,
+            )
+            .context("failed to find next initialized tick")?;
+            tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
+
+            let sqrt_price_next_x96 =
+                get_sqrt_ratio_at_tick(tick_next).context("failed to price next tick")?;
+            let target = if zero_for_one {
+                sqrt_price_next_x96.max(sqrt_price_limit_x96)
+            } else {
+                sqrt_price_next_x96.min(sqrt_price_limit_x96)
+            };
+            let (sqrt_after, step_in, step_out, fee_amount) = compute_swap_step(
+                sqrt_price_x96,
+                target,
+                liquidity,
+                -I256::from_raw(amount_remaining),
+                self.fee_pips,
+            )
+            .context("failed to compute exact-output swap step")?;
+
+            amount_remaining = amount_remaining
+                .checked_sub(step_out)
+                .context("swap produced more than remaining output")?;
+            amount_in = amount_in
+                .checked_add(step_in)
+                .and_then(|value| value.checked_add(fee_amount))
+                .context("swap input overflow")?;
+            sqrt_price_x96 = sqrt_after;
+
+            if sqrt_after == sqrt_price_next_x96 {
+                if initialized {
+                    let tick_state = self
+                        .ticks
+                        .get(&tick_next)
+                        .with_context(|| format!("bitmap references missing tick {tick_next}"))?;
+                    let liquidity_net = if zero_for_one {
+                        tick_state
+                            .net
+                            .checked_neg()
+                            .context("liquidity net overflow")?
+                    } else {
+                        tick_state.net
+                    };
+                    liquidity = add_delta(liquidity, liquidity_net)
+                        .context("failed to cross initialized tick")?;
+                }
+                tick = if zero_for_one {
+                    tick_next.saturating_sub(1)
+                } else {
+                    tick_next
+                };
+            } else {
+                break;
+            }
+        }
+
+        if !amount_remaining.is_zero() {
+            return Err(InsufficientLiquidity.into());
+        }
+        Ok(amount_in)
+    }
+
     #[inline]
     fn quote_exact_in_impl<const INCLUDE_AFTER_STATE: bool>(
         &self,
@@ -299,10 +403,9 @@ impl ClmmPool {
             }
         }
 
-        ensure!(
-            amount_remaining.is_zero(),
-            "pool has insufficient hydrated liquidity"
-        );
+        if !amount_remaining.is_zero() {
+            return Err(InsufficientLiquidity.into());
+        }
         Ok(LocalQuote {
             amount_out,
             sqrt_price_after_x96: sqrt_price_x96,
@@ -402,6 +505,29 @@ mod tests {
         assert!(zero_for_one.tick_after < 0);
         assert!(one_for_zero.tick_after >= 0);
         assert_eq!(pool.sqrt_price_x96, before);
+    }
+
+    #[test]
+    fn exact_output_returns_the_step_aligned_input_requirement() {
+        let pool = pool();
+        let desired = U256::from(996_999_u64);
+
+        for zero_for_one in [true, false] {
+            let required = pool
+                .quote_exact_out_amount_in(zero_for_one, desired)
+                .unwrap();
+            let delivered = pool
+                .quote_exact_in_amount_out(zero_for_one, required)
+                .unwrap();
+
+            assert!(delivered >= desired);
+            if required > U256::ONE {
+                let previous = pool
+                    .quote_exact_in_amount_out(zero_for_one, required - U256::ONE)
+                    .unwrap();
+                assert!(previous < desired);
+            }
+        }
     }
 
     #[test]

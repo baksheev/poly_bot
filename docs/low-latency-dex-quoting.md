@@ -1,7 +1,7 @@
 # Low-latency Uniswap quoting
 
-Status: pinned hydration and ordered Alchemy event ingestion implemented
-Last reviewed: 2026-07-15
+Status: local opportunity calculation and market-liquidity sizing implemented
+Last reviewed: 2026-07-16
 
 ## Decision
 
@@ -43,6 +43,11 @@ only `amount_out`; the diagnostic API additionally derives post-swap state for
 parity tests. Both are read-only, so the same state serves both directions
 without cloning or locking.
 
+The hot API also supports exact-output quotes. DEX-buy/CEX-sell sizing asks the
+pool for the exact token-A input required for a Binance-step-aligned token-B
+output. This prevents a residual token-B position caused by quoting an
+arbitrary token-A input and rounding its output down after the swap.
+
 V4 pools with hooks that can affect a swap are rejected. The current production
 snapshot has zero hooks, so the shared CLMM path is valid.
 
@@ -79,6 +84,41 @@ V3 `Swap` replaces the head fields. `Mint` and `Burn` update the two boundary
 ticks and bitmap. V4 `Swap` replaces the head fields; `ModifyLiquidity` updates
 the affected boundary ticks. Events update the in-memory mirror before the next
 decision is accepted.
+
+## Opportunity and capacity model
+
+For each accepted Binance update, the single state owner evaluates every
+hydrated pool in both directions using a common token-B amount:
+
+1. Derive the baseline token-B quantity from the configured 20 USDC notional
+   and current Binance ask, then round down to the Binance step size.
+2. DEX buy / CEX sell: exact-output quote that token-B amount on the DEX and
+   compare the reserved token-A cost with Binance bid proceeds.
+3. CEX buy / DEX sell: price the same token-B amount at Binance ask and compare
+   it with the reserved exact-input DEX proceeds.
+4. If the baseline clears 20 bps, binary-search whole Binance steps until the
+   next step fails the profit threshold, exceeds hydrated DEX liquidity, or
+   reaches the observed Binance top-of-book quantity.
+5. Across qualifying pools, retain the capacity candidate with the greatest
+   absolute token-A profit. No RPC, database call, lock, or pool clone occurs.
+
+Uniswap LP fees are already included by the CLMM swap math. The configured
+four-basis-point DEX reserve is then applied conservatively: costs round up and
+proceeds round down. All amount, threshold, and sizing math is checked integer
+math; `f64` is not used.
+
+The service writes one `arbitrage_evaluation` for every calculation and a
+separate `arbitrage_opportunity` for each direction that clears the threshold.
+Each record contains baseline economics, selected pool, signed profit,
+hundredths-of-basis-point edge, capacity, limiter, calculation latency, and
+end-to-end decision latency.
+
+The capacity is deliberately named `market_liquidity_capacity`, not executable
+size. Both market data and eventual execution use Binance Spot, but bookTicker
+contains only the best price level. Deeper Spot depth and fees, gas,
+wallet/Binance inventory, concurrency reservations, and risk caps are not
+applied yet. Those must become hard minimum constraints before paper or live
+execution.
 
 ## Gaps and reorgs
 
@@ -125,6 +165,16 @@ The first local arm64 release baseline (2026-07-15, two million iterations,
 full-range fixture, hot `amount_out` path, no tick crossing) measured 550 ns for
 token0 to token1 and 291 ns for token1 to token0. Treat these as
 development-machine averages, not Worker Pool p99 results.
+
+After adding exact-output sizing, the 2026-07-16 local arm64 release benchmark
+measured 537/283 ns for exact-input and 395/386 ns for exact-output in the two
+directions. A short live Spot release run over all five hydrated pools produced
+90 full baseline evaluations with calculation p50 288 us, p95 987 us, and p99
+3,711 us. No opportunity crossed the threshold, so those figures exclude the
+conditional binary sizing path. This development-machine end-to-end result is
+above the 100 us acceptance threshold; production Worker Pool histograms and
+profiling must drive the next optimization rather than treating the single-call
+microbenchmark as sufficient evidence.
 
 Run the allocation-free calculation baseline with:
 

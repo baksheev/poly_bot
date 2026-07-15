@@ -316,8 +316,8 @@ impl BinanceConfig {
             "Binance symbol must equal base_asset + quote_asset"
         );
         ensure!(
-            self.market_data_product == BinanceProduct::UsdMFutures,
-            "the implemented market-data adapter requires usd_m_futures"
+            self.market_data_product == BinanceProduct::Spot,
+            "opportunity sizing requires Binance Spot market data"
         );
         ensure!(
             self.execution_product == BinanceProduct::Spot,
@@ -640,7 +640,7 @@ mod tests {
 
     use super::{ArbitrageStrategy, BinanceProduct, LoadedDomainConfig, TokenBQuoteSizing};
 
-    const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v1.json");
+    const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v2.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -659,10 +659,7 @@ mod tests {
 
         assert_eq!(loaded.binance_symbols(), ["WLDUSDC"]);
         assert_eq!(pair.chain.chain_id, 480);
-        assert_eq!(
-            pair.binance.market_data_product,
-            BinanceProduct::UsdMFutures
-        );
+        assert_eq!(pair.binance.market_data_product, BinanceProduct::Spot);
         assert_eq!(pair.binance.execution_product, BinanceProduct::Spot);
         assert_eq!(
             pair.quote_sizing.token_b,
@@ -680,7 +677,7 @@ mod tests {
         assert_eq!(first.fingerprint_sha256(), second.fingerprint_sha256());
         assert_eq!(
             first.fingerprint_sha256(),
-            "1285588f5fd53bf8a4408180bddd6192bbe543a0ba7e30c07164aff26be65443"
+            "59ae8cc398344932ad85bdc06bdbf91185261fd7997e3c2b86a993c64d80e298"
         );
     }
 
@@ -701,6 +698,15 @@ mod tests {
         let bytes = mutate(|value| {
             let duplicate = value["pairs"][0].clone();
             value["pairs"].as_array_mut().unwrap().push(duplicate);
+        });
+        assert!(load(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_futures_market_data_for_spot_execution() {
+        let bytes = mutate(|value| {
+            value["pairs"][0]["binance"]["market_data_product"] =
+                Value::String("usd_m_futures".into());
         });
         assert!(load(&bytes).is_err());
     }

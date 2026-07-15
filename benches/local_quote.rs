@@ -16,6 +16,14 @@ fn main() {
         pool.quote_exact_in_amount_out(false, black_box(U256::from(20_000_000_u64)))
             .unwrap()
     });
+    measure("exact_out_no_cross_zero_for_one", || {
+        pool.quote_exact_out_amount_in(true, black_box(U256::from(19_000_000_u64)))
+            .unwrap()
+    });
+    measure("exact_out_no_cross_one_for_zero", || {
+        pool.quote_exact_out_amount_in(false, black_box(U256::from(19_000_000_u64)))
+            .unwrap()
+    });
 }
 
 fn measure(label: &str, mut quote: impl FnMut() -> U256) {

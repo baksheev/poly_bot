@@ -116,9 +116,10 @@ Definition of done:
 ### 3. Binance public market data
 
 Replace `BinancePriceRelay`, `BinancePriceReader`, and per-cycle REST price
-fetches with persistent typed WebSocket streams. Start with Futures
-`@bookTicker` because that matches the current source behavior. Maintain
-exchange ID/time, monotonic receive time, reconnect generation, and freshness.
+fetches with a persistent typed Spot `@bookTicker` WebSocket stream. This is an
+explicit divergence from the current Futures relay: the signal and eventual
+hedge must observe the same Spot market. Maintain exchange ID/time, monotonic
+receive time, reconnect generation, and freshness.
 
 Definition of done:
 
@@ -281,7 +282,7 @@ The first executable slice now provides:
 
 - no remaining Polymarket runtime types or endpoints;
 - fixed-point Binance top-of-book values with no `f64` strategy data;
-- persistent read-only Binance Futures `bookTicker` for configured symbols;
+- persistent read-only Binance Spot `bookTicker` for configured symbols;
 - reconnect generations, stale/regressed update rejection, and readiness based
   on connection plus quote freshness;
 - a single in-memory state owner and bounded asynchronous ClickHouse telemetry;

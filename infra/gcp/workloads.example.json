@@ -14,8 +14,8 @@
       "env": {
         "ENGINE_ID": "arb-bot-rust-shadow-gcp",
         "GCP_REGION": "asia-southeast1",
-        "BINANCE_WS_BASE_URL": "wss://fstream.binance.com/public/ws",
-        "DOMAIN_CONFIG_PATH": "config/strategies/usdc-wld-world-chain.v1.json",
+        "BINANCE_WS_BASE_URL": "wss://stream.binance.com:9443/ws",
+        "DOMAIN_CONFIG_PATH": "config/strategies/usdc-wld-world-chain.v2.json",
         "MARKET_EVENT_CHANNEL_CAPACITY": "8192",
         "MARKET_DATA_MAX_AGE_MS": "5000",
         "DEX_EVENT_CHANNEL_CAPACITY": "8192",

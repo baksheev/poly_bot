@@ -136,7 +136,7 @@ async fn run(
         Arc::clone(&domain_config),
         initialized_dex.mirror,
         telemetry,
-    );
+    )?;
     engine.start();
 
     tracing::info!(
@@ -166,7 +166,7 @@ async fn run(
                 let Some(event) = event else {
                     bail!("all Binance market-data connector tasks stopped unexpectedly");
                 };
-                engine.on_market_event(event);
+                engine.on_market_event(event)?;
             }
             event = dex_receiver.recv() => {
                 let Some(event) = event else {

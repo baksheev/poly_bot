@@ -97,7 +97,7 @@ async fn run_connection(
     );
     *reconnect_delay = INITIAL_RECONNECT_DELAY;
 
-    tracing::info!(symbol = symbol.as_ref(), generation, %url, "Binance bookTicker connected");
+    tracing::info!(symbol = symbol.as_ref(), generation, %url, "Binance Spot bookTicker connected");
     sender
         .send(MarketEvent::FeedConnected {
             symbol: Arc::clone(&symbol),
@@ -229,7 +229,7 @@ mod tests {
     use super::parse_book_ticker;
 
     #[test]
-    fn parses_usd_m_book_ticker_without_floating_point() {
+    fn parses_spot_book_ticker_without_floating_point() {
         let payload = br#"{
             "e":"bookTicker",
             "u":400900217,

@@ -42,14 +42,14 @@ pub struct AppConfig {
     #[arg(
         long,
         env = "BINANCE_WS_BASE_URL",
-        default_value = "wss://fstream.binance.com/public/ws"
+        default_value = "wss://stream.binance.com:9443/ws"
     )]
     pub binance_ws_base_url: String,
 
     #[arg(
         long,
         env = "DOMAIN_CONFIG_PATH",
-        default_value = "config/strategies/usdc-wld-world-chain.v1.json"
+        default_value = "config/strategies/usdc-wld-world-chain.v2.json"
     )]
     pub domain_config_path: PathBuf,
 
@@ -128,6 +128,7 @@ impl AppConfig {
             &self.binance_ws_base_url,
             &["ws", "wss"],
         )?;
+        validate_binance_spot_ws_base_url(&self.binance_ws_base_url)?;
         ensure!(
             !self.domain_config_path.as_os_str().is_empty(),
             "DOMAIN_CONFIG_PATH is empty"
@@ -174,6 +175,18 @@ fn validate_runtime_identifier(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_binance_spot_ws_base_url(value: &str) -> anyhow::Result<()> {
+    let normalized = value.trim_end_matches('/');
+    ensure!(
+        matches!(
+            normalized,
+            "wss://stream.binance.com:9443/ws" | "wss://stream.binance.com:443/ws"
+        ),
+        "BINANCE_WS_BASE_URL must use the Binance Spot raw-stream endpoint"
+    );
+    Ok(())
+}
+
 fn validate_sql_identifier(name: &str, value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
@@ -195,8 +208,8 @@ mod tests {
             engine_id: "arb-bot-rust-shadow-test".into(),
             gcp_project_id: "poly-bot-502515".into(),
             gcp_region: "asia-southeast1".into(),
-            binance_ws_base_url: "wss://fstream.binance.com/public/ws".into(),
-            domain_config_path: "config/strategies/usdc-wld-world-chain.v1.json".into(),
+            binance_ws_base_url: "wss://stream.binance.com:9443/ws".into(),
+            domain_config_path: "config/strategies/usdc-wld-world-chain.v2.json".into(),
             market_event_channel_capacity: 8192,
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,
@@ -234,6 +247,13 @@ mod tests {
     fn rejects_unsafe_clickhouse_database_identifier() {
         let mut config = config();
         config.clickhouse_database = "arb-bot".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_binance_futures_stream() {
+        let mut config = config();
+        config.binance_ws_base_url = "wss://fstream.binance.com/public/ws".into();
         assert!(config.validate().is_err());
     }
 }

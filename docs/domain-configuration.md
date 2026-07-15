@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
 Status: implemented for the first read-only production pair snapshot
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-16
 
 ## Runtime boundary
 
@@ -10,9 +10,12 @@ Rails Postgres, Redis, or Rails APIs while running. The artifact is validated
 before any market-data connection starts and its SHA-256 fingerprint is added
 to runtime telemetry.
 
-The first artifact is
-`config/strategies/usdc-wld-world-chain.v1.json`. It represents the active
-Rails production pair `id=3` at the source timestamp stored in the file.
+The active artifact is
+`config/strategies/usdc-wld-world-chain.v2.json`. It starts from the Rails
+production pair `id=3` at the source timestamp stored in the file and records
+one deliberate Rust-clone divergence: both Binance market data and eventual
+execution use Spot. The previous v1 artifact is retained as provenance for the
+earlier Futures-feed experiment and is rejected by current runtime validation.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven
@@ -21,16 +24,19 @@ attached to the Worker Pool.
 
 ## Captured behavior
 
-The v1 snapshot records:
+The active v2 snapshot records:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
 - USDC as token A and WLD as token B, with base-unit decimals;
-- Binance `WLDUSDC`, exact step/tick size, USD-M Futures market data, and Spot
-  execution parity with Rails;
+- Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
+  step/tick size;
 - fixed 20 USDC quote notional;
 - token-B quote sizing derived from the latest Binance ask, matching
   `UpdateMinBuyAmountJob` without its database update loop;
+- opportunity capacity expressed as whole Binance token-B steps, starting at
+  that derived baseline and bounded by DEX liquidity, the profit threshold,
+  and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, quote age, slippage reserve,
   DEX fee reserve, and balance safety multiplier;
 - the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.
