@@ -70,13 +70,13 @@ Worker Pool instance. It refuses to deploy a dirty worktree.
 ## Current production baseline
 
 The verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
-`arb-bot-rust-shadow-00004-tvb`, from source revision `c798349c8c8f` and image
-digest `sha256:5023049d0c4340f7eff2c2b06bdb12c159fb5eeee63cd7a8405e510e4e242d67`.
+`arb-bot-rust-shadow-00006-9jv`, from source revision `3cdfc7fd9fc4` and image
+digest `sha256:52fd05aa51b65710814bbc159a8673c4844111fe261b2a6d41990a748feeacae`.
 
 - Cloud Run reports the revision `Ready` with one manually scaled instance,
   8 vCPU, 16 GiB RAM, and CPU idle disabled.
 - The process hydrated five configured Uniswap pools at World Chain block
-  `32407281`, completed its race-free backfill, and
+  `32408833`, completed its race-free backfill, and
   established filtered Alchemy WebSocket subscriptions.
 - The process connected to the Binance Spot raw stream
   `wss://stream.binance.com:9443/ws/wldusdc@bookTicker`; both the market-data
@@ -99,7 +99,29 @@ digest `sha256:5023049d0c4340f7eff2c2b06bdb12c159fb5eeee63cd7a8405e510e4e242d67`
   capacity-search quotes remain deliberately uncached.
 - This calculation timer measures the complete two-direction, five-pool
   evaluation including conditional capacity search, but excludes network
-  latency and telemetry insertion. Overall decision latency in the post-cache
-  window was 100 us p50, 235 us p95, and 715 us p99.
+  latency and telemetry insertion.
+- The prepared-curve revision was measured over the fixed window from
+  `2026-07-15 22:08:26 UTC` through `22:13:00 UTC`. Its 667 Binance-triggered
+  evaluations measured 3 us p50, 7 us p95, 13 us p99, and 97 us maximum for
+  the complete two-direction, five-pool calculation. Compared with the
+  pre-cache baseline this is 151x, 80x, and 70x faster at p50, p95, and p99.
+- Of those evaluations, 664 were fully warm at 3/7/10 us p50/p95/p99. Three
+  state-driven rebuild evaluations measured 20/77/77 us. Across 6,670
+  baseline lookups, 6,648 hit and 22 missed (99.67% hit rate).
+- Eighteen production curve builds measured 155/229/229 us p50/p95/p99 for
+  construction and 314/682/682 us from request to publication. Decisions fail
+  closed during this bounded interval and reevaluate the latest Spot book as
+  soon as the matching generation is published.
+- End-to-end frame-receipt-to-decision latency was 51/87/201 us p50/p95/p99.
+  Seventeen events (2.55%) exceeded 100 us, six exceeded 250 us, and one
+  exceeded 1 ms. The 3,899 us maximum had a 3,911 us engine queue age while
+  its calculation took 5 us; the other slow rows show the same correlation.
+  The remaining tail is therefore before opportunity calculation, in the
+  Binance-task to state-owner wakeup and Cloud Run scheduling path.
+- Raw Binance and opportunity JSON formatting now runs behind separate bounded
+  telemetry channels and is not included in the decision timer. Calculation
+  meets the 25 us p99 contract; stable sub-100 us decision p99 will require a
+  direct Binance-read/state-owner loop and validation on dedicated compute
+  rather than relying on shared Cloud Run scheduling.
 - No Worker Pool warning or error logs appeared during the startup check.
 - No wallet, signing, or Binance trading credentials are attached.

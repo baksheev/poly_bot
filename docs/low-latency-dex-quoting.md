@@ -96,20 +96,34 @@ hydrated pool in both directions using a common token-B amount:
    compare the reserved token-A cost with Binance bid proceeds.
 3. CEX buy / DEX sell: price the same token-B amount at Binance ask and compare
    it with the reserved exact-input DEX proceeds.
-4. If the baseline clears 20 bps, binary-search whole Binance steps until the
-   next step fails the profit threshold, exceeds hydrated DEX liquidity, or
-   reaches the observed Binance top-of-book quantity.
+4. If the baseline clears 20 bps, binary-search whole Binance steps over an
+   immutable prepared swap curve until the next step fails the profit
+   threshold, exceeds hydrated DEX liquidity, or reaches the observed Binance
+   top-of-book quantity. Each probe is a segment lookup plus at most one swap
+   step; it never replays the CLMM bitmap walk.
 5. Across qualifying pools, retain the capacity candidate with the greatest
    absolute token-A profit. No RPC, database call, lock, or pool clone occurs.
 
-The repeated baseline DEX quote is held in a fixed-size cache with exactly one
-entry per `(pool, direction)`. The token-B amount is part of the entry, so a new
-Binance-derived baseline replaces it. Both successful quotes and insufficient-
-liquidity results are cached. Any applied `Swap`, `Mint`, `Burn`, or
-`ModifyLiquidity` event clears both direction entries for only the affected
-pool before the next decision. Capacity-search quotes remain uncached. The
-cache is therefore bounded at two entries per hydrated pool and cannot hide a
-DEX state change or grow with observed Binance prices.
+The repeated baseline DEX quote is held in a fixed ring of eight entries per
+`(pool, direction)`. The token-B amount is part of each entry, so small Binance
+price oscillations reuse recent step-aligned amounts without unbounded growth.
+Both successful quotes and insufficient-liquidity results are cached.
+
+Each pool also has two immutable prepared curves: exact-output for DEX buy and
+exact-input for DEX sell. Curve construction performs the exact Uniswap
+word-boundary traversal once and stores contiguous cumulative segments with
+the original rounding. A quote then performs a binary search and at most one
+`compute_swap_step`; an amount above the directional capacity fails in constant
+time. Capacity-search probes use the curve directly and do not need their own
+cache.
+
+Any applied `Swap`, `Mint`, `Burn`, or `ModifyLiquidity` event immediately
+marks only the affected pool stale, clears its rings, and transfers a cloned
+versioned pool state to a bounded builder thread. Decisions fail closed while
+any required curve is missing. Only a result matching the latest requested
+generation is published; superseded builds are discarded. Once published, the
+last Binance Spot book is evaluated immediately instead of waiting for another
+exchange tick.
 
 Uniswap LP fees are already included by the CLMM swap math. The configured
 four-basis-point DEX reserve is then applied conservatively: costs round up and
@@ -122,6 +136,9 @@ Each record contains baseline economics, selected pool, signed profit,
 hundredths-of-basis-point edge, capacity, limiter, calculation latency, and
 end-to-end decision latency. `baseline_quote_cache_hits` and
 `baseline_quote_cache_misses` make every recomputation visible in telemetry.
+Raw Binance and evaluation payloads are formatted on a separate bounded task.
+The decision path only transfers typed in-memory records, and captures decision
+latency before JSON construction or ClickHouse channel work.
 
 The capacity is deliberately named `market_liquidity_capacity`, not executable
 size. Both market data and eventual execution use Binance Spot, but bookTicker
@@ -204,6 +221,24 @@ state-driven cache miss measured 25/792/1,106 us; these recomputations now
 account for the overall p99. The observed cache hit rate was 97.4%. The warm
 p99 is much better but still above the 25 us all-candidate target, so the
 performance contract remains an active target rather than being relaxed.
+
+The prepared-curve local benchmark reduced an exact-output request above a
+sparse pool's capacity from 68,327 ns to 60.2 ns (about 1,135x). No-cross
+prepared quotes measured 267-483 ns depending on direction and mode. A live
+five-pool run after moving repeated CEX arithmetic out of the pool loop measured
+the fully warm opportunity calculation at 2/12/19 us p50/p95/p99. These local
+figures remain secondary to the production window recorded in the deployment
+runbook.
+
+The subsequent Singapore production window contained 667 Binance-triggered
+evaluations. The complete calculation measured 3/7/13 us p50/p95/p99; its 664
+fully warm rows measured 3/7/10 us. This satisfies the 25 us calculation p99
+contract. Frame-receipt-to-decision latency measured 51/87/201 us. Slow rows
+were dominated by time waiting to enter the state owner: the 3,899 us maximum
+had a 3,911 us engine queue age and only 5 us of calculation. The next latency
+boundary is therefore the Binance-reader task/channel/Cloud Run scheduler, not
+CLMM math. A direct read-and-decide loop on a dedicated CPU is the next
+architecture experiment for a stable sub-100 us decision p99.
 
 Run the allocation-free calculation baseline with:
 
