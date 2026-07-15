@@ -35,21 +35,39 @@ The pure `rebalance::planner` module operates only on integer base units. It:
 - targets half of total inventory on Binance and half in the wallet;
 - refills the deficient side using only surplus above the other side's minimum;
 - applies Binance withdrawal minimum, maximum, and integer-multiple rules;
+- selects routes from live Binance `depositEnable`, `withdrawEnable`, and
+  `busy` state independently for each direction;
+- prefers the direct World Chain route and falls back to Optimism plus Across;
 - emits at most one action for one token per planning pass;
-- preserves whether execution is direct or routed through Across.
+- fails closed when neither a direct route nor a verified Across direction is
+  currently available.
 
 The production Rails configuration captured on 2026-07-16 for World Chain
 pair `WLDUSDC` (pair id 3) is:
 
 | Token | Binance minimum | Wallet minimum | Withdrawal min / max / multiple | Route |
 |---|---:|---:|---:|---|
-| USDC | 2,000 | 2,000 | 5 / 9,999,999 / 0.000001 | Binance Optimism, then Across between chain 10 and World Chain 480 |
-| WLD | 4,000 | 4,000 | 0.2 / 8,700,000 / 0.00000001 | Direct Binance network `WLD` to World Chain 480 |
+| USDC | 2,000 | 2,000 | 5 / 9,999,999 / 0.000001 | Prefer direct only when live; otherwise Binance Optimism plus Across between chain 10 and World Chain 480 |
+| WLD | 4,000 | 4,000 | 0.2 / 8,700,000 / 0.00000001 | Prefer Binance `WLD`; fall back to Binance `OPTIMISM` plus Across when the direct network disappears |
 
 These values are evidence for parity tests, not immutable production limits.
 At runtime the Binance capital configuration is authoritative for network
 enablement, fees, and withdrawal constraints. A changed or unavailable route
 blocks rebalance and therefore blocks new entries once inventory is unsafe.
+
+Route choice follows the Rails behavior but is stricter:
+
+1. For Binance to wallet, use the target network only while live
+   `withdrawEnable=true` and `busy=false`.
+2. Otherwise require the configured Optimism network to be withdrawable and a
+   fresh Across Optimism-to-World-Chain quote.
+3. For wallet to Binance, repeat the decision independently using
+   `depositEnable`; withdrawal availability must not influence deposit routing.
+4. Use withdrawal min/max/multiple and fee from the selected network, because
+   the Optimism constraints can differ from the `WLD` constraints.
+5. Recheck immediately before reserving the operation. Once the first external
+   side effect is submitted, pin that route and recover it rather than silently
+   switching routes midway.
 
 ## Execution state machine
 

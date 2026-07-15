@@ -141,7 +141,12 @@ impl BinanceAccountClient {
             .await
     }
 
-    async fn signed_get<T>(&self, path: &str, query: &str, operation: &str) -> anyhow::Result<T>
+    pub(super) async fn signed_get<T>(
+        &self,
+        path: &str,
+        query: &str,
+        operation: &str,
+    ) -> anyhow::Result<T>
     where
         T: for<'de> Deserialize<'de>,
     {
@@ -162,7 +167,7 @@ impl BinanceAccountClient {
         decode_response(response, operation).await
     }
 
-    fn signed_query(&self, parameters: &[(&str, String)]) -> anyhow::Result<String> {
+    pub(super) fn signed_query(&self, parameters: &[(&str, String)]) -> anyhow::Result<String> {
         let local_timestamp = unix_timestamp_ms()?;
         let timestamp = apply_clock_offset(local_timestamp, self.clock_offset_ms)?;
         let mut query = parameters

@@ -42,12 +42,12 @@ arbitrage execution jobs in the Rails application.
 | `GET /api/v3/openOrders` | Missing in Rails | Add at startup/reconnect for reconciliation of the Rust client-order namespace. |
 | `GET /api/v3/myTrades` | Missing in Rails | Add only for restart recovery when fills cannot be reconstructed from orders and the journal. |
 | `GET /api/v3/rateLimit/order` | Missing in Rails | Add outside the hot path for readiness and rate-limit telemetry. |
+| `GET /sapi/v1/capital/config/getall` | Rails chooses direct vs bridge and refreshes withdrawal limits | Keep in the cold path. Hydrate live network enablement, `busy`, fee, min/max, and integer multiple before every rebalance reservation. Prefer direct `WLD`, fall back to `OPTIMISM` plus Across independently for deposit and withdrawal. |
 
 The following Rails endpoints stay out of the trading hot path but are needed
 by the Rust rebalance state machine:
 
 - `GET /sapi/v1/capital/deposit/address/list`;
-- `GET /sapi/v1/capital/config/getall`;
 - `GET /sapi/v2/localentity/deposit/history`;
 - `PUT /sapi/v2/localentity/deposit/provide-info`;
 - `POST /sapi/v1/localentity/withdraw/apply`;

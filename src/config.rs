@@ -25,6 +25,8 @@ pub enum Command {
     Hydrate,
     /// Validate Binance credentials and hydrate sanitized Spot account metadata.
     BinanceAccount,
+    /// Hydrate sanitized Binance direct and Optimism fallback network state.
+    BinanceCapital,
 }
 
 #[derive(Parser, Debug, Clone)]

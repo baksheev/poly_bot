@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     binance::account::{BinanceAccountClient, BinanceAccountState},
+    binance::capital::{CapitalRouteState, select_capital_routes},
     chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
     dex::{
@@ -69,6 +70,16 @@ async fn main() -> anyhow::Result<()> {
             let state = client.hydrate(&symbols[0]).await?;
             validate_binance_account(&state)?;
             log_binance_account(&state);
+            Ok(())
+        }
+        Command::BinanceCapital => {
+            let mut client = BinanceAccountClient::from_env(&cli.config)?;
+            client.synchronize_clock().await?;
+            let coins = client.all_coin_information().await?;
+            let wld = select_capital_routes(&coins, "WLD", "WLD", "OPTIMISM")?;
+            let usdc = select_capital_routes(&coins, "USDC", "WLD", "OPTIMISM")?;
+            log_binance_capital(&wld);
+            log_binance_capital(&usdc);
             Ok(())
         }
     }
@@ -261,6 +272,21 @@ fn log_binance_account(state: &BinanceAccountState) {
         binance_wld_balance_present = state.balance("WLD").is_some(),
         binance_usdc_balance_present = state.balance("USDC").is_some(),
         "authenticated Binance Spot account hydrated"
+    );
+}
+
+fn log_binance_capital(state: &CapitalRouteState) {
+    tracing::info!(
+        coin = %state.coin,
+        deposit_all_enabled = state.deposit_all_enabled,
+        withdrawal_all_enabled = state.withdrawal_all_enabled,
+        direct_network = state.direct.as_ref().map(|network| network.network.as_str()),
+        direct_deposit_available = state.direct_deposit_available(),
+        direct_withdrawal_available = state.direct_withdrawal_available(),
+        fallback_network = state.fallback.as_ref().map(|network| network.network.as_str()),
+        fallback_deposit_available = state.fallback_deposit_available(),
+        fallback_withdrawal_available = state.fallback_withdrawal_available(),
+        "Binance capital routes hydrated"
     );
 }
 

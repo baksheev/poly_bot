@@ -26,15 +26,29 @@ pub enum Route {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WithdrawalRules {
+    pub minimum: U256,
+    pub maximum: U256,
+    pub multiple: U256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteCandidate {
+    pub route: Route,
+    pub binance_deposit_enabled: bool,
+    pub binance_withdrawal_enabled: bool,
+    pub across_wallet_to_bridge_enabled: bool,
+    pub across_bridge_to_wallet_enabled: bool,
+    pub withdrawal: WithdrawalRules,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalancePolicy {
     pub token_symbol: String,
     pub binance_min: U256,
     pub wallet_min: U256,
-    pub withdrawal_min: U256,
-    pub withdrawal_max: U256,
-    pub withdrawal_multiple: U256,
-    pub route: Route,
+    pub routes: Vec<RouteCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,9 +104,9 @@ pub fn plan_rebalance(
     let binance_target = total / U256::from(2);
     let wallet_target = total - binance_target;
     let action = if projected.binance < policy.binance_min {
-        plan_binance_refill(policy, projected, binance_target)
+        plan_binance_refill(policy, projected, binance_target)?
     } else if projected.wallet < policy.wallet_min {
-        plan_wallet_refill(policy, projected, wallet_target)
+        plan_wallet_refill(policy, projected, wallet_target)?
     } else {
         None
     };
@@ -111,15 +125,22 @@ fn validate_policy(policy: &RebalancePolicy) -> Result<()> {
         "rebalance token symbol is empty"
     );
     ensure!(
-        !policy.withdrawal_multiple.is_zero(),
-        "{} withdrawal multiple must be positive",
+        !policy.routes.is_empty(),
+        "{} has no configured rebalance routes",
         policy.token_symbol
     );
-    ensure!(
-        policy.withdrawal_min <= policy.withdrawal_max,
-        "{} withdrawal minimum exceeds maximum",
-        policy.token_symbol
-    );
+    for candidate in &policy.routes {
+        ensure!(
+            !candidate.withdrawal.multiple.is_zero(),
+            "{} withdrawal multiple must be positive",
+            policy.token_symbol
+        );
+        ensure!(
+            candidate.withdrawal.minimum <= candidate.withdrawal.maximum,
+            "{} withdrawal minimum exceeds maximum",
+            policy.token_symbol
+        );
+    }
     Ok(())
 }
 
@@ -178,44 +199,91 @@ fn plan_binance_refill(
     policy: &RebalancePolicy,
     projected: BalanceSnapshot,
     binance_target: U256,
-) -> Option<RebalanceAction> {
-    let wallet_surplus = projected.wallet.checked_sub(policy.wallet_min)?;
-    let target_deficit = binance_target.checked_sub(projected.binance)?;
+) -> Result<Option<RebalanceAction>> {
+    let wallet_surplus = projected
+        .wallet
+        .checked_sub(policy.wallet_min)
+        .unwrap_or(U256::ZERO);
+    let target_deficit = binance_target
+        .checked_sub(projected.binance)
+        .unwrap_or(U256::ZERO);
     let amount = target_deficit.min(wallet_surplus);
-    (!amount.is_zero()).then(|| RebalanceAction {
+    if amount.is_zero() {
+        return Ok(None);
+    }
+    let candidate = select_route(policy, Direction::WalletToBinance)?;
+    Ok(Some(RebalanceAction {
         direction: Direction::WalletToBinance,
         amount,
-        route: policy.route.clone(),
-    })
+        route: candidate.route.clone(),
+    }))
 }
 
 fn plan_wallet_refill(
     policy: &RebalancePolicy,
     projected: BalanceSnapshot,
     wallet_target: U256,
-) -> Option<RebalanceAction> {
-    let binance_surplus = projected.binance.checked_sub(policy.binance_min)?;
-    let target_deficit = wallet_target.checked_sub(projected.wallet)?;
+) -> Result<Option<RebalanceAction>> {
+    let binance_surplus = projected
+        .binance
+        .checked_sub(policy.binance_min)
+        .unwrap_or(U256::ZERO);
+    let target_deficit = wallet_target
+        .checked_sub(projected.wallet)
+        .unwrap_or(U256::ZERO);
     let requested = target_deficit.min(binance_surplus);
-    let amount = constrain_withdrawal(requested, policy);
+    if requested.is_zero() {
+        return Ok(None);
+    }
+    let candidate = select_route(policy, Direction::BinanceToWallet)?;
+    let amount = constrain_withdrawal(requested, candidate.withdrawal);
 
-    (!amount.is_zero() && amount <= binance_surplus).then(|| RebalanceAction {
-        direction: Direction::BinanceToWallet,
-        amount,
-        route: policy.route.clone(),
-    })
+    Ok(
+        (!amount.is_zero() && amount <= binance_surplus).then(|| RebalanceAction {
+            direction: Direction::BinanceToWallet,
+            amount,
+            route: candidate.route.clone(),
+        }),
+    )
 }
 
-fn constrain_withdrawal(requested: U256, policy: &RebalancePolicy) -> U256 {
+fn select_route(policy: &RebalancePolicy, direction: Direction) -> Result<&RouteCandidate> {
+    policy
+        .routes
+        .iter()
+        .find(|candidate| candidate.supports(direction))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no currently available {:?} route",
+                policy.token_symbol,
+                direction
+            )
+        })
+}
+
+impl RouteCandidate {
+    fn supports(&self, direction: Direction) -> bool {
+        match (&self.route, direction) {
+            (Route::Direct { .. }, Direction::WalletToBinance) => self.binance_deposit_enabled,
+            (Route::Direct { .. }, Direction::BinanceToWallet) => self.binance_withdrawal_enabled,
+            (Route::Across { .. }, Direction::WalletToBinance) => {
+                self.binance_deposit_enabled && self.across_wallet_to_bridge_enabled
+            }
+            (Route::Across { .. }, Direction::BinanceToWallet) => {
+                self.binance_withdrawal_enabled && self.across_bridge_to_wallet_enabled
+            }
+        }
+    }
+}
+
+fn constrain_withdrawal(requested: U256, rules: WithdrawalRules) -> U256 {
     if requested.is_zero() {
         return U256::ZERO;
     }
 
-    let bounded = requested
-        .max(policy.withdrawal_min)
-        .min(policy.withdrawal_max);
-    let rounded = bounded - (bounded % policy.withdrawal_multiple);
-    if rounded < policy.withdrawal_min {
+    let bounded = requested.max(rules.minimum).min(rules.maximum);
+    let rounded = bounded - (bounded % rules.multiple);
+    if rounded < rules.minimum {
         U256::ZERO
     } else {
         rounded
@@ -231,12 +299,43 @@ mod tests {
             token_symbol: "WLD".to_owned(),
             binance_min: U256::from(4_000),
             wallet_min: U256::from(4_000),
-            withdrawal_min: U256::from(200),
-            withdrawal_max: U256::from(8_700_000),
-            withdrawal_multiple: U256::from(10),
+            routes: vec![direct_candidate(true, true)],
+        }
+    }
+
+    fn direct_candidate(deposit_enabled: bool, withdrawal_enabled: bool) -> RouteCandidate {
+        RouteCandidate {
             route: Route::Direct {
                 binance_network: "WLD".to_owned(),
                 chain_id: 480,
+            },
+            binance_deposit_enabled: deposit_enabled,
+            binance_withdrawal_enabled: withdrawal_enabled,
+            across_wallet_to_bridge_enabled: false,
+            across_bridge_to_wallet_enabled: false,
+            withdrawal: WithdrawalRules {
+                minimum: U256::from(200),
+                maximum: U256::from(8_700_000),
+                multiple: U256::from(10),
+            },
+        }
+    }
+
+    fn across_candidate(deposit_enabled: bool, withdrawal_enabled: bool) -> RouteCandidate {
+        RouteCandidate {
+            route: Route::Across {
+                binance_network: "OPTIMISM".to_owned(),
+                bridge_chain_id: 10,
+                wallet_chain_id: 480,
+            },
+            binance_deposit_enabled: deposit_enabled,
+            binance_withdrawal_enabled: withdrawal_enabled,
+            across_wallet_to_bridge_enabled: true,
+            across_bridge_to_wallet_enabled: true,
+            withdrawal: WithdrawalRules {
+                minimum: U256::from(300),
+                maximum: U256::from(8_000_000),
+                multiple: U256::from(100),
             },
         }
     }
@@ -275,7 +374,7 @@ mod tests {
             Some(RebalanceAction {
                 direction: Direction::WalletToBinance,
                 amount: U256::from(2_000),
-                route: direct_policy().route,
+                route: direct_policy().routes[0].route.clone(),
             })
         );
     }
@@ -386,9 +485,9 @@ mod tests {
         let mut policy = direct_policy();
         policy.binance_min *= scale;
         policy.wallet_min *= scale;
-        policy.withdrawal_min *= scale;
-        policy.withdrawal_max *= scale;
-        policy.withdrawal_multiple *= scale;
+        policy.routes[0].withdrawal.minimum *= scale;
+        policy.routes[0].withdrawal.maximum *= scale;
+        policy.routes[0].withdrawal.multiple *= scale;
 
         let plan = plan_rebalance(
             &policy,
@@ -406,11 +505,7 @@ mod tests {
     #[test]
     fn preserves_across_route_in_action() {
         let mut policy = direct_policy();
-        policy.route = Route::Across {
-            binance_network: "OPTIMISM".to_owned(),
-            bridge_chain_id: 10,
-            wallet_chain_id: 480,
-        };
+        policy.routes = vec![across_candidate(true, true)];
 
         let plan = plan_rebalance(
             &policy,
@@ -422,6 +517,123 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.action.unwrap().route, policy.route);
+        assert_eq!(plan.action.unwrap().route, policy.routes[0].route);
+    }
+
+    #[test]
+    fn prefers_direct_withdrawal_when_the_wld_network_is_available() {
+        let mut policy = direct_policy();
+        policy.routes.push(across_candidate(true, true));
+
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(7_000),
+                wallet: U256::from(3_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan.action.unwrap().route,
+            Route::Direct { ref binance_network, .. } if binance_network == "WLD"
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_optimism_withdrawal_when_wld_withdrawal_disappears() {
+        let mut policy = direct_policy();
+        policy.routes = vec![direct_candidate(true, false), across_candidate(true, true)];
+
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(7_000),
+                wallet: U256::from(3_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan.action.unwrap().route,
+            Route::Across { ref binance_network, bridge_chain_id: 10, .. }
+                if binance_network == "OPTIMISM"
+        ));
+    }
+
+    #[test]
+    fn selects_deposit_route_independently_from_withdrawal_route() {
+        let mut policy = direct_policy();
+        policy.routes = vec![direct_candidate(false, true), across_candidate(true, true)];
+
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(3_000),
+                wallet: U256::from(7_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(plan.action.unwrap().route, Route::Across { .. }));
+    }
+
+    #[test]
+    fn fallback_uses_its_own_live_withdrawal_limits() {
+        let mut policy = direct_policy();
+        policy.routes = vec![direct_candidate(true, false), across_candidate(true, true)];
+
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(4_250),
+                wallet: U256::from(3_900),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(plan.action, None);
+    }
+
+    #[test]
+    fn fails_closed_when_neither_direct_nor_bridge_route_is_available() {
+        let mut policy = direct_policy();
+        policy.routes = vec![direct_candidate(true, false), across_candidate(true, false)];
+
+        let error = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(7_000),
+                wallet: U256::from(3_000),
+            },
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no currently available"));
+    }
+
+    #[test]
+    fn requires_across_direction_to_be_available_for_fallback() {
+        let mut fallback = across_candidate(true, true);
+        fallback.across_bridge_to_wallet_enabled = false;
+        let mut policy = direct_policy();
+        policy.routes = vec![direct_candidate(true, false), fallback];
+
+        let error = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(7_000),
+                wallet: U256::from(3_000),
+            },
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no currently available"));
     }
 }
