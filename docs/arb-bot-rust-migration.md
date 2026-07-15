@@ -206,6 +206,10 @@ the actual DEX received amount when quantity semantics match. Preserve:
 - restart hydration before new entries are enabled.
 
 Changing leg ordering is a separate strategy design, not part of cloning.
+After this control mode reaches paper parity, implement the concurrent mode
+behind the same coordinator and compare them through the randomized protocol in
+[the concurrent execution design](concurrent-execution.md). The external Rails
+bot is an operational benchmark, not the statistical control.
 
 ### 10. Rebalancing and operations
 
@@ -247,7 +251,8 @@ risk that both bots may act on the same opportunity.
 7. Enable one pair, minimum size, low daily limit, and automatic fail-closed
    gates.
 8. Compare realized execution, hedge latency, PnL, failures, and recovery with
-   the old bot without sharing state.
+   the old bot without sharing state; separately run the predeclared randomized
+   Rust `dex_first` versus `concurrent_hedged` experiment.
 9. Increase scope only through explicit limit/config changes.
 
 Stopping the canary means disabling its entry gate and reconciling its own

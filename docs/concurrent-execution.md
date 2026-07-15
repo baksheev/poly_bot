@@ -11,6 +11,19 @@ actual results and immediately flattens any unmatched exposure. The existing
 DEX-first behavior remains a control mode and fallback until production evidence
 shows that concurrent execution has better net expected value.
 
+Both modes must be implemented behind the same Rust coordinator boundary:
+
+- `dex_first` is the control and reproduces the current production ordering:
+  complete the DEX leg, submit a Binance limit hedge for the actual received
+  amount, then use the existing market fallback and reconciliation behavior;
+- `concurrent_hedged` is the treatment described by this document.
+
+The independently running Rails bot is a useful operational benchmark, but it
+is not the statistical control. Different code, infrastructure, accounts,
+inventory, and observation windows would confound the comparison. Confirmatory
+results come from randomized assignment between the two Rust modes under one
+versioned experiment protocol.
+
 Concurrent execution is not atomic. It deliberately exchanges the price drift
 between sequential legs for a higher probability of an orphaned or partially
 filled leg. It may be enabled only when the service can prove current balances,
@@ -380,6 +393,240 @@ Core operational distributions are:
 - recovery loss by cause and size bucket;
 - concurrent realized net profit compared with a replayed DEX-first control.
 
+## Comparative experiment
+
+### Hypothesis
+
+The confirmatory hypothesis is:
+
+```text
+H0: concurrent_hedged mean realized net PnL per assigned opportunity
+    - dex_first mean realized net PnL per assigned opportunity
+    <= superiority_margin
+
+H1: the difference is greater than superiority_margin
+```
+
+`superiority_margin` is the minimum improvement that pays for the treatment's
+additional orphan-leg and operational risk. It is denominated in token A per
+assigned opportunity and fixed before the confirmatory run. A statistically
+positive difference smaller than this margin is not sufficient to change the
+production default.
+
+The primary outcome is realized net PnL after all DEX and Binance fees, gas,
+slippage, recovery trades, and failed-attempt costs. Mean PnL is primary because
+it is economically additive. Median PnL and basis points per executed notional
+are descriptive secondary metrics and cannot replace an unfavorable primary
+result.
+
+### Shared opportunity and isolation
+
+Every candidate first becomes one immutable `ExperimentOpportunity` with:
+
+- unique `opportunity_id` and `experiment_id`;
+- identical market, pool-generation, fee, balance, risk, and source-revision
+  fingerprints for both policies;
+- one common direction, quantity, profit threshold, and maximum loss budget;
+- both policy plans or an explicit reason why either policy could not construct
+  a valid plan.
+
+Both planners run for every opportunity. They may differ only where execution
+ordering requires it; market inputs, math, fees, risk caps, and proposed size
+remain common. Only the randomly assigned mode may send live commands. The
+unassigned mode remains shadow-only, so the experiment never doubles capital or
+lets both modes consume the same liquidity.
+
+Only one plan may own the global execution lane at a time during the first
+canary. The opportunity engine continues recording deduplicated shared
+candidates while that lane is busy. A candidate suppressed by an active plan is
+assigned to the currently active switchback arm with zero execution PnL and an
+explicit `busy_suppressed` outcome. Otherwise a slower policy could hide its
+throughput cost by making later opportunities disappear from the dataset.
+
+An opportunity must be deduplicated before assignment. Repeated Binance ticks
+showing the same still-open edge are not independent experiment units and must
+not be randomized as separate chances to trade. The deduplication and cooldown
+rules are versioned parts of the experiment protocol.
+
+### Eligibility and intent to treat
+
+The pre-assignment gate checks only a common observable market opportunity:
+market/DEX freshness, common size, economics, and global hard risk configuration.
+This produces `shared_market_eligible`. Global-lane availability, inventory
+consumed by earlier trades, recovery state, and other policy-caused readiness
+conditions are deliberately not part of this gate; their suppression is an
+outcome of the assigned arm.
+
+The experiment may be globally paused for a predeclared exogenous condition that
+affects both modes, such as planned maintenance or loss of both venue feeds.
+Policy-triggered unknown exposure, circuit breaking, inventory depletion, or
+long recovery is never relabeled as an exogenous pause.
+
+Every shared-market-eligible opportunity is assigned and included in the primary
+intent-to-treat dataset. If the assigned policy subsequently declines, fails to
+dispatch, hits a safety gate, or recovers at a loss, its actual outcome remains
+in that arm. Dropping such rows would systematically hide operational failures.
+
+A secondary `both_policy_eligible` analysis may isolate execution mechanics, but
+it is not allowed to override the intent-to-treat result. Pre-assignment rejects
+are retained for funnel diagnostics but do not enter the primary estimator.
+
+### Random assignment
+
+The first live canary uses a randomized switchback design on one wallet and
+Binance account. A fixed-duration time block runs exactly one mode, and every
+shared candidate in that block belongs to that arm. This preserves one global
+execution lane while attributing busy time, recovery duration, and inventory
+carryover to the policy that caused them.
+
+The block sequence is deterministic, auditable, and balanced in randomized
+`AB`/`BA` pairs:
+
+```text
+pair_order = hash(experiment_seed, experiment_id, block_pair_id) mod 2
+0 -> [dex_first, concurrent_hedged]
+1 -> [concurrent_hedged, dex_first]
+```
+
+The secret-free seed, hash algorithm, block duration, and schedule are committed
+before enrollment. Assignment is immutable and recoverable after restart without
+ClickHouse. Blocks are long relative to normal execution/recovery time but short
+enough to distribute intraday market regimes across both modes; the duration is
+selected from pilot autocorrelation and then frozen.
+
+At a boundary, the current block stops opening entries and enters a bounded
+washout. The next block begins only after all exposure, orders, and nonces are
+reconciled. Washout time and delayed starts are attributed to the outgoing arm.
+Common, mode-independent inventory targets and rebalancing rules minimize
+carryover.
+
+Opportunity rows remain nested observations. The independent randomization and
+analysis unit is the switchback block, not an individual Binance tick. Direction,
+fixed size, expected edge, and volatility regime are recorded as adjustment and
+post-stratification fields rather than pretending that temporally adjacent rows
+are independent assignments.
+
+The first live experiment should use one fixed minimum size where possible. This
+reduces variance and makes token-A PnL per candidate interpretable. Both modes
+use the same account, fee tier, network path, balances, and runtime, removing
+those as confounders.
+
+If two genuinely isolated execution lanes are later provisioned, opportunity-
+level randomization can increase power. Each lane then needs matched capital,
+fee tier, latency, and risk limits plus a crossover schedule that periodically
+swaps modes between wallets/accounts; otherwise lane differences are confounded
+with policy.
+
+### Shadow counterfactual
+
+The unassigned planner records its plan and then consumes the captured market
+stream in paper mode. This produces a paired counterfactual useful for debugging,
+capacity analysis, and variance reduction.
+
+It is not treated as a live outcome. The unassigned order did not enter either
+venue, could not affect available liquidity, and did not experience actual
+matching-engine priority. Only randomized live outcomes support the causal
+production decision.
+
+### Metrics
+
+Primary metric:
+
+- realized net token-A PnL per assigned opportunity, including zero dispatches,
+  gas-only failures, and recovery losses after assignment.
+
+Each switchback block contributes its total realized PnL and count of assigned
+shared-market-eligible opportunities. The confirmatory estimator compares arms
+at the randomized block level while weighting only according to the predeclared
+analysis plan; it does not promote thousands of correlated ticks into thousands
+of independent samples. Blocks with no shared opportunity contribute to uptime
+and PnL-per-hour reporting but contain no per-opportunity outcome.
+
+Secondary metrics:
+
+- realized net PnL in basis points of assigned and executed notional;
+- realized net PnL per experiment-active hour, including washout;
+- profitable completion and primary-leg fill rates;
+- DEX and CEX latency, dispatch skew, and opportunity-to-terminal duration;
+- orphan, partial-fill, recovery, unknown-status, and circuit-breaker rates;
+- unhedged duration and maximum unhedged token-A notional;
+- recovery PnL, gas, Binance fee, DEX fee, and slippage by cause;
+- opportunity throughput and rejection reasons.
+
+Hard safety guardrails:
+
+- unresolved exposure count must return to zero;
+- no plan may exceed configured maximum loss, notional, or unhedged duration;
+- treatment recovery/unknown rates must remain within predeclared
+  non-inferiority margins versus control;
+- daily recovery loss and drawdown remain below hard circuit-breaker limits;
+- process restart and venue disconnect tests must reconcile before new entries.
+
+The treatment cannot win on mean PnL while failing a hard guardrail. Tail losses
+are reported without removing or winsorizing adverse outcomes from the primary
+metric.
+
+### Power and stopping rule
+
+The experiment declares before enrollment:
+
+- two-sided significance level `alpha = 0.05` for estimation and the equivalent
+  one-sided superiority decision;
+- target power of at least `80%`;
+- economically meaningful superiority margin `delta`;
+- fixed enrollment horizon or approved group-sequential checkpoints;
+- clustering interval and all safety non-inferiority margins.
+
+After a paper pilot estimates the standard deviation `sigma` of the block-level
+primary outcome, the approximate starting number of independent blocks per arm
+is:
+
+```text
+n ~= 2 * (z_(1-alpha/2) + z_power)^2 * sigma^2 / delta^2
+```
+
+This is increased for unequal block sizes, empty blocks, and the observed rate
+of unusable opportunities. Because trading outcomes are autocorrelated and
+heavy-tailed, the final confidence interval uses switchback randomization
+inference or a predeclared block bootstrap. Individual opportunities and ticks
+inside a block are never counted as independent sample-size units.
+
+Safety metrics are monitored continuously and may stop the experiment at any
+time. Efficacy is not repeatedly tested after every trade. A fixed-horizon test
+is preferred initially; if interim efficacy checks are needed, their checkpoints
+and alpha-spending boundaries are frozen in advance.
+
+The treatment becomes the default only when all conditions hold:
+
+1. the planned sample size and minimum runtime are complete;
+2. the lower confidence bound for the primary PnL difference exceeds the
+   predeclared superiority margin;
+3. safety guardrails pass their hard limits and non-inferiority checks;
+4. enough orphan and recovery observations exist to make the tail comparison
+   meaningful;
+5. results reproduce in a second holdout period or deliberately staged scale
+   increase.
+
+If the result is inconclusive, the control remains the default. The margin,
+outcome definition, strata, and stopping rule may be changed only in a new
+experiment ID.
+
+### Experiment telemetry
+
+Each shared candidate emits one experiment envelope containing:
+
+- experiment/opportunity IDs, block and block-pair IDs, assignment arm,
+  assignment probability, seed version, analysis strata, and eligibility result;
+- both policy plan fingerprints, proposed economics, and rejection reasons;
+- the assigned live plan ID and unassigned shadow plan ID;
+- every actual execution/recovery event and realized primary outcome;
+- active/washout timing and all metric inputs in integer base units.
+
+ClickHouse receives this envelope asynchronously for analysis. Assignment and
+live safety never depend on ClickHouse availability. A reproducible analysis
+query or script must regenerate arm counts, exclusions, PnL, confidence
+intervals, and guardrail results from the immutable envelopes.
+
 ## Paper implementation and tests
 
 The first implementation contains no live adapters. A deterministic simulator
@@ -396,7 +643,13 @@ drives the coordinator through at least:
 9. market recovery rejection, partial fill, and unknown result;
 10. process restart with open CEX orders, pending nonce, and unknown exposure;
 11. telemetry backpressure or outage during every state;
-12. duplicate and out-of-order venue events.
+12. duplicate and out-of-order venue events;
+13. both planners receiving an identical opportunity fingerprint and only the
+    assigned planner emitting commands;
+14. deterministic `AB`/`BA` block assignment across restart, washout, and empty
+    blocks;
+15. attribution of busy-suppressed opportunities and delayed block transitions
+    to the responsible arm.
 
 Property tests must prove:
 
@@ -405,23 +658,30 @@ Property tests must prove:
 - no state marked balanced retains exposure above the dust threshold;
 - unknown venue status never becomes a silent success or failure;
 - every risk-limit breach blocks new entries;
-- ClickHouse failure never blocks dispatch or recovery.
+- ClickHouse failure never blocks dispatch or recovery;
+- no post-assignment reject or recovery loss can disappear from the
+  intent-to-treat dataset;
+- the analysis counts switchback blocks, not nested ticks, as independent units.
 
 ## Rollout
 
-1. Implement the pure coordinator, deterministic identifiers, reservations, and
-   fault-injection tests.
-2. Feed real shadow opportunities into simulated venue adapters using measured
-   DEX/CEX latency and failure distributions.
-3. Add read-only Binance account hydration and validate restart reconciliation.
-4. Add paper adapters that construct exact requests and transactions but cannot
+1. Implement both `dex_first` and `concurrent_hedged` behind the same pure
+   coordinator interfaces, identifiers, reservations, and fault-injection
+   harness.
+2. Run both planners on every real shadow opportunity and feed them into
+   simulated venue adapters using measured DEX/CEX latency and failure
+   distributions.
+3. Freeze the first experiment protocol, eligibility rules, superiority margin,
+   pilot/confirmatory split, and analysis code.
+4. Add read-only Binance account hydration and validate restart reconciliation.
+5. Add paper adapters that construct exact requests and transactions but cannot
    submit them.
-5. Test supported non-production environments where venue behavior is
+6. Test supported non-production environments where venue behavior is
    representative.
-6. Provision a separate wallet and Binance account, tiny balances, hard loss
-   limits, and an explicit live-canary gate.
-7. Compare `concurrent_hedged` with DEX-first on realized profit, orphan rate,
-   unhedged duration, and recovery loss before increasing size.
+7. Provision one separate clone wallet and Binance account, tiny balances, hard
+   loss limits, and an explicit randomized live-canary gate.
+8. Complete the predeclared sample and holdout checks before changing the default
+   mode or increasing size.
 
 ## References
 
@@ -430,4 +690,3 @@ Property tests must prove:
   order state.
 - [Binance Developer Documentation](https://developers.binance.com/en/docs/introduction)
   describes persistent WebSocket, FIX, and SBE interfaces for trading systems.
-

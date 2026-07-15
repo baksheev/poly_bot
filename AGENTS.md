@@ -46,6 +46,10 @@ a time.
   sources of truth, validate them, and keep operational state in memory.
 - Preserve the existing DEX-first, Binance-hedge recovery semantics until a
   separate design explicitly changes execution ordering.
+- Keep `dex_first` and `concurrent_hedged` behind the same coordinator boundary.
+  Treat DEX-first as the control; change the production default only through the
+  predeclared randomized switchback experiment in
+  `docs/concurrent-execution.md`.
 - Before live canary, provision separate EVM wallets, nonce space, Binance
   account/API keys, inventory, secrets, limits, and recovery scope. Never let
   the two bots control the same funds, orders, or nonces.
