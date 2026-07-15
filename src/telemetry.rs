@@ -1,4 +1,10 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -12,6 +18,7 @@ use crate::config::AppConfig;
 #[derive(Clone)]
 pub struct TelemetryHandle {
     sender: mpsc::Sender<TelemetryRecord>,
+    dropped_records: Arc<AtomicU64>,
 }
 
 impl TelemetryHandle {
@@ -23,8 +30,8 @@ impl TelemetryHandle {
             payload_json: payload.to_string(),
         };
 
-        if let Err(error) = self.sender.try_send(record) {
-            tracing::warn!(kind, %error, "dropping telemetry outside the hot path");
+        if self.sender.try_send(record).is_err() {
+            self.dropped_records.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -66,11 +73,16 @@ impl TelemetryWriter {
 
     pub fn channel(self) -> (TelemetryHandle, TelemetryTask) {
         let (sender, receiver) = mpsc::channel(self.channel_capacity);
+        let dropped_records = Arc::new(AtomicU64::new(0));
         (
-            TelemetryHandle { sender },
+            TelemetryHandle {
+                sender,
+                dropped_records: Arc::clone(&dropped_records),
+            },
             TelemetryTask {
                 writer: self,
                 receiver,
+                dropped_records,
             },
         )
     }
@@ -138,6 +150,7 @@ TTL toDateTime(fromUnixTimestamp64Milli(observed_at_ms)) + INTERVAL 30 DAY
 pub struct TelemetryTask {
     writer: TelemetryWriter,
     receiver: mpsc::Receiver<TelemetryRecord>,
+    dropped_records: Arc<AtomicU64>,
 }
 
 impl TelemetryTask {
@@ -162,8 +175,18 @@ impl TelemetryTask {
                         }
                     }
                 }
-                _ = interval.tick() => self.flush(&mut batch).await,
+                _ = interval.tick() => {
+                    self.report_drops();
+                    self.flush(&mut batch).await;
+                },
             }
+        }
+    }
+
+    fn report_drops(&self) {
+        let dropped = self.dropped_records.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::warn!(dropped, "telemetry records dropped outside the hot path");
         }
     }
 
@@ -205,7 +228,7 @@ mod tests {
 
     #[test]
     fn clickhouse_identifier_is_restricted() {
-        assert!(validate_identifier("poly_bot_prod").is_ok());
-        assert!(validate_identifier("poly_bot; DROP DATABASE x").is_err());
+        assert!(validate_identifier("arb_bot_prod").is_ok());
+        assert!(validate_identifier("arb_bot; DROP DATABASE x").is_err());
     }
 }

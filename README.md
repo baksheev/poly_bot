@@ -1,41 +1,80 @@
-# poly_bot
+# arb_bot Rust migration
 
-Low-latency Rust service for trading Polymarket **BTC 5-minute Up/Down**
-markets. This first version is an executable architecture scaffold; it does
-not connect to exchanges or place orders yet.
+Low-latency Rust replacement for the existing Rails application at
+`/Users/baksheev/code/arb_bot`.
 
-## Architecture
+The new service is built beside the existing bot, one component at a time.
+Rails keeps running unchanged while the Rust service grows into a complete,
+autonomous clone. The two runtimes do not share mutable state or delegate live
+work to one another.
+
+## Target architecture
 
 ```text
-Binance WS ─┐
-            ├─> one Rust event loop ─> in-memory state ─> strategy ─> execution
-Polymarket ─┘                               │
-                                           └─> bounded async queue ─> ClickHouse
+Binance WebSocket ─────────┐
+Alchemy RPC / Multicall ───┼─> one Rust process ─> in-memory state
+chain subscriptions ───────┘          │                 │
+                                      │                 ├─> opportunity engine
+                                      │                 ├─> risk / inventory
+                                      │                 └─> execution (later)
+                                      │
+                                      └─> bounded async queue ─> ClickHouse
 ```
 
-The hot path never reads from or waits for ClickHouse. Telemetry uses
-`try_send`; if the bounded queue is full, the event is dropped and trading can
-continue. The service is intended to run as one Cloud Run Worker Pool instance.
+The trading path does not read from Postgres or ClickHouse and does not cross
+a job queue. Network clients, parsed configuration, market state, balances,
+reservations, nonces, and execution context are process-scoped and reused.
+ClickHouse is an asynchronous telemetry and journal sink only.
 
-The initial region is **GCP `us-east1`**, matching the current `pump_bot`
-ClickHouse region. This is a provisional placement decision and should be
-validated with latency measurements from GCP to Binance and Polymarket before
-enabling live execution.
+## Clone strategy
 
-The GCP project is `poly-bot-502515`. Local Google Cloud authentication is
-repository-scoped: always use `./scripts/gcloud-local` so this repository's
-active account, project, and ADC do not change the global `gcloud` setup. See
-[docs/gcp-local-auth.md](docs/gcp-local-auth.md).
+Each component is cloned and verified independently: configuration, Binance
+market data, DEX quoting, opportunity math, wallet state, DEX execution,
+Binance execution, recovery, and finally rebalancing. The existing Rails code
+is a behavioral specification and fixture source, not a runtime dependency.
 
-## What is included
+The first useful chain of components reproduces the current `USDC-WLD` /
+`WLDUSDC` loop in read-only mode:
 
-- Rust 1.90 / edition 2024 binary with `run`, `check`, and `migrate` commands;
-- single-owner in-memory runtime state;
-- non-blocking, batched ClickHouse telemetry channel;
-- ClickHouse migration for `runtime_telemetry`;
-- production multi-stage Docker image;
-- GitHub Actions quality and Docker build gate;
-- GCP Worker Pool configuration template.
+1. Binance `bookTicker` WebSocket.
+2. Uniswap V3/V4 quotes through Alchemy and `Multicall3`.
+3. Both arbitrage calculations in memory using fixed-point values.
+4. ClickHouse capture and deterministic replay.
+
+After the full clone passes paper and recovery tests, it receives separate EVM
+wallets, a separate Binance account/API key and separate inventory. It can then
+be enabled with a small isolated capital budget while the Rails bot continues
+to run.
+
+See [the migration design](docs/arb-bot-rust-migration.md) for the current
+Rails flow, ownership boundaries, stages, safety gates, and acceptance
+criteria.
+
+## Archived experiment: USDT/AED
+
+The initial OKX snapshot showed only about 6.6 bps gross edge before fees,
+versus roughly 17.5 bps for two taker legs on a regular account. That direction
+is not being implemented. The evidence is retained in
+[USDT/AED arbitrage validation](docs/usdt-aed-arbitrage-validation.md).
+
+## Current status
+
+The first clone component is implemented in read-only shadow mode: persistent
+Binance USD-M Futures `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
+parsing, reconnect generations, freshness/readiness state, a single in-memory
+state owner, and non-blocking ClickHouse telemetry. It has no private Binance,
+wallet, signing, or trading credentials and cannot place orders.
+
+Temporary infrastructure identifiers still use the original `poly_bot`
+bootstrap names:
+
+- GitHub remote: `baksheev/poly_bot`;
+- GCP project: `poly-bot-502515`;
+- runtime region: `asia-southeast1` (Singapore);
+- ClickHouse region: GCP `asia-southeast1` (Singapore).
+
+The GCP project and repository keep their bootstrap names for now. See
+[Singapore deployment and ClickHouse cutover](docs/singapore-infrastructure.md).
 
 ## Local setup
 
@@ -45,8 +84,8 @@ cargo run -- check
 cargo run -- run
 ```
 
-Without `CLICKHOUSE_URL`, `run` uses log-only telemetry. To create the table in
-a configured ClickHouse instance:
+Without `CLICKHOUSE_URL`, `run` uses log-only telemetry. To create the current
+telemetry table in a configured ClickHouse instance:
 
 ```bash
 cargo run -- migrate
@@ -58,24 +97,18 @@ Quality gate:
 scripts/quality.sh
 ```
 
-## Repository bootstrap
+Use `./scripts/gcloud-local` for all local Google Cloud commands. Its
+repository-local configuration does not mutate the global gcloud account,
+project, or ADC state. See [local GCP authentication](docs/gcp-local-auth.md).
 
-After creating an empty GitHub repository:
+## Planned implementation slices
 
-```bash
-git remote add origin git@github.com:YOUR_ORG/poly_bot.git
-git push -u origin main
-```
-
-Before the first GCP deployment, copy
-`infra/gcp/workloads.example.json` to `infra/gcp/workloads.json` and replace the
-service-account placeholder. Deployment automation is intentionally deferred
-until that identity and the GitHub repository exist.
-
-## Next implementation slices
-
-1. Discover the active BTC 5-minute market and resolve Up/Down token IDs.
-2. Add Binance book-ticker and Polymarket CLOB WebSocket connectors.
-3. Record synchronized market data to ClickHouse for research and replay.
-4. Add a deterministic replay/paper-trading engine and latency telemetry.
-5. Add signing, risk limits, reconciliation, and an explicit live-trading gate.
+1. Validate the read-only Binance component against live `WLDUSDC` traffic and
+   capture comparable Rails/Rust fixtures.
+2. Export and validate a versioned non-secret configuration snapshot for the
+   current `USDC-WLD` strategy.
+3. Implement reusable Alchemy + `Multicall3` Uniswap V3/V4 quote adapters.
+4. Port both opportunity calculations as pure fixed-point functions and run
+   synchronized shadow comparisons.
+5. Add isolated account/wallet hydration, then paper execution and forced
+   recovery tests before any live credentials are provisioned.
