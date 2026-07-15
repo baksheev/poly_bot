@@ -1,7 +1,7 @@
 # Singapore deployment and ClickHouse cutover
 
 Status: read-only production worker deployed and verified
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-16
 
 ## Decision
 
@@ -70,18 +70,26 @@ Worker Pool instance. It refuses to deploy a dirty worktree.
 ## Current production baseline
 
 The verified deployment is Worker Pool `arb-bot-rust-shadow`, revision
-`arb-bot-rust-shadow-00002-k4n`, from source revision `29aa3860a3b3` and image
-digest `sha256:db472da2deb93cb2d81d7c9a78487efcb292f768d6e73701f91df600e6564bfe`.
+`arb-bot-rust-shadow-00003-tjp`, from source revision `dc003db54889` and image
+digest `sha256:bf2683b29c77f8f1ab3fc5892c6db09d838352a5b03e3a0544f4cc2b196cc347`.
 
 - Cloud Run reports the revision `Ready` with one manually scaled instance,
   8 vCPU, 16 GiB RAM, and CPU idle disabled.
 - The process hydrated five configured Uniswap pools at World Chain block
-  `32405407`, completed its race-free backfill through block `32405408`, and
+  `32406459`, completed its race-free backfill, and
   established filtered Alchemy WebSocket subscriptions.
-- The process connected to Binance `WLDUSDC` bookTicker from Singapore and the
-  engine transitioned from `Starting` to `Ready`.
-- During the first production verification window ClickHouse received 40
-  `world_chain_head` records, four applied `dex_pool_event` records, and 788
-  `binance_book_ticker` records from the new revision.
+- The process connected to the Binance Spot raw stream
+  `wss://stream.binance.com:9443/ws/wldusdc@bookTicker`; both the market-data
+  and execution products in the active domain snapshot are `spot`.
+- In the fixed first production window from `2026-07-15 20:49:18 UTC` through
+  `20:52:00 UTC`, ClickHouse received 288 accepted Spot bookTicker records and
+  exactly 288 arbitrage evaluations. No candidate met the 20 bps threshold.
+- In that window in-memory opportunity calculation latency was 453 us p50,
+  560 us p95, 911 us p99, and 1,715 us maximum. This measures the complete
+  two-direction, five-pool evaluation including capacity search, not network
+  latency or telemetry insertion.
+- The latest sample in the verification window evaluated a 48.1 WLD baseline:
+  buying on the DEX and selling on Binance Spot was -21.10 bps, while buying on
+  Binance Spot and selling on the DEX was -53.64 bps.
 - No Worker Pool warning or error logs appeared during the startup check.
 - No wallet, signing, or Binance trading credentials are attached.
