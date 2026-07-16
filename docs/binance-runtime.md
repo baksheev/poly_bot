@@ -142,15 +142,14 @@ The production Rust subaccount should have:
 - IP restriction to the VM static address `34.21.220.162`;
 - a Rust-specific client order ID prefix, separate from Rails `arb...` IDs.
 
-A second, IP-restricted treasury API key remains the preferred least-privilege
-option for withdrawals. It is loaded by the cold-path rebalance owner only and
-is never accepted by an order client. The isolated Rust subaccount currently
-uses explicit `shared_trading` mode instead: its verified trading credential is
-reused by the cold-path owner and must therefore retain withdrawal permission.
-This is never an implicit fallback. Withdrawal-address whitelisting is required
-if the Binance account supports it. Runtime capability discovery must fail
-closed if the subaccount cannot deposit and withdraw directly without
-master-account coordination.
+A second, IP-restricted master treasury API key is required for withdrawals
+from the isolated subaccount. It is loaded by the cold-path rebalance owner
+only and is never accepted by an order client. The master first performs a
+deterministically identified Universal Transfer from subaccount Spot to master
+Spot, then submits the external withdrawal. Withdrawal-address whitelisting is
+required if the Binance account supports it. Runtime capability discovery must
+fail closed if the master cannot resolve the configured subaccount, transfer
+from it, or withdraw externally.
 
 The same in-process owner serializes DEX and rebalance wallet nonces. The
 initial safe implementation pauses new entries before reserving a rebalance

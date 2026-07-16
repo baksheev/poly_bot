@@ -37,7 +37,7 @@ plus the journal file lock prevent two processes from owning the same canary
 operation. The implemented
 full executor also places its high-level and nonce journals on this disk, but
 the current manifest selects `full_live`, mounts the wallet signer, and
-explicitly chooses shared Binance credentials for the isolated subaccount.
+explicitly chooses separate Binance subaccount and master treasury credentials.
 
 ## Networking and secrets
 
@@ -45,12 +45,14 @@ explicitly chooses shared Binance credentials for the isolated subaccount.
 - The control plane exposes only its IAM-authenticated DNS endpoint.
 - Pod egress passes through `arb-bot-gke-nat` and the reserved
   `arb-bot-gce-egress` address (`34.21.220.162`).
-- The GKE Secret Manager add-on mounts eight runtime secrets directly as
+- The GKE Secret Manager add-on mounts eleven runtime secrets directly as
   in-memory files. GitHub Actions and Kubernetes Secret objects never contain
   their values.
 - The runtime Kubernetes service account receives accessor permission only for
-  those eight secrets. GKE uses explicit `shared_trading` mode, so the verified
-  isolated-subaccount Binance pair is mounted once and reused by the executor.
+  those eleven secrets. The isolated-subaccount pair remains the trading and
+  deposit credential; a separate master pair owns internal transfer and
+  external withdrawal authority. The subaccount email is also mounted from
+  Secret Manager.
 - The namespace denies all inbound connections to the runtime Pod.
 
 Cloud NAT deliberately reuses the static IP that was previously attached to
@@ -129,8 +131,9 @@ Kubernetes retains five Deployment revisions.
 ## First cutover
 
 1. Confirm that `34.21.220.162` remains in the Binance API-key allowlist.
-2. Confirm that the key belongs exclusively to the isolated Rust subaccount
-   and that shared read/trade/withdraw authority is intentional.
+2. Confirm that the trading key belongs exclusively to the isolated Rust
+   subaccount. Confirm that the separate master key has only Reading,
+   Withdrawals, Universal Transfer, and the same IP restriction.
 3. Verify the signer address, fund only the reviewed test inventory, and choose
    positive WLD and USDC per-operation caps.
 4. Configure the six GitHub production environment variables and reviewer.

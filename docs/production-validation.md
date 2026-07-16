@@ -49,9 +49,10 @@ does not replace a real operation against the production endpoint.
 | Compensation | CEX failure retries MARKET and records loss | Pending | — |
 | Rebalance | direct route end-to-end | Pending | — |
 | Rebalance | Optimism + Across fallback end-to-end | Pending | — |
-| GKE full-live preflight | secrets, signer, caps, isolated inventory | Passed | GKE NAT authenticated the latest shared key against exactly 1,000 USDC and 2,500 WLD; WLD direct/fallback and USDC fallback routes pass; signer and both RPCs pass; GitHub caps are 500 USDC and 1,250 WLD; operator selected explicit shared-key mode |
+| GKE subaccount preflight | trading key, signer, caps, isolated inventory | Passed | GKE NAT authenticated the isolated subaccount against exactly 1,000 USDC and 2,500 WLD; WLD direct/fallback and USDC fallback routes pass; signer and both RPCs pass; GitHub caps are 500 USDC and 1,250 WLD. |
 | GKE first full-live attempt | 500 USDC fallback intent | Failed closed | `localentity` withdrawal returned HTTP 401 / Binance `-1002`; durable journal remained at `intent_recorded`, wallet nonce journal stayed empty, and no withdrawal was indexed. The account is configured for the standard capital withdrawal API before retry. |
 | GKE standard withdrawal retry | 500 USDC fallback intent | Failed closed | Standard `capital/withdraw/apply` also returned HTTP 401 / Binance `-1002` before any withdrawal was indexed, proving the shared API key itself lacks withdrawal authorization even though the Spot account reports `canWithdraw=true`. Startup now checks `account/apiRestrictions` before creating a journal. |
+| GKE master-treasury preflight | master key permissions and subaccount mapping | Pending | The runtime now requires Reading, Withdrawals, Universal Transfer, and the production IP allowlist on a separate master key, then verifies the master's WLD/USDC view of the configured subaccount before opening journals. |
 
 The wallet and Binance hydration evidence above intentionally records no secret
 material or raw authenticated request. The bootstrap ETH withdrawal and native

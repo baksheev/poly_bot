@@ -303,11 +303,8 @@ impl AppConfig {
             "rebalance live amount limits must not be negative"
         );
         ensure!(
-            matches!(
-                self.rebalance_binance_credential_mode.as_str(),
-                "separate_treasury" | "shared_trading"
-            ),
-            "REBALANCE_BINANCE_CREDENTIAL_MODE must be separate_treasury or shared_trading"
+            self.rebalance_binance_credential_mode == "separate_treasury",
+            "REBALANCE_BINANCE_CREDENTIAL_MODE must be separate_treasury"
         );
         ensure!(
             matches!(
@@ -521,7 +518,7 @@ mod tests {
         value.validate().unwrap();
 
         value.rebalance_binance_credential_mode = "shared_trading".into();
-        value.validate().unwrap();
+        assert!(value.validate().is_err());
     }
 
     #[test]

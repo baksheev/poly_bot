@@ -1736,28 +1736,17 @@ async fn run(
             std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
                 format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
             })?;
-        let mut treasury_client = if config.rebalance_binance_credential_mode == "shared_trading" {
-            tracing::warn!(
-                "full rebalance executor is sharing the Binance trading credential by operator choice"
-            );
-            binance_account_client.clone()
-        } else {
-            BinanceAccountClient::from_treasury_env(&config)?
-        };
-        treasury_client.synchronize_clock().await?;
-        let treasury_account = treasury_client.account_information().await?;
-        for asset in &binance_assets {
-            let observed = initial_binance_balances
-                .balances
-                .get(asset)
-                .with_context(|| format!("initial Binance snapshot is missing {asset}"))?;
-            ensure!(
-                free_balance_from_information(&treasury_account, asset) == observed.free,
-                "Binance treasury key does not resolve to the hydrated trading subaccount"
-            );
-        }
+        ensure!(
+            config.rebalance_binance_credential_mode == "separate_treasury",
+            "full rebalance requires a separate Binance master treasury key"
+        );
+        let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
+            .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
+        let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
         let mut executor = RebalanceExecutor::hydrate(
+            binance_account_client.clone(),
             treasury_client,
+            subaccount_email,
             AcrossClient::new(&config)?,
             wallet_rpc.clone(),
             JsonRpcClient::new(optimism_endpoint)?,

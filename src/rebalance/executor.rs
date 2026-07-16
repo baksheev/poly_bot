@@ -70,6 +70,16 @@ impl RebalanceExecutionIntent {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RebalanceExecutionProgress {
     IntentRecorded,
+    BinanceTransferSubmitted {
+        transaction_id: u64,
+        #[serde(with = "u256_serde")]
+        bridge_balance_before: U256,
+    },
+    BinanceTransferCompleted {
+        transaction_id: u64,
+        #[serde(with = "u256_serde")]
+        bridge_balance_before: U256,
+    },
     BinanceWithdrawalSubmitted {
         submission_reference: String,
         #[serde(with = "u256_serde")]
@@ -553,6 +563,18 @@ fn validate_transition(
             Route::Direct { .. },
             Direction::BinanceToWallet,
             P::IntentRecorded,
+            P::BinanceTransferSubmitted { .. },
+        ) => true,
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::BinanceTransferSubmitted { .. },
+            P::BinanceTransferCompleted { .. },
+        ) => true,
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::BinanceTransferCompleted { .. },
             P::BinanceWithdrawalSubmitted { .. },
         ) => true,
         (
@@ -583,6 +605,18 @@ fn validate_transition(
             Route::Across { .. },
             Direction::BinanceToWallet,
             P::IntentRecorded,
+            P::BinanceTransferSubmitted { .. },
+        ) => true,
+        (
+            Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceTransferSubmitted { .. },
+            P::BinanceTransferCompleted { .. },
+        ) => true,
+        (
+            Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceTransferCompleted { .. },
             P::BinanceWithdrawalSubmitted { .. },
         ) => true,
         (
@@ -665,6 +699,10 @@ fn validate_progress_evidence(
 ) -> anyhow::Result<()> {
     use RebalanceExecutionProgress as P;
     match progress {
+        P::BinanceTransferSubmitted { transaction_id, .. }
+        | P::BinanceTransferCompleted { transaction_id, .. } => {
+            ensure!(*transaction_id > 0, "rebalance Binance transfer id is zero")
+        }
         P::BinanceWithdrawalSubmitted {
             submission_reference,
             ..
@@ -1055,6 +1093,54 @@ mod tests {
                 calldata_hash,
                 ..
             } if recovered == &calldata && *calldata_hash == keccak256(&calldata)
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persists_master_transfer_before_binance_withdrawal() {
+        let path = path("master-transfer");
+        let operation_id;
+        {
+            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+            let operation = journal
+                .reserve(&request(Direction::BinanceToWallet, across()))
+                .unwrap();
+            operation_id = operation.intent.operation_id.clone();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceTransferSubmitted {
+                        transaction_id: 42,
+                        bridge_balance_before: U256::from(8_000_000_u64),
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceTransferCompleted {
+                        transaction_id: 42,
+                        bridge_balance_before: U256::from(8_000_000_u64),
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                        submission_reference: "withdrawal-1".to_owned(),
+                        bridge_balance_before: U256::from(8_000_000_u64),
+                    },
+                )
+                .unwrap();
+        }
+
+        let journal = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(matches!(
+            journal.operations()[&operation_id].progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted { .. }
         ));
         drop(journal);
         fs::remove_file(path).unwrap();

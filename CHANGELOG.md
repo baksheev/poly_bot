@@ -14,12 +14,16 @@ the exact artifact used by each rollout.
   withdrawal ID, exact Across calldata, confirmation, and final balance
   reconciliation; a bounded worker keeps the network-heavy flow outside the
   market-data loop.
-- `full_live` requires an explicit separate-treasury or shared-trading Binance
-  credential mode, an exact operator acknowledgement, positive WLD and USDC
-  caps, a wallet signer, dual-chain RPC hydration, and durable high-level plus
-  nonce journals.
-- The GKE template mounts the eight secrets needed by operator-selected
-  shared-key mode, persists both executor journals, and obtains positive
+- `full_live` requires an isolated subaccount trading credential and a separate
+  master treasury credential, an exact operator acknowledgement, positive WLD
+  and USDC caps, a wallet signer, dual-chain RPC hydration, and durable
+  high-level plus nonce journals.
+- Binance-to-wallet execution first performs a master-authorized universal
+  transfer from the isolated subaccount with a deterministic `clientTranId`,
+  reconciles that transfer, and only then submits the external withdrawal from
+  the master account. Both steps survive restart without blind retries.
+- The GKE template mounts the eleven secrets needed by the two-account flow,
+  persists both executor journals, and obtains positive
   WLD/USDC limits from a reviewer-protected GitHub production environment.
   Deployment validation rejects absent or zero limits before authentication or
   rollout.
@@ -28,8 +32,9 @@ the exact artifact used by each rollout.
 - Full rebalance withdrawal submission supports explicit `standard` and
   `travel_rule` Binance API modes. GKE selects `standard` after the isolated
   subaccount rejected the local-entity endpoint before any withdrawal.
-- Full-live startup checks the selected Binance key's read, withdrawal, and IP
-  restriction flags before opening either durable execution journal.
+- Full-live startup checks the subaccount key's read/IP flags, the master key's
+  read/withdrawal/universal-transfer/IP flags, and verifies the master's view
+  of the configured subaccount balances before opening either journal.
 
 - Reusable EVM wallet primitives for canonical-block balance and allowance
   hydration, latest/pending nonce observation, native and ERC-20 transfer or

@@ -1,6 +1,6 @@
 # Autonomous rebalance design
 
-Status: full executor and GKE template implemented; shared-key mode selected for the isolated subaccount; first live rollout pending
+Status: full executor and GKE template implemented; isolated subaccount plus master treasury mode selected; first live rollout pending
 Last reviewed: 2026-07-16
 
 ## Ownership and safety boundary
@@ -13,16 +13,14 @@ Use two Binance credentials:
 
 1. A trading key with read and Spot trading permissions, withdrawals disabled,
    and an IP restriction to the production VM.
-2. A treasury key with only the permissions required for deposit/withdrawal
-   reconciliation and withdrawals, the same IP restriction, and withdrawal
-   address whitelisting where available.
+2. A master treasury key with reading, external withdrawal, and Universal
+   Transfer permissions, the same production IP restriction, and withdrawal
+   address whitelisting where available. It does not need Spot trading.
 
-This is the preferred least-privilege topology, not a functional requirement.
-For the isolated Rust subaccount, the operator selected explicit
-`shared_trading` mode. It reuses one process-scoped client and one credential
-pair for reads, trading, and treasury operations. This increases credential
-blast radius and must never be enabled implicitly or used to share ownership
-with the Rails bot.
+Binance subaccounts cannot withdraw externally. The separate master credential
+is therefore a functional requirement for the isolated Rust subaccount, not
+only a least-privilege preference. `BINANCE_SUBACCOUNT_EMAIL` identifies the
+exact transfer source and is stored in Secret Manager as account metadata.
 
 The credentials used for initial parity testing are not production-isolated.
 Rotate them before live trading and replace them with keys belonging to the
@@ -75,9 +73,12 @@ Deployment template selects it, but no GKE workload has been rolled out yet.
 Startup requires an explicitly selected Binance credential mode, a wallet
 signer, both durable journals, positive per-token caps, and the exact
 `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE` acknowledgement.
-Before opening either journal, startup verifies the selected Binance key has
-reading, withdrawal, and IP-restriction permissions through
-`account/apiRestrictions`; account-level `canWithdraw` alone is insufficient.
+Before opening either journal, startup verifies the trading key has reading and
+IP-restriction permissions, the master treasury key has reading, withdrawal,
+Universal Transfer, and IP-restriction permissions through
+`account/apiRestrictions`, and the master key reports the same WLD/USDC
+subaccount balances as the trading key. Account-level `canWithdraw` alone is
+insufficient.
 The current subaccount uses explicit `standard` withdrawal API mode; the
 `localentity` Travel Rule endpoint is available only through explicit
 `travel_rule` configuration and is never used as an implicit fallback.
@@ -112,8 +113,8 @@ unresolved hash: a matching receipt durably closes the operation, while a
 transaction without a receipt is accepted only after chain, sender, nonce,
 target, value, and calldata hash match the journaled intent. Missing, replaced,
 or unsigned operations remain blocked for operator review. The first GKE
-deployment uses the verified isolated subaccount, operator-selected caps, and
-shared-key acknowledgement. The Rails failure-mode review is recorded in
+deployment uses the verified isolated subaccount, a separate master treasury
+key, and operator-selected caps. The Rails failure-mode review is recorded in
 [Rails wallet failure lessons](rails-wallet-parity.md).
 
 Explicitly gated mutation commands require `EVM_WALLET_JOURNAL_PATH`. Its
@@ -194,15 +195,18 @@ Every transfer follows a recoverable sequence:
 
 Routes for both WLD and USDC:
 
-- Direct Binance to wallet: submit a withdrawal with deterministic
-  `withdrawOrderId` through the explicitly selected standard or Travel Rule
-  API, reconcile withdrawal history, and confirm the final World Chain balance.
+- Direct Binance to wallet: use the master key to transfer the exact amount
+  from subaccount Spot to master Spot with a deterministic `clientTranId`,
+  reconcile the internal transfer, submit a withdrawal with deterministic
+  `withdrawOrderId`, reconcile withdrawal history, and confirm the final World
+  Chain balance.
 - Direct wallet to Binance: transfer to a freshly verified Binance deposit
   address, confirm the chain receipt, then reconcile Travel Rule state,
   deposit history, and credited balance.
-- Across Binance to wallet: withdraw to Optimism, measure the actual amount
-  received after the Binance fee, execute any required approval plus the
-  validated Across call, then confirm the World Chain credit.
+- Across Binance to wallet: transfer subaccount Spot to master Spot, withdraw
+  to Optimism, measure the actual amount received after the Binance fee,
+  execute any required approval plus the validated Across call, then confirm
+  the World Chain credit.
 - Across wallet to Binance: bridge World Chain to Optimism, measure the actual
   output, transfer that exact amount to the verified Binance deposit address,
   then reconcile the Binance credit.
@@ -226,6 +230,8 @@ Across credentials.
 
 Official references:
 
+- <https://www.binance.com/en/academy/articles/how-to-transfer-assets-between-binance-master-and-sub-accounts>
+- <https://developers.binance.com/en/docs/catalog/core-trading-wallet/api/rest-api/account>
 - <https://docs.across.to/introduction/swap-api>
 - <https://docs.across.to/introduction/tracking-deposits>
 - <https://developers.binance.com/en/docs/wallet/capital/withdraw>
@@ -276,7 +282,7 @@ new quote after an ambiguous outcome.
    the explicit `full_live` gate; no production activation has occurred.
 7. One-shot direct WLD Binance-to-wallet transfer behind a capped production
    gate — implemented and retained as the GKE control mode.
-8. Explicit separate-treasury or shared-trading credential mode, per-token
+8. Explicit subaccount plus master-treasury credential mode, per-token
    caps, exact live acknowledgement, route revalidation, and dual-chain nonce
    recovery — implemented.
 9. Isolated-capital canaries, failure injection, soak testing, and only then a

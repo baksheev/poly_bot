@@ -66,6 +66,9 @@ spec:
                 ALCHEMY_OPTIMISM_RPC_URL \
                 BINANCE_API_KEY \
                 BINANCE_SECRET_KEY \
+                BINANCE_TREASURY_API_KEY \
+                BINANCE_TREASURY_SECRET_KEY \
+                BINANCE_SUBACCOUNT_EMAIL \
                 EVM_WALLET_PRIVATE_KEY; do
                 secret_value="$(cat "/var/run/secrets/arb-bot/${secret_name}")"
                 export "${secret_name}=${secret_value}"
@@ -85,7 +88,7 @@ spec:
             - name: REBALANCE_LIVE_CONFIRMATION
               value: ENABLE_FULL_REBALANCE
             - name: REBALANCE_BINANCE_CREDENTIAL_MODE
-              value: shared_trading
+              value: separate_treasury
             - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
               value: standard
           resources:

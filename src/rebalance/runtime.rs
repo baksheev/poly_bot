@@ -11,8 +11,9 @@ use crate::{
         validate_quote,
     },
     binance::{
-        account::BinanceAccountClient,
+        account::{AccountInformation, BinanceAccountClient},
         capital::{DepositRecord, WithdrawalRecord, select_capital_routes},
+        sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
     chain::rpc::{JsonRpcClient, TransactionReceipt},
     wallet::{
@@ -56,7 +57,9 @@ impl RebalanceRuntimeLimits {
 }
 
 pub struct RebalanceExecutor {
-    binance: BinanceAccountClient,
+    trading_binance: BinanceAccountClient,
+    treasury_binance: BinanceAccountClient,
+    subaccount_email: String,
     across: AcrossClient,
     world: JsonRpcClient,
     optimism: JsonRpcClient,
@@ -83,7 +86,9 @@ impl std::fmt::Debug for RebalanceExecutor {
 impl RebalanceExecutor {
     #[allow(clippy::too_many_arguments)]
     pub async fn hydrate(
-        mut binance: BinanceAccountClient,
+        mut trading_binance: BinanceAccountClient,
+        mut treasury_binance: BinanceAccountClient,
+        subaccount_email: String,
         across: AcrossClient,
         world: JsonRpcClient,
         optimism: JsonRpcClient,
@@ -118,25 +123,52 @@ impl RebalanceExecutor {
             optimism_chain == OPTIMISM_CHAIN_ID,
             "Optimism RPC returned the wrong chain id"
         );
-        binance.synchronize_clock().await?;
-        let treasury_account = binance.account_information().await?;
         ensure!(
-            treasury_account.can_withdraw && treasury_account.can_deposit,
-            "Binance treasury account does not permit deposits and withdrawals"
+            subaccount_email.contains('@') && subaccount_email.is_ascii(),
+            "Binance sub-account email is invalid"
         );
-        let api_key_permissions = binance.api_key_permissions().await?;
+        trading_binance.synchronize_clock().await?;
+        treasury_binance.synchronize_clock().await?;
+        let trading_account = trading_binance.account_information().await?;
         ensure!(
-            api_key_permissions.enable_reading,
-            "Binance rebalance API key does not permit reads"
+            trading_account.can_deposit,
+            "Binance trading sub-account does not permit deposits"
+        );
+        let trading_permissions = trading_binance.api_key_permissions().await?;
+        ensure!(
+            trading_permissions.enable_reading,
+            "Binance trading sub-account key does not permit reads"
         );
         ensure!(
-            api_key_permissions.enable_withdrawals,
-            "Binance rebalance API key does not permit withdrawals"
+            trading_permissions.ip_restrict,
+            "Binance trading sub-account key is not IP restricted"
+        );
+        let treasury_account = treasury_binance.account_information().await?;
+        ensure!(
+            treasury_account.can_withdraw,
+            "Binance master account does not permit withdrawals"
+        );
+        let treasury_permissions = treasury_binance.api_key_permissions().await?;
+        ensure!(
+            treasury_permissions.enable_reading,
+            "Binance master treasury key does not permit reads"
         );
         ensure!(
-            api_key_permissions.ip_restrict,
-            "Binance rebalance API key is not IP restricted"
+            treasury_permissions.enable_withdrawals,
+            "Binance master treasury key does not permit withdrawals"
         );
+        ensure!(
+            treasury_permissions.permits_universal_transfer,
+            "Binance master treasury key does not permit universal transfers"
+        );
+        ensure!(
+            treasury_permissions.ip_restrict,
+            "Binance master treasury key is not IP restricted"
+        );
+        let master_view = treasury_binance
+            .subaccount_spot_assets(&subaccount_email)
+            .await?;
+        validate_master_subaccount_view(&trading_account, &master_view.balances)?;
 
         let mut transaction_journal = TransactionJournal::open(transaction_journal_path)?;
         let (world_latest, world_pending, optimism_latest, optimism_pending) = tokio::try_join!(
@@ -179,7 +211,9 @@ impl RebalanceExecutor {
         .await?;
 
         Ok(Self {
-            binance,
+            trading_binance,
+            treasury_binance,
+            subaccount_email,
             across,
             world,
             optimism,
@@ -271,18 +305,17 @@ impl RebalanceExecutor {
             chain_id == WORLD_CHAIN_CHAIN_ID,
             "direct rebalance target is not World Chain"
         );
+        let withdrawal_submission_safe = created_here
+            || matches!(
+                operation.progress,
+                RebalanceExecutionProgress::IntentRecorded
+                    | RebalanceExecutionProgress::BinanceTransferSubmitted { .. }
+            );
         if matches!(
             operation.progress,
             RebalanceExecutionProgress::IntentRecorded
         ) {
             self.verify_route(&operation, true).await?;
-            let existing = self
-                .binance
-                .withdrawal_history(
-                    &operation.intent.token_symbol,
-                    &operation.intent.withdraw_order_id,
-                )
-                .await?;
             let bridge_before = self
                 .world
                 .erc20_balance(
@@ -290,29 +323,14 @@ impl RebalanceExecutor {
                     operation.intent.wallet_owner,
                 )
                 .await?;
-            let submission_reference = if let Some(record) = existing.first() {
-                validate_withdrawal_record(&operation, record)?;
-                record.id.clone()
-            } else {
-                ensure!(
-                    created_here,
-                    "rebalance intent has no indexed Binance withdrawal; operator review required"
-                );
-                let amount = base_units_to_decimal(
-                    operation.intent.amount,
-                    operation.intent.token_decimals,
-                )?;
-                self.submit_binance_withdrawal(&operation, &binance_network, amount)
-                    .await?
-            };
-            operation = self.execution_journal.advance(
-                &operation.intent.operation_id,
-                RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
-                    submission_reference,
-                    bridge_balance_before: bridge_before,
-                },
-            )?;
+            operation = self
+                .begin_master_transfer(operation, created_here, bridge_before)
+                .await?;
         }
+        operation = self.finish_master_transfer(operation).await?;
+        operation = self
+            .begin_binance_withdrawal(operation, withdrawal_submission_safe, &binance_network)
+            .await?;
         let (bridge_before, record) = match &operation.progress {
             RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
                 bridge_balance_before,
@@ -378,7 +396,7 @@ impl RebalanceExecutor {
         ) {
             self.verify_route(&operation, false).await?;
             let address = self
-                .binance
+                .trading_binance
                 .evm_deposit_address(&operation.intent.token_symbol, &binance_network)
                 .await?;
             let call = WalletCall::erc20_transfer(
@@ -428,18 +446,17 @@ impl RebalanceExecutor {
             bridge_chain_id == OPTIMISM_CHAIN_ID && wallet_chain_id == WORLD_CHAIN_CHAIN_ID,
             "unsupported Across route"
         );
+        let withdrawal_submission_safe = created_here
+            || matches!(
+                operation.progress,
+                RebalanceExecutionProgress::IntentRecorded
+                    | RebalanceExecutionProgress::BinanceTransferSubmitted { .. }
+            );
         if matches!(
             operation.progress,
             RebalanceExecutionProgress::IntentRecorded
         ) {
             self.verify_route(&operation, true).await?;
-            let existing = self
-                .binance
-                .withdrawal_history(
-                    &operation.intent.token_symbol,
-                    &operation.intent.withdraw_order_id,
-                )
-                .await?;
             let bridge_before = self
                 .optimism
                 .erc20_balance(
@@ -447,29 +464,14 @@ impl RebalanceExecutor {
                     operation.intent.wallet_owner,
                 )
                 .await?;
-            let submission_reference = if let Some(record) = existing.first() {
-                validate_withdrawal_record(&operation, record)?;
-                record.id.clone()
-            } else {
-                ensure!(
-                    created_here,
-                    "rebalance intent has no indexed Binance withdrawal; operator review required"
-                );
-                let amount = base_units_to_decimal(
-                    operation.intent.amount,
-                    operation.intent.token_decimals,
-                )?;
-                self.submit_binance_withdrawal(&operation, &binance_network, amount)
-                    .await?
-            };
-            operation = self.execution_journal.advance(
-                &operation.intent.operation_id,
-                RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
-                    submission_reference,
-                    bridge_balance_before: bridge_before,
-                },
-            )?;
+            operation = self
+                .begin_master_transfer(operation, created_here, bridge_before)
+                .await?;
         }
+        operation = self.finish_master_transfer(operation).await?;
+        operation = self
+            .begin_binance_withdrawal(operation, withdrawal_submission_safe, &binance_network)
+            .await?;
         if let RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
             bridge_balance_before,
             ..
@@ -537,7 +539,7 @@ impl RebalanceExecutor {
         {
             self.verify_route(&operation, false).await?;
             let deposit_address = self
-                .binance
+                .trading_binance
                 .evm_deposit_address(&operation.intent.token_symbol, &binance_network)
                 .await?;
             let call = WalletCall::erc20_transfer(
@@ -947,6 +949,161 @@ impl RebalanceExecutor {
         Ok(operation)
     }
 
+    async fn begin_master_transfer(
+        &mut self,
+        operation: RebalanceExecutionOperation,
+        created_here: bool,
+        bridge_balance_before: U256,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let client_transaction_id = &operation.intent.withdraw_order_id;
+        let existing = self
+            .treasury_binance
+            .universal_transfer_history(&self.subaccount_email, client_transaction_id)
+            .await?;
+        let transaction_id = if let Some(record) = existing.first() {
+            validate_master_transfer_record(&operation, &self.subaccount_email, record)?;
+            record.transaction_id
+        } else {
+            ensure!(
+                created_here,
+                "rebalance intent has no indexed Binance master transfer; operator review required"
+            );
+            let amount =
+                base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+            self.treasury_binance
+                .universal_transfer_from_subaccount(
+                    &self.subaccount_email,
+                    &operation.intent.token_symbol,
+                    amount,
+                    client_transaction_id,
+                )
+                .await?
+                .transaction_id
+        };
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceTransferSubmitted {
+                transaction_id,
+                bridge_balance_before,
+            },
+        )
+    }
+
+    async fn finish_master_transfer(
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        if let RebalanceExecutionProgress::BinanceTransferSubmitted {
+            transaction_id,
+            bridge_balance_before,
+        } = operation.progress
+        {
+            let record = self
+                .wait_master_transfer(&operation, transaction_id)
+                .await?;
+            operation = self.execution_journal.advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: record.transaction_id,
+                    bridge_balance_before,
+                },
+            )?;
+        }
+        Ok(operation)
+    }
+
+    async fn begin_binance_withdrawal(
+        &mut self,
+        operation: RebalanceExecutionOperation,
+        submission_safe: bool,
+        network: &str,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let RebalanceExecutionProgress::BinanceTransferCompleted {
+            bridge_balance_before,
+            ..
+        } = operation.progress
+        else {
+            return Ok(operation);
+        };
+        let existing = self
+            .treasury_binance
+            .withdrawal_history(
+                &operation.intent.token_symbol,
+                &operation.intent.withdraw_order_id,
+            )
+            .await?;
+        let submission_reference = if let Some(record) = existing.first() {
+            validate_withdrawal_record(&operation, record)?;
+            record.id.clone()
+        } else {
+            ensure!(
+                submission_safe,
+                "master transfer completed but no Binance withdrawal is indexed; operator review required"
+            );
+            let amount =
+                base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+            self.submit_binance_withdrawal(&operation, network, amount)
+                .await?
+        };
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                submission_reference,
+                bridge_balance_before,
+            },
+        )
+    }
+
+    async fn wait_master_transfer(
+        &mut self,
+        operation: &RebalanceExecutionOperation,
+        transaction_id: u64,
+    ) -> anyhow::Result<UniversalTransferRecord> {
+        let deadline = tokio::time::Instant::now() + self.limits.operation_timeout;
+        loop {
+            if let Some(record) = self
+                .treasury_binance
+                .universal_transfer_history(
+                    &self.subaccount_email,
+                    &operation.intent.withdraw_order_id,
+                )
+                .await?
+                .into_iter()
+                .next()
+            {
+                validate_master_transfer_record(operation, &self.subaccount_email, &record)?;
+                ensure!(
+                    record.transaction_id == transaction_id,
+                    "Binance master transfer id changed"
+                );
+                match record.status.as_str() {
+                    "SUCCESS" => return Ok(record),
+                    "FAILED" | "FAILURE" => {
+                        self.execution_journal.advance(
+                            &operation.intent.operation_id,
+                            RebalanceExecutionProgress::Failed {
+                                reason: format!(
+                                    "Binance master transfer terminal status {}",
+                                    record.status
+                                ),
+                            },
+                        )?;
+                        bail!(
+                            "Binance master transfer failed with status {}",
+                            record.status
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Binance master transfer"
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
     async fn submit_binance_withdrawal(
         &self,
         operation: &RebalanceExecutionOperation,
@@ -957,7 +1114,7 @@ impl RebalanceExecutor {
         match self.limits.binance_withdrawal_api_mode.as_str() {
             "standard" => {
                 let submission = self
-                    .binance
+                    .treasury_binance
                     .withdraw_standard(
                         &operation.intent.token_symbol,
                         network,
@@ -970,7 +1127,7 @@ impl RebalanceExecutor {
             }
             "travel_rule" => {
                 let submission = self
-                    .binance
+                    .treasury_binance
                     .withdraw(
                         &operation.intent.token_symbol,
                         network,
@@ -997,7 +1154,7 @@ impl RebalanceExecutor {
         let deadline = tokio::time::Instant::now() + self.limits.operation_timeout;
         loop {
             if let Some(record) = self
-                .binance
+                .treasury_binance
                 .withdrawal_history(
                     &operation.intent.token_symbol,
                     &operation.intent.withdraw_order_id,
@@ -1042,7 +1199,7 @@ impl RebalanceExecutor {
         let deadline = tokio::time::Instant::now() + self.limits.operation_timeout;
         loop {
             if let Some(record) = self
-                .binance
+                .trading_binance
                 .deposit_history(&operation.intent.token_symbol, &transaction_hash)
                 .await?
                 .into_iter()
@@ -1054,7 +1211,7 @@ impl RebalanceExecutor {
                 );
                 if record.questionnaire_required() {
                     let submission = self
-                        .binance
+                        .trading_binance
                         .submit_deposit_questionnaire(&record.deposit_id)
                         .await?;
                     ensure!(
@@ -1112,7 +1269,7 @@ impl RebalanceExecutor {
                 binance_network, ..
             } => (binance_network.as_str(), "WLD"),
         };
-        let coins = self.binance.all_coin_information().await?;
+        let coins = self.trading_binance.all_coin_information().await?;
         let capital = select_capital_routes(
             &coins,
             &operation.intent.token_symbol,
@@ -1163,7 +1320,7 @@ impl RebalanceExecutor {
         &self,
         operation: &RebalanceExecutionOperation,
     ) -> anyhow::Result<U256> {
-        let account = self.binance.account_information().await?;
+        let account = self.trading_binance.account_information().await?;
         let balance = account
             .balances
             .iter()
@@ -1351,6 +1508,63 @@ fn validate_withdrawal_record(
             == operation.intent.amount,
         "Binance withdrawal amount changed"
     );
+    Ok(())
+}
+
+fn validate_master_transfer_record(
+    operation: &RebalanceExecutionOperation,
+    subaccount_email: &str,
+    record: &UniversalTransferRecord,
+) -> anyhow::Result<()> {
+    ensure!(
+        record.from_email.eq_ignore_ascii_case(subaccount_email),
+        "Binance master transfer source sub-account changed"
+    );
+    ensure!(
+        !record.to_email.trim().is_empty(),
+        "Binance master transfer destination is empty"
+    );
+    ensure!(
+        record.asset == operation.intent.token_symbol,
+        "Binance master transfer asset changed"
+    );
+    ensure!(
+        record.from_account_type == "SPOT" && record.to_account_type == "SPOT",
+        "Binance master transfer account type changed"
+    );
+    ensure!(
+        record.client_transaction_id == operation.intent.withdraw_order_id,
+        "Binance master transfer client id changed"
+    );
+    ensure!(
+        decimal_to_base_units(record.amount, operation.intent.token_decimals)?
+            == operation.intent.amount,
+        "Binance master transfer amount changed"
+    );
+    Ok(())
+}
+
+fn validate_master_subaccount_view(
+    trading_account: &AccountInformation,
+    master_balances: &[SubAccountAssetBalance],
+) -> anyhow::Result<()> {
+    for asset in ["USDC", "WLD"] {
+        let trading = trading_account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == asset);
+        let master = master_balances
+            .iter()
+            .find(|balance| balance.asset == asset);
+        let trading_free = trading.map_or(Decimal::ZERO, |balance| balance.free);
+        let trading_locked = trading.map_or(Decimal::ZERO, |balance| balance.locked);
+        let master_free = master.map_or(Decimal::ZERO, |balance| balance.free);
+        let master_locked = master.map_or(Decimal::ZERO, |balance| balance.locked);
+        ensure!(
+            trading_free == master_free && trading_locked == master_locked,
+            "Binance master key does not resolve to the configured trading sub-account"
+        );
+    }
     Ok(())
 }
 

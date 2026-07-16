@@ -55,6 +55,12 @@ spec:
         path: "BINANCE_API_KEY"
       - resourceName: "projects/__GCP_PROJECT_ID__/secrets/BINANCE_SECRET_KEY/versions/latest"
         path: "BINANCE_SECRET_KEY"
+      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/BINANCE_TREASURY_API_KEY/versions/latest"
+        path: "BINANCE_TREASURY_API_KEY"
+      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/BINANCE_TREASURY_SECRET_KEY/versions/latest"
+        path: "BINANCE_TREASURY_SECRET_KEY"
+      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/BINANCE_SUBACCOUNT_EMAIL/versions/latest"
+        path: "BINANCE_SUBACCOUNT_EMAIL"
       - resourceName: "projects/__GCP_PROJECT_ID__/secrets/EVM_WALLET_PRIVATE_KEY/versions/latest"
         path: "EVM_WALLET_PRIVATE_KEY"
 ---
