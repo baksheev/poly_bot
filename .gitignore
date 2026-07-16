@@ -9,6 +9,8 @@
 !.env.example
 !.env.*.example
 .gcloud/
+gha-creds-*.json
+gha-kubeconfig-*
 
 # Editors and OS
 .DS_Store

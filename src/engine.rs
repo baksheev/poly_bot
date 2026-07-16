@@ -10,6 +10,7 @@ use crate::{
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{OpportunityEngine, PreparedPoolBuildRequest, PreparedPoolBuildResult},
+    rebalance::RebalanceTracker,
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
@@ -20,6 +21,7 @@ pub struct TradingEngine {
     state: RuntimeState,
     dex: DexMirror,
     opportunities: OpportunityEngine,
+    rebalance: RebalanceTracker,
     telemetry: TelemetryHandle,
     hot_telemetry: HotTelemetryHandle,
 }
@@ -30,6 +32,7 @@ impl TradingEngine {
         domain_config: Arc<LoadedDomainConfig>,
         dex: DexMirror,
         telemetry: TelemetryHandle,
+        rebalance: RebalanceTracker,
     ) -> anyhow::Result<(Self, HotTelemetryTask)> {
         let symbols = domain_config
             .binance_symbols()
@@ -45,6 +48,7 @@ impl TradingEngine {
                 state: RuntimeState::new(symbols),
                 dex,
                 opportunities,
+                rebalance,
                 telemetry,
                 hot_telemetry,
             },
@@ -280,7 +284,55 @@ impl TradingEngine {
                 );
             }
         }
+        self.evaluate_rebalance();
         self.refresh_phase(Instant::now());
+    }
+
+    fn evaluate_rebalance(&mut self) {
+        let Some(binance) = self.state.balances.binance.as_ref() else {
+            return;
+        };
+        let Some(wallet) = self.state.balances.wallet.as_ref() else {
+            return;
+        };
+        match self.rebalance.evaluate(binance, wallet) {
+            Ok(evaluations) => {
+                for evaluation in evaluations {
+                    let action = evaluation.plan.action.as_ref();
+                    self.telemetry.emit(
+                        "rebalance_plan_evaluated",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "mode": "paper",
+                            "token": evaluation.token_symbol,
+                            "token_decimals": evaluation.token_decimals,
+                            "reference_captured": evaluation.reference_captured,
+                            "reference_inventory_base_units": evaluation.plan.reference_inventory.to_string(),
+                            "start_balance_base_units": evaluation.plan.start_balance.to_string(),
+                            "binance_balance_base_units": evaluation.plan.projected.binance.to_string(),
+                            "wallet_balance_base_units": evaluation.plan.projected.wallet.to_string(),
+                            "binance_target_base_units": evaluation.plan.binance_target.to_string(),
+                            "wallet_target_base_units": evaluation.plan.wallet_target.to_string(),
+                            "action_direction": action.map(|action| format!("{:?}", action.direction)),
+                            "action_amount_base_units": action.map(|action| action.amount.to_string()),
+                            "action_route": action.map(|action| format!("{:?}", action.route)),
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                self.rebalance.mark_unready();
+                tracing::warn!(error = %error, "rebalance planning failed closed");
+                self.telemetry.emit(
+                    "rebalance_plan_failed",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "mode": "paper",
+                        "error": format!("{error:#}"),
+                    }),
+                );
+            }
+        }
     }
 
     fn on_binance_quote(&mut self, quote: TopOfBook) -> anyhow::Result<()> {
@@ -347,7 +399,7 @@ impl TradingEngine {
         let current = self.state.refresh_phase(
             now,
             self.config.market_data_max_age_ms,
-            dex_ready && balances_ready,
+            dex_ready && balances_ready && self.rebalance.ready(),
         );
         if previous != current {
             tracing::info!(?previous, ?current, "runtime phase changed");

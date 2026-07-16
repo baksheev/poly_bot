@@ -134,7 +134,7 @@ pub struct AppConfig {
     #[arg(
         long,
         env = "DOMAIN_CONFIG_PATH",
-        default_value = "config/strategies/usdc-wld-world-chain.v2.json"
+        default_value = "config/strategies/usdc-wld-world-chain.v3.json"
     )]
     pub domain_config_path: PathBuf,
 
@@ -361,7 +361,7 @@ mod tests {
             binance_rest_base_url: "https://api.binance.com".into(),
             binance_ws_api_url: "wss://ws-api.binance.com:443/ws-api/v3".into(),
             across_api_base_url: "https://app.across.to/api".into(),
-            domain_config_path: "config/strategies/usdc-wld-world-chain.v2.json".into(),
+            domain_config_path: "config/strategies/usdc-wld-world-chain.v3.json".into(),
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,
             dex_head_max_age_ms: 10_000,

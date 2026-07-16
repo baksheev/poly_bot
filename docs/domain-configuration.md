@@ -11,7 +11,7 @@ before any market-data connection starts and its SHA-256 fingerprint is added
 to runtime telemetry.
 
 The active artifact is
-`config/strategies/usdc-wld-world-chain.v2.json`. It starts from the Rails
+`config/strategies/usdc-wld-world-chain.v3.json`. It starts from the Rails
 production pair `id=3` at the source timestamp stored in the file and records
 one deliberate Rust-clone divergence: both Binance market data and eventual
 execution use Spot. The previous v1 artifact is retained as provenance for the
@@ -24,7 +24,7 @@ attached to the GCE VM.
 
 ## Captured behavior
 
-The active v2 snapshot records:
+The active v3 snapshot records:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
@@ -39,11 +39,13 @@ The active v2 snapshot records:
   and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, quote age, slippage reserve,
   DEX fee reserve, and balance safety multiplier;
+- paper rebalance enablement and a 2500 bps start threshold derived from the
+  process's initial combined inventory;
 - the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.
 
 Wallets, balances, bridge state, private keys, RPC URLs, and execution
-credentials are deliberately absent. The artifact contains only an environment
-variable names for the future Alchemy HTTP and WebSocket endpoints.
+credentials are deliberately absent. The artifact contains only environment
+variable names for the Alchemy HTTP and WebSocket endpoints.
 
 ## Fail-closed validation
 

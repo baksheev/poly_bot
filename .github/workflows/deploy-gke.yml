@@ -1,0 +1,226 @@
+name: Deploy GKE
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-gke
+  cancel-in-progress: false
+
+env:
+  GCP_REGION: asia-southeast1
+  GKE_ZONE: asia-southeast1-b
+  GKE_CLUSTER: arb-bot
+  GKE_NAMESPACE: arb-bot
+  ARTIFACT_REPOSITORY: poly-bot
+  IMAGE_NAME: poly-bot
+  NODE_POOL_PREFIX: arb
+  SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  deploy:
+    name: Build and roll out immutable image
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Validate deployment inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test "$(git branch --show-current)" = "" || test "$(git branch --show-current)" = "main"
+          test -n "${GCP_PROJECT_ID}"
+          test -n "${GCP_WORKLOAD_IDENTITY_PROVIDER}"
+          test -n "${GCP_DEPLOY_SERVICE_ACCOUNT}"
+          test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            successful_ci="$(gh run list \
+              --workflow CI \
+              --commit "${SOURCE_SHA}" \
+              --limit 20 \
+              --json conclusion \
+              --jq 'any(.[]; .conclusion == "success")')"
+            test "${successful_ci}" = "true"
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push immutable image
+        id: image
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          registry="${GCP_REGION}-docker.pkg.dev"
+          image_tag="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}:${SOURCE_SHA}"
+          gcloud auth configure-docker "${registry}" --quiet
+          docker build \
+            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --tag "${image_tag}" \
+            .
+          docker push "${image_tag}"
+          digest="$(gcloud artifacts docker images describe \
+            "${image_tag}" \
+            --format='value(image_summary.digest)')"
+          test "${digest#sha256:}" != "${digest}"
+          test "${#digest}" -eq 71
+          image="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}@${digest}"
+          echo "image=${image}" >>"${GITHUB_OUTPUT}"
+
+      - name: Get private cluster credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          namespace: ${{ env.GKE_NAMESPACE }}
+          use_dns_based_endpoint: true
+
+      - name: Replace the fixed release node and roll out
+        id: rollout
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -Eeuo pipefail
+          release_id="${SOURCE_SHA:0:12}"
+          new_pool="${NODE_POOL_PREFIX}-${release_id}"
+          had_previous=false
+          previous_pool=""
+          rollout_applied=false
+          rollout_succeeded=false
+
+          if kubectl get deployment arb-bot --namespace "${GKE_NAMESPACE}" >/dev/null 2>&1; then
+            had_previous=true
+            previous_pool="$(kubectl get deployment arb-bot \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+          fi
+
+          restore_on_failure() {
+            status="$?"
+            trap - EXIT
+            if [[ "${status}" -eq 0 || "${rollout_succeeded}" == true ]]; then
+              exit "${status}"
+            fi
+
+            kubectl describe deployment arb-bot --namespace "${GKE_NAMESPACE}" || true
+            kubectl get pods \
+              --namespace "${GKE_NAMESPACE}" \
+              --selector=app.kubernetes.io/name=arb-bot \
+              -o wide || true
+
+            if [[ "${rollout_applied}" == true ]]; then
+              if [[ "${had_previous}" == true ]]; then
+                kubectl rollout undo deployment/arb-bot --namespace "${GKE_NAMESPACE}" || true
+                kubectl rollout status deployment/arb-bot \
+                  --namespace "${GKE_NAMESPACE}" \
+                  --timeout=10m || true
+              else
+                kubectl delete deployment arb-bot \
+                  --namespace "${GKE_NAMESPACE}" \
+                  --ignore-not-found || true
+              fi
+            fi
+
+            if [[ "${new_pool}" != "${previous_pool}" ]]; then
+              gcloud container node-pools delete "${new_pool}" \
+                --project="${GCP_PROJECT_ID}" \
+                --cluster="${GKE_CLUSTER}" \
+                --zone="${GKE_ZONE}" \
+                --quiet || true
+            fi
+            exit "${status}"
+          }
+          trap restore_on_failure EXIT
+
+          if [[ "${new_pool}" != "${previous_pool}" ]]; then
+            GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
+            GKE_CLUSTER="${GKE_CLUSTER}" \
+            GKE_ZONE="${GKE_ZONE}" \
+            GKE_RELEASE_ID="${release_id}" \
+            GCLOUD_BIN=gcloud \
+              scripts/create-gke-node-pool "${new_pool}"
+          fi
+
+          sed \
+            -e "s|__IMAGE__|${IMAGE}|g" \
+            -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
+            -e "s|__NODE_POOL__|${new_pool}|g" \
+            infra/gcp/gke/deployment.yaml \
+            | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+          rollout_applied=true
+
+          kubectl rollout status deployment/arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --timeout=20m
+          selected_pool="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+          test "${selected_pool}" = "${new_pool}"
+          kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            -o wide
+          rollout_succeeded=true
+
+          while IFS= read -r pool; do
+            if [[ -n "${pool}" && "${pool}" != "${new_pool}" && "${pool}" == arb-* ]]; then
+              gcloud container node-pools delete "${pool}" \
+                --project="${GCP_PROJECT_ID}" \
+                --cluster="${GKE_CLUSTER}" \
+                --zone="${GKE_ZONE}" \
+                --quiet
+            fi
+          done < <(gcloud container node-pools list \
+            --project="${GCP_PROJECT_ID}" \
+            --cluster="${GKE_CLUSTER}" \
+            --zone="${GKE_ZONE}" \
+            --format='value(name)')
+
+          echo "node_pool=${new_pool}" >>"${GITHUB_OUTPUT}"
+          trap - EXIT
+
+      - name: Publish deployment summary
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          {
+            echo "### GKE production deployment"
+            echo
+            echo "- Revision: \`${SOURCE_SHA}\`"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Fixed node pool: \`${{ steps.rollout.outputs.node_pool }}\`"
+            echo "- Cluster: \`${GKE_CLUSTER}\` in \`${GKE_ZONE}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"

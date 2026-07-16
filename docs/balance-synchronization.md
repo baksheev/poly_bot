@@ -49,3 +49,15 @@ through bounded background telemetry and do not block market-data processing.
 
 The observer accepts only `EVM_WALLET_ADDRESS`; it never loads a wallet private
 key or signer.
+
+## Rebalance planning
+
+The first complete Binance and wallet snapshot is also the process-scoped
+reference maximum for each token's paper rebalance policy. With the v3 artifact,
+a location becomes deficient below 25% of that combined reference inventory.
+The planner then targets half of the latest combined balance, matching Rails,
+and caps the transfer so the source remains above the same start limit.
+
+Planning runs in the single state owner after balance application. A required
+action or planning error closes the readiness gate and emits bounded telemetry.
+It never performs network I/O or mutation in the engine event path.

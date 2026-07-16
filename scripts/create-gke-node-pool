@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+gcloud_bin="${GCLOUD_BIN:-${repo_root}/scripts/gcloud-local}"
+node_pool="${1:?usage: create-gke-node-pool NODE_POOL_NAME}"
+project="${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+zone="${GKE_ZONE:-asia-southeast1-b}"
+cluster="${GKE_CLUSTER:-arb-bot}"
+release_id="${GKE_RELEASE_ID:-bootstrap}"
+node_service_account="arb-bot-gke-node@${project}.iam.gserviceaccount.com"
+
+if [[ ! "${node_pool}" =~ ^[a-z][a-z0-9-]{0,38}[a-z0-9]$ ]]; then
+  echo "invalid GKE node pool name: ${node_pool}" >&2
+  exit 1
+fi
+if [[ ! "${release_id}" =~ ^[a-z0-9-]{1,63}$ ]]; then
+  echo "GKE_RELEASE_ID must be a Kubernetes label value" >&2
+  exit 1
+fi
+
+status="$("${gcloud_bin}" container node-pools describe "${node_pool}" \
+  --project="${project}" \
+  --cluster="${cluster}" \
+  --zone="${zone}" \
+  --format='value(status)' 2>/dev/null || true)"
+
+if [[ "${status}" == RUNNING ]]; then
+  machine_type="$("${gcloud_bin}" container node-pools describe "${node_pool}" \
+    --project="${project}" \
+    --cluster="${cluster}" \
+    --zone="${zone}" \
+    --format='value(config.machineType)')"
+  initial_node_count="$("${gcloud_bin}" container node-pools describe "${node_pool}" \
+    --project="${project}" \
+    --cluster="${cluster}" \
+    --zone="${zone}" \
+    --format='value(initialNodeCount)')"
+  autoscaling_enabled="$("${gcloud_bin}" container node-pools describe "${node_pool}" \
+    --project="${project}" \
+    --cluster="${cluster}" \
+    --zone="${zone}" \
+    --format='value(autoscaling.enabled)')"
+  if [[ "${machine_type}" != c4-highcpu-8 || "${initial_node_count}" != 1 || "${autoscaling_enabled}" == True ]]; then
+    echo "existing node pool ${node_pool} is not a fixed one-node c4-highcpu-8 pool" >&2
+    exit 1
+  fi
+  echo "Node pool ${node_pool} is already RUNNING"
+  exit 0
+fi
+if [[ "${status}" == ERROR ]]; then
+  echo "Deleting failed node pool ${node_pool} before retry" >&2
+  "${gcloud_bin}" container node-pools delete "${node_pool}" \
+    --project="${project}" \
+    --cluster="${cluster}" \
+    --zone="${zone}" \
+    --quiet
+elif [[ -n "${status}" ]]; then
+  echo "node pool ${node_pool} is ${status}; wait for it to settle" >&2
+  exit 1
+fi
+
+"${gcloud_bin}" container node-pools create "${node_pool}" \
+  --project="${project}" \
+  --cluster="${cluster}" \
+  --zone="${zone}" \
+  --machine-type=c4-highcpu-8 \
+  --image-type=COS_CONTAINERD \
+  --disk-type=hyperdisk-balanced \
+  --disk-size=20GB \
+  --service-account="${node_service_account}" \
+  --scopes=https://www.googleapis.com/auth/cloud-platform \
+  --node-labels="workload=arb-bot,arb-bot-release=${release_id}" \
+  --system-config-from-file="${repo_root}/infra/gcp/gke/node-system-config.yaml" \
+  --num-nodes=1 \
+  --enable-autorepair \
+  --enable-autoupgrade \
+  --enable-surge-upgrade \
+  --max-surge-upgrade=1 \
+  --max-unavailable-upgrade=0 \
+  --shielded-secure-boot \
+  --shielded-integrity-monitoring \
+  --quiet
+
+echo "Created fixed one-node pool ${node_pool}"

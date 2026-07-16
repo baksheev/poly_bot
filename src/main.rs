@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_consensus::TxEip1559;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
@@ -32,6 +32,7 @@ use arb_bot::{
         binance::BookTickerFeed,
     },
     opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult, format_base_units},
+    rebalance::{RebalanceTracker, route_candidates_from_capital},
     telemetry::TelemetryWriter,
     wallet::{OPTIMISM_RPC_URL_ENV, TestWallet, TokenBalanceRequest, hydrate_chain_wallet},
 };
@@ -1205,6 +1206,25 @@ async fn run(
         .iter()
         .find(|pair| pair.market_data_enabled)
         .context("balance synchronization requires one enabled pair")?;
+    let rebalance_tracker = if pair.rebalance.enabled {
+        let coins = binance_account_client.all_coin_information().await?;
+        let mut routes = BTreeMap::new();
+        for token in [&pair.token_a, &pair.token_b] {
+            let capital = select_capital_routes(
+                &coins,
+                &token.symbol,
+                &pair.chain.binance_network_name,
+                "OPTIMISM",
+            )?;
+            routes.insert(
+                token.symbol.clone(),
+                route_candidates_from_capital(&capital, token.decimals, pair.chain.chain_id)?,
+            );
+        }
+        RebalanceTracker::new(pair, routes)?
+    } else {
+        RebalanceTracker::disabled()
+    };
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -1272,6 +1292,7 @@ async fn run(
         Arc::clone(&domain_config),
         mirror,
         telemetry,
+        rebalance_tracker,
     )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances));
@@ -1305,8 +1326,9 @@ async fn run(
         clickhouse_enabled = config.clickhouse_enabled(),
         "read-only arbitrage shadow service started with authenticated Binance account state"
     );
+    let runtime_ready_file = mark_runtime_ready()?;
 
-    let shutdown = tokio::signal::ctrl_c();
+    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let health_interval =
         Duration::from_millis((config.market_data_max_age_ms / 4).clamp(100, 1_000));
@@ -1381,8 +1403,50 @@ async fn run(
 
     hot_telemetry_task.await??;
     writer_task.await??;
+    if let Some(path) = runtime_ready_file
+        && let Err(error) = std::fs::remove_file(&path)
+    {
+        tracing::warn!(path = %path.display(), %error, "failed to remove runtime readiness marker");
+    }
     tracing::info!("read-only arbitrage shadow service stopped");
     Ok(())
+}
+
+fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
+    let Some(path) = std::env::var_os("RUNTIME_READY_FILE") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    ensure!(
+        !path.as_os_str().is_empty(),
+        "RUNTIME_READY_FILE must not be empty"
+    );
+    std::fs::write(&path, b"ready\n").with_context(|| {
+        format!(
+            "failed to write runtime readiness marker {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(path))
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())
+            .expect("SIGTERM handler must be installable before the runtime loop starts");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn validate_binance_account(state: &BinanceAccountState) -> anyhow::Result<()> {

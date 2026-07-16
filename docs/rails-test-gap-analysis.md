@@ -16,6 +16,8 @@ The following areas with a current Rust equivalent were reviewed in detail:
 
 - Binance service, price reader, order processor, capital routes, and
   withdrawal flow;
+- periodic Binance account and EVM wallet balance synchronization, freshness,
+  and readiness gating;
 - Across bridge service, quote/status transport, native ETH flow, and all four
   Rails Across fixtures;
 - arbitrage detection, execution failure, and Binance hedge recovery;
@@ -32,18 +34,22 @@ The following areas with a current Rust equivalent were reviewed in detail:
 | Binance bookTicker parsing, precision, missing fields, invalid symbol/book | `market_data::binance`, `state` | Covered |
 | Quote freshness, reconnect generations, duplicate/regressed updates | `state` | Covered, including exact age boundary |
 | Binance signed account hydration, clock offset, commission, and request encoding | `binance::account`, diagnostic VM canary | Covered and live-verified from whitelisted static egress; WLD and USDC funding is present |
+| Binance balance cache: one-second polling, exact decimals, expected zero balances, retry after clock resync, and snapshot publication | `balances`, `binance::account`, `state` | Implemented with a process-scoped client; value/state boundaries are unit-tested and the steady-state cadence is production-verified |
+| EVM wallet balance cache: address validation, native balance, batched ERC20 `balanceOf`, and one canonical EIP-1898 block hash per snapshot | `balances`, `chain::rpc`, `state`, `market_data::alchemy` | Implemented from World Chain `newHeads`; regressed snapshots are rejected and steady-state behavior is production-verified |
+| Balance readiness: both sources initialized, Binance account tradable, snapshots no older than five seconds, and last-good state retained through transient failures | `state`, `engine` | Covered at freshness and regression boundaries; end-to-end fault injection and recovery remain open |
 | Binance capital routes, live network limits, Travel Rule response/history, and withdrawal identity validation | `binance::capital`, diagnostic VM and manual CLI canaries | Covered and live-verified at the read-only API boundary; durable withdrawal recovery remains open |
 | BUY/SELL balance deltas and commissions in base, quote, or third asset | `binance::ws_api::OrderResult` | Added in this audit |
 | Across HTTP status handling, bounded responses, and sanitized transport failures | `across::AcrossClient` | Covered for quote and deposit-status calls |
 | Across USDC quote tokens, chains, amounts, approval, recipient, spender, calldata, and value | `across` | Covered against all Rails fixtures |
 | Across native ETH quote, calldata, value, gas bounds, receipt, and destination minimum | `across`, native ETH manual canary | Covered at the one-shot canary boundary; restart recovery remains open |
-| EVM key/raw-payload redaction, EIP-1559 signing, hydration, simulation, gas, submission, and receipt decoding | `wallet`, `chain::rpc` | Primitive coverage only; there is no shared nonce owner or durable transaction lifecycle |
+| EVM key/raw-payload redaction, EIP-1559 signing, hydration, simulation, gas, submission, and receipt decoding | `wallet`, `chain::rpc` | Signing primitives and read-only wallet hydration are covered; there is no shared nonce owner or durable transaction lifecycle |
 | CLMM quoting, tick crossing, liquidity limits, both directions | `dex::clmm` | Already stronger than Rails unit coverage |
 | Opportunity threshold, conservative reserve, provider choice, sizing | `opportunity` | Covered, with boundary tests added |
 | Rebalance targets, in-flight projection, direct/Across fallback, direction-specific availability, and live withdrawal limits | `rebalance::planner`, `binance::capital` | Covered, with validation/overflow tests and live route hydration |
 
-The Rust suite increased from 83 to 127 tests. The additional tests target
-business invariants and failure modes rather than framework behavior.
+The Rust suite increased from 83 to 132 tests: 129 library tests and 3 binary
+tests. The additional tests target business invariants and failure modes rather
+than framework behavior.
 
 The live read-only Binance checks run only through the dedicated IAP diagnostic
 VM and a digest-pinned image. They validate credential/IP restrictions,
@@ -55,12 +61,48 @@ the earlier buy/sell evidence came from pre-isolation credentials, so a capped
 order-placement and reconciliation canary on the funded subaccount remains an
 explicit test gap.
 
+Continuous balance synchronization is also deployed on the production GCE
+runtime. Binance produced 114 consecutive snapshots at a 1,001.2 ms average
+interval, with request p50/p95 of 74.3/76.4 ms. The World Chain wallet produced
+58 block-driven snapshots at a 1,975.8 ms average interval, with RPC p50/p95 of
+7.8/13.3 ms. During that observation window there were no balance-sync failures
+or Binance feed disconnects, both snapshots remained fresh, and the engine was
+`ready` with the Binance account in `SPOT`/`canTrade` state. This closes the
+steady-state observation and freshness gap, but it does not validate failure
+recovery, reservations, pending nonces, allowances, or reconciliation after
+the service's own mutations.
+
 ## Deliberately not ported yet
 
 These Rails tests describe features that do not yet exist in Rust. Adding mock
 tests before the state and ownership models exist would create false confidence.
 They become mandatory acceptance criteria when the corresponding component is
 implemented.
+
+### Balance synchronization and inventory readiness
+
+The production loop now observes one Binance account and one World Chain wallet
+without putting Postgres or ClickHouse on the trading path. The remaining tests
+and state are required before those balances can safely authorize live orders:
+
+- drive Binance 429, timeout, timestamp-skew, and malformed-account responses
+  through the real scheduler and verify degradation, clock-resync retry, and
+  recovery without overlapping polls;
+- drive Alchemy WebSocket reconnects, slow HTTP batches, partial batch errors,
+  missing canonical block hashes, and short reorgs through the wallet task;
+- verify that `newHeads` coalescing under a slow RPC never publishes an older
+  snapshot after a newer one;
+- test `TradingEngine` degradation and recovery when either five-second
+  freshness deadline is crossed, including background-channel shutdown;
+- hydrate Binance open orders and reconcile them with deterministic client
+  order IDs; an authenticated user-data stream is not implemented;
+- hydrate ERC20 allowances plus both latest and pending EVM nonces;
+- subtract process-owned reservations and unresolved orders/transactions from
+  available balances before sizing an opportunity;
+- reconcile snapshots immediately after the service's own order or transaction
+  instead of waiting only for the next periodic/block-driven refresh;
+- add isolated lanes and acceptance tests before supporting more than the
+  current single wallet, chain, and Binance account.
 
 ### Execution coordinator
 

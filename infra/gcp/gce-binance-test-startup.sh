@@ -52,7 +52,7 @@ umask 077
   printf 'BINANCE_WS_BASE_URL=wss://stream.binance.com:9443/ws\n'
   printf 'BINANCE_REST_BASE_URL=https://api.binance.com\n'
   printf 'BINANCE_WS_API_URL=wss://ws-api.binance.com:443/ws-api/v3\n'
-  printf 'DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v2.json\n'
+  printf 'DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v3.json\n'
   printf 'RUST_LOG=arb_bot=info\n'
   printf 'BINANCE_API_KEY='
   fetch_secret BINANCE_API_KEY

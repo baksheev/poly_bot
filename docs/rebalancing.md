@@ -1,6 +1,6 @@
 # Autonomous rebalance design
 
-Status: planner implemented; all external mutations disabled
+Status: continuous paper planner integrated; all external mutations disabled
 Last reviewed: 2026-07-16
 
 ## Ownership and safety boundary
@@ -27,11 +27,19 @@ execution, approvals, bridges, and transfers.
 
 ## Planner parity
 
-The pure `rebalance::planner` module operates only on integer base units. It:
+The runtime captures the first complete, fresh Binance plus World Chain wallet
+snapshot after startup as the reference maximum inventory for each token. The
+reference is process-scoped and never ratchets down during the process lifetime.
+The versioned domain artifact supplies `rebalance.start_threshold_bps`; v3 uses
+`2500`, so either location triggers at 25% of that startup total. The target
+remains Rails-compatible: half of the latest projected total inventory.
+
+The `rebalance` modules operate only on integer base units. The planner:
 
 - projects active transfers before making another plan;
 - fails closed if projected arithmetic is inconsistent;
-- rejects inventory below `binance_min + wallet_min`;
+- derives the Binance and wallet start limits from the startup reference;
+- rejects inventory below twice the derived start balance;
 - targets half of total inventory on Binance and half in the wallet;
 - refills the deficient side using only surplus above the other side's minimum;
 - applies Binance withdrawal minimum, maximum, and integer-multiple rules;
@@ -42,6 +50,12 @@ The pure `rebalance::planner` module operates only on integer base units. It:
 - fails closed when neither a direct route nor a verified Across direction is
   currently available.
 
+The steady-state balance owner evaluates the planner whenever either balance
+snapshot changes. It emits `rebalance_plan_evaluated` telemetry in `paper` mode.
+When an action is required or planning fails, the normal readiness gate closes,
+so new trading cannot start while inventory is unsafe. No transfer, approval,
+bridge, withdrawal, signing, or other external mutation is submitted.
+
 The production Rails configuration captured on 2026-07-16 for World Chain
 pair `WLDUSDC` (pair id 3) is:
 
@@ -50,7 +64,9 @@ pair `WLDUSDC` (pair id 3) is:
 | USDC | 2,000 | 2,000 | 5 / 9,999,999 / 0.000001 | Prefer direct only when live; otherwise Binance Optimism plus Across between chain 10 and World Chain 480 |
 | WLD | 4,000 | 4,000 | 0.2 / 8,700,000 / 0.00000001 | Prefer Binance `WLD`; fall back to Binance `OPTIMISM` plus Across when the direct network disappears |
 
-These values are evidence for parity tests, not immutable production limits.
+These values are historical Rails evidence for parity tests, not Rust runtime
+limits. Rust derives its start limits from the isolated account's startup
+inventory instead.
 At runtime the Binance capital configuration is authoritative for network
 enablement, fees, and withdrawal constraints. A changed or unavailable route
 blocks rebalance and therefore blocks new entries once inventory is unsafe.
@@ -138,10 +154,12 @@ it is paid only by the cold rebalance path.
 ## Delivery phases
 
 1. Pure planner and parity tests — implemented.
-2. Read-only hydrator for wallet balances, gas, Binance network capabilities,
-   deposit address, deposit history, and withdrawal history.
-3. Persistent operation journal and startup recovery.
-4. Paper executor that validates generated routes and calldata without signing.
-5. Direct WLD transfers behind a separate explicit live gate.
-6. Across USDC route behind its own explicit live gate.
-7. Rebalance soak test, failure injection, and only then trading integration.
+2. Continuous balance integration, startup-derived thresholds, live Binance
+   network capability hydration, paper plans, and readiness gating — implemented.
+3. Read-only hydrator for gas, deposit address, deposit history, and withdrawal
+   history.
+4. Persistent operation journal and startup recovery.
+5. Paper executor that validates generated routes and calldata without signing.
+6. Direct WLD transfers behind a separate explicit live gate.
+7. Across USDC route behind its own explicit live gate.
+8. Rebalance soak test, failure injection, and only then trading integration.

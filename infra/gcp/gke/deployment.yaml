@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arb-bot
+  namespace: arb-bot
+  labels:
+    app.kubernetes.io/name: arb-bot
+    app.kubernetes.io/component: trading-shadow
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 900
+  minReadySeconds: 20
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: arb-bot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: arb-bot
+        app.kubernetes.io/component: trading-shadow
+        arb-bot/source-revision: __SOURCE_REVISION__
+      annotations:
+        arb-bot/source-revision: __SOURCE_REVISION__
+    spec:
+      serviceAccountName: arb-bot-runtime
+      priorityClassName: arb-bot-critical
+      terminationGracePeriodSeconds: 45
+      nodeSelector:
+        cloud.google.com/gke-nodepool: __NODE_POOL__
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: arb-bot
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              for secret_name in \
+                CLICKHOUSE_URL \
+                CLICKHOUSE_PASSWORD \
+                ALCHEMY_WORLDCHAIN_RPC_URL \
+                ALCHEMY_WORLDCHAIN_WS_URL \
+                BINANCE_API_KEY \
+                BINANCE_SECRET_KEY; do
+                secret_value="$(cat "/var/run/secrets/arb-bot/${secret_name}")"
+                export "${secret_name}=${secret_value}"
+              done
+              export ENGINE_ID="arb-bot-rust-shadow-gke-${HOSTNAME}"
+              exec arb_bot run
+          envFrom:
+            - configMapRef:
+                name: arb-bot-runtime
+          resources:
+            requests:
+              cpu: "6"
+              memory: 10Gi
+            limits:
+              cpu: "6"
+              memory: 10Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "test -s /tmp/arb-bot-ready"]
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "test -s /tmp/arb-bot-ready"]
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          volumeMounts:
+            - name: runtime-secrets
+              mountPath: /var/run/secrets/arb-bot
+              readOnly: true
+            - name: runtime-tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: arb-bot-runtime
+        - name: runtime-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

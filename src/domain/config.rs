@@ -176,6 +176,8 @@ pub struct PairConfig {
     pub binance: BinanceConfig,
     pub quote_sizing: QuoteSizingConfig,
     pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub rebalance: RebalanceConfig,
     pub dex: DexConfig,
 }
 
@@ -198,7 +200,34 @@ impl PairConfig {
         self.binance.validate(&self.token_a, &self.token_b)?;
         self.quote_sizing.validate()?;
         self.strategy.validate()?;
+        self.rebalance.validate()?;
         self.dex.validate(&self.chain)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RebalanceConfig {
+    pub enabled: bool,
+    pub start_threshold_bps: u16,
+}
+
+impl Default for RebalanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_threshold_bps: 2_500,
+        }
+    }
+}
+
+impl RebalanceConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.start_threshold_bps > 0 && self.start_threshold_bps < 5_000,
+            "rebalance.start_threshold_bps must be between 1 and 4999"
+        );
         Ok(())
     }
 }
@@ -640,7 +669,7 @@ mod tests {
 
     use super::{ArbitrageStrategy, BinanceProduct, LoadedDomainConfig, TokenBQuoteSizing};
 
-    const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v2.json");
+    const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v3.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -677,7 +706,7 @@ mod tests {
         assert_eq!(first.fingerprint_sha256(), second.fingerprint_sha256());
         assert_eq!(
             first.fingerprint_sha256(),
-            "59ae8cc398344932ad85bdc06bdbf91185261fd7997e3c2b86a993c64d80e298"
+            "b5462e240a3da6ef1a55c413b99742bb2595371ea65110e5f2fd182e7bb46b06"
         );
     }
 
@@ -724,6 +753,14 @@ mod tests {
     fn rejects_invalid_evm_address() {
         let bytes = mutate(|value| {
             value["pairs"][0]["token_a"]["contract"] = Value::String("0x1234".into());
+        });
+        assert!(load(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_rebalance_threshold_without_hysteresis() {
+        let bytes = mutate(|value| {
+            value["pairs"][0]["rebalance"]["start_threshold_bps"] = Value::from(5_000);
         });
         assert!(load(&bytes).is_err());
     }

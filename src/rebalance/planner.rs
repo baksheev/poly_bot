@@ -46,8 +46,8 @@ pub struct RouteCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalancePolicy {
     pub token_symbol: String,
-    pub binance_min: U256,
-    pub wallet_min: U256,
+    pub reference_inventory: U256,
+    pub start_threshold_bps: u16,
     pub routes: Vec<RouteCandidate>,
 }
 
@@ -74,6 +74,8 @@ pub struct RebalanceAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalancePlan {
     pub projected: BalanceSnapshot,
+    pub reference_inventory: U256,
+    pub start_balance: U256,
     pub binance_target: U256,
     pub wallet_target: U256,
     pub action: Option<RebalanceAction>,
@@ -85,14 +87,14 @@ pub fn plan_rebalance(
     pending: &[PendingTransfer],
 ) -> Result<RebalancePlan> {
     validate_policy(policy)?;
+    let start_balance = policy.start_balance()?;
     let projected = projected_balances(snapshot, pending)?;
     let total = projected
         .binance
         .checked_add(projected.wallet)
         .ok_or_else(|| anyhow::anyhow!("{} inventory overflow", policy.token_symbol))?;
-    let required = policy
-        .binance_min
-        .checked_add(policy.wallet_min)
+    let required = start_balance
+        .checked_mul(U256::from(2))
         .ok_or_else(|| anyhow::anyhow!("{} minimum inventory overflow", policy.token_symbol))?;
 
     ensure!(
@@ -103,16 +105,18 @@ pub fn plan_rebalance(
 
     let binance_target = total / U256::from(2);
     let wallet_target = total - binance_target;
-    let action = if projected.binance < policy.binance_min {
-        plan_binance_refill(policy, projected, binance_target)?
-    } else if projected.wallet < policy.wallet_min {
-        plan_wallet_refill(policy, projected, wallet_target)?
+    let action = if projected.binance < start_balance {
+        plan_binance_refill(policy, projected, start_balance, binance_target)?
+    } else if projected.wallet < start_balance {
+        plan_wallet_refill(policy, projected, start_balance, wallet_target)?
     } else {
         None
     };
 
     Ok(RebalancePlan {
         projected,
+        reference_inventory: policy.reference_inventory,
+        start_balance,
         binance_target,
         wallet_target,
         action,
@@ -123,6 +127,16 @@ fn validate_policy(policy: &RebalancePolicy) -> Result<()> {
     ensure!(
         !policy.token_symbol.trim().is_empty(),
         "rebalance token symbol is empty"
+    );
+    ensure!(
+        !policy.reference_inventory.is_zero(),
+        "{} reference inventory must be positive",
+        policy.token_symbol
+    );
+    ensure!(
+        policy.start_threshold_bps > 0 && policy.start_threshold_bps < 5_000,
+        "{} rebalance start threshold must be between 1 and 4999 bps",
+        policy.token_symbol
     );
     ensure!(
         !policy.routes.is_empty(),
@@ -142,6 +156,22 @@ fn validate_policy(policy: &RebalancePolicy) -> Result<()> {
         );
     }
     Ok(())
+}
+
+impl RebalancePolicy {
+    pub fn start_balance(&self) -> Result<U256> {
+        let start_balance = self
+            .reference_inventory
+            .checked_mul(U256::from(self.start_threshold_bps))
+            .map(|scaled| scaled / U256::from(10_000))
+            .ok_or_else(|| anyhow::anyhow!("{} start balance overflow", self.token_symbol))?;
+        ensure!(
+            !start_balance.is_zero(),
+            "{} derived start balance is zero",
+            self.token_symbol
+        );
+        Ok(start_balance)
+    }
 }
 
 fn projected_balances(
@@ -198,11 +228,12 @@ fn projected_balances(
 fn plan_binance_refill(
     policy: &RebalancePolicy,
     projected: BalanceSnapshot,
+    start_balance: U256,
     binance_target: U256,
 ) -> Result<Option<RebalanceAction>> {
     let wallet_surplus = projected
         .wallet
-        .checked_sub(policy.wallet_min)
+        .checked_sub(start_balance)
         .unwrap_or(U256::ZERO);
     let target_deficit = binance_target
         .checked_sub(projected.binance)
@@ -222,11 +253,12 @@ fn plan_binance_refill(
 fn plan_wallet_refill(
     policy: &RebalancePolicy,
     projected: BalanceSnapshot,
+    start_balance: U256,
     wallet_target: U256,
 ) -> Result<Option<RebalanceAction>> {
     let binance_surplus = projected
         .binance
-        .checked_sub(policy.binance_min)
+        .checked_sub(start_balance)
         .unwrap_or(U256::ZERO);
     let target_deficit = wallet_target
         .checked_sub(projected.wallet)
@@ -297,8 +329,8 @@ mod tests {
     fn direct_policy() -> RebalancePolicy {
         RebalancePolicy {
             token_symbol: "WLD".to_owned(),
-            binance_min: U256::from(4_000),
-            wallet_min: U256::from(4_000),
+            reference_inventory: U256::from(16_000),
+            start_threshold_bps: 2_500,
             routes: vec![direct_candidate(true, true)],
         }
     }
@@ -483,8 +515,7 @@ mod tests {
     fn handles_eighteen_decimal_balances_without_narrowing() {
         let scale = U256::from(10).pow(U256::from(18));
         let mut policy = direct_policy();
-        policy.binance_min *= scale;
-        policy.wallet_min *= scale;
+        policy.reference_inventory *= scale;
         policy.routes[0].withdrawal.minimum *= scale;
         policy.routes[0].withdrawal.maximum *= scale;
         policy.routes[0].withdrawal.multiple *= scale;
@@ -676,6 +707,20 @@ mod tests {
                 BalanceSnapshot {
                     binance: U256::from(5_000),
                     wallet: U256::from(5_000),
+                },
+                &[],
+            )
+            .is_err()
+        );
+
+        let mut zero_derived_start = direct_policy();
+        zero_derived_start.reference_inventory = U256::ONE;
+        assert!(
+            plan_rebalance(
+                &zero_derived_start,
+                BalanceSnapshot {
+                    binance: U256::ONE,
+                    wallet: U256::ONE,
                 },
                 &[],
             )

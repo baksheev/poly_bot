@@ -72,6 +72,12 @@ network requests never run in the quote hot path. Only the public
 `Burn`, and `ModifyLiquidity` update the same single-owner pool mirrors used by
 local quotes; no RPC call is made on the event or quote hot path.
 
+The first complete balance pair now seeds a process-scoped rebalance reference
+for each token. The v3 policy starts a paper rebalance when either location
+falls below 25% of that startup total and targets the Rails-compatible 50/50
+split of current inventory. A required action closes readiness and is emitted
+to telemetry; transfers, withdrawals, bridges, and signing remain disabled.
+
 Every accepted Binance update now evaluates both arbitrage directions against
 all hydrated pools. The read-only opportunity engine uses exact-output DEX
 quotes when buying WLD, exact-input quotes when selling WLD, applies the
@@ -145,6 +151,15 @@ scripts/quality.sh
 Use `./scripts/gcloud-local` for all local Google Cloud commands. Its
 repository-local configuration does not mutate the global gcloud account,
 project, or ADC state. See [local GCP authentication](docs/gcp-local-auth.md).
+
+The next production topology is a private zonal GKE Standard cluster with one
+dedicated C4 node in steady state and a temporary second node during a verified
+zero-downtime rollout. GitHub Actions publishes digest-pinned images through
+OIDC, waits for application-level startup readiness, and restores the previous
+revision on failure. See [GKE production deployment](docs/gke-deployment.md)
+and [the release changelog](CHANGELOG.md). The existing GCE VM remains active
+until the GKE egress IP is allowlisted and the first revision passes the cutover
+checks.
 
 Production is a single read-only Compute Engine VM in Singapore. The current
 machine is `c4-highcpu-8` (8 dedicated vCPUs, 16 GiB RAM) in

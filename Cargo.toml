@@ -1,6 +1,6 @@
 [package]
 name = "arb_bot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Low-latency side-by-side Rust clone of arb_bot"
 publish = false

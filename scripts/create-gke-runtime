@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-${repo_root}/.gcloud}"
+export KUBECONFIG="${KUBECONFIG:-${repo_root}/.gcloud/gke-kubeconfig}"
+
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl is required" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+: "${EVM_WALLET_ADDRESS:?EVM_WALLET_ADDRESS is required}"
+if [[ ! "${EVM_WALLET_ADDRESS}" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+  echo "EVM_WALLET_ADDRESS must be a public 20-byte EVM address" >&2
+  exit 1
+fi
+
+gcloud_local="${repo_root}/scripts/gcloud-local"
+region="${GCP_REGION:-asia-southeast1}"
+zone="${GKE_ZONE:-${region}-b}"
+cluster="${GKE_CLUSTER:-arb-bot}"
+node_pool="arb-bot-c4"
+network="arb-bot-low-latency"
+subnet="arb-bot-singapore"
+pods_range="arb-bot-gke-pods"
+services_range="arb-bot-gke-services"
+router="arb-bot-gke-router"
+nat="arb-bot-gke-nat"
+address="arb-bot-gce-egress"
+artifact_repository="poly-bot"
+node_service_account_name="arb-bot-gke-node"
+node_service_account="${node_service_account_name}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+deploy_service_account_name="poly-bot-github-deploy"
+deploy_service_account="${deploy_service_account_name}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+github_repository="${GITHUB_REPOSITORY:-baksheev/poly_bot}"
+workload_pool="github"
+workload_provider="poly-bot"
+node_pool_role_id="polyBotGkeNodePoolDeployer"
+node_pool_role="projects/${GCP_PROJECT_ID}/roles/${node_pool_role_id}"
+
+add_project_iam_binding() {
+  local member="$1"
+  local role="$2"
+  local attempt
+  for attempt in {1..12}; do
+    if "${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+      --member="${member}" \
+      --role="${role}" \
+      --condition=None \
+      --quiet >/dev/null; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 12 ]]; then
+      echo "IAM principal is not visible yet; retrying (${attempt}/12)" >&2
+      sleep 5
+    fi
+  done
+  return 1
+}
+
+"${gcloud_local}" config set project "${GCP_PROJECT_ID}" >/dev/null
+"${gcloud_local}" services enable \
+  artifactregistry.googleapis.com \
+  compute.googleapis.com \
+  container.googleapis.com \
+  iamcredentials.googleapis.com \
+  secretmanager.googleapis.com \
+  sts.googleapis.com \
+  --quiet
+
+project_number="$("${gcloud_local}" projects describe "${GCP_PROJECT_ID}" \
+  --format='value(projectNumber)')"
+
+if ! "${gcloud_local}" artifacts repositories describe "${artifact_repository}" \
+  --location="${region}" >/dev/null 2>&1; then
+  "${gcloud_local}" artifacts repositories create "${artifact_repository}" \
+    --location="${region}" \
+    --repository-format=docker \
+    --description="Low-latency arb bot images" \
+    --quiet
+fi
+
+if ! "${gcloud_local}" iam service-accounts describe "${node_service_account}" >/dev/null 2>&1; then
+  "${gcloud_local}" iam service-accounts create "${node_service_account_name}" \
+    --display-name="Arb Bot GKE nodes" \
+    --quiet
+fi
+add_project_iam_binding \
+  "serviceAccount:${node_service_account}" \
+  roles/container.defaultNodeServiceAccount
+"${gcloud_local}" artifacts repositories add-iam-policy-binding "${artifact_repository}" \
+  --location="${region}" \
+  --member="serviceAccount:${node_service_account}" \
+  --role=roles/artifactregistry.reader \
+  --quiet >/dev/null
+
+secondary_ranges="$("${gcloud_local}" compute networks subnets describe "${subnet}" \
+  --region="${region}" \
+  --format='value(secondaryIpRanges.rangeName)')"
+pods_range_present=false
+services_range_present=false
+grep -Fq "${pods_range}" <<<"${secondary_ranges}" && pods_range_present=true
+grep -Fq "${services_range}" <<<"${secondary_ranges}" && services_range_present=true
+if [[ "${pods_range_present}" != "${services_range_present}" ]]; then
+  echo "subnet has only one of the required GKE secondary ranges; inspect it manually" >&2
+  exit 1
+fi
+if [[ "${pods_range_present}" == false ]]; then
+  "${gcloud_local}" compute networks subnets update "${subnet}" \
+    --region="${region}" \
+    --add-secondary-ranges="${pods_range}=10.44.0.0/20,${services_range}=10.44.16.0/24" \
+    --quiet
+fi
+
+if ! "${gcloud_local}" compute addresses describe "${address}" \
+  --region="${region}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute addresses create "${address}" \
+    --region="${region}" \
+    --network-tier=PREMIUM \
+    --quiet
+fi
+if ! "${gcloud_local}" compute routers describe "${router}" \
+  --region="${region}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute routers create "${router}" \
+    --network="${network}" \
+    --region="${region}" \
+    --quiet
+fi
+if ! "${gcloud_local}" compute routers nats describe "${nat}" \
+  --router="${router}" \
+  --region="${region}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute routers nats create "${nat}" \
+    --router="${router}" \
+    --region="${region}" \
+    --nat-all-subnet-ip-ranges \
+    --nat-external-ip-pool="${address}" \
+    --enable-logging \
+    --log-filter=ERRORS_ONLY \
+    --quiet
+else
+  "${gcloud_local}" compute routers nats update "${nat}" \
+    --router="${router}" \
+    --region="${region}" \
+    --nat-all-subnet-ip-ranges \
+    --nat-external-ip-pool="${address}" \
+    --enable-logging \
+    --log-filter=ERRORS_ONLY \
+    --quiet
+fi
+
+if ! "${gcloud_local}" container clusters describe "${cluster}" \
+  --zone="${zone}" >/dev/null 2>&1; then
+  "${gcloud_local}" container clusters create "${cluster}" \
+    --zone="${zone}" \
+    --release-channel=regular \
+    --network="${network}" \
+    --subnetwork="${subnet}" \
+    --enable-ip-alias \
+    --cluster-secondary-range-name="${pods_range}" \
+    --services-secondary-range-name="${services_range}" \
+    --enable-private-nodes \
+    --enable-dns-access \
+    --no-enable-ip-access \
+    --enable-dataplane-v2 \
+    --enable-shielded-nodes \
+    --workload-pool="${GCP_PROJECT_ID}.svc.id.goog" \
+    --enable-secret-manager \
+    --logging=SYSTEM,WORKLOAD \
+    --monitoring=SYSTEM \
+    --machine-type=e2-small \
+    --image-type=COS_CONTAINERD \
+    --disk-type=pd-balanced \
+    --disk-size=20GB \
+    --service-account="${node_service_account}" \
+    --scopes=https://www.googleapis.com/auth/cloud-platform \
+    --num-nodes=1 \
+    --quiet
+fi
+
+if "${gcloud_local}" container node-pools describe default-pool \
+  --cluster="${cluster}" \
+  --zone="${zone}" >/dev/null 2>&1; then
+  "${gcloud_local}" container node-pools delete default-pool \
+    --cluster="${cluster}" \
+    --zone="${zone}" \
+    --quiet
+fi
+GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
+GKE_CLUSTER="${cluster}" \
+GKE_ZONE="${zone}" \
+GKE_RELEASE_ID=bootstrap \
+  "${repo_root}/scripts/create-gke-node-pool" "${node_pool}"
+"${gcloud_local}" container node-pools update "${node_pool}" \
+  --cluster="${cluster}" \
+  --zone="${zone}" \
+  --no-enable-autoscaling \
+  --quiet
+"${gcloud_local}" container node-pools update "${node_pool}" \
+  --cluster="${cluster}" \
+  --zone="${zone}" \
+  --node-taints="" \
+  --quiet
+
+runtime_principal="principal://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${GCP_PROJECT_ID}.svc.id.goog/subject/ns/arb-bot/sa/arb-bot-runtime"
+for secret in \
+  CLICKHOUSE_URL \
+  CLICKHOUSE_PASSWORD \
+  ALCHEMY_WORLDCHAIN_RPC_URL \
+  ALCHEMY_WORLDCHAIN_WS_URL \
+  BINANCE_API_KEY \
+  BINANCE_SECRET_KEY; do
+  "${gcloud_local}" secrets add-iam-policy-binding "${secret}" \
+    --member="${runtime_principal}" \
+    --role=roles/secretmanager.secretAccessor \
+    --quiet >/dev/null
+done
+
+if ! "${gcloud_local}" iam service-accounts describe "${deploy_service_account}" >/dev/null 2>&1; then
+  "${gcloud_local}" iam service-accounts create "${deploy_service_account_name}" \
+    --display-name="poly_bot GitHub production deployer" \
+    --quiet
+fi
+"${gcloud_local}" artifacts repositories add-iam-policy-binding "${artifact_repository}" \
+  --location="${region}" \
+  --member="serviceAccount:${deploy_service_account}" \
+  --role=roles/artifactregistry.writer \
+  --quiet >/dev/null
+for role in roles/container.clusterViewer roles/serviceusage.serviceUsageConsumer; do
+  add_project_iam_binding "serviceAccount:${deploy_service_account}" "${role}"
+done
+node_pool_permissions="container.clusters.get,container.nodes.create,container.nodes.delete,container.nodes.get,container.nodes.getStatus,container.nodes.list,container.operations.get,container.operations.list"
+if "${gcloud_local}" iam roles describe "${node_pool_role_id}" \
+  --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
+  "${gcloud_local}" iam roles update "${node_pool_role_id}" \
+    --project="${GCP_PROJECT_ID}" \
+    --title="poly_bot GKE node pool deployer" \
+    --description="Create and retire fixed release node pools; cannot modify or delete the cluster." \
+    --permissions="${node_pool_permissions}" \
+    --stage=GA \
+    --quiet
+else
+  "${gcloud_local}" iam roles create "${node_pool_role_id}" \
+    --project="${GCP_PROJECT_ID}" \
+    --title="poly_bot GKE node pool deployer" \
+    --description="Create and retire fixed release node pools; cannot modify or delete the cluster." \
+    --permissions="${node_pool_permissions}" \
+    --stage=GA \
+    --quiet
+fi
+add_project_iam_binding \
+  "serviceAccount:${deploy_service_account}" \
+  "${node_pool_role}"
+"${gcloud_local}" iam service-accounts add-iam-policy-binding "${node_service_account}" \
+  --member="serviceAccount:${deploy_service_account}" \
+  --role=roles/iam.serviceAccountUser \
+  --quiet >/dev/null
+
+if ! "${gcloud_local}" iam workload-identity-pools describe "${workload_pool}" \
+  --location=global >/dev/null 2>&1; then
+  "${gcloud_local}" iam workload-identity-pools create "${workload_pool}" \
+    --location=global \
+    --display-name="GitHub Actions" \
+    --quiet
+fi
+if ! "${gcloud_local}" iam workload-identity-pools providers describe "${workload_provider}" \
+  --workload-identity-pool="${workload_pool}" \
+  --location=global >/dev/null 2>&1; then
+  "${gcloud_local}" iam workload-identity-pools providers create-oidc "${workload_provider}" \
+    --workload-identity-pool="${workload_pool}" \
+    --location=global \
+    --issuer-uri=https://token.actions.githubusercontent.com/ \
+    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
+    --attribute-condition="assertion.repository=='${github_repository}' && assertion.ref=='refs/heads/main'" \
+    --quiet
+fi
+"${gcloud_local}" iam service-accounts add-iam-policy-binding "${deploy_service_account}" \
+  --role=roles/iam.workloadIdentityUser \
+  --member="principalSet://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${workload_pool}/attribute.repository/${github_repository}" \
+  --quiet >/dev/null
+
+"${gcloud_local}" container clusters get-credentials "${cluster}" \
+  --zone="${zone}" \
+  --dns-endpoint \
+  --quiet
+
+sed \
+  -e "s|__GCP_PROJECT_ID__|${GCP_PROJECT_ID}|g" \
+  -e "s|__EVM_WALLET_ADDRESS__|${EVM_WALLET_ADDRESS}|g" \
+  -e "s|__GITHUB_DEPLOY_SERVICE_ACCOUNT__|${deploy_service_account}|g" \
+  "${repo_root}/infra/gcp/gke/platform.yaml" \
+  | kubectl apply -f -
+
+provider_name="$("${gcloud_local}" iam workload-identity-pools providers describe \
+  "${workload_provider}" \
+  --workload-identity-pool="${workload_pool}" \
+  --location=global \
+  --format='value(name)')"
+egress_ip="$("${gcloud_local}" compute addresses describe "${address}" \
+  --region="${region}" \
+  --format='value(address)')"
+
+echo "GKE runtime infrastructure is ready"
+echo "Binance allowlist egress IP: ${egress_ip}"
+echo "GitHub production environment variables:"
+echo "  GCP_PROJECT_ID=${GCP_PROJECT_ID}"
+echo "  GCP_WORKLOAD_IDENTITY_PROVIDER=${provider_name}"
+echo "  GCP_DEPLOY_SERVICE_ACCOUNT=${deploy_service_account}"
+echo "Confirm the retained egress IP is still in the Binance API-key allowlist before deployment."
