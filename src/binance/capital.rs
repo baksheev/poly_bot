@@ -86,14 +86,14 @@ impl BinanceAccountClient {
             ("network", network.to_owned()),
             ("recvWindow", "5000".to_owned()),
         ])?;
-        let addresses: Vec<DepositAddressRecord> = self
+        let address: DepositAddressRecord = self
             .signed_get(
-                "/sapi/v1/capital/deposit/address/list",
+                "/sapi/v1/capital/deposit/address",
                 &query,
-                "deposit address list",
+                "deposit address",
             )
             .await?;
-        select_evm_deposit_address(&addresses, coin, network)
+        select_evm_deposit_address(&address, coin, network)
     }
 
     pub async fn deposit_history(
@@ -293,11 +293,8 @@ pub struct EvmDepositAddress {
 struct DepositAddressRecord {
     coin: String,
     address: String,
-    network: String,
     #[serde(default)]
     tag: String,
-    deposit_enable: bool,
-    is_default: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -478,41 +475,26 @@ impl WithdrawalRecord {
 }
 
 fn select_evm_deposit_address(
-    records: &[DepositAddressRecord],
+    record: &DepositAddressRecord,
     coin: &str,
     network: &str,
 ) -> anyhow::Result<EvmDepositAddress> {
-    let enabled = records
-        .iter()
-        .filter(|record| record.coin == coin && record.network == network && record.deposit_enable)
-        .collect::<Vec<_>>();
     ensure!(
-        !enabled.is_empty(),
-        "Binance has no enabled deposit address for {coin} on {network}"
+        record.coin == coin,
+        "Binance returned a deposit address for a different coin"
     );
-    let defaults = enabled
-        .iter()
-        .copied()
-        .filter(|record| record.is_default)
-        .collect::<Vec<_>>();
-    let selected = match defaults.as_slice() {
-        [selected] => *selected,
-        [] if enabled.len() == 1 => enabled[0],
-        [] => anyhow::bail!("Binance returned multiple deposit addresses without one default"),
-        _ => anyhow::bail!("Binance returned multiple default deposit addresses"),
-    };
     ensure!(
-        selected.tag.is_empty(),
+        record.tag.is_empty(),
         "Binance EVM deposit address unexpectedly requires a tag"
     );
-    let address = selected
+    let address = record
         .address
         .parse::<Address>()
         .context("Binance deposit address is not an EVM address")?;
     ensure!(address != Address::ZERO, "Binance deposit address is zero");
     Ok(EvmDepositAddress {
-        coin: selected.coin.clone(),
-        network: selected.network.clone(),
+        coin: record.coin.clone(),
+        network: network.to_owned(),
         address,
     })
 }
@@ -866,55 +848,37 @@ mod tests {
     }
 
     #[test]
-    fn selects_the_exact_enabled_default_evm_deposit_address() {
-        let records: Vec<DepositAddressRecord> = serde_json::from_str(
-            r#"[
-              {"coin":"USDC","address":"0x1111111111111111111111111111111111111111",
-               "network":"ETH","tag":"","depositEnable":true,"isDefault":true},
-              {"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
-               "network":"OPTIMISM","tag":"","depositEnable":true,"isDefault":true}
-            ]"#,
+    fn selects_the_exact_network_scoped_evm_deposit_address() {
+        let record: DepositAddressRecord = serde_json::from_str(
+            r#"{"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
+                 "tag":"","url":"https://optimistic.etherscan.io/address/0x22"}"#,
         )
         .unwrap();
 
-        let selected = select_evm_deposit_address(&records, "USDC", "OPTIMISM").unwrap();
+        let selected = select_evm_deposit_address(&record, "USDC", "OPTIMISM").unwrap();
         assert_eq!(selected.coin, "USDC");
         assert_eq!(selected.network, "OPTIMISM");
         assert_eq!(selected.address, Address::repeat_byte(0x22));
     }
 
     #[test]
-    fn rejects_disabled_ambiguous_tagged_or_non_evm_deposit_addresses() {
-        let disabled: Vec<DepositAddressRecord> = serde_json::from_str(
-            r#"[{"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
-                 "network":"OPTIMISM","tag":"","depositEnable":false,"isDefault":true}]"#,
+    fn rejects_wrong_coin_tagged_or_non_evm_deposit_addresses() {
+        let wrong_coin: DepositAddressRecord = serde_json::from_str(
+            r#"{"coin":"ETH","address":"0x2222222222222222222222222222222222222222",
+                 "tag":""}"#,
         )
         .unwrap();
-        assert!(select_evm_deposit_address(&disabled, "USDC", "OPTIMISM").is_err());
+        assert!(select_evm_deposit_address(&wrong_coin, "USDC", "OPTIMISM").is_err());
 
-        let ambiguous: Vec<DepositAddressRecord> = serde_json::from_str(
-            r#"[
-              {"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
-               "network":"OPTIMISM","tag":"","depositEnable":true,"isDefault":false},
-              {"coin":"USDC","address":"0x3333333333333333333333333333333333333333",
-               "network":"OPTIMISM","tag":"","depositEnable":true,"isDefault":false}
-            ]"#,
-        )
-        .unwrap();
-        assert!(select_evm_deposit_address(&ambiguous, "USDC", "OPTIMISM").is_err());
-
-        let tagged: Vec<DepositAddressRecord> = serde_json::from_str(
-            r#"[{"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
-                 "network":"OPTIMISM","tag":"memo","depositEnable":true,"isDefault":true}]"#,
+        let tagged: DepositAddressRecord = serde_json::from_str(
+            r#"{"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
+                 "tag":"memo"}"#,
         )
         .unwrap();
         assert!(select_evm_deposit_address(&tagged, "USDC", "OPTIMISM").is_err());
 
-        let invalid: Vec<DepositAddressRecord> = serde_json::from_str(
-            r#"[{"coin":"USDC","address":"not-an-address","network":"OPTIMISM",
-                 "tag":"","depositEnable":true,"isDefault":true}]"#,
-        )
-        .unwrap();
+        let invalid: DepositAddressRecord =
+            serde_json::from_str(r#"{"coin":"USDC","address":"not-an-address","tag":""}"#).unwrap();
         assert!(select_evm_deposit_address(&invalid, "USDC", "OPTIMISM").is_err());
     }
 
