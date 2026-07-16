@@ -252,7 +252,7 @@ fi
 for role in roles/container.clusterViewer roles/serviceusage.serviceUsageConsumer; do
   add_project_iam_binding "serviceAccount:${deploy_service_account}" "${role}"
 done
-node_pool_permissions="container.clusters.get,container.nodes.create,container.nodes.delete,container.nodes.get,container.nodes.getStatus,container.nodes.list,container.operations.get,container.operations.list"
+node_pool_permissions="container.clusters.get,container.clusters.update,container.nodes.create,container.nodes.delete,container.nodes.get,container.nodes.getStatus,container.nodes.list,container.operations.get,container.operations.list"
 if "${gcloud_local}" iam roles describe "${node_pool_role_id}" \
   --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
   "${gcloud_local}" iam roles update "${node_pool_role_id}" \

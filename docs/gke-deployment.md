@@ -83,7 +83,7 @@ The idempotent script creates or configures:
    temporary two-vCPU default pool is removed first);
 4. Workload Identity access to Secret Manager;
 5. the GitHub OIDC provider, a least-privilege deploy service account, and a
-   custom role limited to node-pool create/get/list/delete operations;
+   custom role limited to the permissions required for node-pool lifecycle;
 6. the namespace, runtime configuration, CSI secret provider, PDB, and RBAC.
 
 It prints the NAT IP and these GitHub `production` environment variables:
