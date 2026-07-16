@@ -766,24 +766,32 @@ fn transaction_integer(name: &str, value: &serde_json::Value) -> anyhow::Result<
 
 pub fn validate_deposit_status(
     status: &AcrossDepositStatus,
+    origin_chain_id: u64,
+    origin_transaction_hash: &str,
     destination_chain_id: u64,
     output_token: Address,
     minimum_output_amount: u128,
 ) -> anyhow::Result<bool> {
+    validate_transaction_hash(origin_transaction_hash)?;
+    ensure!(
+        status.origin_chain_id == Some(origin_chain_id),
+        "Across status origin chain mismatch"
+    );
+    ensure!(
+        status.deposit_tx_hash.as_deref() == Some(origin_transaction_hash)
+            && status.deposit_txn_ref.as_deref() == Some(origin_transaction_hash),
+        "Across status origin transaction mismatch"
+    );
     ensure!(
         status.destination_chain_id == destination_chain_id,
         "Across status destination chain mismatch"
     );
-    ensure!(
-        parse_address(
-            "status.outputToken",
-            status
-                .output_token
-                .as_deref()
-                .context("Across status has no output token")?,
-        )? == output_token,
-        "Across status output token mismatch"
-    );
+    if let Some(status_output_token) = status.output_token.as_deref() {
+        ensure!(
+            parse_address("status.outputToken", status_output_token)? == output_token,
+            "Across status output token mismatch"
+        );
+    }
     match status.status.as_str() {
         "pending" => {
             ensure!(
@@ -807,21 +815,12 @@ pub fn validate_deposit_status(
                     .as_deref()
                     .context("filled Across status has no fill transaction")?,
             )?;
-            let output_amount = parse_amount(
-                "status.outputAmount",
-                status
-                    .output_amount
-                    .as_deref()
-                    .context("filled Across status has no output amount")?,
-            )?;
-            ensure!(
-                output_amount >= minimum_output_amount,
-                "Across fill output is below the reserved minimum"
-            );
-            ensure!(
-                status.fill_time.is_some(),
-                "filled Across status has no fill time"
-            );
+            if let Some(output_amount) = status.output_amount.as_deref() {
+                ensure!(
+                    parse_amount("status.outputAmount", output_amount)? >= minimum_output_amount,
+                    "Across fill output is below the reserved minimum"
+                );
+            }
             Ok(true)
         }
         _ => anyhow::bail!("unsupported Across deposit status {}", status.status),
@@ -1277,55 +1276,78 @@ mod tests {
 
     #[test]
     fn validates_pending_and_filled_deposit_status() {
+        let origin = format!("0x{}", "12".repeat(32));
         let pending = AcrossDepositStatus {
             status: "pending".to_owned(),
             fill_txn_ref: None,
-            origin_chain_id: None,
-            deposit_tx_hash: None,
-            deposit_txn_ref: None,
+            origin_chain_id: Some(OPTIMISM_CHAIN_ID),
+            deposit_tx_hash: Some(origin.clone()),
+            deposit_txn_ref: Some(origin.clone()),
             destination_chain_id: WORLD_CHAIN_CHAIN_ID,
             output_token: Some(format!("{WORLD_CHAIN_USDC:#x}")),
             output_amount: None,
             fill_time: None,
         };
         assert!(
-            !validate_deposit_status(&pending, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, 999_400)
-                .unwrap()
+            !validate_deposit_status(
+                &pending,
+                OPTIMISM_CHAIN_ID,
+                &origin,
+                WORLD_CHAIN_CHAIN_ID,
+                WORLD_CHAIN_USDC,
+                999_400
+            )
+            .unwrap()
         );
 
         let filled = AcrossDepositStatus {
             status: "filled".to_owned(),
             fill_txn_ref: Some(format!("0x{}", "ab".repeat(32))),
-            origin_chain_id: None,
-            deposit_tx_hash: None,
-            deposit_txn_ref: None,
+            origin_chain_id: Some(OPTIMISM_CHAIN_ID),
+            deposit_tx_hash: Some(origin.clone()),
+            deposit_txn_ref: Some(origin.clone()),
             destination_chain_id: WORLD_CHAIN_CHAIN_ID,
-            output_token: Some(format!("{WORLD_CHAIN_USDC:#x}")),
-            output_amount: Some("999500".to_owned()),
-            fill_time: Some(1_784_192_400),
+            output_token: None,
+            output_amount: None,
+            fill_time: None,
         };
         assert!(
-            validate_deposit_status(&filled, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, 999_400)
-                .unwrap()
+            validate_deposit_status(
+                &filled,
+                OPTIMISM_CHAIN_ID,
+                &origin,
+                WORLD_CHAIN_CHAIN_ID,
+                WORLD_CHAIN_USDC,
+                999_400
+            )
+            .unwrap()
         );
     }
 
     #[test]
     fn rejects_filled_status_below_reserved_minimum() {
+        let origin = format!("0x{}", "12".repeat(32));
         let status = AcrossDepositStatus {
             status: "filled".to_owned(),
             fill_txn_ref: Some(format!("0x{}", "ab".repeat(32))),
-            origin_chain_id: None,
-            deposit_tx_hash: None,
-            deposit_txn_ref: None,
+            origin_chain_id: Some(OPTIMISM_CHAIN_ID),
+            deposit_tx_hash: Some(origin.clone()),
+            deposit_txn_ref: Some(origin.clone()),
             destination_chain_id: WORLD_CHAIN_CHAIN_ID,
             output_token: Some(format!("{WORLD_CHAIN_USDC:#x}")),
             output_amount: Some("999399".to_owned()),
             fill_time: Some(1_784_192_400),
         };
         assert!(
-            validate_deposit_status(&status, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, 999_400)
-                .is_err()
+            validate_deposit_status(
+                &status,
+                OPTIMISM_CHAIN_ID,
+                &origin,
+                WORLD_CHAIN_CHAIN_ID,
+                WORLD_CHAIN_USDC,
+                999_400
+            )
+            .is_err()
         );
     }
 

@@ -812,6 +812,8 @@ impl RebalanceExecutor {
                 Ok(status)
                     if validate_deposit_status(
                         &status,
+                        origin_chain_id,
+                        &format!("{transaction_hash:#x}"),
                         if origin_chain_id == WORLD_CHAIN_CHAIN_ID {
                             OPTIMISM_CHAIN_ID
                         } else {
