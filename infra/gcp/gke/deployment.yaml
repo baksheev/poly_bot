@@ -7,10 +7,10 @@ metadata:
     app.kubernetes.io/name: arb-bot
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: standard-rwo
+  storageClassName: dynamic-rwo
   resources:
     requests:
-      storage: 1Gi
+      storage: 4Gi
 ---
 apiVersion: apps/v1
 kind: Deployment

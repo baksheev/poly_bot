@@ -23,6 +23,8 @@ the exact artifact used by each rollout.
   WLD/USDC limits from a reviewer-protected GitHub production environment.
   Deployment validation rejects absent or zero limits before authentication or
   rollout.
+- The GKE journal PVC uses C4-compatible `dynamic-rwo` Hyperdisk Balanced
+  storage instead of the unsupported `pd-balanced` class.
 
 - Reusable EVM wallet primitives for canonical-block balance and allowance
   hydration, latest/pending nonce observation, native and ERC-20 transfer or

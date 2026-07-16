@@ -31,9 +31,10 @@ is deleted. If old-pool cleanup fails after a successful rollout, the healthy
 new revision remains active and a later workflow retry removes orphaned
 `arb-*` pools.
 
-The zonal ReadWriteOnce disk stores the durable rebalance journal and provides
-a second single-writer boundary. Recreate rollout plus the journal file lock
-prevent two processes from owning the same canary operation. The implemented
+The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable rebalance
+journal and provides a second single-writer boundary on C4. Recreate rollout
+plus the journal file lock prevent two processes from owning the same canary
+operation. The implemented
 full executor also places its high-level and nonce journals on this disk, but
 the current manifest selects `full_live`, mounts the wallet signer, and
 explicitly chooses shared Binance credentials for the isolated subaccount.

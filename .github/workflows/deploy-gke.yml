@@ -193,6 +193,19 @@ jobs:
             infra/gcp/gke/release-platform.yaml \
             | kubectl apply -f -
 
+          if kubectl get persistentvolumeclaim arb-bot-state \
+            --namespace "${GKE_NAMESPACE}" >/dev/null 2>&1; then
+            existing_storage_class="$(kubectl get persistentvolumeclaim arb-bot-state \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.spec.storageClassName}')"
+            if [[ "${existing_storage_class}" != dynamic-rwo ]]; then
+              test "${had_previous}" = false
+              kubectl delete persistentvolumeclaim arb-bot-state \
+                --namespace "${GKE_NAMESPACE}" \
+                --wait=true
+            fi
+          fi
+
           sed \
             -e "s|__IMAGE__|${IMAGE}|g" \
             -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
