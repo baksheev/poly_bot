@@ -158,12 +158,42 @@ impl BinanceAccountClient {
     where
         T: for<'de> Deserialize<'de>,
     {
+        let signature = sign_hex(&self.credentials.secret_key, query)?;
         let response = self
             .http
-            .get(format!("{}{}", self.base_url, path))
+            .get(format!(
+                "{}{}?{}&signature={}",
+                self.base_url, path, query, signature
+            ))
             .header(API_KEY_HEADER, &self.credentials.api_key)
-            .query(&parse_query_pairs(query))
-            .query(&[("signature", sign_hex(&self.credentials.secret_key, query)?)])
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Binance {operation} request failed: {}",
+                    error.without_url()
+                )
+            })?;
+        decode_response(response, operation).await
+    }
+
+    pub(super) async fn signed_post<T>(
+        &self,
+        path: &str,
+        query: &str,
+        operation: &str,
+    ) -> anyhow::Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let signature = sign_hex(&self.credentials.secret_key, query)?;
+        let response = self
+            .http
+            .post(format!(
+                "{}{}?{}&signature={}",
+                self.base_url, path, query, signature
+            ))
+            .header(API_KEY_HEADER, &self.credentials.api_key)
             .send()
             .await
             .map_err(|error| {
@@ -178,12 +208,18 @@ impl BinanceAccountClient {
     pub(super) fn signed_query(&self, parameters: &[(&str, String)]) -> anyhow::Result<String> {
         let local_timestamp = unix_timestamp_ms()?;
         let timestamp = apply_clock_offset(local_timestamp, self.clock_offset_ms)?;
-        let mut query = parameters
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>();
-        query.push(format!("timestamp={timestamp}"));
-        Ok(query.join("&"))
+        let mut url = reqwest::Url::parse("http://localhost")
+            .context("failed to initialize Binance query encoder")?;
+        {
+            let mut query = url.query_pairs_mut();
+            for (name, value) in parameters {
+                query.append_pair(name, value);
+            }
+            query.append_pair("timestamp", &timestamp.to_string());
+        }
+        url.query()
+            .map(str::to_owned)
+            .context("Binance signed query encoder returned an empty query")
     }
 }
 
@@ -338,13 +374,6 @@ fn sign_hex(secret: &str, payload: &str) -> anyhow::Result<String> {
     Ok(encoded)
 }
 
-fn parse_query_pairs(query: &str) -> Vec<(&str, &str)> {
-    query
-        .split('&')
-        .map(|pair| pair.split_once('=').expect("signed query pair has equals"))
-        .collect()
-}
-
 fn unix_timestamp_ms() -> anyhow::Result<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -372,7 +401,9 @@ fn apply_clock_offset(timestamp: u64, offset: i64) -> anyhow::Result<u64> {
 mod tests {
     use rust_decimal::Decimal;
 
-    use super::{BinanceCredentials, CommissionRates, apply_clock_offset, sign_hex};
+    use super::{
+        BinanceAccountClient, BinanceCredentials, CommissionRates, apply_clock_offset, sign_hex,
+    };
 
     #[test]
     fn produces_binance_hmac_example_signature() {
@@ -412,5 +443,24 @@ mod tests {
     fn applies_positive_and_negative_clock_offsets() {
         assert_eq!(apply_clock_offset(1_000, 25).unwrap(), 1_025);
         assert_eq!(apply_clock_offset(1_000, -25).unwrap(), 975);
+    }
+
+    #[test]
+    fn percent_encodes_values_before_signing() {
+        let client = BinanceAccountClient::new(
+            "https://api.binance.com",
+            BinanceCredentials::new("api", "secret"),
+        )
+        .unwrap();
+        let query = client
+            .signed_query(&[(
+                "questionnaire",
+                r#"{"isAddressOwner":1,"sendTo":1}"#.to_owned(),
+            )])
+            .unwrap();
+
+        assert!(query.starts_with(
+            "questionnaire=%7B%22isAddressOwner%22%3A1%2C%22sendTo%22%3A1%7D&timestamp="
+        ));
     }
 }

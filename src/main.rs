@@ -4,7 +4,10 @@ use alloy_primitives::Address;
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     binance::account::{BinanceAccountClient, BinanceAccountState},
-    binance::capital::{CapitalRouteState, select_capital_routes},
+    binance::capital::{
+        CapitalRouteState, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
+        select_capital_routes,
+    },
     binance::ws_api::{BinanceWsApiClient, OrderResult, WsApiError},
     chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
@@ -96,6 +99,25 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceRecentValidationOrders { limit } => {
             binance_recent_validation_orders(&cli.config, limit).await
         }
+        Command::BinanceManualEthBuy {
+            quote_amount,
+            confirm_live,
+        } => binance_manual_eth_buy(&cli.config, quote_amount, confirm_live).await,
+        Command::BinanceManualWalletWithdraw {
+            coin,
+            network,
+            amount,
+            confirm_live,
+        } => {
+            binance_manual_wallet_withdraw(&cli.config, &coin, &network, amount, confirm_live).await
+        }
+        Command::BinanceWithdrawalStatus {
+            coin,
+            withdraw_order_id,
+        } => binance_withdrawal_status(&cli.config, &coin, &withdraw_order_id).await,
+        Command::BinanceTravelRuleWithdrawalStatus { tr_id } => {
+            binance_travel_rule_withdrawal_status(&cli.config, tr_id).await
+        }
         Command::WalletAddress => {
             let wallet = TestWallet::from_env()?;
             tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
@@ -106,6 +128,284 @@ async fn main() -> anyhow::Result<()> {
             wallet_hydrate(&domain_config).await
         }
     }
+}
+
+async fn binance_manual_wallet_withdraw(
+    config: &config::AppConfig,
+    coin: &str,
+    network: &str,
+    amount: Decimal,
+    confirm_live: bool,
+) -> anyhow::Result<()> {
+    ensure!(
+        confirm_live,
+        "live Binance withdrawal requires explicit --confirm-live"
+    );
+    let cap = withdrawal_cap(coin, network)?;
+    ensure!(
+        amount > Decimal::ZERO && amount <= cap,
+        "withdrawal amount exceeds the canary cap for this coin/network"
+    );
+    let wallet = TestWallet::from_env()?;
+    let address = format!("{:#x}", wallet.address());
+    let commission_symbol = match coin {
+        "ETH" => "ETHUSDT",
+        "WLD" | "USDC" => "WLDUSDC",
+        _ => bail!("unsupported withdrawal coin"),
+    };
+    let mut client = BinanceAccountClient::from_env(config)?;
+    let account = client.hydrate(commission_symbol).await?;
+    validate_binance_account(&account)?;
+    ensure!(
+        account.account.can_withdraw,
+        "Binance account does not permit withdrawals"
+    );
+    let coins = client.all_coin_information().await?;
+    let coin_state = coins
+        .iter()
+        .find(|state| state.coin == coin)
+        .with_context(|| format!("Binance capital state is missing {coin}"))?;
+    ensure!(
+        coin_state.withdraw_all_enable,
+        "Binance withdrawals are globally disabled for this coin"
+    );
+    let network_state = coin_state
+        .network_list
+        .iter()
+        .find(|state| state.network == network)
+        .with_context(|| format!("Binance capital state is missing network {network}"))?;
+    validate_withdrawal_amount(network_state, amount)?;
+    let required_balance = amount + network_state.withdraw_fee;
+    ensure!(
+        free_balance(&account, coin) >= required_balance,
+        "free Binance balance does not cover amount plus live withdrawal fee"
+    );
+
+    let withdraw_order_id = format!("rustwd{}", unix_timestamp_ms()?);
+    let submission = client
+        .withdraw(coin, network, &address, amount, &withdraw_order_id)
+        .await?;
+    ensure!(
+        submission.accepted,
+        "Binance rejected the Travel Rule withdrawal: {}",
+        submission.info
+    );
+    tracing::info!(
+        coin,
+        network,
+        amount = %amount,
+        fee = %network_state.withdraw_fee,
+        destination = %address,
+        withdraw_order_id,
+        travel_rule_id = %submission.tr_id,
+        travel_rule_info = %submission.info,
+        "capped Binance Travel Rule wallet withdrawal submitted"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let records = client.withdrawal_history(coin, &withdraw_order_id).await?;
+    if let Some(record) = records.first() {
+        validate_withdrawal_record(record, coin, network, &address, &withdraw_order_id)?;
+        log_withdrawal_record(record);
+    } else {
+        tracing::warn!(
+            coin,
+            network,
+            withdraw_order_id,
+            travel_rule_id = %submission.tr_id,
+            "withdrawal accepted but not visible in history yet"
+        );
+    }
+    Ok(())
+}
+
+async fn binance_withdrawal_status(
+    config: &config::AppConfig,
+    coin: &str,
+    withdraw_order_id: &str,
+) -> anyhow::Result<()> {
+    let mut client = BinanceAccountClient::from_env(config)?;
+    client.synchronize_clock().await?;
+    let records = client.withdrawal_history(coin, withdraw_order_id).await?;
+    ensure!(records.len() == 1, "expected exactly one withdrawal record");
+    let record = &records[0];
+    ensure!(
+        record.withdraw_order_id == withdraw_order_id,
+        "Binance returned an unexpected withdrawal client id"
+    );
+    log_withdrawal_record(record);
+    Ok(())
+}
+
+async fn binance_travel_rule_withdrawal_status(
+    config: &config::AppConfig,
+    tr_id: i64,
+) -> anyhow::Result<()> {
+    let mut client = BinanceAccountClient::from_env(config)?;
+    client.synchronize_clock().await?;
+    let records = client.travel_rule_withdrawal_history(tr_id).await?;
+    ensure!(
+        records.len() == 1,
+        "expected exactly one Travel Rule record"
+    );
+    let record = &records[0];
+    ensure!(
+        record.tr_id == tr_id,
+        "Binance returned an unexpected Travel Rule id"
+    );
+    log_travel_rule_withdrawal_record(record);
+    Ok(())
+}
+
+fn log_travel_rule_withdrawal_record(record: &TravelRuleWithdrawalRecord) {
+    tracing::info!(
+        travel_rule_id = record.tr_id,
+        binance_withdrawal_id = %record.id,
+        withdraw_order_id = %record.withdraw_order_id,
+        coin = %record.coin,
+        network = %record.network,
+        amount = %record.amount,
+        transaction_fee = %record.transaction_fee,
+        withdrawal_status = record.withdrawal_status,
+        travel_rule_status = record.travel_rule_status,
+        destination = %record.address,
+        transaction_id = %record.tx_id,
+        info = %record.info,
+        "Binance Travel Rule withdrawal status hydrated"
+    );
+}
+
+fn withdrawal_cap(coin: &str, network: &str) -> anyhow::Result<Decimal> {
+    match (coin, network) {
+        ("ETH", "OPTIMISM") => Ok(Decimal::new(2, 2)),
+        ("WLD", "WLD" | "OPTIMISM") => Ok(Decimal::from(50_u64)),
+        ("USDC", "OPTIMISM") => Ok(Decimal::from(100_u64)),
+        _ => bail!("coin/network is outside the manual withdrawal allowlist"),
+    }
+}
+
+fn validate_withdrawal_amount(network: &NetworkInformation, amount: Decimal) -> anyhow::Result<()> {
+    ensure!(
+        network.withdrawal_available(),
+        "Binance network withdrawal is disabled or busy"
+    );
+    ensure!(
+        amount >= network.withdraw_min && amount <= network.withdraw_max,
+        "withdrawal amount is outside Binance live network limits"
+    );
+    if network.withdraw_integer_multiple > Decimal::ZERO {
+        ensure!(
+            amount % network.withdraw_integer_multiple == Decimal::ZERO,
+            "withdrawal amount does not match Binance integer multiple"
+        );
+    }
+    Ok(())
+}
+
+fn validate_withdrawal_record(
+    record: &WithdrawalRecord,
+    coin: &str,
+    network: &str,
+    address: &str,
+    withdraw_order_id: &str,
+) -> anyhow::Result<()> {
+    ensure!(record.coin == coin, "withdrawal history coin mismatch");
+    ensure!(
+        record.network == network,
+        "withdrawal history network mismatch"
+    );
+    ensure!(
+        record.address.eq_ignore_ascii_case(address),
+        "withdrawal history destination mismatch"
+    );
+    ensure!(
+        record.withdraw_order_id == withdraw_order_id,
+        "withdrawal history client id mismatch"
+    );
+    Ok(())
+}
+
+fn log_withdrawal_record(record: &WithdrawalRecord) {
+    tracing::info!(
+        binance_withdrawal_id = %record.id,
+        withdraw_order_id = %record.withdraw_order_id,
+        coin = %record.coin,
+        network = %record.network,
+        amount = %record.amount,
+        transaction_fee = %record.transaction_fee,
+        status = record.status,
+        destination = %record.address,
+        transaction_id = %record.tx_id,
+        info = %record.info,
+        "Binance withdrawal status hydrated"
+    );
+}
+
+async fn binance_manual_eth_buy(
+    config: &config::AppConfig,
+    quote_amount: Decimal,
+    confirm_live: bool,
+) -> anyhow::Result<()> {
+    ensure!(
+        confirm_live,
+        "live Binance ETH purchase requires explicit --confirm-live"
+    );
+    ensure!(
+        quote_amount > Decimal::ZERO && quote_amount <= Decimal::from(200_u64),
+        "ETH gas purchase must be greater than zero and no more than 200 USDT"
+    );
+    let mut account_client = BinanceAccountClient::from_env(config)?;
+    let before = account_client.hydrate("ETHUSDT").await?;
+    validate_binance_account(&before)?;
+    let usdt_before = free_balance(&before, "USDT");
+    let eth_before = free_balance(&before, "ETH");
+    ensure!(
+        usdt_before >= quote_amount,
+        "insufficient free USDT for capped ETH gas purchase"
+    );
+
+    let client_order_id = format!("rustgas{}B", unix_timestamp_ms()?);
+    let mut ws = BinanceWsApiClient::connect(config).await?;
+    ws.test_market_buy("ETHUSDT", quote_amount, &client_order_id)
+        .await
+        .context("Binance ETHUSDT MARKET buy order.test failed")?;
+    let buy = match ws
+        .place_market_buy("ETHUSDT", quote_amount, &client_order_id)
+        .await
+    {
+        Ok(order) => order,
+        Err(error) => reconcile_unknown_order(config, "ETHUSDT", &client_order_id, error)
+            .await
+            .context("Binance ETHUSDT MARKET buy failed and could not be reconciled")?,
+    };
+    validate_filled_order(&buy, "ETHUSDT", "BUY", &client_order_id)?;
+    ensure!(
+        buy.cummulative_quote_qty <= Decimal::from(200_u64),
+        "Binance ETH purchase exceeded the absolute 200 USDT validation cap"
+    );
+    let reconciled = ws
+        .query_order("ETHUSDT", &client_order_id)
+        .await
+        .context("failed to reconcile filled Binance ETH purchase")?;
+    validate_filled_order(&reconciled, "ETHUSDT", "BUY", &client_order_id)?;
+
+    let after = account_client.hydrate("ETHUSDT").await?;
+    validate_binance_account(&after)?;
+    let usdt_after = free_balance(&after, "USDT");
+    let eth_after = free_balance(&after, "ETH");
+    tracing::info!(
+        order_id = buy.order_id,
+        client_order_id = %buy.client_order_id,
+        executed_eth = %buy.executed_qty,
+        executed_usdt = %buy.cummulative_quote_qty,
+        usdt_before = %usdt_before,
+        usdt_after = %usdt_after,
+        eth_before = %eth_before,
+        eth_after = %eth_after,
+        eth_delta = %(eth_after - eth_before),
+        "capped live ETH gas purchase completed and reconciled"
+    );
+    Ok(())
 }
 
 async fn wallet_hydrate(domain_config: &LoadedDomainConfig) -> anyhow::Result<()> {

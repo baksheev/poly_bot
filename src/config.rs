@@ -39,6 +39,36 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u16,
     },
+    /// Buy a capped amount of ETHUSDT for test-wallet gas funding.
+    BinanceManualEthBuy {
+        #[arg(long)]
+        quote_amount: rust_decimal::Decimal,
+        #[arg(long, default_value_t = false)]
+        confirm_live: bool,
+    },
+    /// Withdraw a strictly capped ETH/WLD/USDC canary to the configured test wallet.
+    BinanceManualWalletWithdraw {
+        #[arg(long)]
+        coin: String,
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        amount: rust_decimal::Decimal,
+        #[arg(long, default_value_t = false)]
+        confirm_live: bool,
+    },
+    /// Read one Binance withdrawal by its deterministic client id.
+    BinanceWithdrawalStatus {
+        #[arg(long)]
+        coin: String,
+        #[arg(long)]
+        withdraw_order_id: String,
+    },
+    /// Read one Binance Travel Rule withdrawal by its travel-rule id.
+    BinanceTravelRuleWithdrawalStatus {
+        #[arg(long)]
+        tr_id: i64,
+    },
     /// Derive and print only the public address of the configured EVM wallet.
     WalletAddress,
     /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.

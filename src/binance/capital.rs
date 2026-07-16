@@ -26,6 +26,149 @@ impl BinanceAccountClient {
         let coins = self.all_coin_information().await?;
         select_capital_routes(&coins, coin, direct_network, fallback_network)
     }
+
+    pub async fn withdraw(
+        &self,
+        coin: &str,
+        network: &str,
+        address: &str,
+        amount: Decimal,
+        withdraw_order_id: &str,
+    ) -> anyhow::Result<WithdrawalSubmission> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        ensure!(
+            address.starts_with("0x")
+                && address.len() == 42
+                && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Binance withdrawal address must be an EVM address"
+        );
+        ensure!(amount > Decimal::ZERO, "withdrawal amount must be positive");
+        ensure!(
+            !withdraw_order_id.is_empty()
+                && withdraw_order_id.len() <= 64
+                && withdraw_order_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+            "withdrawal client id is invalid"
+        );
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("address", address.to_owned()),
+            ("amount", amount.normalize().to_string()),
+            ("withdrawOrderId", withdraw_order_id.to_owned()),
+            ("network", network.to_owned()),
+            ("walletType", "0".to_owned()),
+            (
+                "questionnaire",
+                serde_json::json!({
+                    "isAddressOwner": 1,
+                    "sendTo": 1,
+                })
+                .to_string(),
+            ),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        self.signed_post(
+            "/sapi/v1/localentity/withdraw/apply",
+            &query,
+            "Travel Rule withdrawal submission",
+        )
+        .await
+    }
+
+    pub async fn withdrawal_history(
+        &self,
+        coin: &str,
+        withdraw_order_id: &str,
+    ) -> anyhow::Result<Vec<WithdrawalRecord>> {
+        validate_symbol("coin", coin)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("withdrawOrderId", withdraw_order_id.to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        self.signed_get(
+            "/sapi/v1/capital/withdraw/history",
+            &query,
+            "withdrawal history",
+        )
+        .await
+    }
+
+    pub async fn travel_rule_withdrawal_history(
+        &self,
+        tr_id: i64,
+    ) -> anyhow::Result<Vec<TravelRuleWithdrawalRecord>> {
+        ensure!(tr_id > 0, "Travel Rule id must be positive");
+        let query = self.signed_query(&[
+            ("trId", tr_id.to_string()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        self.signed_get(
+            "/sapi/v1/localentity/withdraw/history",
+            &query,
+            "Travel Rule withdrawal history",
+        )
+        .await
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalSubmission {
+    pub tr_id: i64,
+    pub accepted: bool,
+    #[serde(default)]
+    pub info: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TravelRuleWithdrawalRecord {
+    #[serde(default)]
+    pub id: String,
+    pub tr_id: i64,
+    #[serde(default)]
+    pub amount: String,
+    #[serde(default)]
+    pub transaction_fee: String,
+    #[serde(default)]
+    pub coin: String,
+    #[serde(default)]
+    pub withdrawal_status: i64,
+    #[serde(default)]
+    pub travel_rule_status: i64,
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub tx_id: String,
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub withdraw_order_id: String,
+    #[serde(default)]
+    pub info: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalRecord {
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub amount: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub transaction_fee: Decimal,
+    pub coin: String,
+    pub status: u8,
+    pub address: String,
+    #[serde(default)]
+    pub tx_id: String,
+    pub network: String,
+    #[serde(default)]
+    pub withdraw_order_id: String,
+    #[serde(default)]
+    pub info: String,
 }
 
 pub fn select_capital_routes(
@@ -168,7 +311,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CoinInformation, NetworkInformation, select_capital_routes};
+    use super::{CoinInformation, NetworkInformation, WithdrawalSubmission, select_capital_routes};
 
     const WLD: &str = r#"{
       "coin":"WLD",
@@ -199,6 +342,17 @@ mod tests {
         }
       ]
     }"#;
+
+    #[test]
+    fn parses_numeric_travel_rule_submission_id() {
+        let submission: WithdrawalSubmission = serde_json::from_str(
+            r#"{"trId":65865740,"accepted":true,"info":"Withdrawal request accepted"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(submission.tr_id, 65_865_740);
+        assert!(submission.accepted);
+    }
 
     #[test]
     fn parses_live_wld_network_fields_without_floating_point() {
