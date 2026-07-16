@@ -235,6 +235,13 @@ jobs:
             -e "s|__REBALANCE_MAX_USDC_AMOUNT__|${REBALANCE_MAX_USDC_AMOUNT}|g" \
             infra/gcp/gke/deployment.yaml \
             | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+          # Delete the legacy one-shot withdrawal authorization that predates
+          # the declarative manifest and therefore is not owned by kubectl
+          # apply's last-applied configuration.
+          kubectl patch deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --type=strategic \
+            --patch '{"spec":{"template":{"spec":{"initContainers":[{"name":"authorize-reviewed-withdrawal","$patch":"delete"}]}}}}'
           rollout_applied=true
 
           kubectl rollout status deployment/arb-bot \
