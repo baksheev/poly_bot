@@ -1,9 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
+use alloy_primitives::Address;
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     binance::account::{BinanceAccountClient, BinanceAccountState},
     binance::capital::{CapitalRouteState, select_capital_routes},
+    binance::ws_api::{BinanceWsApiClient, OrderResult, WsApiError},
     chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
     dex::{
@@ -19,8 +21,10 @@ use arb_bot::{
     },
     opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult},
     telemetry::TelemetryWriter,
+    wallet::{OPTIMISM_RPC_URL_ENV, TestWallet, TokenBalanceRequest, hydrate_chain_wallet},
 };
 use clap::Parser;
+use rust_decimal::Decimal;
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -82,7 +86,359 @@ async fn main() -> anyhow::Result<()> {
             log_binance_capital(&usdc);
             Ok(())
         }
+        Command::BinanceManualRoundTrip {
+            quote_amount,
+            confirm_live,
+        } => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            binance_manual_round_trip(&cli.config, &domain_config, quote_amount, confirm_live).await
+        }
+        Command::BinanceRecentValidationOrders { limit } => {
+            binance_recent_validation_orders(&cli.config, limit).await
+        }
+        Command::WalletAddress => {
+            let wallet = TestWallet::from_env()?;
+            tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
+            Ok(())
+        }
+        Command::WalletHydrate => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            wallet_hydrate(&domain_config).await
+        }
     }
+}
+
+async fn wallet_hydrate(domain_config: &LoadedDomainConfig) -> anyhow::Result<()> {
+    let wallet = TestWallet::from_env()?;
+    let pairs = &domain_config.snapshot().pairs;
+    ensure!(
+        pairs.len() == 1,
+        "wallet hydration requires exactly one configured pair"
+    );
+    let pair = &pairs[0];
+    ensure!(
+        pair.chain.chain_id == 480,
+        "configured execution pair must be on World Chain"
+    );
+    let world_endpoint = std::env::var(&pair.chain.rpc_url_env).with_context(|| {
+        format!(
+            "required environment variable {} is not set",
+            pair.chain.rpc_url_env
+        )
+    })?;
+    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
+        format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
+    })?;
+    let world_tokens = vec![
+        TokenBalanceRequest {
+            symbol: pair.token_a.symbol.clone(),
+            contract: pair
+                .token_a
+                .contract
+                .parse()
+                .context("configured World Chain token_a address is invalid")?,
+        },
+        TokenBalanceRequest {
+            symbol: pair.token_b.symbol.clone(),
+            contract: pair
+                .token_b
+                .contract
+                .parse()
+                .context("configured World Chain token_b address is invalid")?,
+        },
+    ];
+    let optimism_tokens = vec![
+        TokenBalanceRequest {
+            symbol: "USDC".to_owned(),
+            contract: "0x0b2c639c533813f4aa9d7837caf62653d097ff85"
+                .parse::<Address>()
+                .expect("constant native Optimism USDC address is valid"),
+        },
+        TokenBalanceRequest {
+            symbol: "USDC.e".to_owned(),
+            contract: "0x7f5c764cbc14f9669b88837ca1490cca17c31607"
+                .parse::<Address>()
+                .expect("constant bridged Optimism USDC address is valid"),
+        },
+        TokenBalanceRequest {
+            symbol: "WLD".to_owned(),
+            contract: "0xdc6ff44d5d932cbd77b52e5612ba0529dc6226f1"
+                .parse::<Address>()
+                .expect("constant Optimism WLD address is valid"),
+        },
+    ];
+    let address = wallet.address();
+    let (world, optimism) = tokio::try_join!(
+        hydrate_chain_wallet(world_endpoint, 480, address, &world_tokens),
+        hydrate_chain_wallet(optimism_endpoint, 10, address, &optimism_tokens),
+    )?;
+    log_chain_wallet_state(address, "World Chain", &world);
+    log_chain_wallet_state(address, "Optimism", &optimism);
+    Ok(())
+}
+
+fn log_chain_wallet_state(
+    address: Address,
+    chain_name: &str,
+    state: &arb_bot::wallet::ChainWalletState,
+) {
+    tracing::info!(
+        wallet_address = %address,
+        chain = chain_name,
+        chain_id = state.chain_id,
+        block_number = state.block_number,
+        pending_nonce = state.pending_nonce,
+        native_balance_wei = %state.native_balance_wei,
+        rpc_http_requests = state.rpc_stats.http_requests,
+        rpc_eth_calls = state.rpc_stats.eth_calls,
+        "EVM wallet chain state hydrated"
+    );
+    for token in &state.token_balances {
+        tracing::info!(
+            wallet_address = %address,
+            chain = chain_name,
+            chain_id = state.chain_id,
+            symbol = %token.symbol,
+            contract = %token.contract,
+            balance_base_units = %token.base_units,
+            "EVM wallet token balance hydrated"
+        );
+    }
+}
+
+async fn binance_recent_validation_orders(
+    config: &config::AppConfig,
+    limit: u16,
+) -> anyhow::Result<()> {
+    let mut ws = BinanceWsApiClient::connect(config).await?;
+    let orders = ws.recent_orders("WLDUSDC", limit).await?;
+    let validation_orders = orders
+        .iter()
+        .filter(|order| order.client_order_id.starts_with("rustval"))
+        .collect::<Vec<_>>();
+    for order in &validation_orders {
+        tracing::info!(
+            symbol = %order.symbol,
+            order_id = order.order_id,
+            client_order_id = %order.client_order_id,
+            side = %order.side,
+            order_type = %order.order_type,
+            status = %order.status,
+            executed_base = %order.executed_qty,
+            executed_quote = %order.cummulative_quote_qty,
+            "Rust Binance validation order found"
+        );
+    }
+    ensure!(
+        !validation_orders.is_empty(),
+        "no recent Rust validation orders found"
+    );
+    tracing::info!(
+        validation_orders = validation_orders.len(),
+        inspected_orders = orders.len(),
+        binance_ws_clock_offset_ms = ws.clock_offset_ms(),
+        "recent Rust Binance validation order audit completed"
+    );
+    Ok(())
+}
+
+async fn binance_manual_round_trip(
+    config: &config::AppConfig,
+    domain_config: &LoadedDomainConfig,
+    quote_amount: Decimal,
+    confirm_live: bool,
+) -> anyhow::Result<()> {
+    ensure!(
+        confirm_live,
+        "live Binance validation requires explicit --confirm-live"
+    );
+    ensure!(
+        quote_amount > Decimal::ZERO && quote_amount <= Decimal::from(100_u64),
+        "quote amount must be greater than zero and no more than 100 USDC"
+    );
+    let pairs = &domain_config.snapshot().pairs;
+    ensure!(
+        pairs.len() == 1,
+        "live Binance validation requires exactly one configured pair"
+    );
+    let pair = &pairs[0];
+    ensure!(
+        pair.binance.symbol == "WLDUSDC"
+            && pair.binance.base_asset == "WLD"
+            && pair.binance.quote_asset == "USDC",
+        "live Binance validation is hard-limited to WLDUSDC"
+    );
+    let step_size = Decimal::from_str(&pair.binance.step_size)
+        .context("validated Binance step size is invalid")?;
+
+    let mut account_client = BinanceAccountClient::from_env(config)?;
+    let before = account_client.hydrate(&pair.binance.symbol).await?;
+    validate_binance_account(&before)?;
+    let usdc_before = free_balance(&before, "USDC");
+    let wld_before = free_balance(&before, "WLD");
+    ensure!(
+        usdc_before >= quote_amount,
+        "insufficient free USDC for capped live validation"
+    );
+
+    let sequence = unix_timestamp_ms()?;
+    let buy_client_id = format!("rustval{sequence}B");
+    let sell_client_id = format!("rustval{sequence}S");
+    let mut ws = BinanceWsApiClient::connect(config).await?;
+    ws.test_market_buy(&pair.binance.symbol, quote_amount, &buy_client_id)
+        .await
+        .context("Binance MARKET buy order.test failed")?;
+    let buy = match ws
+        .place_market_buy(&pair.binance.symbol, quote_amount, &buy_client_id)
+        .await
+    {
+        Ok(order) => order,
+        Err(error) => reconcile_unknown_order(config, &pair.binance.symbol, &buy_client_id, error)
+            .await
+            .context("Binance MARKET buy failed and could not be reconciled")?,
+    };
+    validate_filled_order(&buy, &pair.binance.symbol, "BUY", &buy_client_id)?;
+    ensure!(
+        buy.cummulative_quote_qty <= Decimal::from(100_u64),
+        "Binance buy exceeded the absolute 100 USDC validation cap"
+    );
+
+    let acquired_wld = buy.executed_qty - buy.commission_in("WLD");
+    let sell_quantity = (acquired_wld / step_size).floor() * step_size;
+    ensure!(
+        sell_quantity > Decimal::ZERO,
+        "buy produced no sellable WLD"
+    );
+    ensure!(
+        sell_quantity <= acquired_wld,
+        "rounded sell quantity exceeds acquired WLD"
+    );
+
+    ws.test_market_sell(&pair.binance.symbol, sell_quantity, &sell_client_id)
+        .await
+        .context("Binance MARKET sell order.test failed")?;
+    let sell = match ws
+        .place_market_sell(&pair.binance.symbol, sell_quantity, &sell_client_id)
+        .await
+    {
+        Ok(order) => order,
+        Err(error) => reconcile_unknown_order(config, &pair.binance.symbol, &sell_client_id, error)
+            .await
+            .context("Binance MARKET sell failed and could not be reconciled")?,
+    };
+    validate_filled_order(&sell, &pair.binance.symbol, "SELL", &sell_client_id)?;
+
+    let reconciled_buy = ws
+        .query_order(&pair.binance.symbol, &buy_client_id)
+        .await
+        .context("failed to reconcile filled Binance buy")?;
+    let reconciled_sell = ws
+        .query_order(&pair.binance.symbol, &sell_client_id)
+        .await
+        .context("failed to reconcile filled Binance sell")?;
+    validate_filled_order(&reconciled_buy, &pair.binance.symbol, "BUY", &buy_client_id)?;
+    validate_filled_order(
+        &reconciled_sell,
+        &pair.binance.symbol,
+        "SELL",
+        &sell_client_id,
+    )?;
+
+    let after = account_client.hydrate(&pair.binance.symbol).await?;
+    validate_binance_account(&after)?;
+    let usdc_after = free_balance(&after, "USDC");
+    let wld_after = free_balance(&after, "WLD");
+    tracing::info!(
+        symbol = %pair.binance.symbol,
+        quote_cap = %quote_amount,
+        buy_order_id = buy.order_id,
+        buy_client_order_id = %buy.client_order_id,
+        buy_executed_base = %buy.executed_qty,
+        buy_executed_quote = %buy.cummulative_quote_qty,
+        sell_order_id = sell.order_id,
+        sell_client_order_id = %sell.client_order_id,
+        sell_executed_base = %sell.executed_qty,
+        sell_executed_quote = %sell.cummulative_quote_qty,
+        usdc_before = %usdc_before,
+        usdc_after = %usdc_after,
+        usdc_delta = %(usdc_after - usdc_before),
+        wld_before = %wld_before,
+        wld_after = %wld_after,
+        wld_delta = %(wld_after - wld_before),
+        binance_ws_clock_offset_ms = ws.clock_offset_ms(),
+        "capped live Binance MARKET round trip completed and reconciled"
+    );
+    Ok(())
+}
+
+async fn reconcile_unknown_order(
+    config: &config::AppConfig,
+    symbol: &str,
+    client_order_id: &str,
+    placement_error: WsApiError,
+) -> anyhow::Result<OrderResult> {
+    if matches!(placement_error, WsApiError::Rejected { .. }) {
+        bail!(placement_error);
+    }
+    let mut reconciliation = BinanceWsApiClient::connect(config)
+        .await
+        .context("failed to reconnect for order reconciliation")?;
+    let order = reconciliation
+        .query_order(symbol, client_order_id)
+        .await
+        .with_context(|| format!("placement outcome was unknown: {placement_error}"))?;
+    tracing::warn!(
+        order_id = order.order_id,
+        status = %order.status,
+        client_order_id,
+        "Binance placement transport outcome was unknown; order recovered by client id"
+    );
+    Ok(order)
+}
+
+fn validate_filled_order(
+    order: &OrderResult,
+    symbol: &str,
+    side: &str,
+    client_order_id: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        order.symbol == symbol,
+        "Binance returned an unexpected symbol"
+    );
+    ensure!(order.side == side, "Binance returned an unexpected side");
+    ensure!(
+        order.client_order_id == client_order_id,
+        "Binance returned an unexpected client order id"
+    );
+    ensure!(
+        order.order_type == "MARKET",
+        "Binance returned an unexpected order type"
+    );
+    ensure!(
+        order.status == "FILLED",
+        "Binance order was not fully filled"
+    );
+    ensure!(
+        order.executed_qty > Decimal::ZERO,
+        "Binance order executed no base quantity"
+    );
+    Ok(())
+}
+
+fn free_balance(state: &BinanceAccountState, asset: &str) -> Decimal {
+    state
+        .balance(asset)
+        .map_or(Decimal::ZERO, |balance| balance.free)
+}
+
+fn unix_timestamp_ms() -> anyhow::Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("timestamp overflow")
 }
 
 fn load_dotenv() -> anyhow::Result<()> {

@@ -41,6 +41,14 @@ impl BinanceCredentials {
             secret_key: secret_key.to_owned(),
         }
     }
+
+    pub(super) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    pub(super) fn sign(&self, payload: &str) -> anyhow::Result<String> {
+        sign_hex(&self.secret_key, payload)
+    }
 }
 
 impl fmt::Debug for BinanceCredentials {

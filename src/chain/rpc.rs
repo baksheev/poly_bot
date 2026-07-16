@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use alloy_primitives::{Address, B256, hex};
+use alloy_primitives::{Address, B256, U256, hex};
 use anyhow::{Context, anyhow, ensure};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -127,6 +127,47 @@ impl JsonRpcClient {
             hash: parse_b256("block.hash", &block.hash)?,
             parent_hash: parse_b256("block.parentHash", &block.parent_hash)?,
         })
+    }
+
+    pub async fn chain_id(&self) -> anyhow::Result<u64> {
+        let value = self.request("eth_chainId", json!([])).await?;
+        parse_quantity_value_u64("eth_chainId", value)
+    }
+
+    pub async fn native_balance(&self, address: Address) -> anyhow::Result<U256> {
+        let value = self
+            .request("eth_getBalance", json!([format!("{address:#x}"), "latest"]))
+            .await?;
+        parse_quantity_value_u256("eth_getBalance", value)
+    }
+
+    pub async fn pending_nonce(&self, address: Address) -> anyhow::Result<u64> {
+        let value = self
+            .request(
+                "eth_getTransactionCount",
+                json!([format!("{address:#x}"), "pending"]),
+            )
+            .await?;
+        parse_quantity_value_u64("eth_getTransactionCount", value)
+    }
+
+    pub async fn erc20_balance(&self, token: Address, owner: Address) -> anyhow::Result<U256> {
+        let block = self.latest_block().await?;
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+        data.extend_from_slice(&[0_u8; 12]);
+        data.extend_from_slice(owner.as_slice());
+        let mut values = self
+            .eth_call_batch(&[EthCall { to: token, data }], block)
+            .await?;
+        let value = values
+            .pop()
+            .context("ERC-20 balance call returned no value")?;
+        ensure!(
+            value.len() == 32,
+            "ERC-20 balance result is not one ABI word"
+        );
+        Ok(U256::from_be_slice(&value))
     }
 
     pub async fn eth_call_batch(
@@ -320,6 +361,28 @@ fn parse_quantity_u64(name: &str, value: &str) -> anyhow::Result<u64> {
     u64::from_str_radix(encoded, 16).with_context(|| format!("{name} is invalid"))
 }
 
+fn parse_quantity_u256(name: &str, value: &str) -> anyhow::Result<U256> {
+    let encoded = value
+        .strip_prefix("0x")
+        .with_context(|| format!("{name} is missing 0x prefix"))?;
+    ensure!(!encoded.is_empty(), "{name} is empty");
+    U256::from_str_radix(encoded, 16).with_context(|| format!("{name} is invalid"))
+}
+
+fn parse_quantity_value_u64(name: &str, value: Value) -> anyhow::Result<u64> {
+    let encoded = value
+        .as_str()
+        .with_context(|| format!("{name} result is not a string"))?;
+    parse_quantity_u64(name, encoded)
+}
+
+fn parse_quantity_value_u256(name: &str, value: Value) -> anyhow::Result<U256> {
+    let encoded = value
+        .as_str()
+        .with_context(|| format!("{name} result is not a string"))?;
+    parse_quantity_u256(name, encoded)
+}
+
 fn parse_b256(name: &str, value: &str) -> anyhow::Result<B256> {
     value.parse().with_context(|| format!("{name} is invalid"))
 }
@@ -365,7 +428,12 @@ fn retry_delay(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonRpcClient, parse_data_hex, parse_quantity_u64, sanitize_rpc_message};
+    use alloy_primitives::U256;
+
+    use super::{
+        JsonRpcClient, parse_data_hex, parse_quantity_u64, parse_quantity_u256,
+        sanitize_rpc_message,
+    };
 
     #[test]
     fn endpoint_is_redacted_from_debug() {
@@ -384,6 +452,10 @@ mod tests {
             32_403_561
         );
         assert_eq!(parse_data_hex("data", "0x00ff").unwrap(), [0, 255]);
+        assert_eq!(
+            parse_quantity_u256("balance", "0x100").unwrap(),
+            U256::from(256)
+        );
         assert!(parse_data_hex("data", "ff").is_err());
     }
 

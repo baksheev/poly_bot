@@ -10,3 +10,4 @@ pub mod opportunity;
 pub mod rebalance;
 pub mod state;
 pub mod telemetry;
+pub mod wallet;

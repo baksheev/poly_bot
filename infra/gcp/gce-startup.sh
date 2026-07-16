@@ -52,6 +52,7 @@ umask 077
   printf 'GCP_REGION=%s\n' "${region}"
   printf 'BINANCE_WS_BASE_URL=wss://stream.binance.com:9443/ws\n'
   printf 'BINANCE_REST_BASE_URL=https://api.binance.com\n'
+  printf 'BINANCE_WS_API_URL=wss://ws-api.binance.com:443/ws-api/v3\n'
   printf 'DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v2.json\n'
   printf 'MARKET_DATA_MAX_AGE_MS=5000\n'
   printf 'DEX_EVENT_CHANNEL_CAPACITY=8192\n'

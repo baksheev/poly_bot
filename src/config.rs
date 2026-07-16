@@ -27,6 +27,22 @@ pub enum Command {
     BinanceAccount,
     /// Hydrate sanitized Binance direct and Optimism fallback network state.
     BinanceCapital,
+    /// Perform a capped live WLDUSDC MARKET buy/sell validation over WebSocket API.
+    BinanceManualRoundTrip {
+        #[arg(long)]
+        quote_amount: rust_decimal::Decimal,
+        #[arg(long, default_value_t = false)]
+        confirm_live: bool,
+    },
+    /// Read recent WLDUSDC orders created by the Rust validation client.
+    BinanceRecentValidationOrders {
+        #[arg(long, default_value_t = 20)]
+        limit: u16,
+    },
+    /// Derive and print only the public address of the configured EVM wallet.
+    WalletAddress,
+    /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.
+    WalletHydrate,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -56,6 +72,13 @@ pub struct AppConfig {
         default_value = "https://api.binance.com"
     )]
     pub binance_rest_base_url: String,
+
+    #[arg(
+        long,
+        env = "BINANCE_WS_API_URL",
+        default_value = "wss://ws-api.binance.com:443/ws-api/v3"
+    )]
+    pub binance_ws_api_url: String,
 
     #[arg(
         long,
@@ -139,6 +162,8 @@ impl AppConfig {
             &["https"],
         )?;
         validate_binance_spot_rest_base_url(&self.binance_rest_base_url)?;
+        validate_url("BINANCE_WS_API_URL", &self.binance_ws_api_url, &["wss"])?;
+        validate_binance_spot_ws_api_url(&self.binance_ws_api_url)?;
         ensure!(
             !self.domain_config_path.as_os_str().is_empty(),
             "DOMAIN_CONFIG_PATH is empty"
@@ -214,6 +239,18 @@ fn validate_binance_spot_rest_base_url(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_binance_spot_ws_api_url(value: &str) -> anyhow::Result<()> {
+    let normalized = value.trim_end_matches('/');
+    ensure!(
+        matches!(
+            normalized,
+            "wss://ws-api.binance.com:443/ws-api/v3" | "wss://ws-api.binance.com:9443/ws-api/v3"
+        ),
+        "BINANCE_WS_API_URL must use an official Binance Spot WebSocket API endpoint"
+    );
+    Ok(())
+}
+
 fn validate_sql_identifier(name: &str, value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
@@ -237,6 +274,7 @@ mod tests {
             gcp_region: "asia-southeast1".into(),
             binance_ws_base_url: "wss://stream.binance.com:9443/ws".into(),
             binance_rest_base_url: "https://api.binance.com".into(),
+            binance_ws_api_url: "wss://ws-api.binance.com:443/ws-api/v3".into(),
             domain_config_path: "config/strategies/usdc-wld-world-chain.v2.json".into(),
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,
