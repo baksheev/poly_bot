@@ -27,15 +27,16 @@ does not replace a real operation against the production endpoint.
 | Binance Spot WS API | MARKET sell WLDUSDC | Passed | order `455189375`, `FILLED`, 24.5 WLD / 9.95925 USDC |
 | Binance reconciliation | signed `allOrders` query | Passed | both deterministic `rustval...` IDs returned `FILLED` |
 | EVM signer | derive public address from Secret Manager value | Passed | `0x90D990C81320221D2882De32beeA78923c1e77A3` |
-| World Chain RPC | chain ID, latest block, pending nonce, ETH/WLD/USDC | Passed | chain `480`; empty wallet; pending nonce `0` |
-| Optimism RPC | chain ID, latest block, pending nonce, ETH/WLD/USDC/USDC.e | Passed | chain `10`; empty wallet; pending nonce `0` |
+| World Chain RPC | chain ID, latest block, pending nonce, ETH/WLD/USDC | Passed | chain `480`; native balance `0.007982721314804481 ETH` after Across fill |
+| Optimism RPC | chain ID, latest block, pending nonce, ETH/WLD/USDC/USDC.e | Passed | chain `10`; native balance `0.001997329279441474 ETH`; pending nonce `1` |
 | Binance IOC | place/cancel/partial-fill reconciliation | Pending | — |
 | Binance recovery | LIMIT unwind, then MARKET loss fixation | Pending | — |
-| Binance withdrawal | ETH to Optimism | Pending | — |
+| Binance withdrawal | ETH to Optimism | Passed | `0.01 ETH` requested; `0.009985 ETH` received after Binance fee |
 | Binance withdrawal | WLD direct to World Chain | Pending | — |
 | Binance fallback | WLD to Optimism when World route is unavailable | Pending | — |
-| Across | Optimism to World Chain | Pending | — |
-| Across | World Chain to Optimism | Pending | — |
+| Across native ETH | Optimism to World Chain | Passed | origin `0x8a6d9da68dd5b9ed9f4bbcc6e7d736f8d249a773e8b9921003eeceb89eb57f86`; fill `0x09bcd6beb4ed5f188df7cc3b2b23f7d215a95111c05bfef390cf3632adfb7877`; sent `0.00798759334452456 ETH`; received `0.007982721314804481 ETH`; retained more than 20% on Optimism |
+| Across USDC | Optimism to World Chain | Pending | — |
+| Across USDC | World Chain to Optimism | Pending | — |
 | DEX | USDC to WLD | Pending | — |
 | DEX | WLD to USDC | Pending | — |
 | EVM recovery | reverted/replaced transaction and nonce recovery | Pending | — |
@@ -46,5 +47,5 @@ does not replace a real operation against the production endpoint.
 | Rebalance | Optimism + Across fallback end-to-end | Pending | — |
 
 The wallet hydration evidence above intentionally records no secret material.
-At the time of the check all native and ERC-20 balances were zero, so no signed
-chain transaction can be tested until the bootstrap withdrawal completes.
+The bootstrap ETH withdrawal and native Across bridge are complete; ERC-20
+inventory and DEX execution canaries remain pending.

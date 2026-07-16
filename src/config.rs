@@ -78,6 +78,11 @@ pub enum Command {
         #[arg(long)]
         amount: u128,
     },
+    /// Bridge native ETH from Optimism to World Chain, retaining at least 20% for Optimism gas.
+    AcrossManualEthToWorld {
+        #[arg(long, default_value_t = false)]
+        confirm_live: bool,
+    },
     /// Derive and print only the public address of the configured EVM wallet.
     WalletAddress,
     /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.

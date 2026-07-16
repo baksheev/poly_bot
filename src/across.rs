@@ -1,9 +1,9 @@
 use std::{str::FromStr, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::{Context, ensure};
 use reqwest::{Client, Response, StatusCode};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 
 use crate::config::AppConfig;
 
@@ -13,6 +13,9 @@ pub const OPTIMISM_USDC: Address =
     alloy_primitives::address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85");
 pub const WORLD_CHAIN_USDC: Address =
     alloy_primitives::address!("0x79A02482A880bCE3F13e09Da970dC34db4CD24d1");
+pub const NATIVE_ETH: Address = Address::ZERO;
+pub const OPTIMISM_WETH: Address =
+    alloy_primitives::address!("0x4200000000000000000000000000000000000006");
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -123,7 +126,7 @@ pub struct AcrossQuoteRequest {
 pub struct AcrossQuote {
     pub amount_type: String,
     pub checks: AcrossChecks,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub approval_txns: Vec<AcrossTransaction>,
     pub input_token: AcrossToken,
     pub output_token: AcrossToken,
@@ -136,6 +139,14 @@ pub struct AcrossQuote {
     pub swap_tx: AcrossTransaction,
     pub quote_expiry_timestamp: u64,
     pub id: String,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -185,9 +196,25 @@ pub struct AcrossTransaction {
     pub to: String,
     pub data: String,
     #[serde(default)]
+    pub simulation_success: Option<bool>,
+    #[serde(default)]
     pub value: serde_json::Value,
     #[serde(default)]
     pub gas: serde_json::Value,
+    #[serde(default)]
+    pub max_fee_per_gas: serde_json::Value,
+    #[serde(default)]
+    pub max_priority_fee_per_gas: serde_json::Value,
+}
+
+pub struct ValidatedNativeEthQuote {
+    pub target: Address,
+    pub data: Vec<u8>,
+    pub value: u128,
+    pub gas: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub minimum_output_amount: u128,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -195,9 +222,18 @@ pub struct AcrossTransaction {
 pub struct AcrossDepositStatus {
     pub status: String,
     pub fill_txn_ref: Option<String>,
+    #[serde(default)]
+    pub origin_chain_id: Option<u64>,
+    #[serde(default)]
+    pub deposit_tx_hash: Option<String>,
+    #[serde(default)]
+    pub deposit_txn_ref: Option<String>,
     pub destination_chain_id: u64,
-    pub output_token: String,
+    #[serde(default)]
+    pub output_token: Option<String>,
+    #[serde(default)]
     pub output_amount: Option<String>,
+    #[serde(default)]
     pub fill_time: Option<u64>,
 }
 
@@ -291,6 +327,210 @@ pub fn validate_quote(request: &AcrossQuoteRequest, quote: &AcrossQuote) -> anyh
     validate_swap_calldata(request, &quote.swap_tx.data, min_output)?;
     validate_approvals(request, quote, spender)?;
     Ok(())
+}
+
+pub fn validate_native_eth_quote(
+    request: &AcrossQuoteRequest,
+    quote: &AcrossQuote,
+    source_balance: u128,
+) -> anyhow::Result<ValidatedNativeEthQuote> {
+    ensure!(
+        request.origin_chain_id == OPTIMISM_CHAIN_ID
+            && request.destination_chain_id == WORLD_CHAIN_CHAIN_ID,
+        "native ETH canary only permits Optimism to World Chain"
+    );
+    ensure!(
+        request.input_token == NATIVE_ETH && request.output_token == NATIVE_ETH,
+        "native ETH canary requires the zero-address token"
+    );
+    ensure!(
+        request.depositor == request.recipient,
+        "native ETH canary recipient changed"
+    );
+    ensure!(
+        quote.amount_type == "exactInput",
+        "Across changed the quote amount type"
+    );
+    ensure!(
+        !quote.id.is_empty() && quote.id.len() <= 256,
+        "Across quote id is invalid"
+    );
+    ensure_native_token(&quote.input_token, OPTIMISM_CHAIN_ID)?;
+    ensure_native_token(&quote.output_token, WORLD_CHAIN_CHAIN_ID)?;
+
+    let input_amount = parse_amount("inputAmount", &quote.input_amount)?;
+    let max_input = parse_amount("maxInputAmount", &quote.max_input_amount)?;
+    let expected_output = parse_amount("expectedOutputAmount", &quote.expected_output_amount)?;
+    let min_output = parse_amount("minOutputAmount", &quote.min_output_amount)?;
+    let fee = parse_amount("fees.total.amount", &quote.fees.total.amount)?;
+    ensure!(
+        input_amount == request.amount && max_input == request.amount,
+        "Across changed the exact input amount"
+    );
+    ensure!(
+        expected_output > 0 && expected_output <= request.amount,
+        "Across expected native ETH output is invalid"
+    );
+    ensure!(
+        min_output > 0 && min_output <= expected_output,
+        "Across minimum native ETH output is invalid"
+    );
+    ensure!(
+        fee < request.amount,
+        "Across fee consumes the full input amount"
+    );
+    ensure!(
+        quote.expected_fill_time <= 600,
+        "Across expected fill time exceeds the safety bound"
+    );
+    validate_expiry(quote.quote_expiry_timestamp)?;
+
+    ensure_check_token(&quote.checks.allowance.token, NATIVE_ETH)?;
+    ensure_check_token(&quote.checks.balance.token, NATIVE_ETH)?;
+    ensure!(
+        parse_amount("allowance.expected", &quote.checks.allowance.expected)? == request.amount,
+        "Across allowance expectation changed"
+    );
+    ensure!(
+        parse_amount("balance.expected", &quote.checks.balance.expected)? == request.amount,
+        "Across balance expectation changed"
+    );
+    ensure!(
+        parse_amount("balance.actual", &quote.checks.balance.actual)? == source_balance,
+        "Across observed a different native ETH balance"
+    );
+    ensure!(
+        parse_u256_amount("allowance.actual", &quote.checks.allowance.actual)?
+            >= U256::from(request.amount),
+        "Across native ETH allowance check is insufficient"
+    );
+    ensure!(
+        quote.approval_txns.is_empty(),
+        "Across returned an approval for native ETH"
+    );
+
+    ensure!(
+        quote.swap_tx.chain_id == OPTIMISM_CHAIN_ID,
+        "Across native ETH swap chain mismatch"
+    );
+    let spender = parse_address("allowance.spender", &quote.checks.allowance.spender)?;
+    let target = parse_address("swapTx.to", &quote.swap_tx.to)?;
+    ensure!(
+        target == spender,
+        "Across swap target differs from allowance spender"
+    );
+    ensure!(
+        quote.swap_tx.simulation_success == Some(true),
+        "Across native ETH simulation did not succeed"
+    );
+    let value = transaction_integer("swapTx.value", &quote.swap_tx.value)?;
+    ensure!(
+        value == request.amount,
+        "Across native ETH transaction value changed"
+    );
+    let gas = transaction_integer("swapTx.gas", &quote.swap_tx.gas)?;
+    let gas = u64::try_from(gas).context("Across native ETH gas exceeds u64")?;
+    ensure!(
+        gas > 0 && gas <= 500_000,
+        "Across native ETH gas is outside the canary bound"
+    );
+    let max_fee_per_gas =
+        transaction_integer("swapTx.maxFeePerGas", &quote.swap_tx.max_fee_per_gas)?;
+    let max_priority_fee_per_gas = transaction_integer(
+        "swapTx.maxPriorityFeePerGas",
+        &quote.swap_tx.max_priority_fee_per_gas,
+    )?;
+    ensure!(
+        max_fee_per_gas > 0
+            && max_priority_fee_per_gas > 0
+            && max_priority_fee_per_gas <= max_fee_per_gas
+            && max_fee_per_gas <= 100_000_000_000,
+        "Across native ETH fee fields are invalid"
+    );
+    let data = validate_native_eth_calldata(request, &quote.swap_tx.data, min_output)?;
+
+    Ok(ValidatedNativeEthQuote {
+        target,
+        data,
+        value,
+        gas,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        minimum_output_amount: min_output,
+    })
+}
+
+fn ensure_native_token(token: &AcrossToken, chain_id: u64) -> anyhow::Result<()> {
+    ensure!(
+        token.chain_id == chain_id,
+        "Across native ETH chain mismatch"
+    );
+    ensure!(
+        parse_address("token.address", &token.address)? == NATIVE_ETH,
+        "Across native ETH token address changed"
+    );
+    ensure!(token.decimals == 18, "Across native ETH decimals changed");
+    ensure!(token.symbol == "ETH", "Across native ETH symbol changed");
+    Ok(())
+}
+
+fn validate_expiry(expiry: u64) -> anyhow::Result<()> {
+    let now = unix_timestamp_seconds()?;
+    ensure!(expiry > now, "Across quote is already expired");
+    ensure!(
+        expiry <= now + 7_200,
+        "Across quote expiry is outside the safety bound"
+    );
+    Ok(())
+}
+
+fn validate_native_eth_calldata(
+    request: &AcrossQuoteRequest,
+    data: &str,
+    min_output: u128,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = decode_calldata("swapTx.data", data)?;
+    ensure!(
+        bytes.len() >= 4 + 14 * 32 && bytes.len() <= 1_024,
+        "Across native ETH calldata length is invalid"
+    );
+    ensure!(
+        bytes[..4] == [0x60, 0x9e, 0xa0, 0x81],
+        "Across native ETH calldata selector changed"
+    );
+    ensure!(
+        address_word(&bytes, 1)? == request.depositor,
+        "Across native ETH calldata depositor mismatch"
+    );
+    ensure!(
+        address_word(&bytes, 2)? == request.recipient,
+        "Across native ETH calldata recipient mismatch"
+    );
+    ensure!(
+        address_word(&bytes, 3)? == OPTIMISM_WETH && address_word(&bytes, 5)? == OPTIMISM_WETH,
+        "Across native ETH calldata WETH address changed"
+    );
+    ensure!(
+        u256_word_fits_u128(&bytes, 4)? == request.amount,
+        "Across native ETH calldata input amount mismatch"
+    );
+    ensure!(
+        u256_word_fits_u128(&bytes, 6)? == min_output,
+        "Across native ETH calldata minimum output mismatch"
+    );
+    ensure!(
+        u256_word_fits_u128(&bytes, 7)? == u128::from(request.destination_chain_id),
+        "Across native ETH calldata destination chain mismatch"
+    );
+    ensure!(
+        u256_word_fits_u128(&bytes, 12)? == 13 * 32,
+        "Across native ETH calldata message offset changed"
+    );
+    ensure!(
+        u256_word_fits_u128(&bytes, 13)? == 0,
+        "Across native ETH calldata contains a destination message"
+    );
+    Ok(bytes)
 }
 
 fn ensure_token(token: &AcrossToken, chain_id: u64, address: Address) -> anyhow::Result<()> {
@@ -457,6 +697,12 @@ fn parse_amount(name: &str, value: &str) -> anyhow::Result<u128> {
         .with_context(|| format!("Across {name} is not an unsigned integer"))
 }
 
+fn parse_u256_amount(name: &str, value: &str) -> anyhow::Result<U256> {
+    value
+        .parse()
+        .with_context(|| format!("Across {name} is not an unsigned uint256 integer"))
+}
+
 fn transaction_integer(name: &str, value: &serde_json::Value) -> anyhow::Result<u128> {
     match value {
         serde_json::Value::Null => Ok(0),
@@ -487,7 +733,13 @@ pub fn validate_deposit_status(
         "Across status destination chain mismatch"
     );
     ensure!(
-        parse_address("status.outputToken", &status.output_token)? == output_token,
+        parse_address(
+            "status.outputToken",
+            status
+                .output_token
+                .as_deref()
+                .context("Across status has no output token")?,
+        )? == output_token,
         "Across status output token mismatch"
     );
     match status.status.as_str() {
@@ -534,6 +786,61 @@ pub fn validate_deposit_status(
     }
 }
 
+pub fn validate_native_eth_deposit_status(
+    status: &AcrossDepositStatus,
+    origin_transaction_hash: &str,
+    minimum_output_amount: u128,
+) -> anyhow::Result<bool> {
+    validate_transaction_hash(origin_transaction_hash)?;
+    ensure!(
+        status.origin_chain_id == Some(OPTIMISM_CHAIN_ID),
+        "Across native ETH status origin chain mismatch"
+    );
+    ensure!(
+        status.deposit_tx_hash.as_deref() == Some(origin_transaction_hash)
+            && status.deposit_txn_ref.as_deref() == Some(origin_transaction_hash),
+        "Across native ETH status origin transaction mismatch"
+    );
+    ensure!(
+        status.destination_chain_id == WORLD_CHAIN_CHAIN_ID,
+        "Across native ETH status destination chain mismatch"
+    );
+    if let Some(output_token) = status.output_token.as_deref() {
+        ensure!(
+            parse_address("status.outputToken", output_token)? == NATIVE_ETH,
+            "Across native ETH status output token mismatch"
+        );
+    }
+    match status.status.as_str() {
+        "pending" => {
+            ensure!(
+                status.fill_txn_ref.is_none(),
+                "pending Across native ETH status has a fill transaction"
+            );
+            Ok(false)
+        }
+        "filled" => {
+            validate_transaction_hash(
+                status
+                    .fill_txn_ref
+                    .as_deref()
+                    .context("filled Across native ETH status has no fill transaction")?,
+            )?;
+            if let Some(output_amount) = status.output_amount.as_deref() {
+                ensure!(
+                    parse_amount("status.outputAmount", output_amount)? >= minimum_output_amount,
+                    "Across native ETH fill output is below the reserved minimum"
+                );
+            }
+            Ok(true)
+        }
+        _ => anyhow::bail!(
+            "unsupported Across native ETH deposit status {}",
+            status.status
+        ),
+    }
+}
+
 fn validate_transaction_hash(value: &str) -> anyhow::Result<()> {
     ensure!(
         value.len() == 66
@@ -554,17 +861,25 @@ fn unix_timestamp_seconds() -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, address};
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::{
         AcrossAllowanceCheck, AcrossBalanceCheck, AcrossChecks, AcrossDepositStatus, AcrossFee,
-        AcrossFees, AcrossQuote, AcrossQuoteRequest, AcrossToken, AcrossTransaction,
-        OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, decode_calldata,
-        transaction_integer, u256_word_is_at_least_u128, validate_deposit_status, validate_quote,
+        AcrossFees, AcrossQuote, AcrossQuoteRequest, AcrossToken, AcrossTransaction, NATIVE_ETH,
+        OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WETH, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
+        decode_calldata, transaction_integer, u256_word_is_at_least_u128, validate_deposit_status,
+        validate_native_eth_deposit_status, validate_native_eth_quote, validate_quote,
     };
 
     const DEPOSITOR: Address = address!("0x1111111111111111111111111111111111111111");
     const SPENDER: Address = address!("0x2222222222222222222222222222222222222222");
+
+    #[derive(Deserialize)]
+    struct NullableList {
+        #[serde(default, deserialize_with = "super::deserialize_null_default")]
+        values: Vec<u8>,
+    }
 
     fn request() -> AcrossQuoteRequest {
         AcrossQuoteRequest {
@@ -599,8 +914,11 @@ mod tests {
                 chain_id: request.origin_chain_id,
                 to: format!("{:#x}", request.input_token),
                 data: approval_calldata(SPENDER),
+                simulation_success: None,
                 value: json!("0"),
                 gas: json!("0"),
+                max_fee_per_gas: serde_json::Value::Null,
+                max_priority_fee_per_gas: serde_json::Value::Null,
             }],
             input_token: token(request.origin_chain_id, request.input_token),
             output_token: token(request.destination_chain_id, request.output_token),
@@ -618,8 +936,11 @@ mod tests {
                 chain_id: request.origin_chain_id,
                 to: format!("{SPENDER:#x}"),
                 data: swap_calldata(&request, 999_400),
+                simulation_success: None,
                 value: json!("0x0"),
                 gas: json!(0),
+                max_fee_per_gas: serde_json::Value::Null,
+                max_priority_fee_per_gas: serde_json::Value::Null,
             },
             quote_expiry_timestamp: super::unix_timestamp_seconds().unwrap() + 60,
             id: "test-quote".to_owned(),
@@ -633,6 +954,101 @@ mod tests {
             address: format!("{address:#x}"),
             chain_id,
         }
+    }
+
+    fn native_request() -> AcrossQuoteRequest {
+        AcrossQuoteRequest {
+            origin_chain_id: OPTIMISM_CHAIN_ID,
+            destination_chain_id: WORLD_CHAIN_CHAIN_ID,
+            input_token: NATIVE_ETH,
+            output_token: NATIVE_ETH,
+            amount: 7_987_000_000_000_000,
+            depositor: DEPOSITOR,
+            recipient: DEPOSITOR,
+        }
+    }
+
+    fn valid_native_quote() -> AcrossQuote {
+        let request = native_request();
+        let minimum_output = request.amount - 5_000_000_000_000;
+        AcrossQuote {
+            amount_type: "exactInput".to_owned(),
+            checks: AcrossChecks {
+                allowance: AcrossAllowanceCheck {
+                    token: format!("{NATIVE_ETH:#x}"),
+                    spender: format!("{SPENDER:#x}"),
+                    actual: "115792089237316195423570985008687907853269984665640564039457584007913129639935".to_owned(),
+                    expected: request.amount.to_string(),
+                },
+                balance: AcrossBalanceCheck {
+                    token: format!("{NATIVE_ETH:#x}"),
+                    actual: "9985000000000000".to_owned(),
+                    expected: request.amount.to_string(),
+                },
+            },
+            approval_txns: Vec::new(),
+            input_token: AcrossToken {
+                decimals: 18,
+                symbol: "ETH".to_owned(),
+                address: format!("{NATIVE_ETH:#x}"),
+                chain_id: OPTIMISM_CHAIN_ID,
+            },
+            output_token: AcrossToken {
+                decimals: 18,
+                symbol: "ETH".to_owned(),
+                address: format!("{NATIVE_ETH:#x}"),
+                chain_id: WORLD_CHAIN_CHAIN_ID,
+            },
+            fees: AcrossFees {
+                total: AcrossFee {
+                    amount: "5000000000000".to_owned(),
+                },
+            },
+            input_amount: request.amount.to_string(),
+            max_input_amount: request.amount.to_string(),
+            expected_output_amount: minimum_output.to_string(),
+            min_output_amount: minimum_output.to_string(),
+            expected_fill_time: 1,
+            swap_tx: AcrossTransaction {
+                chain_id: OPTIMISM_CHAIN_ID,
+                to: format!("{SPENDER:#x}"),
+                data: native_swap_calldata(&request, minimum_output, 0),
+                simulation_success: Some(true),
+                value: json!(request.amount.to_string()),
+                gas: json!("85000"),
+                max_fee_per_gas: json!("1001000"),
+                max_priority_fee_per_gas: json!("1000000"),
+            },
+            quote_expiry_timestamp: super::unix_timestamp_seconds().unwrap() + 60,
+            id: "native-test-quote".to_owned(),
+        }
+    }
+
+    fn native_swap_calldata(
+        request: &AcrossQuoteRequest,
+        minimum_output: u128,
+        message_length: u128,
+    ) -> String {
+        let mut bytes = vec![0x60, 0x9e, 0xa0, 0x81];
+        push_address_word(&mut bytes, Address::repeat_byte(0x66));
+        push_address_word(&mut bytes, request.depositor);
+        push_address_word(&mut bytes, request.recipient);
+        push_address_word(&mut bytes, OPTIMISM_WETH);
+        push_u128_word(&mut bytes, request.amount);
+        push_address_word(&mut bytes, OPTIMISM_WETH);
+        push_u128_word(&mut bytes, minimum_output);
+        push_u128_word(&mut bytes, u128::from(request.destination_chain_id));
+        push_address_word(&mut bytes, Address::repeat_byte(0x77));
+        push_u128_word(&mut bytes, super::unix_timestamp_seconds().unwrap() as u128);
+        push_u128_word(
+            &mut bytes,
+            super::unix_timestamp_seconds().unwrap() as u128 + 600,
+        );
+        push_u128_word(&mut bytes, 0);
+        push_u128_word(&mut bytes, 13 * 32);
+        push_u128_word(&mut bytes, message_length);
+        bytes.extend([0x73, 0xc0, 0xde]);
+        encode_hex(&bytes)
     }
 
     fn approval_calldata(spender: Address) -> String {
@@ -676,6 +1092,48 @@ mod tests {
     #[test]
     fn validates_rails_compatible_quote_and_approval() {
         validate_quote(&request(), &valid_quote()).unwrap();
+    }
+
+    #[test]
+    fn validates_native_eth_quote_and_transaction_fields() {
+        let request = native_request();
+        let quote = valid_native_quote();
+        let terms = validate_native_eth_quote(&request, &quote, 9_985_000_000_000_000).unwrap();
+        assert_eq!(terms.target, SPENDER);
+        assert_eq!(terms.value, request.amount);
+        assert_eq!(terms.gas, 85_000);
+        assert_eq!(terms.max_fee_per_gas, 1_001_000);
+        assert_eq!(terms.data[..4], [0x60, 0x9e, 0xa0, 0x81]);
+    }
+
+    #[test]
+    fn treats_null_approval_transactions_as_empty() {
+        let decoded: NullableList = serde_json::from_value(json!({ "values": null })).unwrap();
+        assert!(decoded.values.is_empty());
+    }
+
+    #[test]
+    fn rejects_native_eth_recipient_value_balance_and_message_changes() {
+        let request = native_request();
+
+        let mut recipient = valid_native_quote();
+        let mut changed_request = request.clone();
+        changed_request.recipient = Address::repeat_byte(0x99);
+        recipient.swap_tx.data =
+            native_swap_calldata(&changed_request, request.amount - 5_000_000_000_000, 0);
+        assert!(validate_native_eth_quote(&request, &recipient, 9_985_000_000_000_000).is_err());
+
+        let mut value = valid_native_quote();
+        value.swap_tx.value = json!((request.amount - 1).to_string());
+        assert!(validate_native_eth_quote(&request, &value, 9_985_000_000_000_000).is_err());
+
+        let balance = valid_native_quote();
+        assert!(validate_native_eth_quote(&request, &balance, 9_985_000_000_000_001).is_err());
+
+        let mut message = valid_native_quote();
+        message.swap_tx.data =
+            native_swap_calldata(&request, request.amount - 5_000_000_000_000, 1);
+        assert!(validate_native_eth_quote(&request, &message, 9_985_000_000_000_000).is_err());
     }
 
     #[test]
@@ -732,8 +1190,11 @@ mod tests {
         let pending = AcrossDepositStatus {
             status: "pending".to_owned(),
             fill_txn_ref: None,
+            origin_chain_id: None,
+            deposit_tx_hash: None,
+            deposit_txn_ref: None,
             destination_chain_id: WORLD_CHAIN_CHAIN_ID,
-            output_token: format!("{WORLD_CHAIN_USDC:#x}"),
+            output_token: Some(format!("{WORLD_CHAIN_USDC:#x}")),
             output_amount: None,
             fill_time: None,
         };
@@ -745,8 +1206,11 @@ mod tests {
         let filled = AcrossDepositStatus {
             status: "filled".to_owned(),
             fill_txn_ref: Some(format!("0x{}", "ab".repeat(32))),
+            origin_chain_id: None,
+            deposit_tx_hash: None,
+            deposit_txn_ref: None,
             destination_chain_id: WORLD_CHAIN_CHAIN_ID,
-            output_token: format!("{WORLD_CHAIN_USDC:#x}"),
+            output_token: Some(format!("{WORLD_CHAIN_USDC:#x}")),
             output_amount: Some("999500".to_owned()),
             fill_time: Some(1_784_192_400),
         };
@@ -761,8 +1225,11 @@ mod tests {
         let status = AcrossDepositStatus {
             status: "filled".to_owned(),
             fill_txn_ref: Some(format!("0x{}", "ab".repeat(32))),
+            origin_chain_id: None,
+            deposit_tx_hash: None,
+            deposit_txn_ref: None,
             destination_chain_id: WORLD_CHAIN_CHAIN_ID,
-            output_token: format!("{WORLD_CHAIN_USDC:#x}"),
+            output_token: Some(format!("{WORLD_CHAIN_USDC:#x}")),
             output_amount: Some("999399".to_owned()),
             fill_time: Some(1_784_192_400),
         };
@@ -770,6 +1237,27 @@ mod tests {
             validate_deposit_status(&status, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, 999_400)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn validates_current_native_eth_filled_status_without_legacy_amount_fields() {
+        let origin = format!("0x{}", "12".repeat(32));
+        let status = AcrossDepositStatus {
+            status: "filled".to_owned(),
+            fill_txn_ref: Some(format!("0x{}", "34".repeat(32))),
+            origin_chain_id: Some(OPTIMISM_CHAIN_ID),
+            deposit_tx_hash: Some(origin.clone()),
+            deposit_txn_ref: Some(origin.clone()),
+            destination_chain_id: WORLD_CHAIN_CHAIN_ID,
+            output_token: None,
+            output_amount: None,
+            fill_time: None,
+        };
+        assert!(validate_native_eth_deposit_status(&status, &origin, 1).unwrap());
+
+        let mut wrong_origin = status.clone();
+        wrong_origin.deposit_tx_hash = Some(format!("0x{}", "56".repeat(32)));
+        assert!(validate_native_eth_deposit_status(&wrong_origin, &origin, 1).is_err());
     }
 
     #[test]

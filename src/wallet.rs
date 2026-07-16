@@ -1,6 +1,9 @@
 use std::str::FromStr;
 
-use alloy_primitives::{Address, U256};
+use alloy_consensus::{SignableTransaction, TxEip1559};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_network::TxSignerSync;
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, ensure};
 
@@ -88,6 +91,33 @@ impl TestWallet {
     pub fn address(&self) -> Address {
         self.signer.address()
     }
+
+    pub fn sign_eip1559(&self, mut transaction: TxEip1559) -> anyhow::Result<SignedTransaction> {
+        let signature = self
+            .signer
+            .sign_transaction_sync(&mut transaction)
+            .context("failed to sign EIP-1559 transaction")?;
+        let raw = transaction.into_signed(signature).encoded_2718();
+        Ok(SignedTransaction {
+            hash: keccak256(&raw),
+            raw,
+        })
+    }
+}
+
+pub struct SignedTransaction {
+    pub hash: B256,
+    pub raw: Vec<u8>,
+}
+
+impl std::fmt::Debug for SignedTransaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedTransaction")
+            .field("hash", &self.hash)
+            .field("raw", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for TestWallet {
@@ -102,6 +132,9 @@ impl std::fmt::Debug for TestWallet {
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::TxEip1559;
+    use alloy_primitives::{Address, Bytes, TxKind, U256};
+
     use super::TestWallet;
 
     #[test]
@@ -117,5 +150,33 @@ mod tests {
         let debug = format!("{wallet:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("59c6995e"));
+    }
+
+    #[test]
+    fn signed_transaction_debug_never_contains_raw_payload() {
+        let wallet: TestWallet = format!(
+            "0x{}",
+            "59c6995e998f97a5a0044976f7d04f8b2b7f4e5b5d5f3e49f2f4e7838a2b0c19"
+        )
+        .parse::<alloy_signer_local::PrivateKeySigner>()
+        .map(|signer| TestWallet { signer })
+        .unwrap();
+        let signed = wallet
+            .sign_eip1559(TxEip1559 {
+                chain_id: 10,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_000_000,
+                max_priority_fee_per_gas: 1_000_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1),
+                access_list: Default::default(),
+                input: Bytes::new(),
+            })
+            .unwrap();
+        let debug = format!("{signed:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains(&alloy_primitives::hex::encode(&signed.raw)));
+        assert_eq!(signed.raw[0], 0x02);
     }
 }

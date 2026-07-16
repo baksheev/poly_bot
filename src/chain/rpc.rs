@@ -38,6 +38,34 @@ pub struct EthCall {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TransactionCall {
+    pub from: Address,
+    pub to: Address,
+    pub data: Vec<u8>,
+    pub value: U256,
+}
+
+impl TransactionCall {
+    fn json(&self) -> Value {
+        json!({
+            "from": format!("{:#x}", self.from),
+            "to": format!("{:#x}", self.to),
+            "data": format!("0x{}", hex::encode(&self.data)),
+            "value": format!("{:#x}", self.value),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionReceipt {
+    pub transaction_hash: B256,
+    pub block_number: u64,
+    pub status: u64,
+    pub gas_used: u64,
+    pub effective_gas_price: u128,
+}
+
 impl EthCall {
     fn json(&self) -> Value {
         json!({
@@ -142,13 +170,83 @@ impl JsonRpcClient {
     }
 
     pub async fn pending_nonce(&self, address: Address) -> anyhow::Result<u64> {
+        self.nonce(address, "pending").await
+    }
+
+    pub async fn latest_nonce(&self, address: Address) -> anyhow::Result<u64> {
+        self.nonce(address, "latest").await
+    }
+
+    async fn nonce(&self, address: Address, block: &str) -> anyhow::Result<u64> {
         let value = self
             .request(
                 "eth_getTransactionCount",
-                json!([format!("{address:#x}"), "pending"]),
+                json!([format!("{address:#x}"), block]),
             )
             .await?;
         parse_quantity_value_u64("eth_getTransactionCount", value)
+    }
+
+    pub async fn gas_price(&self) -> anyhow::Result<u128> {
+        let value = self.request("eth_gasPrice", json!([])).await?;
+        parse_quantity_value_u128("eth_gasPrice", value)
+    }
+
+    pub async fn simulate_transaction(
+        &self,
+        transaction: &TransactionCall,
+    ) -> anyhow::Result<Vec<u8>> {
+        let value = self
+            .request("eth_call", json!([transaction.json(), "pending"]))
+            .await?;
+        let encoded = value
+            .as_str()
+            .context("eth_call transaction result is not a hex string")?;
+        parse_data_hex("eth_call transaction result", encoded)
+    }
+
+    pub async fn estimate_gas(&self, transaction: &TransactionCall) -> anyhow::Result<u64> {
+        let value = self
+            .request("eth_estimateGas", json!([transaction.json(), "pending"]))
+            .await?;
+        parse_quantity_value_u64("eth_estimateGas", value)
+    }
+
+    pub async fn send_raw_transaction(&self, raw: &[u8]) -> anyhow::Result<B256> {
+        let value = self
+            .request(
+                "eth_sendRawTransaction",
+                json!([format!("0x{}", hex::encode(raw))]),
+            )
+            .await?;
+        let encoded = value
+            .as_str()
+            .context("eth_sendRawTransaction result is not a hash")?;
+        parse_b256("eth_sendRawTransaction", encoded)
+    }
+
+    pub async fn transaction_receipt(
+        &self,
+        hash: B256,
+    ) -> anyhow::Result<Option<TransactionReceipt>> {
+        let value = self
+            .request_optional("eth_getTransactionReceipt", json!([format!("{hash:#x}")]))
+            .await?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let receipt: WireTransactionReceipt = serde_json::from_value(value)
+            .context("eth_getTransactionReceipt returned an invalid receipt")?;
+        Ok(Some(TransactionReceipt {
+            transaction_hash: parse_b256("receipt.transactionHash", &receipt.transaction_hash)?,
+            block_number: parse_quantity_u64("receipt.blockNumber", &receipt.block_number)?,
+            status: parse_quantity_u64("receipt.status", &receipt.status)?,
+            gas_used: parse_quantity_u64("receipt.gasUsed", &receipt.gas_used)?,
+            effective_gas_price: parse_quantity_u128(
+                "receipt.effectiveGasPrice",
+                &receipt.effective_gas_price,
+            )?,
+        }))
     }
 
     pub async fn erc20_balance(&self, token: Address, owner: Address) -> anyhow::Result<U256> {
@@ -269,6 +367,29 @@ impl JsonRpcClient {
         decode_rpc_result(decoded)
     }
 
+    async fn request_optional(&self, method: &str, params: Value) -> anyhow::Result<Option<Value>> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let response = self
+            .send_json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .await?;
+        let decoded: RpcResponse =
+            serde_json::from_value(response).context("invalid JSON-RPC response")?;
+        ensure!(decoded.id == id, "JSON-RPC response id mismatch");
+        if let Some(error) = decoded.error {
+            return Err(anyhow!(
+                "JSON-RPC error {}: {}",
+                error.code,
+                sanitize_rpc_message(&error.message)
+            ));
+        }
+        Ok(decoded.result)
+    }
+
     async fn send_json(&self, body: Value) -> anyhow::Result<Value> {
         for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
             self.http_requests.fetch_add(1, Ordering::Relaxed);
@@ -309,6 +430,16 @@ struct RpcBlock {
     hash: String,
     #[serde(rename = "parentHash")]
     parent_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireTransactionReceipt {
+    transaction_hash: String,
+    block_number: String,
+    status: String,
+    gas_used: String,
+    effective_gas_price: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,6 +492,14 @@ fn parse_quantity_u64(name: &str, value: &str) -> anyhow::Result<u64> {
     u64::from_str_radix(encoded, 16).with_context(|| format!("{name} is invalid"))
 }
 
+fn parse_quantity_u128(name: &str, value: &str) -> anyhow::Result<u128> {
+    let encoded = value
+        .strip_prefix("0x")
+        .with_context(|| format!("{name} is missing 0x prefix"))?;
+    ensure!(!encoded.is_empty(), "{name} is empty");
+    u128::from_str_radix(encoded, 16).with_context(|| format!("{name} is invalid"))
+}
+
 fn parse_quantity_u256(name: &str, value: &str) -> anyhow::Result<U256> {
     let encoded = value
         .strip_prefix("0x")
@@ -374,6 +513,13 @@ fn parse_quantity_value_u64(name: &str, value: Value) -> anyhow::Result<u64> {
         .as_str()
         .with_context(|| format!("{name} result is not a string"))?;
     parse_quantity_u64(name, encoded)
+}
+
+fn parse_quantity_value_u128(name: &str, value: Value) -> anyhow::Result<u128> {
+    let encoded = value
+        .as_str()
+        .with_context(|| format!("{name} result is not a string"))?;
+    parse_quantity_u128(name, encoded)
 }
 
 fn parse_quantity_value_u256(name: &str, value: Value) -> anyhow::Result<U256> {

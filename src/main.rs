@@ -1,11 +1,13 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_consensus::TxEip1559;
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
-        AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
-        WORLD_CHAIN_USDC, validate_quote,
+        AcrossClient, AcrossQuoteRequest, NATIVE_ETH, OPTIMISM_CHAIN_ID, OPTIMISM_USDC,
+        ValidatedNativeEthQuote, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
+        validate_native_eth_deposit_status, validate_native_eth_quote, validate_quote,
     },
     binance::account::{BinanceAccountClient, BinanceAccountState},
     binance::capital::{
@@ -13,7 +15,7 @@ use arb_bot::{
         select_capital_routes,
     },
     binance::ws_api::{BinanceWsApiClient, OrderResult, WsApiError},
-    chain::rpc::JsonRpcClient,
+    chain::rpc::{JsonRpcClient, TransactionCall, TransactionReceipt},
     config::{self, Cli, Command},
     dex::{
         events::build_log_filters,
@@ -26,7 +28,7 @@ use arb_bot::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
     },
-    opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult},
+    opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult, format_base_units},
     telemetry::TelemetryWriter,
     wallet::{OPTIMISM_RPC_URL_ENV, TestWallet, TokenBalanceRequest, hydrate_chain_wallet},
 };
@@ -126,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
             origin_chain_id,
             amount,
         } => across_usdc_quote(&cli.config, origin_chain_id, amount).await,
+        Command::AcrossManualEthToWorld { confirm_live } => {
+            across_manual_eth_to_world(&cli.config, confirm_live).await
+        }
         Command::WalletAddress => {
             let wallet = TestWallet::from_env()?;
             tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
@@ -135,6 +140,325 @@ async fn main() -> anyhow::Result<()> {
             let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
             wallet_hydrate(&domain_config).await
         }
+    }
+}
+
+const RETAIN_OPTIMISM_BPS: u128 = 2_000;
+const BASIS_POINTS: u128 = 10_000;
+const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
+const GAS_LIMIT_MARGIN_DENOMINATOR: u64 = 100;
+const MAX_NATIVE_BRIDGE_GAS: u64 = 500_000;
+const MAX_ORIGIN_GAS_COST_WEI: u128 = 100_000_000_000_000;
+
+struct NativeBridgeGasPlan {
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    maximum_cost: u128,
+}
+
+async fn across_manual_eth_to_world(
+    config: &config::AppConfig,
+    confirm_live: bool,
+) -> anyhow::Result<()> {
+    ensure!(
+        confirm_live,
+        "live Across native ETH bridge requires explicit --confirm-live"
+    );
+    let wallet = TestWallet::from_env()?;
+    let owner = wallet.address();
+    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
+        format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
+    })?;
+    let world_endpoint_name = "ALCHEMY_WORLDCHAIN_RPC_URL";
+    let world_endpoint = std::env::var(world_endpoint_name).with_context(|| {
+        format!("required environment variable {world_endpoint_name} is not set")
+    })?;
+    let optimism = JsonRpcClient::new(optimism_endpoint)?;
+    let world = JsonRpcClient::new(world_endpoint)?;
+    let (optimism_chain_id, world_chain_id) =
+        tokio::try_join!(optimism.chain_id(), world.chain_id())?;
+    ensure!(
+        optimism_chain_id == OPTIMISM_CHAIN_ID,
+        "Optimism RPC returned the wrong chain id"
+    );
+    ensure!(
+        world_chain_id == WORLD_CHAIN_CHAIN_ID,
+        "World Chain RPC returned the wrong chain id"
+    );
+
+    let (source_balance_u256, destination_balance_before, latest_nonce, pending_nonce, gas_price) =
+        tokio::try_join!(
+            optimism.native_balance(owner),
+            world.native_balance(owner),
+            optimism.latest_nonce(owner),
+            optimism.pending_nonce(owner),
+            optimism.gas_price(),
+        )?;
+    ensure!(
+        latest_nonce == pending_nonce,
+        "Optimism wallet has an unresolved pending transaction"
+    );
+    let source_balance = u128::try_from(source_balance_u256)
+        .context("Optimism ETH balance exceeds the bridge canary representation")?;
+    ensure!(
+        destination_balance_before == U256::ZERO,
+        "World Chain wallet is already funded; refusing to repeat the bootstrap bridge"
+    );
+    let retained = retained_optimism_balance(source_balance)?;
+    let initial_amount = source_balance
+        .checked_sub(retained)
+        .context("Optimism ETH balance cannot cover the retained amount")?;
+    ensure!(initial_amount > 0, "no Optimism ETH is available to bridge");
+
+    let client = AcrossClient::new(config)?;
+    let initial_request = native_eth_request(owner, initial_amount);
+    let initial_quote = client.quote(&initial_request).await?;
+    let initial_terms =
+        validate_native_eth_quote(&initial_request, &initial_quote, source_balance)?;
+    let initial_call = native_bridge_call(owner, &initial_terms);
+    optimism.simulate_transaction(&initial_call).await?;
+    let initial_estimate = optimism.estimate_gas(&initial_call).await?;
+    let initial_gas = native_bridge_gas_plan(&initial_terms, initial_estimate, gas_price)?;
+    let reserved_gas_cost = initial_gas
+        .maximum_cost
+        .checked_mul(2)
+        .context("native ETH gas reserve overflow")?;
+    ensure!(
+        reserved_gas_cost <= MAX_ORIGIN_GAS_COST_WEI,
+        "native ETH gas reserve exceeds the absolute canary cap"
+    );
+
+    let bridge_amount = initial_amount
+        .checked_sub(reserved_gas_cost)
+        .context("Optimism ETH balance cannot retain 20% plus maximum origin gas")?;
+    ensure!(
+        bridge_amount > 0,
+        "native ETH bridge amount is zero after gas reserve"
+    );
+    let request = native_eth_request(owner, bridge_amount);
+    let quote = client.quote(&request).await?;
+    let terms = validate_native_eth_quote(&request, &quote, source_balance)?;
+    let call = native_bridge_call(owner, &terms);
+    optimism.simulate_transaction(&call).await?;
+    let estimate = optimism.estimate_gas(&call).await?;
+    let gas = native_bridge_gas_plan(&terms, estimate, gas_price)?;
+    ensure!(
+        gas.maximum_cost <= reserved_gas_cost,
+        "fresh Across quote requires more gas than the doubled reserve"
+    );
+    let minimum_retained_after_max_gas = source_balance
+        .checked_sub(bridge_amount)
+        .and_then(|value| value.checked_sub(gas.maximum_cost))
+        .context("native ETH bridge exceeds the observed Optimism balance")?;
+    ensure!(
+        minimum_retained_after_max_gas >= retained,
+        "native ETH bridge would leave less than 20% on Optimism"
+    );
+
+    let transaction = TxEip1559 {
+        chain_id: OPTIMISM_CHAIN_ID,
+        nonce: pending_nonce,
+        gas_limit: gas.gas_limit,
+        max_fee_per_gas: gas.max_fee_per_gas,
+        max_priority_fee_per_gas: gas.max_priority_fee_per_gas,
+        to: TxKind::Call(terms.target),
+        value: U256::from(bridge_amount),
+        access_list: Default::default(),
+        input: Bytes::from(terms.data.clone()),
+    };
+    let signed = wallet.sign_eip1559(transaction)?;
+    tracing::info!(
+        wallet = %owner,
+        origin_chain_id = OPTIMISM_CHAIN_ID,
+        destination_chain_id = WORLD_CHAIN_CHAIN_ID,
+        source_balance = %format_base_units(source_balance_u256, 18),
+        bridge_amount = %format_base_units(U256::from(bridge_amount), 18),
+        retained_at_max_gas = %format_base_units(U256::from(minimum_retained_after_max_gas), 18),
+        minimum_destination_amount = %format_base_units(U256::from(terms.minimum_output_amount), 18),
+        route_fee = %format_base_units(U256::from(quote.fees.total.amount.parse::<u128>()?), 18),
+        gas_limit = gas.gas_limit,
+        max_fee_per_gas = gas.max_fee_per_gas,
+        maximum_origin_gas_cost = %format_base_units(U256::from(gas.maximum_cost), 18),
+        nonce = pending_nonce,
+        transaction_hash = %signed.hash,
+        "validated native ETH Across bridge ready for broadcast"
+    );
+
+    let submitted_hash = optimism.send_raw_transaction(&signed.raw).await?;
+    ensure!(
+        submitted_hash == signed.hash,
+        "Optimism RPC returned a different transaction hash"
+    );
+    let receipt = wait_for_origin_receipt(&optimism, signed.hash).await?;
+    ensure!(
+        receipt.status == 1,
+        "native ETH Across origin transaction reverted"
+    );
+    let filled = wait_for_across_fill(&client, signed.hash, terms.minimum_output_amount).await?;
+    let destination_balance_after = world.native_balance(owner).await?;
+    let destination_delta = destination_balance_after
+        .checked_sub(destination_balance_before)
+        .context("World Chain ETH balance decreased during Across canary")?;
+    ensure!(
+        destination_delta >= U256::from(terms.minimum_output_amount),
+        "World Chain ETH balance increase is below Across minimum output"
+    );
+    let source_balance_after = optimism.native_balance(owner).await?;
+    ensure!(
+        source_balance_after >= U256::from(retained),
+        "Optimism ETH retained balance fell below 20%"
+    );
+    let receipt_execution_gas_cost = u128::from(receipt.gas_used)
+        .checked_mul(receipt.effective_gas_price)
+        .context("origin gas cost overflow")?;
+    let source_balance_after_u128 = u128::try_from(source_balance_after)
+        .context("post-bridge Optimism balance exceeds u128")?;
+    let actual_origin_gas_cost = source_balance
+        .checked_sub(bridge_amount)
+        .and_then(|value| value.checked_sub(source_balance_after_u128))
+        .context("actual Optimism gas cost cannot be reconciled from balances")?;
+    ensure!(
+        actual_origin_gas_cost <= gas.maximum_cost,
+        "actual Optimism gas cost exceeds the signed maximum"
+    );
+    tracing::info!(
+        origin_transaction_hash = %signed.hash,
+        destination_transaction_hash = %filled.fill_txn_ref.as_deref().unwrap_or_default(),
+        origin_block = receipt.block_number,
+        origin_gas_used = receipt.gas_used,
+        receipt_execution_gas_cost = %format_base_units(U256::from(receipt_execution_gas_cost), 18),
+        actual_origin_gas_cost = %format_base_units(U256::from(actual_origin_gas_cost), 18),
+        optimism_balance_after = %format_base_units(source_balance_after, 18),
+        world_balance_before = %format_base_units(destination_balance_before, 18),
+        world_balance_after = %format_base_units(destination_balance_after, 18),
+        world_balance_delta = %format_base_units(destination_delta, 18),
+        "native ETH Across bridge completed and reconciled"
+    );
+    Ok(())
+}
+
+fn native_eth_request(owner: Address, amount: u128) -> AcrossQuoteRequest {
+    AcrossQuoteRequest {
+        origin_chain_id: OPTIMISM_CHAIN_ID,
+        destination_chain_id: WORLD_CHAIN_CHAIN_ID,
+        input_token: NATIVE_ETH,
+        output_token: NATIVE_ETH,
+        amount,
+        depositor: owner,
+        recipient: owner,
+    }
+}
+
+fn native_bridge_call(owner: Address, terms: &ValidatedNativeEthQuote) -> TransactionCall {
+    TransactionCall {
+        from: owner,
+        to: terms.target,
+        data: terms.data.clone(),
+        value: U256::from(terms.value),
+    }
+}
+
+fn retained_optimism_balance(balance: u128) -> anyhow::Result<u128> {
+    balance
+        .checked_mul(RETAIN_OPTIMISM_BPS)
+        .and_then(|value| value.checked_add(BASIS_POINTS - 1))
+        .map(|value| value / BASIS_POINTS)
+        .context("Optimism retained-balance calculation overflow")
+}
+
+fn native_bridge_gas_plan(
+    terms: &ValidatedNativeEthQuote,
+    rpc_estimate: u64,
+    rpc_gas_price: u128,
+) -> anyhow::Result<NativeBridgeGasPlan> {
+    let estimated = terms.gas.max(rpc_estimate);
+    let gas_limit = estimated
+        .checked_mul(GAS_LIMIT_MARGIN_NUMERATOR)
+        .and_then(|value| value.checked_add(GAS_LIMIT_MARGIN_DENOMINATOR - 1))
+        .map(|value| value / GAS_LIMIT_MARGIN_DENOMINATOR)
+        .context("native ETH gas-limit margin overflow")?;
+    ensure!(
+        gas_limit > 0 && gas_limit <= MAX_NATIVE_BRIDGE_GAS,
+        "native ETH bridge gas limit exceeds the canary cap"
+    );
+    let max_fee_per_gas = terms
+        .max_fee_per_gas
+        .max(rpc_gas_price)
+        .checked_mul(2)
+        .context("native ETH max fee overflow")?;
+    ensure!(
+        max_fee_per_gas <= 100_000_000_000,
+        "native ETH max fee exceeds the canary cap"
+    );
+    let max_priority_fee_per_gas = terms.max_priority_fee_per_gas;
+    ensure!(
+        max_priority_fee_per_gas <= max_fee_per_gas,
+        "native ETH priority fee exceeds max fee"
+    );
+    let maximum_cost = u128::from(gas_limit)
+        .checked_mul(max_fee_per_gas)
+        .context("native ETH maximum gas cost overflow")?;
+    ensure!(
+        maximum_cost <= MAX_ORIGIN_GAS_COST_WEI,
+        "native ETH origin gas cost exceeds the absolute canary cap"
+    );
+    Ok(NativeBridgeGasPlan {
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        maximum_cost,
+    })
+}
+
+async fn wait_for_origin_receipt(
+    rpc: &JsonRpcClient,
+    transaction_hash: alloy_primitives::B256,
+) -> anyhow::Result<TransactionReceipt> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(receipt) = rpc.transaction_receipt(transaction_hash).await? {
+            ensure!(
+                receipt.transaction_hash == transaction_hash,
+                "Optimism receipt transaction hash mismatch"
+            );
+            return Ok(receipt);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for Optimism Across transaction receipt"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn wait_for_across_fill(
+    client: &AcrossClient,
+    transaction_hash: alloy_primitives::B256,
+    minimum_output_amount: u128,
+) -> anyhow::Result<arb_bot::across::AcrossDepositStatus> {
+    let transaction_hash = format!("{transaction_hash:#x}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        match client.deposit_status(&transaction_hash).await {
+            Ok(status) => {
+                if validate_native_eth_deposit_status(
+                    &status,
+                    &transaction_hash,
+                    minimum_output_amount,
+                )? {
+                    return Ok(status);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, %transaction_hash, "Across fill status is not available yet");
+            }
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for Across destination fill"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -1119,4 +1443,48 @@ fn init_tracing() {
         .json()
         .with_current_span(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::Address;
+
+    use super::{native_bridge_gas_plan, retained_optimism_balance};
+    use arb_bot::across::ValidatedNativeEthQuote;
+
+    fn terms() -> ValidatedNativeEthQuote {
+        ValidatedNativeEthQuote {
+            target: Address::repeat_byte(0x11),
+            data: vec![0x60, 0x9e, 0xa0, 0x81],
+            value: 7_987_000_000_000_000,
+            gas: 84_674,
+            max_fee_per_gas: 1_000_536,
+            max_priority_fee_per_gas: 1_000_000,
+            minimum_output_amount: 7_982_000_000_000_000,
+        }
+    }
+
+    #[test]
+    fn retains_at_least_twenty_percent_with_rounding_up() {
+        assert_eq!(
+            retained_optimism_balance(9_985_000_000_000_000).unwrap(),
+            1_997_000_000_000_000
+        );
+        assert_eq!(retained_optimism_balance(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn gas_plan_uses_larger_estimate_and_double_fee_headroom() {
+        let plan = native_bridge_gas_plan(&terms(), 90_000, 1_000_400).unwrap();
+        assert_eq!(plan.gas_limit, 108_000);
+        assert_eq!(plan.max_fee_per_gas, 2_001_072);
+        assert_eq!(plan.max_priority_fee_per_gas, 1_000_000);
+        assert_eq!(plan.maximum_cost, 216_115_776_000);
+    }
+
+    #[test]
+    fn gas_plan_rejects_excessive_estimate_or_fee() {
+        assert!(native_bridge_gas_plan(&terms(), 500_000, 1_000_000).is_err());
+        assert!(native_bridge_gas_plan(&terms(), 90_000, 100_000_000_000).is_err());
+    }
 }
