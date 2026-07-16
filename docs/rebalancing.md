@@ -98,12 +98,22 @@ Routes:
   actual destination amount, transfer it to the verified Binance deposit
   address, then reconcile the Binance credit.
 
-Across `/swap/approval` responses are short-lived and must never be cached.
-Production usage requires an API key and Integrator ID. The response-provided
-approval and swap calldata must be validated for chain, token, recipient,
-amount bounds, and destination before signing. `/deposit/status` is a helpful
-secondary tracker but can lag its indexer; chain receipts and balance changes
-remain part of reconciliation.
+For Rails parity, Across uses the public unauthenticated
+`https://app.across.to/api/swap/approval` endpoint. It sends no API key and no
+Integrator ID. The endpoint produces optional approval transactions and the
+on-chain swap transaction; Rust signs and submits those transactions itself.
+The response is short-lived and must never be cached. Before signing, validate
+the returned chain ID, token/spender, transaction target, recipient, input and
+minimum output amounts, value, deadline, and calldata against the reserved
+rebalance operation. Never trust response-provided gas blindly: estimate it on
+the origin RPC and apply a bounded margin.
+
+Completion uses the public `/deposit/status?depositTxnRef=...` endpoint for
+Rails parity. It is a secondary tracker and can lag its indexer, so the origin
+receipt, destination-chain receipt or balance delta, and expected recipient
+remain authoritative reconciliation evidence. This path is API-assisted
+calldata generation followed by an on-chain transaction; it does not require
+Across credentials.
 
 Official references:
 
