@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde_json::json;
 
@@ -10,7 +13,7 @@ use crate::{
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{OpportunityEngine, PreparedPoolBuildRequest, PreparedPoolBuildResult},
-    rebalance::{RebalanceEvaluation, RebalanceTracker},
+    rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
@@ -28,6 +31,53 @@ pub struct TradingEngine {
     rebalance_inflight: bool,
     rebalance_blocked: bool,
     rebalance_reconcile_after: Option<(Instant, Instant)>,
+    rebalance_direction_locks: RebalanceDirectionLocks,
+}
+
+const REBALANCE_DIRECTION_LOCK_DURATION: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct RebalanceDirectionLock {
+    token_symbol: String,
+    direction: Direction,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct RebalanceDirectionLocks {
+    entries: Vec<RebalanceDirectionLock>,
+}
+
+impl RebalanceDirectionLocks {
+    fn lock(&mut self, token_symbol: &str, direction: Direction, now: Instant) {
+        self.entries.retain(|entry| entry.expires_at > now);
+        self.entries
+            .retain(|entry| entry.token_symbol != token_symbol || entry.direction != direction);
+        self.entries.push(RebalanceDirectionLock {
+            token_symbol: token_symbol.to_owned(),
+            direction,
+            expires_at: now + REBALANCE_DIRECTION_LOCK_DURATION,
+        });
+    }
+
+    fn is_locked(&mut self, token_symbol: &str, direction: Direction, now: Instant) -> bool {
+        self.entries.retain(|entry| entry.expires_at > now);
+        self.entries
+            .iter()
+            .any(|entry| entry.token_symbol == token_symbol && entry.direction == direction)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradingReadiness {
+    dex_ready: bool,
+    balances_ready: bool,
+}
+
+impl TradingReadiness {
+    const fn ready(self) -> bool {
+        self.dex_ready && self.balances_ready
+    }
 }
 
 impl TradingEngine {
@@ -59,6 +109,7 @@ impl TradingEngine {
                 rebalance_inflight: false,
                 rebalance_blocked: false,
                 rebalance_reconcile_after: None,
+                rebalance_direction_locks: RebalanceDirectionLocks::default(),
             },
             hot_telemetry_task,
         ))
@@ -300,10 +351,13 @@ impl TradingEngine {
         self.pending_rebalance.take()
     }
 
-    pub fn on_rebalance_execution_result(&mut self, result: Result<&str, &str>) {
+    pub fn on_rebalance_execution_result(
+        &mut self,
+        result: Result<&RebalanceExecutionOperation, &str>,
+    ) {
         self.rebalance_inflight = false;
         match result {
-            Ok(operation_id) => {
+            Ok(operation) => {
                 if let (Some(binance), Some(wallet)) = (
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),
@@ -311,17 +365,31 @@ impl TradingEngine {
                     self.rebalance_reconcile_after =
                         Some((binance.observed_at, wallet.observed_at));
                 }
+                self.rebalance_direction_locks.lock(
+                    &operation.intent.token_symbol,
+                    operation.intent.direction,
+                    Instant::now(),
+                );
                 self.telemetry.emit(
                     "rebalance_execution_completed",
                     json!({
                         "engine_id": self.config.engine_id,
-                        "operation_id": operation_id,
+                        "operation_id": operation.intent.operation_id,
+                    }),
+                );
+                self.telemetry.emit(
+                    "rebalance_direction_locked",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "token": operation.intent.token_symbol,
+                        "direction": format!("{:?}", operation.intent.direction),
+                        "duration_ms": REBALANCE_DIRECTION_LOCK_DURATION.as_millis(),
                     }),
                 );
             }
             Err(error) => {
                 self.rebalance_blocked = true;
-                self.rebalance.mark_unready();
+                self.rebalance.mark_unbalanced();
                 tracing::error!(error, "rebalance executor failed closed");
                 self.telemetry.emit(
                     "rebalance_execution_failed",
@@ -373,19 +441,30 @@ impl TradingEngine {
                         }),
                     );
                 }
+                let pending_action = self.rebalance.pending_action();
+                let direction_locked = pending_action.as_ref().is_some_and(|evaluation| {
+                    evaluation.plan.action.as_ref().is_some_and(|action| {
+                        self.rebalance_direction_locks.is_locked(
+                            &evaluation.token_symbol,
+                            action.direction,
+                            Instant::now(),
+                        )
+                    })
+                });
                 if mode == "full_live"
                     && !self.rebalance_inflight
                     && !self.rebalance_blocked
                     && self.rebalance_reconcile_after.is_none()
                     && self.pending_rebalance.is_none()
-                    && let Some(evaluation) = self.rebalance.pending_action()
+                    && !direction_locked
+                    && let Some(evaluation) = pending_action
                 {
                     self.rebalance_inflight = true;
                     self.pending_rebalance = Some(evaluation);
                 }
             }
             Err(error) => {
-                self.rebalance.mark_unready();
+                self.rebalance.mark_unbalanced();
                 tracing::warn!(error = %error, "rebalance planning failed closed");
                 self.telemetry.emit(
                     "rebalance_plan_failed",
@@ -460,13 +539,19 @@ impl TradingEngine {
             .state
             .balances
             .is_fresh(now, self.config.balance_max_age_ms);
+        // Rebalancing is proactive inventory maintenance, not a global trading
+        // lock. Its pending, in-flight, failed, and post-reconciliation states
+        // serialize only rebalance operations. Trading remains gated by fresh
+        // market/DEX/balance inputs; an execution coordinator must separately
+        // reserve and validate the assets required by its concrete trade.
+        let trading_readiness = TradingReadiness {
+            dex_ready,
+            balances_ready,
+        };
         let current = self.state.refresh_phase(
             now,
             self.config.market_data_max_age_ms,
-            dex_ready
-                && balances_ready
-                && self.rebalance.ready()
-                && self.rebalance_reconcile_after.is_none(),
+            trading_readiness.ready(),
         );
         if previous != current {
             tracing::info!(?previous, ?current, "runtime phase changed");
@@ -493,6 +578,73 @@ impl TradingEngine {
                 "engine_id": self.config.engine_id,
                 "processed_events": self.state.processed_events,
             }),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use crate::rebalance::Direction;
+
+    use super::{REBALANCE_DIRECTION_LOCK_DURATION, RebalanceDirectionLocks, TradingReadiness};
+
+    #[test]
+    fn rebalance_state_is_not_a_global_trading_readiness_input() {
+        assert!(
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: true,
+            }
+            .ready()
+        );
+    }
+
+    #[test]
+    fn stale_dex_or_balance_inputs_still_fail_closed() {
+        for readiness in [
+            TradingReadiness {
+                dex_ready: false,
+                balances_ready: true,
+            },
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: false,
+            },
+        ] {
+            assert!(!readiness.ready());
+        }
+    }
+
+    #[test]
+    fn completed_rebalance_locks_only_the_same_token_direction() {
+        let now = Instant::now();
+        let mut locks = RebalanceDirectionLocks::default();
+        locks.lock("WLD", Direction::WalletToBinance, now);
+
+        assert!(locks.is_locked("WLD", Direction::WalletToBinance, now));
+        assert!(!locks.is_locked("WLD", Direction::BinanceToWallet, now));
+        assert!(!locks.is_locked("USDC", Direction::WalletToBinance, now));
+        assert!(!locks.is_locked(
+            "WLD",
+            Direction::WalletToBinance,
+            now + REBALANCE_DIRECTION_LOCK_DURATION
+        ));
+    }
+
+    #[test]
+    fn direction_lock_does_not_change_trading_readiness() {
+        let now = Instant::now();
+        let mut locks = RebalanceDirectionLocks::default();
+        locks.lock("WLD", Direction::WalletToBinance, now);
+        assert!(locks.is_locked("WLD", Direction::WalletToBinance, now));
+        assert!(
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: true,
+            }
+            .ready()
         );
     }
 }

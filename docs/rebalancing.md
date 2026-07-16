@@ -26,9 +26,10 @@ the external withdrawal used by Binance-to-wallet rebalancing. There is no
 shared-credential mode or runtime flag for it.
 
 The wallet signer is loaded only when `REBALANCE_EXECUTION_MODE=full_live`.
-The same process owns the World Chain and Optimism nonce lanes. A rebalance
-operation closes the normal live-entry gate until the operation is terminal
-and fresh balances from both venues have been observed.
+The same process owns the World Chain and Optimism nonce lanes. Rebalancing is
+proactive inventory maintenance and does not close the market-data or trading
+readiness gate while an operation is pending, running, failed, or awaiting
+fresh post-operation observations.
 
 ## Sources of truth
 
@@ -57,9 +58,10 @@ reference_inventory = binance_balance + wallet_balance
 start_balance       = reference_inventory * start_threshold_bps / 10_000
 ```
 
-The production domain artifact uses `start_threshold_bps = 2500`, so a venue
-becomes unsafe below 25% of the startup inventory. The reference is fixed for
-the process lifetime and never ratchets down after fees or transfers.
+The production domain artifact uses `start_threshold_bps = 2500`, so proactive
+rebalancing starts when a venue drops below 25% of the startup inventory. This
+threshold is not a trading stop. The reference is fixed for the process
+lifetime and never ratchets down after fees or transfers.
 
 For every later snapshot:
 
@@ -74,7 +76,7 @@ toward `binance_target`. If the wallet is below `start_balance`, it transfers
 Binance surplus toward `wallet_target`. It does nothing while both venues are
 at or above the threshold.
 
-The planner fails closed when:
+The planner fails closed for that rebalance decision when:
 
 - total inventory is below twice the startup-derived minimum;
 - an observed or projected debit is arithmetically impossible;
@@ -139,11 +141,42 @@ executor task. The executor:
 4. records authoritative evidence after every step;
 5. returns a terminal result to the owner;
 6. waits for newly observed Binance and wallet snapshots before another
-   operation can be dispatched.
+   rebalance operation can be dispatched.
 
 Only one non-terminal operation may exist. The executor journal file lock and
 the GKE `Recreate` rollout with a ReadWriteOnce volume enforce a single process
 owner.
+
+## Interaction with trading
+
+The rebalance planner and executor never act as a global trading lock. Binance
+prices, DEX state, and opportunity calculations continue while inventory is
+being moved. Pending execution, an in-flight transfer, a rebalance failure, and
+the post-completion reconciliation window serialize only subsequent rebalance
+operations.
+
+Only one rebalance operation may be active at a time. After it completes, Rust
+requires both a newer Binance snapshot and a newer wallet snapshot before
+dispatching another rebalance. It also locks the completed `(token, direction)`
+for 10 seconds. During that window another token or the opposite direction may
+become eligible, but the same transfer direction cannot be repeated because of
+Binance deposit/indexing lag. The lock does not affect trading readiness.
+
+This matches the production Rails behavior: rebalance runs independently,
+while an arbitrage opportunity is admitted only after checking the exact
+wallet and Binance sell assets. Rails requires the configured `3x` balance
+safety multiplier and atomically reserves the wallet sell amount before
+enqueueing execution. Rails separately uses a 10-second
+`RebalanceTransferLock` keyed by wallet, token, and direction after completed
+transfers. It does not reject trading merely because a rebalance is active.
+
+The global Rust runtime still fails closed for stale or unhealthy Binance,
+wallet, DEX, or price inputs. Those conditions make balance sufficiency
+unknowable; they are distinct from an otherwise healthy rebalance operation.
+The Rust arbitrage order coordinator is not live yet. Before it is enabled, it
+must apply the same direction-specific available-balance and reservation rule,
+including subtracting amounts reserved by concurrent trades and outbound
+rebalance legs.
 
 ## Route execution
 
@@ -359,6 +392,10 @@ with normal automatic route preference and no active journal operation.
 
 Regression coverage includes:
 
+- trading readiness remaining independent from pending, active, failed, and
+  reconciling rebalance state;
+- the 10-second completed-transfer lock applying only to the same token and
+  direction, without changing trading readiness;
 - the actual 1,000 USDC / 2,500 WLD two-token budget sequence;
 - retention of the second token action after the first token completes;
 - both WLD Across directions with 18 decimals;

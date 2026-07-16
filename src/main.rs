@@ -777,7 +777,7 @@ async fn run(
                     bail!("rebalance executor result channel stopped unexpectedly");
                 };
                 match result {
-                    Ok(operation) => engine.on_rebalance_execution_result(Ok(&operation.intent.operation_id)),
+                    Ok(operation) => engine.on_rebalance_execution_result(Ok(&operation)),
                     Err(error) => engine.on_rebalance_execution_result(Err(&error)),
                 }
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;

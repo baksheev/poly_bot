@@ -39,7 +39,7 @@ struct TokenTracker {
 pub struct RebalanceTracker {
     enabled: bool,
     tokens: Vec<TokenTracker>,
-    ready: bool,
+    balanced: bool,
 }
 
 impl RebalanceTracker {
@@ -47,7 +47,7 @@ impl RebalanceTracker {
         Self {
             enabled: false,
             tokens: Vec::new(),
-            ready: true,
+            balanced: true,
         }
     }
 
@@ -84,12 +84,12 @@ impl RebalanceTracker {
         Ok(Self {
             enabled: true,
             tokens,
-            ready: false,
+            balanced: false,
         })
     }
 
-    pub fn ready(&self) -> bool {
-        self.ready
+    pub fn balanced(&self) -> bool {
+        self.balanced
     }
 
     pub fn evaluate(
@@ -102,7 +102,7 @@ impl RebalanceTracker {
         }
 
         let mut evaluations = Vec::new();
-        let mut ready = true;
+        let mut balanced = true;
         for token in &mut self.tokens {
             let snapshot = token_snapshot(token, binance, wallet)?;
             let reference_captured = token.policy.is_none();
@@ -129,7 +129,7 @@ impl RebalanceTracker {
                 snapshot,
                 &[],
             )?;
-            ready &= plan.action.is_none();
+            balanced &= plan.action.is_none();
             if token.last_plan.as_ref() != Some(&plan) || reference_captured {
                 token.last_plan = Some(plan.clone());
                 evaluations.push(RebalanceEvaluation {
@@ -140,13 +140,13 @@ impl RebalanceTracker {
                 });
             }
         }
-        self.ready = ready;
+        self.balanced = balanced;
         Ok(evaluations)
     }
 
-    pub fn mark_unready(&mut self) {
+    pub fn mark_unbalanced(&mut self) {
         if self.enabled {
-            self.ready = false;
+            self.balanced = false;
         }
     }
 
@@ -453,7 +453,7 @@ mod tests {
             U256::from(10_000_000_000_u64)
         );
         assert_eq!(usdc.plan.start_balance, U256::from(2_500_000_000_u64));
-        assert!(tracker.ready());
+        assert!(tracker.balanced());
 
         let (binance, wallet) = snapshots(2_000, 8_000);
         let changed = tracker.evaluate(&binance, &wallet).unwrap();
@@ -474,7 +474,7 @@ mod tests {
             usdc.plan.action.as_ref().unwrap().amount,
             U256::from(3_000_000_000_u64)
         );
-        assert!(!tracker.ready());
+        assert!(!tracker.balanced());
     }
 
     #[test]
@@ -564,7 +564,7 @@ mod tests {
         );
         tracker.evaluate(&binance, &wallet).unwrap();
         assert!(tracker.pending_action().is_none());
-        assert!(tracker.ready());
+        assert!(tracker.balanced());
     }
 
     #[test]
@@ -619,6 +619,6 @@ mod tests {
         );
         tracker.evaluate(&binance, &wallet).unwrap();
         assert!(tracker.pending_action().is_none());
-        assert!(tracker.ready());
+        assert!(tracker.balanced());
     }
 }
