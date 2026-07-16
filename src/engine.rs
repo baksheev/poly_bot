@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde_json::json;
 
@@ -26,9 +29,14 @@ pub struct TradingEngine {
     hot_telemetry: HotTelemetryHandle,
     pending_rebalance: Option<RebalanceEvaluation>,
     rebalance_inflight: bool,
+    rebalance_inflight_since: Option<Instant>,
     rebalance_blocked: bool,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
+    last_rebalance_health_log_at: Option<Instant>,
 }
+
+const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct RebalanceSettlementBarrier {
@@ -37,6 +45,30 @@ struct RebalanceSettlementBarrier {
     direction: Direction,
     binance_after: Instant,
     wallet_after: Instant,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RebalanceHealthState {
+    healthy: bool,
+    inflight_stuck: bool,
+    settlement_stuck: bool,
+}
+
+fn rebalance_health_state(
+    blocked: bool,
+    inflight_age: Option<Duration>,
+    settlement_age: Option<Duration>,
+    operation_timeout: Duration,
+    settlement_timeout: Duration,
+) -> RebalanceHealthState {
+    let inflight_stuck = inflight_age.is_some_and(|age| age >= operation_timeout);
+    let settlement_stuck = settlement_age.is_some_and(|age| age >= settlement_timeout);
+    RebalanceHealthState {
+        healthy: !blocked && !inflight_stuck && !settlement_stuck,
+        inflight_stuck,
+        settlement_stuck,
+    }
 }
 
 impl RebalanceSettlementBarrier {
@@ -84,8 +116,10 @@ impl TradingEngine {
                 hot_telemetry,
                 pending_rebalance: None,
                 rebalance_inflight: false,
+                rebalance_inflight_since: None,
                 rebalance_blocked: false,
                 rebalance_settlement: None,
+                last_rebalance_health_log_at: None,
             },
             hot_telemetry_task,
         ))
@@ -332,6 +366,7 @@ impl TradingEngine {
         result: Result<&RebalanceExecutionOperation, &str>,
     ) {
         self.rebalance_inflight = false;
+        self.rebalance_inflight_since = None;
         match result {
             Ok(operation) => {
                 if let (Some(binance), Some(wallet)) = (
@@ -344,6 +379,7 @@ impl TradingEngine {
                         direction: operation.intent.direction,
                         binance_after: binance.observed_at,
                         wallet_after: wallet.observed_at,
+                        started_at: Instant::now(),
                     });
                 }
                 self.telemetry.emit(
@@ -436,6 +472,7 @@ impl TradingEngine {
                     && let Some(evaluation) = pending_action
                 {
                     self.rebalance_inflight = true;
+                    self.rebalance_inflight_since = Some(Instant::now());
                     self.pending_rebalance = Some(evaluation);
                 }
             }
@@ -504,7 +541,65 @@ impl TradingEngine {
     }
 
     pub fn refresh_health(&mut self) {
-        self.refresh_phase(Instant::now());
+        let now = Instant::now();
+        self.refresh_phase(now);
+        self.log_rebalance_health(now);
+    }
+
+    fn log_rebalance_health(&mut self, now: Instant) {
+        if self
+            .last_rebalance_health_log_at
+            .is_some_and(|last| now.saturating_duration_since(last) < REBALANCE_HEALTH_LOG_INTERVAL)
+        {
+            return;
+        }
+
+        let inflight_age = self
+            .rebalance_inflight_since
+            .map(|started_at| now.saturating_duration_since(started_at));
+        let settlement_age = self
+            .rebalance_settlement
+            .as_ref()
+            .map(|barrier| now.saturating_duration_since(barrier.started_at));
+        let settlement_timeout = Duration::from_millis(
+            self.config
+                .balance_max_age_ms
+                .saturating_mul(12)
+                .max(MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT.as_millis() as u64),
+        );
+        let health = rebalance_health_state(
+            self.rebalance_blocked,
+            inflight_age,
+            settlement_age,
+            Duration::from_secs(self.config.rebalance_executor_timeout_seconds),
+            settlement_timeout,
+        );
+        let inflight_age_ms = inflight_age.map(|age| age.as_millis());
+        let settlement_age_ms = settlement_age.map(|age| age.as_millis());
+        if health.healthy {
+            tracing::info!(
+                healthy = true,
+                rebalance_blocked = self.rebalance_blocked,
+                rebalance_inflight = self.rebalance_inflight,
+                inflight_age_ms,
+                settlement_waiting = self.rebalance_settlement.is_some(),
+                settlement_age_ms,
+                "rebalance health heartbeat"
+            );
+        } else {
+            tracing::error!(
+                healthy = false,
+                rebalance_blocked = self.rebalance_blocked,
+                rebalance_inflight = self.rebalance_inflight,
+                inflight_stuck = health.inflight_stuck,
+                inflight_age_ms,
+                settlement_waiting = self.rebalance_settlement.is_some(),
+                settlement_stuck = health.settlement_stuck,
+                settlement_age_ms,
+                "rebalance health heartbeat"
+            );
+        }
+        self.last_rebalance_health_log_at = Some(now);
     }
 
     fn refresh_phase(&mut self, now: Instant) {
@@ -564,7 +659,7 @@ mod tests {
 
     use crate::rebalance::Direction;
 
-    use super::{RebalanceSettlementBarrier, TradingReadiness};
+    use super::{RebalanceSettlementBarrier, TradingReadiness, rebalance_health_state};
 
     #[test]
     fn rebalance_state_is_not_a_global_trading_readiness_input() {
@@ -603,6 +698,7 @@ mod tests {
             direction: Direction::WalletToBinance,
             binance_after: now,
             wallet_after: now,
+            started_at: now,
         };
 
         assert!(!barrier.reconciled(now, now));
@@ -620,5 +716,19 @@ mod tests {
             }
             .ready()
         );
+    }
+
+    #[test]
+    fn rebalance_health_detects_blocked_and_stuck_states_at_the_boundary() {
+        let timeout = std::time::Duration::from_secs(60);
+
+        assert!(rebalance_health_state(false, None, None, timeout, timeout).healthy);
+        assert!(!rebalance_health_state(true, None, None, timeout, timeout).healthy);
+        let inflight = rebalance_health_state(false, Some(timeout), None, timeout, timeout);
+        assert!(inflight.inflight_stuck);
+        assert!(!inflight.healthy);
+        let settlement = rebalance_health_state(false, None, Some(timeout), timeout, timeout);
+        assert!(settlement.settlement_stuck);
+        assert!(!settlement.healthy);
     }
 }

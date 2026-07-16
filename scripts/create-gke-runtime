@@ -76,6 +76,8 @@ add_project_iam_binding() {
   compute.googleapis.com \
   container.googleapis.com \
   iamcredentials.googleapis.com \
+  logging.googleapis.com \
+  monitoring.googleapis.com \
   secretmanager.googleapis.com \
   sts.googleapis.com \
   --quiet
@@ -252,7 +254,12 @@ fi
   --member="serviceAccount:${deploy_service_account}" \
   --role=roles/artifactregistry.writer \
   --quiet >/dev/null
-for role in roles/container.clusterViewer roles/serviceusage.serviceUsageConsumer; do
+for role in \
+  roles/container.clusterViewer \
+  roles/logging.configWriter \
+  roles/monitoring.alertPolicyEditor \
+  roles/monitoring.notificationChannelEditor \
+  roles/serviceusage.serviceUsageConsumer; do
   add_project_iam_binding "serviceAccount:${deploy_service_account}" "${role}"
 done
 node_pool_permissions="container.clusters.get,container.clusters.update,container.nodes.create,container.nodes.delete,container.nodes.get,container.nodes.getStatus,container.nodes.list,container.operations.get,container.operations.list"

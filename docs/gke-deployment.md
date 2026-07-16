@@ -117,7 +117,10 @@ started manually from `main`.
    revision exclusively at that pool;
 7. waits up to 30 minutes for readiness;
 8. deletes every previous release/bootstrap pool only after success;
-9. restores the previous Deployment and deletes the new pool on failure.
+9. idempotently applies the rebalance log metrics, alert policies, and operator
+   email channel;
+10. restores the previous Deployment and deletes the new pool on rollout
+    failure.
 
 Live-capable releases accept deployment downtime: preserving single ownership
 is more important than overlap availability. No Cluster Autoscaler participates
@@ -145,7 +148,9 @@ Kubernetes retains five Deployment revisions.
 7. Confirm that the startup log reports `rebalance_execution_mode=full_live`,
    the journal has no unexpected active operation, and only the new release
    node pool remains after workflow cleanup.
-8. Keep the stopped VM, its digest, and configuration as the rollback target
+8. Confirm that both `poly_bot rebalance` alert policies are enabled and target
+   the `baksheev@me.com` notification channel.
+9. Keep the stopped VM, its digest, and configuration as the rollback target
    until the GKE observation window is complete.
 
 Do not start the old VM while its static IP is assigned to Cloud NAT. A rollback

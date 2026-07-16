@@ -267,6 +267,12 @@ jobs:
           echo "node_pool=${new_pool}" >>"${GITHUB_OUTPUT}"
           trap - EXIT
 
+      - name: Apply rebalance monitoring
+        env:
+          ALERT_EMAIL: baksheev@me.com
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: GCLOUD_BIN=gcloud scripts/apply-gcp-rebalance-monitoring
+
       - name: Publish deployment summary
         env:
           IMAGE: ${{ steps.image.outputs.image }}

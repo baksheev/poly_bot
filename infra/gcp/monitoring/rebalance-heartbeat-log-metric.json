@@ -1,0 +1,10 @@
+{
+  "description": "One point per poly_bot rebalance health heartbeat from the production GKE runtime.",
+  "filter": "resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\" AND jsonPayload.fields.message=\"rebalance health heartbeat\"",
+  "metricDescriptor": {
+    "displayName": "poly_bot rebalance health heartbeat",
+    "metricKind": "DELTA",
+    "valueType": "INT64",
+    "unit": "1"
+  }
+}

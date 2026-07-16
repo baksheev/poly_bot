@@ -8,6 +8,10 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Added a one-minute production rebalance health heartbeat plus Google Cloud
+  Monitoring email alerts for explicit planner/executor faults, blocked or
+  stuck operations, stuck settlement, and five minutes without a heartbeat.
+  The GitHub deployment idempotently targets `baksheev@me.com`.
 - Rebalancing is production-enabled on GKE for WLD and USDC. Direct WLD and
   Optimism/Across fallback routes have completed in both directions; USDC has
   completed in both directions through its only live Binance route, Optimism.

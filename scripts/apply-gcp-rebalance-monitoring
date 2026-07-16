@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+gcloud_bin="${GCLOUD_BIN:-${repo_root}/scripts/gcloud-local}"
+
+: "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+: "${ALERT_EMAIL:?ALERT_EMAIL is required}"
+if [[ ! "${ALERT_EMAIL}" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+  echo "ALERT_EMAIL must be a valid email address" >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required" >&2
+  exit 1
+fi
+
+monitoring_dir="${repo_root}/infra/gcp/monitoring"
+project_args=(--project="${GCP_PROJECT_ID}" --quiet)
+
+upsert_log_metric() {
+  local metric_name="$1"
+  local config_file="$2"
+  if "${gcloud_bin}" logging metrics describe "${metric_name}" "${project_args[@]}" >/dev/null 2>&1; then
+    "${gcloud_bin}" logging metrics update "${metric_name}" \
+      --config-from-file="${config_file}" \
+      "${project_args[@]}" >/dev/null
+  else
+    "${gcloud_bin}" logging metrics create "${metric_name}" \
+      --config-from-file="${config_file}" \
+      "${project_args[@]}" >/dev/null
+  fi
+}
+
+upsert_log_metric \
+  poly_bot_rebalance_health_heartbeat \
+  "${monitoring_dir}/rebalance-heartbeat-log-metric.json"
+upsert_log_metric \
+  poly_bot_rebalance_fault \
+  "${monitoring_dir}/rebalance-fault-log-metric.json"
+
+channels_json="$("${gcloud_bin}" alpha monitoring channels list \
+  "${project_args[@]}" \
+  --format=json)"
+matching_channels=()
+while IFS= read -r channel; do
+  matching_channels+=("${channel}")
+done < <(
+  jq -r --arg email "${ALERT_EMAIL}" \
+    '.[] | select(.type == "email" and .labels.email_address == $email) | .name' \
+    <<<"${channels_json}"
+)
+if [[ "${#matching_channels[@]}" -gt 1 ]]; then
+  echo "multiple email notification channels already target ${ALERT_EMAIL}" >&2
+  exit 1
+fi
+if [[ "${#matching_channels[@]}" -eq 0 ]]; then
+  notification_channel="$("${gcloud_bin}" alpha monitoring channels create \
+    --display-name="poly_bot rebalance operator" \
+    --description="Critical production rebalance alerts" \
+    --type=email \
+    --channel-labels="email_address=${ALERT_EMAIL}" \
+    --user-labels="service=poly_bot,component=rebalance" \
+    "${project_args[@]}" \
+    --format='value(name)')"
+else
+  notification_channel="${matching_channels[0]}"
+  "${gcloud_bin}" alpha monitoring channels update "${notification_channel}" \
+    --display-name="poly_bot rebalance operator" \
+    --description="Critical production rebalance alerts" \
+    --enabled \
+    --update-user-labels="service=poly_bot,component=rebalance" \
+    "${project_args[@]}" >/dev/null
+fi
+if [[ -z "${notification_channel}" ]]; then
+  echo "email notification channel was not created" >&2
+  exit 1
+fi
+
+upsert_policy() {
+  local display_name="$1"
+  local template="$2"
+  local rendered
+  local policies_json
+  local existing
+  rendered="$(mktemp)"
+  policies_json="$("${gcloud_bin}" alpha monitoring policies list \
+    "${project_args[@]}" \
+    --format=json)"
+  existing=()
+  while IFS= read -r policy; do
+    existing+=("${policy}")
+  done < <(
+    jq -r --arg display_name "${display_name}" \
+      '.[] | select(.displayName == $display_name) | .name' \
+      <<<"${policies_json}"
+  )
+  if [[ "${#existing[@]}" -gt 1 ]]; then
+    echo "multiple alert policies are named ${display_name}" >&2
+    exit 1
+  fi
+  if [[ "${#existing[@]}" -eq 0 ]]; then
+    jq --arg channel "${notification_channel}" \
+      '.notificationChannels = [$channel]' \
+      "${template}" >"${rendered}"
+    "${gcloud_bin}" alpha monitoring policies create \
+      --policy-from-file="${rendered}" \
+      "${project_args[@]}" >/dev/null
+  else
+    jq --arg channel "${notification_channel}" --arg name "${existing[0]}" \
+      '.notificationChannels = [$channel] | .name = $name' \
+      "${template}" >"${rendered}"
+    "${gcloud_bin}" alpha monitoring policies update "${existing[0]}" \
+      --policy-from-file="${rendered}" \
+      "${project_args[@]}" >/dev/null
+  fi
+  rm -f "${rendered}"
+}
+
+upsert_policy \
+  "poly_bot rebalance fault" \
+  "${monitoring_dir}/rebalance-fault-policy.json"
+upsert_policy \
+  "poly_bot rebalance heartbeat missing" \
+  "${monitoring_dir}/rebalance-heartbeat-missing-policy.json"
+
+echo "rebalance monitoring configured for ${ALERT_EMAIL}"

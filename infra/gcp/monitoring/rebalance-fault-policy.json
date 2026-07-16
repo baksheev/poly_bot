@@ -1,0 +1,44 @@
+{
+  "displayName": "poly_bot rebalance fault",
+  "combiner": "OR",
+  "enabled": true,
+  "conditions": [
+    {
+      "displayName": "Rebalance fault log observed",
+      "conditionThreshold": {
+        "filter": "resource.type = \"k8s_container\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_fault\" AND resource.labels.cluster_name = \"arb-bot\" AND resource.labels.namespace_name = \"arb-bot\" AND resource.labels.container_name = \"arb-bot\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_RATE",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": [
+              "resource.label.project_id",
+              "resource.label.cluster_name",
+              "resource.label.namespace_name",
+              "resource.label.container_name"
+            ]
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "trigger": {
+          "count": 1
+        },
+        "evaluationMissingData": "EVALUATION_MISSING_DATA_INACTIVE"
+      }
+    }
+  ],
+  "documentation": {
+    "mimeType": "text/markdown",
+    "content": "A critical rebalance signal was emitted by the production `poly_bot` GKE runtime. This covers planner or executor failure, a fail-closed blocked state, an operation exceeding `REBALANCE_EXECUTOR_TIMEOUT_SECONDS`, or settlement waiting for fresh balance streams for at least 60 seconds. Inspect the `arb-bot` namespace logs and `/var/lib/arb-bot/rebalance-executor.jsonl` before changing funds or retrying an operation."
+  },
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "userLabels": {
+    "service": "poly_bot",
+    "component": "rebalance"
+  }
+}

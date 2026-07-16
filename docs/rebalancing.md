@@ -342,6 +342,30 @@ The engine emits bounded asynchronous ClickHouse records for:
 The durable journal, Binance history, and chain receipts authorize recovery.
 ClickHouse is used to audit what the in-memory owner observed and decided.
 
+Production also emits a structured `rebalance health heartbeat` to Cloud
+Logging once per minute. This is deliberately outside the market-data and
+decision hot path. The heartbeat reports whether rebalance is blocked, how long
+an operation has been in flight, and how long post-completion settlement has
+been waiting. It becomes unhealthy when:
+
+- the executor has failed closed;
+- an in-flight operation reaches `REBALANCE_EXECUTOR_TIMEOUT_SECONDS`; or
+- completed-transfer settlement is still waiting for fresh Binance and wallet
+  snapshots after at least 60 seconds.
+
+`scripts/apply-gcp-rebalance-monitoring` idempotently provisions two log-based
+metrics, two Cloud Monitoring alert policies, and the operator email channel:
+
+- `poly_bot rebalance fault` alerts on planner/executor errors or an unhealthy
+  heartbeat;
+- `poly_bot rebalance heartbeat missing` alerts after five minutes without any
+  heartbeat, covering a stopped process, pod, logging path, or event loop.
+
+Both policies notify `baksheev@me.com`. They are reapplied by the GitHub GKE
+deployment workflow after a successful rollout. Rollouts aggregate heartbeat
+series across pod names, so replacing the immutable release pod does not create
+a false missing-heartbeat incident.
+
 Useful read-only commands remain available:
 
 ```bash
