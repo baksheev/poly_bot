@@ -28,6 +28,8 @@ the exact artifact used by each rollout.
 - Full rebalance withdrawal submission supports explicit `standard` and
   `travel_rule` Binance API modes. GKE selects `standard` after the isolated
   subaccount rejected the local-entity endpoint before any withdrawal.
+- Full-live startup checks the selected Binance key's read, withdrawal, and IP
+  restriction flags before opening either durable execution journal.
 
 - Reusable EVM wallet primitives for canonical-block balance and allowance
   hydration, latest/pending nonce observation, native and ERC-20 transfer or

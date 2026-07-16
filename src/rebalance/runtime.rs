@@ -124,6 +124,19 @@ impl RebalanceExecutor {
             treasury_account.can_withdraw && treasury_account.can_deposit,
             "Binance treasury account does not permit deposits and withdrawals"
         );
+        let api_key_permissions = binance.api_key_permissions().await?;
+        ensure!(
+            api_key_permissions.enable_reading,
+            "Binance rebalance API key does not permit reads"
+        );
+        ensure!(
+            api_key_permissions.enable_withdrawals,
+            "Binance rebalance API key does not permit withdrawals"
+        );
+        ensure!(
+            api_key_permissions.ip_restrict,
+            "Binance rebalance API key is not IP restricted"
+        );
 
         let mut transaction_journal = TransactionJournal::open(transaction_journal_path)?;
         let (world_latest, world_pending, optimism_latest, optimism_pending) = tokio::try_join!(

@@ -75,6 +75,9 @@ Deployment template selects it, but no GKE workload has been rolled out yet.
 Startup requires an explicitly selected Binance credential mode, a wallet
 signer, both durable journals, positive per-token caps, and the exact
 `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE` acknowledgement.
+Before opening either journal, startup verifies the selected Binance key has
+reading, withdrawal, and IP-restriction permissions through
+`account/apiRestrictions`; account-level `canWithdraw` alone is insufficient.
 The current subaccount uses explicit `standard` withdrawal API mode; the
 `localentity` Travel Rule endpoint is available only through explicit
 `travel_rule` configuration and is never used as an implicit fallback.

@@ -164,6 +164,16 @@ impl BinanceAccountClient {
             .await
     }
 
+    pub async fn api_key_permissions(&self) -> anyhow::Result<ApiKeyPermissions> {
+        let query = self.signed_query(&[("recvWindow", "5000".to_owned())])?;
+        self.signed_get(
+            "/sapi/v1/account/apiRestrictions",
+            &query,
+            "API key permissions",
+        )
+        .await
+    }
+
     pub async fn commission_rates(&self, symbol: &str) -> anyhow::Result<CommissionRates> {
         ensure!(
             symbol
@@ -308,6 +318,16 @@ pub struct AccountInformation {
     pub balances: Vec<AssetBalance>,
     #[serde(default)]
     pub permissions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyPermissions {
+    pub ip_restrict: bool,
+    pub enable_reading: bool,
+    pub enable_withdrawals: bool,
+    #[serde(default)]
+    pub enable_spot_and_margin_trading: bool,
 }
 
 #[derive(Debug)]
@@ -457,7 +477,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        BinanceAccountClient, BinanceCredentials, CommissionRates, apply_clock_offset, sign_hex,
+        ApiKeyPermissions, BinanceAccountClient, BinanceCredentials, CommissionRates,
+        apply_clock_offset, sign_hex,
     };
 
     #[test]
@@ -492,6 +513,19 @@ mod tests {
         .unwrap();
         assert_eq!(commission.standard_commission.taker, Decimal::new(2, 3));
         assert_eq!(commission.discount.discount, Decimal::new(75, 2));
+    }
+
+    #[test]
+    fn parses_withdrawal_and_ip_restriction_permissions() {
+        let permissions: ApiKeyPermissions = serde_json::from_str(
+            r#"{"ipRestrict":true,"enableReading":true,"enableWithdrawals":false,"enableSpotAndMarginTrading":true}"#,
+        )
+        .unwrap();
+
+        assert!(permissions.ip_restrict);
+        assert!(permissions.enable_reading);
+        assert!(!permissions.enable_withdrawals);
+        assert!(permissions.enable_spot_and_margin_trading);
     }
 
     #[test]
