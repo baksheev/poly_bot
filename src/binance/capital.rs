@@ -194,6 +194,47 @@ impl BinanceAccountClient {
         .await
     }
 
+    pub async fn withdraw_standard(
+        &self,
+        coin: &str,
+        network: &str,
+        address: &str,
+        amount: Decimal,
+        withdraw_order_id: &str,
+    ) -> anyhow::Result<StandardWithdrawalSubmission> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        ensure!(
+            address.starts_with("0x")
+                && address.len() == 42
+                && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Binance withdrawal address must be an EVM address"
+        );
+        ensure!(amount > Decimal::ZERO, "withdrawal amount must be positive");
+        validate_withdraw_order_id(withdraw_order_id)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("address", address.to_owned()),
+            ("amount", amount.normalize().to_string()),
+            ("withdrawOrderId", withdraw_order_id.to_owned()),
+            ("network", network.to_owned()),
+            ("walletType", "0".to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let submission: StandardWithdrawalSubmission = self
+            .signed_post(
+                "/sapi/v1/capital/withdraw/apply",
+                &query,
+                "standard withdrawal submission",
+            )
+            .await?;
+        ensure!(
+            !submission.id.trim().is_empty(),
+            "Binance standard withdrawal returned an empty id"
+        );
+        Ok(submission)
+    }
+
     pub async fn withdrawal_history(
         &self,
         coin: &str,
@@ -366,6 +407,11 @@ pub struct WithdrawalSubmission {
     pub accepted: bool,
     #[serde(default)]
     pub info: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct StandardWithdrawalSubmission {
+    pub id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -678,9 +724,9 @@ mod tests {
 
     use super::{
         CoinInformation, DepositAddressRecord, DepositCreditState, DepositRecord,
-        NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord, WithdrawalState,
-        WithdrawalSubmission, matching_deposits, matching_withdrawals, select_capital_routes,
-        select_evm_deposit_address,
+        NetworkInformation, StandardWithdrawalSubmission, TravelRuleWithdrawalRecord,
+        WithdrawalRecord, WithdrawalState, WithdrawalSubmission, matching_deposits,
+        matching_withdrawals, select_capital_routes, select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -722,6 +768,14 @@ mod tests {
 
         assert_eq!(submission.tr_id, 65_865_740);
         assert!(submission.accepted);
+    }
+
+    #[test]
+    fn parses_standard_withdrawal_submission_id() {
+        let submission: StandardWithdrawalSubmission =
+            serde_json::from_str(r#"{"id":"7213fea8e94b4a5593d507237e5a555b"}"#).unwrap();
+
+        assert_eq!(submission.id, "7213fea8e94b4a5593d507237e5a555b");
     }
 
     #[test]

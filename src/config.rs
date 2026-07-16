@@ -210,6 +210,13 @@ pub struct AppConfig {
     )]
     pub rebalance_binance_credential_mode: String,
 
+    #[arg(
+        long,
+        env = "REBALANCE_BINANCE_WITHDRAWAL_API_MODE",
+        default_value = "standard"
+    )]
+    pub rebalance_binance_withdrawal_api_mode: String,
+
     #[arg(long, env = "EVM_WALLET_ADDRESS", default_value = "")]
     pub evm_wallet_address: String,
 
@@ -301,6 +308,13 @@ impl AppConfig {
                 "separate_treasury" | "shared_trading"
             ),
             "REBALANCE_BINANCE_CREDENTIAL_MODE must be separate_treasury or shared_trading"
+        );
+        ensure!(
+            matches!(
+                self.rebalance_binance_withdrawal_api_mode.as_str(),
+                "standard" | "travel_rule"
+            ),
+            "REBALANCE_BINANCE_WITHDRAWAL_API_MODE must be standard or travel_rule"
         );
         if self.rebalance_execution_mode == "full_live" {
             ensure!(
@@ -478,6 +492,7 @@ mod tests {
             rebalance_max_usdc_amount: rust_decimal::Decimal::ZERO,
             rebalance_live_confirmation: String::new(),
             rebalance_binance_credential_mode: "separate_treasury".into(),
+            rebalance_binance_withdrawal_api_mode: "standard".into(),
             evm_wallet_address: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "arb_bot".into(),

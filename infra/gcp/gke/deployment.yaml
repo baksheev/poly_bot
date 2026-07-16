@@ -86,6 +86,8 @@ spec:
               value: ENABLE_FULL_REBALANCE
             - name: REBALANCE_BINANCE_CREDENTIAL_MODE
               value: shared_trading
+            - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
+              value: standard
           resources:
             requests:
               cpu: "6"

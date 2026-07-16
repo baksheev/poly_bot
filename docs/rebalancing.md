@@ -75,6 +75,9 @@ Deployment template selects it, but no GKE workload has been rolled out yet.
 Startup requires an explicitly selected Binance credential mode, a wallet
 signer, both durable journals, positive per-token caps, and the exact
 `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE` acknowledgement.
+The current subaccount uses explicit `standard` withdrawal API mode; the
+`localentity` Travel Rule endpoint is available only through explicit
+`travel_rule` configuration and is never used as an implicit fallback.
 The worker uses a bounded cold-path channel, so Binance, Across, and RPC waits
 never run inside the market-data loop. Only one operation may be active; after
 completion, both Binance and wallet snapshots must refresh before another plan
@@ -189,8 +192,8 @@ Every transfer follows a recoverable sequence:
 Routes for both WLD and USDC:
 
 - Direct Binance to wallet: submit a withdrawal with deterministic
-  `withdrawOrderId`, reconcile withdrawal history, and confirm the final World
-  Chain balance.
+  `withdrawOrderId` through the explicitly selected standard or Travel Rule
+  API, reconcile withdrawal history, and confirm the final World Chain balance.
 - Direct wallet to Binance: transfer to a freshly verified Binance deposit
   address, confirm the chain receipt, then reconcile Travel Rule state,
   deposit history, and credited balance.

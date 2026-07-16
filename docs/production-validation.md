@@ -50,6 +50,7 @@ does not replace a real operation against the production endpoint.
 | Rebalance | direct route end-to-end | Pending | — |
 | Rebalance | Optimism + Across fallback end-to-end | Pending | — |
 | GKE full-live preflight | secrets, signer, caps, isolated inventory | Passed | GKE NAT authenticated the latest shared key against exactly 1,000 USDC and 2,500 WLD; WLD direct/fallback and USDC fallback routes pass; signer and both RPCs pass; GitHub caps are 500 USDC and 1,250 WLD; operator selected explicit shared-key mode |
+| GKE first full-live attempt | 500 USDC fallback intent | Failed closed | `localentity` withdrawal returned HTTP 401 / Binance `-1002`; durable journal remained at `intent_recorded`, wallet nonce journal stayed empty, and no withdrawal was indexed. The account is configured for the standard capital withdrawal API before retry. |
 
 The wallet and Binance hydration evidence above intentionally records no secret
 material or raw authenticated request. The bootstrap ETH withdrawal and native

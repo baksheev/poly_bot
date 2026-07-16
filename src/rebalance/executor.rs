@@ -71,7 +71,7 @@ impl RebalanceExecutionIntent {
 pub enum RebalanceExecutionProgress {
     IntentRecorded,
     BinanceWithdrawalSubmitted {
-        travel_rule_id: i64,
+        submission_reference: String,
         #[serde(with = "u256_serde")]
         bridge_balance_before: U256,
     },
@@ -665,8 +665,14 @@ fn validate_progress_evidence(
 ) -> anyhow::Result<()> {
     use RebalanceExecutionProgress as P;
     match progress {
-        P::BinanceWithdrawalSubmitted { travel_rule_id, .. } => {
-            ensure!(*travel_rule_id > 0, "rebalance Travel Rule id is invalid");
+        P::BinanceWithdrawalSubmitted {
+            submission_reference,
+            ..
+        } => {
+            ensure!(
+                !submission_reference.is_empty() && submission_reference.len() <= 128,
+                "rebalance Binance withdrawal submission reference is invalid"
+            );
         }
         P::FundsOnBridge {
             withdrawal_id,

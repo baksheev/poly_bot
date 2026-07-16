@@ -50,7 +50,9 @@ by the Rust rebalance state machine:
 - `GET /sapi/v1/capital/deposit/address/list`;
 - `GET /sapi/v2/localentity/deposit/history`;
 - `PUT /sapi/v2/localentity/deposit/provide-info`;
-- `POST /sapi/v1/localentity/withdraw/apply`;
+- `POST /sapi/v1/capital/withdraw/apply` for the current non-local-entity
+  subaccount, or explicit `POST /sapi/v1/localentity/withdraw/apply` mode when
+  Binance reports a Travel Rule questionnaire requirement;
 - `GET /sapi/v1/capital/withdraw/history`.
 
 ## Rails execution semantics to preserve

@@ -25,6 +25,9 @@ the exact artifact used by each rollout.
   rollout.
 - The GKE journal PVC uses C4-compatible `dynamic-rwo` Hyperdisk Balanced
   storage instead of the unsupported `pd-balanced` class.
+- Full rebalance withdrawal submission supports explicit `standard` and
+  `travel_rule` Binance API modes. GKE selects `standard` after the isolated
+  subaccount rejected the local-entity endpoint before any withdrawal.
 
 - Reusable EVM wallet primitives for canonical-block balance and allowance
   hydration, latest/pending nonce observation, native and ERC-20 transfer or

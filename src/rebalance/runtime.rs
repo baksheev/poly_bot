@@ -37,6 +37,7 @@ pub struct RebalanceRuntimeLimits {
     pub maximum_wld: Decimal,
     pub maximum_usdc: Decimal,
     pub operation_timeout: Duration,
+    pub binance_withdrawal_api_mode: String,
 }
 
 impl RebalanceRuntimeLimits {
@@ -98,6 +99,13 @@ impl RebalanceExecutor {
         ensure!(
             limits.operation_timeout <= Duration::from_secs(24 * 60 * 60),
             "rebalance timeout exceeds one day"
+        );
+        ensure!(
+            matches!(
+                limits.binance_withdrawal_api_mode.as_str(),
+                "standard" | "travel_rule"
+            ),
+            "rebalance Binance withdrawal API mode is invalid"
         );
         let owner = wallet.address();
         let (world_chain, optimism_chain) =
@@ -269,9 +277,9 @@ impl RebalanceExecutor {
                     operation.intent.wallet_owner,
                 )
                 .await?;
-            let tr_id = if let Some(record) = existing.first() {
+            let submission_reference = if let Some(record) = existing.first() {
                 validate_withdrawal_record(&operation, record)?;
-                1
+                record.id.clone()
             } else {
                 ensure!(
                     created_here,
@@ -281,27 +289,13 @@ impl RebalanceExecutor {
                     operation.intent.amount,
                     operation.intent.token_decimals,
                 )?;
-                let submission = self
-                    .binance
-                    .withdraw(
-                        &operation.intent.token_symbol,
-                        &binance_network,
-                        &format!("{:#x}", operation.intent.wallet_owner),
-                        amount,
-                        &operation.intent.withdraw_order_id,
-                    )
-                    .await?;
-                ensure!(
-                    submission.accepted,
-                    "Binance rejected rebalance withdrawal: {}",
-                    submission.info
-                );
-                submission.tr_id
+                self.submit_binance_withdrawal(&operation, &binance_network, amount)
+                    .await?
             };
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
-                    travel_rule_id: tr_id,
+                    submission_reference,
                     bridge_balance_before: bridge_before,
                 },
             )?;
@@ -440,9 +434,9 @@ impl RebalanceExecutor {
                     operation.intent.wallet_owner,
                 )
                 .await?;
-            let tr_id = if let Some(record) = existing.first() {
+            let submission_reference = if let Some(record) = existing.first() {
                 validate_withdrawal_record(&operation, record)?;
-                1
+                record.id.clone()
             } else {
                 ensure!(
                     created_here,
@@ -452,27 +446,13 @@ impl RebalanceExecutor {
                     operation.intent.amount,
                     operation.intent.token_decimals,
                 )?;
-                let submission = self
-                    .binance
-                    .withdraw(
-                        &operation.intent.token_symbol,
-                        &binance_network,
-                        &format!("{:#x}", operation.intent.wallet_owner),
-                        amount,
-                        &operation.intent.withdraw_order_id,
-                    )
-                    .await?;
-                ensure!(
-                    submission.accepted,
-                    "Binance rejected rebalance withdrawal: {}",
-                    submission.info
-                );
-                submission.tr_id
+                self.submit_binance_withdrawal(&operation, &binance_network, amount)
+                    .await?
             };
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
-                    travel_rule_id: tr_id,
+                    submission_reference,
                     bridge_balance_before: bridge_before,
                 },
             )?;
@@ -952,6 +932,49 @@ impl RebalanceExecutor {
             )?;
         }
         Ok(operation)
+    }
+
+    async fn submit_binance_withdrawal(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        network: &str,
+        amount: Decimal,
+    ) -> anyhow::Result<String> {
+        let address = format!("{:#x}", operation.intent.wallet_owner);
+        match self.limits.binance_withdrawal_api_mode.as_str() {
+            "standard" => {
+                let submission = self
+                    .binance
+                    .withdraw_standard(
+                        &operation.intent.token_symbol,
+                        network,
+                        &address,
+                        amount,
+                        &operation.intent.withdraw_order_id,
+                    )
+                    .await?;
+                Ok(submission.id)
+            }
+            "travel_rule" => {
+                let submission = self
+                    .binance
+                    .withdraw(
+                        &operation.intent.token_symbol,
+                        network,
+                        &address,
+                        amount,
+                        &operation.intent.withdraw_order_id,
+                    )
+                    .await?;
+                ensure!(
+                    submission.accepted,
+                    "Binance rejected rebalance withdrawal: {}",
+                    submission.info
+                );
+                Ok(submission.tr_id.to_string())
+            }
+            _ => bail!("unsupported Binance withdrawal API mode"),
+        }
     }
 
     async fn wait_withdrawal(

@@ -1768,6 +1768,7 @@ async fn run(
                 maximum_wld: config.rebalance_max_wld_amount,
                 maximum_usdc: config.rebalance_max_usdc_amount,
                 operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
+                binance_withdrawal_api_mode: config.rebalance_binance_withdrawal_api_mode.clone(),
             },
         )
         .await?;
