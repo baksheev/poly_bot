@@ -38,35 +38,10 @@ pub enum Command {
         #[arg(long)]
         withdraw_order_id: Option<String>,
     },
-    /// Perform a capped live WLDUSDC MARKET buy/sell validation over WebSocket API.
-    BinanceManualRoundTrip {
-        #[arg(long)]
-        quote_amount: rust_decimal::Decimal,
-        #[arg(long, default_value_t = false)]
-        confirm_live: bool,
-    },
     /// Read recent WLDUSDC orders created by the Rust validation client.
     BinanceRecentValidationOrders {
         #[arg(long, default_value_t = 20)]
         limit: u16,
-    },
-    /// Buy a capped amount of ETHUSDT for test-wallet gas funding.
-    BinanceManualEthBuy {
-        #[arg(long)]
-        quote_amount: rust_decimal::Decimal,
-        #[arg(long, default_value_t = false)]
-        confirm_live: bool,
-    },
-    /// Withdraw a strictly capped ETH/WLD/USDC canary to the configured test wallet.
-    BinanceManualWalletWithdraw {
-        #[arg(long)]
-        coin: String,
-        #[arg(long)]
-        network: String,
-        #[arg(long)]
-        amount: rust_decimal::Decimal,
-        #[arg(long, default_value_t = false)]
-        confirm_live: bool,
     },
     /// Read one Binance withdrawal by its deterministic client id.
     BinanceWithdrawalStatus {
@@ -88,11 +63,6 @@ pub enum Command {
         /// Exact input in USDC base units (1 USDC = 1,000,000).
         #[arg(long)]
         amount: u128,
-    },
-    /// Bridge native ETH from Optimism to World Chain, retaining at least 20% for Optimism gas.
-    AcrossManualEthToWorld {
-        #[arg(long, default_value_t = false)]
-        confirm_live: bool,
     },
     /// Derive and print only the public address of the configured EVM wallet.
     WalletAddress,
@@ -170,19 +140,6 @@ pub struct AppConfig {
     #[arg(long, env = "REBALANCE_EXECUTION_MODE", default_value = "disabled")]
     pub rebalance_execution_mode: String,
 
-    #[arg(long, env = "REBALANCE_WLD_ROUTE_MODE", default_value = "auto")]
-    pub rebalance_wld_route_mode: String,
-
-    #[arg(long, env = "REBALANCE_CANARY_WLD_AMOUNT", default_value = "1")]
-    pub rebalance_canary_wld_amount: rust_decimal::Decimal,
-
-    #[arg(
-        long,
-        env = "REBALANCE_JOURNAL_PATH",
-        default_value = "/var/lib/arb-bot/rebalance-canary.jsonl"
-    )]
-    pub rebalance_journal_path: PathBuf,
-
     #[arg(
         long,
         env = "REBALANCE_EXECUTOR_JOURNAL_PATH",
@@ -205,13 +162,6 @@ pub struct AppConfig {
 
     #[arg(long, env = "REBALANCE_LIVE_CONFIRMATION", default_value = "")]
     pub rebalance_live_confirmation: String,
-
-    #[arg(
-        long,
-        env = "REBALANCE_BINANCE_CREDENTIAL_MODE",
-        default_value = "separate_treasury"
-    )]
-    pub rebalance_binance_credential_mode: String,
 
     #[arg(
         long,
@@ -279,25 +229,9 @@ impl AppConfig {
         ensure!(
             matches!(
                 self.rebalance_execution_mode.as_str(),
-                "disabled" | "direct_wld_canary" | "full_live"
+                "disabled" | "full_live"
             ),
-            "REBALANCE_EXECUTION_MODE must be disabled, direct_wld_canary, or full_live"
-        );
-        ensure!(
-            matches!(
-                self.rebalance_wld_route_mode.as_str(),
-                "auto" | "across_only"
-            ),
-            "REBALANCE_WLD_ROUTE_MODE must be auto or across_only"
-        );
-        ensure!(
-            self.rebalance_canary_wld_amount > rust_decimal::Decimal::ZERO
-                && self.rebalance_canary_wld_amount <= rust_decimal::Decimal::ONE,
-            "REBALANCE_CANARY_WLD_AMOUNT must be positive and no more than 1 WLD"
-        );
-        ensure!(
-            !self.rebalance_journal_path.as_os_str().is_empty(),
-            "REBALANCE_JOURNAL_PATH is empty"
+            "REBALANCE_EXECUTION_MODE must be disabled or full_live"
         );
         ensure!(
             !self.rebalance_executor_journal_path.as_os_str().is_empty(),
@@ -311,10 +245,6 @@ impl AppConfig {
             self.rebalance_max_wld_amount >= rust_decimal::Decimal::ZERO
                 && self.rebalance_max_usdc_amount >= rust_decimal::Decimal::ZERO,
             "rebalance live amount limits must not be negative"
-        );
-        ensure!(
-            self.rebalance_binance_credential_mode == "separate_treasury",
-            "REBALANCE_BINANCE_CREDENTIAL_MODE must be separate_treasury"
         );
         ensure!(
             matches!(
@@ -491,15 +421,11 @@ mod tests {
             balance_max_age_ms: 5_000,
             balance_event_channel_capacity: 16,
             rebalance_execution_mode: "disabled".into(),
-            rebalance_wld_route_mode: "auto".into(),
-            rebalance_canary_wld_amount: rust_decimal::Decimal::ONE,
-            rebalance_journal_path: "/tmp/rebalance-canary.jsonl".into(),
             rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),
             rebalance_executor_timeout_seconds: 1_800,
             rebalance_max_wld_amount: rust_decimal::Decimal::ZERO,
             rebalance_max_usdc_amount: rust_decimal::Decimal::ZERO,
             rebalance_live_confirmation: String::new(),
-            rebalance_binance_credential_mode: "separate_treasury".into(),
             rebalance_binance_withdrawal_api_mode: "standard".into(),
             evm_wallet_address: String::new(),
             clickhouse_url: String::new(),
@@ -527,15 +453,12 @@ mod tests {
         value.rebalance_max_wld_amount = rust_decimal::Decimal::ONE;
         value.rebalance_max_usdc_amount = rust_decimal::Decimal::from(100);
         value.validate().unwrap();
-
-        value.rebalance_binance_credential_mode = "shared_trading".into();
-        assert!(value.validate().is_err());
     }
 
     #[test]
-    fn rejects_unknown_wld_route_mode() {
+    fn retired_canary_execution_mode_is_rejected() {
         let mut value = config();
-        value.rebalance_wld_route_mode = "direct_only".into();
+        value.rebalance_execution_mode = "direct_wld_canary".into();
         assert!(value.validate().is_err());
     }
 

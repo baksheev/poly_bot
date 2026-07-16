@@ -19,8 +19,6 @@ data:
   BALANCE_MAX_AGE_MS: "5000"
   BALANCE_EVENT_CHANNEL_CAPACITY: "16"
   REBALANCE_EXECUTION_MODE: disabled
-  REBALANCE_CANARY_WLD_AMOUNT: "1"
-  REBALANCE_JOURNAL_PATH: /var/lib/arb-bot/rebalance-canary.jsonl
   REBALANCE_EXECUTOR_JOURNAL_PATH: /var/lib/arb-bot/rebalance-executor.jsonl
   REBALANCE_EXECUTOR_TIMEOUT_SECONDS: "1800"
   EVM_WALLET_JOURNAL_PATH: /var/lib/arb-bot/evm-wallet.jsonl

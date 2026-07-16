@@ -417,7 +417,7 @@ mod tests {
         )
     }
 
-    fn tracker() -> RebalanceTracker {
+    fn tracker_with_wld_routes(wld_routes: Vec<RouteCandidate>) -> RebalanceTracker {
         let config = LoadedDomainConfig::load(format!(
             "{}/config/strategies/usdc-wld-world-chain.v3.json",
             env!("CARGO_MANIFEST_DIR")
@@ -428,10 +428,14 @@ mod tests {
             pair,
             BTreeMap::from([
                 ("USDC".to_owned(), vec![across_route()]),
-                ("WLD".to_owned(), vec![direct_route()]),
+                ("WLD".to_owned(), wld_routes),
             ]),
         )
         .unwrap()
+    }
+
+    fn tracker() -> RebalanceTracker {
+        tracker_with_wld_routes(vec![direct_route()])
     }
 
     #[test]
@@ -557,6 +561,61 @@ mod tests {
             U256::from(499_000_000),
             Decimal::from(1_250),
             U256::from(1_249) * scale_18,
+        );
+        tracker.evaluate(&binance, &wallet).unwrap();
+        assert!(tracker.pending_action().is_none());
+        assert!(tracker.ready());
+    }
+
+    #[test]
+    fn wld_across_route_handles_both_live_directions_and_post_fee_balances() {
+        let scale = U256::from(10).pow(U256::from(18));
+        let mut tracker = tracker_with_wld_routes(vec![across_route()]);
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(500),
+            U256::from(500_000_000_u64),
+            Decimal::from(1_250),
+            U256::from(1_250) * scale,
+        );
+        tracker.evaluate(&binance, &wallet).unwrap();
+
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(500),
+            U256::from(500_000_000_u64),
+            Decimal::from(2_000),
+            U256::from(500) * scale,
+        );
+        let evaluations = tracker.evaluate(&binance, &wallet).unwrap();
+        let action = evaluations
+            .iter()
+            .find(|evaluation| evaluation.token_symbol == "WLD")
+            .and_then(|evaluation| evaluation.plan.action.as_ref())
+            .unwrap();
+        assert_eq!(action.direction, Direction::BinanceToWallet);
+        assert_eq!(action.amount, U256::from(750) * scale);
+        assert!(matches!(action.route, Route::Across { .. }));
+
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(500),
+            U256::from(500_000_000_u64),
+            Decimal::from(500),
+            U256::from(2_000) * scale,
+        );
+        let evaluations = tracker.evaluate(&binance, &wallet).unwrap();
+        let action = evaluations
+            .iter()
+            .find(|evaluation| evaluation.token_symbol == "WLD")
+            .and_then(|evaluation| evaluation.plan.action.as_ref())
+            .unwrap();
+        assert_eq!(action.direction, Direction::WalletToBinance);
+        assert_eq!(action.amount, U256::from(750) * scale);
+        assert!(matches!(action.route, Route::Across { .. }));
+
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(500),
+            U256::from(500_000_000_u64),
+            Decimal::from_str_exact("1249.29385325").unwrap(),
+            U256::from_str_radix("1249633722185452956848", 10).unwrap(),
         );
         tracker.evaluate(&binance, &wallet).unwrap();
         assert!(tracker.pending_action().is_none());

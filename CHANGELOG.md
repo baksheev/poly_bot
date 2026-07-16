@@ -6,59 +6,36 @@ the exact artifact used by each rollout.
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- An off-by-default full rebalance executor implements direct and
-  Optimism/Across routes in both directions for WLD and USDC. A checksummed,
-  fsynced state-machine journal pins every operation, deterministic Binance
-  withdrawal ID, exact Across calldata, confirmation, and final balance
-  reconciliation; a bounded worker keeps the network-heavy flow outside the
-  market-data loop.
-- `full_live` requires an isolated subaccount trading credential and a separate
-  master treasury credential, an exact operator acknowledgement, positive WLD
-  and USDC caps, a wallet signer, dual-chain RPC hydration, and durable
-  high-level plus nonce journals.
-- Binance-to-wallet execution first performs a master-authorized universal
-  transfer from the isolated subaccount with a deterministic `clientTranId`,
-  reconciles that transfer, and only then submits the external withdrawal from
-  the master account. Both steps survive restart without blind retries.
-- The GKE template mounts the eleven secrets needed by the two-account flow,
-  persists both executor journals, and obtains positive
-  WLD/USDC limits from a reviewer-protected GitHub production environment.
-  Deployment validation rejects absent or zero limits before authentication or
-  rollout.
-- The GKE journal PVC uses C4-compatible `dynamic-rwo` Hyperdisk Balanced
-  storage instead of the unsupported `pd-balanced` class.
-- Full rebalance withdrawal submission supports explicit `standard` and
-  `travel_rule` Binance API modes. GKE selects `standard` after the isolated
-  subaccount rejected the local-entity endpoint before any withdrawal.
-- Full-live startup checks the subaccount key's read/IP flags, the master key's
-  read/withdrawal/universal-transfer/IP flags, and verifies the master's view
-  of the configured subaccount balances before opening either journal.
+- Rebalancing is production-enabled on GKE for WLD and USDC. Direct WLD and
+  Optimism/Across fallback routes have completed in both directions; USDC has
+  completed in both directions through its only live Binance route, Optimism.
+- The rebalance documentation now describes the deployed planner, route matrix,
+  treasury boundary, exact four route state machines, journals, recovery,
+  telemetry, production evidence, and current operator workflow.
+- Production withdrawal mode is documented and deployed as Binance Travel Rule.
 
-- Reusable EVM wallet primitives for canonical-block balance and allowance
-  hydration, latest/pending nonce observation, native and ERC-20 transfer or
-  approval calls, checked EIP-1559 signing, and hash-verified broadcast. The
-  explicitly gated Across native-ETH canary and full rebalance executor use the
-  shared wallet API; general execution remains off by default.
-- A single-owner EVM nonce lane and checksummed, fsynced JSONL transaction
-  journal preserve intent, signed hash, broadcast, unknown outcome, and mined
-  state across restart. Rails wallet regressions for duplicate nonces,
-  `already known`, receipt timeout, and premature reservation release are
-  covered by Rust failure tests.
-- Conservative startup reconciliation for unresolved EVM operations. Matching
-  receipts close the journaled operation; pending transactions must match the
-  full journaled identity and call, while absent, replaced, or unsigned cases
-  keep the nonce lane blocked for review.
-- A read-only Binance capital recovery snapshot hydrates an exact EVM deposit
-  address plus optional Travel Rule deposit and withdrawal evidence. It uses
-  decimal arithmetic, typed statuses, transaction-hash matching, and local
-  deterministic `withdrawOrderId` matching without submitting mutations.
-- A one-shot production direct-WLD rebalance canary reserves at most 1 WLD in a
-  checksummed fsynced journal, submits one deterministic Binance withdrawal,
-  recovers it through withdrawal history, and completes only after the World
-  Chain wallet balance increases. GKE now uses a Recreate rollout and a zonal
-  ReadWriteOnce journal disk so live-capable revisions never overlap.
+### Fixed
+
+- Preserve the second token budget after the first token rebalance completes.
+- Treat Binance withdrawal history amount as net received and approve or bridge
+  that net amount after the withdrawal fee.
+- Accept current Across filled responses without legacy output fields while
+  preserving origin, destination, transaction, and minimum-output validation.
+- Use the singular network-scoped Binance deposit-address endpoint and reconcile
+  exact credited amounts, including exchange precision residue.
+- Preserve legacy executor journal checksums and approval recovery across rollout.
+
+### Removed
+
+- Retired the direct-WLD canary execution mode, canary amount and journal flags,
+  forced WLD Across route flag, and the obsolete canary journal implementation.
+- Removed one-off mutating CLI commands for MARKET round trips, gas purchases,
+  manual wallet withdrawals, and native-ETH bootstrap bridging. Financial
+  mutations now go through the recoverable executor.
+- Removed the single-value Binance credential-mode flag; the separate master
+  treasury identity is now an unconditional production invariant.
 
 ## [0.2.0] - 2026-07-16
 

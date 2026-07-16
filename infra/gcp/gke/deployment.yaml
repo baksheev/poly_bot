@@ -88,8 +88,6 @@ spec:
               value: "__REBALANCE_MAX_USDC_AMOUNT__"
             - name: REBALANCE_LIVE_CONFIRMATION
               value: ENABLE_FULL_REBALANCE
-            - name: REBALANCE_BINANCE_CREDENTIAL_MODE
-              value: separate_treasury
             - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
               value: travel_rule
           resources:

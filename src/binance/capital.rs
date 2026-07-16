@@ -7,6 +7,8 @@ use serde::Deserialize;
 
 use super::account::BinanceAccountClient;
 
+const DEPOSIT_ADDRESS_ENDPOINT: &str = "/sapi/v1/capital/deposit/address";
+
 impl BinanceAccountClient {
     pub async fn all_coin_information(&self) -> anyhow::Result<Vec<CoinInformation>> {
         let query = self.signed_query(&[])?;
@@ -87,11 +89,7 @@ impl BinanceAccountClient {
             ("recvWindow", "5000".to_owned()),
         ])?;
         let address: DepositAddressRecord = self
-            .signed_get(
-                "/sapi/v1/capital/deposit/address",
-                &query,
-                "deposit address",
-            )
+            .signed_get(DEPOSIT_ADDRESS_ENDPOINT, &query, "deposit address")
             .await?;
         select_evm_deposit_address(&address, coin, network)
     }
@@ -705,10 +703,10 @@ mod tests {
     use alloy_primitives::{Address, B256};
 
     use super::{
-        CoinInformation, DepositAddressRecord, DepositCreditState, DepositRecord,
-        NetworkInformation, StandardWithdrawalSubmission, TravelRuleWithdrawalRecord,
-        WithdrawalRecord, WithdrawalState, WithdrawalSubmission, matching_deposits,
-        matching_withdrawals, select_capital_routes, select_evm_deposit_address,
+        CoinInformation, DEPOSIT_ADDRESS_ENDPOINT, DepositAddressRecord, DepositCreditState,
+        DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
+        TravelRuleWithdrawalRecord, WithdrawalRecord, WithdrawalState, WithdrawalSubmission,
+        matching_deposits, matching_withdrawals, select_capital_routes, select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -859,6 +857,12 @@ mod tests {
         assert_eq!(selected.coin, "USDC");
         assert_eq!(selected.network, "OPTIMISM");
         assert_eq!(selected.address, Address::repeat_byte(0x22));
+    }
+
+    #[test]
+    fn uses_the_singular_network_scoped_deposit_address_endpoint() {
+        assert_eq!(DEPOSIT_ADDRESS_ENDPOINT, "/sapi/v1/capital/deposit/address");
+        assert!(!DEPOSIT_ADDRESS_ENDPOINT.ends_with("/list"));
     }
 
     #[test]

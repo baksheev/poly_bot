@@ -1763,5 +1763,21 @@ mod tests {
             withdrawal_received_base_units(&record, 6).unwrap(),
             U256::from(499_950_000_u64)
         );
+
+        let wld = WithdrawalRecord {
+            amount: Decimal::from_str_exact("875.429").unwrap(),
+            transaction_fee: Decimal::from_str_exact("0.071").unwrap(),
+            coin: "WLD".to_owned(),
+            network: "OPTIMISM".to_owned(),
+            ..record
+        };
+        assert_eq!(
+            withdrawal_requested_base_units(&wld, 18).unwrap(),
+            U256::from(875_500_000_000_000_000_000_u128)
+        );
+        assert_eq!(
+            withdrawal_received_base_units(&wld, 18).unwrap(),
+            U256::from(875_429_000_000_000_000_000_u128)
+        );
     }
 }

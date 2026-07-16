@@ -1,23 +1,22 @@
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
-        AcrossClient, AcrossQuoteRequest, NATIVE_ETH, OPTIMISM_CHAIN_ID, OPTIMISM_USDC,
-        ValidatedNativeEthQuote, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
-        validate_native_eth_deposit_status, validate_native_eth_quote, validate_quote,
+        AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
+        WORLD_CHAIN_USDC, validate_quote,
     },
     balances::{
         BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
     },
     binance::account::{BinanceAccountClient, BinanceAccountState},
     binance::capital::{
-        CapitalRecoverySnapshot, CapitalRouteState, NetworkInformation, TravelRuleWithdrawalRecord,
-        WithdrawalRecord, select_capital_routes,
+        CapitalRecoverySnapshot, CapitalRouteState, TravelRuleWithdrawalRecord, WithdrawalRecord,
+        select_capital_routes,
     },
-    binance::ws_api::{BinanceWsApiClient, OrderResult, WsApiError},
-    chain::rpc::{JsonRpcClient, TransactionReceipt},
+    binance::ws_api::BinanceWsApiClient,
+    chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
     dex::{
         events::build_log_filters,
@@ -30,21 +29,18 @@ use arb_bot::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
     },
-    opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult, format_base_units},
+    opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult},
     rebalance::{
-        Direction, RebalanceCanaryIntent, RebalanceCanaryJournal, RebalanceCanaryStatus,
-        RebalanceEvaluation, RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits,
-        RebalanceTracker, Route, route_candidates_from_capital,
+        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
+        route_candidates_from_capital,
     },
     telemetry::TelemetryWriter,
     wallet::{
-        EvmWallet, NonceLane, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, TransactionJournal,
-        UnknownOutcomeReason, WALLET_JOURNAL_PATH_ENV, WalletCall, WalletTransactionParameters,
-        broadcast_signed_transaction, hydrate_chain_wallet,
+        EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV,
+        hydrate_chain_wallet,
     },
 };
 use clap::Parser;
-use rust_decimal::Decimal;
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -121,27 +117,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::BinanceManualRoundTrip {
-            quote_amount,
-            confirm_live,
-        } => {
-            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
-            binance_manual_round_trip(&cli.config, &domain_config, quote_amount, confirm_live).await
-        }
         Command::BinanceRecentValidationOrders { limit } => {
             binance_recent_validation_orders(&cli.config, limit).await
-        }
-        Command::BinanceManualEthBuy {
-            quote_amount,
-            confirm_live,
-        } => binance_manual_eth_buy(&cli.config, quote_amount, confirm_live).await,
-        Command::BinanceManualWalletWithdraw {
-            coin,
-            network,
-            amount,
-            confirm_live,
-        } => {
-            binance_manual_wallet_withdraw(&cli.config, &coin, &network, amount, confirm_live).await
         }
         Command::BinanceWithdrawalStatus {
             coin,
@@ -154,9 +131,6 @@ async fn main() -> anyhow::Result<()> {
             origin_chain_id,
             amount,
         } => across_usdc_quote(&cli.config, origin_chain_id, amount).await,
-        Command::AcrossManualEthToWorld { confirm_live } => {
-            across_manual_eth_to_world(&cli.config, confirm_live).await
-        }
         Command::WalletAddress => {
             let wallet = EvmWallet::from_env()?;
             tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
@@ -166,380 +140,6 @@ async fn main() -> anyhow::Result<()> {
             let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
             wallet_hydrate(&domain_config).await
         }
-    }
-}
-
-const RETAIN_OPTIMISM_BPS: u128 = 2_000;
-const BASIS_POINTS: u128 = 10_000;
-const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
-const GAS_LIMIT_MARGIN_DENOMINATOR: u64 = 100;
-const MAX_NATIVE_BRIDGE_GAS: u64 = 500_000;
-const MAX_ORIGIN_GAS_COST_WEI: u128 = 100_000_000_000_000;
-const DIRECT_WLD_CANARY_OPERATION_ID: &str = "directwldcanaryv1";
-const DIRECT_WLD_CANARY_WITHDRAW_ID: &str = "rustrebwldcanary1";
-const REBALANCE_CANARY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-struct NativeBridgeGasPlan {
-    gas_limit: u64,
-    max_fee_per_gas: u128,
-    max_priority_fee_per_gas: u128,
-    maximum_cost: u128,
-}
-
-async fn across_manual_eth_to_world(
-    config: &config::AppConfig,
-    confirm_live: bool,
-) -> anyhow::Result<()> {
-    ensure!(
-        confirm_live,
-        "live Across native ETH bridge requires explicit --confirm-live"
-    );
-    let wallet = EvmWallet::from_env()?;
-    let owner = wallet.address();
-    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
-        format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
-    })?;
-    let world_endpoint_name = "ALCHEMY_WORLDCHAIN_RPC_URL";
-    let world_endpoint = std::env::var(world_endpoint_name).with_context(|| {
-        format!("required environment variable {world_endpoint_name} is not set")
-    })?;
-    let optimism = JsonRpcClient::new(optimism_endpoint)?;
-    let world = JsonRpcClient::new(world_endpoint)?;
-    let (optimism_chain_id, world_chain_id) =
-        tokio::try_join!(optimism.chain_id(), world.chain_id())?;
-    ensure!(
-        optimism_chain_id == OPTIMISM_CHAIN_ID,
-        "Optimism RPC returned the wrong chain id"
-    );
-    ensure!(
-        world_chain_id == WORLD_CHAIN_CHAIN_ID,
-        "World Chain RPC returned the wrong chain id"
-    );
-
-    let (source_balance_u256, destination_balance_before, latest_nonce, pending_nonce, gas_price) =
-        tokio::try_join!(
-            optimism.native_balance(owner),
-            world.native_balance(owner),
-            optimism.latest_nonce(owner),
-            optimism.pending_nonce(owner),
-            optimism.gas_price(),
-        )?;
-    let journal_path = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
-        format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
-    })?;
-    let mut journal = TransactionJournal::open(journal_path)?;
-    let reconciled = NonceLane::reconcile(
-        &optimism,
-        &mut journal,
-        OPTIMISM_CHAIN_ID,
-        owner,
-        latest_nonce,
-        pending_nonce,
-    )
-    .await?;
-    let reconciliation_outcome = reconciled.outcome.label();
-    let mut nonce_lane = reconciled.lane;
-    tracing::info!(
-        wallet = %owner,
-        chain_id = OPTIMISM_CHAIN_ID,
-        latest_nonce,
-        pending_nonce,
-        outcome = reconciliation_outcome,
-        "wallet nonce lane startup reconciliation completed"
-    );
-    ensure!(
-        nonce_lane.ready(),
-        "Optimism wallet nonce lane requires recovery ({reconciliation_outcome})"
-    );
-    let executable_nonce = nonce_lane
-        .next_nonce()
-        .context("ready Optimism wallet nonce lane has no executable nonce")?;
-    let source_balance = u128::try_from(source_balance_u256)
-        .context("Optimism ETH balance exceeds the bridge canary representation")?;
-    ensure!(
-        destination_balance_before == U256::ZERO,
-        "World Chain wallet is already funded; refusing to repeat the bootstrap bridge"
-    );
-    let retained = retained_optimism_balance(source_balance)?;
-    let initial_amount = source_balance
-        .checked_sub(retained)
-        .context("Optimism ETH balance cannot cover the retained amount")?;
-    ensure!(initial_amount > 0, "no Optimism ETH is available to bridge");
-
-    let client = AcrossClient::new(config)?;
-    let initial_request = native_eth_request(owner, initial_amount);
-    let initial_quote = client.quote(&initial_request).await?;
-    let initial_terms =
-        validate_native_eth_quote(&initial_request, &initial_quote, source_balance)?;
-    let initial_wallet_call = WalletCall::validated_contract_call(
-        initial_terms.target,
-        U256::from(initial_terms.value),
-        initial_terms.data.clone(),
-    )?;
-    let initial_call = initial_wallet_call.rpc_call(owner);
-    optimism.simulate_transaction(&initial_call).await?;
-    let initial_estimate = optimism.estimate_gas(&initial_call).await?;
-    let initial_gas = native_bridge_gas_plan(&initial_terms, initial_estimate, gas_price)?;
-    let reserved_gas_cost = initial_gas
-        .maximum_cost
-        .checked_mul(2)
-        .context("native ETH gas reserve overflow")?;
-    ensure!(
-        reserved_gas_cost <= MAX_ORIGIN_GAS_COST_WEI,
-        "native ETH gas reserve exceeds the absolute canary cap"
-    );
-
-    let bridge_amount = initial_amount
-        .checked_sub(reserved_gas_cost)
-        .context("Optimism ETH balance cannot retain 20% plus maximum origin gas")?;
-    ensure!(
-        bridge_amount > 0,
-        "native ETH bridge amount is zero after gas reserve"
-    );
-    let request = native_eth_request(owner, bridge_amount);
-    let quote = client.quote(&request).await?;
-    let terms = validate_native_eth_quote(&request, &quote, source_balance)?;
-    let wallet_call = WalletCall::validated_contract_call(
-        terms.target,
-        U256::from(terms.value),
-        terms.data.clone(),
-    )?;
-    let call = wallet_call.rpc_call(owner);
-    optimism.simulate_transaction(&call).await?;
-    let estimate = optimism.estimate_gas(&call).await?;
-    let gas = native_bridge_gas_plan(&terms, estimate, gas_price)?;
-    ensure!(
-        gas.maximum_cost <= reserved_gas_cost,
-        "fresh Across quote requires more gas than the doubled reserve"
-    );
-    let minimum_retained_after_max_gas = source_balance
-        .checked_sub(bridge_amount)
-        .and_then(|value| value.checked_sub(gas.maximum_cost))
-        .context("native ETH bridge exceeds the observed Optimism balance")?;
-    ensure!(
-        minimum_retained_after_max_gas >= retained,
-        "native ETH bridge would leave less than 20% on Optimism"
-    );
-
-    let operation_id = format!("across-native-eth:{OPTIMISM_CHAIN_ID}:{executable_nonce}");
-    let identity = nonce_lane.reserve(
-        &mut journal,
-        operation_id,
-        "across_native_eth_to_world",
-        &wallet_call,
-    )?;
-    let signed = wallet.sign_call(
-        &wallet_call,
-        WalletTransactionParameters {
-            chain_id: OPTIMISM_CHAIN_ID,
-            nonce: identity.nonce,
-            gas_limit: gas.gas_limit,
-            max_fee_per_gas: gas.max_fee_per_gas,
-            max_priority_fee_per_gas: gas.max_priority_fee_per_gas,
-        },
-    )?;
-    nonce_lane.record_signed(&mut journal, &signed)?;
-    tracing::info!(
-        wallet = %owner,
-        origin_chain_id = OPTIMISM_CHAIN_ID,
-        destination_chain_id = WORLD_CHAIN_CHAIN_ID,
-        source_balance = %format_base_units(source_balance_u256, 18),
-        bridge_amount = %format_base_units(U256::from(bridge_amount), 18),
-        retained_at_max_gas = %format_base_units(U256::from(minimum_retained_after_max_gas), 18),
-        minimum_destination_amount = %format_base_units(U256::from(terms.minimum_output_amount), 18),
-        route_fee = %format_base_units(U256::from(quote.fees.total.amount.parse::<u128>()?), 18),
-        gas_limit = gas.gas_limit,
-        max_fee_per_gas = gas.max_fee_per_gas,
-        maximum_origin_gas_cost = %format_base_units(U256::from(gas.maximum_cost), 18),
-        nonce = identity.nonce,
-        transaction_hash = %signed.hash,
-        "validated native ETH Across bridge ready for broadcast"
-    );
-
-    let submitted_hash = match broadcast_signed_transaction(&optimism, &signed).await {
-        Ok(hash) => hash,
-        Err(error) => {
-            let reason = if error.to_string().starts_with("JSON-RPC error") {
-                UnknownOutcomeReason::BroadcastRejected
-            } else {
-                UnknownOutcomeReason::BroadcastTransport
-            };
-            nonce_lane
-                .record_unknown_outcome(&mut journal, reason)
-                .context("failed to journal unknown broadcast outcome")?;
-            return Err(error);
-        }
-    };
-    nonce_lane.record_broadcast(&mut journal, submitted_hash)?;
-    let receipt = match wait_for_origin_receipt(&optimism, signed.hash).await {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            nonce_lane
-                .record_unknown_outcome(&mut journal, UnknownOutcomeReason::ConfirmationTimeout)
-                .context("failed to journal unknown confirmation outcome")?;
-            return Err(error);
-        }
-    };
-    nonce_lane.record_receipt(&mut journal, receipt)?;
-    ensure!(
-        receipt.status == 1,
-        "native ETH Across origin transaction reverted"
-    );
-    let filled = wait_for_across_fill(&client, signed.hash, terms.minimum_output_amount).await?;
-    let destination_balance_after = world.native_balance(owner).await?;
-    let destination_delta = destination_balance_after
-        .checked_sub(destination_balance_before)
-        .context("World Chain ETH balance decreased during Across canary")?;
-    ensure!(
-        destination_delta >= U256::from(terms.minimum_output_amount),
-        "World Chain ETH balance increase is below Across minimum output"
-    );
-    let source_balance_after = optimism.native_balance(owner).await?;
-    ensure!(
-        source_balance_after >= U256::from(retained),
-        "Optimism ETH retained balance fell below 20%"
-    );
-    let receipt_execution_gas_cost = u128::from(receipt.gas_used)
-        .checked_mul(receipt.effective_gas_price)
-        .context("origin gas cost overflow")?;
-    let source_balance_after_u128 = u128::try_from(source_balance_after)
-        .context("post-bridge Optimism balance exceeds u128")?;
-    let actual_origin_gas_cost = source_balance
-        .checked_sub(bridge_amount)
-        .and_then(|value| value.checked_sub(source_balance_after_u128))
-        .context("actual Optimism gas cost cannot be reconciled from balances")?;
-    ensure!(
-        actual_origin_gas_cost <= gas.maximum_cost,
-        "actual Optimism gas cost exceeds the signed maximum"
-    );
-    tracing::info!(
-        origin_transaction_hash = %signed.hash,
-        destination_transaction_hash = %filled.fill_txn_ref.as_deref().unwrap_or_default(),
-        origin_block = receipt.block_number,
-        origin_gas_used = receipt.gas_used,
-        receipt_execution_gas_cost = %format_base_units(U256::from(receipt_execution_gas_cost), 18),
-        actual_origin_gas_cost = %format_base_units(U256::from(actual_origin_gas_cost), 18),
-        optimism_balance_after = %format_base_units(source_balance_after, 18),
-        world_balance_before = %format_base_units(destination_balance_before, 18),
-        world_balance_after = %format_base_units(destination_balance_after, 18),
-        world_balance_delta = %format_base_units(destination_delta, 18),
-        "native ETH Across bridge completed and reconciled"
-    );
-    Ok(())
-}
-
-fn native_eth_request(owner: Address, amount: u128) -> AcrossQuoteRequest {
-    AcrossQuoteRequest {
-        origin_chain_id: OPTIMISM_CHAIN_ID,
-        destination_chain_id: WORLD_CHAIN_CHAIN_ID,
-        input_token: NATIVE_ETH,
-        output_token: NATIVE_ETH,
-        amount,
-        depositor: owner,
-        recipient: owner,
-    }
-}
-
-fn retained_optimism_balance(balance: u128) -> anyhow::Result<u128> {
-    balance
-        .checked_mul(RETAIN_OPTIMISM_BPS)
-        .and_then(|value| value.checked_add(BASIS_POINTS - 1))
-        .map(|value| value / BASIS_POINTS)
-        .context("Optimism retained-balance calculation overflow")
-}
-
-fn native_bridge_gas_plan(
-    terms: &ValidatedNativeEthQuote,
-    rpc_estimate: u64,
-    rpc_gas_price: u128,
-) -> anyhow::Result<NativeBridgeGasPlan> {
-    let estimated = terms.gas.max(rpc_estimate);
-    let gas_limit = estimated
-        .checked_mul(GAS_LIMIT_MARGIN_NUMERATOR)
-        .and_then(|value| value.checked_add(GAS_LIMIT_MARGIN_DENOMINATOR - 1))
-        .map(|value| value / GAS_LIMIT_MARGIN_DENOMINATOR)
-        .context("native ETH gas-limit margin overflow")?;
-    ensure!(
-        gas_limit > 0 && gas_limit <= MAX_NATIVE_BRIDGE_GAS,
-        "native ETH bridge gas limit exceeds the canary cap"
-    );
-    let max_fee_per_gas = terms
-        .max_fee_per_gas
-        .max(rpc_gas_price)
-        .checked_mul(2)
-        .context("native ETH max fee overflow")?;
-    ensure!(
-        max_fee_per_gas <= 100_000_000_000,
-        "native ETH max fee exceeds the canary cap"
-    );
-    let max_priority_fee_per_gas = terms.max_priority_fee_per_gas;
-    ensure!(
-        max_priority_fee_per_gas <= max_fee_per_gas,
-        "native ETH priority fee exceeds max fee"
-    );
-    let maximum_cost = u128::from(gas_limit)
-        .checked_mul(max_fee_per_gas)
-        .context("native ETH maximum gas cost overflow")?;
-    ensure!(
-        maximum_cost <= MAX_ORIGIN_GAS_COST_WEI,
-        "native ETH origin gas cost exceeds the absolute canary cap"
-    );
-    Ok(NativeBridgeGasPlan {
-        gas_limit,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-        maximum_cost,
-    })
-}
-
-async fn wait_for_origin_receipt(
-    rpc: &JsonRpcClient,
-    transaction_hash: alloy_primitives::B256,
-) -> anyhow::Result<TransactionReceipt> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    loop {
-        if let Some(receipt) = rpc.transaction_receipt(transaction_hash).await? {
-            ensure!(
-                receipt.transaction_hash == transaction_hash,
-                "Optimism receipt transaction hash mismatch"
-            );
-            return Ok(receipt);
-        }
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for Optimism Across transaction receipt"
-        );
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn wait_for_across_fill(
-    client: &AcrossClient,
-    transaction_hash: alloy_primitives::B256,
-    minimum_output_amount: u128,
-) -> anyhow::Result<arb_bot::across::AcrossDepositStatus> {
-    let transaction_hash = format!("{transaction_hash:#x}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-    loop {
-        match client.deposit_status(&transaction_hash).await {
-            Ok(status) => {
-                if validate_native_eth_deposit_status(
-                    &status,
-                    &transaction_hash,
-                    minimum_output_amount,
-                )? {
-                    return Ok(status);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, %transaction_hash, "Across fill status is not available yet");
-            }
-        }
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for Across destination fill"
-        );
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -583,95 +183,6 @@ async fn across_usdc_quote(
         swap_target = %quote.swap_tx.to,
         "public unauthenticated Across quote validated"
     );
-    Ok(())
-}
-
-async fn binance_manual_wallet_withdraw(
-    config: &config::AppConfig,
-    coin: &str,
-    network: &str,
-    amount: Decimal,
-    confirm_live: bool,
-) -> anyhow::Result<()> {
-    ensure!(
-        confirm_live,
-        "live Binance withdrawal requires explicit --confirm-live"
-    );
-    let cap = withdrawal_cap(coin, network)?;
-    ensure!(
-        amount > Decimal::ZERO && amount <= cap,
-        "withdrawal amount exceeds the canary cap for this coin/network"
-    );
-    let wallet = EvmWallet::from_env()?;
-    let address = format!("{:#x}", wallet.address());
-    let commission_symbol = match coin {
-        "ETH" => "ETHUSDT",
-        "WLD" | "USDC" => "WLDUSDC",
-        _ => bail!("unsupported withdrawal coin"),
-    };
-    let mut client = BinanceAccountClient::from_env(config)?;
-    let account = client.hydrate(commission_symbol).await?;
-    validate_binance_account(&account)?;
-    ensure!(
-        account.account.can_withdraw,
-        "Binance account does not permit withdrawals"
-    );
-    let coins = client.all_coin_information().await?;
-    let coin_state = coins
-        .iter()
-        .find(|state| state.coin == coin)
-        .with_context(|| format!("Binance capital state is missing {coin}"))?;
-    ensure!(
-        coin_state.withdraw_all_enable,
-        "Binance withdrawals are globally disabled for this coin"
-    );
-    let network_state = coin_state
-        .network_list
-        .iter()
-        .find(|state| state.network == network)
-        .with_context(|| format!("Binance capital state is missing network {network}"))?;
-    validate_withdrawal_amount(network_state, amount)?;
-    let required_balance = amount + network_state.withdraw_fee;
-    ensure!(
-        free_balance(&account, coin) >= required_balance,
-        "free Binance balance does not cover amount plus live withdrawal fee"
-    );
-
-    let withdraw_order_id = format!("rustwd{}", unix_timestamp_ms()?);
-    let submission = client
-        .withdraw(coin, network, &address, amount, &withdraw_order_id)
-        .await?;
-    ensure!(
-        submission.accepted,
-        "Binance rejected the Travel Rule withdrawal: {}",
-        submission.info
-    );
-    tracing::info!(
-        coin,
-        network,
-        amount = %amount,
-        fee = %network_state.withdraw_fee,
-        destination = %address,
-        withdraw_order_id,
-        travel_rule_id = %submission.tr_id,
-        travel_rule_info = %submission.info,
-        "capped Binance Travel Rule wallet withdrawal submitted"
-    );
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let records = client.withdrawal_history(coin, &withdraw_order_id).await?;
-    if let Some(record) = records.first() {
-        validate_withdrawal_record(record, coin, network, &address, &withdraw_order_id)?;
-        log_withdrawal_record(record);
-    } else {
-        tracing::warn!(
-            coin,
-            network,
-            withdraw_order_id,
-            travel_rule_id = %submission.tr_id,
-            "withdrawal accepted but not visible in history yet"
-        );
-    }
     Ok(())
 }
 
@@ -785,56 +296,6 @@ fn log_travel_rule_withdrawal_record(record: &TravelRuleWithdrawalRecord) {
     );
 }
 
-fn withdrawal_cap(coin: &str, network: &str) -> anyhow::Result<Decimal> {
-    match (coin, network) {
-        ("ETH", "OPTIMISM") => Ok(Decimal::new(2, 2)),
-        ("WLD", "WLD" | "OPTIMISM") => Ok(Decimal::from(50_u64)),
-        ("USDC", "OPTIMISM") => Ok(Decimal::from(100_u64)),
-        _ => bail!("coin/network is outside the manual withdrawal allowlist"),
-    }
-}
-
-fn validate_withdrawal_amount(network: &NetworkInformation, amount: Decimal) -> anyhow::Result<()> {
-    ensure!(
-        network.withdrawal_available(),
-        "Binance network withdrawal is disabled or busy"
-    );
-    ensure!(
-        amount >= network.withdraw_min && amount <= network.withdraw_max,
-        "withdrawal amount is outside Binance live network limits"
-    );
-    if network.withdraw_integer_multiple > Decimal::ZERO {
-        ensure!(
-            amount % network.withdraw_integer_multiple == Decimal::ZERO,
-            "withdrawal amount does not match Binance integer multiple"
-        );
-    }
-    Ok(())
-}
-
-fn validate_withdrawal_record(
-    record: &WithdrawalRecord,
-    coin: &str,
-    network: &str,
-    address: &str,
-    withdraw_order_id: &str,
-) -> anyhow::Result<()> {
-    ensure!(record.coin == coin, "withdrawal history coin mismatch");
-    ensure!(
-        record.network == network,
-        "withdrawal history network mismatch"
-    );
-    ensure!(
-        record.address.eq_ignore_ascii_case(address),
-        "withdrawal history destination mismatch"
-    );
-    ensure!(
-        record.withdraw_order_id == withdraw_order_id,
-        "withdrawal history client id mismatch"
-    );
-    Ok(())
-}
-
 fn log_withdrawal_record(record: &WithdrawalRecord) {
     tracing::info!(
         binance_withdrawal_id = %record.id,
@@ -849,372 +310,6 @@ fn log_withdrawal_record(record: &WithdrawalRecord) {
         info = %record.info,
         "Binance withdrawal status hydrated"
     );
-}
-
-async fn execute_direct_wld_rebalance_canary(
-    config: &config::AppConfig,
-    evaluations: &[RebalanceEvaluation],
-    client: &mut BinanceAccountClient,
-    wallet_rpc: &JsonRpcClient,
-    wallet_owner: Address,
-    wld_contract: Address,
-    wallet_balance_before: U256,
-) -> anyhow::Result<()> {
-    ensure!(
-        config.rebalance_execution_mode == "direct_wld_canary",
-        "direct WLD canary called while execution mode is disabled"
-    );
-    let amount = config.rebalance_canary_wld_amount;
-    let amount_base_units = decimal_to_base_units_exact(amount, 18)?;
-    let mut journal = RebalanceCanaryJournal::open(&config.rebalance_journal_path)?;
-    let mut created_here = false;
-
-    if journal.operation().is_none() {
-        let action = evaluations
-            .iter()
-            .find(|evaluation| evaluation.token_symbol == "WLD")
-            .and_then(|evaluation| evaluation.plan.action.as_ref())
-            .context("direct WLD canary requires an active WLD rebalance plan")?;
-        ensure!(
-            action.direction == Direction::BinanceToWallet,
-            "direct WLD canary only permits Binance-to-wallet direction"
-        );
-        let Route::Direct {
-            binance_network,
-            chain_id,
-        } = &action.route
-        else {
-            anyhow::bail!("direct WLD canary refuses an Across route");
-        };
-        ensure!(
-            binance_network == "WLD" && *chain_id == WORLD_CHAIN_CHAIN_ID,
-            "direct WLD canary route identity mismatch"
-        );
-        ensure!(
-            action.amount >= amount_base_units,
-            "planned WLD rebalance is smaller than the configured canary"
-        );
-
-        let coins = client.all_coin_information().await?;
-        let capital = select_capital_routes(&coins, "WLD", "WLD", "OPTIMISM")?;
-        let network = capital
-            .direct
-            .as_ref()
-            .context("Binance direct WLD network disappeared")?;
-        ensure!(
-            capital.direct_withdrawal_available(),
-            "Binance direct WLD withdrawal is unavailable"
-        );
-        validate_withdrawal_amount(network, amount)?;
-        let account = client.account_information().await?;
-        ensure!(
-            free_balance_from_information(&account, "WLD") >= amount,
-            "Binance WLD balance does not cover the canary"
-        );
-        let intent = RebalanceCanaryIntent {
-            operation_id: DIRECT_WLD_CANARY_OPERATION_ID.to_owned(),
-            coin: "WLD".to_owned(),
-            network: "WLD".to_owned(),
-            amount_base_units,
-            destination: wallet_owner,
-            withdraw_order_id: DIRECT_WLD_CANARY_WITHDRAW_ID.to_owned(),
-            wallet_balance_before,
-        };
-        journal.record_intent(&intent)?;
-        created_here = true;
-        tracing::warn!(
-            operation_id = DIRECT_WLD_CANARY_OPERATION_ID,
-            coin = "WLD",
-            network = "WLD",
-            amount = %amount,
-            amount_base_units = %amount_base_units,
-            destination = %wallet_owner,
-            withdraw_order_id = DIRECT_WLD_CANARY_WITHDRAW_ID,
-            "production direct WLD rebalance canary intent durably reserved"
-        );
-    }
-
-    loop {
-        let operation = journal
-            .operation()
-            .cloned()
-            .context("rebalance canary journal lost its operation")?;
-        ensure!(
-            operation.intent.operation_id == DIRECT_WLD_CANARY_OPERATION_ID
-                && operation.intent.coin == "WLD"
-                && operation.intent.network == "WLD"
-                && operation.intent.destination == wallet_owner
-                && operation.intent.amount_base_units == amount_base_units
-                && operation.intent.withdraw_order_id == DIRECT_WLD_CANARY_WITHDRAW_ID,
-            "existing rebalance canary journal does not match configured identity"
-        );
-
-        match operation.status {
-            RebalanceCanaryStatus::Completed {
-                transaction_id,
-                wallet_balance_after,
-            } => {
-                tracing::info!(
-                    operation_id = DIRECT_WLD_CANARY_OPERATION_ID,
-                    transaction_id,
-                    wallet_balance_before = %operation.intent.wallet_balance_before,
-                    wallet_balance_after = %wallet_balance_after,
-                    "production direct WLD rebalance canary already completed; repeat blocked"
-                );
-                return Ok(());
-            }
-            RebalanceCanaryStatus::Failed { status } => {
-                anyhow::bail!("direct WLD rebalance canary previously failed with status {status}");
-            }
-            RebalanceCanaryStatus::IntentRecorded => {
-                let records = client
-                    .withdrawal_history("WLD", DIRECT_WLD_CANARY_WITHDRAW_ID)
-                    .await?;
-                if let Some(record) = records.first() {
-                    validate_direct_wld_canary_record(record, wallet_owner, amount)?;
-                    journal.record_withdrawal(&record.id, &record.tx_id, record.status)?;
-                    continue;
-                }
-                ensure!(
-                    created_here,
-                    "rebalance intent exists but Binance has no matching withdrawal; outcome requires operator review"
-                );
-                let submission = client
-                    .withdraw(
-                        "WLD",
-                        "WLD",
-                        &format!("{wallet_owner:#x}"),
-                        amount,
-                        DIRECT_WLD_CANARY_WITHDRAW_ID,
-                    )
-                    .await?;
-                ensure!(
-                    submission.accepted,
-                    "Binance rejected direct WLD canary: {}",
-                    submission.info
-                );
-                journal.record_submitted(submission.tr_id)?;
-                tracing::warn!(
-                    operation_id = DIRECT_WLD_CANARY_OPERATION_ID,
-                    withdraw_order_id = DIRECT_WLD_CANARY_WITHDRAW_ID,
-                    travel_rule_id = submission.tr_id,
-                    info = %submission.info,
-                    "production direct WLD rebalance canary submitted"
-                );
-            }
-            RebalanceCanaryStatus::Submitted { .. }
-            | RebalanceCanaryStatus::WithdrawalObserved { .. } => {
-                let deadline = tokio::time::Instant::now() + REBALANCE_CANARY_TIMEOUT;
-                let record = loop {
-                    let records = client
-                        .withdrawal_history("WLD", DIRECT_WLD_CANARY_WITHDRAW_ID)
-                        .await?;
-                    if let Some(record) = records.into_iter().next() {
-                        validate_direct_wld_canary_record(&record, wallet_owner, amount)?;
-                        if matches!(record.status, 1 | 3 | 5) {
-                            journal.record_withdrawal(&record.id, &record.tx_id, record.status)?;
-                            journal.record_failed(record.status)?;
-                            anyhow::bail!(
-                                "direct WLD rebalance canary failed with Binance status {}",
-                                record.status
-                            );
-                        }
-                        if record.status == 6 && !record.tx_id.is_empty() {
-                            journal.record_withdrawal(&record.id, &record.tx_id, record.status)?;
-                            break record;
-                        }
-                        tracing::info!(
-                            operation_id = DIRECT_WLD_CANARY_OPERATION_ID,
-                            status = record.status,
-                            withdrawal_id = %record.id,
-                            "waiting for direct WLD withdrawal completion"
-                        );
-                    }
-                    ensure!(
-                        tokio::time::Instant::now() < deadline,
-                        "timed out waiting for direct WLD Binance withdrawal"
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                };
-
-                let received = expected_withdrawal_receipt_amount(&record, amount)?;
-                let received_base_units = decimal_to_base_units_exact(received, 18)?;
-                let expected_wallet_balance = operation
-                    .intent
-                    .wallet_balance_before
-                    .checked_add(received_base_units)
-                    .context("expected WLD wallet balance overflow")?;
-                let deadline = tokio::time::Instant::now() + REBALANCE_CANARY_TIMEOUT;
-                let wallet_balance_after = loop {
-                    let balance = wallet_rpc.erc20_balance(wld_contract, wallet_owner).await?;
-                    if balance >= expected_wallet_balance {
-                        break balance;
-                    }
-                    tracing::info!(
-                        operation_id = DIRECT_WLD_CANARY_OPERATION_ID,
-                        transaction_id = %record.tx_id,
-                        observed_wallet_balance = %balance,
-                        expected_wallet_balance = %expected_wallet_balance,
-                        "waiting for direct WLD wallet credit"
-                    );
-                    ensure!(
-                        tokio::time::Instant::now() < deadline,
-                        "timed out waiting for direct WLD wallet credit"
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                };
-                journal.record_completed(&record.tx_id, wallet_balance_after)?;
-                tracing::warn!(
-                    operation_id = DIRECT_WLD_CANARY_OPERATION_ID,
-                    withdrawal_id = %record.id,
-                    transaction_id = %record.tx_id,
-                    amount_requested = %amount,
-                    amount_received = %received,
-                    wallet_balance_before = %operation.intent.wallet_balance_before,
-                    wallet_balance_after = %wallet_balance_after,
-                    "production direct WLD rebalance canary completed and reconciled"
-                );
-            }
-        }
-    }
-}
-
-fn validate_direct_wld_canary_record(
-    record: &WithdrawalRecord,
-    wallet_owner: Address,
-    requested: Decimal,
-) -> anyhow::Result<()> {
-    validate_withdrawal_record(
-        record,
-        "WLD",
-        "WLD",
-        &format!("{wallet_owner:#x}"),
-        DIRECT_WLD_CANARY_WITHDRAW_ID,
-    )?;
-    ensure!(
-        record.amount > Decimal::ZERO,
-        "withdrawal history amount is not positive"
-    );
-    ensure!(
-        record.amount == requested || record.amount + record.transaction_fee == requested,
-        "withdrawal history amount and fee do not reconcile to the canary request"
-    );
-    Ok(())
-}
-
-fn expected_withdrawal_receipt_amount(
-    record: &WithdrawalRecord,
-    requested: Decimal,
-) -> anyhow::Result<Decimal> {
-    let received = if record.amount + record.transaction_fee == requested {
-        record.amount
-    } else {
-        record
-            .amount
-            .checked_sub(record.transaction_fee)
-            .context("withdrawal fee exceeds the history amount")?
-    };
-    ensure!(
-        received > Decimal::ZERO,
-        "expected wallet receipt is not positive"
-    );
-    Ok(received)
-}
-
-fn decimal_to_base_units_exact(value: Decimal, decimals: u32) -> anyhow::Result<U256> {
-    ensure!(
-        value >= Decimal::ZERO,
-        "decimal base-unit value is negative"
-    );
-    let mantissa = value.mantissa();
-    ensure!(mantissa >= 0, "decimal base-unit mantissa is negative");
-    let numerator = U256::from(mantissa as u128)
-        .checked_mul(U256::from(10).pow(U256::from(decimals)))
-        .context("decimal base-unit numerator overflow")?;
-    let denominator = U256::from(10).pow(U256::from(value.scale()));
-    ensure!(
-        numerator % denominator == U256::ZERO,
-        "decimal has more precision than token base units"
-    );
-    Ok(numerator / denominator)
-}
-
-fn free_balance_from_information(
-    account: &arb_bot::binance::account::AccountInformation,
-    asset: &str,
-) -> Decimal {
-    account
-        .balances
-        .iter()
-        .find(|balance| balance.asset == asset)
-        .map_or(Decimal::ZERO, |balance| balance.free)
-}
-
-async fn binance_manual_eth_buy(
-    config: &config::AppConfig,
-    quote_amount: Decimal,
-    confirm_live: bool,
-) -> anyhow::Result<()> {
-    ensure!(
-        confirm_live,
-        "live Binance ETH purchase requires explicit --confirm-live"
-    );
-    ensure!(
-        quote_amount > Decimal::ZERO && quote_amount <= Decimal::from(200_u64),
-        "ETH gas purchase must be greater than zero and no more than 200 USDT"
-    );
-    let mut account_client = BinanceAccountClient::from_env(config)?;
-    let before = account_client.hydrate("ETHUSDT").await?;
-    validate_binance_account(&before)?;
-    let usdt_before = free_balance(&before, "USDT");
-    let eth_before = free_balance(&before, "ETH");
-    ensure!(
-        usdt_before >= quote_amount,
-        "insufficient free USDT for capped ETH gas purchase"
-    );
-
-    let client_order_id = format!("rustgas{}B", unix_timestamp_ms()?);
-    let mut ws = BinanceWsApiClient::connect(config).await?;
-    ws.test_market_buy("ETHUSDT", quote_amount, &client_order_id)
-        .await
-        .context("Binance ETHUSDT MARKET buy order.test failed")?;
-    let buy = match ws
-        .place_market_buy("ETHUSDT", quote_amount, &client_order_id)
-        .await
-    {
-        Ok(order) => order,
-        Err(error) => reconcile_unknown_order(config, "ETHUSDT", &client_order_id, error)
-            .await
-            .context("Binance ETHUSDT MARKET buy failed and could not be reconciled")?,
-    };
-    validate_filled_order(&buy, "ETHUSDT", "BUY", &client_order_id)?;
-    ensure!(
-        buy.cummulative_quote_qty <= Decimal::from(200_u64),
-        "Binance ETH purchase exceeded the absolute 200 USDT validation cap"
-    );
-    let reconciled = ws
-        .query_order("ETHUSDT", &client_order_id)
-        .await
-        .context("failed to reconcile filled Binance ETH purchase")?;
-    validate_filled_order(&reconciled, "ETHUSDT", "BUY", &client_order_id)?;
-
-    let after = account_client.hydrate("ETHUSDT").await?;
-    validate_binance_account(&after)?;
-    let usdt_after = free_balance(&after, "USDT");
-    let eth_after = free_balance(&after, "ETH");
-    tracing::info!(
-        order_id = buy.order_id,
-        client_order_id = %buy.client_order_id,
-        executed_eth = %buy.executed_qty,
-        executed_usdt = %buy.cummulative_quote_qty,
-        usdt_before = %usdt_before,
-        usdt_after = %usdt_after,
-        eth_before = %eth_before,
-        eth_after = %eth_after,
-        eth_delta = %(eth_after - eth_before),
-        "capped live ETH gas purchase completed and reconciled"
-    );
-    Ok(())
 }
 
 async fn wallet_hydrate(domain_config: &LoadedDomainConfig) -> anyhow::Result<()> {
@@ -1367,205 +462,6 @@ async fn binance_recent_validation_orders(
     Ok(())
 }
 
-async fn binance_manual_round_trip(
-    config: &config::AppConfig,
-    domain_config: &LoadedDomainConfig,
-    quote_amount: Decimal,
-    confirm_live: bool,
-) -> anyhow::Result<()> {
-    ensure!(
-        confirm_live,
-        "live Binance validation requires explicit --confirm-live"
-    );
-    ensure!(
-        quote_amount > Decimal::ZERO && quote_amount <= Decimal::from(100_u64),
-        "quote amount must be greater than zero and no more than 100 USDC"
-    );
-    let pairs = &domain_config.snapshot().pairs;
-    ensure!(
-        pairs.len() == 1,
-        "live Binance validation requires exactly one configured pair"
-    );
-    let pair = &pairs[0];
-    ensure!(
-        pair.binance.symbol == "WLDUSDC"
-            && pair.binance.base_asset == "WLD"
-            && pair.binance.quote_asset == "USDC",
-        "live Binance validation is hard-limited to WLDUSDC"
-    );
-    let step_size = Decimal::from_str(&pair.binance.step_size)
-        .context("validated Binance step size is invalid")?;
-
-    let mut account_client = BinanceAccountClient::from_env(config)?;
-    let before = account_client.hydrate(&pair.binance.symbol).await?;
-    validate_binance_account(&before)?;
-    let usdc_before = free_balance(&before, "USDC");
-    let wld_before = free_balance(&before, "WLD");
-    ensure!(
-        usdc_before >= quote_amount,
-        "insufficient free USDC for capped live validation"
-    );
-
-    let sequence = unix_timestamp_ms()?;
-    let buy_client_id = format!("rustval{sequence}B");
-    let sell_client_id = format!("rustval{sequence}S");
-    let mut ws = BinanceWsApiClient::connect(config).await?;
-    ws.test_market_buy(&pair.binance.symbol, quote_amount, &buy_client_id)
-        .await
-        .context("Binance MARKET buy order.test failed")?;
-    let buy = match ws
-        .place_market_buy(&pair.binance.symbol, quote_amount, &buy_client_id)
-        .await
-    {
-        Ok(order) => order,
-        Err(error) => reconcile_unknown_order(config, &pair.binance.symbol, &buy_client_id, error)
-            .await
-            .context("Binance MARKET buy failed and could not be reconciled")?,
-    };
-    validate_filled_order(&buy, &pair.binance.symbol, "BUY", &buy_client_id)?;
-    ensure!(
-        buy.cummulative_quote_qty <= Decimal::from(100_u64),
-        "Binance buy exceeded the absolute 100 USDC validation cap"
-    );
-
-    let acquired_wld = buy.executed_qty - buy.commission_in("WLD");
-    let sell_quantity = (acquired_wld / step_size).floor() * step_size;
-    ensure!(
-        sell_quantity > Decimal::ZERO,
-        "buy produced no sellable WLD"
-    );
-    ensure!(
-        sell_quantity <= acquired_wld,
-        "rounded sell quantity exceeds acquired WLD"
-    );
-
-    ws.test_market_sell(&pair.binance.symbol, sell_quantity, &sell_client_id)
-        .await
-        .context("Binance MARKET sell order.test failed")?;
-    let sell = match ws
-        .place_market_sell(&pair.binance.symbol, sell_quantity, &sell_client_id)
-        .await
-    {
-        Ok(order) => order,
-        Err(error) => reconcile_unknown_order(config, &pair.binance.symbol, &sell_client_id, error)
-            .await
-            .context("Binance MARKET sell failed and could not be reconciled")?,
-    };
-    validate_filled_order(&sell, &pair.binance.symbol, "SELL", &sell_client_id)?;
-
-    let reconciled_buy = ws
-        .query_order(&pair.binance.symbol, &buy_client_id)
-        .await
-        .context("failed to reconcile filled Binance buy")?;
-    let reconciled_sell = ws
-        .query_order(&pair.binance.symbol, &sell_client_id)
-        .await
-        .context("failed to reconcile filled Binance sell")?;
-    validate_filled_order(&reconciled_buy, &pair.binance.symbol, "BUY", &buy_client_id)?;
-    validate_filled_order(
-        &reconciled_sell,
-        &pair.binance.symbol,
-        "SELL",
-        &sell_client_id,
-    )?;
-
-    let after = account_client.hydrate(&pair.binance.symbol).await?;
-    validate_binance_account(&after)?;
-    let usdc_after = free_balance(&after, "USDC");
-    let wld_after = free_balance(&after, "WLD");
-    tracing::info!(
-        symbol = %pair.binance.symbol,
-        quote_cap = %quote_amount,
-        buy_order_id = buy.order_id,
-        buy_client_order_id = %buy.client_order_id,
-        buy_executed_base = %buy.executed_qty,
-        buy_executed_quote = %buy.cummulative_quote_qty,
-        sell_order_id = sell.order_id,
-        sell_client_order_id = %sell.client_order_id,
-        sell_executed_base = %sell.executed_qty,
-        sell_executed_quote = %sell.cummulative_quote_qty,
-        usdc_before = %usdc_before,
-        usdc_after = %usdc_after,
-        usdc_delta = %(usdc_after - usdc_before),
-        wld_before = %wld_before,
-        wld_after = %wld_after,
-        wld_delta = %(wld_after - wld_before),
-        binance_ws_clock_offset_ms = ws.clock_offset_ms(),
-        "capped live Binance MARKET round trip completed and reconciled"
-    );
-    Ok(())
-}
-
-async fn reconcile_unknown_order(
-    config: &config::AppConfig,
-    symbol: &str,
-    client_order_id: &str,
-    placement_error: WsApiError,
-) -> anyhow::Result<OrderResult> {
-    if matches!(placement_error, WsApiError::Rejected { .. }) {
-        bail!(placement_error);
-    }
-    let mut reconciliation = BinanceWsApiClient::connect(config)
-        .await
-        .context("failed to reconnect for order reconciliation")?;
-    let order = reconciliation
-        .query_order(symbol, client_order_id)
-        .await
-        .with_context(|| format!("placement outcome was unknown: {placement_error}"))?;
-    tracing::warn!(
-        order_id = order.order_id,
-        status = %order.status,
-        client_order_id,
-        "Binance placement transport outcome was unknown; order recovered by client id"
-    );
-    Ok(order)
-}
-
-fn validate_filled_order(
-    order: &OrderResult,
-    symbol: &str,
-    side: &str,
-    client_order_id: &str,
-) -> anyhow::Result<()> {
-    ensure!(
-        order.symbol == symbol,
-        "Binance returned an unexpected symbol"
-    );
-    ensure!(order.side == side, "Binance returned an unexpected side");
-    ensure!(
-        order.client_order_id == client_order_id,
-        "Binance returned an unexpected client order id"
-    );
-    ensure!(
-        order.order_type == "MARKET",
-        "Binance returned an unexpected order type"
-    );
-    ensure!(
-        order.status == "FILLED",
-        "Binance order was not fully filled"
-    );
-    ensure!(
-        order.executed_qty > Decimal::ZERO,
-        "Binance order executed no base quantity"
-    );
-    Ok(())
-}
-
-fn free_balance(state: &BinanceAccountState, asset: &str) -> Decimal {
-    state
-        .balance(asset)
-        .map_or(Decimal::ZERO, |balance| balance.free)
-}
-
-fn unix_timestamp_ms() -> anyhow::Result<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_millis()
-        .try_into()
-        .context("timestamp overflow")
-}
-
 fn load_dotenv() -> anyhow::Result<()> {
     if let Some(path) = std::env::var_os("ENV_FILE") {
         dotenvy::from_path(&path)
@@ -1644,12 +540,6 @@ async fn run(
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
     let binance_account = binance_account_client.hydrate(&binance_symbols[0]).await?;
     validate_binance_account(&binance_account)?;
-    if config.rebalance_execution_mode == "direct_wld_canary" {
-        ensure!(
-            binance_account.account.can_withdraw,
-            "Binance account does not permit the configured rebalance canary"
-        );
-    }
     let mut binance_feed = BookTickerFeed::new(&config, binance_symbols[0].clone());
 
     let pair = domain_config
@@ -1658,7 +548,7 @@ async fn run(
         .iter()
         .find(|pair| pair.market_data_enabled)
         .context("balance synchronization requires one enabled pair")?;
-    let mut rebalance_tracker = if pair.rebalance.enabled {
+    let rebalance_tracker = if pair.rebalance.enabled {
         let coins = binance_account_client.all_coin_information().await?;
         let mut routes = BTreeMap::new();
         for token in [&pair.token_a, &pair.token_b] {
@@ -1668,16 +558,10 @@ async fn run(
                 &pair.chain.binance_network_name,
                 "OPTIMISM",
             )?;
-            let mut candidates =
-                route_candidates_from_capital(&capital, token.decimals, pair.chain.chain_id)?;
-            if token.symbol == "WLD" && config.rebalance_wld_route_mode == "across_only" {
-                candidates.retain(|candidate| matches!(candidate.route, Route::Across { .. }));
-                ensure!(
-                    candidates.len() == 1,
-                    "REBALANCE_WLD_ROUTE_MODE=across_only requires exactly one live WLD Across candidate"
-                );
-            }
-            routes.insert(token.symbol.clone(), candidates);
+            routes.insert(
+                token.symbol.clone(),
+                route_candidates_from_capital(&capital, token.decimals, pair.chain.chain_id)?,
+            );
         }
         RebalanceTracker::new(pair, routes)?
     } else {
@@ -1742,10 +626,6 @@ async fn run(
             std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
                 format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
             })?;
-        ensure!(
-            config.rebalance_binance_credential_mode == "separate_treasury",
-            "full rebalance requires a separate Binance master treasury key"
-        );
         let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
             .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
         let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
@@ -1789,53 +669,6 @@ async fn run(
     } else {
         None
     };
-    if config.rebalance_execution_mode == "direct_wld_canary" {
-        let evaluations = rebalance_tracker
-            .evaluate(&initial_binance_balances, &initial_wallet_balances)
-            .context("failed to produce initial production rebalance plan")?;
-        let wld_contract = pair
-            .token_a
-            .symbol
-            .eq("WLD")
-            .then_some(pair.token_a.contract.as_str())
-            .or_else(|| {
-                pair.token_b
-                    .symbol
-                    .eq("WLD")
-                    .then_some(pair.token_b.contract.as_str())
-            })
-            .context("production pair is missing WLD")?
-            .parse::<Address>()
-            .context("configured WLD contract is invalid")?;
-        let wallet_wld_before = initial_wallet_balances
-            .token_balances
-            .iter()
-            .find(|balance| balance.symbol.as_ref() == "WLD")
-            .context("initial wallet snapshot is missing WLD")?
-            .base_units;
-        execute_direct_wld_rebalance_canary(
-            &config,
-            &evaluations,
-            &mut binance_account_client,
-            &wallet_rpc,
-            wallet_owner,
-            wld_contract,
-            wallet_wld_before,
-        )
-        .await?;
-
-        let refreshed_account = binance_account_client.account_information().await?;
-        initial_binance_balances = binance_snapshot(&refreshed_account, &binance_assets, 1);
-        let refreshed_head = wallet_rpc.latest_block().await?;
-        initial_wallet_balances = fetch_wallet_snapshot(
-            &wallet_rpc,
-            wallet_owner,
-            wallet_chain_id,
-            &wallet_tokens,
-            refreshed_head,
-        )
-        .await?;
-    }
     let BalanceSync {
         receiver: mut balance_receiver,
         wallet_heads,
@@ -1915,7 +748,6 @@ async fn run(
         wallet_sync_trigger = "alchemy_new_heads",
         clickhouse_enabled = config.clickhouse_enabled(),
         rebalance_execution_mode = %config.rebalance_execution_mode,
-        rebalance_wld_route_mode = %config.rebalance_wld_route_mode,
         "arbitrage shadow service started with authenticated Binance account state"
     );
     let runtime_ready_file = mark_runtime_ready()?;
@@ -2270,83 +1102,4 @@ fn init_tracing() {
         .json()
         .with_current_span(false)
         .init();
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy_primitives::Address;
-    use rust_decimal::Decimal;
-
-    use super::{
-        decimal_to_base_units_exact, expected_withdrawal_receipt_amount, native_bridge_gas_plan,
-        retained_optimism_balance,
-    };
-    use arb_bot::{across::ValidatedNativeEthQuote, binance::capital::WithdrawalRecord};
-
-    fn terms() -> ValidatedNativeEthQuote {
-        ValidatedNativeEthQuote {
-            target: Address::repeat_byte(0x11),
-            data: vec![0x60, 0x9e, 0xa0, 0x81],
-            value: 7_987_000_000_000_000,
-            gas: 84_674,
-            max_fee_per_gas: 1_000_536,
-            max_priority_fee_per_gas: 1_000_000,
-            minimum_output_amount: 7_982_000_000_000_000,
-        }
-    }
-
-    #[test]
-    fn retains_at_least_twenty_percent_with_rounding_up() {
-        assert_eq!(
-            retained_optimism_balance(9_985_000_000_000_000).unwrap(),
-            1_997_000_000_000_000
-        );
-        assert_eq!(retained_optimism_balance(1).unwrap(), 1);
-    }
-
-    #[test]
-    fn gas_plan_uses_larger_estimate_and_double_fee_headroom() {
-        let plan = native_bridge_gas_plan(&terms(), 90_000, 1_000_400).unwrap();
-        assert_eq!(plan.gas_limit, 108_000);
-        assert_eq!(plan.max_fee_per_gas, 2_001_072);
-        assert_eq!(plan.max_priority_fee_per_gas, 1_000_000);
-        assert_eq!(plan.maximum_cost, 216_115_776_000);
-    }
-
-    #[test]
-    fn gas_plan_rejects_excessive_estimate_or_fee() {
-        assert!(native_bridge_gas_plan(&terms(), 500_000, 1_000_000).is_err());
-        assert!(native_bridge_gas_plan(&terms(), 90_000, 100_000_000_000).is_err());
-    }
-
-    #[test]
-    fn direct_wld_canary_converts_exact_units_and_reconciles_fee_shapes() {
-        assert_eq!(
-            decimal_to_base_units_exact(Decimal::ONE, 18)
-                .unwrap()
-                .to_string(),
-            "1000000000000000000"
-        );
-        let mut record = WithdrawalRecord {
-            id: "uuid".to_owned(),
-            amount: Decimal::new(94, 2),
-            transaction_fee: Decimal::new(6, 2),
-            coin: "WLD".to_owned(),
-            status: 6,
-            address: format!("{:#x}", Address::repeat_byte(0x11)),
-            tx_id: "0xabc".to_owned(),
-            network: "WLD".to_owned(),
-            withdraw_order_id: "rustrebwldcanary1".to_owned(),
-            info: String::new(),
-        };
-        assert_eq!(
-            expected_withdrawal_receipt_amount(&record, Decimal::ONE).unwrap(),
-            Decimal::new(94, 2)
-        );
-        record.amount = Decimal::ONE;
-        assert_eq!(
-            expected_withdrawal_receipt_amount(&record, Decimal::ONE).unwrap(),
-            Decimal::new(94, 2)
-        );
-    }
 }

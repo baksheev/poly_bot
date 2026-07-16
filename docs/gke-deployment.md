@@ -1,7 +1,7 @@
 # GKE production deployment
 
-Status: GKE network prepared; the old GCE VM is stopped and retained as a
-rollback target; the first GKE application revision is not deployed yet
+Status: production is running on GKE; the old GCE VM is stopped and retained
+as a rollback target.
 
 ## Topology
 
@@ -33,11 +33,10 @@ new revision remains active and a later workflow retry removes orphaned
 
 The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable rebalance
 journal and provides a second single-writer boundary on C4. Recreate rollout
-plus the journal file lock prevent two processes from owning the same canary
-operation. The implemented
-full executor also places its high-level and nonce journals on this disk, but
-the current manifest selects `full_live`, mounts the wallet signer, and
-explicitly chooses separate Binance subaccount and master treasury credentials.
+plus the journal file lock prevent two processes from owning the same rebalance
+operation. The full executor places its high-level and nonce journals on this
+disk. The current manifest selects `full_live`, mounts the wallet signer, and
+uses separate Binance subaccount and master treasury credentials.
 
 ## Networking and secrets
 
@@ -128,21 +127,24 @@ Every operator-visible release must update `CHANGELOG.md`. GitHub Actions also
 records the source SHA, digest, cluster, and zone in the workflow summary;
 Kubernetes retains five Deployment revisions.
 
-## First cutover
+## Release verification
 
 1. Confirm that `34.21.220.162` remains in the Binance API-key allowlist.
 2. Confirm that the trading key belongs exclusively to the isolated Rust
    subaccount. Confirm that the separate master key has only Reading,
    Withdrawals, Universal Transfer, and the same IP restriction.
-3. Verify the signer address, fund only the reviewed test inventory, and choose
-   positive WLD and USDC per-operation caps.
+3. Verify the signer address, current inventory, and positive WLD and USDC
+   per-operation caps.
 4. Configure the six GitHub production environment variables and reviewer.
 5. Run `scripts/sync-gcp-secrets`, then
    `ENV_FILE=.env.production scripts/create-gke-runtime` to update CSI and
    Secret Manager IAM.
-6. Run the workflow and verify startup, Binance freshness, DEX heads, balances,
-   ClickHouse telemetry, and decision latency using the GKE engine identity.
-7. Observe at least one reconnect and one controlled rollout.
+6. Run the workflow and verify startup recovery, Binance freshness, DEX heads,
+   balances, ClickHouse telemetry, and decision latency using the new GKE
+   engine identity.
+7. Confirm that the startup log reports `rebalance_execution_mode=full_live`,
+   the journal has no unexpected active operation, and only the new release
+   node pool remains after workflow cleanup.
 8. Keep the stopped VM, its digest, and configuration as the rollback target
    until the GKE observation window is complete.
 
