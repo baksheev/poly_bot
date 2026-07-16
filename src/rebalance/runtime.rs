@@ -621,8 +621,25 @@ impl RebalanceExecutor {
                 received_base_units,
                 ..
             } => *received_base_units,
-            RebalanceExecutionProgress::IntentRecorded
-            | RebalanceExecutionProgress::ApprovalMined { .. } => operation.intent.amount,
+            RebalanceExecutionProgress::ApprovalMined {
+                chain_id,
+                input_amount,
+                ..
+            } => {
+                ensure!(
+                    *chain_id == origin_chain_id,
+                    "journaled Across approval uses the wrong origin chain"
+                );
+                if !input_amount.is_zero() {
+                    *input_amount
+                } else if operation.intent.direction == Direction::BinanceToWallet {
+                    let record = self.wait_withdrawal(&operation).await?;
+                    withdrawal_received_base_units(&record, operation.intent.token_decimals)?
+                } else {
+                    operation.intent.amount
+                }
+            }
+            RebalanceExecutionProgress::IntentRecorded => operation.intent.amount,
             RebalanceExecutionProgress::BridgePrepared { .. } => unreachable!(),
             RebalanceExecutionProgress::BridgeMined { .. }
             | RebalanceExecutionProgress::AcrossFilled { .. } => return Ok(operation),
@@ -673,6 +690,7 @@ impl RebalanceExecutor {
                     RebalanceExecutionProgress::ApprovalMined {
                         chain_id: origin_chain_id,
                         transaction_hash: hash,
+                        input_amount: amount,
                     },
                 )?;
             }

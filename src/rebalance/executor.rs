@@ -95,6 +95,12 @@ pub enum RebalanceExecutionProgress {
         chain_id: u64,
         #[serde(with = "b256_serde")]
         transaction_hash: B256,
+        /// Exact amount approved for the subsequent bridge call. Zero is
+        /// accepted only when reading journals written before this field was
+        /// introduced; the runtime rehydrates the amount before preparing a
+        /// bridge in that case.
+        #[serde(default, with = "u256_serde")]
+        input_amount: U256,
     },
     BridgePrepared {
         origin_chain_id: u64,
@@ -727,7 +733,18 @@ fn validate_progress_evidence(
                 "rebalance bridge receipt amount is invalid"
             );
         }
-        P::ApprovalMined { chain_id, .. } | P::DepositTransferMined { chain_id, .. } => {
+        P::ApprovalMined {
+            chain_id,
+            input_amount,
+            ..
+        } => {
+            ensure!(*chain_id > 0, "rebalance transaction chain id is zero");
+            ensure!(
+                *input_amount <= intent.amount,
+                "rebalance approval input exceeds the operation amount"
+            );
+        }
+        P::DepositTransferMined { chain_id, .. } => {
             ensure!(*chain_id > 0, "rebalance transaction chain id is zero")
         }
         P::BridgeMined {
@@ -963,6 +980,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_approval_recovers_with_an_unset_input_amount() {
+        let progress: RebalanceExecutionProgress = serde_json::from_value(serde_json::json!({
+            "state": "approval_mined",
+            "chain_id": 10,
+            "transaction_hash": format!("{:#x}", B256::repeat_byte(0x31)),
+        }))
+        .unwrap();
+        assert!(matches!(
+            progress,
+            RebalanceExecutionProgress::ApprovalMined {
+                input_amount,
+                ..
+            } if input_amount.is_zero()
+        ));
+    }
+
+    #[test]
     fn persists_and_recovers_full_wallet_to_binance_lifecycle() {
         let path = path("lifecycle");
         let operation_id;
@@ -982,6 +1016,7 @@ mod tests {
                     RebalanceExecutionProgress::ApprovalMined {
                         chain_id: 480,
                         transaction_hash: B256::repeat_byte(0x31),
+                        input_amount: U256::from(2_000_000_u64),
                     },
                 )
                 .unwrap();

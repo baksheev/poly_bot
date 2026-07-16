@@ -52,6 +52,45 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: repair-reviewed-across-net-amount
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              journal=/state/rebalance-executor.jsonl
+              wallet_journal=/state/evm-wallet.jsonl
+              backup=/state/rebalance-executor.gross-across-prepared.jsonl
+              if [ ! -e "${backup}" ]; then
+                test "$(wc -l < "${journal}")" -eq 7
+                tail -n 2 "${journal}" | head -n 1 \
+                  | grep -F '"state":"approval_mined","chain_id":10,"transaction_hash":"0xa3e2cfecbd61740d174c9d1273047a942e9e4a058ee9e4b3099ff911845bbcea"'
+                tail -n 1 "${journal}" \
+                  | grep -F '"state":"bridge_prepared","origin_chain_id":10,"input_amount":"500000000"'
+                tail -n 1 "${journal}" \
+                  | grep -F '"calldata_hash":"0xf99f9a25a88c540e89cebf17e3a0a5695619587d89e71fd9d5e824b60af5ee9d"'
+                ! grep -F '"operation_id":"rebalance-0-af1fc09f42a0b3eb:bridge"' "${wallet_journal}"
+                cp -p "${journal}" "${backup}"
+                sed -i '$d' "${journal}"
+                test "$(wc -l < "${journal}")" -eq 6
+              fi
+              chmod 600 "${journal}" "${wallet_journal}" "${backup}"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: runtime-state
+              mountPath: /state
       containers:
         - name: arb-bot
           image: __IMAGE__
