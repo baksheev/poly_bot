@@ -48,6 +48,9 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
+          REBALANCE_MAX_WLD_AMOUNT: ${{ vars.REBALANCE_MAX_WLD_AMOUNT }}
+          REBALANCE_MAX_USDC_AMOUNT: ${{ vars.REBALANCE_MAX_USDC_AMOUNT }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
@@ -55,6 +58,11 @@ jobs:
           test -n "${GCP_PROJECT_ID}"
           test -n "${GCP_WORKLOAD_IDENTITY_PROVIDER}"
           test -n "${GCP_DEPLOY_SERVICE_ACCOUNT}"
+          [[ "${EVM_WALLET_ADDRESS}" =~ ^0x[0-9a-fA-F]{40}$ ]]
+          for limit in "${REBALANCE_MAX_WLD_AMOUNT}" "${REBALANCE_MAX_USDC_AMOUNT}"; do
+            [[ "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+            test -n "${limit//[0.]/}"
+          done
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -112,6 +120,10 @@ jobs:
         env:
           IMAGE: ${{ steps.image.outputs.image }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
+          REBALANCE_MAX_WLD_AMOUNT: ${{ vars.REBALANCE_MAX_WLD_AMOUNT }}
+          REBALANCE_MAX_USDC_AMOUNT: ${{ vars.REBALANCE_MAX_USDC_AMOUNT }}
         run: |
           set -Eeuo pipefail
           release_id="${SOURCE_SHA:0:12}"
@@ -175,9 +187,18 @@ jobs:
           fi
 
           sed \
+            -e "s|__GCP_PROJECT_ID__|${GCP_PROJECT_ID}|g" \
+            -e "s|__EVM_WALLET_ADDRESS__|${EVM_WALLET_ADDRESS}|g" \
+            -e "s|__GCP_DEPLOY_SERVICE_ACCOUNT__|${GCP_DEPLOY_SERVICE_ACCOUNT}|g" \
+            infra/gcp/gke/release-platform.yaml \
+            | kubectl apply -f -
+
+          sed \
             -e "s|__IMAGE__|${IMAGE}|g" \
             -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
             -e "s|__NODE_POOL__|${new_pool}|g" \
+            -e "s|__REBALANCE_MAX_WLD_AMOUNT__|${REBALANCE_MAX_WLD_AMOUNT}|g" \
+            -e "s|__REBALANCE_MAX_USDC_AMOUNT__|${REBALANCE_MAX_USDC_AMOUNT}|g" \
             infra/gcp/gke/deployment.yaml \
             | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
           rollout_applied=true

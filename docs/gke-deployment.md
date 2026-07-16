@@ -33,7 +33,10 @@ new revision remains active and a later workflow retry removes orphaned
 
 The zonal ReadWriteOnce disk stores the durable rebalance journal and provides
 a second single-writer boundary. Recreate rollout plus the journal file lock
-prevent two processes from owning the same canary operation.
+prevent two processes from owning the same canary operation. The implemented
+full executor also places its high-level and nonce journals on this disk, but
+the current manifest selects `full_live`, mounts the wallet signer, and
+explicitly chooses shared Binance credentials for the isolated subaccount.
 
 ## Networking and secrets
 
@@ -41,11 +44,12 @@ prevent two processes from owning the same canary operation.
 - The control plane exposes only its IAM-authenticated DNS endpoint.
 - Pod egress passes through `arb-bot-gke-nat` and the reserved
   `arb-bot-gce-egress` address (`34.21.220.162`).
-- The GKE Secret Manager add-on mounts six runtime secrets directly as
+- The GKE Secret Manager add-on mounts eight runtime secrets directly as
   in-memory files. GitHub Actions and Kubernetes Secret objects never contain
   their values.
 - The runtime Kubernetes service account receives accessor permission only for
-  those six secrets.
+  those eight secrets. GKE uses explicit `shared_trading` mode, so the verified
+  isolated-subaccount Binance pair is mounted once and reused by the executor.
 - The namespace denies all inbound connections to the runtime Pod.
 
 Cloud NAT deliberately reuses the static IP that was previously attached to
@@ -87,6 +91,12 @@ It prints the NAT IP and these GitHub `production` environment variables:
 - `GCP_PROJECT_ID`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_DEPLOY_SERVICE_ACCOUNT`
+- `EVM_WALLET_ADDRESS` (public address only)
+
+The operator must additionally set positive, reviewed capital caps:
+
+- `REBALANCE_MAX_WLD_AMOUNT`
+- `REBALANCE_MAX_USDC_AMOUNT`
 
 Configure a required reviewer on the GitHub `production` environment. The
 workflow is triggered only after `CI` succeeds on `main`, and can also be
@@ -101,8 +111,9 @@ started manually from `main`.
 3. builds and pushes a SHA-tagged image;
 4. resolves the immutable Artifact Registry digest;
 5. creates a fixed one-node pool named `arb-<source-sha-prefix>`;
-6. targets the new Deployment revision exclusively at that pool;
-7. waits up to 20 minutes for readiness;
+6. applies the versioned platform resources and targets the new Deployment
+   revision exclusively at that pool;
+7. waits up to 30 minutes for readiness;
 8. deletes every previous release/bootstrap pool only after success;
 9. restores the previous Deployment and deletes the new pool on failure.
 
@@ -117,11 +128,18 @@ Kubernetes retains five Deployment revisions.
 ## First cutover
 
 1. Confirm that `34.21.220.162` remains in the Binance API-key allowlist.
-2. Configure the three GitHub production environment variables and reviewer.
-3. Run the workflow and verify startup, Binance freshness, DEX heads, balances,
+2. Confirm that the key belongs exclusively to the isolated Rust subaccount
+   and that shared read/trade/withdraw authority is intentional.
+3. Verify the signer address, fund only the reviewed test inventory, and choose
+   positive WLD and USDC per-operation caps.
+4. Configure the six GitHub production environment variables and reviewer.
+5. Run `scripts/sync-gcp-secrets`, then
+   `ENV_FILE=.env.production scripts/create-gke-runtime` to update CSI and
+   Secret Manager IAM.
+6. Run the workflow and verify startup, Binance freshness, DEX heads, balances,
    ClickHouse telemetry, and decision latency using the GKE engine identity.
-4. Observe at least one reconnect and one controlled rollout.
-5. Keep the stopped VM, its digest, and configuration as the rollback target
+7. Observe at least one reconnect and one controlled rollout.
+8. Keep the stopped VM, its digest, and configuration as the rollback target
    until the GKE observation window is complete.
 
 Do not start the old VM while its static IP is assigned to Cloud NAT. A rollback

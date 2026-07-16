@@ -214,13 +214,25 @@ GKE_RELEASE_ID=bootstrap \
   --quiet
 
 runtime_principal="principal://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${GCP_PROJECT_ID}.svc.id.goog/subject/ns/arb-bot/sa/arb-bot-runtime"
-for secret in \
-  CLICKHOUSE_URL \
-  CLICKHOUSE_PASSWORD \
-  ALCHEMY_WORLDCHAIN_RPC_URL \
-  ALCHEMY_WORLDCHAIN_WS_URL \
-  BINANCE_API_KEY \
-  BINANCE_SECRET_KEY; do
+runtime_secrets=(
+  CLICKHOUSE_URL
+  CLICKHOUSE_PASSWORD
+  ALCHEMY_WORLDCHAIN_RPC_URL
+  ALCHEMY_WORLDCHAIN_WS_URL
+  ALCHEMY_OPTIMISM_RPC_URL
+  BINANCE_API_KEY
+  BINANCE_SECRET_KEY
+  EVM_WALLET_PRIVATE_KEY
+)
+for secret in "${runtime_secrets[@]}"; do
+  if ! "${gcloud_local}" secrets versions describe latest \
+    --secret="${secret}" \
+    --format='value(state)' 2>/dev/null | grep -qx ENABLED; then
+    echo "required enabled Secret Manager version is missing: ${secret}" >&2
+    exit 1
+  fi
+done
+for secret in "${runtime_secrets[@]}"; do
   "${gcloud_local}" secrets add-iam-policy-binding "${secret}" \
     --member="${runtime_principal}" \
     --role=roles/secretmanager.secretAccessor \
@@ -302,6 +314,12 @@ sed \
   "${repo_root}/infra/gcp/gke/platform.yaml" \
   | kubectl apply -f -
 
+sed \
+  -e "s|__GCP_PROJECT_ID__|${GCP_PROJECT_ID}|g" \
+  -e "s|__EVM_WALLET_ADDRESS__|${EVM_WALLET_ADDRESS}|g" \
+  "${repo_root}/infra/gcp/gke/release-platform.yaml" \
+  | kubectl apply -f -
+
 provider_name="$("${gcloud_local}" iam workload-identity-pools providers describe \
   "${workload_provider}" \
   --workload-identity-pool="${workload_pool}" \
@@ -316,5 +334,6 @@ echo "Binance allowlist egress IP: ${egress_ip}"
 echo "GitHub production environment variables:"
 echo "  GCP_PROJECT_ID=${GCP_PROJECT_ID}"
 echo "  GCP_WORKLOAD_IDENTITY_PROVIDER=${provider_name}"
+echo "  EVM_WALLET_ADDRESS=${EVM_WALLET_ADDRESS}"
 echo "  GCP_DEPLOY_SERVICE_ACCOUNT=${deploy_service_account}"
 echo "Confirm the retained egress IP is still in the Binance API-key allowlist before deployment."

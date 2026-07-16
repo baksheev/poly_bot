@@ -15,6 +15,7 @@ const RECV_WINDOW_MS: u64 = 5_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Clone)]
 pub struct BinanceCredentials {
     api_key: String,
     secret_key: String,
@@ -22,12 +23,17 @@ pub struct BinanceCredentials {
 
 impl BinanceCredentials {
     pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = std::env::var("BINANCE_API_KEY")
-            .context("required environment variable BINANCE_API_KEY is not set")?;
-        let secret_key = std::env::var("BINANCE_SECRET_KEY")
-            .context("required environment variable BINANCE_SECRET_KEY is not set")?;
-        ensure!(!api_key.trim().is_empty(), "BINANCE_API_KEY is empty");
-        ensure!(!secret_key.trim().is_empty(), "BINANCE_SECRET_KEY is empty");
+        Self::from_env_names("BINANCE_API_KEY", "BINANCE_SECRET_KEY")
+    }
+
+    fn from_env_names(api_key_name: &str, secret_key_name: &str) -> anyhow::Result<Self> {
+        let api_key = std::env::var(api_key_name)
+            .with_context(|| format!("required environment variable {api_key_name} is not set"))?;
+        let secret_key = std::env::var(secret_key_name).with_context(|| {
+            format!("required environment variable {secret_key_name} is not set")
+        })?;
+        ensure!(!api_key.trim().is_empty(), "{api_key_name} is empty");
+        ensure!(!secret_key.trim().is_empty(), "{secret_key_name} is empty");
         Ok(Self {
             api_key,
             secret_key,
@@ -68,11 +74,32 @@ pub struct BinanceAccountClient {
     clock_offset_ms: i64,
 }
 
+impl Clone for BinanceAccountClient {
+    fn clone(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            credentials: self.credentials.clone(),
+            clock_offset_ms: self.clock_offset_ms,
+        }
+    }
+}
+
 impl BinanceAccountClient {
     pub fn from_env(config: &AppConfig) -> anyhow::Result<Self> {
         Self::new(
             &config.binance_rest_base_url,
             BinanceCredentials::from_env()?,
+        )
+    }
+
+    pub fn from_treasury_env(config: &AppConfig) -> anyhow::Result<Self> {
+        Self::new(
+            &config.binance_rest_base_url,
+            BinanceCredentials::from_env_names(
+                "BINANCE_TREASURY_API_KEY",
+                "BINANCE_TREASURY_SECRET_KEY",
+            )?,
         )
     }
 
@@ -190,6 +217,34 @@ impl BinanceAccountClient {
         let response = self
             .http
             .post(format!(
+                "{}{}?{}&signature={}",
+                self.base_url, path, query, signature
+            ))
+            .header(API_KEY_HEADER, &self.credentials.api_key)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Binance {operation} request failed: {}",
+                    error.without_url()
+                )
+            })?;
+        decode_response(response, operation).await
+    }
+
+    pub(super) async fn signed_put<T>(
+        &self,
+        path: &str,
+        query: &str,
+        operation: &str,
+    ) -> anyhow::Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let signature = sign_hex(&self.credentials.secret_key, query)?;
+        let response = self
+            .http
+            .put(format!(
                 "{}{}?{}&signature={}",
                 self.base_url, path, query, signature
             ))

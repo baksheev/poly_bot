@@ -33,7 +33,8 @@ use arb_bot::{
     opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult, format_base_units},
     rebalance::{
         Direction, RebalanceCanaryIntent, RebalanceCanaryJournal, RebalanceCanaryStatus,
-        RebalanceEvaluation, RebalanceTracker, Route, route_candidates_from_capital,
+        RebalanceEvaluation, RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits,
+        RebalanceTracker, Route, route_candidates_from_capital,
     },
     telemetry::TelemetryWriter,
     wallet::{
@@ -1643,7 +1644,7 @@ async fn run(
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
     let binance_account = binance_account_client.hydrate(&binance_symbols[0]).await?;
     validate_binance_account(&binance_account)?;
-    if config.rebalance_execution_mode != "disabled" {
+    if config.rebalance_execution_mode == "direct_wld_canary" {
         ensure!(
             binance_account.account.can_withdraw,
             "Binance account does not permit the configured rebalance canary"
@@ -1722,6 +1723,76 @@ async fn run(
         initial_wallet_head,
     )
     .await?;
+    let mut full_rebalance_executor = if config.rebalance_execution_mode == "full_live" {
+        let wallet = EvmWallet::from_env()?;
+        ensure!(
+            wallet.address() == wallet_owner,
+            "full rebalance signer does not match EVM_WALLET_ADDRESS"
+        );
+        let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
+            format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
+        })?;
+        let transaction_journal_path =
+            std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
+                format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
+            })?;
+        let mut treasury_client = if config.rebalance_binance_credential_mode == "shared_trading" {
+            tracing::warn!(
+                "full rebalance executor is sharing the Binance trading credential by operator choice"
+            );
+            binance_account_client.clone()
+        } else {
+            BinanceAccountClient::from_treasury_env(&config)?
+        };
+        treasury_client.synchronize_clock().await?;
+        let treasury_account = treasury_client.account_information().await?;
+        for asset in &binance_assets {
+            let observed = initial_binance_balances
+                .balances
+                .get(asset)
+                .with_context(|| format!("initial Binance snapshot is missing {asset}"))?;
+            ensure!(
+                free_balance_from_information(&treasury_account, asset) == observed.free,
+                "Binance treasury key does not resolve to the hydrated trading subaccount"
+            );
+        }
+        let mut executor = RebalanceExecutor::hydrate(
+            treasury_client,
+            AcrossClient::new(&config)?,
+            wallet_rpc.clone(),
+            JsonRpcClient::new(optimism_endpoint)?,
+            wallet,
+            config.rebalance_executor_journal_path.clone(),
+            transaction_journal_path.into(),
+            RebalanceRuntimeLimits {
+                maximum_wld: config.rebalance_max_wld_amount,
+                maximum_usdc: config.rebalance_max_usdc_amount,
+                operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
+            },
+        )
+        .await?;
+        if let Some(recovered) = executor.recover_active().await? {
+            tracing::warn!(
+                operation_id = %recovered.intent.operation_id,
+                progress = ?recovered.progress,
+                "recovered active rebalance operation before runtime start"
+            );
+            let refreshed_account = binance_account_client.account_information().await?;
+            initial_binance_balances = binance_snapshot(&refreshed_account, &binance_assets, 1);
+            let refreshed_head = wallet_rpc.latest_block().await?;
+            initial_wallet_balances = fetch_wallet_snapshot(
+                &wallet_rpc,
+                wallet_owner,
+                wallet_chain_id,
+                &wallet_tokens,
+                refreshed_head,
+            )
+            .await?;
+        }
+        Some(executor)
+    } else {
+        None
+    };
     if config.rebalance_execution_mode == "direct_wld_canary" {
         let evaluations = rebalance_tracker
             .evaluate(&initial_binance_balances, &initial_wallet_balances)
@@ -1794,8 +1865,32 @@ async fn run(
         rebalance_tracker,
     )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
+    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) =
+        if let Some(mut executor) = full_rebalance_executor.take() {
+            let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
+            let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(async move {
+                while let Some(request) = request_receiver.recv().await {
+                    let result = executor
+                        .execute(request)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    if result_sender.send(result).await.is_err() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            (Some(request_sender), result_receiver, Some(task))
+        } else {
+            let (_request_sender, _request_receiver) =
+                tokio::sync::mpsc::channel::<RebalanceExecutionRequest>(1);
+            let (_result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
+            (None, result_receiver, None)
+        };
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances));
     engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances));
+    dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
     engine.start();
     let (prepared_sender, mut prepared_receiver, prepared_thread) =
         spawn_prepared_pool_builder(64)?;
@@ -1846,6 +1941,17 @@ async fn run(
                     bail!("balance synchronization channel stopped unexpectedly");
                 };
                 engine.on_balance_event(event);
+                dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+            }
+            result = rebalance_receiver.recv(), if rebalance_sender.is_some() => {
+                let Some(result) = result else {
+                    bail!("rebalance executor result channel stopped unexpectedly");
+                };
+                match result {
+                    Ok(operation) => engine.on_rebalance_execution_result(Ok(&operation.intent.operation_id)),
+                    Err(error) => engine.on_rebalance_execution_result(Err(&error)),
+                }
+                dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
             }
             event = dex_receiver.recv() => {
                 let Some(event) = event else {
@@ -1888,6 +1994,11 @@ async fn run(
     }
 
     engine.shutdown();
+    drop(rebalance_sender);
+    if let Some(task) = rebalance_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     binance_balance_task.abort();
     wallet_balance_task.abort();
     let _ = binance_balance_task.await;
@@ -1912,6 +2023,43 @@ async fn run(
         rebalance_execution_mode = %config.rebalance_execution_mode,
         "arbitrage shadow service stopped"
     );
+    Ok(())
+}
+
+fn dispatch_rebalance_execution(
+    engine: &mut TradingEngine,
+    sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutionRequest>>,
+    pair: &arb_bot::domain::config::PairConfig,
+    wallet_owner: Address,
+) -> anyhow::Result<()> {
+    let Some(evaluation) = engine.take_rebalance_execution() else {
+        return Ok(());
+    };
+    let sender = sender.context("rebalance engine produced live work without an executor")?;
+    let action = evaluation
+        .plan
+        .action
+        .clone()
+        .context("rebalance execution evaluation has no action")?;
+    let token = [&pair.token_a, &pair.token_b]
+        .into_iter()
+        .find(|token| token.symbol == evaluation.token_symbol)
+        .context("rebalance execution token is absent from the domain pair")?;
+    let token_contract = token
+        .contract
+        .parse::<Address>()
+        .context("rebalance execution token contract is invalid")?;
+    sender
+        .try_send(RebalanceExecutionRequest {
+            token_symbol: evaluation.token_symbol,
+            token_decimals: evaluation.token_decimals,
+            token_contract,
+            wallet_owner,
+            action,
+            binance_balance_before: evaluation.plan.projected.binance,
+            wallet_balance_before: evaluation.plan.projected.wallet,
+        })
+        .context("rebalance executor queue is full or closed")?;
     Ok(())
 }
 

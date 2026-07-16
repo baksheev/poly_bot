@@ -21,83 +21,6 @@ metadata:
   namespace: arb-bot
 automountServiceAccountToken: true
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: arb-bot-runtime
-  namespace: arb-bot
-data:
-  SERVICE_NAME: arb-bot-rust-shadow
-  GCP_PROJECT_ID: __GCP_PROJECT_ID__
-  GCP_REGION: asia-southeast1
-  BINANCE_WS_BASE_URL: wss://stream.binance.com:9443/ws
-  BINANCE_REST_BASE_URL: https://api.binance.com
-  BINANCE_WS_API_URL: wss://ws-api.binance.com:443/ws-api/v3
-  EVM_WALLET_ADDRESS: __EVM_WALLET_ADDRESS__
-  DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v3.json
-  MARKET_DATA_MAX_AGE_MS: "5000"
-  DEX_EVENT_CHANNEL_CAPACITY: "8192"
-  DEX_HEAD_MAX_AGE_MS: "10000"
-  BALANCE_SYNC_INTERVAL_MS: "1000"
-  BALANCE_MAX_AGE_MS: "5000"
-  BALANCE_EVENT_CHANNEL_CAPACITY: "16"
-  REBALANCE_EXECUTION_MODE: disabled
-  REBALANCE_CANARY_WLD_AMOUNT: "1"
-  REBALANCE_JOURNAL_PATH: /var/lib/arb-bot/rebalance-canary.jsonl
-  CLICKHOUSE_DATABASE: arb_bot_prod
-  CLICKHOUSE_USER: default
-  TELEMETRY_CHANNEL_CAPACITY: "8192"
-  TELEMETRY_BATCH_SIZE: "200"
-  TELEMETRY_FLUSH_INTERVAL_MS: "100"
-  RUNTIME_READY_FILE: /tmp/arb-bot-ready
-  RUST_LOG: arb_bot=info
----
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: arb-bot-runtime
-  namespace: arb-bot
-spec:
-  provider: gke
-  parameters:
-    secrets: |
-      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/CLICKHOUSE_URL/versions/latest"
-        path: "CLICKHOUSE_URL"
-      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/CLICKHOUSE_PASSWORD/versions/latest"
-        path: "CLICKHOUSE_PASSWORD"
-      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/ALCHEMY_WORLDCHAIN_RPC_URL/versions/latest"
-        path: "ALCHEMY_WORLDCHAIN_RPC_URL"
-      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/ALCHEMY_WORLDCHAIN_WS_URL/versions/latest"
-        path: "ALCHEMY_WORLDCHAIN_WS_URL"
-      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/BINANCE_API_KEY/versions/latest"
-        path: "BINANCE_API_KEY"
-      - resourceName: "projects/__GCP_PROJECT_ID__/secrets/BINANCE_SECRET_KEY/versions/latest"
-        path: "BINANCE_SECRET_KEY"
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: arb-bot
-  namespace: arb-bot
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: arb-bot
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: arb-bot-deny-ingress
-  namespace: arb-bot
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: arb-bot
-  policyTypes:
-    - Ingress
-  ingress: []
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -113,6 +36,21 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "events"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "patch", "update"]
+  - apiGroups: ["secrets-store.csi.x-k8s.io"]
+    resources: ["secretproviderclasses"]
+    verbs: ["create", "get", "patch", "update"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "get", "patch", "update"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

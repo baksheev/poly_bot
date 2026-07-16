@@ -8,11 +8,27 @@ the exact artifact used by each rollout.
 
 ### Added
 
+- An off-by-default full rebalance executor implements direct and
+  Optimism/Across routes in both directions for WLD and USDC. A checksummed,
+  fsynced state-machine journal pins every operation, deterministic Binance
+  withdrawal ID, exact Across calldata, confirmation, and final balance
+  reconciliation; a bounded worker keeps the network-heavy flow outside the
+  market-data loop.
+- `full_live` requires an explicit separate-treasury or shared-trading Binance
+  credential mode, an exact operator acknowledgement, positive WLD and USDC
+  caps, a wallet signer, dual-chain RPC hydration, and durable high-level plus
+  nonce journals.
+- The GKE template mounts the eight secrets needed by operator-selected
+  shared-key mode, persists both executor journals, and obtains positive
+  WLD/USDC limits from a reviewer-protected GitHub production environment.
+  Deployment validation rejects absent or zero limits before authentication or
+  rollout.
+
 - Reusable EVM wallet primitives for canonical-block balance and allowance
   hydration, latest/pending nonce observation, native and ERC-20 transfer or
   approval calls, checked EIP-1559 signing, and hash-verified broadcast. The
-  explicitly gated Across native-ETH canary now uses the shared wallet API;
-  autonomous live execution remains disabled.
+  explicitly gated Across native-ETH canary and full rebalance executor use the
+  shared wallet API; general execution remains off by default.
 - A single-owner EVM nonce lane and checksummed, fsynced JSONL transaction
   journal preserve intent, signed hash, broadcast, unknown outcome, and mined
   state across restart. Rails wallet regressions for duplicate nonces,

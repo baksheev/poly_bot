@@ -10,7 +10,7 @@ use crate::{
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{OpportunityEngine, PreparedPoolBuildRequest, PreparedPoolBuildResult},
-    rebalance::RebalanceTracker,
+    rebalance::{RebalanceEvaluation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
@@ -24,6 +24,10 @@ pub struct TradingEngine {
     rebalance: RebalanceTracker,
     telemetry: TelemetryHandle,
     hot_telemetry: HotTelemetryHandle,
+    pending_rebalance: Option<RebalanceEvaluation>,
+    rebalance_inflight: bool,
+    rebalance_blocked: bool,
+    rebalance_reconcile_after: Option<(Instant, Instant)>,
 }
 
 impl TradingEngine {
@@ -51,6 +55,10 @@ impl TradingEngine {
                 rebalance,
                 telemetry,
                 hot_telemetry,
+                pending_rebalance: None,
+                rebalance_inflight: false,
+                rebalance_blocked: false,
+                rebalance_reconcile_after: None,
             },
             hot_telemetry_task,
         ))
@@ -288,6 +296,45 @@ impl TradingEngine {
         self.refresh_phase(Instant::now());
     }
 
+    pub fn take_rebalance_execution(&mut self) -> Option<RebalanceEvaluation> {
+        self.pending_rebalance.take()
+    }
+
+    pub fn on_rebalance_execution_result(&mut self, result: Result<&str, &str>) {
+        self.rebalance_inflight = false;
+        match result {
+            Ok(operation_id) => {
+                if let (Some(binance), Some(wallet)) = (
+                    self.state.balances.binance.as_ref(),
+                    self.state.balances.wallet.as_ref(),
+                ) {
+                    self.rebalance_reconcile_after =
+                        Some((binance.observed_at, wallet.observed_at));
+                }
+                self.telemetry.emit(
+                    "rebalance_execution_completed",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "operation_id": operation_id,
+                    }),
+                );
+            }
+            Err(error) => {
+                self.rebalance_blocked = true;
+                self.rebalance.mark_unready();
+                tracing::error!(error, "rebalance executor failed closed");
+                self.telemetry.emit(
+                    "rebalance_execution_failed",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "error": error,
+                    }),
+                );
+            }
+        }
+        self.refresh_phase(Instant::now());
+    }
+
     fn evaluate_rebalance(&mut self) {
         let Some(binance) = self.state.balances.binance.as_ref() else {
             return;
@@ -295,6 +342,12 @@ impl TradingEngine {
         let Some(wallet) = self.state.balances.wallet.as_ref() else {
             return;
         };
+        if let Some((binance_after, wallet_after)) = self.rebalance_reconcile_after
+            && binance.observed_at > binance_after
+            && wallet.observed_at > wallet_after
+        {
+            self.rebalance_reconcile_after = None;
+        }
         match self.rebalance.evaluate(binance, wallet) {
             Ok(evaluations) => {
                 let mode = self.config.rebalance_execution_mode.as_str();
@@ -319,6 +372,16 @@ impl TradingEngine {
                             "action_route": action.map(|action| format!("{:?}", action.route)),
                         }),
                     );
+                }
+                if mode == "full_live"
+                    && !self.rebalance_inflight
+                    && !self.rebalance_blocked
+                    && self.rebalance_reconcile_after.is_none()
+                    && self.pending_rebalance.is_none()
+                    && let Some(evaluation) = self.rebalance.pending_action()
+                {
+                    self.rebalance_inflight = true;
+                    self.pending_rebalance = Some(evaluation);
                 }
             }
             Err(error) => {
@@ -400,7 +463,10 @@ impl TradingEngine {
         let current = self.state.refresh_phase(
             now,
             self.config.market_data_max_age_ms,
-            dex_ready && balances_ready && self.rebalance.ready(),
+            dex_ready
+                && balances_ready
+                && self.rebalance.ready()
+                && self.rebalance_reconcile_after.is_none(),
         );
         if previous != current {
             tracing::info!(?previous, ?current, "runtime phase changed");

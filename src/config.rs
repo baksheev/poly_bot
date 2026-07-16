@@ -180,6 +180,36 @@ pub struct AppConfig {
     )]
     pub rebalance_journal_path: PathBuf,
 
+    #[arg(
+        long,
+        env = "REBALANCE_EXECUTOR_JOURNAL_PATH",
+        default_value = "/var/lib/arb-bot/rebalance-executor.jsonl"
+    )]
+    pub rebalance_executor_journal_path: PathBuf,
+
+    #[arg(
+        long,
+        env = "REBALANCE_EXECUTOR_TIMEOUT_SECONDS",
+        default_value_t = 1_800
+    )]
+    pub rebalance_executor_timeout_seconds: u64,
+
+    #[arg(long, env = "REBALANCE_MAX_WLD_AMOUNT", default_value = "0")]
+    pub rebalance_max_wld_amount: rust_decimal::Decimal,
+
+    #[arg(long, env = "REBALANCE_MAX_USDC_AMOUNT", default_value = "0")]
+    pub rebalance_max_usdc_amount: rust_decimal::Decimal,
+
+    #[arg(long, env = "REBALANCE_LIVE_CONFIRMATION", default_value = "")]
+    pub rebalance_live_confirmation: String,
+
+    #[arg(
+        long,
+        env = "REBALANCE_BINANCE_CREDENTIAL_MODE",
+        default_value = "separate_treasury"
+    )]
+    pub rebalance_binance_credential_mode: String,
+
     #[arg(long, env = "EVM_WALLET_ADDRESS", default_value = "")]
     pub evm_wallet_address: String,
 
@@ -239,9 +269,9 @@ impl AppConfig {
         ensure!(
             matches!(
                 self.rebalance_execution_mode.as_str(),
-                "disabled" | "direct_wld_canary"
+                "disabled" | "direct_wld_canary" | "full_live"
             ),
-            "REBALANCE_EXECUTION_MODE must be disabled or direct_wld_canary"
+            "REBALANCE_EXECUTION_MODE must be disabled, direct_wld_canary, or full_live"
         );
         ensure!(
             self.rebalance_canary_wld_amount > rust_decimal::Decimal::ZERO
@@ -252,6 +282,37 @@ impl AppConfig {
             !self.rebalance_journal_path.as_os_str().is_empty(),
             "REBALANCE_JOURNAL_PATH is empty"
         );
+        ensure!(
+            !self.rebalance_executor_journal_path.as_os_str().is_empty(),
+            "REBALANCE_EXECUTOR_JOURNAL_PATH is empty"
+        );
+        ensure!(
+            (60..=86_400).contains(&self.rebalance_executor_timeout_seconds),
+            "REBALANCE_EXECUTOR_TIMEOUT_SECONDS must be between 60 and 86400"
+        );
+        ensure!(
+            self.rebalance_max_wld_amount >= rust_decimal::Decimal::ZERO
+                && self.rebalance_max_usdc_amount >= rust_decimal::Decimal::ZERO,
+            "rebalance live amount limits must not be negative"
+        );
+        ensure!(
+            matches!(
+                self.rebalance_binance_credential_mode.as_str(),
+                "separate_treasury" | "shared_trading"
+            ),
+            "REBALANCE_BINANCE_CREDENTIAL_MODE must be separate_treasury or shared_trading"
+        );
+        if self.rebalance_execution_mode == "full_live" {
+            ensure!(
+                self.rebalance_live_confirmation == "ENABLE_FULL_REBALANCE",
+                "full_live rebalance requires REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE"
+            );
+            ensure!(
+                self.rebalance_max_wld_amount > rust_decimal::Decimal::ZERO
+                    && self.rebalance_max_usdc_amount > rust_decimal::Decimal::ZERO,
+                "full_live rebalance requires positive WLD and USDC amount limits"
+            );
+        }
         if !self.evm_wallet_address.trim().is_empty() {
             self.evm_wallet_address
                 .parse::<alloy_primitives::Address>()
@@ -411,6 +472,12 @@ mod tests {
             rebalance_execution_mode: "disabled".into(),
             rebalance_canary_wld_amount: rust_decimal::Decimal::ONE,
             rebalance_journal_path: "/tmp/rebalance-canary.jsonl".into(),
+            rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),
+            rebalance_executor_timeout_seconds: 1_800,
+            rebalance_max_wld_amount: rust_decimal::Decimal::ZERO,
+            rebalance_max_usdc_amount: rust_decimal::Decimal::ZERO,
+            rebalance_live_confirmation: String::new(),
+            rebalance_binance_credential_mode: "separate_treasury".into(),
             evm_wallet_address: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "arb_bot".into(),
@@ -425,6 +492,21 @@ mod tests {
     #[test]
     fn default_shape_is_valid() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn full_rebalance_requires_confirmation_and_positive_limits() {
+        let mut value = config();
+        value.rebalance_execution_mode = "full_live".into();
+        assert!(value.validate().is_err());
+
+        value.rebalance_live_confirmation = "ENABLE_FULL_REBALANCE".into();
+        value.rebalance_max_wld_amount = rust_decimal::Decimal::ONE;
+        value.rebalance_max_usdc_amount = rust_decimal::Decimal::from(100);
+        value.validate().unwrap();
+
+        value.rebalance_binance_credential_mode = "shared_trading".into();
+        value.validate().unwrap();
     }
 
     #[test]

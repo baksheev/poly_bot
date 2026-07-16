@@ -1,6 +1,6 @@
 # Autonomous rebalance design
 
-Status: continuous planner integrated; one-shot production direct-WLD canary enabled in GKE
+Status: full executor and GKE template implemented; shared-key mode selected for the isolated subaccount; first live rollout pending
 Last reviewed: 2026-07-16
 
 ## Ownership and safety boundary
@@ -16,6 +16,13 @@ Use two Binance credentials:
 2. A treasury key with only the permissions required for deposit/withdrawal
    reconciliation and withdrawals, the same IP restriction, and withdrawal
    address whitelisting where available.
+
+This is the preferred least-privilege topology, not a functional requirement.
+For the isolated Rust subaccount, the operator selected explicit
+`shared_trading` mode. It reuses one process-scoped client and one credential
+pair for reads, trading, and treasury operations. This increases credential
+blast radius and must never be enabled implicitly or used to share ownership
+with the Rails bot.
 
 The credentials used for initial parity testing are not production-isolated.
 Rotate them before live trading and replace them with keys belonging to the
@@ -51,10 +58,11 @@ The `rebalance` modules operate only on integer base units. The planner:
   currently available.
 
 The steady-state balance owner evaluates the planner whenever either balance
-snapshot changes. It emits `rebalance_plan_evaluated` telemetry in `paper` mode.
-When an action is required or planning fails, the normal readiness gate closes,
-so new trading cannot start while inventory is unsafe. No transfer, approval,
-bridge, withdrawal, signing, or other external mutation is submitted.
+snapshot changes and emits `rebalance_plan_evaluated` telemetry. When an action
+is required or planning fails, the normal readiness gate closes, so new trading
+cannot start while inventory is unsafe. `disabled` remains the default and does
+not submit transfers, approvals, bridges, withdrawals, signatures, or other
+external mutations.
 
 The first production execution slice is deliberately narrower than the full
 planner. `direct_wld_canary` permits exactly one Binance-to-World-Chain WLD
@@ -62,9 +70,19 @@ withdrawal, capped at 1 WLD. It does not execute USDC, Across,
 wallet-to-Binance, or a second WLD operation. Those plans remain fail-closed
 and observable.
 
+`full_live` connects the same planner to the recoverable executor. The GKE
+Deployment template selects it, but no GKE workload has been rolled out yet.
+Startup requires an explicitly selected Binance credential mode, a wallet
+signer, both durable journals, positive per-token caps, and the exact
+`REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE` acknowledgement.
+The worker uses a bounded cold-path channel, so Binance, Across, and RPC waits
+never run inside the market-data loop. Only one operation may be active; after
+completion, both Binance and wallet snapshots must refresh before another plan
+can be dispatched.
+
 ## Wallet primitive
 
-The reusable wallet layer now provides the cold-path subset needed by a future
+The reusable wallet layer provides the cold-path subset used by the full
 rebalance executor:
 
 - canonical-block hydration of native balance, ERC-20 balances, and requested
@@ -80,16 +98,16 @@ rebalance executor:
   broadcast helper that rejects an RPC-returned hash mismatch.
 
 The existing explicitly gated Across native-ETH canary uses this shared API.
-The autonomous runtime still loads only the public wallet address and does not
-load signing credentials. The canary now also requires a durable journal and
-uses the nonce lane state machine. On startup it automatically queries a known
+Disabled and direct-canary runtime modes still load only the public wallet
+address. `full_live` additionally loads the signer and a second Optimism RPC.
+The canary and full executor require durable journals and use the nonce lane
+state machine. On startup the runtime automatically queries a known
 unresolved hash: a matching receipt durably closes the operation, while a
 transaction without a receipt is accepted only after chain, sender, nonce,
 target, value, and calldata hash match the journaled intent. Missing, replaced,
-or unsigned operations remain blocked for operator review. Inventory
-reservations, deployment fencing, deposit-address verification, and the
-autonomous executor are still required before rebalance actions may mutate
-external state. The Rails failure-mode review is recorded in
+or unsigned operations remain blocked for operator review. The first GKE
+deployment uses the verified isolated subaccount, operator-selected caps, and
+shared-key acknowledgement. The Rails failure-mode review is recorded in
 [Rails wallet failure lessons](rails-wallet-parity.md).
 
 Explicitly gated mutation commands require `EVM_WALLET_JOURNAL_PATH`. Its
@@ -168,20 +186,20 @@ Every transfer follows a recoverable sequence:
 6. Rehydrate all balances and nonce, close the operation, then reopen entries
    only if every normal readiness gate also passes.
 
-Routes:
+Routes for both WLD and USDC:
 
-- WLD Binance to wallet: submit a withdrawal with deterministic
-  `withdrawOrderId`, reconcile withdrawal history, transaction receipt, and
-  final World Chain balance.
-- WLD wallet to Binance: transfer to a freshly verified Binance deposit
-  address, confirm the chain receipt, then reconcile Binance deposit history
-  and credited balance.
-- USDC Binance to wallet: withdraw native USDC to the Optimism wallet, measure
-  the actual received amount, request a fresh Across quote, execute approvals
-  and bridge transaction, then confirm the World Chain credit.
-- USDC wallet to Binance: bridge World Chain USDC to Optimism first, measure the
-  actual destination amount, transfer it to the verified Binance deposit
-  address, then reconcile the Binance credit.
+- Direct Binance to wallet: submit a withdrawal with deterministic
+  `withdrawOrderId`, reconcile withdrawal history, and confirm the final World
+  Chain balance.
+- Direct wallet to Binance: transfer to a freshly verified Binance deposit
+  address, confirm the chain receipt, then reconcile Travel Rule state,
+  deposit history, and credited balance.
+- Across Binance to wallet: withdraw to Optimism, measure the actual amount
+  received after the Binance fee, execute any required approval plus the
+  validated Across call, then confirm the World Chain credit.
+- Across wallet to Binance: bridge World Chain to Optimism, measure the actual
+  output, transfer that exact amount to the verified Binance deposit address,
+  then reconcile the Binance credit.
 
 For Rails parity, Across uses the public unauthenticated
 `https://app.across.to/api/swap/approval` endpoint. It sends no API key and no
@@ -228,20 +246,32 @@ indexed a matching withdrawal, the runtime stops for operator review and never
 blindly resubmits. Completion requires both Binance status `6` with a
 transaction ID and the expected World Chain wallet balance increase.
 
+The full executor adds a second checksummed, fsynced high-level journal. It
+records the pinned route and each authoritative confirmation. Before an Across
+submission it stores the validated target, exact calldata, calldata hash,
+minimum output, and destination balance baseline. The existing transaction
+journal then records nonce, signed hash, broadcast, unknown outcome, and
+receipt. Recovery can therefore continue the exact call and never substitute a
+new quote after an ambiguous outcome.
+
 ## Delivery phases
 
 1. Pure planner and parity tests — implemented.
 2. Continuous balance integration, startup-derived thresholds, live Binance
    network capability hydration, paper plans, and readiness gating — implemented.
 3. Reusable wallet hydration, call construction, signing, and checked broadcast
-   primitives — implemented; autonomous runtime signing remains disabled.
+   primitives — implemented; signing is loaded only in explicitly gated modes.
 4. Read-only hydrator for deposit address, deposit history, and withdrawal
    history — implemented with a diagnostic recovery command.
 5. Checksummed fsynced operation journal and per-chain nonce lane — implemented
    and used by the gated EVM canary, including conservative startup
    reconciliation of unresolved transaction hashes.
-6. Paper executor that validates generated routes and calldata without signing.
+6. Recoverable direct and Across executor for WLD and USDC — implemented behind
+   the explicit `full_live` gate; no production activation has occurred.
 7. One-shot direct WLD Binance-to-wallet transfer behind a capped production
-   gate — implemented; general direct rebalancing remains disabled.
-8. Across USDC route behind its own explicit live gate.
-9. Rebalance soak test, failure injection, and only then trading integration.
+   gate — implemented and retained as the GKE control mode.
+8. Explicit separate-treasury or shared-trading credential mode, per-token
+   caps, exact live acknowledgement, route revalidation, and dual-chain nonce
+   recovery — implemented.
+9. Isolated-capital canaries, failure injection, soak testing, and only then a
+   reviewed first GKE `full_live` rollout — pending.

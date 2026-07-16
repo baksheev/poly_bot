@@ -119,6 +119,38 @@ impl BinanceAccountClient {
         matching_deposits(records, coin, expected_hash)
     }
 
+    pub async fn submit_deposit_questionnaire(
+        &self,
+        deposit_id: &str,
+    ) -> anyhow::Result<WithdrawalSubmission> {
+        ensure!(
+            !deposit_id.is_empty()
+                && deposit_id.len() <= 128
+                && deposit_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "Binance deposit id is invalid"
+        );
+        let query = self.signed_query(&[
+            ("depositId", deposit_id.to_owned()),
+            (
+                "questionnaire",
+                serde_json::json!({
+                    "depositOriginator": 1,
+                    "receiveFrom": 1,
+                })
+                .to_string(),
+            ),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        self.signed_put(
+            "/sapi/v2/localentity/deposit/provide-info",
+            &query,
+            "Travel Rule deposit questionnaire",
+        )
+        .await
+    }
+
     pub async fn withdraw(
         &self,
         coin: &str,

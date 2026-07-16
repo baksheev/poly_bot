@@ -101,6 +101,20 @@ pub struct JsonRpcClient {
     rate_limit_retries: AtomicU64,
 }
 
+impl Clone for JsonRpcClient {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            endpoint: self.endpoint.clone(),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
+            batch_size: self.batch_size,
+            http_requests: AtomicU64::new(0),
+            eth_calls: AtomicU64::new(0),
+            rate_limit_retries: AtomicU64::new(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RpcStats {
     pub http_requests: u64,

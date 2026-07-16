@@ -63,8 +63,10 @@ spec:
                 CLICKHOUSE_PASSWORD \
                 ALCHEMY_WORLDCHAIN_RPC_URL \
                 ALCHEMY_WORLDCHAIN_WS_URL \
+                ALCHEMY_OPTIMISM_RPC_URL \
                 BINANCE_API_KEY \
-                BINANCE_SECRET_KEY; do
+                BINANCE_SECRET_KEY \
+                EVM_WALLET_PRIVATE_KEY; do
                 secret_value="$(cat "/var/run/secrets/arb-bot/${secret_name}")"
                 export "${secret_name}=${secret_value}"
               done
@@ -75,11 +77,15 @@ spec:
                 name: arb-bot-runtime
           env:
             - name: REBALANCE_EXECUTION_MODE
-              value: direct_wld_canary
-            - name: REBALANCE_CANARY_WLD_AMOUNT
-              value: "1"
-            - name: REBALANCE_JOURNAL_PATH
-              value: /var/lib/arb-bot/rebalance-canary.jsonl
+              value: full_live
+            - name: REBALANCE_MAX_WLD_AMOUNT
+              value: "__REBALANCE_MAX_WLD_AMOUNT__"
+            - name: REBALANCE_MAX_USDC_AMOUNT
+              value: "__REBALANCE_MAX_USDC_AMOUNT__"
+            - name: REBALANCE_LIVE_CONFIRMATION
+              value: ENABLE_FULL_REBALANCE
+            - name: REBALANCE_BINANCE_CREDENTIAL_MODE
+              value: shared_trading
           resources:
             requests:
               cpu: "6"

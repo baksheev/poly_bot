@@ -13,6 +13,10 @@ pub const OPTIMISM_USDC: Address =
     alloy_primitives::address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85");
 pub const WORLD_CHAIN_USDC: Address =
     alloy_primitives::address!("0x79A02482A880bCE3F13e09Da970dC34db4CD24d1");
+pub const OPTIMISM_WLD: Address =
+    alloy_primitives::address!("0xdC6fF44d5d932Cbd77B52E5612Ba0529DC6226F1");
+pub const WORLD_CHAIN_WLD: Address =
+    alloy_primitives::address!("0x2cFc85d8E48F8EAB294be644d9E25C3030863003");
 pub const NATIVE_ETH: Address = Address::ZERO;
 pub const OPTIMISM_WETH: Address =
     alloy_primitives::address!("0x4200000000000000000000000000000000000006");
@@ -217,6 +221,19 @@ pub struct ValidatedNativeEthQuote {
     pub minimum_output_amount: u128,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedErc20Transaction {
+    pub target: Address,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedErc20Quote {
+    pub approval: Option<ValidatedErc20Transaction>,
+    pub swap: ValidatedErc20Transaction,
+    pub minimum_output_amount: u128,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrossDepositStatus {
@@ -237,7 +254,10 @@ pub struct AcrossDepositStatus {
     pub fill_time: Option<u64>,
 }
 
-pub fn validate_quote(request: &AcrossQuoteRequest, quote: &AcrossQuote) -> anyhow::Result<()> {
+pub fn validate_quote(
+    request: &AcrossQuoteRequest,
+    quote: &AcrossQuote,
+) -> anyhow::Result<ValidatedErc20Quote> {
     ensure!(
         quote.amount_type == "exactInput",
         "Across changed the quote amount type"
@@ -260,9 +280,14 @@ pub fn validate_quote(request: &AcrossQuoteRequest, quote: &AcrossQuote) -> anyh
         quote.input_token.decimals == quote.output_token.decimals,
         "Across token decimals differ"
     );
+    let (expected_symbol, expected_decimals) = supported_erc20_pair(request)?;
     ensure!(
-        quote.input_token.symbol == "USDC" && quote.output_token.symbol == "USDC",
-        "Across returned a non-USDC token"
+        quote.input_token.symbol == expected_symbol && quote.output_token.symbol == expected_symbol,
+        "Across returned an unexpected token symbol"
+    );
+    ensure!(
+        quote.input_token.decimals == expected_decimals,
+        "Across returned unexpected token decimals"
     );
 
     let input_amount = parse_amount("inputAmount", &quote.input_amount)?;
@@ -324,9 +349,16 @@ pub fn validate_quote(request: &AcrossQuoteRequest, quote: &AcrossQuote) -> anyh
         transaction_integer("swapTx.value", &quote.swap_tx.value)? == 0,
         "Across ERC20 swap transaction has non-zero native value"
     );
-    validate_swap_calldata(request, &quote.swap_tx.data, min_output)?;
-    validate_approvals(request, quote, spender)?;
-    Ok(())
+    let swap_data = validate_swap_calldata(request, &quote.swap_tx.data, min_output)?;
+    let approval = validate_approvals(request, quote, spender)?;
+    Ok(ValidatedErc20Quote {
+        approval,
+        swap: ValidatedErc20Transaction {
+            target: spender,
+            data: swap_data,
+        },
+        minimum_output_amount: min_output,
+    })
 }
 
 pub fn validate_native_eth_quote(
@@ -539,8 +571,15 @@ fn ensure_token(token: &AcrossToken, chain_id: u64, address: Address) -> anyhow:
         parse_address("token.address", &token.address)? == address,
         "Across token address mismatch"
     );
-    ensure!(token.decimals == 6, "Across USDC token decimals changed");
     Ok(())
+}
+
+fn supported_erc20_pair(request: &AcrossQuoteRequest) -> anyhow::Result<(&'static str, u8)> {
+    match (request.input_token, request.output_token) {
+        (OPTIMISM_USDC, WORLD_CHAIN_USDC) | (WORLD_CHAIN_USDC, OPTIMISM_USDC) => Ok(("USDC", 6)),
+        (OPTIMISM_WLD, WORLD_CHAIN_WLD) | (WORLD_CHAIN_WLD, OPTIMISM_WLD) => Ok(("WLD", 18)),
+        _ => anyhow::bail!("Across token pair is not an approved rebalance route"),
+    }
 }
 
 fn ensure_check_token(value: &str, expected: Address) -> anyhow::Result<()> {
@@ -555,14 +594,14 @@ fn validate_approvals(
     request: &AcrossQuoteRequest,
     quote: &AcrossQuote,
     spender: Address,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ValidatedErc20Transaction>> {
     let actual = parse_amount("allowance.actual", &quote.checks.allowance.actual)?;
     if quote.approval_txns.is_empty() {
         ensure!(
             actual >= request.amount,
             "Across omitted approval for insufficient allowance"
         );
-        return Ok(());
+        return Ok(None);
     }
     ensure!(
         quote.approval_txns.len() == 1,
@@ -594,14 +633,17 @@ fn validate_approvals(
         u256_word_is_at_least_u128(&bytes, 1, request.amount)?,
         "Across approval amount is too small"
     );
-    Ok(())
+    Ok(Some(ValidatedErc20Transaction {
+        target: request.input_token,
+        data: bytes,
+    }))
 }
 
 fn validate_swap_calldata(
     request: &AcrossQuoteRequest,
     data: &str,
     min_output: u128,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     let bytes = decode_calldata("swapTx.data", data)?;
     ensure!(
         bytes.len() >= 4 + 6 * 32 && bytes.len() <= 16_384,
@@ -635,7 +677,7 @@ fn validate_swap_calldata(
         u256_word_fits_u128(&bytes, 5)? == min_output,
         "Across calldata minimum output mismatch"
     );
-    Ok(())
+    Ok(bytes)
 }
 
 fn decode_calldata(name: &str, value: &str) -> anyhow::Result<Vec<u8>> {
@@ -867,9 +909,10 @@ mod tests {
     use super::{
         AcrossAllowanceCheck, AcrossBalanceCheck, AcrossChecks, AcrossDepositStatus, AcrossFee,
         AcrossFees, AcrossQuote, AcrossQuoteRequest, AcrossToken, AcrossTransaction, NATIVE_ETH,
-        OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WETH, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
-        decode_calldata, transaction_integer, u256_word_is_at_least_u128, validate_deposit_status,
-        validate_native_eth_deposit_status, validate_native_eth_quote, validate_quote,
+        OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WETH, OPTIMISM_WLD, WORLD_CHAIN_CHAIN_ID,
+        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, decode_calldata, transaction_integer,
+        u256_word_is_at_least_u128, validate_deposit_status, validate_native_eth_deposit_status,
+        validate_native_eth_quote, validate_quote,
     };
 
     const DEPOSITOR: Address = address!("0x1111111111111111111111111111111111111111");
@@ -1091,7 +1134,51 @@ mod tests {
 
     #[test]
     fn validates_rails_compatible_quote_and_approval() {
-        validate_quote(&request(), &valid_quote()).unwrap();
+        let terms = validate_quote(&request(), &valid_quote()).unwrap();
+        assert!(terms.approval.is_some());
+        assert_eq!(terms.minimum_output_amount, 999_400);
+    }
+
+    #[test]
+    fn validates_wld_across_pair_with_eighteen_decimals() {
+        let request = AcrossQuoteRequest {
+            origin_chain_id: OPTIMISM_CHAIN_ID,
+            destination_chain_id: WORLD_CHAIN_CHAIN_ID,
+            input_token: OPTIMISM_WLD,
+            output_token: WORLD_CHAIN_WLD,
+            amount: 1_000_000_000_000_000_000,
+            depositor: DEPOSITOR,
+            recipient: DEPOSITOR,
+        };
+        let minimum = 990_000_000_000_000_000;
+        let mut quote = valid_quote();
+        quote.checks.allowance.token = format!("{OPTIMISM_WLD:#x}");
+        quote.checks.allowance.expected = request.amount.to_string();
+        quote.checks.balance.token = format!("{OPTIMISM_WLD:#x}");
+        quote.checks.balance.actual = request.amount.to_string();
+        quote.checks.balance.expected = request.amount.to_string();
+        quote.approval_txns[0].to = format!("{OPTIMISM_WLD:#x}");
+        quote.input_token = AcrossToken {
+            decimals: 18,
+            symbol: "WLD".to_owned(),
+            address: format!("{OPTIMISM_WLD:#x}"),
+            chain_id: OPTIMISM_CHAIN_ID,
+        };
+        quote.output_token = AcrossToken {
+            decimals: 18,
+            symbol: "WLD".to_owned(),
+            address: format!("{WORLD_CHAIN_WLD:#x}"),
+            chain_id: WORLD_CHAIN_CHAIN_ID,
+        };
+        quote.fees.total.amount = "1000000000000000".to_owned();
+        quote.input_amount = request.amount.to_string();
+        quote.max_input_amount = request.amount.to_string();
+        quote.expected_output_amount = "995000000000000000".to_owned();
+        quote.min_output_amount = minimum.to_string();
+        quote.swap_tx.data = swap_calldata(&request, minimum);
+
+        let terms = validate_quote(&request, &quote).unwrap();
+        assert_eq!(terms.minimum_output_amount, minimum);
     }
 
     #[test]

@@ -149,6 +149,19 @@ impl RebalanceTracker {
             self.ready = false;
         }
     }
+
+    pub fn pending_action(&self) -> Option<RebalanceEvaluation> {
+        self.tokens.iter().find_map(|token| {
+            let plan = token.last_plan.as_ref()?;
+            plan.action.as_ref()?;
+            Some(RebalanceEvaluation {
+                token_symbol: token.symbol.clone(),
+                token_decimals: token.decimals,
+                reference_captured: false,
+                plan: plan.clone(),
+            })
+        })
+    }
 }
 
 fn token_snapshot(
@@ -167,7 +180,7 @@ fn token_snapshot(
         .with_context(|| format!("wallet balance snapshot is missing {}", token.symbol))?;
 
     Ok(BalanceSnapshot {
-        binance: decimal_to_base_units(binance_balance.free, token.decimals)?,
+        binance: decimal_to_base_units_floor(binance_balance.free, token.decimals)?,
         wallet: wallet_balance.base_units,
     })
 }
@@ -253,6 +266,19 @@ fn decimal_to_base_units(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
     Ok(numerator / denominator)
 }
 
+fn decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
+    ensure!(
+        value >= Decimal::ZERO,
+        "decimal balance must not be negative"
+    );
+    let mantissa = value.mantissa();
+    ensure!(mantissa >= 0, "decimal mantissa must not be negative");
+    let numerator = U256::from(mantissa as u128)
+        .checked_mul(pow10(decimals.into())?)
+        .context("decimal balance base-unit numerator overflow")?;
+    Ok(numerator / pow10(value.scale())?)
+}
+
 fn pow10(exponent: u32) -> anyhow::Result<U256> {
     let mut result = U256::ONE;
     for _ in 0..exponent {
@@ -300,12 +326,43 @@ mod tests {
         }
     }
 
+    fn across_route() -> RouteCandidate {
+        RouteCandidate {
+            route: Route::Across {
+                binance_network: "OPTIMISM".to_owned(),
+                bridge_chain_id: 10,
+                wallet_chain_id: 480,
+            },
+            binance_deposit_enabled: true,
+            binance_withdrawal_enabled: true,
+            across_wallet_to_bridge_enabled: true,
+            across_bridge_to_wallet_enabled: true,
+            withdrawal: WithdrawalRules {
+                minimum: U256::ONE,
+                maximum: U256::MAX,
+                multiple: U256::ONE,
+            },
+        }
+    }
+
     fn snapshots(
         binance_usdc: u64,
         wallet_usdc: u64,
     ) -> (BinanceBalanceSnapshot, WalletBalanceSnapshot) {
-        let scale_6 = U256::from(1_000_000);
-        let scale_18 = U256::from(10).pow(U256::from(18));
+        budget_snapshots(
+            Decimal::from(binance_usdc),
+            U256::from(wallet_usdc) * U256::from(1_000_000),
+            Decimal::from(5_000),
+            U256::from(5_000) * U256::from(10).pow(U256::from(18)),
+        )
+    }
+
+    fn budget_snapshots(
+        binance_usdc: Decimal,
+        wallet_usdc: U256,
+        binance_wld: Decimal,
+        wallet_wld: U256,
+    ) -> (BinanceBalanceSnapshot, WalletBalanceSnapshot) {
         let observed_at = Instant::now();
         (
             BinanceBalanceSnapshot {
@@ -316,14 +373,14 @@ mod tests {
                     (
                         Arc::from("USDC"),
                         BinanceAssetBalance {
-                            free: Decimal::from(binance_usdc),
+                            free: binance_usdc,
                             locked: Decimal::ZERO,
                         },
                     ),
                     (
                         Arc::from("WLD"),
                         BinanceAssetBalance {
-                            free: Decimal::from(5_000),
+                            free: binance_wld,
                             locked: Decimal::ZERO,
                         },
                     ),
@@ -341,12 +398,12 @@ mod tests {
                     WalletTokenBalance {
                         symbol: Arc::from("USDC"),
                         contract: Address::ZERO,
-                        base_units: U256::from(wallet_usdc) * scale_6,
+                        base_units: wallet_usdc,
                     },
                     WalletTokenBalance {
                         symbol: Arc::from("WLD"),
                         contract: Address::ZERO,
-                        base_units: U256::from(5_000) * scale_18,
+                        base_units: wallet_wld,
                     },
                 ],
                 observed_at,
@@ -370,7 +427,7 @@ mod tests {
         RebalanceTracker::new(
             pair,
             BTreeMap::from([
-                ("USDC".to_owned(), vec![direct_route()]),
+                ("USDC".to_owned(), vec![across_route()]),
                 ("WLD".to_owned(), vec![direct_route()]),
             ]),
         )
@@ -447,5 +504,62 @@ mod tests {
             routes[0].withdrawal.multiple,
             U256::from(10_000_000_000_000_000_u64)
         );
+    }
+
+    #[test]
+    fn floors_exchange_dust_beyond_on_chain_token_precision() {
+        assert_eq!(
+            super::decimal_to_base_units_floor(
+                Decimal::from_str_exact("6170.80727184").unwrap(),
+                6,
+            )
+            .unwrap(),
+            U256::from(6_170_807_271_u64)
+        );
+        assert!(
+            super::decimal_to_base_units(Decimal::from_str_exact("6170.80727184").unwrap(), 6,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn updates_two_token_budget_without_losing_the_second_action() {
+        let scale_18 = U256::from(10).pow(U256::from(18));
+        let mut tracker = tracker();
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(1_000),
+            U256::ZERO,
+            Decimal::from(2_500),
+            U256::ZERO,
+        );
+        tracker.evaluate(&binance, &wallet).unwrap();
+        let first = tracker.pending_action().unwrap();
+        assert_eq!(first.token_symbol, "USDC");
+        let first_action = first.plan.action.unwrap();
+        assert_eq!(first_action.amount, U256::from(500_000_000));
+        assert!(matches!(first_action.route, Route::Across { .. }));
+
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(500),
+            U256::from(499_000_000),
+            Decimal::from(2_500),
+            U256::ZERO,
+        );
+        tracker.evaluate(&binance, &wallet).unwrap();
+        let second = tracker.pending_action().unwrap();
+        assert_eq!(second.token_symbol, "WLD");
+        let second_action = second.plan.action.unwrap();
+        assert_eq!(second_action.amount, U256::from(1_250) * scale_18);
+        assert!(matches!(second_action.route, Route::Direct { .. }));
+
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(500),
+            U256::from(499_000_000),
+            Decimal::from(1_250),
+            U256::from(1_249) * scale_18,
+        );
+        tracker.evaluate(&binance, &wallet).unwrap();
+        assert!(tracker.pending_action().is_none());
+        assert!(tracker.ready());
     }
 }
