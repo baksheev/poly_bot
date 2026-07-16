@@ -595,10 +595,10 @@ fn validate_approvals(
     quote: &AcrossQuote,
     spender: Address,
 ) -> anyhow::Result<Option<ValidatedErc20Transaction>> {
-    let actual = parse_amount("allowance.actual", &quote.checks.allowance.actual)?;
+    let actual = parse_u256_amount("allowance.actual", &quote.checks.allowance.actual)?;
     if quote.approval_txns.is_empty() {
         ensure!(
-            actual >= request.amount,
+            actual >= U256::from(request.amount),
             "Across omitted approval for insufficient allowance"
         );
         return Ok(None);
@@ -902,7 +902,7 @@ fn unix_timestamp_seconds() -> anyhow::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, address};
+    use alloy_primitives::{Address, U256, address};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -1230,6 +1230,9 @@ mod tests {
         assert!(validate_quote(&request(), &quote).is_err());
 
         quote.checks.allowance.actual = request().amount.to_string();
+        validate_quote(&request(), &quote).unwrap();
+
+        quote.checks.allowance.actual = U256::MAX.to_string();
         validate_quote(&request(), &quote).unwrap();
     }
 
