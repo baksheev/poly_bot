@@ -23,9 +23,13 @@ does not replace a real operation against the production endpoint.
 
 | Component | Production operation | Status | Evidence |
 | --- | --- | --- | --- |
-| Binance Spot WS API | MARKET buy WLDUSDC | Passed | order `455189372`, `FILLED`, 24.5 WLD / 9.96415 USDC |
-| Binance Spot WS API | MARKET sell WLDUSDC | Passed | order `455189375`, `FILLED`, 24.5 WLD / 9.95925 USDC |
-| Binance reconciliation | signed `allOrders` query | Passed | both deterministic `rustval...` IDs returned `FILLED` |
+| Binance subaccount | signed account and WLDUSDC commission hydration from diagnostic VM | Passed | Spot, `canTrade=true`, two nonzero balances, WLD and USDC present; static egress `34.143.148.4` |
+| Binance capital routes | signed `capital/config/getall` from diagnostic VM | Passed | WLD direct and Optimism deposit/withdrawal available; USDC Optimism deposit/withdrawal available and no direct route |
+| Dedicated subaccount order audit | signed `allOrders` query from diagnostic VM | Passed | no recent `rustval...` orders; a new capped execution canary is still required |
+| Dedicated subaccount Spot WS API | capped MARKET buy/sell WLDUSDC | Pending | funded account is ready for an explicitly approved canary |
+| Pre-isolation Binance Spot WS API | MARKET buy WLDUSDC | Historical | order `455189372`, `FILLED`, 24.5 WLD / 9.96415 USDC; does not validate the dedicated subaccount |
+| Pre-isolation Binance Spot WS API | MARKET sell WLDUSDC | Historical | order `455189375`, `FILLED`, 24.5 WLD / 9.95925 USDC; does not validate the dedicated subaccount |
+| Pre-isolation Binance reconciliation | signed `allOrders` query | Historical | both deterministic `rustval...` IDs returned `FILLED`; rerun on the dedicated subaccount |
 | EVM signer | derive public address from Secret Manager value | Passed | `0x90D990C81320221D2882De32beeA78923c1e77A3` |
 | World Chain RPC | chain ID, latest block, pending nonce, ETH/WLD/USDC | Passed | chain `480`; native balance `0.007982721314804481 ETH` after Across fill |
 | Optimism RPC | chain ID, latest block, pending nonce, ETH/WLD/USDC/USDC.e | Passed | chain `10`; native balance `0.001997329279441474 ETH`; pending nonce `1` |
@@ -46,6 +50,8 @@ does not replace a real operation against the production endpoint.
 | Rebalance | direct route end-to-end | Pending | — |
 | Rebalance | Optimism + Across fallback end-to-end | Pending | — |
 
-The wallet hydration evidence above intentionally records no secret material.
-The bootstrap ETH withdrawal and native Across bridge are complete; ERC-20
-inventory and DEX execution canaries remain pending.
+The wallet and Binance hydration evidence above intentionally records no secret
+material or raw authenticated request. The bootstrap ETH withdrawal and native
+Across bridge are complete; ERC-20 inventory and DEX execution canaries remain
+pending. The dedicated Binance subaccount is funded and read-verified, but its
+first capped order-placement and reconciliation canary remains pending.

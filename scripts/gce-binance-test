@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+gcloud_local="${repo_root}/scripts/gcloud-local"
+region="${GCP_REGION:-asia-southeast1}"
+zone="${GCE_TEST_ZONE:-${region}-b}"
+instance="arb-bot-binance-test"
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: scripts/gce-binance-test READ_ONLY_COMMAND [ARGS...]" >&2
+  exit 1
+fi
+
+case "$1" in
+  binance-account|binance-capital|binance-recent-validation-orders|binance-withdrawal-status|binance-travel-rule-withdrawal-status)
+    ;;
+  *)
+    echo "only read-only Binance diagnostic commands are permitted" >&2
+    exit 2
+    ;;
+esac
+
+remote_command="sudo /bin/bash /var/lib/arb-bot-test/arb-bot-test"
+for argument in "$@"; do
+  printf -v quoted ' %q' "${argument}"
+  remote_command+="${quoted}"
+done
+
+exec "${gcloud_local}" compute ssh "${instance}" \
+  --zone="${zone}" \
+  --tunnel-through-iap \
+  --command="${remote_command}"

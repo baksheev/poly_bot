@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Instant};
 use serde_json::json;
 
 use crate::{
+    balances::BalanceEvent,
     config::AppConfig,
     dex::mirror::{DexMirror, LogApplyResult},
     domain::config::LoadedDomainConfig,
@@ -200,6 +201,88 @@ impl TradingEngine {
         Ok(())
     }
 
+    pub fn on_balance_event(&mut self, event: BalanceEvent) {
+        match event {
+            BalanceEvent::Binance(snapshot) => {
+                let balances = snapshot
+                    .balances
+                    .iter()
+                    .map(|(asset, balance)| {
+                        json!({
+                            "asset": asset.as_ref(),
+                            "free": balance.free.to_string(),
+                            "locked": balance.locked.to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.telemetry.emit(
+                    "binance_balance_snapshot",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "account_update_time_ms": snapshot.account_update_time_ms,
+                        "account_type": snapshot.account_type,
+                        "can_trade": snapshot.can_trade,
+                        "balances": balances,
+                        "request_duration_us": snapshot.request_duration_us,
+                    }),
+                );
+                self.state.balances.apply_binance(snapshot);
+            }
+            BalanceEvent::Wallet(snapshot) => {
+                let token_balances = snapshot
+                    .token_balances
+                    .iter()
+                    .map(|balance| {
+                        json!({
+                            "symbol": balance.symbol.as_ref(),
+                            "contract": format!("{:#x}", balance.contract),
+                            "base_units": balance.base_units.to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.telemetry.emit(
+                    "wallet_balance_snapshot",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "owner": format!("{:#x}", snapshot.owner),
+                        "chain_id": snapshot.chain_id,
+                        "block_number": snapshot.block_number,
+                        "block_hash": format!("{:#x}", snapshot.block_hash),
+                        "native_balance_wei": snapshot.native_balance_wei.to_string(),
+                        "token_balances": token_balances,
+                        "request_duration_us": snapshot.request_duration_us,
+                        "rpc_http_requests": snapshot.rpc_stats.http_requests,
+                        "rpc_eth_calls": snapshot.rpc_stats.eth_calls,
+                        "rpc_rate_limit_retries": snapshot.rpc_stats.rate_limit_retries,
+                    }),
+                );
+                self.state.balances.apply_wallet(snapshot);
+            }
+            BalanceEvent::Failed {
+                source,
+                error,
+                observed_at,
+            } => {
+                self.state.balances.record_failure(source);
+                tracing::warn!(
+                    source = source.as_str(),
+                    error,
+                    "balance synchronization failed"
+                );
+                self.telemetry.emit(
+                    "balance_sync_failed",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "source": source.as_str(),
+                        "error": error,
+                        "engine_queue_age_us": observed_at.elapsed().as_micros(),
+                    }),
+                );
+            }
+        }
+        self.refresh_phase(Instant::now());
+    }
+
     fn on_binance_quote(&mut self, quote: TopOfBook) -> anyhow::Result<()> {
         let result = self.state.apply_quote(quote.clone());
         match result {
@@ -257,9 +340,15 @@ impl TradingEngine {
         let previous = self.state.phase;
         let dex_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms)
             && self.opportunities.is_ready();
-        let current = self
+        let balances_ready = self
             .state
-            .refresh_phase(now, self.config.market_data_max_age_ms, dex_ready);
+            .balances
+            .is_fresh(now, self.config.balance_max_age_ms);
+        let current = self.state.refresh_phase(
+            now,
+            self.config.market_data_max_age_ms,
+            dex_ready && balances_ready,
+        );
         if previous != current {
             tracing::info!(?previous, ?current, "runtime phase changed");
             self.telemetry.emit(

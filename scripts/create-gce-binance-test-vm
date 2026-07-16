@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+image="${1:-}"
+source_revision="${2:-}"
+
+if [[ -z "${image}" || -z "${source_revision}" ]]; then
+  echo "usage: scripts/create-gce-binance-test-vm IMAGE SOURCE_REVISION" >&2
+  exit 1
+fi
+if [[ ! "${image}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "IMAGE must be pinned by sha256 digest" >&2
+  exit 1
+fi
+if [[ ! "${source_revision}" =~ ^[a-z0-9-]{1,63}$ ]]; then
+  echo "SOURCE_REVISION must be a valid lowercase GCP label value" >&2
+  exit 1
+fi
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+: "${GCP_REGION:?GCP_REGION is required}"
+
+gcloud_local="${repo_root}/scripts/gcloud-local"
+zone="${GCE_TEST_ZONE:-${GCP_REGION}-b}"
+machine_type="${GCE_TEST_MACHINE_TYPE:-e2-small}"
+network="arb-bot-low-latency"
+subnet="arb-bot-singapore"
+address="arb-bot-binance-test-egress"
+firewall="arb-bot-binance-test-iap-ssh"
+instance="arb-bot-binance-test"
+service_account_name="arb-bot-binance-test"
+service_account="${service_account_name}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+operator="$("${gcloud_local}" config get-value account 2>/dev/null)"
+
+if [[ -z "${operator}" || "${operator}" == "(unset)" ]]; then
+  echo "repository-local gcloud account is not configured" >&2
+  exit 1
+fi
+
+"${gcloud_local}" config set project "${GCP_PROJECT_ID}" >/dev/null
+"${gcloud_local}" services enable \
+  artifactregistry.googleapis.com \
+  compute.googleapis.com \
+  iap.googleapis.com \
+  secretmanager.googleapis.com \
+  --quiet
+
+if ! "${gcloud_local}" iam service-accounts describe \
+  "${service_account}" >/dev/null 2>&1; then
+  "${gcloud_local}" iam service-accounts create "${service_account_name}" \
+    --display-name="Arb Bot Binance diagnostics" \
+    --quiet
+fi
+
+"${gcloud_local}" artifacts repositories add-iam-policy-binding poly-bot \
+  --location="${GCP_REGION}" \
+  --member="serviceAccount:${service_account}" \
+  --role=roles/artifactregistry.reader \
+  --quiet >/dev/null
+for secret in BINANCE_API_KEY BINANCE_SECRET_KEY; do
+  "${gcloud_local}" secrets add-iam-policy-binding "${secret}" \
+    --member="serviceAccount:${service_account}" \
+    --role=roles/secretmanager.secretAccessor \
+    --quiet >/dev/null
+done
+
+"${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="user:${operator}" \
+  --role=roles/iap.tunnelResourceAccessor \
+  --condition=None \
+  --quiet >/dev/null
+"${gcloud_local}" projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="user:${operator}" \
+  --role=roles/compute.osAdminLogin \
+  --condition=None \
+  --quiet >/dev/null
+
+if ! "${gcloud_local}" compute addresses describe "${address}" \
+  --region="${GCP_REGION}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute addresses create "${address}" \
+    --region="${GCP_REGION}" \
+    --network-tier=PREMIUM \
+    --quiet
+fi
+
+if ! "${gcloud_local}" compute firewall-rules describe "${firewall}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute firewall-rules create "${firewall}" \
+    --network="${network}" \
+    --direction=INGRESS \
+    --priority=1000 \
+    --action=ALLOW \
+    --rules=tcp:22 \
+    --source-ranges=35.235.240.0/20 \
+    --target-tags=arb-bot-binance-test \
+    --enable-logging \
+    --quiet
+fi
+
+if "${gcloud_local}" compute instances describe "${instance}" \
+  --zone="${zone}" >/dev/null 2>&1; then
+  echo "instance already exists: ${instance}; refusing to replace it" >&2
+  exit 1
+fi
+
+"${gcloud_local}" compute instances create "${instance}" \
+  --zone="${zone}" \
+  --machine-type="${machine_type}" \
+  --provisioning-model=STANDARD \
+  --maintenance-policy=MIGRATE \
+  --restart-on-failure \
+  --network-tier=PREMIUM \
+  --subnet="${subnet}" \
+  --address="${address}" \
+  --tags=arb-bot-binance-test \
+  --image-family=cos-stable \
+  --image-project=cos-cloud \
+  --boot-disk-type=pd-balanced \
+  --boot-disk-size=10GB \
+  --service-account="${service_account}" \
+  --scopes=https://www.googleapis.com/auth/cloud-platform \
+  --metadata="enable-oslogin=TRUE,block-project-ssh-keys=TRUE,arb-bot-image=${image},arb-bot-region=${GCP_REGION}" \
+  --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-binance-test-startup.sh" \
+  --shielded-secure-boot \
+  --shielded-vtpm \
+  --shielded-integrity-monitoring \
+  --labels="component=binance-diagnostics,mode=read-only,source-revision=${source_revision}" \
+  --quiet
+
+ip="$("${gcloud_local}" compute addresses describe "${address}" \
+  --region="${GCP_REGION}" \
+  --format='value(address)')"
+echo "created ${instance} (${machine_type}, ${zone}) with static egress ${ip}"
+echo "add ${ip} to the Binance API-key IP whitelist before running diagnostics"

@@ -172,11 +172,17 @@ At this point the composed clone can run read-only for `USDC-WLD` /
 
 ### 6. Account and wallet state
 
+Implemented foundation: Binance free/locked balances are refreshed once per
+second in a background task, and World Chain native/ERC-20 balances are
+refreshed on Alchemy `newHeads` with every token read pinned to one block hash.
+The public wallet address and reusable RPC clients are separate from signing.
+Both observations are held in memory and gate readiness by freshness.
+
 Build independent read-only hydration for:
 
-- balances and allowances for each clone wallet;
+- allowances for each clone wallet;
 - gas balances and pending nonces on every chain;
-- Binance balances, filters, open orders, and account health;
+- Binance filters and open orders;
 - in-memory wallet lanes and reservations.
 
 The blockchain and Binance are the recovery sources of truth after restart.

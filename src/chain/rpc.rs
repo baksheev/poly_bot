@@ -24,7 +24,7 @@ pub struct CanonicalBlock {
 }
 
 impl CanonicalBlock {
-    fn eip1898(self) -> Value {
+    pub(crate) fn eip1898(self) -> Value {
         json!({
             "blockHash": format!("{:#x}", self.hash),
             "requireCanonical": true,
@@ -165,6 +165,20 @@ impl JsonRpcClient {
     pub async fn native_balance(&self, address: Address) -> anyhow::Result<U256> {
         let value = self
             .request("eth_getBalance", json!([format!("{address:#x}"), "latest"]))
+            .await?;
+        parse_quantity_value_u256("eth_getBalance", value)
+    }
+
+    pub async fn native_balance_at(
+        &self,
+        address: Address,
+        block: CanonicalBlock,
+    ) -> anyhow::Result<U256> {
+        let value = self
+            .request(
+                "eth_getBalance",
+                json!([format!("{address:#x}"), block.eip1898()]),
+            )
             .await?;
         parse_quantity_value_u256("eth_getBalance", value)
     }

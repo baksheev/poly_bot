@@ -11,9 +11,9 @@ work to one another.
 ## Target architecture
 
 ```text
-Binance WebSocket ─────────┐
-Alchemy pool-log WSS ──────┼─> one Rust process ─> in-memory state
-Alchemy HTTP recovery ─────┘          │                 │
+Binance WebSocket / balance REST ──┐
+Alchemy pool-log / newHeads WSS ───┼─> one Rust process ─> in-memory state
+Alchemy HTTP hydration / balance ──┘          │                 │
                                       │                 ├─> opportunity engine
                                       │                 ├─> risk / inventory
                                       │                 └─> execution (later)
@@ -50,13 +50,6 @@ See [the migration design](docs/arb-bot-rust-migration.md) for the current
 Rails flow, ownership boundaries, stages, safety gates, and acceptance
 criteria.
 
-## Archived experiment: USDT/AED
-
-The initial OKX snapshot showed only about 6.6 bps gross edge before fees,
-versus roughly 17.5 bps for two taker legs on a regular account. That direction
-is not being implemented. The evidence is retained in
-[USDT/AED arbitrage validation](docs/usdt-aed-arbitrage-validation.md).
-
 ## Current status
 
 The first clone components are implemented in read-only shadow mode: persistent
@@ -64,13 +57,20 @@ Binance Spot `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
 parsing, reconnect generations, freshness/readiness state, a single in-memory
 state owner, and non-blocking ClickHouse telemetry. Startup now loads a
 fail-closed, versioned snapshot of the active production World Chain
-`USDC-WLD` configuration and reports its SHA-256 fingerprint. It has no private
-Binance, wallet, signing, or trading credentials and cannot place orders. The
-DEX slice includes pinned-block V3/V4 hydration, an HTTP log backfill after WSS
+`USDC-WLD` configuration and reports its SHA-256 fingerprint. It has
+authenticated Binance account-read credentials, but no wallet signer or live
+trading gate, and cannot place orders. The DEX slice includes pinned-block
+V3/V4 hydration, an HTTP log backfill after WSS
 subscription, ordered Alchemy `logs`/`newHeads` ingestion, and the shared
-hookless concentrated-liquidity calculation core. `Swap`, `Mint`, `Burn`, and
-`ModifyLiquidity` update the same single-owner pool mirrors used by local
-quotes; no RPC call is made on the event or quote hot path.
+hookless concentrated-liquidity calculation core. Authenticated Binance free
+and locked balances are refreshed once per second in a dedicated task. Wallet
+native and ERC-20 balances are refreshed at every accepted World Chain
+`newHeads` notification, with all token calls pinned to the same block hash.
+Both snapshots live under the single state owner and are readiness inputs; the
+network requests never run in the quote hot path. Only the public
+`EVM_WALLET_ADDRESS` is required for this read-only observer. `Swap`, `Mint`,
+`Burn`, and `ModifyLiquidity` update the same single-owner pool mirrors used by
+local quotes; no RPC call is made on the event or quote hot path.
 
 Every accepted Binance update now evaluates both arbitrage directions against
 all hydrated pools. The read-only opportunity engine uses exact-output DEX
@@ -81,7 +81,8 @@ Binance top of book. It writes every evaluation and threshold-crossing
 opportunity asynchronously to ClickHouse. Market data and eventual execution
 now both use Spot. The estimate is still not execution-ready because
 bookTicker exposes only the best level; deeper Spot liquidity, fees, gas,
-balances, and inventory are not hydrated yet.
+deeper Spot liquidity, reservations, and executable inventory limits are not
+integrated yet.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:
@@ -121,6 +122,11 @@ telemetry table in a configured ClickHouse instance:
 cargo run -- migrate
 ```
 
+`run` requires `EVM_WALLET_ADDRESS`, Binance read credentials, and the World
+Chain HTTP/WSS endpoints. Balance sync cadence and freshness are controlled by
+`BALANCE_SYNC_INTERVAL_MS` (default `1000`) and `BALANCE_MAX_AGE_MS` (default
+`5000`). See [balance synchronization](docs/balance-synchronization.md).
+
 The committed domain snapshot is documented in
 [versioned domain configuration](docs/domain-configuration.md). A local,
 read-only comparison with the current Rails production pair is available when
@@ -148,6 +154,20 @@ Provision a new VM from an already published image with
 credentials remain in Secret Manager and are read at boot through the attached
 service account.
 
+Authenticated manual Binance diagnostics use the separate IAP-only VM with
+static egress IP `34.143.148.4`; do not open SSH on or run ad hoc commands from
+the production trading VM. The repository wrapper accepts only read-only
+commands and never places an order or submits a withdrawal:
+
+```bash
+scripts/gce-binance-test binance-account
+scripts/gce-binance-test binance-capital
+scripts/gce-binance-test binance-recent-validation-orders --limit 20
+```
+
+See [Singapore infrastructure](docs/singapore-infrastructure.md) for image
+updates, IAM boundaries, and the complete diagnostic runbook.
+
 ## Planned implementation slices
 
 1. Prove local quote parity against V3/V4 Quoter calls sampled outside the hot
@@ -160,8 +180,9 @@ service account.
 4. Add in-process WSS reconnect/gap repair; the current fail-closed path exits
    on a DEX discontinuity so systemd restarts the container from a fresh
    snapshot.
-5. Add isolated account/wallet hydration, then paper execution and forced
-   recovery tests before any live credentials are provisioned.
+5. Extend the isolated account/wallet snapshots with reservations, allowances,
+   open orders, pending nonces, then add paper execution and forced recovery
+   tests before live trading is enabled.
 
 See [the local DEX quoting design](docs/low-latency-dex-quoting.md) for the
 hot-path contract, hydration boundary, reorg handling, and latency budget.

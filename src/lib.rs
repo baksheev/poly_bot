@@ -1,4 +1,5 @@
 pub mod across;
+pub mod balances;
 pub mod binance;
 pub mod chain;
 pub mod config;

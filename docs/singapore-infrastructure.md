@@ -36,6 +36,55 @@ Registry with an ephemeral Docker config, and removes that config after the
 image pull. No long-lived service-account key or credential is stored in
 instance metadata.
 
+## Binance diagnostic VM
+
+Manual authenticated Binance checks run from the separate
+`arb-bot-binance-test` VM. It uses a small `e2-small` instance in the Singapore
+subnet and its own Premium-tier static egress address `34.143.148.4`. The
+production VM keeps its no-ingress policy unchanged. SSH to the diagnostic VM
+is allowed only through Google IAP (`35.235.240.0/20`) and only to instances
+carrying the `arb-bot-binance-test` network tag; direct internet SSH remains
+blocked.
+
+The diagnostic VM has a dedicated service account. It can read only the two
+Binance secrets and the pinned container image; it has no wallet, Alchemy, or
+ClickHouse access. Its root-owned wrapper permits only read-only Binance CLI
+commands. No long-running trading process is installed.
+
+Provision the VM from an already-published digest-pinned image:
+
+```bash
+scripts/create-gce-binance-test-vm IMAGE SOURCE_REVISION
+```
+
+After adding the printed static IP to the Binance API-key whitelist, run a
+sanitized account and capital-route check through IAP:
+
+```bash
+scripts/gce-binance-test binance-account
+scripts/gce-binance-test binance-capital
+scripts/gce-binance-test binance-recent-validation-orders --limit 20
+```
+
+The local and remote wrappers both reject commands outside the read-only
+allowlist. Do not extend that allowlist with order, withdrawal, wallet, or
+bridge commands. Those operations retain their separate caps, explicit live
+confirmation, and recovery requirements.
+
+The validated diagnostic image is source revision `1c6eb17a6954`, pinned to
+digest
+`sha256:a2325f44b3907c782656dbc15198c3806a427197f5404a969ba4732e8d0fab22`.
+To update an existing diagnostic VM, publish an image built from a committed
+revision, resolve its immutable digest, and run:
+
+```bash
+scripts/update-gce-binance-test-image IMAGE@sha256:DIGEST SOURCE_REVISION
+```
+
+This updates only the diagnostic VM metadata, pulls the pinned image through
+its dedicated service account, and reruns the startup setup over IAP. It does
+not restart or mutate the production trading VM.
+
 systemd owns the container and restarts it after a process failure. Docker uses
 host networking and forwards `SIGINT` for graceful shutdown. The service has a
 large file-descriptor limit, elevated scheduler priority, and a strongly

@@ -4,6 +4,8 @@ use anyhow::ensure;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use crate::balances::{BalanceSource, BinanceBalanceSnapshot, WalletBalanceSnapshot};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopOfBook {
     pub symbol: Arc<str>,
@@ -97,7 +99,54 @@ pub struct RuntimeState {
     pub phase: RuntimePhase,
     pub binance_feeds: HashMap<Arc<str>, BinanceFeedState>,
     pub processed_events: u64,
+    pub balances: BalanceState,
     ever_ready: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct BalanceState {
+    pub binance: Option<BinanceBalanceSnapshot>,
+    pub wallet: Option<WalletBalanceSnapshot>,
+    pub binance_failures: u64,
+    pub wallet_failures: u64,
+}
+
+impl BalanceState {
+    pub fn apply_binance(&mut self, snapshot: BinanceBalanceSnapshot) {
+        self.binance = Some(snapshot);
+    }
+
+    pub fn apply_wallet(&mut self, snapshot: WalletBalanceSnapshot) {
+        if self
+            .wallet
+            .as_ref()
+            .is_some_and(|current| current.block_number > snapshot.block_number)
+        {
+            return;
+        }
+        self.wallet = Some(snapshot);
+    }
+
+    pub fn record_failure(&mut self, source: BalanceSource) {
+        match source {
+            BalanceSource::Binance => self.binance_failures += 1,
+            BalanceSource::Wallet => self.wallet_failures += 1,
+        }
+    }
+
+    pub fn is_fresh(&self, now: Instant, max_age_ms: u64) -> bool {
+        self.binance.as_ref().is_some_and(|snapshot| {
+            snapshot.healthy()
+                && now
+                    .saturating_duration_since(snapshot.observed_at)
+                    .as_millis()
+                    <= u128::from(max_age_ms)
+        }) && self.wallet.as_ref().is_some_and(|snapshot| {
+            now.saturating_duration_since(snapshot.observed_at)
+                .as_millis()
+                <= u128::from(max_age_ms)
+        })
+    }
 }
 
 impl RuntimeState {
@@ -109,6 +158,7 @@ impl RuntimeState {
                 .map(|symbol| (symbol, BinanceFeedState::default()))
                 .collect(),
             processed_events: 0,
+            balances: BalanceState::default(),
             ever_ready: false,
         }
     }
@@ -202,11 +252,17 @@ impl RuntimeState {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
+    use alloy_primitives::{Address, B256, U256};
     use rust_decimal::Decimal;
 
-    use super::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook};
+    use crate::{
+        balances::{BalanceSource, BinanceBalanceSnapshot, WalletBalanceSnapshot},
+        chain::rpc::RpcStats,
+    };
+
+    use super::{BalanceState, QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook};
 
     fn quote(update_id: u64, generation: u64, received_at: std::time::Instant) -> TopOfBook {
         TopOfBook::new(
@@ -223,6 +279,65 @@ mod tests {
             generation,
         )
         .unwrap()
+    }
+
+    fn binance_balances(observed_at: std::time::Instant) -> BinanceBalanceSnapshot {
+        BinanceBalanceSnapshot {
+            account_update_time_ms: 1,
+            account_type: "SPOT".to_owned(),
+            can_trade: true,
+            balances: BTreeMap::new(),
+            observed_at,
+            request_duration_us: 1,
+        }
+    }
+
+    fn wallet_balances(
+        block_number: u64,
+        observed_at: std::time::Instant,
+    ) -> WalletBalanceSnapshot {
+        WalletBalanceSnapshot {
+            owner: Address::ZERO,
+            chain_id: 480,
+            block_number,
+            block_hash: B256::ZERO,
+            native_balance_wei: U256::ZERO,
+            token_balances: Vec::new(),
+            observed_at,
+            request_duration_us: 1,
+            rpc_stats: RpcStats {
+                http_requests: 1,
+                eth_calls: 0,
+                rate_limit_retries: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn balance_state_requires_both_fresh_healthy_sources() {
+        let now = std::time::Instant::now();
+        let mut balances = BalanceState::default();
+        assert!(!balances.is_fresh(now, 5_000));
+
+        balances.apply_binance(binance_balances(now));
+        assert!(!balances.is_fresh(now, 5_000));
+
+        balances.apply_wallet(wallet_balances(10, now));
+        assert!(balances.is_fresh(now + Duration::from_secs(5), 5_000));
+        assert!(!balances.is_fresh(now + Duration::from_millis(5_001), 5_000));
+
+        balances.record_failure(BalanceSource::Binance);
+        assert_eq!(balances.binance_failures, 1);
+        assert!(balances.binance.is_some());
+    }
+
+    #[test]
+    fn balance_state_ignores_regressed_wallet_snapshots() {
+        let now = std::time::Instant::now();
+        let mut balances = BalanceState::default();
+        balances.apply_wallet(wallet_balances(10, now));
+        balances.apply_wallet(wallet_balances(9, now + Duration::from_secs(1)));
+        assert_eq!(balances.wallet.unwrap().block_number, 10);
     }
 
     #[test]

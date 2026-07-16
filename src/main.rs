@@ -9,6 +9,9 @@ use arb_bot::{
         ValidatedNativeEthQuote, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
         validate_native_eth_deposit_status, validate_native_eth_quote, validate_quote,
     },
+    balances::{
+        BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
+    },
     binance::account::{BinanceAccountClient, BinanceAccountState},
     binance::capital::{
         CapitalRouteState, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
@@ -1174,11 +1177,16 @@ async fn run(
     config: config::AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
 ) -> anyhow::Result<()> {
-    let initialized_dex = initialize_dex(&config, domain_config.as_ref()).await?;
+    let InitializedDex {
+        mirror,
+        stream,
+        rpc: wallet_rpc,
+    } = initialize_dex(&config, domain_config.as_ref()).await?;
+    let initial_wallet_head = mirror.latest_head();
     let AlchemyDexStream {
         receiver: mut dex_receiver,
         task: mut dex_task,
-    } = initialized_dex.stream;
+    } = stream;
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
     let writer_task = tokio::spawn(writer.run());
     let binance_symbols = domain_config.binance_symbols();
@@ -1191,13 +1199,83 @@ async fn run(
     validate_binance_account(&binance_account)?;
     let mut binance_feed = BookTickerFeed::new(&config, binance_symbols[0].clone());
 
+    let pair = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.market_data_enabled)
+        .context("balance synchronization requires one enabled pair")?;
+    let wallet_address = config.evm_wallet_address.trim();
+    ensure!(
+        !wallet_address.is_empty(),
+        "run requires EVM_WALLET_ADDRESS"
+    );
+    let wallet_owner = wallet_address
+        .parse::<Address>()
+        .context("run requires a valid EVM_WALLET_ADDRESS")?;
+    let wallet_chain_id = wallet_rpc.chain_id().await?;
+    ensure!(
+        wallet_chain_id == pair.chain.chain_id,
+        "wallet RPC returned chain id {wallet_chain_id}, expected {}",
+        pair.chain.chain_id
+    );
+    let wallet_tokens = vec![
+        TokenBalanceRequest {
+            symbol: pair.token_a.symbol.clone(),
+            contract: pair
+                .token_a
+                .contract
+                .parse()
+                .context("configured token_a address is invalid")?,
+        },
+        TokenBalanceRequest {
+            symbol: pair.token_b.symbol.clone(),
+            contract: pair
+                .token_b
+                .contract
+                .parse()
+                .context("configured token_b address is invalid")?,
+        },
+    ];
+    let binance_assets = vec![
+        Arc::<str>::from(pair.binance.quote_asset.as_str()),
+        Arc::<str>::from(pair.binance.base_asset.as_str()),
+    ];
+    let initial_binance_balances = binance_snapshot(&binance_account.account, &binance_assets, 0);
+    let initial_wallet_balances = fetch_wallet_snapshot(
+        &wallet_rpc,
+        wallet_owner,
+        wallet_chain_id,
+        &wallet_tokens,
+        initial_wallet_head,
+    )
+    .await?;
+    let BalanceSync {
+        receiver: mut balance_receiver,
+        wallet_heads,
+        binance_task: mut binance_balance_task,
+        wallet_task: mut wallet_balance_task,
+    } = spawn_balance_sync(
+        binance_account_client,
+        binance_assets,
+        Duration::from_millis(config.balance_sync_interval_ms),
+        wallet_rpc,
+        wallet_owner,
+        wallet_chain_id,
+        wallet_tokens,
+        initial_wallet_head,
+        config.balance_event_channel_capacity,
+    );
+
     let (mut engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
-        initialized_dex.mirror,
+        mirror,
         telemetry,
     )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
+    engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances));
+    engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances));
     engine.start();
     let (prepared_sender, mut prepared_receiver, prepared_thread) =
         spawn_prepared_pool_builder(64)?;
@@ -1219,6 +1297,11 @@ async fn run(
         binance_standard_taker_fee = %binance_account.commission.standard_commission.taker,
         binance_wld_balance_present = binance_account.balance("WLD").is_some(),
         binance_usdc_balance_present = binance_account.balance("USDC").is_some(),
+        wallet_address = %wallet_owner,
+        wallet_chain_id,
+        balance_sync_interval_ms = config.balance_sync_interval_ms,
+        balance_max_age_ms = config.balance_max_age_ms,
+        wallet_sync_trigger = "alchemy_new_heads",
         clickhouse_enabled = config.clickhouse_enabled(),
         "read-only arbitrage shadow service started with authenticated Binance account state"
     );
@@ -1236,14 +1319,29 @@ async fn run(
             _ = &mut shutdown => break,
             _ = health_tick.tick() => engine.refresh_health(),
             event = binance_feed.next_event() => engine.on_market_event(event)?,
+            event = balance_receiver.recv() => {
+                let Some(event) = event else {
+                    bail!("balance synchronization channel stopped unexpectedly");
+                };
+                engine.on_balance_event(event);
+            }
             event = dex_receiver.recv() => {
                 let Some(event) = event else {
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
+                };
+                let wallet_head = match &event {
+                    arb_bot::market_data::alchemy::DexStreamEvent::Head { head, .. } => Some(*head),
+                    arb_bot::market_data::alchemy::DexStreamEvent::Log { .. } => None,
                 };
                 if let Some(request) = engine.on_dex_event(event)? {
                     prepared_sender
                         .try_send(request)
                         .context("prepared DEX builder queue is full or closed")?;
+                }
+                if let Some(head) = wallet_head
+                    && *wallet_heads.borrow() != head
+                {
+                    wallet_heads.send_replace(head);
                 }
             }
             result = prepared_receiver.recv() => {
@@ -1256,10 +1354,22 @@ async fn run(
                 result.context("Alchemy DEX connector task failed")??;
                 bail!("Alchemy DEX connector stopped; process restart will rehydrate state");
             }
+            result = &mut binance_balance_task => {
+                result.context("Binance balance synchronization task failed")??;
+                bail!("Binance balance synchronization stopped unexpectedly");
+            }
+            result = &mut wallet_balance_task => {
+                result.context("wallet balance synchronization task failed")??;
+                bail!("wallet balance synchronization stopped unexpectedly");
+            }
         }
     }
 
     engine.shutdown();
+    binance_balance_task.abort();
+    wallet_balance_task.abort();
+    let _ = binance_balance_task.await;
+    let _ = wallet_balance_task.await;
     dex_task.abort();
     let _ = dex_task.await;
     drop(engine);
@@ -1350,6 +1460,7 @@ fn spawn_prepared_pool_builder(
 struct InitializedDex {
     mirror: DexMirror,
     stream: AlchemyDexStream,
+    rpc: JsonRpcClient,
 }
 
 async fn initialize_dex(
@@ -1404,7 +1515,11 @@ async fn initialize_dex(
         rpc = ?rpc.stats(),
         "DEX mirror hydrated, backfilled, and subscribed"
     );
-    Ok(InitializedDex { mirror, stream })
+    Ok(InitializedDex {
+        mirror,
+        stream,
+        rpc,
+    })
 }
 
 fn chain_endpoints(domain_config: &LoadedDomainConfig) -> anyhow::Result<(String, String)> {

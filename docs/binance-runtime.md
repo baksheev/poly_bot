@@ -93,6 +93,43 @@ performance endpoints `api1` through `api4` from the production VM. Binance
 documents `api1` through `api4` as potentially faster but less stable, so they
 must never be the only recovery route.
 
+## Authenticated diagnostic boundary
+
+Run manual authenticated Binance reads through `arb-bot-binance-test`, not
+from a developer workstation and not by opening SSH on the production VM. Its
+static Singapore egress IP is `34.143.148.4` and must remain in the applicable
+Binance API-key IP whitelist. Direct internet SSH is blocked; the repository
+wrapper connects through IAP:
+
+```bash
+scripts/gce-binance-test binance-account
+scripts/gce-binance-test binance-capital
+scripts/gce-binance-test binance-recent-validation-orders --limit 20
+```
+
+The remote wrapper independently allowlists read-only subcommands. Do not add
+order, withdrawal, wallet, or bridge commands to it. A mutating canary requires
+its existing explicit cap, `--confirm-live`, deterministic recovery identity,
+and a separately reviewed execution path.
+
+The diagnostic VM uses a dedicated service account with access only to the
+Binance API key/secret and Artifact Registry image. Its currently validated
+image is source revision `1c6eb17a6954`, pinned to digest
+`sha256:a2325f44b3907c782656dbc15198c3806a427197f5404a969ba4732e8d0fab22`.
+Refresh the VM only with `scripts/update-gce-binance-test-image` and another
+digest-pinned image; never point it at a mutable tag.
+
+On 2026-07-16 the account check authenticated successfully as Spot with
+`canTrade=true`, hydrated the WLDUSDC commission, and reported exactly two
+nonzero balances with both WLD and USDC present. The capital check found WLD
+direct and Optimism routes available in both directions; USDC had no direct
+route and had Optimism available in both directions. These reads confirm
+funding and current capabilities, but they do not satisfy order-placement or
+rebalance recovery readiness gates. A read-only `allOrders` audit found no
+recent `rustval...` orders in this dedicated subaccount. Earlier MARKET canary
+orders were placed with pre-isolation credentials and must not be treated as
+execution evidence for the funded subaccount.
+
 ## Subaccount and rebalance boundary
 
 The production Rust subaccount should have:

@@ -26,6 +26,7 @@ set +a
 
 : "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
 : "${GCP_REGION:?GCP_REGION is required}"
+: "${EVM_WALLET_ADDRESS:?EVM_WALLET_ADDRESS is required}"
 
 gcloud_local="${repo_root}/scripts/gcloud-local"
 zone="${GCE_ZONE:-${GCP_REGION}-b}"
@@ -117,7 +118,7 @@ fi
   --boot-disk-size=20GB \
   --service-account="${runtime_service_account}" \
   --scopes=https://www.googleapis.com/auth/cloud-platform \
-  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION}" \
+  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS}" \
   --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh" \
   --shielded-secure-boot \
   --shielded-vtpm \

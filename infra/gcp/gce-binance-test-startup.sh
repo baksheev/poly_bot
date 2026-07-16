@@ -14,9 +14,7 @@ project_id="$(curl --fail --silent --show-error \
   --header "${metadata_header}" \
   "${metadata_root}/project/project-id")"
 image="$(metadata arb-bot-image)"
-engine_id="$(metadata arb-bot-engine-id)"
 region="$(metadata arb-bot-region)"
-wallet_address="$(metadata arb-bot-wallet-address)"
 
 token_response="$(curl --fail --silent --show-error \
   --header "${metadata_header}" \
@@ -43,42 +41,20 @@ fetch_secret() {
   printf '%s' "${encoded}" | base64 --decode
 }
 
-install -d -m 0700 /etc/arb-bot
-env_file=/etc/arb-bot/runtime.env
+install -d -m 0700 /var/lib/arb-bot-test
+env_file=/var/lib/arb-bot-test/binance.env
 umask 077
 {
-  printf 'SERVICE_NAME=arb-bot-rust-shadow\n'
-  printf 'ENGINE_ID=%s\n' "${engine_id}"
+  printf 'SERVICE_NAME=arb-bot-binance-test\n'
+  printf 'ENGINE_ID=arb-bot-binance-test\n'
   printf 'GCP_PROJECT_ID=%s\n' "${project_id}"
   printf 'GCP_REGION=%s\n' "${region}"
   printf 'BINANCE_WS_BASE_URL=wss://stream.binance.com:9443/ws\n'
   printf 'BINANCE_REST_BASE_URL=https://api.binance.com\n'
   printf 'BINANCE_WS_API_URL=wss://ws-api.binance.com:443/ws-api/v3\n'
   printf 'DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v2.json\n'
-  printf 'MARKET_DATA_MAX_AGE_MS=5000\n'
-  printf 'DEX_EVENT_CHANNEL_CAPACITY=8192\n'
-  printf 'DEX_HEAD_MAX_AGE_MS=10000\n'
-  printf 'BALANCE_SYNC_INTERVAL_MS=1000\n'
-  printf 'BALANCE_MAX_AGE_MS=5000\n'
-  printf 'BALANCE_EVENT_CHANNEL_CAPACITY=16\n'
-  printf 'EVM_WALLET_ADDRESS=%s\n' "${wallet_address}"
-  printf 'CLICKHOUSE_DATABASE=arb_bot_prod\n'
-  printf 'CLICKHOUSE_USER=default\n'
-  printf 'TELEMETRY_CHANNEL_CAPACITY=8192\n'
-  printf 'TELEMETRY_BATCH_SIZE=200\n'
-  printf 'TELEMETRY_FLUSH_INTERVAL_MS=100\n'
   printf 'RUST_LOG=arb_bot=info\n'
-  printf 'CLICKHOUSE_URL='
-  fetch_secret CLICKHOUSE_URL
-  printf '\nCLICKHOUSE_PASSWORD='
-  fetch_secret CLICKHOUSE_PASSWORD
-  printf '\nALCHEMY_WORLDCHAIN_RPC_URL='
-  fetch_secret ALCHEMY_WORLDCHAIN_RPC_URL
-  printf '\nALCHEMY_WORLDCHAIN_WS_URL='
-  fetch_secret ALCHEMY_WORLDCHAIN_WS_URL
-  printf '\nALCHEMY_OPTIMISM_RPC_URL='
-  fetch_secret ALCHEMY_OPTIMISM_RPC_URL
-  printf '\nBINANCE_API_KEY='
+  printf 'BINANCE_API_KEY='
   fetch_secret BINANCE_API_KEY
   printf '\nBINANCE_SECRET_KEY='
   fetch_secret BINANCE_SECRET_KEY
@@ -87,7 +63,7 @@ umask 077
 chmod 0600 "${env_file}"
 
 registry="${region}-docker.pkg.dev"
-export DOCKER_CONFIG=/run/arb-bot/docker
+export DOCKER_CONFIG=/run/arb-bot-test/docker
 install -d -m 0700 "${DOCKER_CONFIG}"
 printf '%s' "${access_token}" \
   | docker login --username oauth2accesstoken --password-stdin \
@@ -96,28 +72,29 @@ docker pull "${image}"
 docker logout "https://${registry}"
 rm -rf "${DOCKER_CONFIG}"
 
-cat >/etc/systemd/system/arb-bot.service <<EOF
-[Unit]
-Description=Low-latency read-only arbitrage shadow worker
-After=docker.service network-online.target
-Requires=docker.service
-Wants=network-online.target
+cat >/var/lib/arb-bot-test/arb-bot-test <<'EOF'
+#!/bin/bash
+set -euo pipefail
 
-[Service]
-Type=simple
-ExecStartPre=-/usr/bin/docker rm --force arb-bot-rust-shadow
-ExecStart=/usr/bin/docker run --rm --name arb-bot-rust-shadow --network host --stop-signal SIGINT --env-file ${env_file} --log-driver journald ${image} run
-ExecStop=/usr/bin/docker stop --time 20 arb-bot-rust-shadow
-Restart=always
-RestartSec=1
-TimeoutStopSec=30
-LimitNOFILE=1048576
-Nice=-10
-OOMScoreAdjust=-900
+case "${1:-}" in
+  binance-account|binance-capital|binance-recent-validation-orders|binance-withdrawal-status|binance-travel-rule-withdrawal-status)
+    ;;
+  *)
+    echo "only read-only Binance diagnostic commands are permitted" >&2
+    exit 2
+    ;;
+esac
 
-[Install]
-WantedBy=multi-user.target
+metadata_header="Metadata-Flavor: Google"
+metadata_url="http://metadata.google.internal/computeMetadata/v1/instance/attributes/arb-bot-image"
+image="$(curl --fail --silent --show-error --header "${metadata_header}" "${metadata_url}")"
+
+exec docker run --rm \
+  --network host \
+  --env-file /var/lib/arb-bot-test/binance.env \
+  "${image}" \
+  "$@"
 EOF
+chmod 0755 /var/lib/arb-bot-test/arb-bot-test
 
-systemctl daemon-reload
-systemctl enable --now arb-bot.service
+echo "Binance test VM is ready; use sudo /bin/bash /var/lib/arb-bot-test/arb-bot-test <read-only-command>"

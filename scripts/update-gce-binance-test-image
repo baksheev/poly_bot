@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+gcloud_local="${repo_root}/scripts/gcloud-local"
+region="${GCP_REGION:-asia-southeast1}"
+zone="${GCE_TEST_ZONE:-${region}-b}"
+instance="arb-bot-binance-test"
+image="${1:-}"
+source_revision="${2:-}"
+
+if [[ -z "${image}" || -z "${source_revision}" ]]; then
+  echo "usage: scripts/update-gce-binance-test-image IMAGE SOURCE_REVISION" >&2
+  exit 1
+fi
+if [[ ! "${image}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "IMAGE must be pinned by sha256 digest" >&2
+  exit 1
+fi
+if [[ ! "${source_revision}" =~ ^[a-z0-9-]{1,63}$ ]]; then
+  echo "SOURCE_REVISION must be a valid lowercase GCP label value" >&2
+  exit 1
+fi
+
+"${gcloud_local}" compute instances add-metadata "${instance}" \
+  --zone="${zone}" \
+  --metadata="arb-bot-image=${image}" \
+  --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-binance-test-startup.sh"
+"${gcloud_local}" compute instances add-labels "${instance}" \
+  --zone="${zone}" \
+  --labels="source-revision=${source_revision}"
+"${gcloud_local}" compute ssh "${instance}" \
+  --zone="${zone}" \
+  --tunnel-through-iap \
+  --command='sudo google_metadata_script_runner startup'
+
+echo "updated ${instance} to ${image}"

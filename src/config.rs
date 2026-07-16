@@ -147,6 +147,18 @@ pub struct AppConfig {
     #[arg(long, env = "DEX_HEAD_MAX_AGE_MS", default_value_t = 10_000)]
     pub dex_head_max_age_ms: u64,
 
+    #[arg(long, env = "BALANCE_SYNC_INTERVAL_MS", default_value_t = 1_000)]
+    pub balance_sync_interval_ms: u64,
+
+    #[arg(long, env = "BALANCE_MAX_AGE_MS", default_value_t = 5_000)]
+    pub balance_max_age_ms: u64,
+
+    #[arg(long, env = "BALANCE_EVENT_CHANNEL_CAPACITY", default_value_t = 16)]
+    pub balance_event_channel_capacity: usize,
+
+    #[arg(long, env = "EVM_WALLET_ADDRESS", default_value = "")]
+    pub evm_wallet_address: String,
+
     #[arg(long, env = "CLICKHOUSE_URL", default_value = "")]
     pub clickhouse_url: String,
 
@@ -188,6 +200,23 @@ impl AppConfig {
             self.dex_head_max_age_ms > 0,
             "DEX_HEAD_MAX_AGE_MS must be greater than zero"
         );
+        ensure!(
+            self.balance_sync_interval_ms > 0,
+            "BALANCE_SYNC_INTERVAL_MS must be greater than zero"
+        );
+        ensure!(
+            self.balance_max_age_ms > self.balance_sync_interval_ms,
+            "BALANCE_MAX_AGE_MS must be greater than BALANCE_SYNC_INTERVAL_MS"
+        );
+        ensure!(
+            self.balance_event_channel_capacity > 0,
+            "BALANCE_EVENT_CHANNEL_CAPACITY must be greater than zero"
+        );
+        if !self.evm_wallet_address.trim().is_empty() {
+            self.evm_wallet_address
+                .parse::<alloy_primitives::Address>()
+                .context("EVM_WALLET_ADDRESS is invalid")?;
+        }
         ensure!(
             self.telemetry_channel_capacity > 0,
             "TELEMETRY_CHANNEL_CAPACITY must be greater than zero"
@@ -336,6 +365,10 @@ mod tests {
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,
             dex_head_max_age_ms: 10_000,
+            balance_sync_interval_ms: 1_000,
+            balance_max_age_ms: 5_000,
+            balance_event_channel_capacity: 16,
+            evm_wallet_address: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "arb_bot".into(),
             clickhouse_user: "default".into(),
@@ -378,5 +411,15 @@ mod tests {
         config.across_api_base_url = "https://example.com/api".into();
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_configured_public_wallet_address() {
+        let mut config = config();
+        config.evm_wallet_address = "not-an-address".into();
+        assert!(config.validate().is_err());
+
+        config.evm_wallet_address = "0x90D990C81320221D2882De32beeA78923c1e77A3".into();
+        config.validate().unwrap();
     }
 }
