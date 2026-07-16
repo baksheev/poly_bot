@@ -147,9 +147,11 @@ from the isolated subaccount. It is loaded by the cold-path rebalance owner
 only and is never accepted by an order client. The master first performs a
 deterministically identified Universal Transfer from subaccount Spot to master
 Spot, then submits the external withdrawal. Withdrawal-address whitelisting is
-required if the Binance account supports it. Runtime capability discovery must
-fail closed if the master cannot resolve the configured subaccount, transfer
-from it, or withdraw externally.
+required if the Binance account supports it. Both the Binance API-key flags
+`enableInternalTransfer` and `permitsUniversalTransfer` must be enabled; they
+are distinct capabilities. Runtime capability discovery must fail closed if
+the master cannot resolve the configured subaccount, transfer from it, or
+withdraw externally.
 
 The same in-process owner serializes DEX and rebalance wallet nonces. The
 initial safe implementation pauses new entries before reserving a rebalance

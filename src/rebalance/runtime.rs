@@ -158,6 +158,10 @@ impl RebalanceExecutor {
             "Binance master treasury key does not permit withdrawals"
         );
         ensure!(
+            treasury_permissions.enable_internal_transfer,
+            "Binance master treasury key does not permit internal transfers"
+        );
+        ensure!(
             treasury_permissions.permits_universal_transfer,
             "Binance master treasury key does not permit universal transfers"
         );

@@ -75,7 +75,7 @@ signer, both durable journals, positive per-token caps, and the exact
 `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE` acknowledgement.
 Before opening either journal, startup verifies the trading key has reading and
 IP-restriction permissions, the master treasury key has reading, withdrawal,
-Universal Transfer, and IP-restriction permissions through
+Internal Transfer, Universal Transfer, and IP-restriction permissions through
 `account/apiRestrictions`, and the master key reports the same WLD/USDC
 subaccount balances as the trading key. Account-level `canWithdraw` alone is
 insufficient.

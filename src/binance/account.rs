@@ -327,6 +327,8 @@ pub struct ApiKeyPermissions {
     pub enable_reading: bool,
     pub enable_withdrawals: bool,
     #[serde(default)]
+    pub enable_internal_transfer: bool,
+    #[serde(default)]
     pub permits_universal_transfer: bool,
     #[serde(default)]
     pub enable_spot_and_margin_trading: bool,
@@ -520,13 +522,14 @@ mod tests {
     #[test]
     fn parses_withdrawal_and_ip_restriction_permissions() {
         let permissions: ApiKeyPermissions = serde_json::from_str(
-            r#"{"ipRestrict":true,"enableReading":true,"enableWithdrawals":false,"permitsUniversalTransfer":true,"enableSpotAndMarginTrading":true}"#,
+            r#"{"ipRestrict":true,"enableReading":true,"enableWithdrawals":false,"enableInternalTransfer":true,"permitsUniversalTransfer":true,"enableSpotAndMarginTrading":true}"#,
         )
         .unwrap();
 
         assert!(permissions.ip_restrict);
         assert!(permissions.enable_reading);
         assert!(!permissions.enable_withdrawals);
+        assert!(permissions.enable_internal_transfer);
         assert!(permissions.permits_universal_transfer);
         assert!(permissions.enable_spot_and_margin_trading);
     }
