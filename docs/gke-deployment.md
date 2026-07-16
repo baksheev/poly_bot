@@ -14,10 +14,11 @@ is pinned to the active release pool with a node selector.
 
 Steady state contains one application Pod, one node, and one node pool. For a
 release, GitHub Actions explicitly creates a new one-node pool named from the
-tested source SHA, points the new Deployment revision to that pool, and waits
-for the process to finish startup hydration and remain Ready for 20 seconds.
-Only then does it delete the previous pool. Two nodes exist only during this
-controlled replacement; there is no utilization-driven scaling.
+tested source SHA. The Deployment uses `Recreate`: the previous process must
+terminate before the replacement can attach the single-writer persistent disk
+and start. After startup recovery and hydration remain Ready for 20 seconds,
+the workflow deletes the previous pool. Two nodes can exist during replacement,
+but never two application processes.
 
 The runtime has Guaranteed QoS with equal requests and limits of six exclusive
 CPUs and 10 GiB memory. A C4-8 node exposes about 7.91 CPUs and 12.96 GiB as
@@ -30,10 +31,9 @@ is deleted. If old-pool cleanup fails after a successful rollout, the healthy
 new revision remains active and a later workflow retry removes orphaned
 `arb-*` pools.
 
-This overlap is safe only while the service is read-only. Before live execution
-is enabled, add an explicit ownership/fencing protocol or use a non-overlapping
-rollout. Kubernetes availability does not by itself prevent two processes from
-using the same Binance account, wallet, or nonce space.
+The zonal ReadWriteOnce disk stores the durable rebalance journal and provides
+a second single-writer boundary. Recreate rollout plus the journal file lock
+prevent two processes from owning the same canary operation.
 
 ## Networking and secrets
 
@@ -106,8 +106,9 @@ started manually from `main`.
 8. deletes every previous release/bootstrap pool only after success;
 9. restores the previous Deployment and deletes the new pool on failure.
 
-`maxUnavailable: 0` keeps the old healthy Pod alive while the replacement is
-Pending or failing. No Cluster Autoscaler participates in the release.
+Live-capable releases accept deployment downtime: preserving single ownership
+is more important than overlap availability. No Cluster Autoscaler participates
+in the release.
 
 Every operator-visible release must update `CHANGELOG.md`. GitHub Actions also
 records the source SHA, digest, cluster, and zone in the workflow summary;

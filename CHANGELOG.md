@@ -6,6 +6,32 @@ the exact artifact used by each rollout.
 
 ## [Unreleased]
 
+### Added
+
+- Reusable EVM wallet primitives for canonical-block balance and allowance
+  hydration, latest/pending nonce observation, native and ERC-20 transfer or
+  approval calls, checked EIP-1559 signing, and hash-verified broadcast. The
+  explicitly gated Across native-ETH canary now uses the shared wallet API;
+  autonomous live execution remains disabled.
+- A single-owner EVM nonce lane and checksummed, fsynced JSONL transaction
+  journal preserve intent, signed hash, broadcast, unknown outcome, and mined
+  state across restart. Rails wallet regressions for duplicate nonces,
+  `already known`, receipt timeout, and premature reservation release are
+  covered by Rust failure tests.
+- Conservative startup reconciliation for unresolved EVM operations. Matching
+  receipts close the journaled operation; pending transactions must match the
+  full journaled identity and call, while absent, replaced, or unsigned cases
+  keep the nonce lane blocked for review.
+- A read-only Binance capital recovery snapshot hydrates an exact EVM deposit
+  address plus optional Travel Rule deposit and withdrawal evidence. It uses
+  decimal arithmetic, typed statuses, transaction-hash matching, and local
+  deterministic `withdrawOrderId` matching without submitting mutations.
+- A one-shot production direct-WLD rebalance canary reserves at most 1 WLD in a
+  checksummed fsynced journal, submits one deterministic Binance withdrawal,
+  recovers it through withdrawal history, and completes only after the World
+  Chain wallet balance increases. GKE now uses a Recreate rollout and a zonal
+  ReadWriteOnce journal disk so live-capable revisions never overlap.
+
 ## [0.2.0] - 2026-07-16
 
 ### Added

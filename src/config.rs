@@ -27,6 +27,17 @@ pub enum Command {
     BinanceAccount,
     /// Hydrate sanitized Binance direct and Optimism fallback network state.
     BinanceCapital,
+    /// Hydrate one EVM deposit address and optional deposit/withdrawal recovery evidence.
+    BinanceCapitalRecovery {
+        #[arg(long)]
+        coin: String,
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        deposit_transaction_hash: Option<String>,
+        #[arg(long)]
+        withdraw_order_id: Option<String>,
+    },
     /// Perform a capped live WLDUSDC MARKET buy/sell validation over WebSocket API.
     BinanceManualRoundTrip {
         #[arg(long)]
@@ -156,6 +167,19 @@ pub struct AppConfig {
     #[arg(long, env = "BALANCE_EVENT_CHANNEL_CAPACITY", default_value_t = 16)]
     pub balance_event_channel_capacity: usize,
 
+    #[arg(long, env = "REBALANCE_EXECUTION_MODE", default_value = "disabled")]
+    pub rebalance_execution_mode: String,
+
+    #[arg(long, env = "REBALANCE_CANARY_WLD_AMOUNT", default_value = "1")]
+    pub rebalance_canary_wld_amount: rust_decimal::Decimal,
+
+    #[arg(
+        long,
+        env = "REBALANCE_JOURNAL_PATH",
+        default_value = "/var/lib/arb-bot/rebalance-canary.jsonl"
+    )]
+    pub rebalance_journal_path: PathBuf,
+
     #[arg(long, env = "EVM_WALLET_ADDRESS", default_value = "")]
     pub evm_wallet_address: String,
 
@@ -211,6 +235,22 @@ impl AppConfig {
         ensure!(
             self.balance_event_channel_capacity > 0,
             "BALANCE_EVENT_CHANNEL_CAPACITY must be greater than zero"
+        );
+        ensure!(
+            matches!(
+                self.rebalance_execution_mode.as_str(),
+                "disabled" | "direct_wld_canary"
+            ),
+            "REBALANCE_EXECUTION_MODE must be disabled or direct_wld_canary"
+        );
+        ensure!(
+            self.rebalance_canary_wld_amount > rust_decimal::Decimal::ZERO
+                && self.rebalance_canary_wld_amount <= rust_decimal::Decimal::ONE,
+            "REBALANCE_CANARY_WLD_AMOUNT must be positive and no more than 1 WLD"
+        );
+        ensure!(
+            !self.rebalance_journal_path.as_os_str().is_empty(),
+            "REBALANCE_JOURNAL_PATH is empty"
         );
         if !self.evm_wallet_address.trim().is_empty() {
             self.evm_wallet_address
@@ -368,6 +408,9 @@ mod tests {
             balance_sync_interval_ms: 1_000,
             balance_max_age_ms: 5_000,
             balance_event_channel_capacity: 16,
+            rebalance_execution_mode: "disabled".into(),
+            rebalance_canary_wld_amount: rust_decimal::Decimal::ONE,
+            rebalance_journal_path: "/tmp/rebalance-canary.jsonl".into(),
             evm_wallet_address: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "arb_bot".into(),

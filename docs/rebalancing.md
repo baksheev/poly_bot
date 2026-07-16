@@ -1,6 +1,6 @@
 # Autonomous rebalance design
 
-Status: continuous paper planner integrated; all external mutations disabled
+Status: continuous planner integrated; one-shot production direct-WLD canary enabled in GKE
 Last reviewed: 2026-07-16
 
 ## Ownership and safety boundary
@@ -55,6 +55,75 @@ snapshot changes. It emits `rebalance_plan_evaluated` telemetry in `paper` mode.
 When an action is required or planning fails, the normal readiness gate closes,
 so new trading cannot start while inventory is unsafe. No transfer, approval,
 bridge, withdrawal, signing, or other external mutation is submitted.
+
+The first production execution slice is deliberately narrower than the full
+planner. `direct_wld_canary` permits exactly one Binance-to-World-Chain WLD
+withdrawal, capped at 1 WLD. It does not execute USDC, Across,
+wallet-to-Binance, or a second WLD operation. Those plans remain fail-closed
+and observable.
+
+## Wallet primitive
+
+The reusable wallet layer now provides the cold-path subset needed by a future
+rebalance executor:
+
+- canonical-block hydration of native balance, ERC-20 balances, and requested
+  allowances through a process-scoped RPC client;
+- both latest and pending nonces, with an explicit unresolved-pending signal;
+- validated native transfer, exact ERC-20 `transfer`, exact ERC-20 `approve`,
+  and protocol-validated contract-call construction;
+- an unsigned RPC call representation for mandatory simulation and gas
+  estimation before signing;
+- checked maximum native-cost calculation and validated EIP-1559 chain, nonce,
+  gas, and fee fields;
+- redacted local signing, deterministic transaction hash calculation, and a
+  broadcast helper that rejects an RPC-returned hash mismatch.
+
+The existing explicitly gated Across native-ETH canary uses this shared API.
+The autonomous runtime still loads only the public wallet address and does not
+load signing credentials. The canary now also requires a durable journal and
+uses the nonce lane state machine. On startup it automatically queries a known
+unresolved hash: a matching receipt durably closes the operation, while a
+transaction without a receipt is accepted only after chain, sender, nonce,
+target, value, and calldata hash match the journaled intent. Missing, replaced,
+or unsigned operations remain blocked for operator review. Inventory
+reservations, deployment fencing, deposit-address verification, and the
+autonomous executor are still required before rebalance actions may mutate
+external state. The Rails failure-mode review is recorded in
+[Rails wallet failure lessons](rails-wallet-parity.md).
+
+Explicitly gated mutation commands require `EVM_WALLET_JOURNAL_PATH`. Its
+parent directory must already exist; a new journal is created with mode `0600`
+on Unix, existing group/world-readable files are rejected, and an exclusive OS
+file lock prevents a second local process from owning the same journal.
+
+## Binance capital recovery hydrator
+
+The read-only Binance capital hydrator now retrieves and validates:
+
+- the exact enabled default EVM deposit address for one coin and network;
+- Travel Rule deposit history by EVM transaction hash;
+- capital withdrawal history, matched locally by the deterministic
+  `withdrawOrderId` rather than the unrelated Travel Rule submission ID;
+- exact decimal amounts and fees plus typed deposit and withdrawal states.
+
+It intentionally preserves two Rails recovery lessons: deposit transaction
+hashes are compared case-insensitively, and deposit status `6` is credited even
+though Binance still prevents withdrawal. Missing history remains "not indexed
+yet" evidence and never proves failure. Duplicate records, a mismatched
+coin/network, an ambiguous or tagged deposit address, malformed hashes, and
+non-EVM addresses fail closed. See
+[Rails Binance capital failure lessons](rails-binance-capital-parity.md).
+
+The diagnostic command performs only signed GET requests:
+
+```bash
+cargo run -- binance-capital-recovery \
+  --coin USDC \
+  --network OPTIMISM \
+  --deposit-transaction-hash 0x... \
+  --withdraw-order-id rustwd123
+```
 
 The production Rails configuration captured on 2026-07-16 for World Chain
 pair `WLDUSDC` (pair id 3) is:
@@ -151,15 +220,28 @@ planning anything new.
 This durability cost does not affect opportunity detection or order latency;
 it is paid only by the cold rebalance path.
 
+The direct-WLD canary uses a checksummed append-only JSONL journal on a zonal
+ReadWriteOnce persistent disk. It fsyncs the operation identity, amount,
+destination, and deterministic `withdrawOrderId` before calling Binance. A
+restart reconciles history first. If an intent exists but Binance has not yet
+indexed a matching withdrawal, the runtime stops for operator review and never
+blindly resubmits. Completion requires both Binance status `6` with a
+transaction ID and the expected World Chain wallet balance increase.
+
 ## Delivery phases
 
 1. Pure planner and parity tests — implemented.
 2. Continuous balance integration, startup-derived thresholds, live Binance
    network capability hydration, paper plans, and readiness gating — implemented.
-3. Read-only hydrator for gas, deposit address, deposit history, and withdrawal
-   history.
-4. Persistent operation journal and startup recovery.
-5. Paper executor that validates generated routes and calldata without signing.
-6. Direct WLD transfers behind a separate explicit live gate.
-7. Across USDC route behind its own explicit live gate.
-8. Rebalance soak test, failure injection, and only then trading integration.
+3. Reusable wallet hydration, call construction, signing, and checked broadcast
+   primitives — implemented; autonomous runtime signing remains disabled.
+4. Read-only hydrator for deposit address, deposit history, and withdrawal
+   history — implemented with a diagnostic recovery command.
+5. Checksummed fsynced operation journal and per-chain nonce lane — implemented
+   and used by the gated EVM canary, including conservative startup
+   reconciliation of unresolved transaction hashes.
+6. Paper executor that validates generated routes and calldata without signing.
+7. One-shot direct WLD Binance-to-wallet transfer behind a capped production
+   gate — implemented; general direct rebalancing remains disabled.
+8. Across USDC route behind its own explicit live gate.
+9. Rebalance soak test, failure injection, and only then trading integration.

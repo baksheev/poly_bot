@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use alloy_primitives::{Address, B256};
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -27,6 +28,97 @@ impl BinanceAccountClient {
         select_capital_routes(&coins, coin, direct_network, fallback_network)
     }
 
+    pub async fn hydrate_capital_recovery(
+        &mut self,
+        coin: &str,
+        network: &str,
+        deposit_transaction_hash: Option<&str>,
+        withdraw_order_id: Option<&str>,
+    ) -> anyhow::Result<CapitalRecoverySnapshot> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        self.synchronize_clock().await?;
+        let deposit_address = self.evm_deposit_address(coin, network).await?;
+        let deposits = match deposit_transaction_hash {
+            Some(hash) => self.deposit_history(coin, hash).await?,
+            None => Vec::new(),
+        };
+        ensure!(
+            deposits.iter().all(|deposit| deposit.coin == coin),
+            "Binance deposit history returned a different coin"
+        );
+        ensure!(
+            deposits.iter().all(|deposit| deposit.network == network),
+            "Binance deposit history returned a different network"
+        );
+        let withdrawals = match withdraw_order_id {
+            Some(order_id) => self.withdrawal_history(coin, order_id).await?,
+            None => Vec::new(),
+        };
+        ensure!(
+            withdrawals.iter().all(|withdrawal| withdrawal.coin == coin),
+            "Binance withdrawal history returned a different coin"
+        );
+        ensure!(
+            withdrawals
+                .iter()
+                .all(|withdrawal| withdrawal.network == network),
+            "Binance withdrawal history returned a different network"
+        );
+        Ok(CapitalRecoverySnapshot {
+            coin: coin.to_owned(),
+            network: network.to_owned(),
+            deposit_address,
+            deposits,
+            withdrawals,
+        })
+    }
+
+    pub async fn evm_deposit_address(
+        &self,
+        coin: &str,
+        network: &str,
+    ) -> anyhow::Result<EvmDepositAddress> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("network", network.to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let addresses: Vec<DepositAddressRecord> = self
+            .signed_get(
+                "/sapi/v1/capital/deposit/address/list",
+                &query,
+                "deposit address list",
+            )
+            .await?;
+        select_evm_deposit_address(&addresses, coin, network)
+    }
+
+    pub async fn deposit_history(
+        &self,
+        coin: &str,
+        transaction_hash: &str,
+    ) -> anyhow::Result<Vec<DepositRecord>> {
+        validate_symbol("coin", coin)?;
+        let expected_hash = validate_evm_transaction_hash(transaction_hash)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("txId", transaction_hash.to_owned()),
+            ("retrieveQuestionnaire", "true".to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let records: Vec<DepositRecord> = self
+            .signed_get(
+                "/sapi/v2/localentity/deposit/history",
+                &query,
+                "Travel Rule deposit history",
+            )
+            .await?;
+        matching_deposits(records, coin, expected_hash)
+    }
+
     pub async fn withdraw(
         &self,
         coin: &str,
@@ -44,14 +136,7 @@ impl BinanceAccountClient {
             "Binance withdrawal address must be an EVM address"
         );
         ensure!(amount > Decimal::ZERO, "withdrawal amount must be positive");
-        ensure!(
-            !withdraw_order_id.is_empty()
-                && withdraw_order_id.len() <= 64
-                && withdraw_order_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric()),
-            "withdrawal client id is invalid"
-        );
+        validate_withdraw_order_id(withdraw_order_id)?;
         let query = self.signed_query(&[
             ("coin", coin.to_owned()),
             ("address", address.to_owned()),
@@ -83,17 +168,17 @@ impl BinanceAccountClient {
         withdraw_order_id: &str,
     ) -> anyhow::Result<Vec<WithdrawalRecord>> {
         validate_symbol("coin", coin)?;
-        let query = self.signed_query(&[
-            ("coin", coin.to_owned()),
-            ("withdrawOrderId", withdraw_order_id.to_owned()),
-            ("recvWindow", "5000".to_owned()),
-        ])?;
-        self.signed_get(
-            "/sapi/v1/capital/withdraw/history",
-            &query,
-            "withdrawal history",
-        )
-        .await
+        validate_withdraw_order_id(withdraw_order_id)?;
+        let query =
+            self.signed_query(&[("coin", coin.to_owned()), ("recvWindow", "5000".to_owned())])?;
+        let records: Vec<WithdrawalRecord> = self
+            .signed_get(
+                "/sapi/v1/capital/withdraw/history",
+                &query,
+                "withdrawal history",
+            )
+            .await?;
+        matching_withdrawals(records, coin, withdraw_order_id)
     }
 
     pub async fn travel_rule_withdrawal_history(
@@ -111,6 +196,134 @@ impl BinanceAccountClient {
             "Travel Rule withdrawal history",
         )
         .await
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapitalRecoverySnapshot {
+    pub coin: String,
+    pub network: String,
+    pub deposit_address: EvmDepositAddress,
+    pub deposits: Vec<DepositRecord>,
+    pub withdrawals: Vec<WithdrawalRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvmDepositAddress {
+    pub coin: String,
+    pub network: String,
+    pub address: Address,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DepositAddressRecord {
+    coin: String,
+    address: String,
+    network: String,
+    #[serde(default)]
+    tag: String,
+    deposit_enable: bool,
+    is_default: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositRecord {
+    #[serde(alias = "tranId")]
+    pub deposit_id: String,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub amount: Decimal,
+    pub network: String,
+    pub coin: String,
+    pub deposit_status: u8,
+    #[serde(default, alias = "travelRuleStatus")]
+    pub travel_rule_req_status: Option<u8>,
+    pub address: String,
+    #[serde(default)]
+    pub address_tag: String,
+    pub tx_id: String,
+    pub insert_time: u64,
+    #[serde(default)]
+    pub transfer_type: Option<u8>,
+    #[serde(default)]
+    pub confirm_times: String,
+    #[serde(default)]
+    pub require_questionnaire: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepositCreditState {
+    Pending,
+    Credited,
+    CreditedWithdrawalLocked,
+    Unknown(u8),
+}
+
+impl DepositRecord {
+    pub fn credit_state(&self) -> DepositCreditState {
+        match self.deposit_status {
+            0 => DepositCreditState::Pending,
+            1 => DepositCreditState::Credited,
+            6 => DepositCreditState::CreditedWithdrawalLocked,
+            status => DepositCreditState::Unknown(status),
+        }
+    }
+
+    pub fn is_credited(&self) -> bool {
+        matches!(
+            self.credit_state(),
+            DepositCreditState::Credited | DepositCreditState::CreditedWithdrawalLocked
+        )
+    }
+
+    pub fn questionnaire_required(&self) -> bool {
+        self.require_questionnaire && self.travel_rule_req_status != Some(0)
+    }
+}
+
+impl DepositCreditState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Credited => "credited",
+            Self::CreditedWithdrawalLocked => "credited_withdrawal_locked",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WithdrawalState {
+    EmailSent,
+    Cancelled,
+    AwaitingApproval,
+    Rejected,
+    Processing,
+    Failed,
+    Completed,
+    Unknown(u8),
+}
+
+impl WithdrawalState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::Rejected | Self::Failed | Self::Completed
+        )
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EmailSent => "email_sent",
+            Self::Cancelled => "cancelled",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Rejected => "rejected",
+            Self::Processing => "processing",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+            Self::Unknown(_) => "unknown",
+        }
     }
 }
 
@@ -151,7 +364,7 @@ pub struct TravelRuleWithdrawalRecord {
     pub info: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WithdrawalRecord {
     pub id: String,
@@ -169,6 +382,106 @@ pub struct WithdrawalRecord {
     pub withdraw_order_id: String,
     #[serde(default)]
     pub info: String,
+}
+
+impl WithdrawalRecord {
+    pub fn state(&self) -> WithdrawalState {
+        match self.status {
+            0 => WithdrawalState::EmailSent,
+            1 => WithdrawalState::Cancelled,
+            2 => WithdrawalState::AwaitingApproval,
+            3 => WithdrawalState::Rejected,
+            4 => WithdrawalState::Processing,
+            5 => WithdrawalState::Failed,
+            6 => WithdrawalState::Completed,
+            status => WithdrawalState::Unknown(status),
+        }
+    }
+}
+
+fn select_evm_deposit_address(
+    records: &[DepositAddressRecord],
+    coin: &str,
+    network: &str,
+) -> anyhow::Result<EvmDepositAddress> {
+    let enabled = records
+        .iter()
+        .filter(|record| record.coin == coin && record.network == network && record.deposit_enable)
+        .collect::<Vec<_>>();
+    ensure!(
+        !enabled.is_empty(),
+        "Binance has no enabled deposit address for {coin} on {network}"
+    );
+    let defaults = enabled
+        .iter()
+        .copied()
+        .filter(|record| record.is_default)
+        .collect::<Vec<_>>();
+    let selected = match defaults.as_slice() {
+        [selected] => *selected,
+        [] if enabled.len() == 1 => enabled[0],
+        [] => anyhow::bail!("Binance returned multiple deposit addresses without one default"),
+        _ => anyhow::bail!("Binance returned multiple default deposit addresses"),
+    };
+    ensure!(
+        selected.tag.is_empty(),
+        "Binance EVM deposit address unexpectedly requires a tag"
+    );
+    let address = selected
+        .address
+        .parse::<Address>()
+        .context("Binance deposit address is not an EVM address")?;
+    ensure!(address != Address::ZERO, "Binance deposit address is zero");
+    Ok(EvmDepositAddress {
+        coin: selected.coin.clone(),
+        network: selected.network.clone(),
+        address,
+    })
+}
+
+fn matching_deposits(
+    records: Vec<DepositRecord>,
+    coin: &str,
+    expected_hash: B256,
+) -> anyhow::Result<Vec<DepositRecord>> {
+    let mut matching = Vec::new();
+    for record in records {
+        ensure!(
+            record.amount > Decimal::ZERO,
+            "Binance deposit amount is not positive"
+        );
+        let transaction_hash = validate_evm_transaction_hash(&record.tx_id)
+            .context("Binance deposit history contains an invalid transaction hash")?;
+        if transaction_hash == expected_hash {
+            ensure!(record.coin == coin, "Binance deposit history coin mismatch");
+            matching.push(record);
+        }
+    }
+    ensure!(
+        matching.len() <= 1,
+        "Binance returned duplicate deposits for one transaction hash"
+    );
+    Ok(matching)
+}
+
+fn matching_withdrawals(
+    records: Vec<WithdrawalRecord>,
+    coin: &str,
+    withdraw_order_id: &str,
+) -> anyhow::Result<Vec<WithdrawalRecord>> {
+    let matching = records
+        .into_iter()
+        .filter(|record| record.withdraw_order_id == withdraw_order_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        matching.len() <= 1,
+        "Binance returned duplicate withdrawals for one client id"
+    );
+    ensure!(
+        matching.iter().all(|record| record.coin == coin),
+        "Binance withdrawal history coin mismatch"
+    );
+    Ok(matching)
 }
 
 pub fn select_capital_routes(
@@ -301,6 +614,24 @@ fn validate_symbol(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_withdraw_order_id(value: &str) -> anyhow::Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 64
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "withdrawal client id is invalid"
+    );
+    Ok(())
+}
+
+fn validate_evm_transaction_hash(value: &str) -> anyhow::Result<B256> {
+    let hash = value
+        .parse::<B256>()
+        .context("EVM transaction hash is invalid")?;
+    ensure!(hash != B256::ZERO, "EVM transaction hash is zero");
+    Ok(hash)
+}
+
 fn deserialize_decimal<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -311,9 +642,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::{Address, B256};
+
     use super::{
-        CoinInformation, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
-        WithdrawalSubmission, select_capital_routes,
+        CoinInformation, DepositAddressRecord, DepositCreditState, DepositRecord,
+        NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord, WithdrawalState,
+        WithdrawalSubmission, matching_deposits, matching_withdrawals, select_capital_routes,
+        select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -442,5 +777,119 @@ mod tests {
         assert!(state.direct_deposit_available());
         assert!(state.fallback_withdrawal_available());
         assert!(state.fallback_deposit_available());
+    }
+
+    #[test]
+    fn selects_the_exact_enabled_default_evm_deposit_address() {
+        let records: Vec<DepositAddressRecord> = serde_json::from_str(
+            r#"[
+              {"coin":"USDC","address":"0x1111111111111111111111111111111111111111",
+               "network":"ETH","tag":"","depositEnable":true,"isDefault":true},
+              {"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
+               "network":"OPTIMISM","tag":"","depositEnable":true,"isDefault":true}
+            ]"#,
+        )
+        .unwrap();
+
+        let selected = select_evm_deposit_address(&records, "USDC", "OPTIMISM").unwrap();
+        assert_eq!(selected.coin, "USDC");
+        assert_eq!(selected.network, "OPTIMISM");
+        assert_eq!(selected.address, Address::repeat_byte(0x22));
+    }
+
+    #[test]
+    fn rejects_disabled_ambiguous_tagged_or_non_evm_deposit_addresses() {
+        let disabled: Vec<DepositAddressRecord> = serde_json::from_str(
+            r#"[{"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
+                 "network":"OPTIMISM","tag":"","depositEnable":false,"isDefault":true}]"#,
+        )
+        .unwrap();
+        assert!(select_evm_deposit_address(&disabled, "USDC", "OPTIMISM").is_err());
+
+        let ambiguous: Vec<DepositAddressRecord> = serde_json::from_str(
+            r#"[
+              {"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
+               "network":"OPTIMISM","tag":"","depositEnable":true,"isDefault":false},
+              {"coin":"USDC","address":"0x3333333333333333333333333333333333333333",
+               "network":"OPTIMISM","tag":"","depositEnable":true,"isDefault":false}
+            ]"#,
+        )
+        .unwrap();
+        assert!(select_evm_deposit_address(&ambiguous, "USDC", "OPTIMISM").is_err());
+
+        let tagged: Vec<DepositAddressRecord> = serde_json::from_str(
+            r#"[{"coin":"USDC","address":"0x2222222222222222222222222222222222222222",
+                 "network":"OPTIMISM","tag":"memo","depositEnable":true,"isDefault":true}]"#,
+        )
+        .unwrap();
+        assert!(select_evm_deposit_address(&tagged, "USDC", "OPTIMISM").is_err());
+
+        let invalid: Vec<DepositAddressRecord> = serde_json::from_str(
+            r#"[{"coin":"USDC","address":"not-an-address","network":"OPTIMISM",
+                 "tag":"","depositEnable":true,"isDefault":true}]"#,
+        )
+        .unwrap();
+        assert!(select_evm_deposit_address(&invalid, "USDC", "OPTIMISM").is_err());
+    }
+
+    #[test]
+    fn parses_travel_rule_deposit_status_without_floating_point() {
+        let record: DepositRecord = serde_json::from_str(
+            r#"{
+              "depositId":"4615328107052018946","amount":"10.50","network":"OPTIMISM",
+              "coin":"USDC","depositStatus":6,"travelRuleReqStatus":3,
+              "address":"0x64d62673799a8dc69825ff1cc0d624b1065dab39","addressTag":"",
+              "txId":"0x519f3a47cec440e3bff25d069785a8c3d07911d774316dcde0701b3dcd90c343",
+              "transferType":0,"confirmTimes":"2/1","requireQuestionnaire":true,
+              "insertTime":1765735358000
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(record.amount.to_string(), "10.50");
+        assert_eq!(
+            record.credit_state(),
+            DepositCreditState::CreditedWithdrawalLocked
+        );
+        assert!(record.is_credited());
+        assert!(record.questionnaire_required());
+    }
+
+    #[test]
+    fn matches_deposit_by_case_insensitive_evm_hash_and_rejects_duplicates() {
+        let expected = B256::repeat_byte(0xab);
+        let json = format!(
+            r#"{{
+              "depositId":"1","amount":"1.25","network":"OPTIMISM","coin":"USDC",
+              "depositStatus":1,"address":"0x1111111111111111111111111111111111111111",
+              "txId":"{:#X}","insertTime":1
+            }}"#,
+            expected
+        );
+        let record: DepositRecord = serde_json::from_str(&json).unwrap();
+        let matching = matching_deposits(vec![record.clone()], "USDC", expected).unwrap();
+        assert_eq!(matching, vec![record.clone()]);
+        assert!(matching_deposits(vec![record.clone(), record], "USDC", expected).is_err());
+    }
+
+    #[test]
+    fn matches_withdrawal_locally_by_client_id_and_types_terminal_statuses() {
+        let completed: WithdrawalRecord = serde_json::from_str(
+            r#"{
+              "id":"withdrawal-id","amount":"0.009985","transactionFee":"0.000015",
+              "coin":"ETH","status":6,"address":"0x1111111111111111111111111111111111111111",
+              "txId":"0xabc","network":"OPTIMISM","withdrawOrderId":"rustwd2","info":""
+            }"#,
+        )
+        .unwrap();
+        let mut other = completed.clone();
+        other.withdraw_order_id = "rustwd1".to_owned();
+
+        let matching =
+            matching_withdrawals(vec![other, completed.clone()], "ETH", "rustwd2").unwrap();
+        assert_eq!(matching, vec![completed.clone()]);
+        assert_eq!(completed.state(), WithdrawalState::Completed);
+        assert!(completed.state().is_terminal());
+        assert!(!WithdrawalState::Processing.is_terminal());
     }
 }

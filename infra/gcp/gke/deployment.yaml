@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arb-bot-state
+  namespace: arb-bot
+  labels:
+    app.kubernetes.io/name: arb-bot
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard-rwo
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,13 +23,10 @@ metadata:
 spec:
   replicas: 1
   revisionHistoryLimit: 5
-  progressDeadlineSeconds: 900
+  progressDeadlineSeconds: 2100
   minReadySeconds: 20
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: arb-bot
@@ -62,6 +73,13 @@ spec:
           envFrom:
             - configMapRef:
                 name: arb-bot-runtime
+          env:
+            - name: REBALANCE_EXECUTION_MODE
+              value: direct_wld_canary
+            - name: REBALANCE_CANARY_WLD_AMOUNT
+              value: "1"
+            - name: REBALANCE_JOURNAL_PATH
+              value: /var/lib/arb-bot/rebalance-canary.jsonl
           resources:
             requests:
               cpu: "6"
@@ -79,7 +97,7 @@ spec:
               command: ["/bin/sh", "-ec", "test -s /tmp/arb-bot-ready"]
             periodSeconds: 5
             timeoutSeconds: 2
-            failureThreshold: 120
+            failureThreshold: 360
           readinessProbe:
             exec:
               command: ["/bin/sh", "-ec", "test -s /tmp/arb-bot-ready"]
@@ -92,6 +110,8 @@ spec:
               readOnly: true
             - name: runtime-tmp
               mountPath: /tmp
+            - name: runtime-state
+              mountPath: /var/lib/arb-bot
       volumes:
         - name: runtime-secrets
           csi:
@@ -103,3 +123,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Mi
+        - name: runtime-state
+          persistentVolumeClaim:
+            claimName: arb-bot-state

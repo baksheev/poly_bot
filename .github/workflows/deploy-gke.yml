@@ -184,7 +184,7 @@ jobs:
 
           kubectl rollout status deployment/arb-bot \
             --namespace "${GKE_NAMESPACE}" \
-            --timeout=20m
+            --timeout=30m
           selected_pool="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"

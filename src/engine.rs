@@ -297,13 +297,14 @@ impl TradingEngine {
         };
         match self.rebalance.evaluate(binance, wallet) {
             Ok(evaluations) => {
+                let mode = self.config.rebalance_execution_mode.as_str();
                 for evaluation in evaluations {
                     let action = evaluation.plan.action.as_ref();
                     self.telemetry.emit(
                         "rebalance_plan_evaluated",
                         json!({
                             "engine_id": self.config.engine_id,
-                            "mode": "paper",
+                            "mode": mode,
                             "token": evaluation.token_symbol,
                             "token_decimals": evaluation.token_decimals,
                             "reference_captured": evaluation.reference_captured,
@@ -327,7 +328,7 @@ impl TradingEngine {
                     "rebalance_plan_failed",
                     json!({
                         "engine_id": self.config.engine_id,
-                        "mode": "paper",
+                        "mode": self.config.rebalance_execution_mode,
                         "error": format!("{error:#}"),
                     }),
                 );

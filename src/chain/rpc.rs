@@ -66,6 +66,18 @@ pub struct TransactionReceipt {
     pub effective_gas_price: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcTransaction {
+    pub hash: B256,
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub from: Address,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub input: Vec<u8>,
+    pub block_number: Option<u64>,
+}
+
 impl EthCall {
     fn json(&self) -> Value {
         json!({
@@ -263,6 +275,21 @@ impl JsonRpcClient {
         }))
     }
 
+    pub async fn transaction_by_hash(&self, hash: B256) -> anyhow::Result<Option<RpcTransaction>> {
+        let value = self
+            .request_optional("eth_getTransactionByHash", json!([format!("{hash:#x}")]))
+            .await?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let transaction = decode_rpc_transaction(value)?;
+        ensure!(
+            transaction.hash == hash,
+            "eth_getTransactionByHash returned a different transaction hash"
+        );
+        Ok(Some(transaction))
+    }
+
     pub async fn erc20_balance(&self, token: Address, owner: Address) -> anyhow::Result<U256> {
         let block = self.latest_block().await?;
         let mut data = Vec::with_capacity(36);
@@ -457,6 +484,19 @@ struct WireTransactionReceipt {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRpcTransaction {
+    hash: String,
+    chain_id: String,
+    nonce: String,
+    from: String,
+    to: Option<String>,
+    value: String,
+    input: String,
+    block_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RpcResponse {
     id: u64,
     #[serde(default)]
@@ -488,6 +528,30 @@ fn decode_call_result(response: RpcResponse) -> anyhow::Result<Vec<u8>> {
         .as_str()
         .context("eth_call result is not a hex string")?;
     parse_data_hex("eth_call result", encoded)
+}
+
+fn decode_rpc_transaction(value: Value) -> anyhow::Result<RpcTransaction> {
+    let transaction: WireRpcTransaction = serde_json::from_value(value)
+        .context("eth_getTransactionByHash returned an invalid transaction")?;
+    Ok(RpcTransaction {
+        hash: parse_b256("transaction.hash", &transaction.hash)?,
+        chain_id: parse_quantity_u64("transaction.chainId", &transaction.chain_id)?,
+        nonce: parse_quantity_u64("transaction.nonce", &transaction.nonce)?,
+        from: transaction
+            .from
+            .parse()
+            .context("transaction.from is invalid")?,
+        to: transaction
+            .to
+            .map(|to| to.parse().context("transaction.to is invalid"))
+            .transpose()?,
+        value: parse_quantity_u256("transaction.value", &transaction.value)?,
+        input: parse_data_hex("transaction.input", &transaction.input)?,
+        block_number: transaction
+            .block_number
+            .map(|number| parse_quantity_u64("transaction.blockNumber", &number))
+            .transpose()?,
+    })
 }
 
 fn parse_data_hex(name: &str, value: &str) -> anyhow::Result<Vec<u8>> {
@@ -588,11 +652,12 @@ fn retry_delay(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::U256;
+    use alloy_primitives::{Address, B256, U256};
+    use serde_json::json;
 
     use super::{
-        JsonRpcClient, parse_data_hex, parse_quantity_u64, parse_quantity_u256,
-        sanitize_rpc_message,
+        JsonRpcClient, decode_rpc_transaction, parse_data_hex, parse_quantity_u64,
+        parse_quantity_u256, sanitize_rpc_message,
     };
 
     #[test]
@@ -625,5 +690,40 @@ mod tests {
         let sanitized = sanitize_rpc_message(&message);
         assert!(!sanitized.contains('\n'));
         assert_eq!(sanitized.chars().count(), 256);
+    }
+
+    #[test]
+    fn decodes_transaction_for_strict_reconciliation() {
+        let transaction = decode_rpc_transaction(json!({
+            "hash": format!("{:#x}", B256::repeat_byte(0x11)),
+            "chainId": "0x1e0",
+            "nonce": "0x7",
+            "from": format!("{:#x}", Address::repeat_byte(0x22)),
+            "to": format!("{:#x}", Address::repeat_byte(0x33)),
+            "value": "0x100",
+            "input": "0x00ff",
+            "blockNumber": null
+        }))
+        .unwrap();
+
+        assert_eq!(transaction.hash, B256::repeat_byte(0x11));
+        assert_eq!(transaction.chain_id, 480);
+        assert_eq!(transaction.nonce, 7);
+        assert_eq!(transaction.from, Address::repeat_byte(0x22));
+        assert_eq!(transaction.to, Some(Address::repeat_byte(0x33)));
+        assert_eq!(transaction.value, U256::from(256));
+        assert_eq!(transaction.input, [0, 255]);
+        assert_eq!(transaction.block_number, None);
+    }
+
+    #[test]
+    fn rejects_incomplete_transaction_for_reconciliation() {
+        assert!(
+            decode_rpc_transaction(json!({
+                "hash": format!("{:#x}", B256::repeat_byte(0x11)),
+                "nonce": "0x7"
+            }))
+            .is_err()
+        );
     }
 }
