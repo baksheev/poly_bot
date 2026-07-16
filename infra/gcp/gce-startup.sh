@@ -76,8 +76,6 @@ umask 077
   fetch_secret ALCHEMY_WORLDCHAIN_RPC_URL
   printf '\nALCHEMY_WORLDCHAIN_WS_URL='
   fetch_secret ALCHEMY_WORLDCHAIN_WS_URL
-  printf '\nALCHEMY_OPTIMISM_RPC_URL='
-  fetch_secret ALCHEMY_OPTIMISM_RPC_URL
   printf '\nBINANCE_API_KEY='
   fetch_secret BINANCE_API_KEY
   printf '\nBINANCE_SECRET_KEY='
