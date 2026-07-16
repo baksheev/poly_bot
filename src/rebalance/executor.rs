@@ -99,7 +99,7 @@ pub enum RebalanceExecutionProgress {
         /// accepted only when reading journals written before this field was
         /// introduced; the runtime rehydrates the amount before preparing a
         /// bridge in that case.
-        #[serde(default, with = "u256_serde")]
+        #[serde(default, with = "u256_serde", skip_serializing_if = "U256::is_zero")]
         input_amount: U256,
     },
     BridgePrepared {
@@ -988,12 +988,14 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            progress,
+            &progress,
             RebalanceExecutionProgress::ApprovalMined {
                 input_amount,
                 ..
             } if input_amount.is_zero()
         ));
+        let serialized = serde_json::to_value(progress).unwrap();
+        assert_eq!(serialized.get("input_amount"), None);
     }
 
     #[test]
