@@ -170,6 +170,9 @@ pub struct AppConfig {
     #[arg(long, env = "REBALANCE_EXECUTION_MODE", default_value = "disabled")]
     pub rebalance_execution_mode: String,
 
+    #[arg(long, env = "REBALANCE_WLD_ROUTE_MODE", default_value = "auto")]
+    pub rebalance_wld_route_mode: String,
+
     #[arg(long, env = "REBALANCE_CANARY_WLD_AMOUNT", default_value = "1")]
     pub rebalance_canary_wld_amount: rust_decimal::Decimal,
 
@@ -279,6 +282,13 @@ impl AppConfig {
                 "disabled" | "direct_wld_canary" | "full_live"
             ),
             "REBALANCE_EXECUTION_MODE must be disabled, direct_wld_canary, or full_live"
+        );
+        ensure!(
+            matches!(
+                self.rebalance_wld_route_mode.as_str(),
+                "auto" | "across_only"
+            ),
+            "REBALANCE_WLD_ROUTE_MODE must be auto or across_only"
         );
         ensure!(
             self.rebalance_canary_wld_amount > rust_decimal::Decimal::ZERO
@@ -481,6 +491,7 @@ mod tests {
             balance_max_age_ms: 5_000,
             balance_event_channel_capacity: 16,
             rebalance_execution_mode: "disabled".into(),
+            rebalance_wld_route_mode: "auto".into(),
             rebalance_canary_wld_amount: rust_decimal::Decimal::ONE,
             rebalance_journal_path: "/tmp/rebalance-canary.jsonl".into(),
             rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),
@@ -518,6 +529,13 @@ mod tests {
         value.validate().unwrap();
 
         value.rebalance_binance_credential_mode = "shared_trading".into();
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_wld_route_mode() {
+        let mut value = config();
+        value.rebalance_wld_route_mode = "direct_only".into();
         assert!(value.validate().is_err());
     }
 

@@ -1668,10 +1668,16 @@ async fn run(
                 &pair.chain.binance_network_name,
                 "OPTIMISM",
             )?;
-            routes.insert(
-                token.symbol.clone(),
-                route_candidates_from_capital(&capital, token.decimals, pair.chain.chain_id)?,
-            );
+            let mut candidates =
+                route_candidates_from_capital(&capital, token.decimals, pair.chain.chain_id)?;
+            if token.symbol == "WLD" && config.rebalance_wld_route_mode == "across_only" {
+                candidates.retain(|candidate| matches!(candidate.route, Route::Across { .. }));
+                ensure!(
+                    candidates.len() == 1,
+                    "REBALANCE_WLD_ROUTE_MODE=across_only requires exactly one live WLD Across candidate"
+                );
+            }
+            routes.insert(token.symbol.clone(), candidates);
         }
         RebalanceTracker::new(pair, routes)?
     } else {
@@ -1909,6 +1915,7 @@ async fn run(
         wallet_sync_trigger = "alchemy_new_heads",
         clickhouse_enabled = config.clickhouse_enabled(),
         rebalance_execution_mode = %config.rebalance_execution_mode,
+        rebalance_wld_route_mode = %config.rebalance_wld_route_mode,
         "arbitrage shadow service started with authenticated Binance account state"
     );
     let runtime_ready_file = mark_runtime_ready()?;

@@ -82,6 +82,8 @@ spec:
           env:
             - name: REBALANCE_EXECUTION_MODE
               value: full_live
+            - name: REBALANCE_WLD_ROUTE_MODE
+              value: across_only
             - name: REBALANCE_MAX_WLD_AMOUNT
               value: "__REBALANCE_MAX_WLD_AMOUNT__"
             - name: REBALANCE_MAX_USDC_AMOUNT
