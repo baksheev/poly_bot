@@ -69,6 +69,15 @@ pub enum Command {
         #[arg(long)]
         tr_id: i64,
     },
+    /// Fetch and validate a public unauthenticated Across USDC quote.
+    AcrossUsdcQuote {
+        /// Origin chain: 10 (Optimism) or 480 (World Chain).
+        #[arg(long)]
+        origin_chain_id: u64,
+        /// Exact input in USDC base units (1 USDC = 1,000,000).
+        #[arg(long)]
+        amount: u128,
+    },
     /// Derive and print only the public address of the configured EVM wallet.
     WalletAddress,
     /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.
@@ -109,6 +118,13 @@ pub struct AppConfig {
         default_value = "wss://ws-api.binance.com:443/ws-api/v3"
     )]
     pub binance_ws_api_url: String,
+
+    #[arg(
+        long,
+        env = "ACROSS_API_BASE_URL",
+        default_value = "https://app.across.to/api"
+    )]
+    pub across_api_base_url: String,
 
     #[arg(
         long,
@@ -194,6 +210,11 @@ impl AppConfig {
         validate_binance_spot_rest_base_url(&self.binance_rest_base_url)?;
         validate_url("BINANCE_WS_API_URL", &self.binance_ws_api_url, &["wss"])?;
         validate_binance_spot_ws_api_url(&self.binance_ws_api_url)?;
+        validate_url("ACROSS_API_BASE_URL", &self.across_api_base_url, &["https"])?;
+        ensure!(
+            self.across_api_base_url.trim_end_matches('/') == "https://app.across.to/api",
+            "ACROSS_API_BASE_URL must use the Rails-compatible public Across endpoint"
+        );
         ensure!(
             !self.domain_config_path.as_os_str().is_empty(),
             "DOMAIN_CONFIG_PATH is empty"
@@ -305,6 +326,7 @@ mod tests {
             binance_ws_base_url: "wss://stream.binance.com:9443/ws".into(),
             binance_rest_base_url: "https://api.binance.com".into(),
             binance_ws_api_url: "wss://ws-api.binance.com:443/ws-api/v3".into(),
+            across_api_base_url: "https://app.across.to/api".into(),
             domain_config_path: "config/strategies/usdc-wld-world-chain.v2.json".into(),
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,

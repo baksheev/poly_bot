@@ -3,6 +3,10 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use alloy_primitives::Address;
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
+    across::{
+        AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
+        WORLD_CHAIN_USDC, validate_quote,
+    },
     binance::account::{BinanceAccountClient, BinanceAccountState},
     binance::capital::{
         CapitalRouteState, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
@@ -118,6 +122,10 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceTravelRuleWithdrawalStatus { tr_id } => {
             binance_travel_rule_withdrawal_status(&cli.config, tr_id).await
         }
+        Command::AcrossUsdcQuote {
+            origin_chain_id,
+            amount,
+        } => across_usdc_quote(&cli.config, origin_chain_id, amount).await,
         Command::WalletAddress => {
             let wallet = TestWallet::from_env()?;
             tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
@@ -128,6 +136,49 @@ async fn main() -> anyhow::Result<()> {
             wallet_hydrate(&domain_config).await
         }
     }
+}
+
+async fn across_usdc_quote(
+    config: &config::AppConfig,
+    origin_chain_id: u64,
+    amount: u128,
+) -> anyhow::Result<()> {
+    ensure!(
+        amount > 0 && amount <= 100_000_000,
+        "Across validation quote must be between 1 base unit and 100 USDC"
+    );
+    let (destination_chain_id, input_token, output_token) = match origin_chain_id {
+        OPTIMISM_CHAIN_ID => (WORLD_CHAIN_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_USDC),
+        WORLD_CHAIN_CHAIN_ID => (OPTIMISM_CHAIN_ID, WORLD_CHAIN_USDC, OPTIMISM_USDC),
+        _ => bail!("Across validation only permits Optimism and World Chain"),
+    };
+    let wallet = TestWallet::from_env()?;
+    let request = AcrossQuoteRequest {
+        origin_chain_id,
+        destination_chain_id,
+        input_token,
+        output_token,
+        amount,
+        depositor: wallet.address(),
+        recipient: wallet.address(),
+    };
+    let quote = AcrossClient::new(config)?.quote(&request).await?;
+    validate_quote(&request, &quote)?;
+    tracing::info!(
+        quote_id = %quote.id,
+        origin_chain_id,
+        destination_chain_id,
+        input_amount = %quote.input_amount,
+        expected_output_amount = %quote.expected_output_amount,
+        min_output_amount = %quote.min_output_amount,
+        fee_amount = %quote.fees.total.amount,
+        expected_fill_time_seconds = quote.expected_fill_time,
+        quote_expiry_timestamp = quote.quote_expiry_timestamp,
+        approval_transactions = quote.approval_txns.len(),
+        swap_target = %quote.swap_tx.to,
+        "public unauthenticated Across quote validated"
+    );
+    Ok(())
 }
 
 async fn binance_manual_wallet_withdraw(
