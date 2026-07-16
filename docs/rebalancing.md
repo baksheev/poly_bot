@@ -157,10 +157,13 @@ operations.
 
 Only one rebalance operation may be active at a time. After it completes, Rust
 requires both a newer Binance snapshot and a newer wallet snapshot before
-dispatching another rebalance. It also locks the completed `(token, direction)`
-for 10 seconds. During that window another token or the opposite direction may
-become eligible, but the same transfer direction cannot be repeated because of
-Binance deposit/indexing lag. The lock does not affect trading readiness.
+dispatching another rebalance. This is a state-based settlement barrier, not a
+timer: the executor has already reconciled the Binance deposit or withdrawal
+history and confirmed the destination balance before returning `Completed`,
+and the barrier then waits until both continuous balance streams have advanced
+past the snapshots held at completion. This prevents a stale snapshot from
+repeating a transfer while adding no fixed delay after the balances refresh.
+The barrier does not affect trading readiness.
 
 This matches the production Rails behavior: rebalance runs independently,
 while an arbitrage opportunity is admitted only after checking the exact
@@ -168,7 +171,9 @@ wallet and Binance sell assets. Rails requires the configured `3x` balance
 safety multiplier and atomically reserves the wallet sell amount before
 enqueueing execution. Rails separately uses a 10-second
 `RebalanceTransferLock` keyed by wallet, token, and direction after completed
-transfers. It does not reject trading merely because a rebalance is active.
+transfers. Rust replaces that heuristic TTL with executor credit evidence plus
+the continuous-snapshot settlement barrier. Neither implementation rejects
+trading merely because a rebalance is active.
 
 The global Rust runtime still fails closed for stale or unhealthy Binance,
 wallet, DEX, or price inputs. Those conditions make balance sufficiency
@@ -394,8 +399,8 @@ Regression coverage includes:
 
 - trading readiness remaining independent from pending, active, failed, and
   reconciling rebalance state;
-- the 10-second completed-transfer lock applying only to the same token and
-  direction, without changing trading readiness;
+- the post-completion settlement barrier requiring both continuous balance
+  streams to advance, without changing trading readiness;
 - the actual 1,000 USDC / 2,500 WLD two-token budget sequence;
 - retention of the second token action after the first token completes;
 - both WLD Across directions with 18 decimals;

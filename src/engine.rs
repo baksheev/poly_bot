@@ -1,7 +1,4 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use serde_json::json;
 
@@ -30,41 +27,21 @@ pub struct TradingEngine {
     pending_rebalance: Option<RebalanceEvaluation>,
     rebalance_inflight: bool,
     rebalance_blocked: bool,
-    rebalance_reconcile_after: Option<(Instant, Instant)>,
-    rebalance_direction_locks: RebalanceDirectionLocks,
+    rebalance_settlement: Option<RebalanceSettlementBarrier>,
 }
-
-const REBALANCE_DIRECTION_LOCK_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
-struct RebalanceDirectionLock {
+struct RebalanceSettlementBarrier {
+    operation_id: String,
     token_symbol: String,
     direction: Direction,
-    expires_at: Instant,
+    binance_after: Instant,
+    wallet_after: Instant,
 }
 
-#[derive(Debug, Default)]
-struct RebalanceDirectionLocks {
-    entries: Vec<RebalanceDirectionLock>,
-}
-
-impl RebalanceDirectionLocks {
-    fn lock(&mut self, token_symbol: &str, direction: Direction, now: Instant) {
-        self.entries.retain(|entry| entry.expires_at > now);
-        self.entries
-            .retain(|entry| entry.token_symbol != token_symbol || entry.direction != direction);
-        self.entries.push(RebalanceDirectionLock {
-            token_symbol: token_symbol.to_owned(),
-            direction,
-            expires_at: now + REBALANCE_DIRECTION_LOCK_DURATION,
-        });
-    }
-
-    fn is_locked(&mut self, token_symbol: &str, direction: Direction, now: Instant) -> bool {
-        self.entries.retain(|entry| entry.expires_at > now);
-        self.entries
-            .iter()
-            .any(|entry| entry.token_symbol == token_symbol && entry.direction == direction)
+impl RebalanceSettlementBarrier {
+    fn reconciled(&self, binance_observed_at: Instant, wallet_observed_at: Instant) -> bool {
+        binance_observed_at > self.binance_after && wallet_observed_at > self.wallet_after
     }
 }
 
@@ -108,8 +85,7 @@ impl TradingEngine {
                 pending_rebalance: None,
                 rebalance_inflight: false,
                 rebalance_blocked: false,
-                rebalance_reconcile_after: None,
-                rebalance_direction_locks: RebalanceDirectionLocks::default(),
+                rebalance_settlement: None,
             },
             hot_telemetry_task,
         ))
@@ -362,14 +338,14 @@ impl TradingEngine {
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),
                 ) {
-                    self.rebalance_reconcile_after =
-                        Some((binance.observed_at, wallet.observed_at));
+                    self.rebalance_settlement = Some(RebalanceSettlementBarrier {
+                        operation_id: operation.intent.operation_id.clone(),
+                        token_symbol: operation.intent.token_symbol.clone(),
+                        direction: operation.intent.direction,
+                        binance_after: binance.observed_at,
+                        wallet_after: wallet.observed_at,
+                    });
                 }
-                self.rebalance_direction_locks.lock(
-                    &operation.intent.token_symbol,
-                    operation.intent.direction,
-                    Instant::now(),
-                );
                 self.telemetry.emit(
                     "rebalance_execution_completed",
                     json!({
@@ -378,12 +354,12 @@ impl TradingEngine {
                     }),
                 );
                 self.telemetry.emit(
-                    "rebalance_direction_locked",
+                    "rebalance_settlement_waiting",
                     json!({
                         "engine_id": self.config.engine_id,
+                        "operation_id": operation.intent.operation_id,
                         "token": operation.intent.token_symbol,
                         "direction": format!("{:?}", operation.intent.direction),
-                        "duration_ms": REBALANCE_DIRECTION_LOCK_DURATION.as_millis(),
                     }),
                 );
             }
@@ -410,11 +386,21 @@ impl TradingEngine {
         let Some(wallet) = self.state.balances.wallet.as_ref() else {
             return;
         };
-        if let Some((binance_after, wallet_after)) = self.rebalance_reconcile_after
-            && binance.observed_at > binance_after
-            && wallet.observed_at > wallet_after
+        if self
+            .rebalance_settlement
+            .as_ref()
+            .is_some_and(|barrier| barrier.reconciled(binance.observed_at, wallet.observed_at))
+            && let Some(barrier) = self.rebalance_settlement.take()
         {
-            self.rebalance_reconcile_after = None;
+            self.telemetry.emit(
+                "rebalance_settlement_reconciled",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "operation_id": barrier.operation_id,
+                    "token": barrier.token_symbol,
+                    "direction": format!("{:?}", barrier.direction),
+                }),
+            );
         }
         match self.rebalance.evaluate(binance, wallet) {
             Ok(evaluations) => {
@@ -442,21 +428,11 @@ impl TradingEngine {
                     );
                 }
                 let pending_action = self.rebalance.pending_action();
-                let direction_locked = pending_action.as_ref().is_some_and(|evaluation| {
-                    evaluation.plan.action.as_ref().is_some_and(|action| {
-                        self.rebalance_direction_locks.is_locked(
-                            &evaluation.token_symbol,
-                            action.direction,
-                            Instant::now(),
-                        )
-                    })
-                });
                 if mode == "full_live"
                     && !self.rebalance_inflight
                     && !self.rebalance_blocked
-                    && self.rebalance_reconcile_after.is_none()
+                    && self.rebalance_settlement.is_none()
                     && self.pending_rebalance.is_none()
-                    && !direction_locked
                     && let Some(evaluation) = pending_action
                 {
                     self.rebalance_inflight = true;
@@ -588,7 +564,7 @@ mod tests {
 
     use crate::rebalance::Direction;
 
-    use super::{REBALANCE_DIRECTION_LOCK_DURATION, RebalanceDirectionLocks, TradingReadiness};
+    use super::{RebalanceSettlementBarrier, TradingReadiness};
 
     #[test]
     fn rebalance_state_is_not_a_global_trading_readiness_input() {
@@ -618,27 +594,25 @@ mod tests {
     }
 
     #[test]
-    fn completed_rebalance_locks_only_the_same_token_direction() {
+    fn completed_rebalance_waits_for_both_continuous_balance_streams() {
         let now = Instant::now();
-        let mut locks = RebalanceDirectionLocks::default();
-        locks.lock("WLD", Direction::WalletToBinance, now);
+        let later = now + std::time::Duration::from_millis(1);
+        let barrier = RebalanceSettlementBarrier {
+            operation_id: "rebalance-wld-1".to_owned(),
+            token_symbol: "WLD".to_owned(),
+            direction: Direction::WalletToBinance,
+            binance_after: now,
+            wallet_after: now,
+        };
 
-        assert!(locks.is_locked("WLD", Direction::WalletToBinance, now));
-        assert!(!locks.is_locked("WLD", Direction::BinanceToWallet, now));
-        assert!(!locks.is_locked("USDC", Direction::WalletToBinance, now));
-        assert!(!locks.is_locked(
-            "WLD",
-            Direction::WalletToBinance,
-            now + REBALANCE_DIRECTION_LOCK_DURATION
-        ));
+        assert!(!barrier.reconciled(now, now));
+        assert!(!barrier.reconciled(later, now));
+        assert!(!barrier.reconciled(now, later));
+        assert!(barrier.reconciled(later, later));
     }
 
     #[test]
-    fn direction_lock_does_not_change_trading_readiness() {
-        let now = Instant::now();
-        let mut locks = RebalanceDirectionLocks::default();
-        locks.lock("WLD", Direction::WalletToBinance, now);
-        assert!(locks.is_locked("WLD", Direction::WalletToBinance, now));
+    fn settlement_barrier_does_not_change_trading_readiness() {
         assert!(
             TradingReadiness {
                 dex_ready: true,

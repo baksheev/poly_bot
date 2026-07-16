@@ -23,9 +23,9 @@ the exact artifact used by each rollout.
   snapshots. Rebalance state now serializes only rebalance operations; stale
   market/balance inputs remain fail-closed, and future orders must use
   direction-specific inventory reservations.
-- Match the Rails completed-transfer guard with a 10-second in-memory lock on
-  the same rebalance token and direction, in addition to the existing single
-  active operation and fresh Binance-plus-wallet snapshot barrier.
+- Replace the Rails-style completed-transfer TTL with a state-based settlement
+  barrier: after the executor confirms the destination credit, another
+  rebalance waits until both continuous balance streams advance.
 - Preserve the second token budget after the first token rebalance completes.
 - Treat Binance withdrawal history amount as net received and approve or bridge
   that net amount after the withdrawal fee.
