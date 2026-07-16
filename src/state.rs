@@ -302,4 +302,96 @@ mod tests {
             QuoteApplyResult::DuplicateOrRegressed
         );
     }
+
+    #[test]
+    fn freshness_boundary_is_inclusive_and_then_degrades() {
+        let now = std::time::Instant::now();
+        let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
+        state.on_connected("WLDUSDC", 1);
+        state.apply_quote(quote(1, 1, now));
+
+        assert_eq!(
+            state.refresh_phase(now + Duration::from_millis(5_000), 5_000, true),
+            RuntimePhase::Ready
+        );
+        assert_eq!(
+            state.refresh_phase(now + Duration::from_millis(5_001), 5_000, true),
+            RuntimePhase::Degraded
+        );
+    }
+
+    #[test]
+    fn every_configured_symbol_must_be_fresh_before_ready() {
+        let now = std::time::Instant::now();
+        let mut state = RuntimeState::new([Arc::from("WLDUSDC"), Arc::from("ETHUSDT")]);
+        state.on_connected("WLDUSDC", 1);
+        state.on_connected("ETHUSDT", 1);
+        state.apply_quote(quote(1, 1, now));
+
+        assert_eq!(
+            state.refresh_phase(now, 5_000, true),
+            RuntimePhase::Starting
+        );
+    }
+
+    #[test]
+    fn unknown_symbol_and_stale_disconnect_do_not_mutate_live_feed() {
+        let now = std::time::Instant::now();
+        let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
+        state.on_connected("WLDUSDC", 2);
+        state.apply_quote(quote(1, 2, now));
+        let processed = state.processed_events;
+
+        let mut unknown = quote(1, 2, now);
+        unknown.symbol = Arc::from("UNKNOWN");
+        assert_eq!(state.apply_quote(unknown), QuoteApplyResult::UnknownSymbol);
+        state.on_disconnected("WLDUSDC", 1);
+
+        assert_eq!(state.processed_events, processed);
+        assert!(state.binance_feeds["WLDUSDC"].connected);
+        assert!(state.binance_feeds["WLDUSDC"].book.is_some());
+    }
+
+    #[test]
+    fn stopping_phase_is_terminal() {
+        let now = std::time::Instant::now();
+        let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
+        state.on_connected("WLDUSDC", 1);
+        state.apply_quote(quote(1, 1, now));
+        state.stop();
+
+        assert_eq!(
+            state.refresh_phase(now, 5_000, true),
+            RuntimePhase::Stopping
+        );
+    }
+
+    #[test]
+    fn quote_rejects_zero_or_negative_prices_and_quantities() {
+        let now = std::time::Instant::now();
+        for (bid_price, bid_quantity, ask_price, ask_quantity) in [
+            (Decimal::ZERO, Decimal::ONE, Decimal::ONE, Decimal::ONE),
+            (Decimal::ONE, Decimal::ZERO, Decimal::ONE, Decimal::ONE),
+            (Decimal::ONE, Decimal::ONE, Decimal::ZERO, Decimal::ONE),
+            (Decimal::ONE, Decimal::ONE, Decimal::ONE, Decimal::ZERO),
+            (-Decimal::ONE, Decimal::ONE, Decimal::ONE, Decimal::ONE),
+        ] {
+            assert!(
+                TopOfBook::new(
+                    Arc::from("WLDUSDC"),
+                    1,
+                    bid_price,
+                    bid_quantity,
+                    ask_price,
+                    ask_quantity,
+                    None,
+                    None,
+                    now,
+                    1,
+                    1,
+                )
+                .is_err()
+            );
+        }
+    }
 }

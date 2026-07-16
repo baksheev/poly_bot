@@ -269,6 +269,57 @@ impl OrderResult {
             .map(|fill| fill.commission)
             .sum()
     }
+
+    pub fn balance_changes(
+        &self,
+        base_asset: &str,
+        quote_asset: &str,
+    ) -> Result<BTreeMap<String, Decimal>, WsApiError> {
+        validate_asset(base_asset)?;
+        validate_asset(quote_asset)?;
+        if base_asset == quote_asset {
+            return Err(WsApiError::Protocol(
+                "base and quote assets must differ".to_owned(),
+            ));
+        }
+        if self.executed_qty < Decimal::ZERO || self.cummulative_quote_qty < Decimal::ZERO {
+            return Err(WsApiError::Protocol(
+                "executed order quantities must not be negative".to_owned(),
+            ));
+        }
+
+        let mut changes = BTreeMap::new();
+        match self.side.as_str() {
+            "BUY" => {
+                changes.insert(base_asset.to_owned(), self.executed_qty);
+                changes.insert(quote_asset.to_owned(), -self.cummulative_quote_qty);
+            }
+            "SELL" => {
+                changes.insert(base_asset.to_owned(), -self.executed_qty);
+                changes.insert(quote_asset.to_owned(), self.cummulative_quote_qty);
+            }
+            _ => {
+                return Err(WsApiError::Protocol(format!(
+                    "unsupported Binance order side {}",
+                    sanitize_message(&self.side)
+                )));
+            }
+        }
+        for fill in &self.fills {
+            validate_asset(&fill.commission_asset)?;
+            if fill.commission < Decimal::ZERO {
+                return Err(WsApiError::Protocol(
+                    "Binance fill commission must not be negative".to_owned(),
+                ));
+            }
+            if !fill.commission.is_zero() {
+                *changes
+                    .entry(fill.commission_asset.clone())
+                    .or_insert(Decimal::ZERO) -= fill.commission;
+            }
+        }
+        Ok(changes)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -432,6 +483,19 @@ fn validate_symbol(value: &str) -> Result<(), WsApiError> {
     Ok(())
 }
 
+fn validate_asset(value: &str) -> Result<(), WsApiError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(WsApiError::Protocol(
+            "asset contains unsupported characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_client_order_id(value: &str) -> Result<(), WsApiError> {
     if value.is_empty()
         || value.len() > 36
@@ -483,7 +547,36 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::{Map, Value};
 
-    use super::{market_buy_params, signature_payload};
+    use super::{OrderResult, market_buy_params, market_sell_params, signature_payload};
+
+    fn order(side: &str, executed: &str, quote: &str, fills: serde_json::Value) -> OrderResult {
+        serde_json::from_value(serde_json::json!({
+            "symbol": "WLDUSDC",
+            "orderId": 1,
+            "clientOrderId": "rust-test",
+            "price": "0",
+            "origQty": executed,
+            "executedQty": executed,
+            "origQuoteOrderQty": quote,
+            "cummulativeQuoteQty": quote,
+            "status": "FILLED",
+            "timeInForce": "GTC",
+            "type": "MARKET",
+            "side": side,
+            "fills": fills,
+        }))
+        .unwrap()
+    }
+
+    fn fill(commission: &str, asset: &str, trade_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "price": "0.81234567",
+            "qty": "1.0",
+            "commission": commission,
+            "commissionAsset": asset,
+            "tradeId": trade_id,
+        })
+    }
 
     #[test]
     fn signs_parameters_in_alphabetical_order() {
@@ -506,5 +599,133 @@ mod tests {
         assert_eq!(params["quoteOrderQty"], "100");
         assert_eq!(params["newOrderRespType"], "FULL");
         assert_eq!(params["type"], "MARKET");
+    }
+
+    #[test]
+    fn market_sell_uses_exact_base_quantity_and_full_response() {
+        let params = market_sell_params("WLDUSDC", Decimal::new(245, 1), "rustval123S").unwrap();
+
+        assert_eq!(params["quantity"], "24.5");
+        assert_eq!(params["newOrderRespType"], "FULL");
+        assert_eq!(params["type"], "MARKET");
+    }
+
+    #[test]
+    fn computes_precise_buy_balance_changes_and_aggregates_third_asset_commission() {
+        let order = order(
+            "BUY",
+            "100.123456789",
+            "250.987654321",
+            serde_json::json!([fill("0.000000001", "BNB", 1), fill("0.000000002", "BNB", 2)]),
+        );
+        let changes = order.balance_changes("WLD", "USDC").unwrap();
+
+        assert_eq!(
+            changes["WLD"],
+            Decimal::from_str_exact("100.123456789").unwrap()
+        );
+        assert_eq!(
+            changes["USDC"],
+            Decimal::from_str_exact("-250.987654321").unwrap()
+        );
+        assert_eq!(
+            changes["BNB"],
+            Decimal::from_str_exact("-0.000000003").unwrap()
+        );
+    }
+
+    #[test]
+    fn subtracts_commission_from_received_or_spent_trading_asset() {
+        let buy = order(
+            "BUY",
+            "100",
+            "250",
+            serde_json::json!([fill("0.1", "WLD", 1), fill("0.25", "USDC", 2)]),
+        );
+        let buy_changes = buy.balance_changes("WLD", "USDC").unwrap();
+        assert_eq!(buy_changes["WLD"], Decimal::from_str_exact("99.9").unwrap());
+        assert_eq!(
+            buy_changes["USDC"],
+            Decimal::from_str_exact("-250.25").unwrap()
+        );
+
+        let sell = order(
+            "SELL",
+            "31.10",
+            "19.9662",
+            serde_json::json!([fill("0.01896789", "USDC", 1), fill("0.1", "WLD", 2)]),
+        );
+        let sell_changes = sell.balance_changes("WLD", "USDC").unwrap();
+        assert_eq!(
+            sell_changes["USDC"],
+            Decimal::from_str_exact("19.94723211").unwrap()
+        );
+        assert_eq!(
+            sell_changes["WLD"],
+            Decimal::from_str_exact("-31.20").unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_commission_does_not_create_an_unrelated_balance_entry() {
+        let order = order("BUY", "1", "2", serde_json::json!([fill("0", "BNB", 1)]));
+        let changes = order.balance_changes("WLD", "USDC").unwrap();
+
+        assert!(!changes.contains_key("BNB"));
+        assert_eq!(changes["WLD"], Decimal::ONE);
+        assert_eq!(changes["USDC"], Decimal::from(-2));
+    }
+
+    #[test]
+    fn rejects_unknown_side_negative_quantities_and_negative_commission() {
+        assert!(
+            order("UNKNOWN", "1", "2", serde_json::json!([]))
+                .balance_changes("WLD", "USDC")
+                .is_err()
+        );
+        assert!(
+            order("BUY", "-1", "2", serde_json::json!([]))
+                .balance_changes("WLD", "USDC")
+                .is_err()
+        );
+        assert!(
+            order("BUY", "1", "2", serde_json::json!([fill("-0.1", "BNB", 1)]))
+                .balance_changes("WLD", "USDC")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_order_result_numbers_and_missing_required_fields() {
+        let malformed = serde_json::json!({
+            "symbol": "WLDUSDC",
+            "orderId": 1,
+            "clientOrderId": "rust-test",
+            "price": "not-a-number",
+            "origQty": "1",
+            "executedQty": "1",
+            "origQuoteOrderQty": "2",
+            "cummulativeQuoteQty": "2",
+            "status": "FILLED",
+            "timeInForce": "GTC",
+            "type": "MARKET",
+            "side": "BUY"
+        });
+        assert!(serde_json::from_value::<OrderResult>(malformed).is_err());
+
+        let missing_side = serde_json::json!({
+            "symbol": "WLDUSDC",
+            "orderId": 1,
+            "clientOrderId": "rust-test",
+            "price": "0",
+            "origQty": "1",
+            "executedQty": "1",
+            "origQuoteOrderQty": "2",
+            "cummulativeQuoteQty": "2",
+            "status": "FILLED",
+            "timeInForce": "GTC",
+            "type": "MARKET"
+        });
+        assert!(serde_json::from_value::<OrderResult>(missing_side).is_err());
     }
 }

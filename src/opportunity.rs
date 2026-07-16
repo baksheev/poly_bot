@@ -1121,8 +1121,9 @@ mod tests {
     use super::{
         ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
         CapacityLimiter, DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache,
-        decimal_to_base_units, evaluate_direction, format_base_units, token_a_to_token_b_floor,
-        token_b_to_token_a,
+        TradeEvaluation, add_bps_ceil, decimal_to_base_units, evaluate_direction,
+        format_base_units, meets_threshold, signed_profit_bps_x100, subtract_bps_floor,
+        token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
     };
 
     fn hash(number: u64) -> B256 {
@@ -1463,5 +1464,82 @@ mod tests {
 
         assert!(result.baseline.is_none());
         assert!(result.market_liquidity_capacity.is_none());
+    }
+
+    #[test]
+    fn threshold_boundary_is_inclusive_without_floating_point() {
+        let cost = U256::from(1_000_000_u64);
+        assert!(meets_threshold(U256::from(1_002_000_u64), cost, 20).unwrap());
+        assert!(!meets_threshold(U256::from(1_001_999_u64), cost, 20).unwrap());
+    }
+
+    #[test]
+    fn reserve_rounding_is_conservative_in_both_directions() {
+        assert_eq!(add_bps_ceil(U256::from(1_u8), 4).unwrap(), U256::from(2_u8));
+        assert_eq!(subtract_bps_floor(U256::from(1_u8), 4).unwrap(), U256::ZERO);
+        assert_eq!(
+            add_bps_ceil(U256::from(10_000_u64), 4).unwrap(),
+            U256::from(10_004_u64)
+        );
+        assert_eq!(
+            subtract_bps_floor(U256::from(10_000_u64), 4).unwrap(),
+            U256::from(9_996_u64)
+        );
+    }
+
+    #[test]
+    fn signed_profit_reports_profit_loss_and_rejects_zero_cost() {
+        assert_eq!(
+            signed_profit_bps_x100(U256::from(101_u8), U256::from(100_u8)).unwrap(),
+            10_000
+        );
+        assert_eq!(
+            signed_profit_bps_x100(U256::from(99_u8), U256::from(100_u8)).unwrap(),
+            -10_000
+        );
+        assert_eq!(
+            signed_profit_bps_x100(U256::from(100_u8), U256::from(100_u8)).unwrap(),
+            0
+        );
+        assert!(signed_profit_bps_x100(U256::ONE, U256::ZERO).is_err());
+    }
+
+    #[test]
+    fn provider_selection_prefers_direction_specific_economic_result() {
+        let candidate = TradeEvaluation {
+            pool_index: 1,
+            token_b_amount: U256::from(10_u8),
+            dex_token_a_amount: U256::from(90_u8),
+            cex_token_a_amount: U256::from(100_u8),
+            cost_token_a: U256::from(90_u8),
+            proceeds_token_a: U256::from(110_u8),
+            profit_bps_x100: 0,
+            meets_threshold: true,
+        };
+        let current = TradeEvaluation {
+            pool_index: 0,
+            cost_token_a: U256::from(91_u8),
+            proceeds_token_a: U256::from(109_u8),
+            ..candidate
+        };
+
+        assert!(trade_is_better(
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            &candidate,
+            &current,
+        ));
+        assert!(trade_is_better(
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+            &candidate,
+            &current,
+        ));
+    }
+
+    #[test]
+    fn base_unit_formatting_handles_zero_and_leading_fractional_zeroes() {
+        assert_eq!(format_base_units(U256::ZERO, 6), "0");
+        assert_eq!(format_base_units(U256::from(1_u8), 6), "0.000001");
+        assert_eq!(format_base_units(U256::from(1_230_000_u64), 6), "1.23");
+        assert_eq!(format_base_units(U256::from(123_u8), 0), "123");
     }
 }

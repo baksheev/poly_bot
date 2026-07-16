@@ -320,4 +320,99 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn rejects_wrong_event_type_and_missing_required_fields() {
+        let wrong_event = br#"{
+            "e":"trade","u":1,"s":"WLDUSDC","b":"1","B":"1","a":"2","A":"1"
+        }"#;
+        assert!(
+            parse_book_ticker(
+                wrong_event,
+                Arc::from("WLDUSDC"),
+                1,
+                std::time::Instant::now(),
+                1,
+            )
+            .is_err()
+        );
+
+        let missing_ask = br#"{"u":1,"s":"WLDUSDC","b":"1","B":"1","A":"1"}"#;
+        assert!(
+            parse_book_ticker(
+                missing_ask,
+                Arc::from("WLDUSDC"),
+                1,
+                std::time::Instant::now(),
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_book_ticker(
+                b"not-json",
+                Arc::from("WLDUSDC"),
+                1,
+                std::time::Instant::now(),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_decimals_and_non_positive_liquidity() {
+        let invalid_decimal = br#"{
+            "u":1,"s":"WLDUSDC","b":"NaN","B":"1","a":"2","A":"1"
+        }"#;
+        assert!(
+            parse_book_ticker(
+                invalid_decimal,
+                Arc::from("WLDUSDC"),
+                1,
+                std::time::Instant::now(),
+                1,
+            )
+            .is_err()
+        );
+
+        let zero_bid_quantity = br#"{
+            "u":1,"s":"WLDUSDC","b":"1","B":"0","a":"2","A":"1"
+        }"#;
+        assert!(
+            parse_book_ticker(
+                zero_bid_quantity,
+                Arc::from("WLDUSDC"),
+                1,
+                std::time::Instant::now(),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preserves_sub_satoshi_decimal_precision() {
+        let payload = br#"{
+            "u":1,"s":"WLDUSDC","b":"0.123456789123456789","B":"1.000000001",
+            "a":"0.123456789123456790","A":"2.000000002"
+        }"#;
+        let quote = parse_book_ticker(
+            payload,
+            Arc::from("WLDUSDC"),
+            1,
+            std::time::Instant::now(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            quote.bid_price,
+            Decimal::from_str_exact("0.123456789123456789").unwrap()
+        );
+        assert_eq!(
+            quote.ask_price,
+            Decimal::from_str_exact("0.123456789123456790").unwrap()
+        );
+    }
 }

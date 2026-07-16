@@ -311,7 +311,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CoinInformation, NetworkInformation, WithdrawalSubmission, select_capital_routes};
+    use super::{
+        CoinInformation, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
+        WithdrawalSubmission, select_capital_routes,
+    };
 
     const WLD: &str = r#"{
       "coin":"WLD",
@@ -352,6 +355,52 @@ mod tests {
 
         assert_eq!(submission.tr_id, 65_865_740);
         assert!(submission.accepted);
+    }
+
+    #[test]
+    fn preserves_rejected_travel_rule_submission_for_fail_closed_handling() {
+        let submission: WithdrawalSubmission =
+            serde_json::from_str(r#"{"trId":65865741,"accepted":false,"info":"Rejected"}"#)
+                .unwrap();
+
+        assert!(!submission.accepted);
+        assert_eq!(submission.info, "Rejected");
+    }
+
+    #[test]
+    fn parses_capital_and_travel_rule_history_without_floating_point() {
+        let capital: WithdrawalRecord = serde_json::from_str(
+            r#"{
+              "id":"withdrawal-id","amount":"0.009985","transactionFee":"0.000015",
+              "coin":"ETH","status":6,"address":"0x1111111111111111111111111111111111111111",
+              "txId":"0xabc","network":"OPTIMISM","withdrawOrderId":"rustwd1","info":""
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(capital.amount.to_string(), "0.009985");
+        assert_eq!(capital.transaction_fee.to_string(), "0.000015");
+
+        let travel_rule: TravelRuleWithdrawalRecord = serde_json::from_str(
+            r#"{
+              "id":"withdrawal-id","trId":65865740,"amount":"0.009985",
+              "transactionFee":"0.000015","coin":"ETH","withdrawalStatus":6,
+              "travelRuleStatus":4,"address":"0x1111111111111111111111111111111111111111",
+              "txId":"0xabc","network":"OPTIMISM","withdrawOrderId":"rustwd1","info":""
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(travel_rule.tr_id, 65_865_740);
+        assert_eq!(travel_rule.withdrawal_status, 6);
+        assert_eq!(travel_rule.travel_rule_status, 4);
+    }
+
+    #[test]
+    fn rejects_missing_coin_and_invalid_symbol_in_route_selection() {
+        let coin: CoinInformation = serde_json::from_str(WLD).unwrap();
+        assert!(
+            select_capital_routes(std::slice::from_ref(&coin), "USDC", "WLD", "OPTIMISM").is_err()
+        );
+        assert!(select_capital_routes(&[coin], "wld", "WLD", "OPTIMISM").is_err());
     }
 
     #[test]

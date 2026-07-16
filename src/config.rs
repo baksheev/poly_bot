@@ -366,4 +366,12 @@ mod tests {
         config.binance_ws_base_url = "wss://fstream.binance.com/public/ws".into();
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn rejects_non_official_across_endpoint() {
+        let mut config = config();
+        config.across_api_base_url = "https://example.com/api".into();
+
+        assert!(config.validate().is_err());
+    }
 }

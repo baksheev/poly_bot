@@ -636,4 +636,138 @@ mod tests {
 
         assert!(error.to_string().contains("no currently available"));
     }
+
+    #[test]
+    fn rejects_invalid_policy_before_planning() {
+        let mut no_routes = direct_policy();
+        no_routes.routes.clear();
+        assert!(
+            plan_rebalance(
+                &no_routes,
+                BalanceSnapshot {
+                    binance: U256::from(5_000),
+                    wallet: U256::from(5_000),
+                },
+                &[],
+            )
+            .is_err()
+        );
+
+        let mut zero_multiple = direct_policy();
+        zero_multiple.routes[0].withdrawal.multiple = U256::ZERO;
+        assert!(
+            plan_rebalance(
+                &zero_multiple,
+                BalanceSnapshot {
+                    binance: U256::from(5_000),
+                    wallet: U256::from(5_000),
+                },
+                &[],
+            )
+            .is_err()
+        );
+
+        let mut inverted_limits = direct_policy();
+        inverted_limits.routes[0].withdrawal.minimum = U256::from(201);
+        inverted_limits.routes[0].withdrawal.maximum = U256::from(200);
+        assert!(
+            plan_rebalance(
+                &inverted_limits,
+                BalanceSnapshot {
+                    binance: U256::from(5_000),
+                    wallet: U256::from(5_000),
+                },
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_identical_pending_locations_and_projected_credit_overflow() {
+        let identical = PendingTransfer {
+            source: Location::Wallet,
+            destination: Location::Wallet,
+            amount: U256::ONE,
+        };
+        assert!(
+            plan_rebalance(
+                &direct_policy(),
+                BalanceSnapshot {
+                    binance: U256::from(5_000),
+                    wallet: U256::from(5_000),
+                },
+                &[identical],
+            )
+            .is_err()
+        );
+
+        let overflow = PendingTransfer {
+            source: Location::Binance,
+            destination: Location::Wallet,
+            amount: U256::ONE,
+        };
+        let error = plan_rebalance(
+            &direct_policy(),
+            BalanceSnapshot {
+                binance: U256::ONE,
+                wallet: U256::MAX,
+            },
+            &[overflow],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("wallet credit overflows"));
+    }
+
+    #[test]
+    fn odd_total_inventory_is_split_without_losing_a_base_unit() {
+        let plan = plan_rebalance(
+            &direct_policy(),
+            BalanceSnapshot {
+                binance: U256::from(5_000),
+                wallet: U256::from(5_001),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(plan.binance_target, U256::from(5_000));
+        assert_eq!(plan.wallet_target, U256::from(5_001));
+        assert_eq!(plan.binance_target + plan.wallet_target, U256::from(10_001));
+    }
+
+    #[test]
+    fn wallet_to_binance_transfer_is_not_constrained_by_withdrawal_rules() {
+        let mut policy = direct_policy();
+        policy.routes[0].withdrawal.minimum = U256::from(3_000);
+        policy.routes[0].withdrawal.multiple = U256::from(1_000);
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(3_000),
+                wallet: U256::from(7_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(plan.action.unwrap().amount, U256::from(2_000));
+    }
+
+    #[test]
+    fn direct_route_wins_when_both_deposit_routes_are_available() {
+        let mut policy = direct_policy();
+        policy.routes.push(across_candidate(true, true));
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                binance: U256::from(3_000),
+                wallet: U256::from(7_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(plan.action.unwrap().route, Route::Direct { .. }));
+    }
 }
