@@ -1508,9 +1508,9 @@ fn validate_withdrawal_record(
         "Binance withdrawal destination changed"
     );
     ensure!(
-        decimal_to_base_units(record.amount, operation.intent.token_decimals)?
+        withdrawal_requested_base_units(record, operation.intent.token_decimals)?
             == operation.intent.amount,
-        "Binance withdrawal amount changed"
+        "Binance withdrawal amount plus fee changed"
     );
     Ok(())
 }
@@ -1573,16 +1573,23 @@ fn validate_master_subaccount_view(
 }
 
 fn withdrawal_received_base_units(record: &WithdrawalRecord, decimals: u8) -> anyhow::Result<U256> {
-    let received = if record.transaction_fee.is_zero() {
-        record.amount
-    } else {
-        record
-            .amount
-            .checked_sub(record.transaction_fee)
-            .context("withdrawal fee exceeds amount")?
-    };
-    ensure!(received > Decimal::ZERO, "withdrawal receipt is zero");
-    decimal_to_base_units(received, decimals)
+    ensure!(record.amount > Decimal::ZERO, "withdrawal receipt is zero");
+    decimal_to_base_units(record.amount, decimals)
+}
+
+fn withdrawal_requested_base_units(
+    record: &WithdrawalRecord,
+    decimals: u8,
+) -> anyhow::Result<U256> {
+    ensure!(
+        record.transaction_fee >= Decimal::ZERO,
+        "withdrawal fee is negative"
+    );
+    let requested = record
+        .amount
+        .checked_add(record.transaction_fee)
+        .context("withdrawal amount plus fee overflow")?;
+    decimal_to_base_units(requested, decimals)
 }
 
 fn token_on_chain(symbol: &str, chain_id: u64) -> anyhow::Result<Address> {
@@ -1670,9 +1677,12 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use rust_decimal::Decimal;
 
+    use crate::binance::capital::WithdrawalRecord;
+
     use super::{
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, validate_approved_world_asset,
+        decimal_to_base_units_floor, validate_approved_world_asset, withdrawal_received_base_units,
+        withdrawal_requested_base_units,
     };
 
     #[test]
@@ -1708,5 +1718,30 @@ mod tests {
             U256::from(6_170_807_271_u64)
         );
         assert!(decimal_to_base_units(balance, 6).is_err());
+    }
+
+    #[test]
+    fn treats_binance_withdrawal_amount_as_net_of_fee() {
+        let record = WithdrawalRecord {
+            id: "withdrawal-id".to_owned(),
+            amount: Decimal::from_str_exact("499.95").unwrap(),
+            transaction_fee: Decimal::from_str_exact("0.05").unwrap(),
+            coin: "USDC".to_owned(),
+            status: 6,
+            address: format!("{:#x}", Address::repeat_byte(1)),
+            tx_id: "0xabc".to_owned(),
+            network: "OPTIMISM".to_owned(),
+            withdraw_order_id: "rb1".to_owned(),
+            info: String::new(),
+        };
+
+        assert_eq!(
+            withdrawal_requested_base_units(&record, 6).unwrap(),
+            U256::from(500_000_000_u64)
+        );
+        assert_eq!(
+            withdrawal_received_base_units(&record, 6).unwrap(),
+            U256::from(499_950_000_u64)
+        );
     }
 }

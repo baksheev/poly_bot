@@ -79,9 +79,9 @@ Internal Transfer, Universal Transfer, and IP-restriction permissions through
 `account/apiRestrictions`, and the master key reports the same WLD/USDC
 subaccount balances as the trading key. Account-level `canWithdraw` alone is
 insufficient.
-The current subaccount uses explicit `standard` withdrawal API mode; the
-`localentity` Travel Rule endpoint is available only through explicit
-`travel_rule` configuration and is never used as an implicit fallback.
+The current master account requires the explicit `travel_rule` withdrawal API
+mode and the `localentity` endpoint. Standard withdrawal rejection is never
+treated as implicit authorization to retry through Travel Rule.
 The worker uses a bounded cold-path channel, so Binance, Across, and RPC waits
 never run inside the market-data loop. Only one operation may be active; after
 completion, both Binance and wallet snapshots must refresh before another plan

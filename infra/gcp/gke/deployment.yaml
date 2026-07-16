@@ -49,6 +49,7 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -90,7 +91,7 @@ spec:
             - name: REBALANCE_BINANCE_CREDENTIAL_MODE
               value: separate_treasury
             - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
-              value: standard
+              value: travel_rule
           resources:
             requests:
               cpu: "6"
