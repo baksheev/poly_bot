@@ -177,6 +177,27 @@ jobs:
           }
           trap restore_on_failure EXIT
 
+          # Cancelled deployments can leave immutable release pools behind.
+          # Remove only pools that are not selected by the current Deployment
+          # before creating the next one, so quota cleanup cannot evict the
+          # active workload.
+          while IFS= read -r pool; do
+            if [[ -n "${pool}" \
+              && "${pool}" != "${previous_pool}" \
+              && "${pool}" != "${new_pool}" \
+              && "${pool}" == arb-* ]]; then
+              gcloud container node-pools delete "${pool}" \
+                --project="${GCP_PROJECT_ID}" \
+                --cluster="${GKE_CLUSTER}" \
+                --zone="${GKE_ZONE}" \
+                --quiet
+            fi
+          done < <(gcloud container node-pools list \
+            --project="${GCP_PROJECT_ID}" \
+            --cluster="${GKE_CLUSTER}" \
+            --zone="${GKE_ZONE}" \
+            --format='value(name)')
+
           if [[ "${new_pool}" != "${previous_pool}" ]]; then
             GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
             GKE_CLUSTER="${GKE_CLUSTER}" \
