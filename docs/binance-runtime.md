@@ -153,10 +153,12 @@ are distinct capabilities. Runtime capability discovery must fail closed if
 the master cannot resolve the configured subaccount, transfer from it, or
 withdraw externally.
 
-The same in-process owner serializes DEX and rebalance wallet nonces. The
-initial safe implementation pauses new entries before reserving a rebalance
-operation and resumes only after balances, nonce, and external transfer state
-are reconciled. See `docs/rebalancing.md`.
+The same in-process owner must serialize DEX and rebalance wallet nonces and
+reserve shared inventory. Rebalance state is not a global trading-readiness
+input: market prices and opportunities continue to be processed while a
+transfer is pending. A future trade is rejected only when its direction lacks
+available inventory after reservations, or when a normal trading readiness or
+risk gate fails. See `docs/rebalancing.md`.
 
 ## Readiness gates before order placement
 

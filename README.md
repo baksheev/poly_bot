@@ -52,14 +52,15 @@ criteria.
 
 ## Current status
 
-The first clone components are implemented in read-only shadow mode: persistent
+The Rust service is deployed on the isolated production GKE runtime. Arbitrage
+remains in read-only shadow mode: persistent
 Binance Spot `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
 parsing, reconnect generations, freshness/readiness state, a single in-memory
 state owner, and non-blocking ClickHouse telemetry. Startup now loads a
 fail-closed, versioned snapshot of the active production World Chain
-`USDC-WLD` configuration and reports its SHA-256 fingerprint. No GKE workload
-is currently deployed. The GKE template selects the explicitly gated
-`full_live` rebalance executor for direct and Across WLD/USDC transfers; it
+`USDC-WLD` configuration and reports its SHA-256 fingerprint. Production uses
+the explicitly gated `full_live` rebalance executor for direct and Across
+WLD/USDC transfers; it
 cannot start without an explicit Binance credential mode, a signer, durable
 journals, positive per-token caps, and an exact operator acknowledgement. The
 DEX slice includes pinned-block
@@ -75,13 +76,15 @@ network requests never run in the quote hot path. Only the public
 `Burn`, and `ModifyLiquidity` update the same single-owner pool mirrors used by
 local quotes; no RPC call is made on the event or quote hot path.
 
-The first complete balance pair now seeds a process-scoped rebalance reference
+The first complete balance pair seeds a process-scoped rebalance reference
 for each token. The v3 policy starts a rebalance plan when either location
 falls below 25% of that startup total and targets the Rails-compatible 50/50
-split of current inventory. A required action closes readiness and is emitted
-to telemetry. External mutations remain disabled by default; `full_live` sends
-one journaled action to a bounded cold-path worker and requires fresh Binance
-and wallet reconciliation before another action.
+split of current inventory. `full_live` sends one journaled action to a bounded
+cold-path worker and requires fresh Binance and wallet reconciliation before
+another action. Rebalancing does not close trading readiness: opportunity
+calculation continues, while shared reservations and insufficient available
+inventory are the future per-trade gate. All six supported production routes
+have passed, and heartbeat/fault email monitoring is enabled.
 
 Every accepted Binance update now evaluates both arbitrage directions against
 all hydrated pools. The read-only opportunity engine uses exact-output DEX
@@ -187,6 +190,11 @@ scripts/gce-binance-test binance-recent-validation-orders --limit 20
 
 See [Singapore infrastructure](docs/singapore-infrastructure.md) for image
 updates, IAM boundaries, and the complete diagnostic runbook.
+
+The authoritative checklist for enabling live orders is the
+[full-launch test gate](docs/rails-test-gap-analysis.md). Its current verdict is
+`NO-GO`: the trade execution coordinator, authenticated execution state,
+reservations, recovery/risk gates, and capped canary matrix remain open.
 
 ## Planned implementation slices
 

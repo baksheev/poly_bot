@@ -1,6 +1,98 @@
-# Rails test gap analysis
+# Full-launch test gate and Rails gap analysis
 
 Last reviewed: 2026-07-17
+
+## Current launch verdict
+
+**Live arbitrage: NO-GO.** The production runtime is ready for shadow market
+observation and autonomous rebalancing, but it cannot submit arbitrage orders.
+This is an intentional code-level gate, not an operator setting:
+`PairConfig::validate` rejects `execution_enabled=true`, and every committed
+domain snapshot keeps it `false`.
+
+**Autonomous rebalance: GO within the current caps.** All six supported direct
+and Across routes have completed on the isolated production account. The
+executor is journaled and recoverable, waits for both post-transfer balance
+streams before releasing a route, does not stop opportunity calculation, and
+has Cloud Monitoring heartbeat/fault email alerts. See
+`docs/rebalancing.md` for operation IDs and balances.
+
+"Full launch" in this document means that the Rust service may independently
+detect an opportunity, reserve inventory, execute and reconcile both DEX and
+Binance legs, recover an orphan leg or unknown outcome, and resume after a
+process restart without relying on Rails, Postgres, or ClickHouse.
+
+## Launch gate
+
+| Gate | Status | Evidence now | Required evidence to close |
+|---|---|---|---|
+| Isolated production runtime and capital | Passed | Dedicated GKE runtime, wallet, Binance subaccount/keys, static egress, Secret Manager, per-token rebalance caps | Keep ownership isolated from Rails and verify the same identities at every startup |
+| Market and pool state | Partial | Persistent Binance `bookTicker`; sequence-aware World Chain logs/heads; local V3/V4 state and quotes; freshness gating | Add sequence-consistent Binance Spot depth sufficient for the primary and recovery orders; fault-inject Binance/Alchemy disconnect, gap, reorg, and stale-state recovery |
+| Account and inventory truth | Partial | Exact Binance and wallet snapshots; one-second/block-driven refresh; actual commission hydration | Hydrate exchange filters, order-rate limits, open orders and a fresh User Data Stream; reconcile deterministic client IDs; subtract reservations and unresolved venue state from available balances |
+| Opportunity economics | Partial | Fixed-point two-direction quote math, threshold/reserve, local DEX liquidity sizing | Size against executable CEX depth and reserved inventory; include actual Binance fees, gas and worst-case recovery cost in admission |
+| Rebalance execution | Passed | Direct and Across routes passed in both supported directions; durable journal, route locks, settlement barrier and monitoring are deployed | No launch blocker; retain regression tests and production alerts |
+| Trade execution coordinator | Blocked | Binance WS API request/result primitives and wallet transaction primitives exist, but no trade coordinator is connected to `main` | Implement `dex_first` control and paper `concurrent_hedged` behind one durable intent/state machine; only then permit the config gate to be enabled |
+| Orphan-leg and unknown-outcome recovery | Blocked | Rebalance and wallet recovery patterns exist; Rails behavior is documented | Reconcile Binance timeouts by client order ID; hold unknown wallet nonces; use actual DEX receipt delta; LIMIT then MARKET compensation; restart safely from every intermediate state |
+| Trading risk controls | Blocked | Stale input readiness fails closed and production capital is isolated | Add per-plan/global exposure, order size, rate, loss and recovery-loss limits; one emergency entry stop that never prevents recovery; prevent a second entry while exposure is unknown |
+| Trading observability and operations | Partial | Hot-path telemetry is asynchronous; rebalance heartbeat/fault email alerts are live | Alert on stale execution inputs, unresolved intents/orders/nonces, orphan exposure, recovery loss and disabled/stopped executor; add an operator recovery/kill-switch runbook |
+| Production trade validation | Blocked | Read-only subaccount checks and historical pre-isolation MARKET orders passed | Complete the capped canary matrix below on the dedicated account after paper/fault gates pass |
+
+### P0 work remaining
+
+The following sequence is the shortest safe path to `GO`. Later items must not
+be used to compensate for a missing earlier gate.
+
+1. Build the process-owned execution state machine and durable intent journal.
+   Implement `dex_first` first as the Rails-compatible control. Keep
+   `execution_enabled=false` and use adapters that cannot submit in paper mode.
+2. Add a persistent authenticated Binance execution session: local Spot depth,
+   User Data Stream, exchange filters/rate limits, open-order hydration, and
+   deterministic client-order-ID reconciliation.
+3. Add atomic in-memory inventory, nonce, and order reservations shared by
+   admission, execution, recovery, and rebalance. Available inventory must
+   exclude every unresolved mutation.
+4. Build exact DEX swap transactions from the accepted pool state, simulate
+   them, journal before submission, and use receipt balance deltas rather than
+   planned quantities for hedging and PnL.
+5. Implement compensation and restart recovery: Binance LIMIT-to-MARKET
+   fallback, unknown placement lookup, unknown nonce hold, partial-fill
+   handling, and one balanced terminal state for every accepted intent.
+6. Enforce explicit risk and operator controls before changing the domain gate:
+   per-order/global exposure caps, maximum recovery loss, rate limits,
+   freshness limits, gas reserve, emergency entry stop, and recovery priority.
+7. Run deterministic replay, paper execution, and scheduler/venue fault
+   injection. Every injected timeout, disconnect, partial fill, revert,
+   replacement, stale snapshot, and restart must end balanced or in an explicit
+   alerting fail-closed state.
+8. Run capped production canaries on the isolated account, reconcile them from
+   venue history and ClickHouse, then enable a tiny live budget through a
+   separate explicit acknowledgement. Increasing size is a later decision.
+
+### Required production canary matrix
+
+This matrix begins only after P0 paper and fault-injection gates pass:
+
+| Canary | Required result |
+|---|---|
+| Dedicated Binance MARKET buy and sell | Both fill under deterministic client IDs; account, User Data Stream, order query, fills, commissions and balance deltas agree |
+| Binance IOC/partial fill | Filled and cancelled quantities reconcile exactly; no reservation leaks |
+| DEX USDC to WLD and WLD to USDC | Simulation, submission, receipt, token deltas, nonce and pool-state reconciliation agree |
+| DEX-first arbitrage in both directions | Hedge uses actual DEX delta; realized net PnL and final exposure are recorded |
+| Binance unknown placement | Timeout cannot create a duplicate; client-ID lookup reaches one terminal state |
+| EVM unknown/replaced/reverted transaction | Nonce lane stays held until the chain outcome is known; restart does not duplicate the leg |
+| DEX failure after CEX exposure | LIMIT unwind is attempted, MARKET fallback removes residual exposure, realized loss is recorded |
+| CEX reject/partial fill after DEX exposure | Recovery removes residual exposure within the configured maximum loss |
+| Restart at every coordinator state | No duplicated order/transaction and no silently abandoned exposure |
+| Rebalance during trading | It may run in parallel, but reservations prevent overspend; only insufficient available inventory blocks a new trade |
+
+### Final `GO` rule
+
+The launch verdict changes only when all rows above are `Passed`,
+`scripts/quality.sh` succeeds, the production ledger contains venue-verifiable
+evidence for the complete canary matrix, and there are no unresolved orders,
+transactions, reservations, nonces, or rebalance operations. Passing rebalance
+alone, matching the Rails test count, or observing profitable shadow signals
+cannot change the verdict.
 
 This audit compares the Rails `arb_bot` suite with the business logic that is
 already present in the Rust service. It is not a target to reproduce the Rails
@@ -62,7 +154,7 @@ completed rebalance matrix exercised balance refresh, reservations, nonce
 ownership, allowances, and post-mutation reconciliation. Scheduler fault
 injection and short-reorg recovery remain explicit test gaps below.
 
-## Deliberately not ported yet
+## Rails scenarios not ported yet
 
 These Rails tests describe remaining features or failure-injection scenarios.
 They become mandatory acceptance criteria when the corresponding component is
