@@ -1129,16 +1129,10 @@ impl TradingEngine {
                 );
                 continue;
             }
-            if !economics.meets_threshold {
-                self.emit_admission_risk_rejection(
-                    quote,
-                    &pair_id,
-                    trade_direction,
-                    "fully_burdened_economics_below_threshold",
-                    Some(economics),
-                );
-                continue;
-            }
+            // Rails gates opportunity admission on the gross venue spread.
+            // Keep the fully-burdened economics in telemetry and use them to
+            // rank candidates, but do not turn them into a hidden Rust-only
+            // threshold.
             candidates.push((trade_direction, trade, economics));
         }
         let candidate = candidates

@@ -399,6 +399,8 @@ impl HotTelemetryTask {
             "execution_slippage_bps": trade.execution_slippage_bps,
             "profit_token_a_base_units": trade.signed_profit_token_a(),
             "profit_token_a": profit,
+            "gross_profit_bps_x100": trade.gross_profit_bps_x100,
+            "gross_profit_bps": format_bps_x100(trade.gross_profit_bps_x100),
             "profit_bps_x100": trade.profit_bps_x100,
             "profit_bps": format_bps_x100(trade.profit_bps_x100),
             "meets_threshold": trade.meets_threshold,

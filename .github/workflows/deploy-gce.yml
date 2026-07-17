@@ -1,0 +1,181 @@
+name: Deploy GCE
+
+on:
+  workflow_dispatch:
+    inputs:
+      execution_mode:
+        description: "GCE arbitrage execution mode"
+        required: true
+        default: full_live
+        type: choice
+        options:
+          - full_live
+          - paper_dex_first
+          - disabled
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-gce
+  cancel-in-progress: true
+
+env:
+  GCP_REGION: asia-southeast1
+  GCE_ZONE: asia-southeast1-b
+  GKE_CLUSTER: arb-bot
+  GKE_NAMESPACE: arb-bot
+  GCE_INSTANCE: arb-bot-rust-shadow-gce
+  ARTIFACT_REPOSITORY: poly-bot
+  IMAGE_NAME: poly-bot
+  SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  deploy:
+    name: Build and roll out GCE image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+
+    steps:
+      - name: Checkout revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Validate deployment inputs
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
+          EXECUTION_MODE: ${{ inputs.execution_mode }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test "${GITHUB_REF}" = "refs/heads/main"
+          test -n "${GCP_PROJECT_ID}"
+          test -n "${GCP_WORKLOAD_IDENTITY_PROVIDER}"
+          test -n "${GCP_DEPLOY_SERVICE_ACCOUNT}"
+          [[ "${EVM_WALLET_ADDRESS}" =~ ^0x[0-9a-fA-F]{40}$ ]]
+          [[ "${EXECUTION_MODE}" =~ ^(disabled|paper_dex_first|full_live)$ ]]
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Build and push immutable image
+        id: image
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          registry="${GCP_REGION}-docker.pkg.dev"
+          image_tag="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}:${SOURCE_SHA}"
+          gcloud auth configure-docker "${registry}" --quiet
+          docker build \
+            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --tag "${image_tag}" \
+            .
+          docker push "${image_tag}"
+          digest="$(gcloud artifacts docker images describe \
+            "${image_tag}" \
+            --format='value(image_summary.digest)')"
+          test "${digest#sha256:}" != "${digest}"
+          test "${#digest}" -eq 71
+          image="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}@${digest}"
+          echo "image=${image}" >>"${GITHUB_OUTPUT}"
+
+      - name: Verify GKE live owner is disabled
+        if: inputs.execution_mode == 'full_live'
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          gcloud container clusters get-credentials "${GKE_CLUSTER}" \
+            --zone="${GCE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet
+          replicas="$(kubectl get deployment arb-bot \
+            --namespace="${GKE_NAMESPACE}" \
+            --output='jsonpath={.spec.replicas}')"
+          test "${replicas}" = "0"
+
+      - name: Update GCE metadata and restart
+        id: gce
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
+          EXECUTION_MODE: ${{ inputs.execution_mode }}
+        run: |
+          set -euo pipefail
+          release_id="${SOURCE_SHA:0:12}"
+          mode_label="${EXECUTION_MODE//_/-}"
+          domain_config_path="config/strategies/usdc-wld-world-chain.v4.json"
+          live_confirmation=""
+
+          if [[ "${EXECUTION_MODE}" == "full_live" ]]; then
+            domain_config_path="config/strategies/usdc-wld-world-chain.v5.json"
+            live_confirmation="ENABLE_FULL_LIVE_ARBITRAGE"
+          fi
+
+          engine_id="arb-bot-rust-${mode_label}-gce-${release_id}"
+          gcloud compute instances describe "${GCE_INSTANCE}" \
+            --zone="${GCE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" >/dev/null
+          gcloud compute instances add-metadata "${GCE_INSTANCE}" \
+            --zone="${GCE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --metadata="arb-bot-image=${IMAGE},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=${domain_config_path},arb-bot-arbitrage-execution-mode=${EXECUTION_MODE},arb-bot-arbitrage-live-confirmation=${live_confirmation}" \
+            --metadata-from-file="startup-script=infra/gcp/gce-startup.sh"
+          gcloud compute instances add-labels "${GCE_INSTANCE}" \
+            --zone="${GCE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --labels="component=trading,mode=${mode_label},source-revision=${release_id}"
+
+          status="$(gcloud compute instances describe "${GCE_INSTANCE}" \
+            --zone="${GCE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --format='value(status)')"
+          if [[ "${status}" == "TERMINATED" ]]; then
+            gcloud compute instances start "${GCE_INSTANCE}" \
+              --zone="${GCE_ZONE}" \
+              --project="${GCP_PROJECT_ID}" \
+              --quiet
+          else
+            gcloud compute instances stop "${GCE_INSTANCE}" \
+              --zone="${GCE_ZONE}" \
+              --project="${GCP_PROJECT_ID}" \
+              --quiet
+            gcloud compute instances start "${GCE_INSTANCE}" \
+              --zone="${GCE_ZONE}" \
+              --project="${GCP_PROJECT_ID}" \
+              --quiet
+          fi
+
+          echo "engine_id=${engine_id}" >>"${GITHUB_OUTPUT}"
+          echo "release_id=${release_id}" >>"${GITHUB_OUTPUT}"
+
+      - name: Publish deployment summary
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          {
+            echo "### GCE production deployment"
+            echo
+            echo "- Revision: \`${SOURCE_SHA}\`"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Instance: \`${GCE_INSTANCE}\` in \`${GCE_ZONE}\`"
+            echo "- Engine: \`${{ steps.gce.outputs.engine_id }}\`"
+            echo "- Execution mode: \`${{ inputs.execution_mode }}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"

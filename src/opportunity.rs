@@ -67,6 +67,9 @@ pub struct TradeEvaluation {
     pub cost_token_a: U256,
     pub proceeds_token_a: U256,
     pub execution_slippage_bps: u16,
+    /// Rails-style venue spread before execution reserves and commissions,
+    /// expressed in signed hundredths of one basis point.
+    pub gross_profit_bps_x100: i64,
     /// Signed hundredths of one basis point.
     pub profit_bps_x100: i64,
     pub meets_threshold: bool,
@@ -926,10 +929,11 @@ fn evaluate_trade_with_dex_quote(
         cost_token_a,
         proceeds_token_a,
         execution_slippage_bps,
+        gross_profit_bps_x100,
         profit_bps_x100: 0,
         meets_threshold: meets_threshold(
-            proceeds_token_a,
-            cost_token_a,
+            gross_proceeds_token_a,
+            gross_cost_token_a,
             pair.opportunity_threshold_bps,
         )?,
     }))
@@ -1556,7 +1560,7 @@ mod tests {
     fn slippage_is_derived_before_binance_commission_like_rails() {
         let (mut pair, _) = fixture();
         pair.binance_sell_fee_bps = 20;
-        let trade = evaluate_trade_with_dex_quote(
+        let mut trade = evaluate_trade_with_dex_quote(
             &pair,
             ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             0,
@@ -1568,7 +1572,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(trade.execution_slippage_bps, 15);
+        assert_eq!(trade.gross_profit_bps_x100, 3_000);
         assert_eq!(trade.proceeds_token_a, U256::from(10_009_u16));
+        assert!(trade.meets_threshold);
+        finalize_trade_profit(&mut trade).unwrap();
+        assert!(trade.profit_bps_x100 < i64::from(pair.opportunity_threshold_bps) * 100);
     }
 
     #[test]
@@ -1736,6 +1744,7 @@ mod tests {
             cost_token_a: U256::from(90_u8),
             proceeds_token_a: U256::from(110_u8),
             execution_slippage_bps: 5,
+            gross_profit_bps_x100: 0,
             profit_bps_x100: 0,
             meets_threshold: true,
         };
@@ -1761,6 +1770,7 @@ mod tests {
             cost_token_a: U256::from(1_434_535_u64),
             proceeds_token_a: U256::from(191_558_u64),
             execution_slippage_bps: 5,
+            gross_profit_bps_x100: 0,
             profit_bps_x100: 0,
             meets_threshold: false,
         };
@@ -1772,6 +1782,7 @@ mod tests {
             cost_token_a: U256::from(20_068_045_u64),
             proceeds_token_a: U256::from(19_975_984_u64),
             execution_slippage_bps: 5,
+            gross_profit_bps_x100: 0,
             profit_bps_x100: 0,
             meets_threshold: false,
         };
