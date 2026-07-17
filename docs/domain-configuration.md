@@ -89,3 +89,9 @@ The pair was re-read from production on 2026-07-17 after its latest
 tick `0.001`, `profit_token_a`, and the V3/V4 provider set. The older Rails seed
 value of 10 USDC is not authoritative; the versioned artifact follows the live
 production row and records its exact update timestamp.
+
+Binance currently advertises a finer WLDUSDC `PRICE_FILTER` tick of `0.0001`.
+The runtime deliberately retains the Rails execution tick of `0.001`: startup
+accepts it only while it is an exact integer multiple of the live venue tick,
+and live IOC planning rounds on `0.001`. A non-aligned future filter change is
+fail-closed.

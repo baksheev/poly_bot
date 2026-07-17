@@ -377,6 +377,30 @@ pub struct SymbolRules {
     pub max_num_algo_orders: u32,
 }
 
+impl SymbolRules {
+    /// Keeps a coarser strategy price increment when it is exactly aligned to
+    /// Binance's current PRICE_FILTER. This preserves the Rails-configured
+    /// order rounding while still rejecting prices that the venue cannot
+    /// represent.
+    pub fn with_compatible_price_step(&self, configured_step: Decimal) -> anyhow::Result<Self> {
+        ensure!(
+            configured_step > Decimal::ZERO,
+            "configured Binance price step is non-positive"
+        );
+        ensure!(
+            self.price.step > Decimal::ZERO,
+            "live Binance PRICE_FILTER step is non-positive"
+        );
+        ensure!(
+            configured_step % self.price.step == Decimal::ZERO,
+            "configured Binance price step is not aligned to live PRICE_FILTER"
+        );
+        let mut execution_rules = self.clone();
+        execution_rules.price.step = configured_step;
+        Ok(execution_rules)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecimalFilter {
     pub min: Decimal,
@@ -869,6 +893,22 @@ mod tests {
         assert_eq!(rules.min_notional, Decimal::new(5, 0));
         assert_eq!(rules.max_num_orders, 200);
         assert_eq!(rules.max_num_algo_orders, 5);
+
+        let rails_compatible = rules
+            .with_compatible_price_step(Decimal::new(1, 3))
+            .unwrap();
+        assert_eq!(rails_compatible.price.step, Decimal::new(1, 3));
+        assert_eq!(rules.price.step, Decimal::new(1, 4));
+        assert!(
+            rules
+                .with_compatible_price_step(Decimal::new(15, 5))
+                .is_err()
+        );
+        assert!(
+            rules
+                .with_compatible_price_step(Decimal::new(1, 5))
+                .is_err()
+        );
     }
 
     #[test]

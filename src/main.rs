@@ -707,12 +707,12 @@ async fn run(
         pair.binance.base_asset,
         pair.binance.quote_asset
     );
-    ensure!(
-        binance_account.symbol_rules.price.step
-            == Decimal::from_str(&pair.binance.tick_size)
-                .context("domain Binance tick_size is invalid")?,
-        "domain Binance tick_size differs from live PRICE_FILTER"
-    );
+    let configured_binance_tick = Decimal::from_str(&pair.binance.tick_size)
+        .context("domain Binance tick_size is invalid")?;
+    let execution_symbol_rules = binance_account
+        .symbol_rules
+        .with_compatible_price_step(configured_binance_tick)
+        .context("domain Binance tick_size is incompatible with live PRICE_FILTER")?;
     ensure!(
         binance_account.symbol_rules.lot_size.step
             == Decimal::from_str(&pair.binance.step_size)
@@ -948,7 +948,7 @@ async fn run(
         let executor = ComposedLiveLegExecutor::new(
             dex_service,
             binance_service,
-            binance_account.symbol_rules.clone(),
+            execution_symbol_rules.clone(),
             pair.binance.base_asset.clone(),
             pair.token_b.decimals,
             pair.binance.quote_asset.clone(),
@@ -1083,6 +1083,7 @@ async fn run(
         binance_sell_fee_bps,
         binance_symbol_status = %binance_account.symbol_rules.status,
         binance_price_tick = %binance_account.symbol_rules.price.step,
+        binance_execution_price_tick = %execution_symbol_rules.price.step,
         binance_lot_step = %binance_account.symbol_rules.lot_size.step,
         binance_market_lot_step = %binance_account.symbol_rules.market_lot_size.step,
         binance_min_notional = %binance_account.symbol_rules.min_notional,
