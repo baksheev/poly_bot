@@ -37,6 +37,8 @@ address="arb-bot-gce-egress"
 instance="arb-bot-rust-shadow-gce"
 runtime_service_account="arb-bot-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
 engine_id="arb-bot-rust-shadow-gce-${source_revision}"
+iap_tag="arb-bot-runtime"
+iap_firewall="arb-bot-runtime-iap-ssh"
 
 "${gcloud_local}" config set project "${GCP_PROJECT_ID}" >/dev/null
 "${gcloud_local}" services enable \
@@ -98,6 +100,16 @@ if ! "${gcloud_local}" compute addresses describe "${address}" \
     --network-tier=PREMIUM \
     --quiet
 fi
+if ! "${gcloud_local}" compute firewall-rules describe "${iap_firewall}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute firewall-rules create "${iap_firewall}" \
+    --network="${network}" \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:22 \
+    --source-ranges=35.235.240.0/20 \
+    --target-tags="${iap_tag}" \
+    --quiet
+fi
 if "${gcloud_local}" compute instances describe "${instance}" \
   --zone="${zone}" >/dev/null 2>&1; then
   echo "instance already exists: ${instance}; refusing to replace it" >&2
@@ -118,6 +130,7 @@ fi
   --boot-disk-type=hyperdisk-balanced \
   --boot-disk-size=20GB \
   --service-account="${runtime_service_account}" \
+  --tags="${iap_tag}" \
   --scopes=https://www.googleapis.com/auth/cloud-platform \
   --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v4.json,arb-bot-arbitrage-execution-mode=paper_dex_first" \
   --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh" \

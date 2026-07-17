@@ -29,6 +29,11 @@ The VM is attached to the isolated custom VPC `arb-bot-low-latency`, subnet
 Premium-tier static egress IP is `34.21.220.162`; use that address for future
 exchange allowlists.
 
+The only runtime ingress exception is TCP 22 from Google IAP's
+`35.235.240.0/20` range to the `arb-bot-runtime` network tag. It supports the
+entry-stop and inspection runbook without exposing SSH directly to the
+internet.
+
 The attached runtime service account obtains short-lived metadata-server
 tokens. The boot script reads ClickHouse and Alchemy values directly from
 Secret Manager, writes a root-only environment file, authenticates to Artifact

@@ -91,8 +91,23 @@ zone="${GCE_ZONE:-${GCP_REGION}-b}"
 instance="arb-bot-rust-shadow-gce"
 runtime_service_account="arb-bot-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
 engine_id="arb-bot-rust-${mode_label}-gce-${source_revision}"
+iap_tag="arb-bot-runtime"
+iap_firewall="arb-bot-runtime-iap-ssh"
 
 "${gcloud_local}" compute instances describe "${instance}" --zone="${zone}" >/dev/null
+if ! "${gcloud_local}" compute firewall-rules describe "${iap_firewall}" >/dev/null 2>&1; then
+  "${gcloud_local}" compute firewall-rules create "${iap_firewall}" \
+    --network=arb-bot-low-latency \
+    --direction=INGRESS \
+    --action=ALLOW \
+    --rules=tcp:22 \
+    --source-ranges=35.235.240.0/20 \
+    --target-tags="${iap_tag}" \
+    --quiet
+fi
+"${gcloud_local}" compute instances add-tags "${instance}" \
+  --zone="${zone}" \
+  --tags="${iap_tag}"
 if [[ "${execution_mode}" == "full_live" ]]; then
   audit_kube_dir="$(mktemp -d)"
   export KUBECONFIG="${audit_kube_dir}/config"
