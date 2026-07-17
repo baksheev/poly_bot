@@ -54,6 +54,7 @@ pub struct TradingEngine {
     binance_user_data_connected: bool,
     binance_user_data_clean: bool,
     binance_orders: BTreeMap<String, ExecutionReportEvent>,
+    last_sequence_matched_quote_update: BTreeMap<String, u64>,
     gas_price_symbol: String,
     gas_price_connected: bool,
     gas_price_generation: u64,
@@ -108,6 +109,21 @@ fn rebalance_health_state(
         inflight_stuck,
         settlement_stuck,
     }
+}
+
+fn mark_sequence_matched_update(
+    last_updates: &mut BTreeMap<String, u64>,
+    symbol: &str,
+    update_id: u64,
+) -> bool {
+    if last_updates
+        .get(symbol)
+        .is_some_and(|last| update_id <= *last)
+    {
+        return false;
+    }
+    last_updates.insert(symbol.to_owned(), update_id);
+    true
 }
 
 impl RebalanceSettlementBarrier {
@@ -177,6 +193,7 @@ impl TradingEngine {
                 binance_user_data_connected: false,
                 binance_user_data_clean: true,
                 binance_orders: BTreeMap::new(),
+                last_sequence_matched_quote_update: BTreeMap::new(),
                 gas_price_symbol,
                 gas_price_connected: false,
                 gas_price_generation: 0,
@@ -439,6 +456,8 @@ impl TradingEngine {
                 observed_at,
             } => {
                 self.state.on_connected(&symbol, generation);
+                self.last_sequence_matched_quote_update
+                    .remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_connected",
                     json!({
@@ -506,6 +525,25 @@ impl TradingEngine {
                         "apply_result": format!("{apply_result:?}"),
                     }),
                 );
+                self.refresh_phase(Instant::now());
+                let quote = self
+                    .state
+                    .binance_feeds
+                    .get(symbol.as_ref())
+                    .and_then(|feed| feed.book.clone());
+                if self.state.phase == RuntimePhase::Ready
+                    && let (Some(depth), Some(quote)) = (depth, quote)
+                    && depth.matches_top(
+                        quote.symbol.as_ref(),
+                        quote.update_id,
+                        quote.bid_price,
+                        quote.bid_quantity,
+                        quote.ask_price,
+                        quote.ask_quantity,
+                    )
+                {
+                    self.evaluate_sequence_matched_quote(&quote, "binance_depth", depth)?;
+                }
             }
         }
         self.refresh_phase(Instant::now());
@@ -927,8 +965,10 @@ impl TradingEngine {
                 // The decision is evaluated only after all readiness inputs are
                 // fresh. The calculation itself performs no RPC, I/O, or locks.
                 self.refresh_phase(Instant::now());
-                if self.state.phase == RuntimePhase::Ready && matching_depth.is_some() {
-                    self.evaluate_ready_quote(&quote, "binance_book_ticker", matching_depth)?;
+                if self.state.phase == RuntimePhase::Ready
+                    && let Some(depth) = matching_depth
+                {
+                    self.evaluate_sequence_matched_quote(&quote, "binance_book_ticker", depth)?;
                 } else if self.state.phase == RuntimePhase::Ready {
                     self.telemetry.emit(
                         "binance_book_depth_mismatch",
@@ -962,6 +1002,22 @@ impl TradingEngine {
         Ok(())
     }
 
+    fn evaluate_sequence_matched_quote(
+        &mut self,
+        quote: &TopOfBook,
+        trigger: &'static str,
+        depth: &SpotDepthBook,
+    ) -> anyhow::Result<()> {
+        if !mark_sequence_matched_update(
+            &mut self.last_sequence_matched_quote_update,
+            quote.symbol.as_ref(),
+            quote.update_id,
+        ) {
+            return Ok(());
+        }
+        self.evaluate_ready_quote(quote, trigger, Some(depth))
+    }
+
     fn evaluate_ready_quote(
         &mut self,
         quote: &TopOfBook,
@@ -977,12 +1033,8 @@ impl TradingEngine {
                 calculation_started.elapsed().as_micros(),
                 trigger,
             );
-            if trigger == "binance_book_ticker" {
-                self.submit_paper_opportunity(
-                    quote,
-                    evaluation,
-                    depth.context("book-triggered evaluation has no matching depth")?,
-                )?;
+            if let Some(depth) = depth {
+                self.submit_paper_opportunity(quote, evaluation, depth)?;
             }
         }
         Ok(())
@@ -1471,11 +1523,24 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{collections::BTreeMap, time::Instant};
 
     use crate::rebalance::Direction;
 
-    use super::{RebalanceSettlementBarrier, TradingReadiness, rebalance_health_state};
+    use super::{
+        RebalanceSettlementBarrier, TradingReadiness, mark_sequence_matched_update,
+        rebalance_health_state,
+    };
+
+    #[test]
+    fn sequence_matched_market_updates_are_deduplicated_per_symbol() {
+        let mut updates = BTreeMap::new();
+        assert!(mark_sequence_matched_update(&mut updates, "WLDUSDC", 100));
+        assert!(!mark_sequence_matched_update(&mut updates, "WLDUSDC", 100));
+        assert!(!mark_sequence_matched_update(&mut updates, "WLDUSDC", 99));
+        assert!(mark_sequence_matched_update(&mut updates, "WLDUSDC", 101));
+        assert!(mark_sequence_matched_update(&mut updates, "ETHUSDT", 1));
+    }
 
     #[test]
     fn rebalance_state_is_not_a_global_trading_readiness_input() {
