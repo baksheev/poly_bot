@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v4-gas-accounting",
+  "source": {
+    "repository": "baksheev/arb_bot",
+    "revision": "e381dff246e806b86ca9cf3de4a5c805204cb86c",
+    "rails_pair_id": 3,
+    "rails_pair_updated_at_utc": "2026-07-17T14:16:00.337388Z",
+    "captured_at_utc": "2026-07-17T14:24:20Z",
+    "evidence": [
+      "production PostgreSQL whitelist SELECT from arb_bot_production",
+      "docs/multi-wallet-infrastructure.md current USDC-WLD configuration",
+      "app/jobs/update_min_buy_amount_job.rb dynamic token-B quote sizing",
+      "app/jobs/detect_arbitrage_job.rb strategy constants",
+      "app/jobs/rebalance_wallets_job.rb rebalance direction and target formulas",
+      "app/jobs/calculate_arbitrage_profit_job.rb ETHUSDT gas conversion",
+      "explicit Rust clone decision: Binance market data and execution must both use Spot",
+      "explicit Rust clone decision: startup token inventory is the rebalance reference maximum"
+    ]
+  },
+  "live_trading_enabled": false,
+  "pairs": [
+    {
+      "id": "world-chain-usdc-wld",
+      "market_data_enabled": true,
+      "execution_enabled": false,
+      "chain": {
+        "name": "World Chain",
+        "chain_id": 480,
+        "rpc_url_env": "ALCHEMY_WORLDCHAIN_RPC_URL",
+        "ws_url_env": "ALCHEMY_WORLDCHAIN_WS_URL",
+        "binance_network_name": "WLD",
+        "gas_symbol": "ETH",
+        "gas_decimals": 18,
+        "gas_price_binance_symbol": "ETHUSDT",
+        "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+        "uniswap_v3_factory_address": "0x7a5028BDa40e7B173C278C5342087826455ea25a",
+        "uniswap_v3_quoter_address": "0x10158D43e6cc414deE1Bd1eB0EfC6a5cBCfF244c",
+        "uniswap_v3_router_address": "0x091AD9e2e6e5eD44c1c66dB50e49A601F9f36cF6",
+        "uniswap_v4_quoter_address": "0x55d235b3ff2daf7c3ede0defc9521f1d6fe6c5c0",
+        "uniswap_v4_router_address": "0x8ac7bee993bb44dab564ea4bc9ea67bf9eb5e743",
+        "uniswap_v4_pool_manager_address": "0xb1860d529182ac3bc1f51fa2abd56662b7d13f33",
+        "uniswap_v4_state_view_address": "0x51d394718bc09297262e368c1a481217fdeb71eb"
+      },
+      "token_a": {
+        "symbol": "USDC",
+        "contract": "0x79a02482a880bce3f13e09da970dc34db4cd24d1",
+        "decimals": 6
+      },
+      "token_b": {
+        "symbol": "WLD",
+        "contract": "0x2cfc85d8e48f8eab294be644d9e25c3030863003",
+        "decimals": 18
+      },
+      "binance": {
+        "symbol": "WLDUSDC",
+        "base_asset": "WLD",
+        "quote_asset": "USDC",
+        "market_data_product": "spot",
+        "execution_product": "spot",
+        "step_size": "0.100000000000000",
+        "tick_size": "0.001000000000000"
+      },
+      "quote_sizing": {
+        "token_a_base_units": "20000000",
+        "token_b": {
+          "mode": "derive_from_binance_ask"
+        }
+      },
+      "strategy": {
+        "kind": "profit_token_a",
+        "opportunity_threshold_bps": 20,
+        "max_quote_age_ms": 30000,
+        "min_slippage_bps": 5,
+        "max_slippage_bps": 50,
+        "slippage_profit_share_bps": 5000,
+        "dex_fee_reserve_bps": 4,
+        "balance_safety_multiplier": 3
+      },
+      "rebalance": {
+        "enabled": true,
+        "start_threshold_bps": 2500
+      },
+      "dex": {
+        "allowed_providers": ["uniswap_v3", "uniswap_v4"],
+        "uniswap_v3": {
+          "fee_tiers": [3000, 5000, 10000]
+        },
+        "uniswap_v4": {
+          "pools": [
+            {"fee_tier": 500, "tick_spacing": 10, "hooks": "0x0000000000000000000000000000000000000000"},
+            {"fee_tier": 3000, "tick_spacing": 60, "hooks": "0x0000000000000000000000000000000000000000"},
+            {"fee_tier": 10000, "tick_spacing": 200, "hooks": "0x0000000000000000000000000000000000000000"}
+          ]
+        }
+      }
+    }
+  ]
+}

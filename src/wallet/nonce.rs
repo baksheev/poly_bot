@@ -685,6 +685,7 @@ mod tests {
                 status: 1,
                 gas_used: 50_000,
                 effective_gas_price: 1_000_000,
+                logs: vec![],
             },
         )
         .unwrap();
@@ -731,6 +732,7 @@ mod tests {
                 status: 0,
                 gas_used: 21_000,
                 effective_gas_price: 1_000_000,
+                logs: vec![],
             },
         )
         .unwrap();
@@ -796,6 +798,7 @@ mod tests {
                     status: 1,
                     gas_used: 21_000,
                     effective_gas_price: 1,
+                    logs: vec![],
                 },
             )
             .is_err()
@@ -818,6 +821,7 @@ mod tests {
                 status: 1,
                 gas_used: 50_000,
                 effective_gas_price: 1_000_000,
+                logs: vec![],
             }),
             None,
         )

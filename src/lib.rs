@@ -1,4 +1,6 @@
 pub mod across;
+pub mod admission;
+pub mod arbitrage;
 pub mod balances;
 pub mod binance;
 pub mod chain;
@@ -6,7 +8,11 @@ pub mod config;
 pub mod dex;
 pub mod domain;
 pub mod engine;
+pub mod execution_accounting;
+pub mod execution_plan;
 pub mod hot_telemetry;
+pub mod inventory;
+pub mod live_execution;
 pub mod market_data;
 pub mod opportunity;
 pub mod rebalance;

@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
         AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
         WORLD_CHAIN_USDC, validate_quote,
     },
+    arbitrage::{ExecutionMode, paper_trade_channel},
     balances::{
         BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
     },
@@ -15,16 +16,24 @@ use arb_bot::{
         CapitalRecoverySnapshot, CapitalRouteState, TravelRuleWithdrawalRecord, WithdrawalRecord,
         select_capital_routes,
     },
-    binance::ws_api::BinanceWsApiClient,
+    binance::{
+        execution::BinanceExecutionService,
+        user_data::UserDataStream,
+        validation::{BinanceCanaryKind, execute_order_round_trip},
+        ws_api::BinanceWsApiClient,
+    },
     chain::rpc::JsonRpcClient,
     config::{self, Cli, Command},
     dex::{
         events::build_log_filters,
+        execution::{AllowanceRequirement, DexExecutionService, DexExecutor, UniswapProtocol},
         hydration::DexHydrator,
         mirror::{DexMirror, LogApplyResult},
+        validation::{execute_recovery_sell, execute_round_trip},
     },
-    domain::config::LoadedDomainConfig,
-    engine::TradingEngine,
+    domain::config::{DexProvider, LoadedDomainConfig},
+    engine::{BinanceFeeBps, TradingEngine},
+    live_execution::{ComposedLiveLegExecutor, LiveRiskLimits, live_trade_channel},
     market_data::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
@@ -41,8 +50,13 @@ use arb_bot::{
     },
 };
 use clap::Parser;
+use rust_decimal::Decimal;
+use std::str::FromStr;
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::{EnvFilter, fmt};
+
+const ARBITRAGE_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_WALLET_JOURNAL_PATH";
+const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -120,6 +134,47 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceRecentValidationOrders { limit } => {
             binance_recent_validation_orders(&cli.config, limit).await
         }
+        Command::BinanceOrderRoundTrip {
+            order_type,
+            quote_usdc,
+            price_deviation_bps,
+            journal_path,
+            live_confirmation,
+        } => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            let kind = BinanceCanaryKind::parse(&order_type)?;
+            let quote_usdc =
+                Decimal::from_str(&quote_usdc).context("--quote-usdc must be an exact decimal")?;
+            let outcome = execute_order_round_trip(
+                &cli.config,
+                &domain_config,
+                kind,
+                quote_usdc,
+                price_deviation_bps,
+                journal_path,
+                &live_confirmation,
+            )
+            .await?;
+            tracing::info!(
+                order_type = outcome.kind.label(),
+                buy_order_id = outcome.buy.order.order_id,
+                buy_client_order_id = %outcome.buy.order.client_order_id,
+                sell_order_id = outcome.sell.order.order_id,
+                sell_client_order_id = %outcome.sell.order.client_order_id,
+                fallback_sell_order_id = outcome
+                    .fallback_sell
+                    .as_ref()
+                    .map(|order| order.order.order_id),
+                wld_received = %outcome.wld_received,
+                wld_sell_quantity = %outcome.wld_sell_quantity,
+                wld_before = %outcome.before.wld,
+                wld_after = %outcome.after.wld,
+                usdc_before = %outcome.before.usdc,
+                usdc_after = %outcome.after.usdc,
+                "Binance live validation evidence"
+            );
+            Ok(())
+        }
         Command::BinanceWithdrawalStatus {
             coin,
             withdraw_order_id,
@@ -139,6 +194,80 @@ async fn main() -> anyhow::Result<()> {
         Command::WalletHydrate => {
             let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
             wallet_hydrate(&domain_config).await
+        }
+        Command::UniswapRoundTrip {
+            protocol,
+            amount_usdc_base_units,
+            slippage_bps,
+            additional_gas,
+            confirmation_timeout_seconds,
+            live_confirmation,
+        } => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            let protocol = match protocol.as_str() {
+                "v3" => UniswapProtocol::V3,
+                "v4" => UniswapProtocol::V4,
+                _ => bail!("--protocol must be v3 or v4"),
+            };
+            let outcome = execute_round_trip(
+                &domain_config,
+                protocol,
+                amount_usdc_base_units,
+                slippage_bps,
+                additional_gas,
+                Duration::from_secs(confirmation_timeout_seconds),
+                &live_confirmation,
+            )
+            .await?;
+            tracing::info!(
+                protocol = outcome.protocol.label(),
+                wallet = %outcome.wallet,
+                amount_usdc_in = %outcome.amount_usdc_in,
+                amount_wld_received = %outcome.amount_wld_received,
+                amount_usdc_received = %outcome.amount_usdc_received,
+                buy_transaction_hash = %outcome.buy.transaction_hash,
+                sell_transaction_hash = %outcome.sell.transaction_hash,
+                usdc_before = %outcome.before.usdc,
+                usdc_after = %outcome.after.usdc,
+                wld_before = %outcome.before.wld,
+                wld_after = %outcome.after.wld,
+                "Uniswap live validation evidence"
+            );
+            Ok(())
+        }
+        Command::UniswapRecoverySell {
+            protocol,
+            amount_wld_base_units,
+            slippage_bps,
+            additional_gas,
+            confirmation_timeout_seconds,
+            live_confirmation,
+        } => {
+            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            let protocol = match protocol.as_str() {
+                "v3" => UniswapProtocol::V3,
+                "v4" => UniswapProtocol::V4,
+                _ => bail!("--protocol must be v3 or v4"),
+            };
+            let outcome = execute_recovery_sell(
+                &domain_config,
+                protocol,
+                U256::from(amount_wld_base_units),
+                slippage_bps,
+                additional_gas,
+                Duration::from_secs(confirmation_timeout_seconds),
+                &live_confirmation,
+            )
+            .await?;
+            tracing::info!(
+                protocol = outcome.protocol.label(),
+                wallet = %outcome.wallet,
+                amount_wld_in = %outcome.amount_wld_in,
+                amount_usdc_received = %outcome.amount_usdc_received,
+                transaction_hash = %outcome.sell.transaction_hash,
+                "Uniswap recovery sell evidence"
+            );
+            Ok(())
         }
     }
 }
@@ -453,9 +582,20 @@ async fn binance_recent_validation_orders(
         !validation_orders.is_empty(),
         "no recent Rust validation orders found"
     );
+    let open_orders = ws.open_orders("WLDUSDC").await?;
+    let open_validation_orders = open_orders
+        .iter()
+        .filter(|order| order.client_order_id.starts_with("rustval"))
+        .count();
+    ensure!(
+        open_validation_orders == 0,
+        "a Rust Binance validation order is still open"
+    );
     tracing::info!(
         validation_orders = validation_orders.len(),
         inspected_orders = orders.len(),
+        open_orders = open_orders.len(),
+        open_validation_orders,
         binance_ws_clock_offset_ms = ws.clock_offset_ms(),
         "recent Rust Binance validation order audit completed"
     );
@@ -540,7 +680,17 @@ async fn run(
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
     let binance_account = binance_account_client.hydrate(&binance_symbols[0]).await?;
     validate_binance_account(&binance_account)?;
-    let mut binance_feed = BookTickerFeed::new(&config, binance_symbols[0].clone());
+    let binance_buy_fee_bps = binance_account
+        .commission
+        .conservative_taker_fee_bps("BUY")?;
+    let binance_sell_fee_bps = binance_account
+        .commission
+        .conservative_taker_fee_bps("SELL")?;
+    let mut binance_feed = BookTickerFeed::new_with_depth(
+        &config,
+        binance_symbols[0].clone(),
+        binance_account_client.clone(),
+    );
 
     let pair = domain_config
         .snapshot()
@@ -548,6 +698,33 @@ async fn run(
         .iter()
         .find(|pair| pair.market_data_enabled)
         .context("balance synchronization requires one enabled pair")?;
+    ensure!(
+        binance_account.symbol_rules.base_asset == pair.binance.base_asset
+            && binance_account.symbol_rules.quote_asset == pair.binance.quote_asset,
+        "Binance exchangeInfo assets {}/{} do not match domain assets {}/{}",
+        binance_account.symbol_rules.base_asset,
+        binance_account.symbol_rules.quote_asset,
+        pair.binance.base_asset,
+        pair.binance.quote_asset
+    );
+    ensure!(
+        binance_account.symbol_rules.price.step
+            == Decimal::from_str(&pair.binance.tick_size)
+                .context("domain Binance tick_size is invalid")?,
+        "domain Binance tick_size differs from live PRICE_FILTER"
+    );
+    ensure!(
+        binance_account.symbol_rules.lot_size.step
+            == Decimal::from_str(&pair.binance.step_size)
+                .context("domain Binance step_size is invalid")?,
+        "domain Binance step_size differs from live LOT_SIZE"
+    );
+    let gas_price_symbol = pair
+        .chain
+        .gas_price_binance_symbol
+        .clone()
+        .context("domain config has no Binance gas-price symbol")?;
+    let mut gas_price_feed = BookTickerFeed::new(&config, gas_price_symbol.clone());
     let rebalance_tracker = if pair.rebalance.enabled {
         let coins = binance_account_client.all_coin_information().await?;
         let mut routes = BTreeMap::new();
@@ -603,8 +780,6 @@ async fn run(
         Arc::<str>::from(pair.binance.quote_asset.as_str()),
         Arc::<str>::from(pair.binance.base_asset.as_str()),
     ];
-    let mut initial_binance_balances =
-        binance_snapshot(&binance_account.account, &binance_assets, 0);
     let mut initial_wallet_balances = fetch_wallet_snapshot(
         &wallet_rpc,
         wallet_owner,
@@ -653,8 +828,6 @@ async fn run(
                 progress = ?recovered.progress,
                 "recovered active rebalance operation before runtime start"
             );
-            let refreshed_account = binance_account_client.account_information().await?;
-            initial_binance_balances = binance_snapshot(&refreshed_account, &binance_assets, 1);
             let refreshed_head = wallet_rpc.latest_block().await?;
             initial_wallet_balances = fetch_wallet_snapshot(
                 &wallet_rpc,
@@ -669,6 +842,142 @@ async fn run(
     } else {
         None
     };
+    let mut user_data_stream =
+        UserDataStream::connect(&config, binance_account.clock_offset_ms).await?;
+    let user_data_subscription_id = user_data_stream.subscription_id();
+    let multiplexed_binance_api = user_data_stream.api();
+    let reconciliation_started = std::time::Instant::now();
+    let (reconciled_account, reconciled_open_orders) = tokio::try_join!(
+        binance_account_client.account_information(),
+        binance_account_client.open_orders(&pair.binance.symbol),
+    )?;
+    ensure!(
+        reconciled_open_orders.is_empty(),
+        "Binance open order appeared while User Data Stream was starting"
+    );
+    ensure!(
+        reconciled_account
+            .balances
+            .iter()
+            .all(|balance| balance.locked.is_zero()),
+        "Binance locked balance appeared while User Data Stream was starting"
+    );
+    let initial_binance_balances = binance_snapshot(
+        &reconciled_account,
+        &binance_assets,
+        reconciliation_started.elapsed().as_micros(),
+    );
+    let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
+        ensure!(
+            domain_config.snapshot().live_trading_enabled && pair.execution_enabled,
+            "composed live arbitrage requires both versioned execution gates"
+        );
+        ensure!(
+            config.rebalance_execution_mode != "full_live",
+            "live arbitrage and live rebalance cannot own the same wallet nonce lane"
+        );
+        let wallet = EvmWallet::from_env()?;
+        ensure!(
+            wallet.address() == wallet_owner,
+            "live arbitrage signer does not match EVM_WALLET_ADDRESS"
+        );
+        let wallet_journal_path =
+            std::env::var(ARBITRAGE_WALLET_JOURNAL_PATH_ENV).with_context(|| {
+                format!(
+                    "required environment variable {ARBITRAGE_WALLET_JOURNAL_PATH_ENV} is not set"
+                )
+            })?;
+        let binance_journal_path = std::env::var(ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV)
+            .with_context(|| {
+                format!(
+                    "required environment variable {ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV} is not set"
+                )
+            })?;
+        let mut dex_executor = DexExecutor::hydrate(
+            wallet_rpc.clone(),
+            wallet,
+            wallet_chain_id,
+            wallet_journal_path.into(),
+        )
+        .await?;
+        let mut allowance_requirements = Vec::new();
+        for token in &initial_wallet_balances.token_balances {
+            let required = token.base_units.max(U256::ONE);
+            if pair.dex.allowed_providers.contains(&DexProvider::UniswapV3) {
+                allowance_requirements.push(AllowanceRequirement {
+                    operation_id: format!("rustarb-setup-v3-{}", token.symbol),
+                    protocol: UniswapProtocol::V3,
+                    token: token.contract,
+                    router: pair
+                        .chain
+                        .uniswap_v3_router_address
+                        .as_deref()
+                        .context("live V3 router is missing")?
+                        .parse()
+                        .context("live V3 router is invalid")?,
+                    required,
+                });
+            }
+            if pair.dex.allowed_providers.contains(&DexProvider::UniswapV4) {
+                allowance_requirements.push(AllowanceRequirement {
+                    operation_id: format!("rustarb-setup-v4-{}", token.symbol),
+                    protocol: UniswapProtocol::V4,
+                    token: token.contract,
+                    router: pair
+                        .chain
+                        .uniswap_v4_router_address
+                        .as_deref()
+                        .context("live V4 router is missing")?
+                        .parse()
+                        .context("live V4 router is invalid")?,
+                    required,
+                });
+            }
+        }
+        dex_executor
+            .prepare_and_lock_allowances(&allowance_requirements)
+            .await?;
+        let dex_service =
+            DexExecutionService::spawn(dex_executor, config.arbitrage_execution_channel_capacity)?;
+        let binance_service = BinanceExecutionService::spawn(
+            multiplexed_binance_api.clone(),
+            binance_journal_path.into(),
+            config.arbitrage_execution_channel_capacity,
+        )
+        .await?;
+        let executor = ComposedLiveLegExecutor::new(
+            dex_service,
+            binance_service,
+            binance_account.symbol_rules.clone(),
+            pair.binance.base_asset.clone(),
+            pair.token_b.decimals,
+            pair.binance.quote_asset.clone(),
+            pair.token_a.decimals,
+        )?;
+        let (handle, task, events) = live_trade_channel(
+            &config.arbitrage_trade_journal_path,
+            config.arbitrage_execution_channel_capacity,
+            executor,
+            telemetry.clone(),
+            config.engine_id.clone(),
+            LiveRiskLimits {
+                maximum_plan_cost_token_a_base_units: config
+                    .arbitrage_max_plan_cost_token_a_base_units,
+                maximum_recovery_loss_token_a_base_units: config
+                    .arbitrage_max_recovery_loss_token_a_base_units,
+                maximum_cumulative_loss_token_a_base_units: config
+                    .arbitrage_max_cumulative_loss_token_a_base_units,
+                maximum_cumulative_recovery_loss_token_a_base_units: config
+                    .arbitrage_max_cumulative_recovery_loss_token_a_base_units,
+                maximum_total_entries: config.arbitrage_max_total_entries,
+                maximum_entries_per_minute: config.arbitrage_max_entries_per_minute,
+                entry_stop_file: config.arbitrage_entry_stop_file.clone(),
+            },
+        )?;
+        Some((handle, tokio::spawn(task.run()), events))
+    } else {
+        None
+    };
     let BalanceSync {
         receiver: mut balance_receiver,
         wallet_heads,
@@ -676,6 +985,7 @@ async fn run(
         wallet_task: mut wallet_balance_task,
     } = spawn_balance_sync(
         binance_account_client,
+        pair.binance.symbol.clone(),
         binance_assets,
         Duration::from_millis(config.balance_sync_interval_ms),
         wallet_rpc,
@@ -686,12 +996,41 @@ async fn run(
         config.balance_event_channel_capacity,
     );
 
+    let paper_mode = match config.arbitrage_execution_mode.as_str() {
+        "disabled" => None,
+        "paper_dex_first" => Some(ExecutionMode::DexFirst),
+        "paper_concurrent_hedged" => Some(ExecutionMode::ConcurrentHedged),
+        "full_live" => None,
+        _ => unreachable!("AppConfig validation rejects unknown arbitrage modes"),
+    };
+    let (paper_trades, mut paper_trade_task, mut paper_trade_events) =
+        if let Some(runtime) = live_trade_runtime {
+            let (handle, task, events) = runtime;
+            (Some(handle), Some(task), events)
+        } else if let Some(mode) = paper_mode {
+            let (handle, task, events) = paper_trade_channel(
+                &config.arbitrage_trade_journal_path,
+                config.arbitrage_execution_channel_capacity,
+                mode,
+                telemetry.clone(),
+                config.engine_id.clone(),
+            )?;
+            (Some(handle), Some(tokio::spawn(task.run())), events)
+        } else {
+            let (_event_sender, events) = tokio::sync::mpsc::unbounded_channel();
+            (None, None, events)
+        };
     let (mut engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
         mirror,
         telemetry,
         rebalance_tracker,
+        paper_trades,
+        BinanceFeeBps {
+            buy: binance_buy_fee_bps,
+            sell: binance_sell_fee_bps,
+        },
     )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) =
@@ -717,8 +1056,9 @@ async fn run(
             let (_result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
             (None, result_receiver, None)
         };
-    engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances));
-    engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances));
+    engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
+    engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances))?;
+    engine.on_user_data_connected(user_data_subscription_id);
     dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
     engine.start();
     let (prepared_sender, mut prepared_receiver, prepared_thread) =
@@ -739,6 +1079,16 @@ async fn run(
         binance_clock_offset_ms = binance_account.clock_offset_ms,
         binance_standard_maker_fee = %binance_account.commission.standard_commission.maker,
         binance_standard_taker_fee = %binance_account.commission.standard_commission.taker,
+        binance_buy_fee_bps,
+        binance_sell_fee_bps,
+        binance_symbol_status = %binance_account.symbol_rules.status,
+        binance_price_tick = %binance_account.symbol_rules.price.step,
+        binance_lot_step = %binance_account.symbol_rules.lot_size.step,
+        binance_market_lot_step = %binance_account.symbol_rules.market_lot_size.step,
+        binance_min_notional = %binance_account.symbol_rules.min_notional,
+        binance_open_orders = binance_account.open_orders.len(),
+        binance_order_rate_limits = ?binance_account.order_rate_limits,
+        binance_gas_price_symbol = %gas_price_symbol,
         binance_wld_balance_present = binance_account.balance("WLD").is_some(),
         binance_usdc_balance_present = binance_account.balance("USDC").is_some(),
         wallet_address = %wallet_owner,
@@ -747,6 +1097,7 @@ async fn run(
         balance_max_age_ms = config.balance_max_age_ms,
         wallet_sync_trigger = "alchemy_new_heads",
         clickhouse_enabled = config.clickhouse_enabled(),
+        arbitrage_execution_mode = %config.arbitrage_execution_mode,
         rebalance_execution_mode = %config.rebalance_execution_mode,
         "arbitrage shadow service started with authenticated Binance account state"
     );
@@ -764,12 +1115,20 @@ async fn run(
         tokio::select! {
             _ = &mut shutdown => break,
             _ = health_tick.tick() => engine.refresh_health(),
-            event = binance_feed.next_event() => engine.on_market_event(event)?,
+            event = binance_feed.next_event() => {
+                engine.on_market_event(event, binance_feed.depth_book())?;
+            },
+            event = gas_price_feed.next_event() => {
+                engine.on_gas_market_event(event)?;
+            },
+            event = user_data_stream.next_event() => {
+                engine.on_user_data_event(event?)?;
+            },
             event = balance_receiver.recv() => {
                 let Some(event) = event else {
                     bail!("balance synchronization channel stopped unexpectedly");
                 };
-                engine.on_balance_event(event);
+                engine.on_balance_event(event)?;
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
             }
             result = rebalance_receiver.recv(), if rebalance_sender.is_some() => {
@@ -777,10 +1136,16 @@ async fn run(
                     bail!("rebalance executor result channel stopped unexpectedly");
                 };
                 match result {
-                    Ok(operation) => engine.on_rebalance_execution_result(Ok(&operation)),
-                    Err(error) => engine.on_rebalance_execution_result(Err(&error)),
+                    Ok(operation) => engine.on_rebalance_execution_result(Ok(&operation))?,
+                    Err(error) => engine.on_rebalance_execution_result(Err(&error))?,
                 }
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+            }
+            event = paper_trade_events.recv(), if paper_trade_task.is_some() => {
+                let Some(event) = event else {
+                    bail!("paper trade event channel stopped unexpectedly");
+                };
+                engine.on_paper_trade_event(event)?;
             }
             event = dex_receiver.recv() => {
                 let Some(event) = event else {
@@ -835,6 +1200,9 @@ async fn run(
     dex_task.abort();
     let _ = dex_task.await;
     drop(engine);
+    if let Some(task) = paper_trade_task.take() {
+        task.await??;
+    }
     drop(prepared_sender);
     drop(prepared_receiver);
     prepared_thread
@@ -861,7 +1229,7 @@ fn dispatch_rebalance_execution(
     pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
 ) -> anyhow::Result<()> {
-    let Some(evaluation) = engine.take_rebalance_execution() else {
+    let Some(evaluation) = engine.take_rebalance_execution()? else {
         return Ok(());
     };
     let sender = sender.context("rebalance engine produced live work without an executor")?;
@@ -939,6 +1307,47 @@ fn validate_binance_account(state: &BinanceAccountState) -> anyhow::Result<()> {
         state.account.can_trade,
         "Binance account does not permit trading"
     );
+    ensure!(
+        state.symbol_rules.symbol == state.commission.symbol,
+        "Binance symbol rules and commission refer to different symbols"
+    );
+    ensure!(
+        state.open_orders.is_empty(),
+        "Binance account has {} open order(s) for {}; autonomous ownership is unsafe",
+        state.open_orders.len(),
+        state.symbol_rules.symbol
+    );
+    let locked_assets = state
+        .account
+        .balances
+        .iter()
+        .filter(|balance| !balance.locked.is_zero())
+        .map(|balance| balance.asset.as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        locked_assets.is_empty(),
+        "Binance account has locked balances for {}; autonomous ownership is unsafe",
+        locked_assets.join(",")
+    );
+    ensure!(
+        !state.order_rate_limits.is_empty(),
+        "Binance returned no current order-rate limits"
+    );
+    for limit in &state.order_rate_limits {
+        ensure!(
+            limit.rate_limit_type == "ORDERS",
+            "unexpected Binance order rate-limit type {}",
+            limit.rate_limit_type
+        );
+        ensure!(
+            limit.count < limit.limit,
+            "Binance {} {} order limit is exhausted ({}/{})",
+            limit.interval_num,
+            limit.interval,
+            limit.count,
+            limit.limit
+        );
+    }
     Ok(())
 }
 
@@ -954,6 +1363,17 @@ fn log_binance_account(state: &BinanceAccountState) {
         symbol = %state.commission.symbol,
         binance_standard_maker_fee = %state.commission.standard_commission.maker,
         binance_standard_taker_fee = %state.commission.standard_commission.taker,
+        binance_symbol_status = %state.symbol_rules.status,
+        binance_base_asset = %state.symbol_rules.base_asset,
+        binance_quote_asset = %state.symbol_rules.quote_asset,
+        binance_price_tick = %state.symbol_rules.price.step,
+        binance_lot_step = %state.symbol_rules.lot_size.step,
+        binance_market_lot_step = %state.symbol_rules.market_lot_size.step,
+        binance_min_notional = %state.symbol_rules.min_notional,
+        binance_max_num_orders = state.symbol_rules.max_num_orders,
+        binance_max_num_algo_orders = state.symbol_rules.max_num_algo_orders,
+        binance_open_orders = state.open_orders.len(),
+        binance_order_rate_limits = ?state.order_rate_limits,
         binance_wld_balance_present = state.balance("WLD").is_some(),
         binance_usdc_balance_present = state.balance("USDC").is_some(),
         "authenticated Binance Spot account hydrated"

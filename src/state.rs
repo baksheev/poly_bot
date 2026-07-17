@@ -84,6 +84,8 @@ pub struct BinanceFeedState {
     pub book: Option<TopOfBook>,
     pub accepted_updates: u64,
     pub rejected_updates: u64,
+    pub depth_update_id: Option<u64>,
+    pub depth_received_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,7 @@ pub struct RuntimeState {
     pub processed_events: u64,
     pub balances: BalanceState,
     ever_ready: bool,
+    require_binance_depth: bool,
 }
 
 #[derive(Debug, Default)]
@@ -151,6 +154,17 @@ impl BalanceState {
 
 impl RuntimeState {
     pub fn new(symbols: impl IntoIterator<Item = Arc<str>>) -> Self {
+        Self::with_depth_requirement(symbols, false)
+    }
+
+    pub fn new_with_depth(symbols: impl IntoIterator<Item = Arc<str>>) -> Self {
+        Self::with_depth_requirement(symbols, true)
+    }
+
+    fn with_depth_requirement(
+        symbols: impl IntoIterator<Item = Arc<str>>,
+        require_binance_depth: bool,
+    ) -> Self {
         Self {
             phase: RuntimePhase::Starting,
             binance_feeds: symbols
@@ -160,6 +174,7 @@ impl RuntimeState {
             processed_events: 0,
             balances: BalanceState::default(),
             ever_ready: false,
+            require_binance_depth,
         }
     }
 
@@ -175,6 +190,8 @@ impl RuntimeState {
         feed.connection_generation = generation;
         feed.last_update_id = None;
         feed.book = None;
+        feed.depth_update_id = None;
+        feed.depth_received_at = None;
         self.processed_events += 1;
     }
 
@@ -188,6 +205,8 @@ impl RuntimeState {
 
         feed.connected = false;
         feed.book = None;
+        feed.depth_update_id = None;
+        feed.depth_received_at = None;
         self.processed_events += 1;
     }
 
@@ -214,6 +233,33 @@ impl RuntimeState {
         QuoteApplyResult::Accepted
     }
 
+    pub fn apply_depth(
+        &mut self,
+        symbol: &str,
+        generation: u64,
+        update_id: u64,
+        received_at: Instant,
+    ) -> QuoteApplyResult {
+        let Some(feed) = self.binance_feeds.get_mut(symbol) else {
+            return QuoteApplyResult::UnknownSymbol;
+        };
+        if generation != feed.connection_generation {
+            feed.rejected_updates += 1;
+            return QuoteApplyResult::StaleGeneration;
+        }
+        if feed
+            .depth_update_id
+            .is_some_and(|last_update_id| update_id <= last_update_id)
+        {
+            feed.rejected_updates += 1;
+            return QuoteApplyResult::DuplicateOrRegressed;
+        }
+        feed.depth_update_id = Some(update_id);
+        feed.depth_received_at = Some(received_at);
+        self.processed_events += 1;
+        QuoteApplyResult::Accepted
+    }
+
     pub fn refresh_phase(
         &mut self,
         now: Instant,
@@ -232,6 +278,11 @@ impl RuntimeState {
                         now.saturating_duration_since(book.received_at).as_millis()
                             <= u128::from(max_age_ms)
                     })
+                    && (!self.require_binance_depth
+                        || feed.depth_received_at.is_some_and(|received_at| {
+                            now.saturating_duration_since(received_at).as_millis()
+                                <= u128::from(max_age_ms)
+                        }))
             });
 
         self.phase = if ready {
@@ -302,6 +353,7 @@ mod tests {
             block_number,
             block_hash: B256::ZERO,
             native_balance_wei: U256::ZERO,
+            gas_price_wei: 1,
             token_balances: Vec::new(),
             observed_at,
             request_duration_us: 1,
@@ -378,6 +430,34 @@ mod tests {
         assert_eq!(state.refresh_phase(now, 5_000, true), RuntimePhase::Ready);
         assert_eq!(
             state.refresh_phase(now + Duration::from_secs(6), 5_000, true),
+            RuntimePhase::Degraded
+        );
+    }
+
+    #[test]
+    fn depth_required_state_waits_for_fresh_sequence_consistent_depth() {
+        let now = std::time::Instant::now();
+        let mut state = RuntimeState::new_with_depth([Arc::from("WLDUSDC")]);
+        state.on_connected("WLDUSDC", 3);
+        assert_eq!(
+            state.apply_quote(quote(10, 3, now)),
+            QuoteApplyResult::Accepted
+        );
+        assert_eq!(
+            state.refresh_phase(now, 5_000, true),
+            RuntimePhase::Starting
+        );
+        assert_eq!(
+            state.apply_depth("WLDUSDC", 3, 20, now),
+            QuoteApplyResult::Accepted
+        );
+        assert_eq!(state.refresh_phase(now, 5_000, true), RuntimePhase::Ready);
+        assert_eq!(
+            state.apply_depth("WLDUSDC", 3, 20, now),
+            QuoteApplyResult::DuplicateOrRegressed
+        );
+        assert_eq!(
+            state.refresh_phase(now + Duration::from_millis(5_001), 5_000, true),
             RuntimePhase::Degraded
         );
     }

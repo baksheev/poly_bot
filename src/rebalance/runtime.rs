@@ -1452,7 +1452,7 @@ async fn execute_wallet_call(
             return Err(error);
         }
     };
-    nonce_lane.record_receipt(journal, receipt)?;
+    nonce_lane.record_receipt(journal, receipt.clone())?;
     ensure!(receipt.status == 1, "rebalance wallet transaction reverted");
     Ok(submitted)
 }

@@ -1,7 +1,7 @@
 # Binance runtime parity and low-latency design
 
-Status: authenticated read-only slice deployed; execution and rebalance remain disabled
-Last reviewed: 2026-07-16
+Status: rebalance deployed; capped LIMIT/MARKET canary passed; autonomous trade entry disabled
+Last reviewed: 2026-07-17
 
 ## Decisions
 
@@ -28,17 +28,17 @@ arbitrage execution jobs in the Rails application.
 | `GET /api/v3/time` | Cache server clock offset for signed requests | Keep. Measure request midpoint, refresh periodically and immediately after `-1021`. |
 | Spot/Futures `<symbol>@bookTicker` | Current bid, ask, and best-level quantities | Keep only the Spot stream. It remains the fastest opportunity trigger. |
 | `GET /api/v3/ticker/bookTicker` | REST fallback, batch observations, gas prices | Do not use in the hot path. The Spot WebSocket owns live prices; REST is diagnostic recovery only. |
-| `GET /api/v3/depth` | Not present in Rails | Add for local Spot-book bootstrap, followed by diff-depth updates and gap repair. |
-| `<symbol>@depth@100ms` | Not present in Rails | Add for executable capacity and market-fallback risk. Never use Futures depth. |
+| `GET /api/v3/depth` | Not present in Rails | Implemented for the local Spot-book bootstrap and every reconnect. |
+| `<symbol>@depth@100ms` | Not present in Rails | Implemented with buffered bootstrap, strict `U..u` continuity, gap-triggered reconnect, and freshness gating. Never uses Futures depth. |
 | `GET /api/v3/exchangeInfo` | Discover pairs and obtain filters | Keep at startup and on explicit metadata refresh. Compile filters into per-symbol in-memory values. |
 | `GET /api/v3/account` | Not present in Rails | Add as the trading-account hydration source for permissions and nonzero free/locked balances. |
 | `GET /api/v3/account/commission` | Not present in Rails | Add at startup per traded symbol so opportunity math uses the real account fee. |
 | `POST /sapi/v3/asset/getUserAsset` | Rails balance snapshots, investment, and rebalance | Do not use for the Rust trading path. `account` plus User Data Stream is lower-weight and directly matches Spot execution state. |
 | `POST /api/v3/order`, `LIMIT IOC` | Primary Rails hedge at the opportunity price | Preserve semantics, but send with WebSocket API `order.place` on a persistent connection. |
-| `POST /api/v3/order`, `MARKET quantity` | Hedge fallback and recovery | Preserve semantics for the unfilled residual only. Send with WebSocket API `order.place`. |
+| `POST /api/v3/order`, `MARKET quantity` | Rails hedge fallback and recovery | The autonomous Rust path intentionally tightens this to a persisted, depth-bounded LIMIT IOC for the residual; MARKET remains available only to the separately capped manual canary. |
 | `POST /api/v3/order`, `MARKET quoteOrderQty` | Periodic investment of excess token-A profit | Preserve only in the later non-critical parity slice; it is not part of arbitrage execution. |
 | `GET /api/v3/order` | Find an order by order ID or deterministic client order ID after an ambiguous create | Preserve as `order.status` over WebSocket API, with REST as an independent recovery fallback. |
-| User Data Stream | Missing in Rails | Add. `executionReport`, `outboundAccountPosition`, and `balanceUpdate` are the primary order/fill/balance state source. |
+| User Data Stream | Missing in Rails | Implemented through signed WebSocket API subscription. `executionReport`, `outboundAccountPosition`, and `balanceUpdate` feed the single runtime owner; termination, unknown events, or foreign orders fail closed. |
 | `GET /api/v3/openOrders` | Missing in Rails | Add at startup/reconnect for reconciliation of the Rust client-order namespace. |
 | `GET /api/v3/myTrades` | Missing in Rails | Add only for restart recovery when fills cannot be reconstructed from orders and the journal. |
 | `GET /api/v3/rateLimit/order` | Missing in Rails | Add outside the hot path for readiness and rate-limit telemetry. |
@@ -69,12 +69,14 @@ Rails currently:
 5. If the initial Binance leg fails after DEX success, retries the market hedge
    asynchronously until exposure is closed.
 
-Rust preserves those economic semantics, but not the Rails retry latency. A
-single in-memory order state machine owns each attempt and consumes both the
-request response and User Data Stream events. Deterministic rejections stop
-immediately. Network timeout, HTTP 5xx, disconnect, or a missing response means
-`UNKNOWN`, never `FAILED`: Rust waits briefly for `executionReport`, queries
-the client order ID, and only resends after proving the order absent.
+Rust preserves the residual-only recovery quantity but bounds price as well as
+size: admission consumes the full local depth book, persists the worst recovery
+price, and every primary or recovery order is LIMIT IOC. There is no unbounded
+MARKET fallback in autonomous trading. A single state machine owns each
+attempt. Deterministic rejections become known zero-fill failures. Network
+timeout, 5xx, disconnect, or a missing response means `UNKNOWN`, never
+`FAILED`; the deterministic client ID and durable journal prevent duplicate
+placement.
 
 ## Faster transport
 
@@ -84,6 +86,21 @@ The target topology uses three persistent Binance connections:
 2. Spot WebSocket API for `order.place`, `order.status`, account queries, and
    the User Data Stream subscription.
 3. A pooled REST client for depth bootstrap and independent recovery.
+
+The runtime uses one multiplexing actor for signed order/status requests and
+the User Data Stream. It owns the WebSocket, routes responses by request ID,
+and forwards id-less subscription events through a bounded lossless channel,
+including while an order response is pending. A transport or protocol break
+fails the runtime closed; the child journal is reconciled after process
+restart. Startup subscribes first,
+then independently re-reads account state and `openOrders`, closing the race
+between the original account snapshot and the first stream event. The steady
+state repeats account and `openOrders` REST reconciliation on the configured
+balance interval; any unresolved open order removes readiness. The signed
+subscription and wrapper format follow the official Binance
+[`userDataStream.subscribe.signature`](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-api.md#subscribe-to-user-data-stream-through-signature-subscription-user_stream)
+and [User Data Stream event](https://github.com/binance/binance-spot-api-docs/blob/master/user-data-stream.md)
+contracts.
 
 The current shared HMAC key can sign every WebSocket API request. A later
 Ed25519 subaccount key allows `session.logon`, removes per-request API-key and
@@ -122,15 +139,25 @@ Refresh the VM only with `scripts/update-gce-binance-test-image` and another
 digest-pinned image; never point it at a mutable tag.
 
 On 2026-07-16 the account check authenticated successfully as Spot with
-`canTrade=true`, hydrated the WLDUSDC commission, and reported exactly two
-nonzero balances with both WLD and USDC present. The capital check found WLD
+`canTrade=true`, hydrated the WLDUSDC commission, and reported both WLD and
+USDC present. The capital check found WLD
 direct and Optimism routes available in both directions; USDC had no direct
 route and had Optimism available in both directions. These reads confirm
 funding and current capabilities, but they do not satisfy order-placement or
 rebalance recovery readiness gates. A read-only `allOrders` audit found no
 recent `rustval...` orders in this dedicated subaccount. Earlier MARKET canary
 orders were placed with pre-isolation credentials and must not be treated as
-execution evidence for the funded subaccount.
+execution evidence for the funded subaccount. The dedicated account's live
+LIMIT IOC and MARKET evidence from 2026-07-17 is recorded in
+`docs/binance-order-execution.md`.
+
+The runtime account bootstrap now also loads `exchangeInfo`, compiles the
+symbol's price, lot, market-lot, notional, and open-order filters, reads current
+order-rate counters, and reconciles `openOrders`. Startup fails closed when the
+symbol is not Spot `TRADING`, required order types are absent, a counter is
+exhausted, or any locked balance/open order means the dedicated account is not
+under exclusive clean ownership. These are startup facts only until User Data
+Stream and periodic independent REST reconciliation are connected.
 
 ## Subaccount and rebalance boundary
 

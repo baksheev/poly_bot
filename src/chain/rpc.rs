@@ -57,13 +57,21 @@ impl TransactionCall {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionReceipt {
     pub transaction_hash: B256,
     pub block_number: u64,
     pub status: u64,
     pub gas_used: u64,
     pub effective_gas_price: u128,
+    pub logs: Vec<ReceiptLog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +294,24 @@ impl JsonRpcClient {
                 "receipt.effectiveGasPrice",
                 &receipt.effective_gas_price,
             )?,
+            logs: receipt
+                .logs
+                .into_iter()
+                .map(|log| {
+                    Ok(ReceiptLog {
+                        address: log
+                            .address
+                            .parse()
+                            .context("receipt log address is invalid")?,
+                        topics: log
+                            .topics
+                            .into_iter()
+                            .map(|topic| parse_b256("receipt log topic", &topic))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                        data: parse_data_hex("receipt log data", &log.data)?,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
         }))
     }
 
@@ -495,6 +521,15 @@ struct WireTransactionReceipt {
     status: String,
     gas_used: String,
     effective_gas_price: String,
+    #[serde(default)]
+    logs: Vec<WireReceiptLog>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireReceiptLog {
+    address: String,
+    topics: Vec<String>,
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]

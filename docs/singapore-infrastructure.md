@@ -1,7 +1,7 @@
 # Singapore deployment and ClickHouse cutover
 
-Status: read-only production worker deployed and verified
-Last reviewed: 2026-07-16
+Status: GCE trading target provisioned; temporary GKE rebalance runtime active
+Last reviewed: 2026-07-17
 
 ## Decision
 
@@ -35,6 +35,13 @@ Secret Manager, writes a root-only environment file, authenticates to Artifact
 Registry with an ephemeral Docker config, and removes that config after the
 image pull. No long-lived service-account key or credential is stored in
 instance metadata.
+
+As of the 2026-07-17 audit the GCE VM is stopped and the older GKE deployment
+is the only running process. That deployment uses the same isolated Binance
+subaccount/wallet for full-live rebalance and must be scaled to zero before GCE
+`full_live` arbitrage can start. `scripts/update-gce-worker` enforces this
+single-owner condition. GCE paper mode is read-only and may run while the GKE
+rebalance owner remains active.
 
 ## Binance diagnostic VM
 
@@ -88,8 +95,10 @@ not restart or mutate the production trading VM.
 systemd owns the container and restarts it after a process failure. Docker uses
 host networking and forwards `SIGINT` for graceful shutdown. The service has a
 large file-descriptor limit, elevated scheduler priority, and a strongly
-negative OOM score. Live trading remains disabled and no wallet, signing, or
-Binance execution secrets are attached.
+negative OOM score. `/var/lib/arb-bot` is bind-mounted into the container so
+parent, Binance-order, and wallet/nonce journals survive container and process
+restart. The signer secret is fetched only when metadata selects `full_live`;
+paper mode receives no signer.
 
 Provision a committed, already-published image with:
 
@@ -101,6 +110,18 @@ The script refuses a dirty worktree or replacement of an existing VM. It
 creates the isolated network, subnet, static address, IAM bindings, and VM when
 missing. Replacing the production instance must be an explicit blue/green
 operation; do not silently mutate it in place.
+
+Update the existing VM with a committed digest and an explicit mode:
+
+```bash
+scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION paper_dex_first
+scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION full_live
+```
+
+The update path validates digest pinning, repository cleanliness, GCP label
+shape, the exact live confirmation, every positive risk limit, at most 100
+durable journal entries, at most 10 entries/minute, v5 selection, and zero
+competing GKE replicas before it changes VM metadata.
 
 ## Production checks
 

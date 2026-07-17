@@ -1,13 +1,22 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{collections::VecDeque, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, ensure};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use crate::{config::AppConfig, market_data::MarketEvent, state::TopOfBook};
+use crate::{
+    binance::{
+        account::BinanceAccountClient,
+        depth::{DepthApplyResult, SpotDepthBook, parse_depth_update},
+    },
+    config::AppConfig,
+    market_data::MarketEvent,
+    state::TopOfBook,
+};
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
@@ -29,6 +38,8 @@ pub struct BookTickerFeed {
     reconnect_delay: Duration,
     connect_not_before: TokioInstant,
     rotate_at: TokioInstant,
+    depth_client: Option<BinanceAccountClient>,
+    depth_book: Option<SpotDepthBook>,
 }
 
 impl BookTickerFeed {
@@ -42,7 +53,23 @@ impl BookTickerFeed {
             reconnect_delay: INITIAL_RECONNECT_DELAY,
             connect_not_before: now,
             rotate_at: now + ROTATE_CONNECTION_AFTER,
+            depth_client: None,
+            depth_book: None,
         }
+    }
+
+    pub fn new_with_depth(
+        config: &AppConfig,
+        symbol: String,
+        depth_client: BinanceAccountClient,
+    ) -> Self {
+        let mut feed = Self::new(config, symbol);
+        feed.depth_client = Some(depth_client);
+        feed
+    }
+
+    pub fn depth_book(&self) -> Option<&SpotDepthBook> {
+        self.depth_book.as_ref()
     }
 
     pub async fn next_event(&mut self) -> MarketEvent {
@@ -108,13 +135,18 @@ impl BookTickerFeed {
         }
     }
 
-    async fn connect(&self, generation: u64) -> anyhow::Result<BinanceSocket> {
-        let url = format!(
-            "{}/{}@bookTicker",
-            self.base_url,
-            self.symbol.to_ascii_lowercase()
-        );
-        let (socket, response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url))
+    async fn connect(&mut self, generation: u64) -> anyhow::Result<BinanceSocket> {
+        let with_depth = self.depth_client.is_some();
+        let url = if with_depth {
+            self.base_url.clone()
+        } else {
+            format!(
+                "{}/{}@bookTicker",
+                self.base_url,
+                self.symbol.to_ascii_lowercase()
+            )
+        };
+        let (mut socket, response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url))
             .await
             .context("Binance WebSocket connect timed out")??;
         ensure!(
@@ -122,6 +154,10 @@ impl BookTickerFeed {
             "Binance WebSocket upgrade returned {}",
             response.status()
         );
+        if with_depth {
+            self.subscribe_and_bootstrap_depth(&mut socket, generation)
+                .await?;
+        }
         tracing::info!(
             symbol = self.symbol.as_ref(),
             generation,
@@ -131,21 +167,95 @@ impl BookTickerFeed {
         Ok(socket)
     }
 
-    fn parse_payload(&self, payload: &[u8]) -> anyhow::Result<MarketEvent> {
+    async fn subscribe_and_bootstrap_depth(
+        &mut self,
+        socket: &mut BinanceSocket,
+        generation: u64,
+    ) -> anyhow::Result<()> {
+        let stream_symbol = self.symbol.to_ascii_lowercase();
+        socket
+            .send(Message::Text(
+                json!({
+                    "method": "SUBSCRIBE",
+                    "params": [
+                        format!("{stream_symbol}@bookTicker"),
+                        format!("{stream_symbol}@depth@100ms"),
+                    ],
+                    "id": generation,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .context("failed to subscribe Binance market streams")?;
+        let mut buffered = wait_for_subscription_ack(socket, generation).await?;
+
+        let snapshot = self
+            .depth_client
+            .as_ref()
+            .context("Binance depth client disappeared")?
+            .depth_snapshot(&self.symbol, 5_000)
+            .await?;
+        let mut book = SpotDepthBook::from_snapshot(self.symbol.to_string(), snapshot)?;
+        loop {
+            let payload = match buffered.pop_front() {
+                Some(payload) => payload,
+                None => next_data_payload(socket).await?,
+            };
+            let envelope: WireEventType<'_> =
+                serde_json::from_slice(&payload).context("invalid Binance stream JSON")?;
+            match envelope.event_type {
+                Some("depthUpdate") => {
+                    let update = parse_depth_update(&payload, &self.symbol)?;
+                    if book.apply(update)? == DepthApplyResult::Applied {
+                        self.depth_book = Some(book);
+                        return Ok(());
+                    }
+                }
+                Some("bookTicker") | None => {}
+                Some(other) => anyhow::bail!("unexpected Binance stream event {other}"),
+            }
+        }
+    }
+
+    fn parse_payload(&mut self, payload: &[u8]) -> anyhow::Result<MarketEvent> {
         let received_at = std::time::Instant::now();
         let received_unix_us = unix_timestamp_us();
-        let quote = parse_book_ticker(
-            payload,
-            Arc::clone(&self.symbol),
-            self.generation,
-            received_at,
-            received_unix_us,
-        )?;
-        Ok(MarketEvent::BinanceTopOfBook(quote))
+        let envelope: WireEventType<'_> =
+            serde_json::from_slice(payload).context("invalid Binance stream JSON")?;
+        match envelope.event_type {
+            Some("bookTicker") | None => Ok(MarketEvent::BinanceTopOfBook(parse_book_ticker(
+                payload,
+                Arc::clone(&self.symbol),
+                self.generation,
+                received_at,
+                received_unix_us,
+            )?)),
+            Some("depthUpdate") => {
+                let update = parse_depth_update(payload, &self.symbol)?;
+                let book = self
+                    .depth_book
+                    .as_mut()
+                    .context("Binance depth update arrived before bootstrap")?;
+                let result = book.apply(update)?;
+                ensure!(
+                    result == DepthApplyResult::Applied,
+                    "stale Binance depth event after bootstrap"
+                );
+                Ok(MarketEvent::BinanceDepthApplied {
+                    symbol: Arc::clone(&self.symbol),
+                    generation: self.generation,
+                    last_update_id: book.last_update_id(),
+                    observed_at: received_at,
+                })
+            }
+            Some(other) => anyhow::bail!("unexpected Binance stream event {other}"),
+        }
     }
 
     fn disconnect(&mut self, reason: String) -> MarketEvent {
         self.socket = None;
+        self.depth_book = None;
         let delay = self.reconnect_delay;
         self.connect_not_before = TokioInstant::now() + delay;
         self.reconnect_delay = (delay * 2).min(MAX_RECONNECT_DELAY);
@@ -163,6 +273,68 @@ impl BookTickerFeed {
             observed_at: std::time::Instant::now(),
         }
     }
+}
+
+async fn wait_for_subscription_ack(
+    socket: &mut BinanceSocket,
+    expected_id: u64,
+) -> anyhow::Result<VecDeque<Vec<u8>>> {
+    tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut buffered = VecDeque::new();
+        loop {
+            let payload = next_data_payload(socket).await?;
+            let response: WireOptionalResponseId = serde_json::from_slice(&payload)
+                .context("invalid Binance subscription response JSON")?;
+            if response.id.is_some() {
+                let acknowledgement: WireSubscriptionAck = serde_json::from_slice(&payload)
+                    .context("Binance rejected market stream subscription")?;
+                ensure!(
+                    acknowledgement.id == expected_id && acknowledgement.result.is_null(),
+                    "Binance rejected or mismatched market stream subscription"
+                );
+                return Ok(buffered);
+            }
+            buffered.push_back(payload);
+        }
+    })
+    .await
+    .context("Binance subscription acknowledgement timed out")?
+}
+
+async fn next_data_payload(socket: &mut BinanceSocket) -> anyhow::Result<Vec<u8>> {
+    loop {
+        let message = socket
+            .next()
+            .await
+            .context("Binance WebSocket stream ended")??;
+        match message {
+            Message::Text(payload) => return Ok(payload.as_bytes().to_vec()),
+            Message::Binary(payload) => return Ok(payload.to_vec()),
+            Message::Ping(payload) => socket
+                .send(Message::Pong(payload))
+                .await
+                .context("failed to send Binance pong")?,
+            Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(frame) => anyhow::bail!("Binance closed WebSocket: {frame:?}"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireEventType<'a> {
+    #[serde(rename = "e")]
+    event_type: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct WireSubscriptionAck {
+    result: serde_json::Value,
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct WireOptionalResponseId {
+    id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

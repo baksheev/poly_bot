@@ -66,6 +66,8 @@ pub struct WalletBalanceSnapshot {
     pub block_number: u64,
     pub block_hash: B256,
     pub native_balance_wei: U256,
+    /// Fresh network gas price sampled with the same canonical wallet snapshot.
+    pub gas_price_wei: u128,
     pub token_balances: Vec<WalletTokenBalance>,
     pub observed_at: Instant,
     pub request_duration_us: u128,
@@ -75,6 +77,10 @@ pub struct WalletBalanceSnapshot {
 #[derive(Debug)]
 pub enum BalanceEvent {
     Binance(BinanceBalanceSnapshot),
+    BinanceOpenOrders {
+        client_order_ids: Vec<String>,
+        observed_at: Instant,
+    },
     Wallet(WalletBalanceSnapshot),
     Failed {
         source: BalanceSource,
@@ -93,6 +99,7 @@ pub struct BalanceSync {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_balance_sync(
     mut binance: BinanceAccountClient,
+    binance_symbol: String,
     binance_assets: Vec<Arc<str>>,
     binance_interval: std::time::Duration,
     wallet_rpc: JsonRpcClient,
@@ -113,29 +120,55 @@ pub fn spawn_balance_sync(
         loop {
             tick.tick().await;
             let started = Instant::now();
-            let account = match binance.account_information().await {
-                Ok(account) => Ok(account),
+            let reconciliation = match tokio::try_join!(
+                binance.account_information(),
+                binance.open_orders(&binance_symbol),
+            ) {
+                Ok(reconciliation) => Ok(reconciliation),
                 Err(first_error) => match binance.synchronize_clock().await {
-                    Ok(()) => binance.account_information().await,
+                    Ok(()) => tokio::try_join!(
+                        binance.account_information(),
+                        binance.open_orders(&binance_symbol),
+                    ),
                     Err(clock_error) => Err(anyhow::anyhow!(
                         "{first_error:#}; Binance clock resynchronization failed: {clock_error:#}"
                     )),
                 },
             };
-            let event = match account {
-                Ok(account) => BalanceEvent::Binance(binance_snapshot(
-                    &account,
-                    &binance_assets,
-                    started.elapsed().as_micros(),
-                )),
-                Err(error) => BalanceEvent::Failed {
+            let events = match reconciliation {
+                Ok((account, open_orders)) => Ok([
+                    BalanceEvent::Binance(binance_snapshot(
+                        &account,
+                        &binance_assets,
+                        started.elapsed().as_micros(),
+                    )),
+                    BalanceEvent::BinanceOpenOrders {
+                        client_order_ids: open_orders
+                            .into_iter()
+                            .map(|order| order.client_order_id)
+                            .collect(),
+                        observed_at: Instant::now(),
+                    },
+                ]),
+                Err(error) => Err(BalanceEvent::Failed {
                     source: BalanceSource::Binance,
                     error: format!("{error:#}"),
                     observed_at: Instant::now(),
-                },
+                }),
             };
-            if binance_sender.send(event).await.is_err() {
-                return Ok(());
+            match events {
+                Ok(events) => {
+                    for event in events {
+                        if binance_sender.send(event).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(event) => {
+                    if binance_sender.send(event).await.is_err() {
+                        return Ok(());
+                    }
+                }
             }
         }
     });
@@ -221,10 +254,12 @@ pub async fn fetch_wallet_snapshot(
             data: erc20_balance_of_call(owner),
         })
         .collect::<Vec<_>>();
-    let (native_balance_wei, encoded_balances) = tokio::try_join!(
+    let (native_balance_wei, encoded_balances, gas_price_wei) = tokio::try_join!(
         rpc.native_balance_at(owner, block),
         rpc.eth_call_batch(&calls, block),
+        rpc.gas_price(),
     )?;
+    ensure!(gas_price_wei > 0, "RPC returned zero gas price");
     ensure!(
         encoded_balances.len() == tokens.len(),
         "wallet token balance response count mismatch"
@@ -251,6 +286,7 @@ pub async fn fetch_wallet_snapshot(
         block_number: block.number,
         block_hash: block.hash,
         native_balance_wei,
+        gas_price_wei,
         token_balances,
         observed_at: Instant::now(),
         request_duration_us: started.elapsed().as_micros(),

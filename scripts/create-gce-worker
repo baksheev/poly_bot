@@ -69,7 +69,8 @@ for secret in \
   ALCHEMY_WORLDCHAIN_RPC_URL \
   ALCHEMY_WORLDCHAIN_WS_URL \
   BINANCE_API_KEY \
-  BINANCE_SECRET_KEY; do
+  BINANCE_SECRET_KEY \
+  EVM_WALLET_PRIVATE_KEY; do
   "${gcloud_local}" secrets add-iam-policy-binding "${secret}" \
     --member="serviceAccount:${runtime_service_account}" \
     --role=roles/secretmanager.secretAccessor \
@@ -118,7 +119,7 @@ fi
   --boot-disk-size=20GB \
   --service-account="${runtime_service_account}" \
   --scopes=https://www.googleapis.com/auth/cloud-platform \
-  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS}" \
+  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v4.json,arb-bot-arbitrage-execution-mode=paper_dex_first" \
   --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh" \
   --shielded-secure-boot \
   --shielded-vtpm \

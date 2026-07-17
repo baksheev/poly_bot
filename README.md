@@ -48,12 +48,14 @@ to run.
 
 See [the migration design](docs/arb-bot-rust-migration.md) for the current
 Rails flow, ownership boundaries, stages, safety gates, and acceptance
-criteria.
+criteria. Live stop/recovery, canary, 100-entry, and rollback procedures are in
+the [trading runbook](docs/trading-runbook.md).
 
 ## Current status
 
-The Rust service is deployed on the isolated production GKE runtime. Arbitrage
-remains in read-only shadow mode: persistent
+The currently deployed shadow is the isolated GKE runtime; the trading target
+is the dedicated Singapore GCE VM described below. Arbitrage remains disabled
+in the deployed revision. The current source provides persistent
 Binance Spot `WLDUSDC@bookTicker` WebSocket ingestion, exact decimal
 parsing, reconnect generations, freshness/readiness state, a single in-memory
 state owner, and non-blocking ClickHouse telemetry. Startup now loads a
@@ -82,21 +84,43 @@ falls below 25% of that startup total and targets the Rails-compatible 50/50
 split of current inventory. `full_live` sends one journaled action to a bounded
 cold-path worker and requires fresh Binance and wallet reconciliation before
 another action. Rebalancing does not close trading readiness: opportunity
-calculation continues, while shared reservations and insufficient available
-inventory are the future per-trade gate. All six supported production routes
-have passed, and heartbeat/fault email monitoring is enabled.
+calculation continues. One process-owned inventory ledger reserves the
+rebalance source balance and both paper-trade prefunded legs with the configured
+Rails-compatible `3x` safety multiplier, then releases only after both affected
+balance streams reconcile. Live child-order and recovery claims are still
+closed. All six supported production routes have passed, and heartbeat/fault
+email monitoring is enabled.
+
+Binance startup also compiles live exchange filters, rejects locked balances,
+open orders and exhausted order counters, bootstraps a sequence-consistent
+Spot depth book, and opens a signed User Data Stream. Account-position and
+execution-report events flow to the same in-memory owner. Signed order/status
+RPC and the User Data Stream share one multiplexed WebSocket owner, so id-less
+events are routed losslessly even while an order response is pending; subscription loss,
+unknown account events, foreign orders, depth gaps, or a book/depth mismatch
+remove trading readiness.
 
 Every accepted Binance update now evaluates both arbitrage directions against
 all hydrated pools. The read-only opportunity engine uses exact-output DEX
 quotes when buying WLD, exact-input quotes when selling WLD, applies the
-configured 20 bps threshold and 4 bps reserve, and estimates the largest
+configured 20 bps threshold, the Rails-compatible 50%-of-gross-profit
+slippage budget bounded to 5–50 bps, and the 4 bps DEX fee reserve, then
+estimates the largest
 step-aligned WLD size supported by current DEX liquidity and the observed
-Binance top of book. It writes every evaluation and threshold-crossing
+Binance top of book for telemetry. Executable admission deliberately uses the
+Rails 20 USDC baseline: DEX-buy derives WLD from a 20 USDC exact-input pool
+quote, while CEX-buy derives WLD from the Binance ask. Authenticated account commission is rounded up to basis
+points and applied conservatively to the Binance leg in both directions before
+thresholding and sizing. The selected slippage budget is emitted with every
+trade evaluation. It writes every evaluation and threshold-crossing
 opportunity asynchronously to ClickHouse. Market data and eventual execution
-now both use Spot. The estimate is still not execution-ready because
-bookTicker exposes only the best level; deeper Spot liquidity, fees, gas,
-deeper Spot liquidity, reservations, and executable inventory limits are not
-integrated yet.
+now both use Spot. Before a paper plan is admitted, the entire hedge quantity
+must fit the sequence-consistent Spot depth; its worst consumed price is
+journaled as the recovery IOC limit. Admission charges the full-depth recovery
+loss and a conservative maximum DEX gas cost using a background `eth_gasPrice`
+sample and the fresh ETHUSDT ask, verifies the wallet native balance, and
+atomically reserves executable token inventory. The DEX signer enforces the
+admission-time fee cap again before reserving a nonce.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:
@@ -135,6 +159,23 @@ telemetry table in a configured ClickHouse instance:
 ```bash
 cargo run -- migrate
 ```
+
+Paper execution can be enabled without attaching trade or signing credentials:
+
+```bash
+ARBITRAGE_EXECUTION_MODE=paper_dex_first \
+ARBITRAGE_TRADE_JOURNAL_PATH=./tmp/arbitrage-trades.jsonl \
+cargo run -- run
+```
+
+`paper_dex_first` and `paper_concurrent_hedged` consume threshold-crossing
+opportunities through a bounded background channel and exercise the durable
+parent coordinator. Their synthetic outcomes are emitted as
+`paper_arbitrage_result` and are deliberately excluded from the live
+`arbitrage_results` table. `full_live` additionally requires an exact operator
+confirmation, positive per-plan/cumulative/rate/durable-total limits, the
+separately reviewed v5 execution artifact, isolated identities, and persistent
+parent/Binance/wallet journals. The v4 default stays execution-disabled.
 
 `run` requires `EVM_WALLET_ADDRESS`, Binance read credentials, and the World
 Chain HTTP/WSS endpoints. Balance sync cadence and freshness are controlled by
@@ -216,3 +257,5 @@ See [the local DEX quoting design](docs/low-latency-dex-quoting.md) for the
 hot-path contract, hydration boundary, reorg handling, and latency budget.
 See [the concurrent execution design](docs/concurrent-execution.md) for parallel
 DEX/CEX dispatch, orphan-leg recovery, exposure accounting, and paper rollout.
+See [comparable arbitrage results](docs/arbitrage-results.md) for the exact
+Rust/Rails accounting and equal-window comparison contract.

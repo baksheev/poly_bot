@@ -99,15 +99,12 @@ impl DomainSnapshot {
         );
         validate_runtime_id("snapshot_id", &self.snapshot_id)?;
         self.source.validate()?;
-        ensure!(
-            !self.live_trading_enabled,
-            "live_trading_enabled must remain false: this binary has no live execution"
-        );
         ensure!(!self.pairs.is_empty(), "pairs must not be empty");
 
         let mut pair_ids = HashSet::new();
         let mut binance_symbols = HashSet::new();
         let mut enabled_market_data_pairs = 0_usize;
+        let mut enabled_execution_pairs = 0_usize;
         for pair in &self.pairs {
             pair.validate()?;
             ensure!(pair_ids.insert(&pair.id), "duplicate pair id {}", pair.id);
@@ -117,10 +114,15 @@ impl DomainSnapshot {
                 pair.binance.symbol
             );
             enabled_market_data_pairs += usize::from(pair.market_data_enabled);
+            enabled_execution_pairs += usize::from(pair.execution_enabled);
         }
         ensure!(
             enabled_market_data_pairs > 0,
             "at least one pair must have market_data_enabled"
+        );
+        ensure!(
+            self.live_trading_enabled == (enabled_execution_pairs > 0),
+            "live_trading_enabled must exactly match whether any pair enables execution"
         );
         Ok(())
     }
@@ -185,8 +187,8 @@ impl PairConfig {
     fn validate(&self) -> anyhow::Result<()> {
         validate_runtime_id("pair.id", &self.id)?;
         ensure!(
-            !self.execution_enabled,
-            "pair {} has execution_enabled=true, but execution is not implemented",
+            !self.execution_enabled || self.market_data_enabled,
+            "pair {} cannot enable execution without market data",
             self.id
         );
         self.chain.validate()?;
@@ -242,6 +244,7 @@ pub struct ChainConfig {
     pub binance_network_name: String,
     pub gas_symbol: String,
     pub gas_decimals: u8,
+    pub gas_price_binance_symbol: Option<String>,
     pub multicall3_address: String,
     pub uniswap_v3_factory_address: Option<String>,
     pub uniswap_v3_quoter_address: Option<String>,
@@ -261,6 +264,9 @@ impl ChainConfig {
         validate_symbol("chain.binance_network_name", &self.binance_network_name)?;
         validate_symbol("chain.gas_symbol", &self.gas_symbol)?;
         ensure!(self.gas_decimals > 0, "chain.gas_decimals must be positive");
+        if let Some(symbol) = &self.gas_price_binance_symbol {
+            validate_symbol("chain.gas_price_binance_symbol", symbol)?;
+        }
         validate_evm_address("chain.multicall3_address", &self.multicall3_address)?;
         validate_optional_address(
             "chain.uniswap_v3_factory_address",
@@ -669,7 +675,8 @@ mod tests {
 
     use super::{ArbitrageStrategy, BinanceProduct, LoadedDomainConfig, TokenBQuoteSizing};
 
-    const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v3.json");
+    const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v4.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v5.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -706,7 +713,18 @@ mod tests {
         assert_eq!(first.fingerprint_sha256(), second.fingerprint_sha256());
         assert_eq!(
             first.fingerprint_sha256(),
-            "b5462e240a3da6ef1a55c413b99742bb2595371ea65110e5f2fd182e7bb46b06"
+            "0af151e7f264a8c4e383fe17552a77551f4be381367cbe6a6d2ce8da93f4267f"
+        );
+    }
+
+    #[test]
+    fn committed_live_snapshot_has_both_explicit_gates_and_a_stable_fingerprint() {
+        let loaded = load(LIVE_CONFIG.as_bytes()).unwrap();
+        assert!(loaded.snapshot().live_trading_enabled);
+        assert!(loaded.snapshot().pairs[0].execution_enabled);
+        assert_eq!(
+            loaded.fingerprint_sha256(),
+            "694c53eb6df3766e2558d91eb8099a58abdd5aaeab79f97fff0c5710a3134712"
         );
     }
 
@@ -717,9 +735,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_live_execution_gate() {
-        let bytes = mutate(|value| value["live_trading_enabled"] = Value::Bool(true));
-        assert!(load(&bytes).is_err());
+    fn live_execution_gates_must_be_enabled_together() {
+        let global_only = mutate(|value| value["live_trading_enabled"] = Value::Bool(true));
+        assert!(load(&global_only).is_err());
+
+        let pair_only = mutate(|value| value["pairs"][0]["execution_enabled"] = Value::Bool(true));
+        assert!(load(&pair_only).is_err());
+
+        let both = mutate(|value| {
+            value["live_trading_enabled"] = Value::Bool(true);
+            value["pairs"][0]["execution_enabled"] = Value::Bool(true);
+        });
+        assert!(load(&both).is_ok());
     }
 
     #[test]

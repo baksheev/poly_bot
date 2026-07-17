@@ -15,6 +15,8 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 use crate::config::AppConfig;
 
+pub const ARBITRAGE_RESULT_KIND: &str = "arbitrage_result";
+
 #[derive(Clone)]
 pub struct TelemetryHandle {
     sender: mpsc::Sender<TelemetryRecord>,
@@ -32,6 +34,16 @@ impl TelemetryHandle {
 
         if self.sender.try_send(record).is_err() {
             self.dropped_records.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnected_test_handle() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        Self {
+            sender,
+            dropped_records: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -119,6 +131,64 @@ TTL toDateTime(fromUnixTimestamp64Milli(observed_at_ms)) + INTERVAL 30 DAY
             .execute()
             .await
             .context("failed to create ClickHouse telemetry table")?;
+        client
+            .query(&format!(
+                r#"
+CREATE TABLE IF NOT EXISTS {}.arbitrage_results
+(
+    observed_at_ms UInt64,
+    engine_id LowCardinality(String),
+    plan_id String,
+    source_revision String,
+    pair_id LowCardinality(String),
+    execution_mode LowCardinality(String),
+    direction LowCardinality(String),
+    outcome LowCardinality(String),
+    expected_profit_token_a_base_units String,
+    realized_profit_token_a_base_units String,
+    token_b_residual_base_units String,
+    gas_cost_token_a_base_units String,
+    recovery_loss_token_a_base_units String,
+    payload_json String,
+    ingested_at DateTime64(3, 'UTC') DEFAULT now64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Milli(observed_at_ms))
+ORDER BY (pair_id, observed_at_ms, plan_id)
+"#,
+                self.database
+            ))
+            .execute()
+            .await
+            .context("failed to create ClickHouse arbitrage results table")?;
+        client
+            .query(&format!(
+                r#"
+CREATE MATERIALIZED VIEW IF NOT EXISTS {}.arbitrage_results_from_telemetry
+TO {}.arbitrage_results
+AS SELECT
+    observed_at_ms,
+    JSONExtractString(payload_json, 'engine_id') AS engine_id,
+    JSONExtractString(payload_json, 'plan_id') AS plan_id,
+    JSONExtractString(payload_json, 'source_revision') AS source_revision,
+    JSONExtractString(payload_json, 'pair_id') AS pair_id,
+    JSONExtractString(payload_json, 'execution_mode') AS execution_mode,
+    JSONExtractString(payload_json, 'direction') AS direction,
+    JSONExtractString(payload_json, 'outcome') AS outcome,
+    JSONExtractString(payload_json, 'expected_profit_token_a_base_units') AS expected_profit_token_a_base_units,
+    JSONExtractString(payload_json, 'realized_profit_token_a_base_units') AS realized_profit_token_a_base_units,
+    JSONExtractString(payload_json, 'token_b_residual_base_units') AS token_b_residual_base_units,
+    JSONExtractString(payload_json, 'gas_cost_token_a_base_units') AS gas_cost_token_a_base_units,
+    JSONExtractString(payload_json, 'recovery_loss_token_a_base_units') AS recovery_loss_token_a_base_units,
+    payload_json
+FROM {}.runtime_telemetry
+WHERE kind = '{ARBITRAGE_RESULT_KIND}'
+"#,
+                self.database, self.database, self.database
+            ))
+            .execute()
+            .await
+            .context("failed to create ClickHouse arbitrage results materialized view")?;
         Ok(())
     }
 
@@ -224,11 +294,16 @@ fn validate_identifier(value: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_identifier;
+    use super::{ARBITRAGE_RESULT_KIND, validate_identifier};
 
     #[test]
     fn clickhouse_identifier_is_restricted() {
         assert!(validate_identifier("arb_bot_prod").is_ok());
         assert!(validate_identifier("arb_bot; DROP DATABASE x").is_err());
+    }
+
+    #[test]
+    fn live_result_kind_matches_the_materialized_view_contract() {
+        assert_eq!(ARBITRAGE_RESULT_KIND, "arbitrage_result");
     }
 }

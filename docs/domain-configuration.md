@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
-Status: implemented for the first read-only production pair snapshot
-Last reviewed: 2026-07-16
+Status: v4 read/paper default and separately gated v5 live artifact implemented
+Last reviewed: 2026-07-17
 
 ## Runtime boundary
 
@@ -10,12 +10,15 @@ Rails Postgres, Redis, or Rails APIs while running. The artifact is validated
 before any market-data connection starts and its SHA-256 fingerprint is added
 to runtime telemetry.
 
-The active artifact is
-`config/strategies/usdc-wld-world-chain.v3.json`. It starts from the Rails
+The default artifact is
+`config/strategies/usdc-wld-world-chain.v4.json`. It starts from the Rails
 production pair `id=3` at the source timestamp stored in the file and records
 one deliberate Rust-clone divergence: both Binance market data and eventual
-execution use Spot. The previous v1 artifact is retained as provenance for the
-earlier Futures-feed experiment and is rejected by current runtime validation.
+execution use Spot. The v5 artifact contains identical pair/economics with the
+global and pair execution gates enabled. Selecting v5 alone cannot trade:
+runtime `full_live`, exact confirmation, positive risk limits, signer/order
+journals, and startup health checks are independently required. Earlier
+artifacts remain provenance for prior shadow stages.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven
@@ -24,7 +27,7 @@ attached to the GCE VM.
 
 ## Captured behavior
 
-The active v3 snapshot records:
+The v4/v5 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
@@ -57,9 +60,12 @@ Startup rejects:
 - duplicate pair IDs or Binance symbols;
 - inconsistent token/Binance base and quote assets;
 - enabled providers without required chain contracts/config;
-- every `live_trading_enabled=true` or pair `execution_enabled=true` value.
+- inconsistent global/pair execution gates, including execution without market
+  data.
 
-This binary is structurally unable to accept a live execution snapshot.
+The committed v4 default has both execution gates false. The v5 artifact has
+both true and is valid only for the bounded GCE live path; CLI confirmation and
+all live risk limits still default to fail-closed values.
 
 ## Refreshing the source data
 
@@ -76,3 +82,10 @@ update the expected SHA-256 test value.
 
 The production query output is not consumed automatically because an unnoticed
 Rails configuration change must not silently alter a running Rust strategy.
+
+The pair was re-read from production on 2026-07-17 after its latest
+`updated_at`. It still specifies pair `id=3`, World Chain `480`, active
+`USDC/WLD`, Spot `WLDUSDC`, 20 USDC minimum buy amount, WLD step `0.1`, price
+tick `0.001`, `profit_token_a`, and the V3/V4 provider set. The older Rails seed
+value of 10 USDC is not authoritative; the versioned artifact follows the live
+production row and records its exact update timestamp.

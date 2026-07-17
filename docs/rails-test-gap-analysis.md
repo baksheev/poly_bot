@@ -17,6 +17,13 @@ streams before releasing a route, does not stop opportunity calculation, and
 has Cloud Monitoring heartbeat/fault email alerts. See
 `docs/rebalancing.md` for operation IDs and balances.
 
+**Standalone trade components: validated only behind manual 10 USDC gates.**
+Uniswap V3/V4 buy and sell transactions and Binance LIMIT IOC/MARKET buy and
+sell orders completed on the isolated production identities. Their dedicated
+workers, journals, caps, and independent venue reconciliation are implemented.
+This evidence validates the adapters; it does not validate a composed
+arbitrage, shared reservations, recovery PnL, or restart of a two-leg intent.
+
 "Full launch" in this document means that the Rust service may independently
 detect an opportunity, reserve inventory, execute and reconcile both DEX and
 Binance legs, recover an orphan leg or unknown outcome, and resume after a
@@ -26,64 +33,69 @@ process restart without relying on Rails, Postgres, or ClickHouse.
 
 | Gate | Status | Evidence now | Required evidence to close |
 |---|---|---|---|
-| Isolated production runtime and capital | Passed | Dedicated GKE runtime, wallet, Binance subaccount/keys, static egress, Secret Manager, per-token rebalance caps | Keep ownership isolated from Rails and verify the same identities at every startup |
-| Market and pool state | Partial | Persistent Binance `bookTicker`; sequence-aware World Chain logs/heads; local V3/V4 state and quotes; freshness gating | Add sequence-consistent Binance Spot depth sufficient for the primary and recovery orders; fault-inject Binance/Alchemy disconnect, gap, reorg, and stale-state recovery |
-| Account and inventory truth | Partial | Exact Binance and wallet snapshots; one-second/block-driven refresh; actual commission hydration | Hydrate exchange filters, order-rate limits, open orders and a fresh User Data Stream; reconcile deterministic client IDs; subtract reservations and unresolved venue state from available balances |
-| Opportunity economics | Partial | Fixed-point two-direction quote math, threshold/reserve, local DEX liquidity sizing | Size against executable CEX depth and reserved inventory; include actual Binance fees, gas and worst-case recovery cost in admission |
+| Isolated production runtime and capital | Passed | Dedicated GCE runtime, wallet, Binance subaccount/keys, static egress, Secret Manager, per-token rebalance caps | Keep ownership isolated from Rails and verify the same identities at every startup |
+| Market and pool state | Partial | Persistent Binance `bookTicker`; REST-bootstrapped `depth@100ms` with strict `U..u` continuity, freshness gating, exact top cross-check and full-depth bounded recovery quote; sequence-aware World Chain logs/heads; local V3/V4 state and quotes | Fault-inject Binance/Alchemy disconnect, gap, reorg, and stale-state recovery |
+| Account and inventory truth | Partial | Exact Binance and wallet snapshots; one-second/block-driven refresh and open-order reconciliation; actual commission hydration; startup compiles exchange filters and rejects open orders, locked balances, and exhausted order-rate counters; one multiplexed signed WebSocket actor routes order responses and UDS events without loss; post-subscribe REST closes the startup race; deterministic order and nonce journals exist | Reconcile unresolved live child state and reservations across every forced restart boundary |
+| Opportunity economics | Partial | Fixed-point direction-specific Rails 20 USDC baselines, adaptive 5–50 bps slippage plus DEX fee reserve, hydrated commission, full-depth bounded recovery, conservative maximum DEX gas, persisted primary/recovery limits, native-gas checks and atomic inventory reservations | Verify realized fee/gas/recovery accounting under composed fault injection and the capped live matrix |
 | Rebalance execution | Passed | Direct and Across routes passed in both supported directions; durable journal, route locks, settlement barrier and monitoring are deployed | No launch blocker; retain regression tests and production alerts |
-| Trade execution coordinator | Blocked | Binance WS API request/result primitives and wallet transaction primitives exist, but no trade coordinator is connected to `main` | Implement `dex_first` control and paper `concurrent_hedged` behind one durable intent/state machine; only then permit the config gate to be enabled |
-| Orphan-leg and unknown-outcome recovery | Blocked | Rebalance and wallet recovery patterns exist; Rails behavior is documented | Reconcile Binance timeouts by client order ID; hold unknown wallet nonces; use actual DEX receipt delta; LIMIT then MARKET compensation; restart safely from every intermediate state |
-| Trading risk controls | Blocked | Stale input readiness fails closed and production capital is isolated | Add per-plan/global exposure, order size, rate, loss and recovery-loss limits; one emergency entry stop that never prevents recovery; prevent a second entry while exposure is unknown |
+| Trade execution coordinator | Partial | The durable parent is connected to paper and explicitly gated composed live adapters; it persists exact DEX routes and two-sided bounded Binance recovery limits, supports `dex_first`/`concurrent_hedged`, hedges actual deltas, conservatively marks sub-step dust, and blocks unknown outcomes. Composed reject/revert/unknown and CEX/recovery restart tests pass | Run the production-shaped paper deployment and capped live canaries before selecting the v5/config live gates |
+| Orphan-leg and unknown-outcome recovery | Partial | DEX nonce and Binance client-ID journals feed a composed parent; known unsubmitted/rejected legs are `Failed`, mined DEX reverts are zero-token `Failed` with actual gas, and ambiguous children are `Unknown`; residual recovery is bounded LIMIT IOC | Fault-inject Binance timeout/partial fill and EVM timeout/replacement; restart safely from every coordinator state and record realized recovery loss |
+| Trading risk controls | Partial | Stale inputs fail closed; parent permits one active/unknown plan; full-live requires nonzero per-plan cost, recovery-loss, cumulative-loss, cumulative-recovery-loss, durable total-entry and entry-rate limits; the total cap survives restart; a stop-file blocks only new entries, never restart recovery | Set reviewed production values and validate alert/runbook behavior in the capped GCE canary |
 | Trading observability and operations | Partial | Hot-path telemetry is asynchronous; rebalance heartbeat/fault email alerts are live | Alert on stale execution inputs, unresolved intents/orders/nonces, orphan exposure, recovery loss and disabled/stopped executor; add an operator recovery/kill-switch runbook |
-| Production trade validation | Blocked | Read-only subaccount checks and historical pre-isolation MARKET orders passed | Complete the capped canary matrix below on the dedicated account after paper/fault gates pass |
+| Production trade validation | Partial | Dedicated-account V3/V4 swaps plus fully filled Binance LIMIT IOC and MARKET buy/sell canaries passed under capped commands; venue history and final balances agree | Complete partial-fill, User Data Stream, unknown-outcome, restart and composed arbitrage canaries below before enabling autonomous entry |
 
 ### P0 work remaining
 
-The following sequence is the shortest safe path to `GO`. Later items must not
-be used to compensate for a missing earlier gate.
+The standalone DEX and Binance adapters are no longer P0 implementation gaps.
+The following workstreams are the shortest safe path to `GO`; later rows cannot
+compensate for an earlier missing ownership or recovery boundary.
 
-1. Build the process-owned execution state machine and durable intent journal.
-   Implement `dex_first` first as the Rails-compatible control. Keep
-   `execution_enabled=false` and use adapters that cannot submit in paper mode.
-2. Add a persistent authenticated Binance execution session: local Spot depth,
-   User Data Stream, exchange filters/rate limits, open-order hydration, and
-   deterministic client-order-ID reconciliation.
-3. Add atomic in-memory inventory, nonce, and order reservations shared by
-   admission, execution, recovery, and rebalance. Available inventory must
-   exclude every unresolved mutation.
-4. Build exact DEX swap transactions from the accepted pool state, simulate
-   them, journal before submission, and use receipt balance deltas rather than
-   planned quantities for hedging and PnL.
-5. Implement compensation and restart recovery: Binance LIMIT-to-MARKET
-   fallback, unknown placement lookup, unknown nonce hold, partial-fill
-   handling, and one balanced terminal state for every accepted intent.
-6. Enforce explicit risk and operator controls before changing the domain gate:
-   per-order/global exposure caps, maximum recovery loss, rate limits,
-   freshness limits, gas reserve, emergency entry stop, and recovery priority.
-7. Run deterministic replay, paper execution, and scheduler/venue fault
-   injection. Every injected timeout, disconnect, partial fill, revert,
-   replacement, stale snapshot, and restart must end balanced or in an explicit
-   alerting fail-closed state.
-8. Run capped production canaries on the isolated account, reconcile them from
-   venue history and ClickHouse, then enable a tiny live budget through a
-   separate explicit acknowledgement. Increasing size is a later decision.
+| ID | Workstream | Status | Exit criterion |
+|---|---|---|---|
+| P0-1 | Parent trade coordinator | Partial | The durable parent owns both child legs, supports `dex_first` and `concurrent_hedged`, persists dispatch plus exact child plans before delivery, reconciles residual exposure, and blocks unknown outcomes across restart. Composed production adapters compile behind two closed live gates; fault/restart validation remains. |
+| P0-2 | Persistent Binance execution state | Partial | Startup hydrates filters, order counters and open orders; Spot depth is sequence-consistent and freshness-gated; one signed multiplexing actor losslessly routes order responses and UDS events, while REST reconciliation remains independent. Forced disconnect/restart reconciliation still needs composed evidence. |
+| P0-3 | Shared inventory and reservations | Partial | One in-memory owner hydrates free Binance and wallet base-unit balances. Paper trade admission atomically reserves both prefunded legs with the Rails `3x` safety multiplier; live rebalance reserves its source; unknown outcomes remain held; balanced work releases only after both venues advance. Live child orders, recovery deltas, nonce, and order-rate claims still need the same owner. |
+| P0-4 | Admission economics and PnL | Partial | Parent accounting records planned/realized token-A PnL, gas, bounded recovery loss and visible sub-step dust without `f64`; ClickHouse has a Rails-comparison projection. Admission charges full recovery depth and maximum gas, and persists both price bounds. Composed/capped evidence remains. |
+| P0-5 | Composed compensation and restart | Code complete; live evidence pending | DEX receipt logs and Binance fills/commissions map to exact deltas. Tests cover partial fill, deterministic CEX reject plus recovery, mined DEX revert with gas, ambiguous CEX blocking, restart before DEX/CEX/recovery, entry-stop restart recovery, and buy-vs-sell recovery after residual sign flips. Production timeout/replacement evidence remains. |
+| P0-6 | Trading risk and operator controls | Partial | Per-plan cost, single active exposure, durable total entries, entry rate, cumulative comparable/recovery loss, gas reserve, stale-input limits and emergency entry stop are enforced; recovery remains allowed while entry is stopped. Production values and boundary canaries remain. |
+| P0-7 | Trading alerts and runbook | Partial | The operator runbook documents single ownership, inspect/reconcile/stop/resume, one-entry canary, cumulative 100-entry cap, comparison and rollback without journal editing. Trading-specific alert policies still need production validation. |
+| P0-8 | Replay, fault injection and capped canaries | Partial | Deterministic paper replay passes, every fault below ends balanced or explicitly blocked, then the remaining production matrix passes on isolated identities |
+
+Recommended implementation order:
+
+1. Add P0-6/P0-7 risk controls, emergency entry stop, alerts and runbook while
+   recovery remains independently enabled.
+2. Exhaust P0-5/P0-8 composed fault and restart tests with the code/config live
+   gates still closed.
+3. Run a capped composed paper/dry canary against production-shaped state and
+   verify the Rails-comparison ledger.
+4. Exhaust the remaining isolated production matrix rows, then run the tiny
+   composed live canary on dedicated identities.
+5. Keep the gate closed until 100 balanced live opportunities meet the stated
+   Rails economics criterion and there are no unresolved child states.
 
 ### Required production canary matrix
 
-This matrix begins only after P0 paper and fault-injection gates pass:
+Standalone component rows may be completed before the parent coordinator. A
+composed or fault row starts only after its paper/fault gate exists; a live
+success cannot substitute for the missing deterministic test. Transaction
+hashes are abbreviated here for readability; full hashes and amounts are in
+`docs/production-validation.md`.
 
-| Canary | Required result |
-|---|---|
-| Dedicated Binance MARKET buy and sell | Both fill under deterministic client IDs; account, User Data Stream, order query, fills, commissions and balance deltas agree |
-| Binance IOC/partial fill | Filled and cancelled quantities reconcile exactly; no reservation leaks |
-| DEX USDC to WLD and WLD to USDC | Simulation, submission, receipt, token deltas, nonce and pool-state reconciliation agree |
-| DEX-first arbitrage in both directions | Hedge uses actual DEX delta; realized net PnL and final exposure are recorded |
-| Binance unknown placement | Timeout cannot create a duplicate; client-ID lookup reaches one terminal state |
-| EVM unknown/replaced/reverted transaction | Nonce lane stays held until the chain outcome is known; restart does not duplicate the leg |
-| DEX failure after CEX exposure | LIMIT unwind is attempted, MARKET fallback removes residual exposure, realized loss is recorded |
-| CEX reject/partial fill after DEX exposure | Recovery removes residual exposure within the configured maximum loss |
-| Restart at every coordinator state | No duplicated order/transaction and no silently abandoned exposure |
-| Rebalance during trading | It may run in parallel, but reservations prevent overspend; only insufficient available inventory blocks a new trade |
+| Canary | Status | Evidence now | Still required |
+|---|---|---|---|
+| Dedicated Binance MARKET buy and sell | Partial | Orders `455789048` and `455789056` filled under deterministic IDs; `allOrders`, `openOrders=0` and exact final WLD balance agree | Reconcile the same fills/commissions through User Data Stream and runtime reservations |
+| Dedicated Binance LIMIT IOC full fill | Passed | Orders `455788994` and `455788998` filled and independently reconciled; final WLD balance exactly matched the start | Retain capped regression canary; this does not cover partial fill |
+| Binance IOC partial fill/cancel | Pending | Exact remaining-quantity math and deterministic bounded recovery IOC planning are implemented | Force controlled partial execution; reconcile filled/cancelled quantities, commissions, balances and released reservation |
+| DEX V3 USDC/WLD round trip | Passed | Buy `0xc560...985c3`, recovery sell `0xf196...27fc`; exact WLD delta unwound, nonce/journal terminal | Retain capped regression canary |
+| DEX V4 USDC/WLD round trip | Passed | Buy `0xb9dc...2e0b`, sell `0x7721...5fe8`; exact WLD delta unwound, nonce/journal terminal | Retain capped regression canary |
+| Binance unknown placement | Partial | Ambiguous codes/transport enter durable `outcome_unknown`; client-ID lookup blocks duplicate placement | Inject timeout after matching-engine acceptance, reconcile through WS event/query and restart to one terminal order |
+| EVM unknown/replaced/reverted transaction | Partial | Mock-RPC tests prove reverted/unknown journaling and nonce hold | Exercise timeout/replacement/revert recovery with restart; prove no duplicate nonce or abandoned exposure |
+| DEX-first arbitrage in both directions | Pending | Standalone child adapters passed | Hedge actual DEX delta; record planned/realized PnL and zero final exposure in both directions |
+| DEX failure after CEX exposure | Pending | Admission-persisted LIMIT IOC recovery bounds and exact residual planning exist | Inject DEX failure, unwind CEX, record bounded realized loss and parent terminal state |
+| CEX reject/partial fill after DEX exposure | Partial | Composed deterministic tests remove only the exact residual after reject and partial fill, then record terminal economics | Repeat through the capped production child adapters and reconcile venue history/balances |
+| Restart at every coordinator state | Partial | Tests restart before DEX, CEX and recovery dispatch completion, preserve unknown blocking, select the correct directional limit, and never replay a proven earlier leg | Repeat forced process restarts in the capped production canary |
+| Rebalance during trading | Pending | Rebalance stayed healthy during standalone canaries, but no shared trade reservation existed | Run a controlled overlap; prove shared reservations prevent overspend without globally pausing healthy market processing |
 
 ### Final `GO` rule
 
@@ -131,11 +143,13 @@ The following areas with a current Rust equivalent were reviewed in detail:
 | Balance readiness: both sources initialized, Binance account tradable, snapshots no older than five seconds, and last-good state retained through transient failures | `state`, `engine` | Covered at freshness and regression boundaries; end-to-end fault injection and recovery remain open |
 | Binance capital routes, live network limits, Travel Rule response/history, and withdrawal identity validation | `binance::capital`, `rebalance::runtime` | Covered and live-verified through the recoverable executor |
 | BUY/SELL balance deltas and commissions in base, quote, or third asset | `binance::ws_api::OrderResult` | Added in this audit |
+| Binance LIMIT IOC/MARKET canary placement, deterministic IDs, terminal status and journal restart | `binance::ws_api`, `binance::execution`, `binance::order_journal`, `binance::validation` | Covered at component level and live-verified with four capped orders; autonomous execution uses bounded IOC only; forced partial/unknown outcomes remain open |
 | Across HTTP status handling, bounded responses, and sanitized transport failures | `across::AcrossClient` | Covered for quote and deposit-status calls |
 | Across USDC quote tokens, chains, amounts, approval, recipient, spender, calldata, and value | `across` | Covered against all Rails fixtures |
 | Across ERC20 quote, calldata, approval, receipt, destination minimum, and both WLD directions | `across`, `rebalance::runtime` | Covered and live-verified through the recoverable executor |
-| EVM key/raw-payload redaction, EIP-1559 signing, hydration, simulation, gas, submission, and receipt decoding | `wallet`, `chain::rpc`, `wallet::journal`, `rebalance::executor` | Covered with a process-owned nonce lane and durable transaction recovery |
+| EVM key/raw-payload redaction, EIP-1559 signing, hydration, simulation, Rails-compatible additional gas, submission, and receipt decoding | `wallet`, `chain::rpc`, `wallet::journal`, `dex::execution`, `rebalance::executor` | Covered with a process-owned nonce lane and durable transaction recovery; V3/V4 live canaries passed |
 | CLMM quoting, tick crossing, liquidity limits, both directions | `dex::clmm` | Already stronger than Rails unit coverage |
+| Uniswap V3/V4 exact-input calldata, approvals/Permit2, route identity, balance delta and recovery sell | `dex::calldata`, `dex::execution`, `dex::validation` | Covered at component level and live-verified in both directions; composed hedge/recovery remains open |
 | Opportunity threshold, conservative reserve, provider choice, sizing | `opportunity` | Covered, with boundary tests added |
 | Rebalance targets, in-flight projection, direct/Across fallback, direction-specific availability, and live withdrawal limits | `rebalance::planner`, `binance::capital` | Covered, with validation/overflow tests and live route hydration |
 
@@ -175,8 +189,10 @@ and state are required before those balances can safely authorize live orders:
   snapshot after a newer one;
 - test `TradingEngine` degradation and recovery when either five-second
   freshness deadline is crossed, including background-channel shutdown;
-- hydrate Binance open orders and reconcile them with deterministic client
-  order IDs; an authenticated user-data stream is not implemented;
+- hydrate Binance open orders continuously in the production state owner and
+  reconcile them with deterministic client IDs; the manual canary preflight
+  checks `openOrders`; the authenticated User Data Stream is implemented, but
+  forced disconnect/restart reconciliation still needs production evidence;
 - subtract process-owned reservations and unresolved orders/transactions from
   available balances before sizing an opportunity;
 - reconcile snapshots immediately after the service's own order or transaction
@@ -190,11 +206,14 @@ Port from `perform_arbitrage_job_spec.rb` and `retry_binance_hedge_job_spec.rb`:
 
 - submit DEX and CEX legs concurrently from one durable execution intent;
 - use actual DEX receipt delta for the CEX amount;
-- if DEX fails, unwind CEX by LIMIT at the original price and then MARKET;
-- if CEX LIMIT fails, retry MARKET and record the realized loss;
-- reconcile an unknown Binance placement by deterministic client order ID;
-- never submit a second order while the first result is unknown;
-- hold the wallet lane when an approval or swap nonce is unknown;
+- if DEX fails after CEX exposure, unwind only the residual with the persisted
+  depth-bounded recovery IOC limit;
+- if CEX IOC partially fills, recover only the exact residual within the same
+  admitted price/loss bound and record realized loss;
+- compose the implemented Binance client-ID reconciliation with the parent
+  intent and fault-inject a timeout after matching-engine acceptance;
+- prove across process restart that the implemented Binance and wallet unknown
+  states prevent a second child order or nonce;
 - restart from every intermediate state without duplicating a leg.
 
 ### Out-of-scope Rails components

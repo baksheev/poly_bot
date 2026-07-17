@@ -1,18 +1,39 @@
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use alloy_primitives::U256;
+use anyhow::{Context, ensure};
+use rust_decimal::Decimal;
 use serde_json::json;
 
 use crate::{
+    admission::{AdmissionEconomics, AdmissionInputs, evaluate_admission},
+    arbitrage::{
+        AdmissionRiskBounds, ArbitrageDirection as TradeDirection, PaperOpportunity,
+        PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
+    },
     balances::BalanceEvent,
+    binance::{
+        depth::SpotDepthBook,
+        user_data::{ExecutionReportEvent, UserDataEvent},
+    },
     config::AppConfig,
     dex::mirror::{DexMirror, LogApplyResult},
     domain::config::LoadedDomainConfig,
+    execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
+    inventory::{
+        InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue, ReservationPurpose,
+        ReservationRequest,
+    },
     market_data::{MarketEvent, alchemy::DexStreamEvent},
-    opportunity::{OpportunityEngine, PreparedPoolBuildRequest, PreparedPoolBuildResult},
+    opportunity::{
+        ArbitrageDirection, OpportunityEngine, PairEvaluation, PreparedPoolBuildRequest,
+        PreparedPoolBuildResult,
+    },
     rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
@@ -27,12 +48,30 @@ pub struct TradingEngine {
     rebalance: RebalanceTracker,
     telemetry: TelemetryHandle,
     hot_telemetry: HotTelemetryHandle,
+    paper_trades: Option<PaperTradeHandle>,
+    inventory: InventoryReservations,
+    binance_inventory_generation: u64,
+    binance_user_data_connected: bool,
+    binance_user_data_clean: bool,
+    binance_orders: BTreeMap<String, ExecutionReportEvent>,
+    gas_price_symbol: String,
+    gas_price_connected: bool,
+    gas_price_generation: u64,
+    gas_price_book: Option<TopOfBook>,
+    rebalance_inventory_reservation: Option<String>,
+    next_inventory_reservation: u64,
     pending_rebalance: Option<RebalanceEvaluation>,
     rebalance_inflight: bool,
     rebalance_inflight_since: Option<Instant>,
     rebalance_blocked: bool,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinanceFeeBps {
+    pub buy: u16,
+    pub sell: u16,
 }
 
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -81,11 +120,13 @@ impl RebalanceSettlementBarrier {
 struct TradingReadiness {
     dex_ready: bool,
     balances_ready: bool,
+    user_data_ready: bool,
+    gas_price_ready: bool,
 }
 
 impl TradingReadiness {
     const fn ready(self) -> bool {
-        self.dex_ready && self.balances_ready
+        self.dex_ready && self.balances_ready && self.user_data_ready && self.gas_price_ready
     }
 }
 
@@ -96,24 +137,52 @@ impl TradingEngine {
         dex: DexMirror,
         telemetry: TelemetryHandle,
         rebalance: RebalanceTracker,
+        paper_trades: Option<PaperTradeHandle>,
+        binance_fee_bps: BinanceFeeBps,
     ) -> anyhow::Result<(Self, HotTelemetryTask)> {
         let symbols = domain_config
             .binance_symbols()
             .into_iter()
             .map(Arc::<str>::from);
-        let opportunities = OpportunityEngine::new(domain_config.snapshot(), &dex)?;
+        let gas_price_symbol = domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.market_data_enabled)
+            .and_then(|pair| pair.chain.gas_price_binance_symbol.clone())
+            .context("enabled pair has no versioned gas-price Binance symbol")?;
+        let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &dex)?;
+        for symbol in domain_config.binance_symbols() {
+            opportunities.set_binance_fee_bps(
+                &symbol,
+                binance_fee_bps.buy,
+                binance_fee_bps.sell,
+            )?;
+        }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
         Ok((
             Self {
                 config,
                 domain_config,
-                state: RuntimeState::new(symbols),
+                state: RuntimeState::new_with_depth(symbols),
                 dex,
                 opportunities,
                 rebalance,
                 telemetry,
                 hot_telemetry,
+                paper_trades,
+                inventory: InventoryReservations::default(),
+                binance_inventory_generation: 0,
+                binance_user_data_connected: false,
+                binance_user_data_clean: true,
+                binance_orders: BTreeMap::new(),
+                gas_price_symbol,
+                gas_price_connected: false,
+                gas_price_generation: 0,
+                gas_price_book: None,
+                rebalance_inventory_reservation: None,
+                next_inventory_reservation: 0,
                 pending_rebalance: None,
                 rebalance_inflight: false,
                 rebalance_inflight_since: None,
@@ -143,6 +212,135 @@ impl TradingEngine {
                 "world_chain_block": self.dex.latest_head().number,
             }),
         );
+    }
+
+    pub fn on_user_data_connected(&mut self, subscription_id: u64) {
+        self.binance_user_data_connected = true;
+        self.telemetry.emit(
+            "binance_user_data_connected",
+            json!({
+                "engine_id": self.config.engine_id,
+                "subscription_id": subscription_id,
+            }),
+        );
+        self.refresh_phase(Instant::now());
+    }
+
+    pub fn on_user_data_event(&mut self, event: UserDataEvent) -> anyhow::Result<()> {
+        match event {
+            UserDataEvent::AccountPosition(position) => {
+                self.binance_inventory_generation = self
+                    .binance_inventory_generation
+                    .checked_add(1)
+                    .context("Binance inventory generation overflow")?;
+                let reservations_before = self
+                    .inventory
+                    .active_operation_ids()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let mut balances = Vec::new();
+                let mut locked_assets = Vec::new();
+                for balance in &position.balances {
+                    if !balance.locked.is_zero() {
+                        locked_assets.push(balance.asset.clone());
+                    }
+                    if let Ok(decimals) = self.token_decimals(&balance.asset) {
+                        balances.push((
+                            balance.asset.clone(),
+                            decimal_to_base_units_floor(balance.free, decimals)?,
+                        ));
+                    }
+                }
+                if !balances.is_empty() {
+                    self.inventory.update_venue_assets(
+                        InventoryVenue::Binance,
+                        self.binance_inventory_generation,
+                        balances,
+                    )?;
+                    self.reconcile_inventory_settlements(&reservations_before);
+                }
+                self.binance_user_data_clean &= locked_assets.is_empty();
+                self.telemetry.emit(
+                    "binance_user_account_position",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "event_time_ms": position.event_time_ms,
+                        "last_account_update_ms": position.last_account_update_ms,
+                        "changed_assets": position.balances.len(),
+                        "locked_assets": locked_assets,
+                    }),
+                );
+            }
+            UserDataEvent::ExecutionReport(report) => {
+                let report = *report;
+                let owned = report.client_order_id.starts_with("rust")
+                    && self
+                        .domain_config
+                        .binance_symbols()
+                        .iter()
+                        .any(|symbol| symbol == &report.symbol);
+                if !owned {
+                    self.binance_user_data_clean = false;
+                }
+                self.telemetry.emit(
+                    "binance_execution_report",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "event_time_ms": report.event_time_ms,
+                        "transaction_time_ms": report.transaction_time_ms,
+                        "symbol": &report.symbol,
+                        "client_order_id": &report.client_order_id,
+                        "order_id": report.order_id,
+                        "side": &report.side,
+                        "order_type": &report.order_type,
+                        "execution_type": &report.execution_type,
+                        "order_status": &report.order_status,
+                        "reject_reason": &report.reject_reason,
+                        "last_executed_quantity": report.last_executed_quantity.to_string(),
+                        "cumulative_filled_quantity": report.cumulative_filled_quantity.to_string(),
+                        "last_executed_price": report.last_executed_price.to_string(),
+                        "commission": report.commission.to_string(),
+                        "commission_asset": &report.commission_asset,
+                        "trade_id": report.trade_id,
+                        "owned": owned,
+                    }),
+                );
+                self.binance_orders
+                    .insert(report.client_order_id.clone(), report);
+            }
+            UserDataEvent::BalanceUpdate(update) => self.telemetry.emit(
+                "binance_user_balance_update",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "event_time_ms": update.event_time_ms,
+                    "asset": update.asset,
+                    "delta": update.delta.to_string(),
+                    "clear_time_ms": update.clear_time_ms,
+                }),
+            ),
+            UserDataEvent::StreamTerminated { event_time_ms } => {
+                self.binance_user_data_connected = false;
+                self.refresh_phase(Instant::now());
+                anyhow::bail!("Binance User Data Stream terminated at {event_time_ms}");
+            }
+            UserDataEvent::Other {
+                event_type,
+                event_time_ms,
+            } => {
+                self.binance_user_data_clean = false;
+                self.telemetry.emit(
+                    "binance_user_data_unhandled",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "event_type": event_type,
+                        "event_time_ms": event_time_ms,
+                    }),
+                );
+            }
+        }
+        self.refresh_phase(Instant::now());
+        Ok(())
     }
 
     pub fn on_dex_event(
@@ -209,6 +407,7 @@ impl TradingEngine {
                 "prepared_generation": prepared.generation,
                 "prepared_exact_output_segments": prepared.exact_output_segments,
                 "prepared_exact_input_segments": prepared.exact_input_segments,
+                "prepared_token_a_exact_input_segments": prepared.token_a_exact_input_segments,
                 "build_time_us": prepared.build_time_us,
                 "total_time_us": prepared.total_time_us,
             }),
@@ -222,13 +421,17 @@ impl TradingEngine {
                 .filter_map(|feed| feed.book.clone())
                 .collect();
             for quote in books {
-                self.evaluate_ready_quote(&quote, "dex_prepared")?;
+                self.evaluate_ready_quote(&quote, "dex_prepared", None)?;
             }
         }
         Ok(())
     }
 
-    pub fn on_market_event(&mut self, event: MarketEvent) -> anyhow::Result<()> {
+    pub fn on_market_event(
+        &mut self,
+        event: MarketEvent,
+        depth: Option<&SpotDepthBook>,
+    ) -> anyhow::Result<()> {
         match event {
             MarketEvent::FeedConnected {
                 symbol,
@@ -267,16 +470,131 @@ impl TradingEngine {
                 );
             }
             MarketEvent::BinanceTopOfBook(quote) => {
-                self.on_binance_quote(quote)?;
+                let matching_depth = depth.filter(|depth| {
+                    depth.matches_top(
+                        quote.symbol.as_ref(),
+                        quote.update_id,
+                        quote.bid_price,
+                        quote.bid_quantity,
+                        quote.ask_price,
+                        quote.ask_quantity,
+                    )
+                });
+                self.on_binance_quote(quote, matching_depth)?;
+            }
+            MarketEvent::BinanceDepthApplied {
+                symbol,
+                generation,
+                last_update_id,
+                observed_at,
+            } => {
+                let apply_result = self.state.apply_depth(
+                    symbol.as_ref(),
+                    generation,
+                    last_update_id,
+                    observed_at,
+                );
+                self.telemetry.emit(
+                    "binance_depth_applied",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "product": "spot",
+                        "symbol": symbol.as_ref(),
+                        "generation": generation,
+                        "last_update_id": last_update_id,
+                        "observed_mono_age_us": observed_at.elapsed().as_micros(),
+                        "apply_result": format!("{apply_result:?}"),
+                    }),
+                );
             }
         }
         self.refresh_phase(Instant::now());
         Ok(())
     }
 
-    pub fn on_balance_event(&mut self, event: BalanceEvent) {
+    pub fn on_gas_market_event(&mut self, event: MarketEvent) -> anyhow::Result<()> {
+        match event {
+            MarketEvent::FeedConnected {
+                symbol, generation, ..
+            } => {
+                ensure!(
+                    symbol.as_ref() == self.gas_price_symbol,
+                    "gas feed symbol mismatch"
+                );
+                if generation >= self.gas_price_generation {
+                    self.gas_price_connected = true;
+                    self.gas_price_generation = generation;
+                    self.gas_price_book = None;
+                }
+            }
+            MarketEvent::FeedDisconnected {
+                symbol, generation, ..
+            } => {
+                ensure!(
+                    symbol.as_ref() == self.gas_price_symbol,
+                    "gas feed symbol mismatch"
+                );
+                if generation == self.gas_price_generation {
+                    self.gas_price_connected = false;
+                    self.gas_price_book = None;
+                }
+            }
+            MarketEvent::BinanceTopOfBook(quote) => {
+                ensure!(
+                    quote.symbol.as_ref() == self.gas_price_symbol,
+                    "gas quote symbol mismatch"
+                );
+                if quote.connection_generation == self.gas_price_generation
+                    && self
+                        .gas_price_book
+                        .as_ref()
+                        .is_none_or(|current| quote.update_id > current.update_id)
+                {
+                    self.hot_telemetry.emit_binance_book(&quote);
+                    self.gas_price_book = Some(quote);
+                }
+            }
+            MarketEvent::BinanceDepthApplied { .. } => {
+                anyhow::bail!("gas-price feed unexpectedly emitted depth")
+            }
+        }
+        self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    pub fn native_price_token_a(&self) -> Option<Decimal> {
+        self.gas_price_book.as_ref().map(|book| book.ask_price)
+    }
+
+    pub fn on_balance_event(&mut self, event: BalanceEvent) -> anyhow::Result<()> {
+        let reservations_before = self
+            .inventory
+            .active_operation_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         match event {
             BalanceEvent::Binance(snapshot) => {
+                self.binance_inventory_generation = self
+                    .binance_inventory_generation
+                    .checked_add(1)
+                    .context("Binance inventory generation overflow")?;
+                let balances = snapshot
+                    .balances
+                    .iter()
+                    .map(|(asset, balance)| {
+                        let decimals = self.token_decimals(asset.as_ref())?;
+                        Ok((
+                            asset.to_string(),
+                            decimal_to_base_units_floor(balance.free, decimals)?,
+                        ))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                self.inventory.update_venue(
+                    InventoryVenue::Binance,
+                    self.binance_inventory_generation,
+                    balances,
+                )?;
                 let balances = snapshot
                     .balances
                     .iter()
@@ -301,7 +619,32 @@ impl TradingEngine {
                 );
                 self.state.balances.apply_binance(snapshot);
             }
+            BalanceEvent::BinanceOpenOrders {
+                client_order_ids,
+                observed_at,
+            } => {
+                if !client_order_ids.is_empty() {
+                    self.binance_user_data_clean = false;
+                }
+                self.telemetry.emit(
+                    "binance_open_orders_reconciled",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "open_order_count": client_order_ids.len(),
+                        "client_order_ids": client_order_ids,
+                        "engine_queue_age_us": observed_at.elapsed().as_micros(),
+                    }),
+                );
+            }
             BalanceEvent::Wallet(snapshot) => {
+                self.inventory.update_venue(
+                    InventoryVenue::Wallet,
+                    snapshot.block_number,
+                    snapshot
+                        .token_balances
+                        .iter()
+                        .map(|balance| (balance.symbol.to_string(), balance.base_units)),
+                )?;
                 let token_balances = snapshot
                     .token_balances
                     .iter()
@@ -322,6 +665,7 @@ impl TradingEngine {
                         "block_number": snapshot.block_number,
                         "block_hash": format!("{:#x}", snapshot.block_hash),
                         "native_balance_wei": snapshot.native_balance_wei.to_string(),
+                        "gas_price_wei": snapshot.gas_price_wei.to_string(),
                         "token_balances": token_balances,
                         "request_duration_us": snapshot.request_duration_us,
                         "rpc_http_requests": snapshot.rpc_stats.http_requests,
@@ -353,22 +697,73 @@ impl TradingEngine {
                 );
             }
         }
+        self.reconcile_inventory_settlements(&reservations_before);
         self.evaluate_rebalance();
         self.refresh_phase(Instant::now());
+        Ok(())
     }
 
-    pub fn take_rebalance_execution(&mut self) -> Option<RebalanceEvaluation> {
-        self.pending_rebalance.take()
+    pub fn take_rebalance_execution(&mut self) -> anyhow::Result<Option<RebalanceEvaluation>> {
+        let Some(evaluation) = self.pending_rebalance.take() else {
+            return Ok(None);
+        };
+        ensure!(
+            self.rebalance_inventory_reservation.is_none(),
+            "a rebalance inventory reservation is already active"
+        );
+        let action = evaluation
+            .plan
+            .action
+            .as_ref()
+            .context("rebalance execution has no action")?;
+        let venue = match action.direction {
+            Direction::BinanceToWallet => InventoryVenue::Binance,
+            Direction::WalletToBinance => InventoryVenue::Wallet,
+        };
+        let reservation_id = format!("rebalance-reservation-{}", self.next_inventory_reservation);
+        self.next_inventory_reservation = self
+            .next_inventory_reservation
+            .checked_add(1)
+            .context("inventory reservation sequence overflow")?;
+        self.inventory.reserve(ReservationRequest {
+            operation_id: reservation_id.clone(),
+            purpose: ReservationPurpose::Rebalance,
+            claims: vec![InventoryClaim {
+                key: InventoryKey::new(venue, evaluation.token_symbol.clone())?,
+                amount: action.amount,
+            }],
+            settlement_venues: [InventoryVenue::Binance, InventoryVenue::Wallet]
+                .into_iter()
+                .collect(),
+        })?;
+        self.rebalance_inventory_reservation = Some(reservation_id.clone());
+        self.telemetry.emit(
+            "inventory_reserved",
+            json!({
+                "engine_id": self.config.engine_id,
+                "operation_id": reservation_id,
+                "purpose": "rebalance",
+                "venue": format!("{venue:?}"),
+                "asset": evaluation.token_symbol,
+                "amount_base_units": action.amount.to_string(),
+            }),
+        );
+        Ok(Some(evaluation))
     }
 
     pub fn on_rebalance_execution_result(
         &mut self,
         result: Result<&RebalanceExecutionOperation, &str>,
-    ) {
+    ) -> anyhow::Result<()> {
         self.rebalance_inflight = false;
         self.rebalance_inflight_since = None;
         match result {
             Ok(operation) => {
+                let reservation_id = self
+                    .rebalance_inventory_reservation
+                    .as_deref()
+                    .context("rebalance completed without an inventory reservation")?;
+                self.inventory.mark_pending_settlement(reservation_id)?;
                 if let (Some(binance), Some(wallet)) = (
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),
@@ -413,6 +808,36 @@ impl TradingEngine {
             }
         }
         self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    fn token_decimals(&self, symbol: &str) -> anyhow::Result<u8> {
+        self.domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .flat_map(|pair| [&pair.token_a, &pair.token_b])
+            .find(|token| token.symbol == symbol)
+            .map(|token| token.decimals)
+            .with_context(|| format!("no configured decimals for inventory asset {symbol}"))
+    }
+
+    fn reconcile_inventory_settlements(&mut self, reservations_before: &[String]) {
+        for operation_id in reservations_before {
+            if self.inventory.reservation(operation_id).is_some() {
+                continue;
+            }
+            self.telemetry.emit(
+                "inventory_settlement_reconciled",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "operation_id": operation_id,
+                }),
+            );
+            if self.rebalance_inventory_reservation.as_ref() == Some(operation_id) {
+                self.rebalance_inventory_reservation = None;
+            }
+        }
     }
 
     fn evaluate_rebalance(&mut self) {
@@ -491,15 +916,30 @@ impl TradingEngine {
         }
     }
 
-    fn on_binance_quote(&mut self, quote: TopOfBook) -> anyhow::Result<()> {
+    fn on_binance_quote(
+        &mut self,
+        quote: TopOfBook,
+        matching_depth: Option<&SpotDepthBook>,
+    ) -> anyhow::Result<()> {
         let result = self.state.apply_quote(quote.clone());
         match result {
             QuoteApplyResult::Accepted => {
                 // The decision is evaluated only after all readiness inputs are
                 // fresh. The calculation itself performs no RPC, I/O, or locks.
                 self.refresh_phase(Instant::now());
-                if self.state.phase == RuntimePhase::Ready {
-                    self.evaluate_ready_quote(&quote, "binance_book_ticker")?;
+                if self.state.phase == RuntimePhase::Ready && matching_depth.is_some() {
+                    self.evaluate_ready_quote(&quote, "binance_book_ticker", matching_depth)?;
+                } else if self.state.phase == RuntimePhase::Ready {
+                    self.telemetry.emit(
+                        "binance_book_depth_mismatch",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "product": "spot",
+                            "symbol": quote.symbol.as_ref(),
+                            "book_ticker_update_id": quote.update_id,
+                            "reason": "sequence_or_top_level_mismatch",
+                        }),
+                    );
                 }
 
                 // Raw market telemetry is deliberately serialized only after
@@ -526,6 +966,7 @@ impl TradingEngine {
         &mut self,
         quote: &TopOfBook,
         trigger: &'static str,
+        depth: Option<&SpotDepthBook>,
     ) -> anyhow::Result<()> {
         let calculation_started = Instant::now();
         if let Some(evaluation) = self.opportunities.evaluate(quote)? {
@@ -536,7 +977,347 @@ impl TradingEngine {
                 calculation_started.elapsed().as_micros(),
                 trigger,
             );
+            if trigger == "binance_book_ticker" {
+                self.submit_paper_opportunity(
+                    quote,
+                    evaluation,
+                    depth.context("book-triggered evaluation has no matching depth")?,
+                )?;
+            }
         }
+        Ok(())
+    }
+
+    fn submit_paper_opportunity(
+        &mut self,
+        quote: &TopOfBook,
+        evaluation: PairEvaluation,
+        depth: &SpotDepthBook,
+    ) -> anyhow::Result<()> {
+        let Some(handle) = self.paper_trades.clone() else {
+            return Ok(());
+        };
+        let pair = self.opportunities.pair(evaluation.pair_index)?;
+        let pair_id = pair.pair_id.clone();
+        let pair_symbol = pair.symbol.clone();
+        let token_a_decimals = pair.token_a_decimals;
+        let token_b_decimals = pair.token_b_decimals;
+        let binance_buy_fee_bps = pair.binance_buy_fee_bps;
+        let binance_sell_fee_bps = pair.binance_sell_fee_bps;
+        let opportunity_threshold_bps = pair.opportunity_threshold_bps;
+        let baseline_token_a = pair.baseline_token_a();
+        let token_b_step = pair.token_b_step();
+        let wallet = self
+            .state
+            .balances
+            .wallet
+            .as_ref()
+            .context("admission has no wallet snapshot")?;
+        let network_gas_price_wei = wallet.gas_price_wei;
+        let wallet_native_balance_wei = wallet.native_balance_wei;
+        let native_price_token_a = self
+            .native_price_token_a()
+            .context("admission has no native-token price")?;
+
+        let mut candidates = Vec::with_capacity(2);
+        for direction in [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell] {
+            // Rails executes the fixed token-A minimum-buy baseline. The
+            // larger market-liquidity capacity remains telemetry only and must
+            // not silently change the comparison's order size.
+            let Some(trade) = direction.baseline.filter(|trade| trade.meets_threshold) else {
+                continue;
+            };
+            ensure!(
+                trade.cost_token_a <= baseline_token_a.saturating_mul(U256::from(2_u8)),
+                "baseline trade escaped the two-times token-A safety envelope"
+            );
+            let trade_direction = match direction.direction {
+                ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
+                    TradeDirection::BuyTokenBOnDexSellOnCex
+                }
+                ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
+                    TradeDirection::BuyTokenBOnCexSellOnDex
+                }
+            };
+            let Some(economics) = evaluate_admission(
+                depth,
+                AdmissionInputs {
+                    symbol: &pair_symbol,
+                    direction: trade_direction,
+                    token_b_amount: trade.token_b_amount,
+                    token_a_decimals,
+                    token_b_decimals,
+                    binance_buy_fee_bps,
+                    binance_sell_fee_bps,
+                    expected_cost_token_a: trade.cost_token_a,
+                    expected_proceeds_token_a: trade.proceeds_token_a,
+                    opportunity_threshold_bps,
+                    network_gas_price_wei,
+                    native_price_token_a,
+                    wallet_native_balance_wei,
+                },
+            )?
+            else {
+                self.emit_admission_risk_rejection(
+                    quote,
+                    &pair_id,
+                    trade_direction,
+                    "insufficient_recovery_depth",
+                    None,
+                );
+                continue;
+            };
+            if !economics.native_gas_covered {
+                self.emit_admission_risk_rejection(
+                    quote,
+                    &pair_id,
+                    trade_direction,
+                    "insufficient_native_gas_reserve",
+                    Some(economics),
+                );
+                continue;
+            }
+            if !economics.meets_threshold {
+                self.emit_admission_risk_rejection(
+                    quote,
+                    &pair_id,
+                    trade_direction,
+                    "fully_burdened_economics_below_threshold",
+                    Some(economics),
+                );
+                continue;
+            }
+            candidates.push((trade_direction, trade, economics));
+        }
+        let candidate = candidates
+            .into_iter()
+            .max_by_key(|(_, _, economics)| economics.bounded_profit_token_a);
+        let Some((direction, trade, economics)) = candidate else {
+            return Ok(());
+        };
+        let pair_config = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|config| config.id == pair_id)
+            .context("paper opportunity pair is absent from domain config")?;
+        let token_a_symbol = pair_config.token_a.symbol.clone();
+        let token_b_symbol = pair_config.token_b.symbol.clone();
+        let balance_safety_multiplier = pair_config.strategy.balance_safety_multiplier;
+        let deadline_unix_seconds = quote
+            .received_unix_us
+            .checked_div(1_000_000)
+            .and_then(|seconds| seconds.checked_add(DEX_PLAN_TTL_SECONDS))
+            .context("DEX plan deadline overflow")?;
+        let dex_plan = DexSwapPlan::build(
+            pair_config,
+            self.dex.pool(trade.pool_index)?,
+            direction,
+            trade,
+            deadline_unix_seconds,
+        )?;
+        let opportunity = PaperOpportunity {
+            source_revision: self.domain_config.snapshot().source.revision.clone(),
+            pair_id,
+            update_id: quote.update_id,
+            received_unix_us: quote.received_unix_us,
+            direction,
+            token_b_base_units: u256_to_i128(trade.token_b_amount, "paper token-B amount")?,
+            token_b_step_base_units: u256_to_i128(token_b_step, "paper token-B step")?,
+            cost_token_a_base_units: u256_to_i128(trade.cost_token_a, "paper token-A cost")?,
+            proceeds_token_a_base_units: u256_to_i128(
+                trade.proceeds_token_a,
+                "paper token-A proceeds",
+            )?,
+            admission: AdmissionRiskBounds {
+                execution_slippage_bps: trade.execution_slippage_bps,
+                cex_primary_limit_price: match direction {
+                    TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
+                    TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
+                },
+                cex_recovery_limit_price: economics.recovery_limit_price,
+                cex_recovery_sell_limit_price: Some(economics.recovery_sell_limit_price),
+                cex_recovery_buy_limit_price: Some(economics.recovery_buy_limit_price),
+                recovery_quote_token_a_base_units: u256_to_u128(
+                    economics.recovery_quote_token_a,
+                    "paper recovery quote",
+                )?,
+                recovery_sell_quote_token_a_base_units: u256_to_u128(
+                    economics.recovery_sell_quote_token_a,
+                    "paper recovery sell quote",
+                )?,
+                recovery_buy_quote_token_a_base_units: u256_to_u128(
+                    economics.recovery_buy_quote_token_a,
+                    "paper recovery buy quote",
+                )?,
+                maximum_recovery_loss_token_a_base_units: u256_to_u128(
+                    economics.recovery_loss_token_a,
+                    "paper maximum recovery loss",
+                )?,
+                maximum_fee_per_gas_wei: economics.maximum_fee_per_gas_wei,
+                gas_conversion_price_token_a: native_price_token_a,
+                maximum_gas_cost_token_a_base_units: u256_to_u128(
+                    economics.maximum_gas_cost_token_a,
+                    "paper maximum gas cost",
+                )?,
+                bounded_profit_token_a_base_units: u256_to_u128(
+                    economics.bounded_profit_token_a,
+                    "paper bounded profit",
+                )?,
+            },
+            dex_plan: dex_plan.clone(),
+        };
+        let plan_id = opportunity.plan_id();
+        let safety_multiplier = U256::from(balance_safety_multiplier);
+        let token_a_claim = trade
+            .cost_token_a
+            .max(economics.recovery_quote_token_a)
+            .max(economics.recovery_sell_quote_token_a)
+            .max(economics.recovery_buy_quote_token_a)
+            .checked_mul(safety_multiplier)
+            .context("paper token-A safety reservation overflow")?;
+        let token_b_claim = trade
+            .token_b_amount
+            .checked_mul(safety_multiplier)
+            .context("paper token-B safety reservation overflow")?;
+        let claims = match direction {
+            TradeDirection::BuyTokenBOnDexSellOnCex => vec![
+                InventoryClaim {
+                    key: InventoryKey::new(InventoryVenue::Wallet, token_a_symbol)?,
+                    amount: token_a_claim,
+                },
+                InventoryClaim {
+                    key: InventoryKey::new(InventoryVenue::Binance, token_b_symbol)?,
+                    amount: token_b_claim,
+                },
+            ],
+            TradeDirection::BuyTokenBOnCexSellOnDex => vec![
+                InventoryClaim {
+                    key: InventoryKey::new(InventoryVenue::Binance, token_a_symbol)?,
+                    amount: token_a_claim,
+                },
+                InventoryClaim {
+                    key: InventoryKey::new(InventoryVenue::Wallet, token_b_symbol)?,
+                    amount: token_b_claim,
+                },
+            ],
+        };
+        let request = ReservationRequest {
+            operation_id: plan_id.clone(),
+            purpose: ReservationPurpose::TradePrimary,
+            claims,
+            settlement_venues: [InventoryVenue::Binance, InventoryVenue::Wallet]
+                .into_iter()
+                .collect(),
+        };
+        if let Err(error) = self.inventory.reserve(request) {
+            self.telemetry.emit(
+                "arbitrage_admission_rejected",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "plan_id": plan_id,
+                    "reason": "insufficient_available_inventory",
+                    "error": format!("{error:#}"),
+                }),
+            );
+            return Ok(());
+        }
+        if !handle.try_submit(opportunity) {
+            self.inventory.release_unsubmitted(&plan_id)?;
+            self.telemetry.emit(
+                "arbitrage_admission_rejected",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "plan_id": plan_id,
+                    "reason": "paper_execution_queue_full",
+                }),
+            );
+            return Ok(());
+        }
+        self.telemetry.emit(
+            "arbitrage_admitted",
+            json!({
+                "engine_id": self.config.engine_id,
+                "plan_id": plan_id,
+                "mode": self.config.arbitrage_execution_mode,
+                "balance_safety_multiplier": balance_safety_multiplier,
+                "execution_slippage_bps": trade.execution_slippage_bps,
+                "cex_primary_limit_price": match direction {
+                    TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
+                    TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price.to_string(),
+                },
+                "recovery_limit_price": economics.recovery_limit_price.to_string(),
+                "recovery_sell_limit_price": economics.recovery_sell_limit_price.to_string(),
+                "recovery_buy_limit_price": economics.recovery_buy_limit_price.to_string(),
+                "recovery_quote_token_a_base_units": economics.recovery_quote_token_a.to_string(),
+                "recovery_sell_quote_token_a_base_units": economics.recovery_sell_quote_token_a.to_string(),
+                "recovery_buy_quote_token_a_base_units": economics.recovery_buy_quote_token_a.to_string(),
+                "recovery_loss_token_a_base_units": economics.recovery_loss_token_a.to_string(),
+                "maximum_gas_wei": economics.maximum_gas_wei.to_string(),
+                "maximum_fee_per_gas_wei": economics.maximum_fee_per_gas_wei.to_string(),
+                "gas_conversion_price_token_a": native_price_token_a.to_string(),
+                "maximum_gas_cost_token_a_base_units": economics.maximum_gas_cost_token_a.to_string(),
+                "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
+                "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
+                "dex_plan": dex_plan,
+            }),
+        );
+        Ok(())
+    }
+
+    fn emit_admission_risk_rejection(
+        &self,
+        quote: &TopOfBook,
+        pair_id: &str,
+        direction: TradeDirection,
+        reason: &'static str,
+        economics: Option<AdmissionEconomics>,
+    ) {
+        self.telemetry.emit(
+            "arbitrage_admission_rejected",
+            json!({
+                "engine_id": self.config.engine_id,
+                "pair_id": pair_id,
+                "symbol": quote.symbol.as_ref(),
+                "update_id": quote.update_id,
+                "direction": format!("{direction:?}"),
+                "reason": reason,
+                "recovery_limit_price": economics.map(|value| value.recovery_limit_price.to_string()),
+                "recovery_sell_limit_price": economics.map(|value| value.recovery_sell_limit_price.to_string()),
+                "recovery_buy_limit_price": economics.map(|value| value.recovery_buy_limit_price.to_string()),
+                "recovery_quote_token_a_base_units": economics.map(|value| value.recovery_quote_token_a.to_string()),
+                "recovery_sell_quote_token_a_base_units": economics.map(|value| value.recovery_sell_quote_token_a.to_string()),
+                "recovery_buy_quote_token_a_base_units": economics.map(|value| value.recovery_buy_quote_token_a.to_string()),
+                "recovery_loss_token_a_base_units": economics.map(|value| value.recovery_loss_token_a.to_string()),
+                "maximum_gas_wei": economics.map(|value| value.maximum_gas_wei.to_string()),
+                "maximum_fee_per_gas_wei": economics.map(|value| value.maximum_fee_per_gas_wei.to_string()),
+                "maximum_gas_cost_token_a_base_units": economics.map(|value| value.maximum_gas_cost_token_a.to_string()),
+                "fully_burdened_cost_token_a_base_units": economics.map(|value| value.fully_burdened_cost_token_a.to_string()),
+                "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
+            }),
+        );
+    }
+
+    pub fn on_paper_trade_event(&mut self, event: PaperTradeEvent) -> anyhow::Result<()> {
+        match event.state {
+            PaperTradeEventState::Balanced => {
+                self.inventory.mark_pending_settlement(&event.plan_id)?;
+            }
+            PaperTradeEventState::RejectedUnsubmitted => {
+                self.inventory.release_unsubmitted(&event.plan_id)?;
+            }
+            PaperTradeEventState::BlockedUnknown => {}
+        }
+        self.telemetry.emit(
+            "arbitrage_inventory_state",
+            json!({
+                "engine_id": self.config.engine_id,
+                "plan_id": event.plan_id,
+                "state": format!("{:?}", event.state),
+                "reservation_held": self.inventory.reservation(&event.plan_id).is_some(),
+            }),
+        );
         Ok(())
     }
 
@@ -618,6 +1399,12 @@ impl TradingEngine {
         let trading_readiness = TradingReadiness {
             dex_ready,
             balances_ready,
+            user_data_ready: self.binance_user_data_connected && self.binance_user_data_clean,
+            gas_price_ready: self.gas_price_connected
+                && self.gas_price_book.as_ref().is_some_and(|book| {
+                    now.saturating_duration_since(book.received_at).as_millis()
+                        <= u128::from(self.config.market_data_max_age_ms)
+                }),
         };
         let current = self.state.refresh_phase(
             now,
@@ -653,6 +1440,35 @@ impl TradingEngine {
     }
 }
 
+fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
+    let value = u128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds u128"))?;
+    i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
+}
+
+fn u256_to_u128(value: U256, name: &str) -> anyhow::Result<u128> {
+    u128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds u128"))
+}
+
+fn decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
+    ensure!(value >= Decimal::ZERO, "inventory balance is negative");
+    let mantissa = value.mantissa();
+    let mantissa = u128::try_from(mantissa).context("inventory balance mantissa is negative")?;
+    let numerator = U256::from(mantissa)
+        .checked_mul(pow10(decimals.into())?)
+        .context("inventory balance base-unit numerator overflow")?;
+    Ok(numerator / pow10(value.scale())?)
+}
+
+fn pow10(exponent: u32) -> anyhow::Result<U256> {
+    let mut value = U256::ONE;
+    for _ in 0..exponent {
+        value = value
+            .checked_mul(U256::from(10))
+            .context("inventory decimal scale overflow")?;
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -667,6 +1483,8 @@ mod tests {
             TradingReadiness {
                 dex_ready: true,
                 balances_ready: true,
+                user_data_ready: true,
+                gas_price_ready: true,
             }
             .ready()
         );
@@ -678,10 +1496,26 @@ mod tests {
             TradingReadiness {
                 dex_ready: false,
                 balances_ready: true,
+                user_data_ready: true,
+                gas_price_ready: true,
             },
             TradingReadiness {
                 dex_ready: true,
                 balances_ready: false,
+                user_data_ready: true,
+                gas_price_ready: true,
+            },
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: true,
+                user_data_ready: false,
+                gas_price_ready: true,
+            },
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: true,
+                user_data_ready: true,
+                gas_price_ready: false,
             },
         ] {
             assert!(!readiness.ready());
@@ -713,6 +1547,8 @@ mod tests {
             TradingReadiness {
                 dex_ready: true,
                 balances_ready: true,
+                user_data_ready: true,
+                gas_price_ready: true,
             }
             .ready()
         );

@@ -66,6 +66,7 @@ pub struct TradeEvaluation {
     /// Cost and proceeds after applying the configured reserve.
     pub cost_token_a: U256,
     pub proceeds_token_a: U256,
+    pub execution_slippage_bps: u16,
     /// Signed hundredths of one basis point.
     pub profit_bps_x100: i64,
     pub meets_threshold: bool,
@@ -120,6 +121,11 @@ pub struct PairRuntime {
     pub token_b_decimals: u8,
     pub opportunity_threshold_bps: u16,
     pub dex_fee_reserve_bps: u16,
+    pub min_slippage_bps: u16,
+    pub max_slippage_bps: u16,
+    pub slippage_profit_share_bps: u16,
+    pub binance_buy_fee_bps: u16,
+    pub binance_sell_fee_bps: u16,
     baseline_token_a: U256,
     token_b_step: U256,
     token_a: Address,
@@ -139,6 +145,7 @@ pub struct OpportunityEngine {
 #[derive(Debug)]
 struct PreparedPoolQuotes {
     by_direction: [PreparedQuoteCurve; 2],
+    token_a_exact_input: PreparedQuoteCurve,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +154,7 @@ pub struct PreparedPoolRefresh {
     pub generation: u64,
     pub exact_output_segments: usize,
     pub exact_input_segments: usize,
+    pub token_a_exact_input_segments: usize,
     pub build_time_us: u128,
     pub total_time_us: u128,
 }
@@ -195,6 +203,11 @@ struct DirectionBaselineQuoteCache {
 struct BaselineCacheUsage {
     hits: u16,
     misses: u16,
+}
+
+struct BaselineCacheContext<'a> {
+    pools: &'a mut [PoolBaselineQuoteCache],
+    usage: &'a mut BaselineCacheUsage,
 }
 
 impl OpportunityEngine {
@@ -272,8 +285,11 @@ impl OpportunityEngine {
                 quote,
                 baseline_token_b_amount,
                 ArbitrageDirection::BuyTokenBOnDexSellOnCex,
-                &mut self.baseline_quote_cache,
-                &mut cache_usage,
+                true,
+                BaselineCacheContext {
+                    pools: &mut self.baseline_quote_cache,
+                    usage: &mut cache_usage,
+                },
             )?,
             cex_buy_dex_sell: evaluate_direction_with_cache(
                 pair,
@@ -281,8 +297,11 @@ impl OpportunityEngine {
                 quote,
                 baseline_token_b_amount,
                 ArbitrageDirection::BuyTokenBOnCexSellOnDex,
-                &mut self.baseline_quote_cache,
-                &mut cache_usage,
+                false,
+                BaselineCacheContext {
+                    pools: &mut self.baseline_quote_cache,
+                    usage: &mut cache_usage,
+                },
             )?,
             baseline_cache_hits: cache_usage.hits,
             baseline_cache_misses: cache_usage.misses,
@@ -293,6 +312,28 @@ impl OpportunityEngine {
         self.pairs
             .get(index)
             .context("opportunity pair index is invalid")
+    }
+
+    pub fn set_binance_fee_bps(
+        &mut self,
+        symbol: &str,
+        buy_fee_bps: u16,
+        sell_fee_bps: u16,
+    ) -> anyhow::Result<()> {
+        ensure!(buy_fee_bps <= 10_000, "Binance BUY fee exceeds 100%");
+        ensure!(sell_fee_bps <= 10_000, "Binance SELL fee exceeds 100%");
+        let pair_index = self
+            .pair_indices_by_symbol
+            .get(symbol)
+            .copied()
+            .with_context(|| format!("unknown Binance fee symbol {symbol}"))?;
+        let pair = self
+            .pairs
+            .get_mut(pair_index)
+            .context("Binance fee pair index is invalid")?;
+        pair.binance_buy_fee_bps = buy_fee_bps;
+        pair.binance_sell_fee_bps = sell_fee_bps;
+        Ok(())
     }
 
     pub fn pairs(&self) -> &[PairRuntime] {
@@ -348,6 +389,7 @@ impl OpportunityEngine {
             generation: result.generation,
             exact_output_segments: result.prepared.by_direction[0].segment_count(),
             exact_input_segments: result.prepared.by_direction[1].segment_count(),
+            token_a_exact_input_segments: result.prepared.token_a_exact_input.segment_count(),
             build_time_us: result.build_time_us,
             total_time_us: result.requested_at.elapsed().as_micros(),
         };
@@ -440,10 +482,19 @@ fn prepare_pool_quotes_from_pool(
             pool.prepare_exact_output_curve(exact_output_zero_for_one)?,
             pool.prepare_exact_input_curve(exact_input_zero_for_one)?,
         ],
+        token_a_exact_input: pool.prepare_exact_input_curve(exact_output_zero_for_one)?,
     })
 }
 
 impl PairRuntime {
+    pub fn baseline_token_a(&self) -> U256 {
+        self.baseline_token_a
+    }
+
+    pub fn token_b_step(&self) -> U256 {
+        self.token_b_step
+    }
+
     fn new(config: &PairConfig, dex: &DexMirror) -> anyhow::Result<Self> {
         let token_a = Address::from_str(&config.token_a.contract)
             .context("validated token_a address is invalid")?;
@@ -487,6 +538,11 @@ impl PairRuntime {
             token_b_decimals: config.token_b.decimals,
             opportunity_threshold_bps: config.strategy.opportunity_threshold_bps,
             dex_fee_reserve_bps: config.strategy.dex_fee_reserve_bps,
+            min_slippage_bps: config.strategy.min_slippage_bps,
+            max_slippage_bps: config.strategy.max_slippage_bps,
+            slippage_profit_share_bps: config.strategy.slippage_profit_share_bps,
+            binance_buy_fee_bps: 0,
+            binance_sell_fee_bps: 0,
             baseline_token_a,
             token_b_step,
             token_a,
@@ -515,6 +571,7 @@ fn evaluate_direction(
         quote,
         baseline_token_b,
         direction,
+        false,
         None,
     )
 }
@@ -525,8 +582,8 @@ fn evaluate_direction_with_cache(
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
-    baseline_quote_cache: &mut [PoolBaselineQuoteCache],
-    cache_usage: &mut BaselineCacheUsage,
+    baseline_from_dex_token_a: bool,
+    cache: BaselineCacheContext<'_>,
 ) -> anyhow::Result<DirectionEvaluation> {
     evaluate_direction_impl(
         pair,
@@ -534,7 +591,8 @@ fn evaluate_direction_with_cache(
         quote,
         baseline_token_b,
         direction,
-        Some((baseline_quote_cache, cache_usage)),
+        baseline_from_dex_token_a,
+        Some(cache),
     )
 }
 
@@ -544,7 +602,8 @@ fn evaluate_direction_impl(
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
-    mut cache: Option<(&mut [PoolBaselineQuoteCache], &mut BaselineCacheUsage)>,
+    baseline_from_dex_token_a: bool,
+    mut cache: Option<BaselineCacheContext<'_>>,
 ) -> anyhow::Result<DirectionEvaluation> {
     let cex_top = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_quantity,
@@ -557,54 +616,69 @@ fn evaluate_direction_impl(
 
     let mut best_baseline: Option<TradeEvaluation> = None;
     let mut best_capacity: Option<CapacityEvaluation> = None;
-    if cex_top_token_b_amount >= baseline_token_b {
-        let baseline_cex_token_a = cex_token_a_amount(pair, quote, direction, baseline_token_b)?;
-        for &pool_index in &pair.pool_indices {
-            let dex_quote = if let Some((pool_caches, usage)) = cache.as_mut() {
-                let pool_cache = pool_caches
-                    .get_mut(pool_index)
-                    .context("baseline quote cache index is invalid")?;
-                pool_cache.quote(direction, baseline_token_b, usage, || {
-                    quote_dex(prepared_pools, direction, pool_index, baseline_token_b)
-                })?
-            } else {
-                quote_dex(prepared_pools, direction, pool_index, baseline_token_b)?
-            };
-            let Some(baseline) = evaluate_trade_with_dex_quote(
-                pair,
-                direction,
+    for &pool_index in &pair.pool_indices {
+        let baseline_token_b = if baseline_from_dex_token_a {
+            let Some(amount) = quote_token_a_exact_input_baseline(
+                prepared_pools,
                 pool_index,
-                baseline_token_b,
-                baseline_cex_token_a,
-                dex_quote,
+                pair.baseline_token_a,
             )?
             else {
                 continue;
             };
-            if best_baseline
-                .as_ref()
-                .is_none_or(|best| trade_is_better(direction, &baseline, best))
-            {
-                best_baseline = Some(baseline);
-            }
-            if !baseline.meets_threshold {
-                continue;
-            }
+            round_down_to_step(amount, pair.token_b_step)
+        } else {
+            baseline_token_b
+        };
+        if baseline_token_b.is_zero() || cex_top_token_b_amount < baseline_token_b {
+            continue;
+        }
+        let baseline_cex_token_a = cex_token_a_amount(pair, quote, direction, baseline_token_b)?;
+        let dex_quote = if let Some(cache) = cache.as_mut() {
+            let pool_cache = cache
+                .pools
+                .get_mut(pool_index)
+                .context("baseline quote cache index is invalid")?;
+            pool_cache.quote(direction, baseline_token_b, cache.usage, || {
+                quote_dex(prepared_pools, direction, pool_index, baseline_token_b)
+            })?
+        } else {
+            quote_dex(prepared_pools, direction, pool_index, baseline_token_b)?
+        };
+        let Some(baseline) = evaluate_trade_with_dex_quote(
+            pair,
+            direction,
+            pool_index,
+            baseline_token_b,
+            baseline_cex_token_a,
+            dex_quote,
+        )?
+        else {
+            continue;
+        };
+        if best_baseline
+            .as_ref()
+            .is_none_or(|best| trade_is_better(direction, &baseline, best))
+        {
+            best_baseline = Some(baseline);
+        }
+        if !baseline.meets_threshold {
+            continue;
+        }
 
-            let capacity = size_pool(
-                pair,
-                prepared_pools,
-                quote,
-                direction,
-                pool_index,
-                baseline,
-                cex_top_token_b_amount,
-            )?;
-            if best_capacity.as_ref().is_none_or(|best| {
-                capacity.trade.absolute_profit_token_a() > best.trade.absolute_profit_token_a()
-            }) {
-                best_capacity = Some(capacity);
-            }
+        let capacity = size_pool(
+            pair,
+            prepared_pools,
+            quote,
+            direction,
+            pool_index,
+            baseline,
+            cex_top_token_b_amount,
+        )?;
+        if best_capacity.as_ref().is_none_or(|best| {
+            capacity.trade.absolute_profit_token_a() > best.trade.absolute_profit_token_a()
+        }) {
+            best_capacity = Some(capacity);
         }
     }
 
@@ -774,6 +848,22 @@ fn quote_dex(
     }
 }
 
+fn quote_token_a_exact_input_baseline(
+    prepared_pools: &[Option<PreparedPoolQuotes>],
+    pool_index: usize,
+    token_a_amount: U256,
+) -> anyhow::Result<Option<U256>> {
+    let prepared = prepared_pools
+        .get(pool_index)
+        .and_then(Option::as_ref)
+        .context("prepared DEX pool is unavailable")?;
+    match prepared.token_a_exact_input.quote(token_a_amount) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn evaluate_trade_with_dex_quote(
     pair: &PairRuntime,
     direction: ArbitrageDirection,
@@ -786,16 +876,48 @@ fn evaluate_trade_with_dex_quote(
         return Ok(None);
     };
 
-    let (cex_token_a_amount, cost_token_a, proceeds_token_a) = match direction {
+    // Rails derives the per-order slippage budget from the gross venue spread,
+    // before commissions and execution reserves. Preserve that input exactly,
+    // then apply the account-specific Binance fee and the DEX reserve to the
+    // executable economics below.
+    let (gross_cost_token_a, gross_proceeds_token_a) = match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => (dex_token_a_amount, cex_token_a_amount),
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => (cex_token_a_amount, dex_token_a_amount),
+    };
+    let gross_profit_bps_x100 = signed_profit_bps_x100(gross_proceeds_token_a, gross_cost_token_a)?;
+    let gross_profit_bps =
+        u16::try_from((gross_profit_bps_x100.max(0) / 100).min(i64::from(u16::MAX)))
+            .context("gross opportunity profit bps exceed u16")?;
+    let execution_slippage_bps = slippage_bps(pair, gross_profit_bps)?;
+
+    let (cex_adjusted_cost_token_a, cex_adjusted_proceeds_token_a) = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-            let reserved_cost = add_bps_ceil(dex_token_a_amount, pair.dex_fee_reserve_bps)?;
-            (cex_token_a_amount, reserved_cost, cex_token_a_amount)
+            let net_cex_proceeds =
+                subtract_bps_floor(cex_token_a_amount, pair.binance_sell_fee_bps)?;
+            (dex_token_a_amount, net_cex_proceeds)
         }
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            let reserved_proceeds =
-                subtract_bps_floor(dex_token_a_amount, pair.dex_fee_reserve_bps)?;
-            (cex_token_a_amount, cex_token_a_amount, reserved_proceeds)
+            let gross_cex_cost = add_bps_ceil(cex_token_a_amount, pair.binance_buy_fee_bps)?;
+            (gross_cex_cost, dex_token_a_amount)
         }
+    };
+    let total_dex_reserve_bps = pair
+        .dex_fee_reserve_bps
+        .checked_add(execution_slippage_bps)
+        .context("DEX execution reserve bps overflow")?;
+    ensure!(
+        total_dex_reserve_bps <= 10_000,
+        "DEX execution reserve exceeds 100%"
+    );
+    let (cost_token_a, proceeds_token_a) = match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
+            add_bps_ceil(dex_token_a_amount, total_dex_reserve_bps)?,
+            cex_adjusted_proceeds_token_a,
+        ),
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
+            cex_adjusted_cost_token_a,
+            subtract_bps_floor(dex_token_a_amount, total_dex_reserve_bps)?,
+        ),
     };
 
     Ok(Some(TradeEvaluation {
@@ -805,6 +927,7 @@ fn evaluate_trade_with_dex_quote(
         cex_token_a_amount,
         cost_token_a,
         proceeds_token_a,
+        execution_slippage_bps,
         profit_bps_x100: 0,
         meets_threshold: meets_threshold(
             proceeds_token_a,
@@ -812,6 +935,19 @@ fn evaluate_trade_with_dex_quote(
             pair.opportunity_threshold_bps,
         )?,
     }))
+}
+
+fn slippage_bps(pair: &PairRuntime, profit_bps: u16) -> anyhow::Result<u16> {
+    let allocated = u32::from(profit_bps)
+        .checked_mul(u32::from(pair.slippage_profit_share_bps))
+        .context("slippage profit-share multiplication overflow")?
+        / 10_000;
+    let allocated: u16 = allocated
+        .try_into()
+        .context("allocated slippage exceeds u16")?;
+    Ok(allocated
+        .max(pair.min_slippage_bps)
+        .min(pair.max_slippage_bps))
 }
 
 fn trade_is_better(
@@ -1122,8 +1258,8 @@ mod tests {
         ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
         CapacityLimiter, DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache,
         TradeEvaluation, add_bps_ceil, decimal_to_base_units, evaluate_direction,
-        format_base_units, meets_threshold, signed_profit_bps_x100, subtract_bps_floor,
-        token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
+        evaluate_trade_with_dex_quote, format_base_units, meets_threshold, signed_profit_bps_x100,
+        subtract_bps_floor, token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
     };
 
     fn hash(number: u64) -> B256 {
@@ -1170,6 +1306,11 @@ mod tests {
             token_b_decimals: 18,
             opportunity_threshold_bps: 20,
             dex_fee_reserve_bps: 4,
+            min_slippage_bps: 5,
+            max_slippage_bps: 50,
+            slippage_profit_share_bps: 5_000,
+            binance_buy_fee_bps: 0,
+            binance_sell_fee_bps: 0,
             baseline_token_a: U256::from(20_u8) * U256::from(10_u64).pow(U256::from(18_u8)),
             token_b_step: U256::from(10_u64).pow(U256::from(18_u8)),
             token_a,
@@ -1374,6 +1515,73 @@ mod tests {
     }
 
     #[test]
+    fn account_commission_is_applied_conservatively_in_both_directions() {
+        let (mut pair, _) = fixture();
+        pair.binance_sell_fee_bps = 10;
+        let dex_buy = evaluate_trade_with_dex_quote(
+            &pair,
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            0,
+            U256::from(100_u8),
+            U256::from(1_000_u16),
+            DexQuoteOutcome::Available(U256::from(900_u16)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dex_buy.proceeds_token_a, U256::from(999_u16));
+
+        pair.binance_buy_fee_bps = 10;
+        let cex_buy = evaluate_trade_with_dex_quote(
+            &pair,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+            0,
+            U256::from(100_u8),
+            U256::from(1_000_u16),
+            DexQuoteOutcome::Available(U256::from(1_100_u16)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cex_buy.cost_token_a, U256::from(1_001_u16));
+    }
+
+    #[test]
+    fn execution_slippage_matches_rails_gross_profit_share_and_bounds() {
+        let (pair, _) = fixture();
+        for (cex_proceeds, expected_slippage) in [(10_003_u16, 5_u16), (10_030, 15), (10_200, 50)] {
+            let trade = evaluate_trade_with_dex_quote(
+                &pair,
+                ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                0,
+                U256::from(100_u8),
+                U256::from(cex_proceeds),
+                DexQuoteOutcome::Available(U256::from(10_000_u16)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(trade.execution_slippage_bps, expected_slippage);
+        }
+    }
+
+    #[test]
+    fn slippage_is_derived_before_binance_commission_like_rails() {
+        let (mut pair, _) = fixture();
+        pair.binance_sell_fee_bps = 20;
+        let trade = evaluate_trade_with_dex_quote(
+            &pair,
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            0,
+            U256::from(100_u8),
+            U256::from(10_030_u16),
+            DexQuoteOutcome::Available(U256::from(10_000_u16)),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(trade.execution_slippage_bps, 15);
+        assert_eq!(trade.proceeds_token_a, U256::from(10_009_u16));
+    }
+
+    #[test]
     fn sizes_dex_buy_to_the_full_profitable_cex_top() {
         let (pair, dex) = fixture();
         let quote = quote("1.02", "100.9", "1.03", "100");
@@ -1394,6 +1602,30 @@ mod tests {
             U256::from(100_u8) * pair.token_b_step
         );
         assert!(capacity.trade.meets_threshold);
+    }
+
+    #[test]
+    fn dex_buy_baseline_uses_exact_input_dex_quote_like_rails() {
+        let (pair, dex) = fixture();
+        let prepared = super::prepare_pool_quotes(&pair, &dex, 0, 1).unwrap();
+        let quote = quote("2.10", "100", "2.20", "100");
+        let binance_ask_baseline = U256::from(9_u8) * pair.token_b_step;
+
+        let result = super::evaluate_direction_impl(
+            &pair,
+            &[Some(prepared)],
+            &quote,
+            binance_ask_baseline,
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.baseline.unwrap().token_b_amount,
+            U256::from(19_u8) * pair.token_b_step
+        );
     }
 
     #[test]
@@ -1513,6 +1745,7 @@ mod tests {
             cex_token_a_amount: U256::from(100_u8),
             cost_token_a: U256::from(90_u8),
             proceeds_token_a: U256::from(110_u8),
+            execution_slippage_bps: 5,
             profit_bps_x100: 0,
             meets_threshold: true,
         };

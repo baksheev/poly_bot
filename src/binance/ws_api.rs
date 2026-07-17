@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fmt, str::FromStr, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -101,6 +101,18 @@ impl BinanceWsApiClient {
         self.signed_call("order.place", params).await
     }
 
+    pub async fn place_limit_ioc(
+        &mut self,
+        symbol: &str,
+        side: &str,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: &str,
+    ) -> Result<OrderResult, WsApiError> {
+        let params = limit_ioc_params(symbol, side, quantity, price, client_order_id)?;
+        self.signed_call("order.place", params).await
+    }
+
     pub async fn query_order(
         &mut self,
         symbol: &str,
@@ -132,6 +144,13 @@ impl BinanceWsApiClient {
         params.insert("symbol".to_owned(), Value::String(symbol.to_owned()));
         params.insert("limit".to_owned(), Value::from(limit));
         self.signed_call("allOrders", params).await
+    }
+
+    pub async fn open_orders(&mut self, symbol: &str) -> Result<Vec<OrderResult>, WsApiError> {
+        validate_symbol(symbol)?;
+        let mut params = Map::new();
+        params.insert("symbol".to_owned(), Value::String(symbol.to_owned()));
+        self.signed_call("openOrders.status", params).await
     }
 
     pub fn clock_offset_ms(&self) -> i64 {
@@ -234,7 +253,7 @@ impl BinanceWsApiClient {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResult {
     pub symbol: String,
@@ -322,7 +341,7 @@ impl OrderResult {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderFill {
     #[serde(deserialize_with = "deserialize_decimal")]
@@ -388,7 +407,7 @@ struct ServerTime {
     server_time: u64,
 }
 
-fn market_buy_params(
+pub(crate) fn market_buy_params(
     symbol: &str,
     quote_order_qty: Decimal,
     client_order_id: &str,
@@ -409,7 +428,7 @@ fn market_buy_params(
     Ok(params)
 }
 
-fn market_sell_params(
+pub(crate) fn market_sell_params(
     symbol: &str,
     quantity: Decimal,
     client_order_id: &str,
@@ -426,6 +445,39 @@ fn market_sell_params(
     params.insert(
         "quantity".to_owned(),
         Value::String(quantity.normalize().to_string()),
+    );
+    Ok(params)
+}
+
+pub(crate) fn limit_ioc_params(
+    symbol: &str,
+    side: &str,
+    quantity: Decimal,
+    price: Decimal,
+    client_order_id: &str,
+) -> Result<Map<String, Value>, WsApiError> {
+    validate_symbol(symbol)?;
+    validate_client_order_id(client_order_id)?;
+    if !matches!(side, "BUY" | "SELL") {
+        return Err(WsApiError::Protocol(
+            "limit order side must be BUY or SELL".to_owned(),
+        ));
+    }
+    if quantity <= Decimal::ZERO || price <= Decimal::ZERO {
+        return Err(WsApiError::Protocol(
+            "limit order quantity and price must be positive".to_owned(),
+        ));
+    }
+    let mut params = common_order_params(symbol, side, client_order_id);
+    params.insert("type".to_owned(), Value::String("LIMIT".to_owned()));
+    params.insert("timeInForce".to_owned(), Value::String("IOC".to_owned()));
+    params.insert(
+        "quantity".to_owned(),
+        Value::String(quantity.normalize().to_string()),
+    );
+    params.insert(
+        "price".to_owned(),
+        Value::String(price.normalize().to_string()),
     );
     Ok(params)
 }
@@ -470,7 +522,7 @@ fn signature_payload(params: &Map<String, Value>) -> Result<String, WsApiError> 
         .join("&"))
 }
 
-fn validate_symbol(value: &str) -> Result<(), WsApiError> {
+pub(crate) fn validate_symbol(value: &str) -> Result<(), WsApiError> {
     if value.is_empty()
         || !value
             .bytes()
@@ -496,7 +548,7 @@ fn validate_asset(value: &str) -> Result<(), WsApiError> {
     Ok(())
 }
 
-fn validate_client_order_id(value: &str) -> Result<(), WsApiError> {
+pub(crate) fn validate_client_order_id(value: &str) -> Result<(), WsApiError> {
     if value.is_empty()
         || value.len() > 36
         || !value.bytes().all(|byte| {
@@ -547,7 +599,9 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::{Map, Value};
 
-    use super::{OrderResult, market_buy_params, market_sell_params, signature_payload};
+    use super::{
+        OrderResult, limit_ioc_params, market_buy_params, market_sell_params, signature_payload,
+    };
 
     fn order(side: &str, executed: &str, quote: &str, fills: serde_json::Value) -> OrderResult {
         serde_json::from_value(serde_json::json!({
@@ -576,6 +630,19 @@ mod tests {
             "commissionAsset": asset,
             "tradeId": trade_id,
         })
+    }
+
+    #[test]
+    fn full_order_result_round_trips_through_the_durable_journal_shape() {
+        let order = order(
+            "BUY",
+            "1.23456789",
+            "2.34567891",
+            serde_json::json!([fill("0.0001", "WLD", 7)]),
+        );
+        let encoded = serde_json::to_vec(&order).unwrap();
+        let decoded: OrderResult = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, order);
     }
 
     #[test]
@@ -608,6 +675,24 @@ mod tests {
         assert_eq!(params["quantity"], "24.5");
         assert_eq!(params["newOrderRespType"], "FULL");
         assert_eq!(params["type"], "MARKET");
+    }
+
+    #[test]
+    fn limit_order_matches_rails_ioc_shape() {
+        let params = limit_ioc_params(
+            "WLDUSDC",
+            "BUY",
+            Decimal::new(261, 1),
+            Decimal::new(382, 3),
+            "rustval123LB",
+        )
+        .unwrap();
+
+        assert_eq!(params["quantity"], "26.1");
+        assert_eq!(params["price"], "0.382");
+        assert_eq!(params["timeInForce"], "IOC");
+        assert_eq!(params["newOrderRespType"], "FULL");
+        assert_eq!(params["type"], "LIMIT");
     }
 
     #[test]

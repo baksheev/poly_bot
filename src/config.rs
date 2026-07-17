@@ -43,6 +43,24 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u16,
     },
+    /// Execute one capped WLDUSDC BUY/SELL validation using LIMIT IOC or MARKET.
+    BinanceOrderRoundTrip {
+        /// Order type to validate: limit or market.
+        #[arg(long)]
+        order_type: String,
+        /// Maximum BUY quote quantity, hard-capped at 10 USDC.
+        #[arg(long, default_value = "10")]
+        quote_usdc: String,
+        /// LIMIT protection from top of book, hard-capped at 50 bps.
+        #[arg(long, default_value_t = 50)]
+        price_deviation_bps: u16,
+        /// Durable, process-locked Binance order journal.
+        #[arg(long, env = "BINANCE_ORDER_JOURNAL_PATH")]
+        journal_path: PathBuf,
+        /// Explicit live-trading acknowledgement.
+        #[arg(long, env = "BINANCE_LIVE_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
     /// Read one Binance withdrawal by its deterministic client id.
     BinanceWithdrawalStatus {
         #[arg(long)]
@@ -68,6 +86,44 @@ pub enum Command {
     WalletAddress,
     /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.
     WalletHydrate,
+    /// Execute one bounded live USDC -> WLD -> USDC validation through Uniswap.
+    UniswapRoundTrip {
+        /// Protocol to validate: v3 or v4.
+        #[arg(long)]
+        protocol: String,
+        /// Exact USDC input in base units; hard-capped at 10,000,000 (10 USDC).
+        #[arg(long, default_value_t = 10_000_000)]
+        amount_usdc_base_units: u64,
+        /// Minimum-output slippage, hard-capped at 50 bps.
+        #[arg(long, default_value_t = 50)]
+        slippage_bps: u16,
+        /// Gas units added after the Rails v3/v4 multiplier.
+        #[arg(long, default_value_t = 0)]
+        additional_gas: u64,
+        /// Receipt timeout for each swap. Unknown outcomes remain journaled.
+        #[arg(long, default_value_t = 15)]
+        confirmation_timeout_seconds: u64,
+        /// Explicit live-trading acknowledgement.
+        #[arg(long, env = "UNISWAP_LIVE_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
+    /// Sell a measured WLD delta after a fail-closed canary interruption.
+    UniswapRecoverySell {
+        /// Protocol to use for recovery: v3 or v4.
+        #[arg(long)]
+        protocol: String,
+        /// Exact WLD input in base units. The quote must not exceed 10 USDC.
+        #[arg(long)]
+        amount_wld_base_units: u128,
+        #[arg(long, default_value_t = 50)]
+        slippage_bps: u16,
+        #[arg(long, default_value_t = 0)]
+        additional_gas: u64,
+        #[arg(long, default_value_t = 30)]
+        confirmation_timeout_seconds: u64,
+        #[arg(long, env = "UNISWAP_LIVE_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -115,7 +171,7 @@ pub struct AppConfig {
     #[arg(
         long,
         env = "DOMAIN_CONFIG_PATH",
-        default_value = "config/strategies/usdc-wld-world-chain.v3.json"
+        default_value = "config/strategies/usdc-wld-world-chain.v4.json"
     )]
     pub domain_config_path: PathBuf,
 
@@ -136,6 +192,67 @@ pub struct AppConfig {
 
     #[arg(long, env = "BALANCE_EVENT_CHANNEL_CAPACITY", default_value_t = 16)]
     pub balance_event_channel_capacity: usize,
+
+    #[arg(long, env = "ARBITRAGE_EXECUTION_MODE", default_value = "disabled")]
+    pub arbitrage_execution_mode: String,
+
+    #[arg(long, env = "ARBITRAGE_LIVE_CONFIRMATION", default_value = "")]
+    pub arbitrage_live_confirmation: String,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_TRADE_JOURNAL_PATH",
+        default_value = "/var/lib/arb-bot/arbitrage-trades.jsonl"
+    )]
+    pub arbitrage_trade_journal_path: PathBuf,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_EXECUTION_CHANNEL_CAPACITY",
+        default_value_t = 64
+    )]
+    pub arbitrage_execution_channel_capacity: usize,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_MAX_PLAN_COST_TOKEN_A_BASE_UNITS",
+        default_value_t = 0
+    )]
+    pub arbitrage_max_plan_cost_token_a_base_units: u128,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_MAX_RECOVERY_LOSS_TOKEN_A_BASE_UNITS",
+        default_value_t = 0
+    )]
+    pub arbitrage_max_recovery_loss_token_a_base_units: u128,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_MAX_CUMULATIVE_LOSS_TOKEN_A_BASE_UNITS",
+        default_value_t = 0
+    )]
+    pub arbitrage_max_cumulative_loss_token_a_base_units: u128,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_MAX_CUMULATIVE_RECOVERY_LOSS_TOKEN_A_BASE_UNITS",
+        default_value_t = 0
+    )]
+    pub arbitrage_max_cumulative_recovery_loss_token_a_base_units: u128,
+
+    #[arg(long, env = "ARBITRAGE_MAX_TOTAL_ENTRIES", default_value_t = 0)]
+    pub arbitrage_max_total_entries: usize,
+
+    #[arg(long, env = "ARBITRAGE_MAX_ENTRIES_PER_MINUTE", default_value_t = 0)]
+    pub arbitrage_max_entries_per_minute: usize,
+
+    #[arg(
+        long,
+        env = "ARBITRAGE_ENTRY_STOP_FILE",
+        default_value = "/var/run/arb-bot/arbitrage-entry.stop"
+    )]
+    pub arbitrage_entry_stop_file: PathBuf,
 
     #[arg(long, env = "REBALANCE_EXECUTION_MODE", default_value = "disabled")]
     pub rebalance_execution_mode: String,
@@ -226,6 +343,40 @@ impl AppConfig {
             self.balance_event_channel_capacity > 0,
             "BALANCE_EVENT_CHANNEL_CAPACITY must be greater than zero"
         );
+        ensure!(
+            matches!(
+                self.arbitrage_execution_mode.as_str(),
+                "disabled" | "paper_dex_first" | "paper_concurrent_hedged" | "full_live"
+            ),
+            "ARBITRAGE_EXECUTION_MODE must be disabled, paper_dex_first, paper_concurrent_hedged, or full_live"
+        );
+        ensure!(
+            !self.arbitrage_trade_journal_path.as_os_str().is_empty(),
+            "ARBITRAGE_TRADE_JOURNAL_PATH is empty"
+        );
+        ensure!(
+            self.arbitrage_execution_channel_capacity > 0,
+            "ARBITRAGE_EXECUTION_CHANNEL_CAPACITY must be greater than zero"
+        );
+        ensure!(
+            !self.arbitrage_entry_stop_file.as_os_str().is_empty(),
+            "ARBITRAGE_ENTRY_STOP_FILE is empty"
+        );
+        if self.arbitrage_execution_mode == "full_live" {
+            ensure!(
+                self.arbitrage_live_confirmation == "ENABLE_FULL_LIVE_ARBITRAGE",
+                "full_live arbitrage requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE"
+            );
+            ensure!(
+                self.arbitrage_max_plan_cost_token_a_base_units > 0
+                    && self.arbitrage_max_recovery_loss_token_a_base_units > 0
+                    && self.arbitrage_max_cumulative_loss_token_a_base_units > 0
+                    && self.arbitrage_max_cumulative_recovery_loss_token_a_base_units > 0
+                    && self.arbitrage_max_total_entries > 0
+                    && self.arbitrage_max_entries_per_minute > 0,
+                "full_live arbitrage requires every risk limit to be positive"
+            );
+        }
         ensure!(
             matches!(
                 self.rebalance_execution_mode.as_str(),
@@ -413,13 +564,24 @@ mod tests {
             binance_rest_base_url: "https://api.binance.com".into(),
             binance_ws_api_url: "wss://ws-api.binance.com:443/ws-api/v3".into(),
             across_api_base_url: "https://app.across.to/api".into(),
-            domain_config_path: "config/strategies/usdc-wld-world-chain.v3.json".into(),
+            domain_config_path: "config/strategies/usdc-wld-world-chain.v4.json".into(),
             market_data_max_age_ms: 5_000,
             dex_event_channel_capacity: 8192,
             dex_head_max_age_ms: 10_000,
             balance_sync_interval_ms: 1_000,
             balance_max_age_ms: 5_000,
             balance_event_channel_capacity: 16,
+            arbitrage_execution_mode: "disabled".into(),
+            arbitrage_live_confirmation: String::new(),
+            arbitrage_trade_journal_path: "/tmp/arbitrage-trades.jsonl".into(),
+            arbitrage_execution_channel_capacity: 64,
+            arbitrage_max_plan_cost_token_a_base_units: 0,
+            arbitrage_max_recovery_loss_token_a_base_units: 0,
+            arbitrage_max_cumulative_loss_token_a_base_units: 0,
+            arbitrage_max_cumulative_recovery_loss_token_a_base_units: 0,
+            arbitrage_max_total_entries: 0,
+            arbitrage_max_entries_per_minute: 0,
+            arbitrage_entry_stop_file: "/tmp/arbitrage-entry.stop".into(),
             rebalance_execution_mode: "disabled".into(),
             rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),
             rebalance_executor_timeout_seconds: 1_800,
@@ -460,6 +622,22 @@ mod tests {
         let mut value = config();
         value.rebalance_execution_mode = "direct_wld_canary".into();
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn live_arbitrage_requires_confirmation_and_positive_risk_limits() {
+        let mut value = config();
+        value.arbitrage_execution_mode = "full_live".into();
+        assert!(value.validate().is_err());
+
+        value.arbitrage_live_confirmation = "ENABLE_FULL_LIVE_ARBITRAGE".into();
+        value.arbitrage_max_plan_cost_token_a_base_units = 20_000_000;
+        value.arbitrage_max_recovery_loss_token_a_base_units = 1_000_000;
+        value.arbitrage_max_cumulative_loss_token_a_base_units = 10_000_000;
+        value.arbitrage_max_cumulative_recovery_loss_token_a_base_units = 5_000_000;
+        value.arbitrage_max_total_entries = 1;
+        value.arbitrage_max_entries_per_minute = 1;
+        value.validate().unwrap();
     }
 
     #[test]

@@ -94,14 +94,15 @@ decision is accepted.
 ## Opportunity and capacity model
 
 For each accepted Binance update, the single state owner evaluates every
-hydrated pool in both directions using a common token-B amount:
+hydrated pool in both directions using Rails' direction-specific 20 USDC
+baseline:
 
-1. Derive the baseline token-B quantity from the configured 20 USDC notional
-   and current Binance ask, then round down to the Binance step size.
-2. DEX buy / CEX sell: exact-output quote that token-B amount on the DEX and
-   compare the reserved token-A cost with Binance bid proceeds.
-3. CEX buy / DEX sell: price the same token-B amount at Binance ask and compare
-   it with the reserved exact-input DEX proceeds.
+1. DEX buy / CEX sell: exact-input quote 20 USDC on each DEX pool, round the
+   resulting WLD down to the Binance step, then exact-output quote that rounded
+   WLD amount and compare its reserved DEX cost with Binance bid proceeds.
+2. CEX buy / DEX sell: derive WLD from 20 USDC at the current Binance ask,
+   round it down to the Binance step, and compare the Binance cost with the
+   reserved exact-input DEX proceeds.
 4. If the baseline clears 20 bps, binary-search whole Binance steps over an
    immutable prepared swap curve until the next step fails the profit
    threshold, exceeds hydrated DEX liquidity, or reaches the observed Binance
@@ -115,8 +116,9 @@ The repeated baseline DEX quote is held in a fixed ring of eight entries per
 price oscillations reuse recent step-aligned amounts without unbounded growth.
 Both successful quotes and insufficient-liquidity results are cached.
 
-Each pool also has two immutable prepared curves: exact-output for DEX buy and
-exact-input for DEX sell. Curve construction performs the exact Uniswap
+Each pool has three immutable prepared curves: token-A exact-input for the
+DEX-buy baseline, token-B exact-output for the rounded DEX buy, and token-B
+exact-input for the DEX sell. Curve construction performs the exact Uniswap
 word-boundary traversal once and stores contiguous cumulative segments with
 the original rounding. A quote then performs a binary search and at most one
 `compute_swap_step`; an amount above the directional capacity fails in constant
@@ -131,9 +133,12 @@ generation is published; superseded builds are discarded. Once published, the
 last Binance Spot book is evaluated immediately instead of waiting for another
 exchange tick.
 
-Uniswap LP fees are already included by the CLMM swap math. The configured
-four-basis-point DEX reserve is then applied conservatively: costs round up and
-proceeds round down. All amount, threshold, and sizing math is checked integer
+Uniswap LP fees are already included by the CLMM swap math. As in Rails, half
+of the gross venue-spread basis points is allocated to execution slippage and
+clamped to the configured 5–50 bps range. The configured four-basis-point DEX
+fee reserve is added to that budget. Combined DEX costs round up and proceeds
+round down; account-specific Binance commission is also charged before the
+threshold decision. All amount, threshold, and sizing math is checked integer
 math; `f64` is not used.
 
 The service writes one `arbitrage_evaluation` for every calculation and a
@@ -143,15 +148,26 @@ hundredths-of-basis-point edge, capacity, limiter, calculation latency, and
 end-to-end decision latency. `baseline_quote_cache_hits` and
 `baseline_quote_cache_misses` make every recomputation visible in telemetry.
 Raw Binance and evaluation payloads are formatted on a separate bounded task.
+
+Paper admission then applies execution-only bounds outside the quote
+calculation: the entire token-B hedge must be fillable from sequence-consistent
+Binance depth, and the worst consumed price becomes a persisted recovery IOC
+limit. Depth impact and a maximum DEX gas charge are deducted before admission.
+The gas bound uses the executor's five-million-unit ceiling, the background
+World Chain gas-price snapshot, the Rails priority fee, and the fresh ETHUSDT
+ask. Fully burdened economics must still clear 20 bps, and the signer rejects a
+fee above the admitted cap.
 The decision path only transfers typed in-memory records, and captures decision
 latency before JSON construction or ClickHouse channel work.
 
 The capacity is deliberately named `market_liquidity_capacity`, not executable
-size. Both market data and eventual execution use Binance Spot, but bookTicker
-contains only the best price level. Deeper Spot depth and fees, gas,
-wallet/Binance inventory, concurrency reservations, and risk caps are not
-applied yet. Those must become hard minimum constraints before paper or live
-execution.
+size. Both market data and eventual execution use Binance Spot, and hydrated
+account commission is applied conservatively to the Binance leg. However,
+bookTicker contains only the best price level. A REST-bootstrapped,
+sequence-consistent Spot depth book now verifies that level before an
+opportunity can be admitted, but full-depth recovery cost, gas, executable
+inventory after reservations, and risk caps are not applied to sizing yet.
+Those must become hard minimum constraints before live execution.
 
 ## Gaps and reorgs
 

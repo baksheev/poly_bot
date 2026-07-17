@@ -5,9 +5,13 @@ use hmac::{Hmac, Mac};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::Sha256;
 
-use crate::config::AppConfig;
+use crate::{
+    binance::depth::{DepthSnapshot, parse_depth_snapshot},
+    config::AppConfig,
+};
 
 const API_KEY_HEADER: &str = "X-MBX-APIKEY";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -121,17 +125,26 @@ impl BinanceAccountClient {
 
     pub async fn hydrate(&mut self, symbol: &str) -> anyhow::Result<BinanceAccountState> {
         self.synchronize_clock().await?;
-        let account = self.account_information().await?;
-        let commission = self.commission_rates(symbol).await?;
+        let (account, commission, exchange_information, open_orders, order_rate_limits) = tokio::try_join!(
+            self.account_information(),
+            self.commission_rates(symbol),
+            self.exchange_information(symbol),
+            self.open_orders(symbol),
+            self.order_rate_limits(),
+        )?;
         ensure!(
             commission.symbol == symbol,
             "Binance commission response returned symbol {}, expected {symbol}",
             commission.symbol
         );
+        let symbol_rules = exchange_information.symbol_rules(symbol)?;
         Ok(BinanceAccountState {
             clock_offset_ms: self.clock_offset_ms,
             account,
             commission,
+            symbol_rules,
+            open_orders,
+            order_rate_limits,
         })
     }
 
@@ -184,6 +197,58 @@ impl BinanceAccountClient {
         let query = self.signed_query(&[("symbol", symbol.to_owned())])?;
         self.signed_get("/api/v3/account/commission", &query, "account commission")
             .await
+    }
+
+    pub async fn exchange_information(&self, symbol: &str) -> anyhow::Result<ExchangeInformation> {
+        validate_symbol(symbol)?;
+        let response = self
+            .http
+            .get(format!("{}/api/v3/exchangeInfo", self.base_url))
+            .query(&[("symbol", symbol)])
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Binance exchange information request failed: {}",
+                    error.without_url()
+                )
+            })?;
+        decode_response(response, "exchange information").await
+    }
+
+    pub async fn open_orders(&self, symbol: &str) -> anyhow::Result<Vec<OpenOrder>> {
+        validate_symbol(symbol)?;
+        let query = self.signed_query(&[("symbol", symbol.to_owned())])?;
+        self.signed_get("/api/v3/openOrders", &query, "open orders")
+            .await
+    }
+
+    pub async fn order_rate_limits(&self) -> anyhow::Result<Vec<OrderRateLimit>> {
+        let query = self.signed_query(&[])?;
+        self.signed_get("/api/v3/rateLimit/order", &query, "order rate limits")
+            .await
+    }
+
+    pub async fn depth_snapshot(&self, symbol: &str, limit: u16) -> anyhow::Result<DepthSnapshot> {
+        validate_symbol(symbol)?;
+        ensure!(
+            [5_u16, 10, 20, 50, 100, 500, 1_000, 5_000].contains(&limit),
+            "unsupported Binance depth snapshot limit {limit}"
+        );
+        let response = self
+            .http
+            .get(format!("{}/api/v3/depth", self.base_url))
+            .query(&[("symbol", symbol.to_owned()), ("limit", limit.to_string())])
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Binance depth snapshot request failed: {}",
+                    error.without_url()
+                )
+            })?;
+        let body = decode_response_body(response, "depth snapshot").await?;
+        parse_depth_snapshot(&body)
     }
 
     pub(super) async fn signed_get<T>(
@@ -293,6 +358,178 @@ pub struct BinanceAccountState {
     pub clock_offset_ms: i64,
     pub account: AccountInformation,
     pub commission: CommissionRates,
+    pub symbol_rules: SymbolRules,
+    pub open_orders: Vec<OpenOrder>,
+    pub order_rate_limits: Vec<OrderRateLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SymbolRules {
+    pub symbol: String,
+    pub status: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+    pub price: DecimalFilter,
+    pub lot_size: DecimalFilter,
+    pub market_lot_size: DecimalFilter,
+    pub min_notional: Decimal,
+    pub max_num_orders: u32,
+    pub max_num_algo_orders: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecimalFilter {
+    pub min: Decimal,
+    pub max: Decimal,
+    pub step: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeInformation {
+    pub symbols: Vec<ExchangeSymbol>,
+}
+
+impl ExchangeInformation {
+    pub fn symbol_rules(&self, expected_symbol: &str) -> anyhow::Result<SymbolRules> {
+        let mut matches = self
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.symbol == expected_symbol);
+        let symbol = matches
+            .next()
+            .with_context(|| format!("Binance exchangeInfo omitted {expected_symbol}"))?;
+        ensure!(
+            matches.next().is_none(),
+            "Binance exchangeInfo duplicated {expected_symbol}"
+        );
+        symbol.compile_rules()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeSymbol {
+    pub symbol: String,
+    pub status: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+    #[serde(default)]
+    pub order_types: Vec<String>,
+    #[serde(default)]
+    pub is_spot_trading_allowed: bool,
+    pub filters: Vec<Value>,
+}
+
+impl ExchangeSymbol {
+    fn compile_rules(&self) -> anyhow::Result<SymbolRules> {
+        ensure!(self.status == "TRADING", "{} is not TRADING", self.symbol);
+        ensure!(
+            self.is_spot_trading_allowed,
+            "{} does not allow Spot trading",
+            self.symbol
+        );
+        for required in ["LIMIT", "MARKET"] {
+            ensure!(
+                self.order_types
+                    .iter()
+                    .any(|order_type| order_type == required),
+                "{} does not allow {required} orders",
+                self.symbol
+            );
+        }
+        let price = decimal_filter(
+            self.filter("PRICE_FILTER")?,
+            "minPrice",
+            "maxPrice",
+            "tickSize",
+        )?;
+        let lot_size = decimal_filter(self.filter("LOT_SIZE")?, "minQty", "maxQty", "stepSize")?;
+        let market_lot_size = decimal_filter(
+            self.filter("MARKET_LOT_SIZE")?,
+            "minQty",
+            "maxQty",
+            "stepSize",
+        )?;
+        let min_notional_filter = self
+            .filters
+            .iter()
+            .find(|filter| filter.get("filterType").and_then(Value::as_str) == Some("NOTIONAL"))
+            .or_else(|| {
+                self.filters.iter().find(|filter| {
+                    filter.get("filterType").and_then(Value::as_str) == Some("MIN_NOTIONAL")
+                })
+            })
+            .context("Binance exchangeInfo omitted NOTIONAL/MIN_NOTIONAL")?;
+        let min_notional = decimal_field(min_notional_filter, "minNotional")?;
+        let max_num_orders = integer_filter(self.filter("MAX_NUM_ORDERS")?, "maxNumOrders")?;
+        let max_num_algo_orders =
+            integer_filter(self.filter("MAX_NUM_ALGO_ORDERS")?, "maxNumAlgoOrders")?;
+        ensure!(
+            price.step > Decimal::ZERO,
+            "Binance tick size must be positive"
+        );
+        ensure!(
+            lot_size.step > Decimal::ZERO,
+            "Binance lot step must be positive"
+        );
+        ensure!(
+            market_lot_size.step >= Decimal::ZERO,
+            "Binance market lot step must not be negative"
+        );
+        ensure!(
+            min_notional >= Decimal::ZERO,
+            "Binance min notional is negative"
+        );
+        Ok(SymbolRules {
+            symbol: self.symbol.clone(),
+            status: self.status.clone(),
+            base_asset: self.base_asset.clone(),
+            quote_asset: self.quote_asset.clone(),
+            price,
+            lot_size,
+            market_lot_size,
+            min_notional,
+            max_num_orders,
+            max_num_algo_orders,
+        })
+    }
+
+    fn filter(&self, filter_type: &str) -> anyhow::Result<&Value> {
+        self.filters
+            .iter()
+            .find(|filter| filter.get("filterType").and_then(Value::as_str) == Some(filter_type))
+            .with_context(|| format!("Binance exchangeInfo omitted {filter_type}"))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenOrder {
+    pub symbol: String,
+    pub order_id: u64,
+    pub client_order_id: String,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub orig_qty: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub executed_qty: Decimal,
+    pub status: String,
+    pub time_in_force: String,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub side: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderRateLimit {
+    pub rate_limit_type: String,
+    pub interval: String,
+    pub interval_num: u32,
+    pub limit: u32,
+    pub count: u32,
 }
 
 impl BinanceAccountState {
@@ -358,6 +595,37 @@ pub struct CommissionRates {
     pub discount: CommissionDiscount,
 }
 
+impl CommissionRates {
+    pub fn conservative_taker_fee_bps(&self, side: &str) -> anyhow::Result<u16> {
+        let side_fee = |rates: &CommissionSideRates| match side {
+            "BUY" => Ok(rates.buyer),
+            "SELL" => Ok(rates.seller),
+            _ => bail!("Binance commission side must be BUY or SELL"),
+        };
+        let rate = self.standard_commission.taker
+            + side_fee(&self.standard_commission)?
+            + self.special_commission.taker
+            + side_fee(&self.special_commission)?
+            + self.tax_commission.taker
+            + side_fee(&self.tax_commission)?;
+        ensure!(rate >= Decimal::ZERO, "Binance commission rate is negative");
+        let mantissa =
+            u128::try_from(rate.mantissa()).context("Binance commission mantissa is negative")?;
+        let numerator = mantissa
+            .checked_mul(10_000)
+            .context("Binance commission bps numerator overflow")?;
+        let denominator = 10_u128
+            .checked_pow(rate.scale())
+            .context("Binance commission decimal scale overflow")?;
+        let bps = numerator
+            .checked_add(denominator.saturating_sub(1))
+            .context("Binance commission rounding overflow")?
+            / denominator;
+        ensure!(bps <= 10_000, "Binance commission exceeds 100%");
+        bps.try_into().context("Binance commission bps exceed u16")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CommissionSideRates {
     #[serde(deserialize_with = "deserialize_decimal")]
@@ -396,6 +664,15 @@ async fn decode_response<T>(response: reqwest::Response, operation: &str) -> any
 where
     T: for<'de> Deserialize<'de>,
 {
+    let body = decode_response_body(response, operation).await?;
+    serde_json::from_slice(&body)
+        .with_context(|| format!("invalid Binance {operation} response JSON"))
+}
+
+async fn decode_response_body(
+    response: reqwest::Response,
+    operation: &str,
+) -> anyhow::Result<Vec<u8>> {
     let status = response.status();
     let body = response
         .bytes()
@@ -411,8 +688,7 @@ where
         }
         bail!("Binance {operation} failed with HTTP {status}");
     }
-    serde_json::from_slice(&body)
-        .with_context(|| format!("invalid Binance {operation} response JSON"))
+    Ok(body.to_vec())
 }
 
 fn deserialize_balances<'de, D>(deserializer: D) -> Result<Vec<AssetBalance>, D::Error>
@@ -438,6 +714,47 @@ where
 {
     let value = String::deserialize(deserializer)?;
     Decimal::from_str(&value).map_err(serde::de::Error::custom)
+}
+
+fn validate_symbol(symbol: &str) -> anyhow::Result<()> {
+    ensure!(
+        !symbol.is_empty()
+            && symbol
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+        "Binance symbol must contain only uppercase ASCII letters and digits"
+    );
+    Ok(())
+}
+
+fn decimal_filter(
+    filter: &Value,
+    min_field: &str,
+    max_field: &str,
+    step_field: &str,
+) -> anyhow::Result<DecimalFilter> {
+    Ok(DecimalFilter {
+        min: decimal_field(filter, min_field)?,
+        max: decimal_field(filter, max_field)?,
+        step: decimal_field(filter, step_field)?,
+    })
+}
+
+fn decimal_field(value: &Value, field: &str) -> anyhow::Result<Decimal> {
+    let raw = value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("Binance exchangeInfo filter omitted {field}"))?;
+    Decimal::from_str(raw).with_context(|| format!("invalid Binance {field}"))
+}
+
+fn integer_filter(value: &Value, field: &str) -> anyhow::Result<u32> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("Binance exchangeInfo filter omitted {field}"))?
+        .try_into()
+        .with_context(|| format!("Binance {field} exceeds u32"))
 }
 
 fn sign_hex(secret: &str, payload: &str) -> anyhow::Result<String> {
@@ -482,7 +799,7 @@ mod tests {
 
     use super::{
         ApiKeyPermissions, BinanceAccountClient, BinanceCredentials, CommissionRates,
-        apply_clock_offset, sign_hex,
+        ExchangeInformation, apply_clock_offset, sign_hex,
     };
 
     #[test]
@@ -517,6 +834,41 @@ mod tests {
         .unwrap();
         assert_eq!(commission.standard_commission.taker, Decimal::new(2, 3));
         assert_eq!(commission.discount.discount, Decimal::new(75, 2));
+        assert_eq!(commission.conservative_taker_fee_bps("BUY").unwrap(), 20);
+        assert_eq!(commission.conservative_taker_fee_bps("SELL").unwrap(), 20);
+    }
+
+    #[test]
+    fn compiles_required_spot_filters_without_floating_point() {
+        let information: ExchangeInformation = serde_json::from_str(
+            r#"{
+              "symbols":[{
+                "symbol":"WLDUSDC",
+                "status":"TRADING",
+                "baseAsset":"WLD",
+                "quoteAsset":"USDC",
+                "orderTypes":["LIMIT","MARKET"],
+                "isSpotTradingAllowed":true,
+                "filters":[
+                  {"filterType":"PRICE_FILTER","minPrice":"0.00010000","maxPrice":"1000.00000000","tickSize":"0.00010000"},
+                  {"filterType":"LOT_SIZE","minQty":"0.10000000","maxQty":"100000.00000000","stepSize":"0.10000000"},
+                  {"filterType":"MARKET_LOT_SIZE","minQty":"0.00000000","maxQty":"120000.00000000","stepSize":"0.00000000"},
+                  {"filterType":"NOTIONAL","minNotional":"5.00000000","applyMinToMarket":true,"maxNotional":"9000000.00000000","applyMaxToMarket":false},
+                  {"filterType":"MAX_NUM_ORDERS","maxNumOrders":200},
+                  {"filterType":"MAX_NUM_ALGO_ORDERS","maxNumAlgoOrders":5}
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let rules = information.symbol_rules("WLDUSDC").unwrap();
+        assert_eq!(rules.price.step, Decimal::new(1, 4));
+        assert_eq!(rules.lot_size.step, Decimal::new(1, 1));
+        assert_eq!(rules.market_lot_size.step, Decimal::ZERO);
+        assert_eq!(rules.min_notional, Decimal::new(5, 0));
+        assert_eq!(rules.max_num_orders, 200);
+        assert_eq!(rules.max_num_algo_orders, 5);
     }
 
     #[test]

@@ -394,6 +394,7 @@ mod tests {
                 block_number: 1,
                 block_hash: B256::ZERO,
                 native_balance_wei: U256::ONE,
+                gas_price_wei: 1,
                 token_balances: vec![
                     WalletTokenBalance {
                         symbol: Arc::from("USDC"),
@@ -419,7 +420,7 @@ mod tests {
 
     fn tracker_with_wld_routes(wld_routes: Vec<RouteCandidate>) -> RebalanceTracker {
         let config = LoadedDomainConfig::load(format!(
-            "{}/config/strategies/usdc-wld-world-chain.v3.json",
+            "{}/config/strategies/usdc-wld-world-chain.v4.json",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
