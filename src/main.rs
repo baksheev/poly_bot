@@ -961,16 +961,6 @@ async fn run(
             telemetry.clone(),
             config.engine_id.clone(),
             LiveRiskLimits {
-                maximum_plan_cost_token_a_base_units: config
-                    .arbitrage_max_plan_cost_token_a_base_units,
-                maximum_recovery_loss_token_a_base_units: config
-                    .arbitrage_max_recovery_loss_token_a_base_units,
-                maximum_cumulative_loss_token_a_base_units: config
-                    .arbitrage_max_cumulative_loss_token_a_base_units,
-                maximum_cumulative_recovery_loss_token_a_base_units: config
-                    .arbitrage_max_cumulative_recovery_loss_token_a_base_units,
-                maximum_total_entries: config.arbitrage_max_total_entries,
-                maximum_entries_per_minute: config.arbitrage_max_entries_per_minute,
                 entry_stop_file: config.arbitrage_entry_stop_file.clone(),
             },
         )?;

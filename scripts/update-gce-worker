@@ -43,45 +43,17 @@ set +a
 
 domain_config_path="config/strategies/usdc-wld-world-chain.v4.json"
 live_confirmation=""
-max_plan_cost=0
-max_recovery_loss=0
-max_cumulative_loss=0
-max_cumulative_recovery_loss=0
-max_total_entries=0
-max_entries_per_minute=0
 mode_label="${execution_mode//_/-}"
 
 if [[ "${execution_mode}" == "full_live" ]]; then
   domain_config_path="${ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH:-config/strategies/usdc-wld-world-chain.v5.json}"
   live_confirmation="${ARBITRAGE_LIVE_CONFIRMATION:-}"
-  max_plan_cost="${ARBITRAGE_MAX_PLAN_COST_TOKEN_A_BASE_UNITS:-0}"
-  max_recovery_loss="${ARBITRAGE_MAX_RECOVERY_LOSS_TOKEN_A_BASE_UNITS:-0}"
-  max_cumulative_loss="${ARBITRAGE_MAX_CUMULATIVE_LOSS_TOKEN_A_BASE_UNITS:-0}"
-  max_cumulative_recovery_loss="${ARBITRAGE_MAX_CUMULATIVE_RECOVERY_LOSS_TOKEN_A_BASE_UNITS:-0}"
-  max_total_entries="${ARBITRAGE_MAX_TOTAL_ENTRIES:-0}"
-  max_entries_per_minute="${ARBITRAGE_MAX_ENTRIES_PER_MINUTE:-0}"
   if [[ "${live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then
     echo "full_live requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE" >&2
     exit 1
   fi
   if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v5.json" ]]; then
     echo "full_live requires ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v5.json" >&2
-    exit 1
-  fi
-  for value in \
-    "${max_plan_cost}" \
-    "${max_recovery_loss}" \
-    "${max_cumulative_loss}" \
-    "${max_cumulative_recovery_loss}" \
-    "${max_total_entries}" \
-    "${max_entries_per_minute}"; do
-    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
-      echo "full_live requires every arbitrage risk limit to be a positive integer" >&2
-      exit 1
-    fi
-  done
-  if (( max_total_entries > 100 || max_entries_per_minute > 10 )); then
-    echo "full_live total/rate limits exceed the launch envelope" >&2
     exit 1
   fi
 fi
@@ -129,7 +101,7 @@ if [[ "${execution_mode}" == "full_live" ]]; then
 fi
 "${gcloud_local}" compute instances add-metadata "${instance}" \
   --zone="${zone}" \
-  --metadata="arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=${domain_config_path},arb-bot-arbitrage-execution-mode=${execution_mode},arb-bot-arbitrage-live-confirmation=${live_confirmation},arb-bot-arbitrage-max-plan-cost=${max_plan_cost},arb-bot-arbitrage-max-recovery-loss=${max_recovery_loss},arb-bot-arbitrage-max-cumulative-loss=${max_cumulative_loss},arb-bot-arbitrage-max-cumulative-recovery-loss=${max_cumulative_recovery_loss},arb-bot-arbitrage-max-total-entries=${max_total_entries},arb-bot-arbitrage-max-entries-per-minute=${max_entries_per_minute}" \
+  --metadata="arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=${domain_config_path},arb-bot-arbitrage-execution-mode=${execution_mode},arb-bot-arbitrage-live-confirmation=${live_confirmation}" \
   --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh"
 "${gcloud_local}" compute instances add-labels "${instance}" \
   --zone="${zone}" \

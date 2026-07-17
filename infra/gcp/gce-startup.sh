@@ -34,12 +34,6 @@ wallet_address="$(metadata arb-bot-wallet-address)"
 domain_config_path="$(metadata_or_default arb-bot-domain-config-path config/strategies/usdc-wld-world-chain.v4.json)"
 arbitrage_execution_mode="$(metadata_or_default arb-bot-arbitrage-execution-mode disabled)"
 arbitrage_live_confirmation="$(metadata_or_default arb-bot-arbitrage-live-confirmation '')"
-arbitrage_max_plan_cost="$(metadata_or_default arb-bot-arbitrage-max-plan-cost 0)"
-arbitrage_max_recovery_loss="$(metadata_or_default arb-bot-arbitrage-max-recovery-loss 0)"
-arbitrage_max_cumulative_loss="$(metadata_or_default arb-bot-arbitrage-max-cumulative-loss 0)"
-arbitrage_max_cumulative_recovery_loss="$(metadata_or_default arb-bot-arbitrage-max-cumulative-recovery-loss 0)"
-arbitrage_max_total_entries="$(metadata_or_default arb-bot-arbitrage-max-total-entries 0)"
-arbitrage_max_entries_per_minute="$(metadata_or_default arb-bot-arbitrage-max-entries-per-minute 0)"
 
 if [[ ! "${arbitrage_execution_mode}" =~ ^(disabled|paper_dex_first|paper_concurrent_hedged|full_live)$ ]]; then
   echo "invalid arb-bot-arbitrage-execution-mode metadata" >&2
@@ -49,18 +43,6 @@ if [[ ! "${domain_config_path}" =~ ^config/strategies/[a-z0-9.-]+\.json$ ]]; the
   echo "invalid arb-bot-domain-config-path metadata" >&2
   exit 1
 fi
-for value in \
-  "${arbitrage_max_plan_cost}" \
-  "${arbitrage_max_recovery_loss}" \
-  "${arbitrage_max_cumulative_loss}" \
-  "${arbitrage_max_cumulative_recovery_loss}" \
-  "${arbitrage_max_total_entries}" \
-  "${arbitrage_max_entries_per_minute}"; do
-  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-    echo "invalid numeric arbitrage risk metadata" >&2
-    exit 1
-  fi
-done
 if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
   if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v5.json" ]]; then
     echo "full_live requires the reviewed v5 domain artifact" >&2
@@ -68,17 +50,6 @@ if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
   fi
   if [[ "${arbitrage_live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then
     echo "full_live metadata confirmation is missing" >&2
-    exit 1
-  fi
-  if (( arbitrage_max_plan_cost == 0 \
-    || arbitrage_max_recovery_loss == 0 \
-    || arbitrage_max_cumulative_loss == 0 \
-    || arbitrage_max_cumulative_recovery_loss == 0 \
-    || arbitrage_max_total_entries == 0 \
-    || arbitrage_max_total_entries > 100 \
-    || arbitrage_max_entries_per_minute == 0 \
-    || arbitrage_max_entries_per_minute > 10 )); then
-    echo "full_live arbitrage risk metadata is outside the launch envelope" >&2
     exit 1
   fi
 fi
@@ -137,12 +108,6 @@ umask 077
   printf 'ARBITRAGE_TRADE_JOURNAL_PATH=%s\n' "${arbitrage_trade_journal}"
   printf 'ARBITRAGE_WALLET_JOURNAL_PATH=/var/lib/arb-bot/arbitrage-wallet.jsonl\n'
   printf 'ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH=/var/lib/arb-bot/arbitrage-binance-orders.jsonl\n'
-  printf 'ARBITRAGE_MAX_PLAN_COST_TOKEN_A_BASE_UNITS=%s\n' "${arbitrage_max_plan_cost}"
-  printf 'ARBITRAGE_MAX_RECOVERY_LOSS_TOKEN_A_BASE_UNITS=%s\n' "${arbitrage_max_recovery_loss}"
-  printf 'ARBITRAGE_MAX_CUMULATIVE_LOSS_TOKEN_A_BASE_UNITS=%s\n' "${arbitrage_max_cumulative_loss}"
-  printf 'ARBITRAGE_MAX_CUMULATIVE_RECOVERY_LOSS_TOKEN_A_BASE_UNITS=%s\n' "${arbitrage_max_cumulative_recovery_loss}"
-  printf 'ARBITRAGE_MAX_TOTAL_ENTRIES=%s\n' "${arbitrage_max_total_entries}"
-  printf 'ARBITRAGE_MAX_ENTRIES_PER_MINUTE=%s\n' "${arbitrage_max_entries_per_minute}"
   printf 'ARBITRAGE_ENTRY_STOP_FILE=/var/lib/arb-bot/arbitrage-entry.stop\n'
   printf 'REBALANCE_EXECUTION_MODE=disabled\n'
   printf 'EVM_WALLET_ADDRESS=%s\n' "${wallet_address}"

@@ -1,10 +1,9 @@
 use std::{
-    collections::VecDeque,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::SystemTime,
 };
 
 use anyhow::{Context, ensure};
@@ -303,46 +302,15 @@ pub struct LiveTradeTask<E> {
     engine_id: String,
     event_sender: mpsc::UnboundedSender<PaperTradeEvent>,
     risk_limits: LiveRiskLimits,
-    entry_times: VecDeque<Instant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveRiskLimits {
-    pub maximum_plan_cost_token_a_base_units: u128,
-    pub maximum_recovery_loss_token_a_base_units: u128,
-    pub maximum_cumulative_loss_token_a_base_units: u128,
-    pub maximum_cumulative_recovery_loss_token_a_base_units: u128,
-    pub maximum_total_entries: usize,
-    pub maximum_entries_per_minute: usize,
     pub entry_stop_file: PathBuf,
 }
 
 impl LiveRiskLimits {
     pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.maximum_plan_cost_token_a_base_units > 0,
-            "live maximum plan cost is zero"
-        );
-        ensure!(
-            self.maximum_recovery_loss_token_a_base_units > 0,
-            "live maximum recovery loss is zero"
-        );
-        ensure!(
-            self.maximum_cumulative_loss_token_a_base_units > 0,
-            "live maximum cumulative loss is zero"
-        );
-        ensure!(
-            self.maximum_cumulative_recovery_loss_token_a_base_units > 0,
-            "live maximum cumulative recovery loss is zero"
-        );
-        ensure!(
-            self.maximum_total_entries > 0,
-            "live maximum total entries is zero"
-        );
-        ensure!(
-            self.maximum_entries_per_minute > 0,
-            "live maximum entry rate is zero"
-        );
         ensure!(
             !self.entry_stop_file.as_os_str().is_empty(),
             "live entry-stop path is empty"
@@ -366,8 +334,6 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
     ensure!(capacity > 0, "live trade channel capacity is zero");
     risk_limits.validate()?;
     let coordinator = PaperTradeCoordinator::open(path)?;
-    let entry_times =
-        std::iter::repeat_n(Instant::now(), risk_limits.maximum_entries_per_minute).collect();
     let (handle, receiver, _dropped) = PaperTradeHandle::channel(capacity);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     Ok((
@@ -380,7 +346,6 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
             engine_id,
             event_sender,
             risk_limits,
-            entry_times,
         },
         event_receiver,
     ))
@@ -448,65 +413,13 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             "live intent is incomplete"
         );
         self.coordinator.admit(intent)?;
-        self.entry_times.push_back(Instant::now());
         self.drive(&plan_id).await
     }
 
-    fn authorize_entry(&mut self, opportunity: &PaperOpportunity) -> anyhow::Result<()> {
+    fn authorize_entry(&mut self, _opportunity: &PaperOpportunity) -> anyhow::Result<()> {
         ensure!(
             !self.risk_limits.entry_stop_file.exists(),
             "live entry stop is active"
-        );
-        ensure!(
-            self.coordinator.admitted_operation_count() < self.risk_limits.maximum_total_entries,
-            "live durable total-entry limit is exhausted"
-        );
-        ensure!(
-            opportunity.cost_token_a_base_units > 0
-                && opportunity.cost_token_a_base_units.unsigned_abs()
-                    <= self.risk_limits.maximum_plan_cost_token_a_base_units,
-            "live plan exceeds the maximum token-A cost"
-        );
-        let admission = &opportunity.admission;
-        ensure!(
-            admission.maximum_recovery_loss_token_a_base_units
-                <= self.risk_limits.maximum_recovery_loss_token_a_base_units,
-            "live plan exceeds the maximum recovery loss"
-        );
-        let (cumulative_loss, cumulative_recovery_loss) =
-            self.coordinator.cumulative_terminal_risk()?;
-        let plan_loss_bound = admission
-            .maximum_recovery_loss_token_a_base_units
-            .checked_add(admission.maximum_gas_cost_token_a_base_units)
-            .context("live plan loss bound overflow")?;
-        ensure!(
-            projected_risk_within_limit(
-                cumulative_loss,
-                plan_loss_bound,
-                self.risk_limits.maximum_cumulative_loss_token_a_base_units,
-            ),
-            "live plan would exceed the cumulative loss limit"
-        );
-        ensure!(
-            projected_risk_within_limit(
-                cumulative_recovery_loss,
-                admission.maximum_recovery_loss_token_a_base_units,
-                self.risk_limits
-                    .maximum_cumulative_recovery_loss_token_a_base_units,
-            ),
-            "live plan would exceed the cumulative recovery-loss limit"
-        );
-        let now = Instant::now();
-        while self
-            .entry_times
-            .front()
-            .is_some_and(|entry| now.duration_since(*entry) >= Duration::from_secs(60))
-        {
-            self.entry_times.pop_front();
-        }
-        ensure!(
-            self.entry_times.len() < self.risk_limits.maximum_entries_per_minute,
-            "live entry-rate limit is exhausted"
         );
         Ok(())
     }
@@ -568,12 +481,6 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
     }
 }
 
-fn projected_risk_within_limit(current: u128, additional: u128, limit: u128) -> bool {
-    current
-        .checked_add(additional)
-        .is_some_and(|projected| projected <= limit)
-}
-
 fn failed(role: LegRole, reference: &str) -> (LegRole, LegResult) {
     failed_with_gas(role, 0, reference)
 }
@@ -614,7 +521,7 @@ fn unix_seconds() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs, sync::Mutex};
+    use std::{collections::VecDeque, fs, path::PathBuf, sync::Mutex};
 
     use rust_decimal::Decimal;
 
@@ -627,7 +534,7 @@ mod tests {
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
             LegFuture, LiveLegExecutor, LiveRiskLimits, failed, failed_with_gas,
-            live_trade_channel, projected_risk_within_limit, unknown,
+            live_trade_channel, unknown,
         },
         telemetry::TelemetryHandle,
     };
@@ -705,12 +612,6 @@ mod tests {
 
     fn risk_limits(stop_file: std::path::PathBuf) -> LiveRiskLimits {
         LiveRiskLimits {
-            maximum_plan_cost_token_a_base_units: 2_000,
-            maximum_recovery_loss_token_a_base_units: 20,
-            maximum_cumulative_loss_token_a_base_units: 100,
-            maximum_cumulative_recovery_loss_token_a_base_units: 100,
-            maximum_total_entries: 10,
-            maximum_entries_per_minute: 2,
             entry_stop_file: stop_file,
         }
     }
@@ -734,82 +635,14 @@ mod tests {
     }
 
     #[test]
-    fn live_risk_limits_fail_closed_on_zero_or_missing_controls() {
+    fn live_entry_controls_require_an_entry_stop_path() {
         let valid = LiveRiskLimits {
-            maximum_plan_cost_token_a_base_units: 20_000_000,
-            maximum_recovery_loss_token_a_base_units: 1_000_000,
-            maximum_cumulative_loss_token_a_base_units: 10_000_000,
-            maximum_cumulative_recovery_loss_token_a_base_units: 5_000_000,
-            maximum_total_entries: 100,
-            maximum_entries_per_minute: 3,
             entry_stop_file: "/tmp/arb-bot-entry.stop".into(),
         };
         valid.validate().unwrap();
         let mut invalid = valid;
-        invalid.maximum_entries_per_minute = 0;
+        invalid.entry_stop_file = PathBuf::new();
         assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn projected_risk_must_fit_before_a_new_entry_is_admitted() {
-        assert!(projected_risk_within_limit(90, 10, 100));
-        assert!(!projected_risk_within_limit(91, 10, 100));
-        assert!(!projected_risk_within_limit(u128::MAX, 1, u128::MAX));
-    }
-
-    #[tokio::test]
-    async fn durable_total_entry_limit_survives_restart() {
-        let journal = std::env::temp_dir().join(format!(
-            "poly-bot-live-total-cap-{}-{}.jsonl",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
-        ));
-        let stop_file = journal.with_extension("stop");
-        let _ = fs::remove_file(&journal);
-        let _ = fs::remove_file(&stop_file);
-        let opportunity = opportunity();
-        let mut limits = risk_limits(stop_file.clone());
-        limits.maximum_total_entries = 1;
-        let executor = ScriptedExecutor {
-            results: Mutex::new(VecDeque::from([
-                result(100, -1_000, 5, "dex:total-cap"),
-                result(-100, 1_030, 0, "cex:total-cap"),
-            ])),
-        };
-        let (_handle, mut task, _events) = live_trade_channel(
-            &journal,
-            4,
-            executor,
-            TelemetryHandle::disconnected_test_handle(),
-            "test-engine".to_owned(),
-            limits.clone(),
-        )
-        .unwrap();
-        task.entry_times.clear();
-        task.execute(opportunity.clone()).await.unwrap();
-        drop(task);
-
-        let executor = ScriptedExecutor {
-            results: Mutex::new(VecDeque::new()),
-        };
-        let (_handle, mut task, _events) = live_trade_channel(
-            &journal,
-            4,
-            executor,
-            TelemetryHandle::disconnected_test_handle(),
-            "test-engine".to_owned(),
-            limits,
-        )
-        .unwrap();
-        task.entry_times.clear();
-        assert!(
-            task.authorize_entry(&opportunity)
-                .unwrap_err()
-                .to_string()
-                .contains("durable total-entry limit")
-        );
-        drop(task);
-        fs::remove_file(journal).unwrap();
     }
 
     #[tokio::test]
@@ -840,7 +673,6 @@ mod tests {
             risk_limits(stop_file),
         )
         .unwrap();
-        task.entry_times.clear();
 
         task.execute(opportunity).await.unwrap();
         let operation = task.coordinator.operation(&plan_id).unwrap();
@@ -889,7 +721,6 @@ mod tests {
             risk_limits(stop_file),
         )
         .unwrap();
-        task.entry_times.clear();
 
         task.execute(opportunity).await.unwrap();
         let operation = task.coordinator.operation(&plan_id).unwrap();
@@ -943,7 +774,6 @@ mod tests {
             risk_limits(stop_file),
         )
         .unwrap();
-        task.entry_times.clear();
 
         task.execute(opportunity).await.unwrap();
         let operation = task.coordinator.operation(&plan_id).unwrap();
@@ -988,7 +818,6 @@ mod tests {
             risk_limits(stop_file),
         )
         .unwrap();
-        task.entry_times.clear();
 
         task.execute(opportunity).await.unwrap();
         let operation = task.coordinator.operation(&plan_id).unwrap();

@@ -20,7 +20,8 @@ overlap.
   journals;
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
   active rebalance, and fresh Binance/depth/DEX/balance/gas inputs;
-- exact live confirmation and every risk limit positive.
+- exact live confirmation, v5 domain selection, single-owner deployment, and
+  entry-stop recovery controls.
 
 Run `scripts/quality.sh`, then deploy paper mode first:
 
@@ -61,18 +62,19 @@ parent, order, nonce, transaction, or residual exposure:
 ```
 
 Removing the entry-stop file is a new-entry authorization. Do it only after
-venue and journal reconciliation and a reviewed risk-budget check.
+venue and journal reconciliation.
 
 ## Canary and 100-trade run
 
-For the first composed live canary set the durable total-entry limit to `1` and
-the rate limit to `1`. The total cap counts journaled parent intents and
-survives restart. The GCE startup layer additionally refuses totals above 100
-or rates above 10/minute.
+For the first composed live canary, enable `full_live`, wait for one balanced
+parent result, then immediately activate the entry stop and verify venue
+history, journals, balances, and accounting. The canary must use the same
+strategy parameters as Rails; do not add cost, loss, total-entry, or rate caps
+that Rails does not have.
 
-After the canary is balanced, venue-verified, and economically accounted, raise
-the same live journal's total cap to `100`; this authorizes 99 additional
-entries, not 100 more. Do not replace or clear the journal between phases.
+After the canary is balanced, venue-verified, and economically accounted,
+remove the entry stop and run the same live journal until the watcher observes
+100 balanced results. Do not replace or clear the journal between phases.
 
 The 2026-07-17 Rails reference snapshot for the most recent 100 pair-3
 `profit_token_a` results was:

@@ -215,40 +215,6 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        env = "ARBITRAGE_MAX_PLAN_COST_TOKEN_A_BASE_UNITS",
-        default_value_t = 0
-    )]
-    pub arbitrage_max_plan_cost_token_a_base_units: u128,
-
-    #[arg(
-        long,
-        env = "ARBITRAGE_MAX_RECOVERY_LOSS_TOKEN_A_BASE_UNITS",
-        default_value_t = 0
-    )]
-    pub arbitrage_max_recovery_loss_token_a_base_units: u128,
-
-    #[arg(
-        long,
-        env = "ARBITRAGE_MAX_CUMULATIVE_LOSS_TOKEN_A_BASE_UNITS",
-        default_value_t = 0
-    )]
-    pub arbitrage_max_cumulative_loss_token_a_base_units: u128,
-
-    #[arg(
-        long,
-        env = "ARBITRAGE_MAX_CUMULATIVE_RECOVERY_LOSS_TOKEN_A_BASE_UNITS",
-        default_value_t = 0
-    )]
-    pub arbitrage_max_cumulative_recovery_loss_token_a_base_units: u128,
-
-    #[arg(long, env = "ARBITRAGE_MAX_TOTAL_ENTRIES", default_value_t = 0)]
-    pub arbitrage_max_total_entries: usize,
-
-    #[arg(long, env = "ARBITRAGE_MAX_ENTRIES_PER_MINUTE", default_value_t = 0)]
-    pub arbitrage_max_entries_per_minute: usize,
-
-    #[arg(
-        long,
         env = "ARBITRAGE_ENTRY_STOP_FILE",
         default_value = "/var/run/arb-bot/arbitrage-entry.stop"
     )]
@@ -366,15 +332,6 @@ impl AppConfig {
             ensure!(
                 self.arbitrage_live_confirmation == "ENABLE_FULL_LIVE_ARBITRAGE",
                 "full_live arbitrage requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE"
-            );
-            ensure!(
-                self.arbitrage_max_plan_cost_token_a_base_units > 0
-                    && self.arbitrage_max_recovery_loss_token_a_base_units > 0
-                    && self.arbitrage_max_cumulative_loss_token_a_base_units > 0
-                    && self.arbitrage_max_cumulative_recovery_loss_token_a_base_units > 0
-                    && self.arbitrage_max_total_entries > 0
-                    && self.arbitrage_max_entries_per_minute > 0,
-                "full_live arbitrage requires every risk limit to be positive"
             );
         }
         ensure!(
@@ -575,12 +532,6 @@ mod tests {
             arbitrage_live_confirmation: String::new(),
             arbitrage_trade_journal_path: "/tmp/arbitrage-trades.jsonl".into(),
             arbitrage_execution_channel_capacity: 64,
-            arbitrage_max_plan_cost_token_a_base_units: 0,
-            arbitrage_max_recovery_loss_token_a_base_units: 0,
-            arbitrage_max_cumulative_loss_token_a_base_units: 0,
-            arbitrage_max_cumulative_recovery_loss_token_a_base_units: 0,
-            arbitrage_max_total_entries: 0,
-            arbitrage_max_entries_per_minute: 0,
             arbitrage_entry_stop_file: "/tmp/arbitrage-entry.stop".into(),
             rebalance_execution_mode: "disabled".into(),
             rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),
@@ -625,18 +576,12 @@ mod tests {
     }
 
     #[test]
-    fn live_arbitrage_requires_confirmation_and_positive_risk_limits() {
+    fn live_arbitrage_requires_confirmation() {
         let mut value = config();
         value.arbitrage_execution_mode = "full_live".into();
         assert!(value.validate().is_err());
 
         value.arbitrage_live_confirmation = "ENABLE_FULL_LIVE_ARBITRAGE".into();
-        value.arbitrage_max_plan_cost_token_a_base_units = 20_000_000;
-        value.arbitrage_max_recovery_loss_token_a_base_units = 1_000_000;
-        value.arbitrage_max_cumulative_loss_token_a_base_units = 10_000_000;
-        value.arbitrage_max_cumulative_recovery_loss_token_a_base_units = 5_000_000;
-        value.arbitrage_max_total_entries = 1;
-        value.arbitrage_max_entries_per_minute = 1;
         value.validate().unwrap();
     }
 

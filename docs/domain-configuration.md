@@ -16,8 +16,8 @@ production pair `id=3` at the source timestamp stored in the file and records
 one deliberate Rust-clone divergence: both Binance market data and eventual
 execution use Spot. The v5 artifact contains identical pair/economics with the
 global and pair execution gates enabled. Selecting v5 alone cannot trade:
-runtime `full_live`, exact confirmation, positive risk limits, signer/order
-journals, and startup health checks are independently required. Earlier
+runtime `full_live`, exact confirmation, signer/order journals, single-owner
+deployment, and startup health checks are independently required. Earlier
 artifacts remain provenance for prior shadow stages.
 
 Production Postgres is an export-time source only. The ignored
@@ -64,8 +64,7 @@ Startup rejects:
   data.
 
 The committed v4 default has both execution gates false. The v5 artifact has
-both true and is valid only for the bounded GCE live path; CLI confirmation and
-all live risk limits still default to fail-closed values.
+both true and is valid only for the explicitly confirmed GCE live path.
 
 ## Refreshing the source data
 
