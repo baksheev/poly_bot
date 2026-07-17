@@ -645,7 +645,7 @@ fn evaluate_direction_impl(
         } else {
             quote_dex(prepared_pools, direction, pool_index, baseline_token_b)?
         };
-        let Some(baseline) = evaluate_trade_with_dex_quote(
+        let Some(mut baseline) = evaluate_trade_with_dex_quote(
             pair,
             direction,
             pool_index,
@@ -656,9 +656,10 @@ fn evaluate_direction_impl(
         else {
             continue;
         };
+        finalize_trade_profit(&mut baseline)?;
         if best_baseline
             .as_ref()
-            .is_none_or(|best| trade_is_better(direction, &baseline, best))
+            .is_none_or(|best| trade_is_better(&baseline, best))
         {
             best_baseline = Some(baseline);
         }
@@ -682,9 +683,6 @@ fn evaluate_direction_impl(
         }
     }
 
-    if let Some(best) = best_baseline.as_mut() {
-        finalize_trade_profit(best)?;
-    }
     if let Some(capacity) = best_capacity.as_mut() {
         finalize_trade_profit(&mut capacity.trade)?;
     }
@@ -950,19 +948,10 @@ fn slippage_bps(pair: &PairRuntime, profit_bps: u16) -> anyhow::Result<u16> {
         .min(pair.max_slippage_bps))
 }
 
-fn trade_is_better(
-    direction: ArbitrageDirection,
-    candidate: &TradeEvaluation,
-    current: &TradeEvaluation,
-) -> bool {
-    match direction {
-        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-            candidate.cost_token_a < current.cost_token_a
-        }
-        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            candidate.proceeds_token_a > current.proceeds_token_a
-        }
-    }
+fn trade_is_better(candidate: &TradeEvaluation, current: &TradeEvaluation) -> bool {
+    candidate.profit_bps_x100 > current.profit_bps_x100
+        || (candidate.profit_bps_x100 == current.profit_bps_x100
+            && candidate.token_b_amount > current.token_b_amount)
 }
 
 fn finalize_trade_profit(trade: &mut TradeEvaluation) -> anyhow::Result<()> {
@@ -1258,8 +1247,9 @@ mod tests {
         ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
         CapacityLimiter, DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache,
         TradeEvaluation, add_bps_ceil, decimal_to_base_units, evaluate_direction,
-        evaluate_trade_with_dex_quote, format_base_units, meets_threshold, signed_profit_bps_x100,
-        subtract_bps_floor, token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
+        evaluate_trade_with_dex_quote, finalize_trade_profit, format_base_units, meets_threshold,
+        signed_profit_bps_x100, subtract_bps_floor, token_a_to_token_b_floor, token_b_to_token_a,
+        trade_is_better,
     };
 
     fn hash(number: u64) -> B256 {
@@ -1738,7 +1728,7 @@ mod tests {
 
     #[test]
     fn provider_selection_prefers_direction_specific_economic_result() {
-        let candidate = TradeEvaluation {
+        let mut candidate = TradeEvaluation {
             pool_index: 1,
             token_b_amount: U256::from(10_u8),
             dex_token_a_amount: U256::from(90_u8),
@@ -1749,23 +1739,46 @@ mod tests {
             profit_bps_x100: 0,
             meets_threshold: true,
         };
-        let current = TradeEvaluation {
+        let mut current = TradeEvaluation {
             pool_index: 0,
             cost_token_a: U256::from(91_u8),
             proceeds_token_a: U256::from(109_u8),
             ..candidate
         };
+        finalize_trade_profit(&mut candidate).unwrap();
+        finalize_trade_profit(&mut current).unwrap();
 
-        assert!(trade_is_better(
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
-            &candidate,
-            &current,
-        ));
-        assert!(trade_is_better(
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
-            &candidate,
-            &current,
-        ));
+        assert!(trade_is_better(&candidate, &current));
+    }
+
+    #[test]
+    fn provider_selection_compares_rate_when_dex_buy_baseline_amounts_differ() {
+        let mut low_liquidity = TradeEvaluation {
+            pool_index: 3,
+            token_b_amount: U256::from(500_000_000_000_000_000_u128),
+            dex_token_a_amount: U256::from(1_433_245_u64),
+            cex_token_a_amount: U256::from(191_750_u64),
+            cost_token_a: U256::from(1_434_535_u64),
+            proceeds_token_a: U256::from(191_558_u64),
+            execution_slippage_bps: 5,
+            profit_bps_x100: 0,
+            meets_threshold: false,
+        };
+        let mut healthy_liquidity = TradeEvaluation {
+            pool_index: 0,
+            token_b_amount: U256::from(52_100_000_000_000_000_000_u128),
+            dex_token_a_amount: U256::from(20_050_000_u64),
+            cex_token_a_amount: U256::from(19_995_980_u64),
+            cost_token_a: U256::from(20_068_045_u64),
+            proceeds_token_a: U256::from(19_975_984_u64),
+            execution_slippage_bps: 5,
+            profit_bps_x100: 0,
+            meets_threshold: false,
+        };
+        finalize_trade_profit(&mut low_liquidity).unwrap();
+        finalize_trade_profit(&mut healthy_liquidity).unwrap();
+
+        assert!(trade_is_better(&healthy_liquidity, &low_liquidity));
     }
 
     #[test]
