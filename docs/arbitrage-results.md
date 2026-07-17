@@ -118,6 +118,15 @@ The goal criterion is evaluated only after at least 100 balanced Rust trades.
 Report total and per-trade comparable USDC, with cash realized and the residual
 mark shown separately. Also report unknown/halted parent intents separately:
 excluding unresolved exposure from PnL does not make it economically harmless.
+During the live run, the operator can watch that gate and trigger the same
+equal-window comparison automatically:
+
+```bash
+scripts/watch-arbitrage-results 2026-07-17T16:05:26Z 100
+```
+
+The watcher counts only live `arbitrage_result` rows for `dex_first`; paper
+results remain excluded.
 
 Audit the one-to-one admission/result relationship over the same interval:
 

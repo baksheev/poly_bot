@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+start_utc="${1:-}"
+target_results="${2:-100}"
+once="${3:-}"
+poll_seconds="${POLL_SECONDS:-30}"
+
+if [[ ! "${start_utc}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+  echo "usage: scripts/watch-arbitrage-results START_UTC [TARGET_RESULTS] [--once]" >&2
+  echo "START_UTC must use YYYY-MM-DDTHH:MM:SSZ" >&2
+  exit 1
+fi
+if [[ ! "${target_results}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TARGET_RESULTS must be a positive integer" >&2
+  exit 1
+fi
+if [[ "${once}" != "" && "${once}" != "--once" ]]; then
+  echo "optional third argument must be --once" >&2
+  exit 1
+fi
+if [[ ! "${poll_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "POLL_SECONDS must be a positive integer" >&2
+  exit 1
+fi
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${CLICKHOUSE_URL:?CLICKHOUSE_URL is required}"
+: "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required}"
+clickhouse_user="${CLICKHOUSE_USER:-default}"
+clickhouse_database="${CLICKHOUSE_DATABASE:-arb_bot_prod}"
+start_ch="${start_utc/T/ }"
+start_ch="${start_ch%Z}"
+target_offset=$((target_results - 1))
+
+clickhouse() {
+  local query="$1"
+  curl --fail --silent --show-error \
+    --user "${clickhouse_user}:${CLICKHOUSE_PASSWORD}" \
+    --data-binary "${query}" \
+    "${CLICKHOUSE_URL}"
+}
+
+status_query() {
+  cat <<SQL
+SELECT
+    countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') AS completed,
+    countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'outcome') = 'balanced_profit') AS profitable,
+    sumIf(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units')), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') / 1000000 AS comparable_usdc,
+    if(
+        countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') = 0,
+        0,
+        avgIf(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units')), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') / 1000000
+    ) AS avg_comparable_usdc,
+    sumIf(abs(toInt128OrZero(JSONExtractString(payload_json, 'token_b_residual_base_units'))), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') / 1000000000000000000 AS absolute_wld_residual,
+    uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_admitted') AS admitted,
+    uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_result') AS balanced,
+    uniqExactIf(
+        JSONExtractString(payload_json, 'plan_id'),
+        kind = 'arbitrage_inventory_state'
+        AND JSONExtractString(payload_json, 'state') = 'BlockedUnknown'
+    ) AS blocked_unknown
+FROM ${clickhouse_database}.runtime_telemetry
+WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+  AND kind IN ('arbitrage_admitted', 'arbitrage_result', 'arbitrage_inventory_state')
+FORMAT TabSeparated
+SQL
+}
+
+target_end_query() {
+  cat <<SQL
+SELECT formatDateTime(
+    toDateTime(intDiv(observed_at_ms, 1000) + 1, 'UTC'),
+    '%Y-%m-%dT%H:%M:%SZ',
+    'UTC'
+)
+FROM ${clickhouse_database}.runtime_telemetry
+WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+  AND kind = 'arbitrage_result'
+  AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld'
+  AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first'
+ORDER BY observed_at_ms ASC
+LIMIT 1 OFFSET ${target_offset}
+FORMAT TabSeparated
+SQL
+}
+
+echo "runtime|completed_trades|profitable_trades|comparable_usdc|avg_comparable_usdc|absolute_wld_residual|admitted|balanced|blocked_unknown"
+while true; do
+  row="$(clickhouse "$(status_query)" | tr '\t' '|')"
+  echo "rust|${row}"
+  completed="${row%%$'\t'*}"
+  completed="${completed%%|*}"
+
+  if (( completed >= target_results )); then
+    end_utc="$(clickhouse "$(target_end_query)" | tr -d '\r\n')"
+    if [[ -z "${end_utc}" ]]; then
+      echo "target result count reached, but target end timestamp was not found" >&2
+      exit 1
+    fi
+    echo "comparison_window|${start_utc}|${end_utc}"
+    exec "${repo_root}/scripts/compare-arbitrage-results" "${start_utc}" "${end_utc}"
+  fi
+
+  if [[ "${once}" == "--once" ]]; then
+    exit 0
+  fi
+  sleep "${poll_seconds}"
+done
