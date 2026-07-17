@@ -206,4 +206,5 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now arb-bot.service
+systemctl enable arb-bot.service
+systemctl restart arb-bot.service
