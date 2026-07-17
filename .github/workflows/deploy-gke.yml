@@ -83,6 +83,8 @@ jobs:
 
       - name: Install Google Cloud CLI
         uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: alpha
 
       - name: Build and push immutable image
         id: image
