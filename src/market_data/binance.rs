@@ -155,8 +155,12 @@ impl BookTickerFeed {
             response.status()
         );
         if with_depth {
-            self.subscribe_and_bootstrap_depth(&mut socket, generation)
-                .await?;
+            tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                self.subscribe_and_bootstrap_depth(&mut socket, generation),
+            )
+            .await
+            .context("Binance depth bootstrap timed out")??;
         }
         tracing::info!(
             symbol = self.symbol.as_ref(),

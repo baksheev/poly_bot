@@ -1112,15 +1112,25 @@ async fn run(
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     health_tick.reset();
 
+    // These futures must survive unrelated select branches. Recreating
+    // `next_event()` on every loop iteration cancels a multi-await depth
+    // bootstrap or reconnect before it can commit the connected socket.
+    let mut binance_market_event = Box::pin(binance_feed.next_event());
+    let mut gas_market_event = Box::pin(gas_price_feed.next_event());
+
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             _ = health_tick.tick() => engine.refresh_health(),
-            event = binance_feed.next_event() => {
+            event = &mut binance_market_event => {
+                drop(binance_market_event);
                 engine.on_market_event(event, binance_feed.depth_book())?;
+                binance_market_event = Box::pin(binance_feed.next_event());
             },
-            event = gas_price_feed.next_event() => {
+            event = &mut gas_market_event => {
+                drop(gas_market_event);
                 engine.on_gas_market_event(event)?;
+                gas_market_event = Box::pin(gas_price_feed.next_event());
             },
             event = user_data_stream.next_event() => {
                 engine.on_user_data_event(event?)?;
