@@ -7,7 +7,7 @@ use std::{
 use alloy_primitives::U256;
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     admission::{AdmissionEconomics, AdmissionInputs, evaluate_admission},
@@ -1306,7 +1306,7 @@ impl TradingEngine {
                 "maximum_gas_cost_token_a_base_units": economics.maximum_gas_cost_token_a.to_string(),
                 "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
                 "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
-                "dex_plan": dex_plan,
+                "dex_plan": dex_plan_telemetry_value(&dex_plan),
             }),
         );
         Ok(())
@@ -1491,6 +1491,17 @@ fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
     i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
 }
 
+fn dex_plan_telemetry_value(plan: &DexSwapPlan) -> Value {
+    json!({
+        "route": &plan.route,
+        "token_in": &plan.token_in,
+        "token_out": &plan.token_out,
+        "amount_in_base_units": plan.amount_in_base_units.to_string(),
+        "amount_out_minimum_base_units": plan.amount_out_minimum_base_units.to_string(),
+        "deadline_unix_seconds": plan.deadline_unix_seconds,
+    })
+}
+
 fn u256_to_u128(value: U256, name: &str) -> anyhow::Result<u128> {
     u128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds u128"))
 }
@@ -1519,7 +1530,10 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
-    use crate::rebalance::Direction;
+    use crate::{
+        execution_plan::{DexRoutePlan, DexSwapPlan},
+        rebalance::Direction,
+    };
 
     use super::{
         RebalanceSettlementBarrier, TradingReadiness, mark_sequence_matched_update,
@@ -1534,6 +1548,35 @@ mod tests {
         assert!(!mark_sequence_matched_update(&mut updates, "WLDUSDC", 99));
         assert!(mark_sequence_matched_update(&mut updates, "WLDUSDC", 101));
         assert!(mark_sequence_matched_update(&mut updates, "ETHUSDT", 1));
+    }
+
+    #[test]
+    fn dex_plan_telemetry_serializes_large_base_units_as_strings() {
+        let plan = DexSwapPlan {
+            route: DexRoutePlan::UniswapV3 {
+                router: "0x1111111111111111111111111111111111111111".to_owned(),
+                pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+                fee_pips: 3_000,
+            },
+            token_in: "0x3333333333333333333333333333333333333333".to_owned(),
+            token_out: "0x4444444444444444444444444444444444444444".to_owned(),
+            amount_in_base_units: u128::MAX,
+            amount_out_minimum_base_units: u128::MAX - 1,
+            deadline_unix_seconds: 1_800_000_030,
+        };
+
+        let payload = super::dex_plan_telemetry_value(&plan);
+        let max_u128 = u128::MAX.to_string();
+        let max_u128_minus_one = (u128::MAX - 1).to_string();
+
+        assert_eq!(
+            payload["amount_in_base_units"].as_str(),
+            Some(max_u128.as_str())
+        );
+        assert_eq!(
+            payload["amount_out_minimum_base_units"].as_str(),
+            Some(max_u128_minus_one.as_str())
+        );
     }
 
     #[test]

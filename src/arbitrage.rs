@@ -131,10 +131,6 @@ impl AdmissionRiskBounds {
             self.maximum_gas_cost_token_a_base_units > 0,
             "maximum gas cost is zero"
         );
-        ensure!(
-            self.bounded_profit_token_a_base_units > 0,
-            "bounded admission profit is zero"
-        );
         Ok(())
     }
 
@@ -1651,6 +1647,18 @@ mod tests {
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
         }
+    }
+
+    #[test]
+    fn zero_bounded_profit_is_valid_for_rails_style_admission() {
+        let mut intent = intent(ExecutionMode::DexFirst);
+        intent
+            .admission
+            .as_mut()
+            .unwrap()
+            .bounded_profit_token_a_base_units = 0;
+
+        intent.validate().unwrap();
     }
 
     #[test]
