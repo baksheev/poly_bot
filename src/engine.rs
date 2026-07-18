@@ -55,6 +55,7 @@ pub struct TradingEngine {
     binance_user_data_clean: bool,
     binance_orders: BTreeMap<String, ExecutionReportEvent>,
     last_sequence_matched_quote_update: BTreeMap<String, u64>,
+    latest_sequence_matched_depth: BTreeMap<String, SpotDepthBook>,
     gas_price_symbol: String,
     gas_price_connected: bool,
     gas_price_generation: u64,
@@ -194,6 +195,7 @@ impl TradingEngine {
                 binance_user_data_clean: true,
                 binance_orders: BTreeMap::new(),
                 last_sequence_matched_quote_update: BTreeMap::new(),
+                latest_sequence_matched_depth: BTreeMap::new(),
                 gas_price_symbol,
                 gas_price_connected: false,
                 gas_price_generation: 0,
@@ -438,7 +440,8 @@ impl TradingEngine {
                 .filter_map(|feed| feed.book.clone())
                 .collect();
             for quote in books {
-                self.evaluate_ready_quote(&quote, "dex_prepared", None)?;
+                let depth = self.matching_cached_depth(&quote).cloned();
+                self.evaluate_ready_quote(&quote, "dex_prepared", depth.as_ref())?;
             }
         }
         Ok(())
@@ -458,6 +461,7 @@ impl TradingEngine {
                 self.state.on_connected(&symbol, generation);
                 self.last_sequence_matched_quote_update
                     .remove(symbol.as_ref());
+                self.latest_sequence_matched_depth.remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_connected",
                     json!({
@@ -476,6 +480,7 @@ impl TradingEngine {
                 observed_at,
             } => {
                 self.state.on_disconnected(&symbol, generation);
+                self.latest_sequence_matched_depth.remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_disconnected",
                     json!({
@@ -542,6 +547,8 @@ impl TradingEngine {
                         quote.ask_quantity,
                     )
                 {
+                    self.latest_sequence_matched_depth
+                        .insert(symbol.to_string(), depth.clone());
                     self.evaluate_sequence_matched_quote(&quote, "binance_depth", depth)?;
                 }
             }
@@ -1016,6 +1023,21 @@ impl TradingEngine {
             return Ok(());
         }
         self.evaluate_ready_quote(quote, trigger, Some(depth))
+    }
+
+    fn matching_cached_depth(&self, quote: &TopOfBook) -> Option<&SpotDepthBook> {
+        self.latest_sequence_matched_depth
+            .get(quote.symbol.as_ref())
+            .filter(|depth| {
+                depth.matches_top(
+                    quote.symbol.as_ref(),
+                    quote.update_id,
+                    quote.bid_price,
+                    quote.bid_quantity,
+                    quote.ask_price,
+                    quote.ask_quantity,
+                )
+            })
     }
 
     fn evaluate_ready_quote(
