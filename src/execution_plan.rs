@@ -159,7 +159,7 @@ impl DexSwapPlan {
                     parse_address("DEX plan V4 currency1", currency1)?,
                     *fee_pips,
                     *tick_spacing,
-                    parse_address("DEX plan V4 hooks", hooks)?,
+                    parse_hooks_address("DEX plan V4 hooks", hooks)?,
                 )?;
                 ensure!(
                     key.pool_id() == expected_pool_id,
@@ -203,7 +203,7 @@ impl DexSwapPlan {
                     parse_address("DEX plan V4 currency1", currency1)?,
                     *fee_pips,
                     *tick_spacing,
-                    parse_address("DEX plan V4 hooks", hooks)?,
+                    parse_hooks_address("DEX plan V4 hooks", hooks)?,
                 )?,
             },
         };
@@ -258,9 +258,15 @@ fn parse_address(name: &str, value: &str) -> anyhow::Result<Address> {
     Ok(address)
 }
 
+fn parse_hooks_address(name: &str, value: &str) -> anyhow::Result<Address> {
+    Address::from_str(value).with_context(|| format!("invalid {name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, U256};
+
+    use crate::dex::{execution::SwapRoute, pool_id::V4PoolKey};
 
     use super::{DexRoutePlan, DexSwapPlan};
 
@@ -285,5 +291,40 @@ mod tests {
         assert_eq!(request.amount_in, U256::from(10_000_000_u64));
         assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
         assert_eq!(request.maximum_fee_per_gas_wei, 2_500_000);
+    }
+
+    #[test]
+    fn v4_no_hooks_plan_round_trips_into_an_exact_input_request() {
+        let currency0 = Address::repeat_byte(0x33);
+        let currency1 = Address::repeat_byte(0x44);
+        let key = V4PoolKey::new(currency0, currency1, 3_000, 60, Address::ZERO).unwrap();
+        let plan = DexSwapPlan {
+            route: DexRoutePlan::UniswapV4 {
+                router: Address::repeat_byte(0x11).to_string(),
+                pool_id: key.pool_id().to_string(),
+                currency0: currency0.to_string(),
+                currency1: currency1.to_string(),
+                fee_pips: 3_000,
+                tick_spacing: 60,
+                hooks: Address::ZERO.to_string(),
+            },
+            token_in: currency0.to_string(),
+            token_out: currency1.to_string(),
+            amount_in_base_units: 10_000_000,
+            amount_out_minimum_base_units: 9_000_000,
+            deadline_unix_seconds: 1_900_000_000,
+        };
+
+        let request = plan
+            .execution_request("rustarb-plan-v4.dex", 2_500_000)
+            .unwrap();
+        assert_eq!(request.amount_in, U256::from(10_000_000_u64));
+        assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
+        assert_eq!(request.maximum_fee_per_gas_wei, 2_500_000);
+        assert!(matches!(
+            request.route,
+            SwapRoute::V4 { pool_key, .. }
+                if pool_key.hooks == Address::ZERO && pool_key.pool_id() == key.pool_id()
+        ));
     }
 }
