@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use crate::{execution_plan::DexSwapPlan, telemetry::TelemetryHandle};
+use crate::{execution_plan::DexSwapPlan, state::TopOfBook, telemetry::TelemetryHandle};
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -430,9 +430,12 @@ pub enum CoordinatorCommand {
 pub struct PaperOpportunity {
     pub source_revision: String,
     pub pair_id: String,
+    pub symbol: String,
     pub update_id: u64,
     pub received_unix_us: u64,
     pub direction: ArbitrageDirection,
+    pub dex_pool_index: usize,
+    pub dex_pool_generation: u64,
     pub token_b_base_units: i128,
     pub token_b_step_base_units: i128,
     pub cost_token_a_base_units: i128,
@@ -445,6 +448,7 @@ impl PaperOpportunity {
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_id("source revision", &self.source_revision, 96)?;
         validate_id("pair id", &self.pair_id, 96)?;
+        validate_id("symbol", &self.symbol, 24)?;
         ensure!(self.update_id > 0, "paper opportunity update id is zero");
         ensure!(
             self.received_unix_us > 0,
@@ -453,6 +457,10 @@ impl PaperOpportunity {
         ensure!(
             self.token_b_base_units > 0,
             "paper opportunity token-B amount must be positive"
+        );
+        ensure!(
+            self.dex_pool_generation > 0,
+            "paper opportunity DEX pool generation is zero"
         );
         ensure!(
             self.token_b_step_base_units > 0,
@@ -508,6 +516,116 @@ impl PaperOpportunity {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct EntryPreflightHandle {
+    inner: Arc<RwLock<EntryPreflightState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EntryPreflightState {
+    quotes: BTreeMap<String, TopOfBook>,
+    dex_pool_generations: BTreeMap<usize, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntryPreflightRejection {
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+impl EntryPreflightHandle {
+    pub fn update_quote(&self, quote: &TopOfBook) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        let current = state.quotes.get(quote.symbol.as_ref());
+        if current.is_none_or(|current| {
+            quote.connection_generation > current.connection_generation
+                || (quote.connection_generation == current.connection_generation
+                    && quote.update_id >= current.update_id)
+        }) {
+            state
+                .quotes
+                .insert(quote.symbol.as_ref().to_owned(), quote.clone());
+        }
+    }
+
+    pub fn update_dex_pool_generation(&self, pool_index: usize, generation: u64) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        let current = state.dex_pool_generations.get(&pool_index).copied();
+        if current.is_none_or(|current| generation >= current) {
+            state.dex_pool_generations.insert(pool_index, generation);
+        }
+    }
+
+    pub fn check(
+        &self,
+        opportunity: &PaperOpportunity,
+    ) -> anyhow::Result<Option<EntryPreflightRejection>> {
+        opportunity.validate()?;
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| anyhow::anyhow!("entry preflight state is poisoned"))?;
+        let Some(quote) = state.quotes.get(&opportunity.symbol) else {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "missing_preflight_quote",
+                detail: format!("no latest quote for {}", opportunity.symbol),
+            }));
+        };
+        if quote.update_id < opportunity.update_id {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "stale_preflight_quote",
+                detail: format!(
+                    "latest update_id {} is older than admission update_id {}",
+                    quote.update_id, opportunity.update_id
+                ),
+            }));
+        }
+        let primary = opportunity.admission.cex_primary_limit_price;
+        match opportunity.direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex if quote.bid_price < primary => {
+                return Ok(Some(EntryPreflightRejection {
+                    reason: "cex_price_moved_against_admission",
+                    detail: format!("bid {} is below admission {}", quote.bid_price, primary),
+                }));
+            }
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex if quote.ask_price > primary => {
+                return Ok(Some(EntryPreflightRejection {
+                    reason: "cex_price_moved_against_admission",
+                    detail: format!("ask {} is above admission {}", quote.ask_price, primary),
+                }));
+            }
+            _ => {}
+        }
+        let Some(current_generation) = state
+            .dex_pool_generations
+            .get(&opportunity.dex_pool_index)
+            .copied()
+        else {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "missing_preflight_dex_generation",
+                detail: format!(
+                    "no latest DEX generation for pool {}",
+                    opportunity.dex_pool_index
+                ),
+            }));
+        };
+        if current_generation != opportunity.dex_pool_generation {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "dex_pool_changed_after_quote",
+                detail: format!(
+                    "current generation {} differs from admission generation {}",
+                    current_generation, opportunity.dex_pool_generation
+                ),
+            }));
+        }
+        Ok(None)
+    }
+}
+
 fn cex_client_order_id(
     pair_id: &str,
     received_unix_us: u64,
@@ -536,6 +654,7 @@ pub enum PaperTradeEventState {
 pub struct PaperTradeEvent {
     pub plan_id: String,
     pub state: PaperTradeEventState,
+    pub dex_filled: bool,
 }
 
 #[derive(Clone)]
@@ -628,7 +747,7 @@ impl PaperTradeTask {
                         }
                     },
                 );
-                self.publish_event(plan_id, state)?;
+                self.publish_event(plan_id, state, false)?;
             }
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
@@ -705,12 +824,20 @@ impl PaperTradeTask {
                     object.insert("includes_gas".to_owned(), Value::Bool(false));
                     object.insert("comparable_to_live".to_owned(), Value::Bool(false));
                     self.telemetry.emit("paper_arbitrage_result", payload);
-                    self.publish_event(plan_id.to_owned(), PaperTradeEventState::Balanced)?;
+                    self.publish_event(
+                        plan_id.to_owned(),
+                        PaperTradeEventState::Balanced,
+                        dex_filled(operation),
+                    )?;
                 } else if matches!(
                     operation.stage,
                     TradeStage::UnknownExposure | TradeStage::Halted
                 ) {
-                    self.publish_event(plan_id.to_owned(), PaperTradeEventState::BlockedUnknown)?;
+                    self.publish_event(
+                        plan_id.to_owned(),
+                        PaperTradeEventState::BlockedUnknown,
+                        dex_filled(operation),
+                    )?;
                 }
                 return Ok(());
             }
@@ -727,11 +854,27 @@ impl PaperTradeTask {
         }
     }
 
-    fn publish_event(&self, plan_id: String, state: PaperTradeEventState) -> anyhow::Result<()> {
+    fn publish_event(
+        &self,
+        plan_id: String,
+        state: PaperTradeEventState,
+        dex_filled: bool,
+    ) -> anyhow::Result<()> {
         self.event_sender
-            .send(PaperTradeEvent { plan_id, state })
+            .send(PaperTradeEvent {
+                plan_id,
+                state,
+                dex_filled,
+            })
             .map_err(|_| anyhow::anyhow!("paper trade event receiver is closed"))
     }
+}
+
+fn dex_filled(operation: &TradeOperation) -> bool {
+    operation.dex_result.as_ref().is_some_and(|result| {
+        result.status == LegStatus::Filled
+            && (result.token_b_delta_base_units != 0 || result.token_a_delta_base_units != 0)
+    })
 }
 
 fn simulate_command(

@@ -12,9 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::{
     arbitrage::{
-        CoordinatorCommand, ExecutionMode, LegResult, LegRole, LegStatus, PaperOpportunity,
-        PaperTradeCoordinator, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
-        TradeIntent, TradeStage,
+        CoordinatorCommand, EntryPreflightHandle, ExecutionMode, LegResult, LegRole, LegStatus,
+        PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent, PaperTradeEventState,
+        PaperTradeHandle, TradeIntent, TradeOperation, TradeStage,
     },
     binance::{
         account::SymbolRules,
@@ -383,9 +383,10 @@ pub struct LiveTradeTask<E> {
     risk_limits: LiveRiskLimits,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LiveRiskLimits {
     pub entry_stop_file: PathBuf,
+    pub entry_preflight: EntryPreflightHandle,
 }
 
 impl LiveRiskLimits {
@@ -447,7 +448,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         }
                     },
                 );
-                self.publish_event(plan_id, state)?;
+                self.publish_event(plan_id, state, false)?;
             }
         }
         Ok(())
@@ -498,11 +499,28 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         self.drive(&plan_id).await
     }
 
-    fn authorize_entry(&mut self, _opportunity: &PaperOpportunity) -> anyhow::Result<()> {
+    fn authorize_entry(&mut self, opportunity: &PaperOpportunity) -> anyhow::Result<()> {
         ensure!(
             !self.risk_limits.entry_stop_file.exists(),
             "live entry stop is active"
         );
+        if let Some(rejection) = self.risk_limits.entry_preflight.check(opportunity)? {
+            self.telemetry.emit(
+                "arbitrage_entry_preflight_rejected",
+                serde_json::json!({
+                    "engine_id": self.engine_id,
+                    "plan_id": opportunity.plan_id(),
+                    "pair_id": opportunity.pair_id,
+                    "symbol": opportunity.symbol,
+                    "update_id": opportunity.update_id,
+                    "dex_pool_index": opportunity.dex_pool_index,
+                    "dex_pool_generation": opportunity.dex_pool_generation,
+                    "reason": rejection.reason,
+                    "detail": rejection.detail,
+                }),
+            );
+            anyhow::bail!("live entry preflight rejected: {}", rejection.reason);
+        }
         Ok(())
     }
 
@@ -524,12 +542,20 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     object.insert("includes_gas".to_owned(), Value::Bool(true));
                     object.insert("comparable_to_live".to_owned(), Value::Bool(true));
                     self.telemetry.emit(ARBITRAGE_RESULT_KIND, payload);
-                    self.publish_event(plan_id.to_owned(), PaperTradeEventState::Balanced)?;
+                    self.publish_event(
+                        plan_id.to_owned(),
+                        PaperTradeEventState::Balanced,
+                        dex_filled(operation),
+                    )?;
                 } else if matches!(
                     operation.stage,
                     TradeStage::UnknownExposure | TradeStage::Halted
                 ) {
-                    self.publish_event(plan_id.to_owned(), PaperTradeEventState::BlockedUnknown)?;
+                    self.publish_event(
+                        plan_id.to_owned(),
+                        PaperTradeEventState::BlockedUnknown,
+                        dex_filled(operation),
+                    )?;
                 }
                 return Ok(());
             }
@@ -556,11 +582,27 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         }
     }
 
-    fn publish_event(&self, plan_id: String, state: PaperTradeEventState) -> anyhow::Result<()> {
+    fn publish_event(
+        &self,
+        plan_id: String,
+        state: PaperTradeEventState,
+        dex_filled: bool,
+    ) -> anyhow::Result<()> {
         self.event_sender
-            .send(PaperTradeEvent { plan_id, state })
+            .send(PaperTradeEvent {
+                plan_id,
+                state,
+                dex_filled,
+            })
             .map_err(|_| anyhow::anyhow!("live trade event receiver is closed"))
     }
+}
+
+fn dex_filled(operation: &TradeOperation) -> bool {
+    operation.dex_result.as_ref().is_some_and(|result| {
+        result.status == LegStatus::Filled
+            && (result.token_b_delta_base_units != 0 || result.token_a_delta_base_units != 0)
+    })
 }
 
 fn failed(role: LegRole, reference: &str) -> (LegRole, LegResult) {
@@ -609,9 +651,9 @@ mod tests {
 
     use crate::{
         arbitrage::{
-            AdmissionRiskBounds, ArbitrageDirection, CoordinatorCommand, ExecutionMode, LegResult,
-            LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator, TerminalOutcome,
-            TradeIntent,
+            AdmissionRiskBounds, ArbitrageDirection, CoordinatorCommand, EntryPreflightHandle,
+            ExecutionMode, LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator,
+            TerminalOutcome, TradeIntent,
         },
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
@@ -645,9 +687,12 @@ mod tests {
         PaperOpportunity {
             source_revision: "test-revision".to_owned(),
             pair_id: "world-chain-usdc-wld".to_owned(),
+            symbol: "WLDUSDC".to_owned(),
             update_id: 7,
             received_unix_us: 1_800_000_000_000_000,
             direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            dex_pool_index: 0,
+            dex_pool_generation: 1,
             token_b_base_units: 100,
             token_b_step_base_units: 1,
             cost_token_a_base_units: 1_000,
@@ -695,7 +740,57 @@ mod tests {
     fn risk_limits(stop_file: std::path::PathBuf) -> LiveRiskLimits {
         LiveRiskLimits {
             entry_stop_file: stop_file,
+            entry_preflight: default_preflight(),
         }
+    }
+
+    fn default_preflight() -> EntryPreflightHandle {
+        let handle = EntryPreflightHandle::default();
+        let quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 7);
+        handle.update_quote(&quote);
+        handle.update_dex_pool_generation(0, 1);
+        handle
+    }
+
+    fn preflight_quote(bid: Decimal, ask: Decimal, update_id: u64) -> crate::state::TopOfBook {
+        crate::state::TopOfBook::new(
+            std::sync::Arc::from("WLDUSDC"),
+            update_id,
+            bid,
+            Decimal::new(100, 0),
+            ask,
+            Decimal::new(100, 0),
+            None,
+            None,
+            std::time::Instant::now(),
+            1_800_000_000_000_000,
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn entry_preflight_rejects_price_drift_after_admission() {
+        let handle = EntryPreflightHandle::default();
+        let quote = preflight_quote(Decimal::new(99, 2), Decimal::new(101, 2), 8);
+        handle.update_quote(&quote);
+        handle.update_dex_pool_generation(0, 1);
+
+        let rejection = handle.check(&opportunity()).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "cex_price_moved_against_admission");
+    }
+
+    #[test]
+    fn entry_preflight_rejects_dex_generation_drift_after_admission() {
+        let handle = EntryPreflightHandle::default();
+        let quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 8);
+        handle.update_quote(&quote);
+        handle.update_dex_pool_generation(0, 2);
+
+        let rejection = handle.check(&opportunity()).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "dex_pool_changed_after_quote");
     }
 
     #[test]
@@ -720,6 +815,7 @@ mod tests {
     fn live_entry_controls_require_an_entry_stop_path() {
         let valid = LiveRiskLimits {
             entry_stop_file: "/tmp/arb-bot-entry.stop".into(),
+            entry_preflight: default_preflight(),
         };
         valid.validate().unwrap();
         let mut invalid = valid;

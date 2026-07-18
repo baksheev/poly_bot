@@ -8,7 +8,8 @@ use arb_bot::{
         WORLD_CHAIN_USDC, validate_quote,
     },
     arbitrage::{
-        ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator, TradeStage, paper_trade_channel,
+        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator, TradeStage,
+        paper_trade_channel,
     },
     balances::{
         BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
@@ -1028,14 +1029,11 @@ async fn run(
         &binance_assets,
         reconciliation_started.elapsed().as_micros(),
     );
+    let entry_preflight = EntryPreflightHandle::default();
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
         ensure!(
             domain_config.snapshot().live_trading_enabled && pair.execution_enabled,
             "composed live arbitrage requires both versioned execution gates"
-        );
-        ensure!(
-            config.rebalance_execution_mode != "full_live",
-            "live arbitrage and live rebalance cannot own the same wallet nonce lane"
         );
         let wallet = EvmWallet::from_env()?;
         ensure!(
@@ -1130,6 +1128,7 @@ async fn run(
             config.engine_id.clone(),
             LiveRiskLimits {
                 entry_stop_file: config.arbitrage_entry_stop_file.clone(),
+                entry_preflight: entry_preflight.clone(),
             },
         )?;
         Some((handle, tokio::spawn(task.run()), events))
@@ -1184,7 +1183,10 @@ async fn run(
         mirror,
         telemetry,
         rebalance_tracker,
-        paper_trades,
+        arb_bot::engine::TradingExecutionHandles {
+            paper_trades,
+            entry_preflight,
+        },
         BinanceFeeBps {
             buy: binance_buy_fee_bps,
             sell: binance_sell_fee_bps,

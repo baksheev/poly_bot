@@ -34,9 +34,22 @@ wallet_address="$(metadata arb-bot-wallet-address)"
 domain_config_path="$(metadata_or_default arb-bot-domain-config-path config/strategies/usdc-wld-world-chain.v4.json)"
 arbitrage_execution_mode="$(metadata_or_default arb-bot-arbitrage-execution-mode disabled)"
 arbitrage_live_confirmation="$(metadata_or_default arb-bot-arbitrage-live-confirmation '')"
+rebalance_execution_mode="$(metadata_or_default arb-bot-rebalance-execution-mode disabled)"
+rebalance_live_confirmation="$(metadata_or_default arb-bot-rebalance-live-confirmation '')"
+rebalance_max_wld_amount="$(metadata_or_default arb-bot-rebalance-max-wld-amount 0)"
+rebalance_max_usdc_amount="$(metadata_or_default arb-bot-rebalance-max-usdc-amount 0)"
+rebalance_binance_withdrawal_api_mode="$(metadata_or_default arb-bot-rebalance-binance-withdrawal-api-mode standard)"
 
 if [[ ! "${arbitrage_execution_mode}" =~ ^(disabled|paper_dex_first|paper_concurrent_hedged|full_live)$ ]]; then
   echo "invalid arb-bot-arbitrage-execution-mode metadata" >&2
+  exit 1
+fi
+if [[ ! "${rebalance_execution_mode}" =~ ^(disabled|full_live)$ ]]; then
+  echo "invalid arb-bot-rebalance-execution-mode metadata" >&2
+  exit 1
+fi
+if [[ ! "${rebalance_binance_withdrawal_api_mode}" =~ ^(standard|travel_rule)$ ]]; then
+  echo "invalid arb-bot-rebalance-binance-withdrawal-api-mode metadata" >&2
   exit 1
 fi
 if [[ ! "${domain_config_path}" =~ ^config/strategies/[a-z0-9.-]+\.json$ ]]; then
@@ -50,6 +63,20 @@ if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
   fi
   if [[ "${arbitrage_live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then
     echo "full_live metadata confirmation is missing" >&2
+    exit 1
+  fi
+fi
+if [[ "${rebalance_execution_mode}" == "full_live" ]]; then
+  if [[ "${rebalance_live_confirmation}" != "ENABLE_FULL_REBALANCE" ]]; then
+    echo "full_live rebalance metadata confirmation is missing" >&2
+    exit 1
+  fi
+  if [[ ! "${rebalance_max_wld_amount}" =~ ^[0-9]+([.][0-9]+)?$ || ! "${rebalance_max_usdc_amount}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "full_live rebalance maximum metadata is invalid" >&2
+    exit 1
+  fi
+  if [[ "${rebalance_max_wld_amount}" == "0" || "${rebalance_max_usdc_amount}" == "0" ]]; then
+    echo "full_live rebalance requires positive maximum metadata" >&2
     exit 1
   fi
 fi
@@ -109,7 +136,14 @@ umask 077
   printf 'ARBITRAGE_WALLET_JOURNAL_PATH=/var/lib/arb-bot/arbitrage-wallet.jsonl\n'
   printf 'ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH=/var/lib/arb-bot/arbitrage-binance-orders.jsonl\n'
   printf 'ARBITRAGE_ENTRY_STOP_FILE=/var/lib/arb-bot/arbitrage-entry.stop\n'
-  printf 'REBALANCE_EXECUTION_MODE=disabled\n'
+  printf 'REBALANCE_EXECUTION_MODE=%s\n' "${rebalance_execution_mode}"
+  printf 'REBALANCE_EXECUTOR_JOURNAL_PATH=/var/lib/arb-bot/rebalance-executor.jsonl\n'
+  printf 'REBALANCE_EXECUTOR_TIMEOUT_SECONDS=1800\n'
+  printf 'REBALANCE_MAX_WLD_AMOUNT=%s\n' "${rebalance_max_wld_amount}"
+  printf 'REBALANCE_MAX_USDC_AMOUNT=%s\n' "${rebalance_max_usdc_amount}"
+  printf 'REBALANCE_LIVE_CONFIRMATION=%s\n' "${rebalance_live_confirmation}"
+  printf 'REBALANCE_BINANCE_WITHDRAWAL_API_MODE=%s\n' "${rebalance_binance_withdrawal_api_mode}"
+  printf 'EVM_WALLET_JOURNAL_PATH=/var/lib/arb-bot/rebalance-wallet.jsonl\n'
   printf 'EVM_WALLET_ADDRESS=%s\n' "${wallet_address}"
   printf 'CLICKHOUSE_DATABASE=arb_bot_prod\n'
   printf 'CLICKHOUSE_USER=default\n'
@@ -125,11 +159,23 @@ umask 077
   fetch_secret ALCHEMY_WORLDCHAIN_RPC_URL
   printf '\nALCHEMY_WORLDCHAIN_WS_URL='
   fetch_secret ALCHEMY_WORLDCHAIN_WS_URL
+  if [[ "${rebalance_execution_mode}" == "full_live" ]]; then
+    printf '\nALCHEMY_OPTIMISM_RPC_URL='
+    fetch_secret ALCHEMY_OPTIMISM_RPC_URL
+  fi
   printf '\nBINANCE_API_KEY='
   fetch_secret BINANCE_API_KEY
   printf '\nBINANCE_SECRET_KEY='
   fetch_secret BINANCE_SECRET_KEY
-  if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
+  if [[ "${rebalance_execution_mode}" == "full_live" ]]; then
+    printf '\nBINANCE_TREASURY_API_KEY='
+    fetch_secret BINANCE_TREASURY_API_KEY
+    printf '\nBINANCE_TREASURY_SECRET_KEY='
+    fetch_secret BINANCE_TREASURY_SECRET_KEY
+    printf '\nBINANCE_SUBACCOUNT_EMAIL='
+    fetch_secret BINANCE_SUBACCOUNT_EMAIL
+  fi
+  if [[ "${arbitrage_execution_mode}" == "full_live" || "${rebalance_execution_mode}" == "full_live" ]]; then
     printf '\nEVM_WALLET_PRIVATE_KEY='
     fetch_secret EVM_WALLET_PRIVATE_KEY
   fi

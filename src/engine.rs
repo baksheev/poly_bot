@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use crate::{
     admission::{AdmissionEconomics, AdmissionInputs, evaluate_admission},
     arbitrage::{
-        AdmissionRiskBounds, ArbitrageDirection as TradeDirection, PaperOpportunity,
-        PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
+        AdmissionRiskBounds, ArbitrageDirection as TradeDirection, EntryPreflightHandle,
+        PaperOpportunity, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
     },
     balances::BalanceEvent,
     binance::{
@@ -34,7 +34,10 @@ use crate::{
         ArbitrageDirection, OpportunityEngine, PairEvaluation, PreparedPoolBuildRequest,
         PreparedPoolBuildResult,
     },
-    rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
+    rebalance::{
+        Direction, RebalanceAction, RebalanceEvaluation, RebalanceExecutionOperation,
+        RebalanceTracker, Route,
+    },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
@@ -68,6 +71,15 @@ pub struct TradingEngine {
     rebalance_blocked: bool,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
+    last_rebalance_parallel_skip_key: Option<String>,
+    entry_preflight: EntryPreflightHandle,
+    arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
+    arbitrage_settlement_barriers: BTreeMap<usize, ArbitrageSettlementBarrier>,
+}
+
+pub struct TradingExecutionHandles {
+    pub paper_trades: Option<PaperTradeHandle>,
+    pub entry_preflight: EntryPreflightHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +98,21 @@ struct RebalanceSettlementBarrier {
     direction: Direction,
     binance_after: Instant,
     wallet_after: Instant,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ArbitragePlanFreshness {
+    pair_id: String,
+    pool_index: usize,
+    pool_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ArbitrageSettlementBarrier {
+    pair_id: String,
+    plan_id: String,
+    pool_generation: u64,
     started_at: Instant,
 }
 
@@ -127,6 +154,23 @@ fn mark_sequence_matched_update(
     true
 }
 
+fn rebalance_action_requires_wallet_nonce(action: &RebalanceAction) -> bool {
+    !matches!(
+        (&action.route, action.direction),
+        (Route::Direct { .. }, Direction::BinanceToWallet)
+    )
+}
+
+fn rebalance_parallel_skip_key(
+    evaluation: &RebalanceEvaluation,
+    action: &RebalanceAction,
+) -> String {
+    format!(
+        "{}:{:?}:{}:{:?}",
+        evaluation.token_symbol, action.direction, action.amount, action.route
+    )
+}
+
 impl RebalanceSettlementBarrier {
     fn reconciled(&self, binance_observed_at: Instant, wallet_observed_at: Instant) -> bool {
         binance_observed_at > self.binance_after && wallet_observed_at > self.wallet_after
@@ -154,7 +198,7 @@ impl TradingEngine {
         dex: DexMirror,
         telemetry: TelemetryHandle,
         rebalance: RebalanceTracker,
-        paper_trades: Option<PaperTradeHandle>,
+        execution: TradingExecutionHandles,
         binance_fee_bps: BinanceFeeBps,
     ) -> anyhow::Result<(Self, HotTelemetryTask)> {
         let symbols = domain_config
@@ -176,6 +220,11 @@ impl TradingEngine {
                 binance_fee_bps.sell,
             )?;
         }
+        for (pool_index, generation) in opportunities.pool_generations() {
+            execution
+                .entry_preflight
+                .update_dex_pool_generation(pool_index, generation);
+        }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
         Ok((
@@ -188,7 +237,7 @@ impl TradingEngine {
                 rebalance,
                 telemetry,
                 hot_telemetry,
-                paper_trades,
+                paper_trades: execution.paper_trades,
                 inventory: InventoryReservations::default(),
                 binance_inventory_generation: 0,
                 binance_user_data_connected: false,
@@ -208,6 +257,10 @@ impl TradingEngine {
                 rebalance_blocked: false,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
+                last_rebalance_parallel_skip_key: None,
+                entry_preflight: execution.entry_preflight,
+                arbitrage_plan_freshness: BTreeMap::new(),
+                arbitrage_settlement_barriers: BTreeMap::new(),
             },
             hot_telemetry_task,
         ))
@@ -416,12 +469,17 @@ impl TradingEngine {
             return Ok(());
         };
         let pool = self.dex.pool(prepared.pool_index)?;
+        let pool_pair_id = pool.pair_id.clone();
+        let pool_identity = format!("{:?}", pool.identity);
+        self.entry_preflight
+            .update_dex_pool_generation(prepared.pool_index, prepared.generation);
+        self.reconcile_arbitrage_settlement(prepared.pool_index, prepared.generation);
         self.telemetry.emit(
             "dex_pool_prepared",
             json!({
                 "engine_id": self.config.engine_id,
-                "pair_id": pool.pair_id,
-                "identity": format!("{:?}", pool.identity),
+                "pair_id": pool_pair_id,
+                "identity": pool_identity,
                 "pool_index": prepared.pool_index,
                 "prepared_generation": prepared.generation,
                 "prepared_exact_output_segments": prepared.exact_output_segments,
@@ -940,10 +998,39 @@ impl TradingEngine {
                     && self.rebalance_settlement.is_none()
                     && self.pending_rebalance.is_none()
                     && let Some(evaluation) = pending_action
+                    && let Some(action) = evaluation.plan.action.as_ref()
                 {
-                    self.rebalance_inflight = true;
-                    self.rebalance_inflight_since = Some(Instant::now());
-                    self.pending_rebalance = Some(evaluation);
+                    if self.config.arbitrage_execution_mode == "full_live"
+                        && rebalance_action_requires_wallet_nonce(action)
+                    {
+                        let skip_key = rebalance_parallel_skip_key(&evaluation, action);
+                        if self
+                            .last_rebalance_parallel_skip_key
+                            .as_ref()
+                            .is_none_or(|last| last != &skip_key)
+                        {
+                            self.telemetry.emit(
+                                "rebalance_execution_skipped",
+                                json!({
+                                    "engine_id": self.config.engine_id,
+                                    "mode": mode,
+                                    "reason": "wallet_nonce_shared_with_live_arbitrage",
+                                    "token": evaluation.token_symbol,
+                                    "token_decimals": evaluation.token_decimals,
+                                    "action_direction": format!("{:?}", action.direction),
+                                    "action_amount_base_units": action.amount.to_string(),
+                                    "action_route": format!("{:?}", action.route),
+                                }),
+                            );
+                        }
+                        self.last_rebalance_parallel_skip_key = Some(skip_key);
+                        self.rebalance.mark_unbalanced();
+                    } else {
+                        self.last_rebalance_parallel_skip_key = None;
+                        self.rebalance_inflight = true;
+                        self.rebalance_inflight_since = Some(Instant::now());
+                        self.pending_rebalance = Some(evaluation);
+                    }
                 }
             }
             Err(error) => {
@@ -969,6 +1056,7 @@ impl TradingEngine {
         let result = self.state.apply_quote(quote.clone());
         match result {
             QuoteApplyResult::Accepted => {
+                self.entry_preflight.update_quote(&quote);
                 // The decision is evaluated only after all readiness inputs are
                 // fresh. The calculation itself performs no RPC, I/O, or locks.
                 self.refresh_phase(Instant::now());
@@ -1163,6 +1251,36 @@ impl TradingEngine {
         let Some((direction, trade, economics)) = candidate else {
             return Ok(());
         };
+        let dex_pool_generation = self.opportunities.pool_generation(trade.pool_index)?;
+        if let Some(barrier) = self.arbitrage_settlement_barriers.get(&trade.pool_index)
+            && dex_pool_generation <= barrier.pool_generation
+        {
+            self.telemetry.emit(
+                "arbitrage_admission_rejected",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": pair_id,
+                    "symbol": quote.symbol.as_ref(),
+                    "update_id": quote.update_id,
+                    "plan_id": format!(
+                        "paper-{}-{}-{}",
+                        quote.received_unix_us,
+                        quote.update_id,
+                        match direction {
+                            TradeDirection::BuyTokenBOnDexSellOnCex => "ds",
+                            TradeDirection::BuyTokenBOnCexSellOnDex => "cs",
+                        }
+                    ),
+                    "reason": "dex_settlement_waiting",
+                    "blocked_by_plan_id": barrier.plan_id,
+                    "pool_index": trade.pool_index,
+                    "pool_generation": dex_pool_generation,
+                    "barrier_generation": barrier.pool_generation,
+                    "barrier_age_ms": barrier.started_at.elapsed().as_millis(),
+                }),
+            );
+            return Ok(());
+        }
         let pair_config = self
             .domain_config
             .snapshot()
@@ -1187,10 +1305,13 @@ impl TradingEngine {
         )?;
         let opportunity = PaperOpportunity {
             source_revision: self.domain_config.snapshot().source.revision.clone(),
-            pair_id,
+            pair_id: pair_id.clone(),
+            symbol: pair_symbol.clone(),
             update_id: quote.update_id,
             received_unix_us: quote.received_unix_us,
             direction,
+            dex_pool_index: trade.pool_index,
+            dex_pool_generation,
             token_b_base_units: u256_to_i128(trade.token_b_amount, "paper token-B amount")?,
             token_b_step_base_units: u256_to_i128(token_b_step, "paper token-B step")?,
             cost_token_a_base_units: u256_to_i128(trade.cost_token_a, "paper token-A cost")?,
@@ -1291,7 +1412,16 @@ impl TradingEngine {
             );
             return Ok(());
         }
+        self.arbitrage_plan_freshness.insert(
+            plan_id.clone(),
+            ArbitragePlanFreshness {
+                pair_id: pair_id.clone(),
+                pool_index: trade.pool_index,
+                pool_generation: dex_pool_generation,
+            },
+        );
         if !handle.try_submit(opportunity) {
+            self.arbitrage_plan_freshness.remove(&plan_id);
             self.inventory.release_unsubmitted(&plan_id)?;
             self.telemetry.emit(
                 "arbitrage_admission_rejected",
@@ -1367,6 +1497,31 @@ impl TradingEngine {
         );
     }
 
+    fn reconcile_arbitrage_settlement(&mut self, pool_index: usize, prepared_generation: u64) {
+        let Some(barrier) = self.arbitrage_settlement_barriers.get(&pool_index) else {
+            return;
+        };
+        if prepared_generation <= barrier.pool_generation {
+            return;
+        }
+        let barrier = self
+            .arbitrage_settlement_barriers
+            .remove(&pool_index)
+            .expect("barrier existed above");
+        self.telemetry.emit(
+            "arbitrage_settlement_reconciled",
+            json!({
+                "engine_id": self.config.engine_id,
+                "pair_id": barrier.pair_id,
+                "plan_id": barrier.plan_id,
+                "pool_index": pool_index,
+                "barrier_generation": barrier.pool_generation,
+                "prepared_generation": prepared_generation,
+                "settlement_age_ms": barrier.started_at.elapsed().as_millis(),
+            }),
+        );
+    }
+
     pub fn on_paper_trade_event(&mut self, event: PaperTradeEvent) -> anyhow::Result<()> {
         match event.state {
             PaperTradeEventState::Balanced => {
@@ -1378,8 +1533,22 @@ impl TradingEngine {
                         "balanced arbitrage event has no in-memory reservation after restart"
                     );
                 }
+                if event.dex_filled
+                    && let Some(freshness) = self.arbitrage_plan_freshness.remove(&event.plan_id)
+                {
+                    self.arbitrage_settlement_barriers.insert(
+                        freshness.pool_index,
+                        ArbitrageSettlementBarrier {
+                            pair_id: freshness.pair_id,
+                            plan_id: event.plan_id.clone(),
+                            pool_generation: freshness.pool_generation,
+                            started_at: Instant::now(),
+                        },
+                    );
+                }
             }
             PaperTradeEventState::RejectedUnsubmitted => {
+                self.arbitrage_plan_freshness.remove(&event.plan_id);
                 if self.inventory.reservation(&event.plan_id).is_some() {
                     self.inventory.release_unsubmitted(&event.plan_id)?;
                 } else {
@@ -1389,7 +1558,9 @@ impl TradingEngine {
                     );
                 }
             }
-            PaperTradeEventState::BlockedUnknown => {}
+            PaperTradeEventState::BlockedUnknown => {
+                self.arbitrage_plan_freshness.remove(&event.plan_id);
+            }
         }
         self.telemetry.emit(
             "arbitrage_inventory_state",
@@ -1566,14 +1737,16 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
+    use alloy_primitives::U256;
+
     use crate::{
         execution_plan::{DexRoutePlan, DexSwapPlan},
-        rebalance::Direction,
+        rebalance::{Direction, RebalanceAction, Route},
     };
 
     use super::{
         RebalanceSettlementBarrier, TradingReadiness, mark_sequence_matched_update,
-        rebalance_health_state,
+        rebalance_action_requires_wallet_nonce, rebalance_health_state,
     };
 
     #[test]
@@ -1704,5 +1877,44 @@ mod tests {
         let settlement = rebalance_health_state(false, None, Some(timeout), timeout, timeout);
         assert!(settlement.settlement_stuck);
         assert!(!settlement.healthy);
+    }
+
+    #[test]
+    fn live_parallel_rebalance_allows_only_direct_binance_to_wallet_without_wallet_nonce() {
+        let direct_binance_to_wallet = RebalanceAction {
+            direction: Direction::BinanceToWallet,
+            amount: U256::ONE,
+            route: Route::Direct {
+                binance_network: "WLD".to_owned(),
+                chain_id: 480,
+            },
+        };
+        let direct_wallet_to_binance = RebalanceAction {
+            direction: Direction::WalletToBinance,
+            amount: U256::ONE,
+            route: Route::Direct {
+                binance_network: "WLD".to_owned(),
+                chain_id: 480,
+            },
+        };
+        let across_binance_to_wallet = RebalanceAction {
+            direction: Direction::BinanceToWallet,
+            amount: U256::ONE,
+            route: Route::Across {
+                binance_network: "OPTIMISM".to_owned(),
+                bridge_chain_id: 10,
+                wallet_chain_id: 480,
+            },
+        };
+
+        assert!(!rebalance_action_requires_wallet_nonce(
+            &direct_binance_to_wallet
+        ));
+        assert!(rebalance_action_requires_wallet_nonce(
+            &direct_wallet_to_binance
+        ));
+        assert!(rebalance_action_requires_wallet_nonce(
+            &across_binance_to_wallet
+        ));
     }
 }

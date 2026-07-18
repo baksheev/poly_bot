@@ -407,6 +407,17 @@ impl OpportunityEngine {
             .all(|(index, pair)| pair.is_none() || self.prepared_pools[index].is_some())
     }
 
+    pub fn pool_generation(&self, pool_index: usize) -> anyhow::Result<u64> {
+        self.pool_generations
+            .get(pool_index)
+            .copied()
+            .context("opportunity pool generation index is invalid")
+    }
+
+    pub fn pool_generations(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.pool_generations.iter().copied().enumerate()
+    }
+
     pub fn invalidate_pool(&mut self, pool_index: usize) -> anyhow::Result<()> {
         let cache = self
             .baseline_quote_cache
