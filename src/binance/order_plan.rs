@@ -13,6 +13,13 @@ pub struct PlannedLimitIoc {
     pub submitted_base_units: i128,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedMarketOrder {
+    pub request: BinanceOrderRequest,
+    pub target_base_units: i128,
+    pub submitted_base_units: i128,
+}
+
 /// Builds the same bounded LIMIT IOC shape for the primary hedge and every
 /// recovery. A target below one exchange step returns `None` and is dust.
 pub fn plan_limit_ioc(
@@ -76,6 +83,70 @@ pub fn plan_limit_ioc(
     };
     request.validate()?;
     Ok(Some(PlannedLimitIoc {
+        request,
+        target_base_units,
+        submitted_base_units,
+    }))
+}
+
+/// Builds the final CEX closeout used only after bounded LIMIT IOC recovery
+/// attempts expire. The command targets the exact remaining base quantity using
+/// Binance MARKET quantity semantics, so BUY and SELL closeouts are symmetric.
+pub fn plan_market_order(
+    operation_id: String,
+    client_order_id: String,
+    target_base_units: i128,
+    base_decimals: u8,
+    rules: &SymbolRules,
+) -> anyhow::Result<Option<PlannedMarketOrder>> {
+    ensure!(target_base_units != 0, "Binance target delta is zero");
+    ensure!(rules.status == "TRADING", "Binance symbol is not trading");
+    let absolute = target_base_units.unsigned_abs();
+    let quantity = decimal_from_base_units(absolute, base_decimals)?;
+    let step = if rules.market_lot_size.step > Decimal::ZERO {
+        rules.market_lot_size.step
+    } else {
+        rules.lot_size.step
+    };
+    let quantity = round_down(quantity, step)?;
+    if quantity.is_zero() {
+        return Ok(None);
+    }
+    let min = if rules.market_lot_size.min > Decimal::ZERO {
+        rules.market_lot_size.min
+    } else {
+        rules.lot_size.min
+    };
+    let max = if rules.market_lot_size.max > Decimal::ZERO {
+        rules.market_lot_size.max
+    } else {
+        rules.lot_size.max
+    };
+    ensure!(
+        quantity >= min && quantity <= max,
+        "Binance MARKET quantity is outside MARKET_LOT_SIZE"
+    );
+    let submitted_absolute = base_units_from_decimal(quantity, base_decimals)?;
+    let submitted_absolute =
+        i128::try_from(submitted_absolute).context("Binance submitted quantity exceeds i128")?;
+    let submitted_base_units = if target_base_units > 0 {
+        submitted_absolute
+    } else {
+        -submitted_absolute
+    };
+    let kind = if target_base_units > 0 {
+        BinanceOrderRequestKind::MarketBuyQuantity { quantity }
+    } else {
+        BinanceOrderRequestKind::MarketSell { quantity }
+    };
+    let request = BinanceOrderRequest {
+        operation_id,
+        client_order_id,
+        symbol: rules.symbol.clone(),
+        kind,
+    };
+    request.validate()?;
+    Ok(Some(PlannedMarketOrder {
         request,
         target_base_units,
         submitted_base_units,
@@ -161,7 +232,7 @@ mod tests {
     use crate::binance::{
         account::{DecimalFilter, SymbolRules},
         execution::BinanceOrderRequestKind,
-        order_plan::{plan_limit_ioc, recovery_client_order_id},
+        order_plan::{plan_limit_ioc, plan_market_order, recovery_client_order_id},
     };
 
     fn rules() -> SymbolRules {
@@ -245,5 +316,39 @@ mod tests {
             recovery_client_order_id("rustarb123", 2).unwrap(),
             "rustarb123r2"
         );
+    }
+
+    #[test]
+    fn market_closeout_uses_exact_base_quantity_for_buy_and_sell() {
+        let buy = plan_market_order(
+            "rustarb-market-buy".to_owned(),
+            "rustarb-market-buy".to_owned(),
+            12_345_678_901_234_567_890,
+            18,
+            &rules(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(buy.submitted_base_units, 12_300_000_000_000_000_000);
+        assert!(matches!(
+            buy.request.kind,
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity }
+                if quantity == Decimal::new(123, 1)
+        ));
+
+        let sell = plan_market_order(
+            "rustarb-market-sell".to_owned(),
+            "rustarb-market-sell".to_owned(),
+            -12_345_678_901_234_567_890,
+            18,
+            &rules(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sell.submitted_base_units, -12_300_000_000_000_000_000);
+        assert!(matches!(
+            sell.request.kind,
+            BinanceOrderRequestKind::MarketSell { quantity } if quantity == Decimal::new(123, 1)
+        ));
     }
 }

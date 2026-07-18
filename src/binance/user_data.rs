@@ -12,8 +12,9 @@ use crate::{
     binance::{
         account::BinanceCredentials,
         ws_api::{
-            OrderResult, WsApiError, limit_ioc_params, market_buy_params, market_sell_params,
-            validate_client_order_id, validate_symbol,
+            OrderResult, WsApiError, limit_ioc_params, market_buy_params,
+            market_buy_quantity_params, market_sell_params, validate_client_order_id,
+            validate_symbol,
         },
     },
     config::AppConfig,
@@ -163,6 +164,19 @@ impl MultiplexedBinanceWsApi {
         self.call(
             "order.place",
             market_buy_params(symbol, quote_order_qty, client_order_id)?,
+        )
+        .await
+    }
+
+    pub async fn place_market_buy_quantity(
+        &self,
+        symbol: &str,
+        quantity: Decimal,
+        client_order_id: &str,
+    ) -> Result<OrderResult, WsApiError> {
+        self.call(
+            "order.place",
+            market_buy_quantity_params(symbol, quantity, client_order_id)?,
         )
         .await
     }

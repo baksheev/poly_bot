@@ -19,7 +19,7 @@ use crate::{
     binance::{
         account::SymbolRules,
         execution::{BinanceExecutionService, BinanceExecutionServiceError},
-        order_plan::{plan_limit_ioc, recovery_client_order_id},
+        order_plan::{plan_limit_ioc, plan_market_order, recovery_client_order_id},
     },
     dex::execution::{DexExecutionService, DexExecutionServiceError},
     execution_accounting::{binance_leg_result, dex_leg_result, native_gas_to_token_a_base_units},
@@ -185,7 +185,7 @@ impl ComposedLiveLegExecutor {
                 target_token_b_delta_base_units,
                 limit_price,
             } => {
-                self.execute_cex(
+                self.execute_cex_limit(
                     LegRole::Cex,
                     client_order_id.clone(),
                     *target_token_b_delta_base_units,
@@ -196,7 +196,6 @@ impl ComposedLiveLegExecutor {
             CoordinatorCommand::RecoverCex {
                 attempt,
                 target_token_b_delta_base_units,
-                limit_price,
             } => {
                 let client_order_id =
                     match recovery_client_order_id(&intent.cex_client_order_id, *attempt) {
@@ -206,18 +205,17 @@ impl ComposedLiveLegExecutor {
                             return failed(LegRole::RecoveryCex, "cex:invalid-recovery-id");
                         }
                     };
-                self.execute_cex(
+                self.execute_cex_market(
                     LegRole::RecoveryCex,
                     client_order_id,
                     *target_token_b_delta_base_units,
-                    *limit_price,
                 )
                 .await
             }
         }
     }
 
-    async fn execute_cex(
+    async fn execute_cex_limit(
         &self,
         role: LegRole,
         client_order_id: String,
@@ -279,6 +277,67 @@ impl ComposedLiveLegExecutor {
                     "Binance child outcome requires journal reconciliation"
                 );
                 unknown(role, "cex:child-unknown")
+            }
+        }
+    }
+
+    async fn execute_cex_market(
+        &self,
+        role: LegRole,
+        client_order_id: String,
+        target_token_b_delta_base_units: i128,
+    ) -> (LegRole, LegResult) {
+        let planned = match plan_market_order(
+            client_order_id.clone(),
+            client_order_id.clone(),
+            target_token_b_delta_base_units,
+            self.base_decimals,
+            &self.rules,
+        ) {
+            Ok(Some(planned)) => planned,
+            Ok(None) => return failed(role, "cex:market-sub-step-command"),
+            Err(error) => {
+                tracing::error!(client_order_id, error = %error, "Binance MARKET closeout plan is invalid");
+                return failed(role, "cex:invalid-market-plan");
+            }
+        };
+        match self.binance.execute(planned.request).await {
+            Ok(outcome) => match binance_leg_result(
+                &outcome.order,
+                &self.base_asset,
+                self.base_decimals,
+                &self.quote_asset,
+                self.quote_decimals,
+            ) {
+                Ok(result) => (role, result),
+                Err(error) => {
+                    tracing::error!(client_order_id, error = %error, "Binance market fill accounting is unknown");
+                    unknown(role, "cex:market-accounting-unknown")
+                }
+            },
+            Err(BinanceExecutionServiceError::FailedBeforeSubmission { reason }) => {
+                tracing::warn!(
+                    client_order_id,
+                    reason,
+                    "Binance market closeout failed before submission"
+                );
+                failed(role, "cex:market-unsubmitted")
+            }
+            Err(BinanceExecutionServiceError::Rejected { reason }) => {
+                tracing::warn!(
+                    client_order_id,
+                    reason,
+                    "Binance market closeout was deterministically rejected"
+                );
+                failed(role, "cex:market-rejected")
+            }
+            Err(BinanceExecutionServiceError::OutcomeUnknown { reason }) => {
+                tracing::error!(
+                    client_order_id,
+                    reason,
+                    "Binance market closeout outcome requires journal reconciliation"
+                );
+                unknown(role, "cex:market-child-unknown")
             }
         }
     }
@@ -382,7 +441,10 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             .filter(|operation| {
                 matches!(
                     operation.stage,
-                    TradeStage::Prepared | TradeStage::Executing | TradeStage::Recovering
+                    TradeStage::Prepared
+                        | TradeStage::Executing
+                        | TradeStage::Recovering
+                        | TradeStage::Halted
                 )
             })
             .map(|operation| operation.intent.plan_id.clone())

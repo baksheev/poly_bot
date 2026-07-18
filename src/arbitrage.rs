@@ -25,7 +25,7 @@ use crate::{execution_plan::DexSwapPlan, telemetry::TelemetryHandle};
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
-const MAX_RECOVERY_ATTEMPTS: usize = 2;
+const MAX_RECOVERY_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,16 +132,6 @@ impl AdmissionRiskBounds {
             "maximum gas cost is zero"
         );
         Ok(())
-    }
-
-    fn recovery_limit_for_target(&self, target_token_b_delta_base_units: i128) -> Decimal {
-        if target_token_b_delta_base_units < 0 {
-            self.cex_recovery_sell_limit_price
-                .unwrap_or(self.cex_recovery_limit_price)
-        } else {
-            self.cex_recovery_buy_limit_price
-                .unwrap_or(self.cex_recovery_limit_price)
-        }
     }
 
     fn recovery_quote_for_residual(&self, residual_token_b_base_units: i128) -> u128 {
@@ -288,10 +278,7 @@ pub enum TradeStage {
 
 impl TradeStage {
     pub const fn terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::BalancedProfit | Self::BalancedLoss | Self::Halted
-        )
+        matches!(self, Self::BalancedProfit | Self::BalancedLoss)
     }
 }
 
@@ -436,7 +423,6 @@ pub enum CoordinatorCommand {
     RecoverCex {
         attempt: usize,
         target_token_b_delta_base_units: i128,
-        limit_price: Option<Decimal>,
     },
 }
 
@@ -663,7 +649,10 @@ impl PaperTradeTask {
             .filter(|operation| {
                 matches!(
                     operation.stage,
-                    TradeStage::Prepared | TradeStage::Executing | TradeStage::Recovering
+                    TradeStage::Prepared
+                        | TradeStage::Executing
+                        | TradeStage::Recovering
+                        | TradeStage::Halted
                 )
             })
             .map(|operation| operation.intent.plan_id.clone())
@@ -789,7 +778,7 @@ fn simulate_command(
             simulated_cex_result(
                 intent,
                 *target_token_b_delta_base_units,
-                &format!("recovery:{attempt}"),
+                &format!("recovery:market:{attempt}"),
             )?,
         )),
     }
@@ -932,14 +921,10 @@ impl PaperTradeCoordinator {
         }
         if operation.recovery_inflight {
             let target = -operation.actionable_token_b_residual_base_units();
+            let attempt = operation.recovery_results.len() + 1;
             return Ok(Some(CoordinatorCommand::RecoverCex {
-                attempt: operation.recovery_results.len() + 1,
+                attempt,
                 target_token_b_delta_base_units: target,
-                limit_price: operation
-                    .intent
-                    .admission
-                    .as_ref()
-                    .map(|bounds| bounds.recovery_limit_for_target(target)),
             }));
         }
         Ok(None)
@@ -1030,11 +1015,6 @@ impl PaperTradeCoordinator {
                 commands.push(CoordinatorCommand::RecoverCex {
                     attempt,
                     target_token_b_delta_base_units: target,
-                    limit_price: operation
-                        .intent
-                        .admission
-                        .as_ref()
-                        .map(|bounds| bounds.recovery_limit_for_target(target)),
                 });
                 self.journal.append(operation)?;
             } else {
@@ -1457,6 +1437,7 @@ fn stage_transition_allowed(previous: &TradeStage, next: &TradeStage) -> bool {
                     TradeStage::UnknownExposure,
                     TradeStage::Executing | TradeStage::Recovering | TradeStage::Halted
                 )
+                | (TradeStage::Halted, TradeStage::Recovering)
         )
 }
 
@@ -1649,6 +1630,16 @@ mod tests {
         }
     }
 
+    fn failed(reference: &str) -> LegResult {
+        LegResult {
+            status: LegStatus::Failed,
+            token_b_delta_base_units: 0,
+            token_a_delta_base_units: 0,
+            gas_cost_token_a_base_units: 0,
+            venue_reference: reference.to_owned(),
+        }
+    }
+
     #[test]
     fn zero_bounded_profit_is_valid_for_rails_style_admission() {
         let mut intent = intent(ExecutionMode::DexFirst);
@@ -1828,8 +1819,8 @@ mod tests {
             [CoordinatorCommand::RecoverCex {
                 attempt: 1,
                 target_token_b_delta_base_units: -8,
-                limit_price: Some(price),
-            }] if *price == Decimal::new(99, 2)
+                ..
+            }]
         ));
         coordinator
             .record_result(
@@ -1854,7 +1845,156 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_overhedge_uses_buy_recovery_limit_across_restart() {
+    fn limit_residual_goes_directly_to_market_closeout() {
+        let path = path("market-closeout");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, filled(100, -1_000, "dex:0x-market"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, failed("cex:expired-primary"))
+            .unwrap();
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex {
+                attempt: 1,
+                target_token_b_delta_base_units: -100,
+                ..
+            }]
+        ));
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                filled(-100, 990, "cex:market-closeout"),
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, TradeStage::BalancedLoss);
+        assert_eq!(operation.token_b_residual_base_units(), 0);
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn partial_market_closeout_retries_only_remaining_residual() {
+        let path = path("partial-market-closeout");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                filled(100, -1_000, "dex:0x-partial-market"),
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, failed("cex:expired-primary"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                filled(-40, 396, "cex:partial-market-r1"),
+            )
+            .unwrap();
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex {
+                attempt: 2,
+                target_token_b_delta_base_units: -60,
+                ..
+            }]
+        ));
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                filled(-60, 594, "cex:market-closeout-r2"),
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, TradeStage::BalancedLoss);
+        assert_eq!(operation.token_b_residual_base_units(), 0);
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_halted_after_two_limits_resumes_market_closeout() {
+        let path = path("legacy-halted-market-closeout");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                filled(100, -1_000, "dex:legacy-halted"),
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, failed("cex:expired-primary"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::RecoveryCex, failed("cex:expired-r1"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::RecoveryCex, failed("cex:expired-r2"))
+            .unwrap();
+        let mut legacy = coordinator.operation(&plan_id).unwrap().clone();
+        legacy.stage = TradeStage::Halted;
+        legacy.blocking_reason = Some("recovery_attempts_exhausted".to_owned());
+        coordinator.journal.append(legacy).unwrap();
+        drop(coordinator);
+
+        let mut recovered = PaperTradeCoordinator::open(&path).unwrap();
+        assert!(matches!(
+            recovered.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex {
+                attempt: 3,
+                target_token_b_delta_base_units: -100,
+                ..
+            }]
+        ));
+        recovered
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                filled(-100, 990, "cex:market-closeout"),
+            )
+            .unwrap();
+        recovered.take_commands(&plan_id).unwrap();
+        assert_eq!(
+            recovered.operation(&plan_id).unwrap().stage,
+            TradeStage::BalancedLoss
+        );
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_overhedge_uses_buy_market_recovery_across_restart() {
         let path = path("concurrent-overhedge");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
@@ -1873,8 +2013,8 @@ mod tests {
             [CoordinatorCommand::RecoverCex {
                 attempt: 1,
                 target_token_b_delta_base_units: 7,
-                limit_price: Some(price),
-            }] if *price == Decimal::new(101, 2)
+                ..
+            }]
         ));
         drop(coordinator);
 
@@ -1884,8 +2024,8 @@ mod tests {
             Some(CoordinatorCommand::RecoverCex {
                 attempt: 1,
                 target_token_b_delta_base_units: 7,
-                limit_price: Some(price),
-            }) if price == Decimal::new(101, 2)
+                ..
+            })
         ));
         coordinator
             .record_result(

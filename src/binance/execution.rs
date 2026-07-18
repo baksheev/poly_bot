@@ -18,6 +18,9 @@ pub enum BinanceOrderRequestKind {
     MarketBuy {
         quote_quantity: Decimal,
     },
+    MarketBuyQuantity {
+        quantity: Decimal,
+    },
     MarketSell {
         quantity: Decimal,
     },
@@ -65,6 +68,12 @@ impl BinanceOrderRequest {
                     "market BUY quote quantity must be positive"
                 );
             }
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity } => {
+                ensure!(
+                    *quantity > Decimal::ZERO,
+                    "market BUY quantity must be positive"
+                );
+            }
             BinanceOrderRequestKind::MarketSell { quantity } => {
                 ensure!(
                     *quantity > Decimal::ZERO,
@@ -96,6 +105,13 @@ impl BinanceOrderRequest {
                 "MARKET".to_owned(),
                 None,
                 Some(decimal_string(*quote_quantity)),
+                None,
+            ),
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity } => (
+                "BUY".to_owned(),
+                "MARKET".to_owned(),
+                Some(decimal_string(*quantity)),
+                None,
                 None,
             ),
             BinanceOrderRequestKind::MarketSell { quantity } => (
@@ -251,6 +267,11 @@ impl BinanceExecutor {
             BinanceOrderRequestKind::MarketBuy { quote_quantity } => {
                 self.client
                     .place_market_buy(&symbol, *quote_quantity, &client_order_id)
+                    .await
+            }
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity } => {
+                self.client
+                    .place_market_buy_quantity(&symbol, *quantity, &client_order_id)
                     .await
             }
             BinanceOrderRequestKind::MarketSell { quantity } => {
@@ -647,6 +668,10 @@ fn validate_response(request: &BinanceOrderRequest, order: &OrderResult) -> anyh
         BinanceOrderRequestKind::MarketBuy { quote_quantity } => ensure!(
             order.cummulative_quote_qty <= *quote_quantity,
             "MARKET buy exceeded its quote quantity cap"
+        ),
+        BinanceOrderRequestKind::MarketBuyQuantity { quantity } => ensure!(
+            order.executed_qty <= *quantity,
+            "MARKET buy exceeded its base quantity"
         ),
         BinanceOrderRequestKind::MarketSell { quantity } => ensure!(
             order.executed_qty <= *quantity,

@@ -428,6 +428,27 @@ pub(crate) fn market_buy_params(
     Ok(params)
 }
 
+pub(crate) fn market_buy_quantity_params(
+    symbol: &str,
+    quantity: Decimal,
+    client_order_id: &str,
+) -> Result<Map<String, Value>, WsApiError> {
+    validate_symbol(symbol)?;
+    validate_client_order_id(client_order_id)?;
+    if quantity <= Decimal::ZERO {
+        return Err(WsApiError::Protocol(
+            "order quantity must be positive".to_owned(),
+        ));
+    }
+    let mut params = common_order_params(symbol, "BUY", client_order_id);
+    params.insert("type".to_owned(), Value::String("MARKET".to_owned()));
+    params.insert(
+        "quantity".to_owned(),
+        Value::String(quantity.normalize().to_string()),
+    );
+    Ok(params)
+}
+
 pub(crate) fn market_sell_params(
     symbol: &str,
     quantity: Decimal,
@@ -600,7 +621,8 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::{
-        OrderResult, limit_ioc_params, market_buy_params, market_sell_params, signature_payload,
+        OrderResult, limit_ioc_params, market_buy_params, market_buy_quantity_params,
+        market_sell_params, signature_payload,
     };
 
     fn order(side: &str, executed: &str, quote: &str, fills: serde_json::Value) -> OrderResult {
@@ -664,6 +686,16 @@ mod tests {
         let params = market_buy_params("WLDUSDC", Decimal::new(100, 0), "rustval123B").unwrap();
 
         assert_eq!(params["quoteOrderQty"], "100");
+        assert_eq!(params["newOrderRespType"], "FULL");
+        assert_eq!(params["type"], "MARKET");
+    }
+
+    #[test]
+    fn market_buy_can_use_exact_base_quantity_and_full_response() {
+        let params =
+            market_buy_quantity_params("WLDUSDC", Decimal::new(245, 1), "rustval123B").unwrap();
+
+        assert_eq!(params["quantity"], "24.5");
         assert_eq!(params["newOrderRespType"], "FULL");
         assert_eq!(params["type"], "MARKET");
     }
