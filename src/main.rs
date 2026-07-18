@@ -47,7 +47,7 @@ use arb_bot::{
         RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
         route_candidates_from_capital,
     },
-    telemetry::TelemetryWriter,
+    telemetry::{ARBITRAGE_RESULT_KIND, TelemetryWriter},
     wallet::{
         EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV,
         hydrate_chain_wallet,
@@ -196,6 +196,11 @@ async fn main() -> anyhow::Result<()> {
             order_journal_path,
             &live_confirmation,
         ),
+        Command::ArbitrageEmitResult {
+            plan_id,
+            engine_id,
+            live_confirmation,
+        } => arbitrage_emit_result(&cli.config, &plan_id, engine_id, &live_confirmation).await,
         Command::AcrossUsdcQuote {
             origin_chain_id,
             amount,
@@ -284,6 +289,53 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn arbitrage_emit_result(
+    config: &config::AppConfig,
+    plan_id: &str,
+    engine_id: Option<String>,
+    live_confirmation: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        live_confirmation == "EMIT_LIVE_ARBITRAGE_RESULT",
+        "live arbitrage result emission requires ARBITRAGE_EMIT_RESULT_CONFIRMATION=EMIT_LIVE_ARBITRAGE_RESULT"
+    );
+    let coordinator = PaperTradeCoordinator::open(&config.arbitrage_trade_journal_path)?;
+    let operation = coordinator
+        .operation(plan_id)
+        .with_context(|| format!("unknown arbitrage plan {plan_id}"))?;
+    ensure!(
+        matches!(
+            operation.stage,
+            TradeStage::BalancedProfit | TradeStage::BalancedLoss
+        ),
+        "arbitrage plan is not terminal balanced"
+    );
+    let engine_id = engine_id.unwrap_or_else(|| config.engine_id.clone());
+    let mut payload = operation.result_telemetry_payload(&engine_id)?;
+    let object = payload
+        .as_object_mut()
+        .context("live result payload is not an object")?;
+    object.insert("simulation".to_owned(), serde_json::Value::Bool(false));
+    object.insert(
+        "includes_binance_fee".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    object.insert("includes_gas".to_owned(), serde_json::Value::Bool(true));
+    object.insert(
+        "comparable_to_live".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    TelemetryWriter::new(config)
+        .emit_once(ARBITRAGE_RESULT_KIND, payload)
+        .await?;
+    tracing::info!(
+        plan_id,
+        engine_id,
+        "terminal live arbitrage result emitted from trade journal"
+    );
+    Ok(())
 }
 
 fn arbitrage_reconcile_cex(

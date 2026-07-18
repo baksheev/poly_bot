@@ -85,6 +85,18 @@ pub enum Command {
         #[arg(long, env = "ARBITRAGE_RECONCILE_CONFIRMATION", default_value = "")]
         live_confirmation: String,
     },
+    /// Emit one terminal live arbitrage result from the trade journal to ClickHouse.
+    ArbitrageEmitResult {
+        /// Parent arbitrage plan id with a terminal balanced result.
+        #[arg(long)]
+        plan_id: String,
+        /// Engine id to attach to the emitted result; defaults to ENGINE_ID.
+        #[arg(long)]
+        engine_id: Option<String>,
+        /// Explicit live-result emission acknowledgement.
+        #[arg(long, env = "ARBITRAGE_EMIT_RESULT_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
     /// Fetch and validate a public unauthenticated Across USDC quote.
     AcrossUsdcQuote {
         /// Origin chain: 10 (Optimism) or 480 (World Chain).

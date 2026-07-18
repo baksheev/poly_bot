@@ -1370,10 +1370,24 @@ impl TradingEngine {
     pub fn on_paper_trade_event(&mut self, event: PaperTradeEvent) -> anyhow::Result<()> {
         match event.state {
             PaperTradeEventState::Balanced => {
-                self.inventory.mark_pending_settlement(&event.plan_id)?;
+                if self.inventory.reservation(&event.plan_id).is_some() {
+                    self.inventory.mark_pending_settlement(&event.plan_id)?;
+                } else {
+                    tracing::warn!(
+                        plan_id = %event.plan_id,
+                        "balanced arbitrage event has no in-memory reservation after restart"
+                    );
+                }
             }
             PaperTradeEventState::RejectedUnsubmitted => {
-                self.inventory.release_unsubmitted(&event.plan_id)?;
+                if self.inventory.reservation(&event.plan_id).is_some() {
+                    self.inventory.release_unsubmitted(&event.plan_id)?;
+                } else {
+                    tracing::warn!(
+                        plan_id = %event.plan_id,
+                        "rejected arbitrage event has no in-memory reservation after restart"
+                    );
+                }
             }
             PaperTradeEventState::BlockedUnknown => {}
         }

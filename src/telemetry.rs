@@ -99,6 +99,15 @@ impl TelemetryWriter {
         )
     }
 
+    pub async fn emit_once(&self, kind: &'static str, payload: Value) -> anyhow::Result<()> {
+        let record = TelemetryRecord {
+            observed_at_ms: unix_timestamp_ms(),
+            kind,
+            payload_json: payload.to_string(),
+        };
+        self.insert(&[record]).await
+    }
+
     pub async fn migrate(&self) -> anyhow::Result<()> {
         let client = self
             .client
