@@ -115,11 +115,15 @@ fn decimal_to_signed_base_units(value: Decimal, decimals: u8) -> anyhow::Result<
             .context("signed base-unit conversion overflow");
     }
     let divisor = pow10_i128(scale - u32::from(decimals))?;
-    ensure!(
-        mantissa % divisor == 0,
-        "decimal amount cannot be represented in configured base units"
-    );
-    Ok(mantissa / divisor)
+    let quotient = mantissa / divisor;
+    let remainder = mantissa % divisor;
+    if remainder == 0 || mantissa >= 0 {
+        Ok(quotient)
+    } else {
+        quotient
+            .checked_sub(1)
+            .context("signed base-unit conservative rounding overflow")
+    }
 }
 
 fn pow10_i128(exponent: u32) -> anyhow::Result<i128> {
@@ -150,7 +154,7 @@ mod tests {
 
     use crate::{
         arbitrage::{ArbitrageDirection, LegStatus},
-        binance::ws_api::OrderResult,
+        binance::ws_api::{OrderFill, OrderResult},
         dex::execution::{SwapExecutionOutcome, UniswapProtocol},
     };
 
@@ -172,6 +176,16 @@ mod tests {
             order_type: "LIMIT".to_owned(),
             side: side.to_owned(),
             fills: vec![],
+        }
+    }
+
+    fn fill(price: &str, qty: &str, commission: &str, commission_asset: &str) -> OrderFill {
+        OrderFill {
+            price: price.parse().unwrap(),
+            qty: qty.parse().unwrap(),
+            commission: commission.parse().unwrap(),
+            commission_asset: commission_asset.to_owned(),
+            trade_id: 1,
         }
     }
 
@@ -209,6 +223,18 @@ mod tests {
         assert_eq!(result.status, LegStatus::Filled);
         assert_eq!(result.token_b_delta_base_units, -1_200_000_000_000_000_000);
         assert_eq!(result.token_a_delta_base_units, 975_000);
+    }
+
+    #[test]
+    fn binance_quote_commission_rounds_conservatively_to_token_base_units() {
+        let mut order = order("SELL", "FILLED", "51.90000000", "20.01264000");
+        order.fills = vec![fill("0.38560000", "51.90000000", "0.02001264", "USDC")];
+
+        let result = binance_leg_result(&order, "WLD", 18, "USDC", 6).unwrap();
+
+        assert_eq!(result.status, LegStatus::Filled);
+        assert_eq!(result.token_b_delta_base_units, -51_900_000_000_000_000_000);
+        assert_eq!(result.token_a_delta_base_units, 19_992_627);
     }
 
     #[test]

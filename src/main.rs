@@ -7,7 +7,9 @@ use arb_bot::{
         AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
         WORLD_CHAIN_USDC, validate_quote,
     },
-    arbitrage::{ExecutionMode, paper_trade_channel},
+    arbitrage::{
+        ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator, TradeStage, paper_trade_channel,
+    },
     balances::{
         BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
     },
@@ -18,6 +20,7 @@ use arb_bot::{
     },
     binance::{
         execution::BinanceExecutionService,
+        order_journal::{BinanceOrderJournal, BinanceOrderProgress},
         user_data::UserDataStream,
         validation::{BinanceCanaryKind, execute_order_round_trip},
         ws_api::BinanceWsApiClient,
@@ -33,6 +36,7 @@ use arb_bot::{
     },
     domain::config::{DexProvider, LoadedDomainConfig},
     engine::{BinanceFeeBps, TradingEngine},
+    execution_accounting::binance_leg_result,
     live_execution::{ComposedLiveLegExecutor, LiveRiskLimits, live_trade_channel},
     market_data::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
@@ -182,6 +186,16 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceTravelRuleWithdrawalStatus { tr_id } => {
             binance_travel_rule_withdrawal_status(&cli.config, tr_id).await
         }
+        Command::ArbitrageReconcileCex {
+            plan_id,
+            order_journal_path,
+            live_confirmation,
+        } => arbitrage_reconcile_cex(
+            &cli.config,
+            &plan_id,
+            order_journal_path,
+            &live_confirmation,
+        ),
         Command::AcrossUsdcQuote {
             origin_chain_id,
             amount,
@@ -270,6 +284,99 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn arbitrage_reconcile_cex(
+    config: &config::AppConfig,
+    plan_id: &str,
+    order_journal_path: PathBuf,
+    live_confirmation: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        live_confirmation == "RECONCILE_LIVE_ARBITRAGE_CEX",
+        "live arbitrage CEX reconciliation requires ARBITRAGE_RECONCILE_CONFIRMATION=RECONCILE_LIVE_ARBITRAGE_CEX"
+    );
+    let domain_config = LoadedDomainConfig::load(&config.domain_config_path)?;
+    let execution_pairs = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .filter(|pair| pair.execution_enabled)
+        .collect::<Vec<_>>();
+    ensure!(
+        execution_pairs.len() == 1,
+        "arbitrage CEX reconciliation requires exactly one execution-enabled pair"
+    );
+    let pair = execution_pairs[0];
+
+    let mut coordinator = PaperTradeCoordinator::open(&config.arbitrage_trade_journal_path)?;
+    let operation = coordinator
+        .operation(plan_id)
+        .with_context(|| format!("unknown arbitrage plan {plan_id}"))?
+        .clone();
+    ensure!(
+        operation.stage == TradeStage::UnknownExposure,
+        "arbitrage plan is not waiting for unknown-outcome reconciliation"
+    );
+    ensure!(
+        operation.intent.pair_id == pair.id,
+        "arbitrage plan pair does not match the execution-enabled domain pair"
+    );
+    ensure!(
+        operation
+            .cex_result
+            .as_ref()
+            .is_some_and(|result| result.status == LegStatus::Unknown),
+        "arbitrage plan CEX leg is not unknown"
+    );
+
+    let order_journal = BinanceOrderJournal::open(order_journal_path)?;
+    let order_operation = order_journal
+        .operations()
+        .get(&operation.intent.cex_client_order_id)
+        .with_context(|| {
+            format!(
+                "Binance order journal is missing {}",
+                operation.intent.cex_client_order_id
+            )
+        })?;
+    ensure!(
+        order_operation.intent.symbol == pair.binance.symbol,
+        "Binance order symbol does not match domain pair"
+    );
+    let BinanceOrderProgress::Terminal {
+        order_id,
+        status,
+        order: Some(order),
+        ..
+    } = &order_operation.progress
+    else {
+        anyhow::bail!("Binance order is not terminal with full order details in the journal");
+    };
+    ensure!(
+        order.client_order_id == operation.intent.cex_client_order_id,
+        "journaled Binance order client id does not match the arbitrage intent"
+    );
+
+    let result = binance_leg_result(
+        order,
+        &pair.binance.base_asset,
+        pair.token_b.decimals,
+        &pair.binance.quote_asset,
+        pair.token_a.decimals,
+    )?;
+    coordinator.reconcile_unknown(plan_id, LegRole::Cex, result.clone())?;
+    tracing::info!(
+        plan_id,
+        client_order_id = %operation.intent.cex_client_order_id,
+        order_id,
+        status,
+        token_b_delta_base_units = result.token_b_delta_base_units,
+        token_a_delta_base_units = result.token_a_delta_base_units,
+        venue_reference = %result.venue_reference,
+        "arbitrage CEX unknown exposure reconciled from Binance order journal"
+    );
+    Ok(())
 }
 
 async fn across_usdc_quote(

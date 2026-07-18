@@ -73,6 +73,18 @@ pub enum Command {
         #[arg(long)]
         tr_id: i64,
     },
+    /// Reconcile a live arbitrage CEX unknown outcome from the Binance order journal.
+    ArbitrageReconcileCex {
+        /// Parent arbitrage plan id waiting in unknown_exposure.
+        #[arg(long)]
+        plan_id: String,
+        /// Durable, process-locked arbitrage Binance order journal.
+        #[arg(long, env = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH")]
+        order_journal_path: PathBuf,
+        /// Explicit live-reconciliation acknowledgement.
+        #[arg(long, env = "ARBITRAGE_RECONCILE_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
     /// Fetch and validate a public unauthenticated Across USDC quote.
     AcrossUsdcQuote {
         /// Origin chain: 10 (Optimism) or 480 (World Chain).
