@@ -65,12 +65,32 @@ curl --fail --silent --show-error \
 
 audit_query="
 SELECT
-    uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_admitted') AS admitted,
-    uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_result') AS balanced,
-    uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_inventory_state' AND JSONExtractString(payload_json, 'state') = 'BlockedUnknown') AS blocked_unknown
-FROM arb_bot_prod.runtime_telemetry
-WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
-  AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+    (
+        SELECT uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_admitted')
+        FROM arb_bot_prod.runtime_telemetry
+        WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+          AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+    ) AS admitted,
+    (
+        SELECT uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_result')
+        FROM arb_bot_prod.runtime_telemetry
+        WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+          AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+    ) AS balanced,
+    countIf(blocked_at > 0 AND blocked_at > result_at) AS blocked_unknown
+FROM
+(
+    SELECT
+        JSONExtractString(payload_json, 'plan_id') AS plan_id,
+        maxIf(observed_at_ms, kind = 'arbitrage_inventory_state' AND JSONExtractString(payload_json, 'state') = 'BlockedUnknown') AS blocked_at,
+        maxIf(observed_at_ms, kind = 'arbitrage_result') AS result_at
+    FROM arb_bot_prod.runtime_telemetry
+    WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+      AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+      AND kind IN ('arbitrage_result', 'arbitrage_inventory_state')
+    GROUP BY plan_id
+)
+WHERE plan_id != ''
 FORMAT TabSeparated
 "
 echo "rust_admitted|rust_balanced|rust_blocked_unknown"
