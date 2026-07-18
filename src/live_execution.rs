@@ -44,18 +44,32 @@ pub struct ComposedLiveLegExecutor {
     base_decimals: u8,
     quote_asset: String,
     quote_decimals: u8,
+    market_buy_recovery_fee_bps: u16,
+}
+
+pub struct ComposedLiveLegExecutorConfig {
+    pub rules: SymbolRules,
+    pub base_asset: String,
+    pub base_decimals: u8,
+    pub quote_asset: String,
+    pub quote_decimals: u8,
+    pub market_buy_recovery_fee_bps: u16,
 }
 
 impl ComposedLiveLegExecutor {
     pub fn new(
         dex: DexExecutionService,
         binance: BinanceExecutionService,
-        rules: SymbolRules,
-        base_asset: String,
-        base_decimals: u8,
-        quote_asset: String,
-        quote_decimals: u8,
+        config: ComposedLiveLegExecutorConfig,
     ) -> anyhow::Result<Self> {
+        let ComposedLiveLegExecutorConfig {
+            rules,
+            base_asset,
+            base_decimals,
+            quote_asset,
+            quote_decimals,
+            market_buy_recovery_fee_bps,
+        } = config;
         ensure!(
             rules.symbol == format!("{base_asset}{quote_asset}"),
             "live symbol mismatch"
@@ -69,6 +83,10 @@ impl ComposedLiveLegExecutor {
             base_decimals <= 36 && quote_decimals <= 36,
             "live token decimals invalid"
         );
+        ensure!(
+            market_buy_recovery_fee_bps < 10_000,
+            "live Binance market BUY recovery fee is invalid"
+        );
         Ok(Self {
             dex,
             binance,
@@ -77,6 +95,7 @@ impl ComposedLiveLegExecutor {
             base_decimals,
             quote_asset,
             quote_decimals,
+            market_buy_recovery_fee_bps,
         })
     }
 
@@ -293,6 +312,7 @@ impl ComposedLiveLegExecutor {
             target_token_b_delta_base_units,
             self.base_decimals,
             &self.rules,
+            self.market_buy_recovery_fee_bps,
         ) {
             Ok(Some(planned)) => planned,
             Ok(None) => return failed(role, "cex:market-sub-step-command"),

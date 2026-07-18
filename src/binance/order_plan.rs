@@ -89,26 +89,40 @@ pub fn plan_limit_ioc(
     }))
 }
 
-/// Builds the final CEX closeout used only after bounded LIMIT IOC recovery
-/// attempts expire. The command targets the exact remaining base quantity using
-/// Binance MARKET quantity semantics, so BUY and SELL closeouts are symmetric.
+/// Builds the final CEX closeout used after a bounded LIMIT IOC leaves a
+/// proven residual. BUY closeouts can be grossed up by the conservative taker
+/// fee because Binance commonly charges BUY commission in the received base
+/// asset; without the gross-up, buying the exact residual leaves fee dust short.
 pub fn plan_market_order(
     operation_id: String,
     client_order_id: String,
     target_base_units: i128,
     base_decimals: u8,
     rules: &SymbolRules,
+    buy_fee_bps: u16,
 ) -> anyhow::Result<Option<PlannedMarketOrder>> {
     ensure!(target_base_units != 0, "Binance target delta is zero");
     ensure!(rules.status == "TRADING", "Binance symbol is not trading");
+    ensure!(buy_fee_bps < 10_000, "Binance BUY fee must be below 100%");
     let absolute = target_base_units.unsigned_abs();
-    let quantity = decimal_from_base_units(absolute, base_decimals)?;
+    let target_quantity = decimal_from_base_units(absolute, base_decimals)?;
     let step = if rules.market_lot_size.step > Decimal::ZERO {
         rules.market_lot_size.step
     } else {
         rules.lot_size.step
     };
-    let quantity = round_down(quantity, step)?;
+    let quantity = if target_base_units > 0 && buy_fee_bps > 0 {
+        let retention_bps = 10_000_u32
+            .checked_sub(u32::from(buy_fee_bps))
+            .context("Binance BUY fee retention underflow")?;
+        let retention = Decimal::from(retention_bps) / Decimal::from(10_000_u32);
+        let gross = target_quantity
+            .checked_div(retention)
+            .context("Binance MARKET BUY fee gross-up overflow")?;
+        round_up(gross, step)?
+    } else {
+        round_down(target_quantity, step)?
+    };
     if quantity.is_zero() {
         return Ok(None);
     }
@@ -326,6 +340,7 @@ mod tests {
             12_345_678_901_234_567_890,
             18,
             &rules(),
+            0,
         )
         .unwrap()
         .unwrap();
@@ -342,6 +357,7 @@ mod tests {
             -12_345_678_901_234_567_890,
             18,
             &rules(),
+            0,
         )
         .unwrap()
         .unwrap();
@@ -349,6 +365,27 @@ mod tests {
         assert!(matches!(
             sell.request.kind,
             BinanceOrderRequestKind::MarketSell { quantity } if quantity == Decimal::new(123, 1)
+        ));
+    }
+
+    #[test]
+    fn market_buy_closeout_grosses_up_for_base_asset_commission() {
+        let buy = plan_market_order(
+            "rustarb-market-buy-fee".to_owned(),
+            "rustarb-market-buy-fee".to_owned(),
+            53_200_000_000_000_000_000,
+            18,
+            &rules(),
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(buy.target_base_units, 53_200_000_000_000_000_000);
+        assert_eq!(buy.submitted_base_units, 53_300_000_000_000_000_000);
+        assert!(matches!(
+            buy.request.kind,
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity }
+                if quantity == Decimal::new(533, 1)
         ));
     }
 }

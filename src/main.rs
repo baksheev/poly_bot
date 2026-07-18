@@ -37,7 +37,9 @@ use arb_bot::{
     domain::config::{DexProvider, LoadedDomainConfig},
     engine::{BinanceFeeBps, TradingEngine},
     execution_accounting::binance_leg_result,
-    live_execution::{ComposedLiveLegExecutor, LiveRiskLimits, live_trade_channel},
+    live_execution::{
+        ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveRiskLimits, live_trade_channel,
+    },
     market_data::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
@@ -1104,14 +1106,21 @@ async fn run(
             config.arbitrage_execution_channel_capacity,
         )
         .await?;
+        let market_buy_recovery_fee_bps = binance_account
+            .commission
+            .conservative_taker_fee_bps("BUY")
+            .context("failed to derive Binance MARKET BUY recovery fee")?;
         let executor = ComposedLiveLegExecutor::new(
             dex_service,
             binance_service,
-            execution_symbol_rules.clone(),
-            pair.binance.base_asset.clone(),
-            pair.token_b.decimals,
-            pair.binance.quote_asset.clone(),
-            pair.token_a.decimals,
+            ComposedLiveLegExecutorConfig {
+                rules: execution_symbol_rules.clone(),
+                base_asset: pair.binance.base_asset.clone(),
+                base_decimals: pair.token_b.decimals,
+                quote_asset: pair.binance.quote_asset.clone(),
+                quote_decimals: pair.token_a.decimals,
+                market_buy_recovery_fee_bps,
+            },
         )?;
         let (handle, task, events) = live_trade_channel(
             &config.arbitrage_trade_journal_path,
