@@ -862,6 +862,84 @@ impl TradingEngine {
         Ok(Some(evaluation))
     }
 
+    pub fn on_rebalance_recovery_started(
+        &mut self,
+        operation: &RebalanceExecutionOperation,
+    ) -> anyhow::Result<()> {
+        self.rebalance_inflight = true;
+        self.rebalance_inflight_since = Some(Instant::now());
+        self.telemetry.emit(
+            "rebalance_recovery_inflight",
+            json!({
+                "engine_id": self.config.engine_id,
+                "operation_id": operation.intent.operation_id,
+                "token": operation.intent.token_symbol,
+                "direction": format!("{:?}", operation.intent.direction),
+                "progress": format!("{:?}", operation.progress),
+            }),
+        );
+        self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    pub fn on_rebalance_recovery_result(
+        &mut self,
+        result: Result<&RebalanceExecutionOperation, &str>,
+    ) -> anyhow::Result<()> {
+        self.rebalance_inflight = false;
+        self.rebalance_inflight_since = None;
+        match result {
+            Ok(operation) => {
+                if let (Some(binance), Some(wallet)) = (
+                    self.state.balances.binance.as_ref(),
+                    self.state.balances.wallet.as_ref(),
+                ) {
+                    self.rebalance_settlement = Some(RebalanceSettlementBarrier {
+                        operation_id: operation.intent.operation_id.clone(),
+                        token_symbol: operation.intent.token_symbol.clone(),
+                        direction: operation.intent.direction,
+                        binance_after: binance.observed_at,
+                        wallet_after: wallet.observed_at,
+                        started_at: Instant::now(),
+                    });
+                }
+                self.telemetry.emit(
+                    "rebalance_execution_completed",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "operation_id": operation.intent.operation_id,
+                        "recovered": true,
+                    }),
+                );
+                self.telemetry.emit(
+                    "rebalance_settlement_waiting",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "operation_id": operation.intent.operation_id,
+                        "token": operation.intent.token_symbol,
+                        "direction": format!("{:?}", operation.intent.direction),
+                        "recovered": true,
+                    }),
+                );
+            }
+            Err(error) => {
+                self.rebalance_blocked = true;
+                self.rebalance.mark_unbalanced();
+                tracing::error!(error, "rebalance recovery failed closed");
+                self.telemetry.emit(
+                    "rebalance_execution_failed",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "error": error,
+                        "recovered": true,
+                    }),
+                );
+            }
+        }
+        self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
     pub fn on_rebalance_execution_result(
         &mut self,
         result: Result<&RebalanceExecutionOperation, &str>,

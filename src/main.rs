@@ -47,8 +47,8 @@ use arb_bot::{
     },
     opportunity::{PreparedPoolBuildRequest, PreparedPoolBuildResult},
     rebalance::{
-        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
-        route_candidates_from_capital,
+        RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
+        RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
     },
     telemetry::{ARBITRAGE_RESULT_KIND, TelemetryWriter},
     wallet::{
@@ -64,6 +64,11 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 const ARBITRAGE_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_WALLET_JOURNAL_PATH";
 const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
+
+enum RebalanceExecutorEvent {
+    Recovery(Result<RebalanceExecutionOperation, String>),
+    Execution(Result<RebalanceExecutionOperation, String>),
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -942,7 +947,7 @@ async fn run(
         Arc::<str>::from(pair.binance.quote_asset.as_str()),
         Arc::<str>::from(pair.binance.base_asset.as_str()),
     ];
-    let mut initial_wallet_balances = fetch_wallet_snapshot(
+    let initial_wallet_balances = fetch_wallet_snapshot(
         &wallet_rpc,
         wallet_owner,
         wallet_chain_id,
@@ -950,7 +955,10 @@ async fn run(
         initial_wallet_head,
     )
     .await?;
-    let mut full_rebalance_executor = if config.rebalance_execution_mode == "full_live" {
+    let (mut full_rebalance_executor, rebalance_recovery_operation) = if config
+        .rebalance_execution_mode
+        == "full_live"
+    {
         let wallet = EvmWallet::from_env()?;
         ensure!(
             wallet.address() == wallet_owner,
@@ -966,7 +974,7 @@ async fn run(
         let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
             .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
         let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
-        let mut executor = RebalanceExecutor::hydrate(
+        let executor = RebalanceExecutor::hydrate(
             binance_account_client.clone(),
             treasury_client,
             subaccount_email,
@@ -984,25 +992,17 @@ async fn run(
             },
         )
         .await?;
-        if let Some(recovered) = executor.recover_active().await? {
+        let recovery_operation = executor.active_operation()?.cloned();
+        if let Some(operation) = recovery_operation.as_ref() {
             tracing::warn!(
-                operation_id = %recovered.intent.operation_id,
-                progress = ?recovered.progress,
-                "recovered active rebalance operation before runtime start"
+                operation_id = %operation.intent.operation_id,
+                progress = ?operation.progress,
+                "recovered active rebalance operation for asynchronous runtime recovery"
             );
-            let refreshed_head = wallet_rpc.latest_block().await?;
-            initial_wallet_balances = fetch_wallet_snapshot(
-                &wallet_rpc,
-                wallet_owner,
-                wallet_chain_id,
-                &wallet_tokens,
-                refreshed_head,
-            )
-            .await?;
         }
-        Some(executor)
+        (Some(executor), recovery_operation)
     } else {
-        None
+        (None, None)
     };
     let mut user_data_stream =
         UserDataStream::connect(&config, binance_account.clock_offset_ms).await?;
@@ -1193,29 +1193,55 @@ async fn run(
         },
     )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
-    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) =
-        if let Some(mut executor) = full_rebalance_executor.take() {
-            let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
-            let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
-            let task = tokio::spawn(async move {
-                while let Some(request) = request_receiver.recv().await {
-                    let result = executor
-                        .execute(request)
-                        .await
-                        .map_err(|error| format!("{error:#}"));
-                    if result_sender.send(result).await.is_err() {
-                        return Ok::<(), anyhow::Error>(());
-                    }
+    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) = if let Some(mut executor) =
+        full_rebalance_executor.take()
+    {
+        let recover_on_start = rebalance_recovery_operation.is_some();
+        let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
+        let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            if recover_on_start {
+                let result = executor
+                    .recover_active()
+                    .await
+                    .and_then(|operation| {
+                        operation.context("active rebalance operation disappeared before recovery")
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                if result_sender
+                    .send(RebalanceExecutorEvent::Recovery(result))
+                    .await
+                    .is_err()
+                {
+                    return Ok::<(), anyhow::Error>(());
                 }
-                Ok::<(), anyhow::Error>(())
-            });
-            (Some(request_sender), result_receiver, Some(task))
-        } else {
-            let (_request_sender, _request_receiver) =
-                tokio::sync::mpsc::channel::<RebalanceExecutionRequest>(1);
-            let (_result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
-            (None, result_receiver, None)
-        };
+            }
+            while let Some(request) = request_receiver.recv().await {
+                let result = executor
+                    .execute(request)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                if result_sender
+                    .send(RebalanceExecutorEvent::Execution(result))
+                    .await
+                    .is_err()
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        (Some(request_sender), result_receiver, Some(task))
+    } else {
+        let (_request_sender, _request_receiver) =
+            tokio::sync::mpsc::channel::<RebalanceExecutionRequest>(1);
+        let (_result_sender, result_receiver) =
+            tokio::sync::mpsc::channel::<RebalanceExecutorEvent>(1);
+        (None, result_receiver, None)
+    };
+    if let Some(operation) = rebalance_recovery_operation.as_ref() {
+        engine.on_rebalance_recovery_started(operation)?;
+    }
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
     engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances))?;
     engine.on_user_data_connected(user_data_subscription_id);
@@ -1307,8 +1333,18 @@ async fn run(
                     bail!("rebalance executor result channel stopped unexpectedly");
                 };
                 match result {
-                    Ok(operation) => engine.on_rebalance_execution_result(Ok(&operation))?,
-                    Err(error) => engine.on_rebalance_execution_result(Err(&error))?,
+                    RebalanceExecutorEvent::Recovery(Ok(operation)) => {
+                        engine.on_rebalance_recovery_result(Ok(&operation))?
+                    }
+                    RebalanceExecutorEvent::Recovery(Err(error)) => {
+                        engine.on_rebalance_recovery_result(Err(&error))?
+                    }
+                    RebalanceExecutorEvent::Execution(Ok(operation)) => {
+                        engine.on_rebalance_execution_result(Ok(&operation))?
+                    }
+                    RebalanceExecutorEvent::Execution(Err(error)) => {
+                        engine.on_rebalance_execution_result(Err(&error))?
+                    }
                 }
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
             }
