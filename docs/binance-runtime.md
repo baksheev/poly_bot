@@ -70,8 +70,11 @@ Rails currently:
    asynchronously until exposure is closed.
 
 Rust preserves the residual-only recovery quantity but bounds price as well as
-size: admission consumes the full local depth book, persists the worst recovery
-price, and every primary or recovery order is LIMIT IOC. There is no unbounded
+size. Production `dex_first` admission consumes the relevant real-time
+`bookTicker` level and persists that primary execution bound without waiting
+for `depth@100ms`; exact sequence-consistent depth is a fallback when the top
+level is too small. Concurrent execution continues to consume both sides of
+the local depth book. Every primary or recovery order is LIMIT IOC. There is no unbounded
 MARKET fallback in autonomous trading. A single state machine owns each
 attempt. Deterministic rejections become known zero-fill failures. Network
 timeout, 5xx, disconnect, or a missing response means `UNKNOWN`, never

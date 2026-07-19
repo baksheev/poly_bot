@@ -378,9 +378,9 @@ pub struct SymbolRules {
 }
 
 impl SymbolRules {
-    /// Keeps a coarser strategy price increment when it is exactly aligned to
-    /// Binance's current PRICE_FILTER. This preserves the Rails-configured
-    /// order rounding while still rejecting prices that the venue cannot
+    /// Applies the reviewed execution price increment when it is exactly
+    /// aligned to Binance's current PRICE_FILTER. This permits a deliberately
+    /// coarser strategy increment while rejecting prices the venue cannot
     /// represent.
     pub fn with_compatible_price_step(&self, configured_step: Decimal) -> anyhow::Result<Self> {
         ensure!(

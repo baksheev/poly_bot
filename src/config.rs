@@ -220,9 +220,6 @@ pub struct AppConfig {
     #[arg(long, env = "ARBITRAGE_EXECUTION_MODE", default_value = "disabled")]
     pub arbitrage_execution_mode: String,
 
-    #[arg(long, env = "ARBITRAGE_LIVE_CONFIRMATION", default_value = "")]
-    pub arbitrage_live_confirmation: String,
-
     #[arg(
         long,
         env = "ARBITRAGE_TRADE_JOURNAL_PATH",
@@ -232,10 +229,10 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        env = "ARBITRAGE_EXECUTION_CHANNEL_CAPACITY",
+        env = "ARBITRAGE_LEG_EXECUTION_CHANNEL_CAPACITY",
         default_value_t = 64
     )]
-    pub arbitrage_execution_channel_capacity: usize,
+    pub arbitrage_leg_execution_channel_capacity: usize,
 
     #[arg(
         long,
@@ -345,19 +342,13 @@ impl AppConfig {
             "ARBITRAGE_TRADE_JOURNAL_PATH is empty"
         );
         ensure!(
-            self.arbitrage_execution_channel_capacity > 0,
-            "ARBITRAGE_EXECUTION_CHANNEL_CAPACITY must be greater than zero"
+            self.arbitrage_leg_execution_channel_capacity > 0,
+            "ARBITRAGE_LEG_EXECUTION_CHANNEL_CAPACITY must be greater than zero"
         );
         ensure!(
             !self.arbitrage_entry_stop_file.as_os_str().is_empty(),
             "ARBITRAGE_ENTRY_STOP_FILE is empty"
         );
-        if self.arbitrage_execution_mode == "full_live" {
-            ensure!(
-                self.arbitrage_live_confirmation == "ENABLE_FULL_LIVE_ARBITRAGE",
-                "full_live arbitrage requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE"
-            );
-        }
         ensure!(
             matches!(
                 self.rebalance_execution_mode.as_str(),
@@ -553,9 +544,8 @@ mod tests {
             balance_max_age_ms: 5_000,
             balance_event_channel_capacity: 16,
             arbitrage_execution_mode: "disabled".into(),
-            arbitrage_live_confirmation: String::new(),
             arbitrage_trade_journal_path: "/tmp/arbitrage-trades.jsonl".into(),
-            arbitrage_execution_channel_capacity: 64,
+            arbitrage_leg_execution_channel_capacity: 64,
             arbitrage_entry_stop_file: "/tmp/arbitrage-entry.stop".into(),
             rebalance_execution_mode: "disabled".into(),
             rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),
@@ -597,16 +587,6 @@ mod tests {
         let mut value = config();
         value.rebalance_execution_mode = "direct_wld_canary".into();
         assert!(value.validate().is_err());
-    }
-
-    #[test]
-    fn live_arbitrage_requires_confirmation() {
-        let mut value = config();
-        value.arbitrage_execution_mode = "full_live".into();
-        assert!(value.validate().is_err());
-
-        value.arbitrage_live_confirmation = "ENABLE_FULL_LIVE_ARBITRAGE".into();
-        value.validate().unwrap();
     }
 
     #[test]

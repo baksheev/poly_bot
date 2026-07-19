@@ -1096,12 +1096,14 @@ async fn run(
         dex_executor
             .prepare_and_lock_allowances(&allowance_requirements)
             .await?;
-        let dex_service =
-            DexExecutionService::spawn(dex_executor, config.arbitrage_execution_channel_capacity)?;
+        let dex_service = DexExecutionService::spawn(
+            dex_executor,
+            config.arbitrage_leg_execution_channel_capacity,
+        )?;
         let binance_service = BinanceExecutionService::spawn(
             multiplexed_binance_api.clone(),
             binance_journal_path.into(),
-            config.arbitrage_execution_channel_capacity,
+            config.arbitrage_leg_execution_channel_capacity,
         )
         .await?;
         let market_buy_recovery_fee_bps = binance_account
@@ -1122,7 +1124,6 @@ async fn run(
         )?;
         let (handle, task, events) = live_trade_channel(
             &config.arbitrage_trade_journal_path,
-            config.arbitrage_execution_channel_capacity,
             executor,
             telemetry.clone(),
             config.engine_id.clone(),
@@ -1167,7 +1168,6 @@ async fn run(
         } else if let Some(mode) = paper_mode {
             let (handle, task, events) = paper_trade_channel(
                 &config.arbitrage_trade_journal_path,
-                config.arbitrage_execution_channel_capacity,
                 mode,
                 telemetry.clone(),
                 config.engine_id.clone(),

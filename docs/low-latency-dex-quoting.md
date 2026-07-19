@@ -149,10 +149,14 @@ end-to-end decision latency. `baseline_quote_cache_hits` and
 `baseline_quote_cache_misses` make every recomputation visible in telemetry.
 Raw Binance and evaluation payloads are formatted on a separate bounded task.
 
-Paper admission then applies execution-only bounds outside the quote
-calculation: the entire token-B hedge must be fillable from sequence-consistent
-Binance depth, and the worst consumed price becomes a persisted recovery IOC
-limit. Depth impact and a maximum DEX gas charge are deducted before admission.
+Admission then applies execution-only bounds outside the quote calculation.
+For `dex_first`, each `bookTicker` update can admit immediately when the entire
+primary IOC quantity fits the relevant best-price level. The matching
+`depth@100ms` book is only a fallback when that level is too small; concurrent
+execution keeps the two-sided full-depth requirement. The admitted top price
+and quantity are persisted and rechecked alongside the exact DEX generation
+and swap deadline immediately before dispatch. A maximum DEX gas charge is
+deducted before admission.
 The gas bound uses the executor's five-million-unit ceiling, the background
 World Chain gas-price snapshot, the Rails priority fee, and the fresh ETHUSDT
 ask. Fully burdened economics must still clear 20 bps, and the signer rejects a
@@ -163,11 +167,12 @@ latency before JSON construction or ClickHouse channel work.
 The capacity is deliberately named `market_liquidity_capacity`, not executable
 size. Both market data and eventual execution use Binance Spot, and hydrated
 account commission is applied conservatively to the Binance leg. However,
-bookTicker contains only the best price level. A REST-bootstrapped,
-sequence-consistent Spot depth book now verifies that level before an
-opportunity can be admitted, but full-depth recovery cost, gas, executable
-inventory after reservations, and risk caps are not applied to sizing yet.
-Those must become hard minimum constraints before live execution.
+bookTicker contains only the best price level. That is sufficient for the
+fixed production baseline whenever its relevant-side quantity covers the IOC;
+a REST-bootstrapped, sequence-consistent Spot depth book handles the larger
+fallback case. Gas, executable inventory after reservations, and risk caps are
+hard admission constraints, while larger market-liquidity capacity remains
+telemetry rather than executable sizing.
 
 ## Gaps and reorgs
 

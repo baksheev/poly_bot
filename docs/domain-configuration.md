@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated v5 live artifact implemented
-Last reviewed: 2026-07-17
+Status: v4 read/paper default and separately gated v6 live artifact implemented
+Last reviewed: 2026-07-19
 
 ## Runtime boundary
 
@@ -14,11 +14,13 @@ The default artifact is
 `config/strategies/usdc-wld-world-chain.v4.json`. It starts from the Rails
 production pair `id=3` at the source timestamp stored in the file and records
 one deliberate Rust-clone divergence: both Binance market data and eventual
-execution use Spot. The v5 artifact contains identical pair/economics with the
-global and pair execution gates enabled. Selecting v5 alone cannot trade:
-runtime `full_live`, exact confirmation, signer/order journals, single-owner
-deployment, and startup health checks are independently required. Earlier
-artifacts remain provenance for prior shadow stages.
+execution use Spot. The v6 artifact contains the same pair/economics, uses the
+live Binance price tick, and has the global and pair execution gates enabled.
+Selecting v6 alone cannot trade:
+the production GCE wrapper fixes runtime execution to `full_live`, and
+signer/order journals, single-owner deployment, and startup health checks are
+independently required. Earlier artifacts remain provenance for prior shadow
+stages.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven
@@ -27,7 +29,7 @@ attached to the GCE VM.
 
 ## Captured behavior
 
-The v4/v5 snapshots record:
+The v4-v6 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
@@ -63,8 +65,9 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v5 artifact has
-both true and is valid only for the explicitly confirmed GCE live path.
+The committed v4 default has both execution gates false. The v6 artifact has
+both true and is valid only for the explicitly confirmed GCE live path. The v5
+artifact remains immutable provenance for the previous live release.
 
 ## Refreshing the source data
 
@@ -89,8 +92,9 @@ tick `0.001`, `profit_token_a`, and the V3/V4 provider set. The older Rails seed
 value of 10 USDC is not authoritative; the versioned artifact follows the live
 production row and records its exact update timestamp.
 
-Binance currently advertises a finer WLDUSDC `PRICE_FILTER` tick of `0.0001`.
-The runtime deliberately retains the Rails execution tick of `0.001`: startup
-accepts it only while it is an exact integer multiple of the live venue tick,
-and live IOC planning rounds on `0.001`. A non-aligned future filter change is
+Binance advertises a WLDUSDC `PRICE_FILTER` tick of `0.0001`. The v6 live
+artifact deliberately uses that venue tick instead of the coarser Rails
+`0.001` value, so IOC protection no longer loses a full millitick to parity
+rounding. Startup still requires the configured tick to be an exact integer
+multiple of the live venue tick; a non-aligned future filter change is
 fail-closed.

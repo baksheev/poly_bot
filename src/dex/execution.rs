@@ -47,6 +47,12 @@ pub enum UniswapProtocol {
     V4,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapSubmissionPolicy {
+    SimulateAndEstimate,
+    Immediate,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllowanceRequirement {
     pub operation_id: String,
@@ -108,6 +114,7 @@ pub struct ExactInputSwapRequest {
     pub maximum_fee_per_gas_wei: u128,
     pub deadline_unix_seconds: u64,
     pub confirmation_timeout: Duration,
+    pub submission_policy: SwapSubmissionPolicy,
 }
 
 impl ExactInputSwapRequest {
@@ -185,6 +192,7 @@ impl ExactInputSwapRequest {
             maximum_fee_per_gas_wei: MAX_FEE_PER_GAS_WEI,
             deadline_unix_seconds,
             confirmation_timeout: DEFAULT_SWAP_CONFIRMATION_TIMEOUT,
+            submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
         }
     }
 }
@@ -214,6 +222,7 @@ struct ExecuteCallPolicy {
     quoted_gas: Option<u64>,
     admitted_max_fee_per_gas: Option<u128>,
     confirmation_timeout: Duration,
+    submission_policy: SwapSubmissionPolicy,
 }
 
 impl GasLimitPolicy {
@@ -265,6 +274,21 @@ impl GasLimitPolicy {
             .checked_add(self.additional)
             .context("Rails-compatible gas addition overflow")?;
         let limit = rails_with_extra.max(estimate_with_extra);
+        ensure!(limit <= MAX_GAS_LIMIT, "DEX gas limit exceeds safety cap");
+        Ok(limit)
+    }
+
+    fn resolve_without_estimate(self, quoted_gas: Option<u64>) -> anyhow::Result<u64> {
+        let rails_limit = match quoted_gas {
+            Some(quoted_gas) => quoted_gas
+                .checked_mul(self.multiplier)
+                .context("Rails-compatible gas multiplier overflow")?,
+            None => self.default,
+        };
+        let limit = rails_limit
+            .max(self.minimum)
+            .checked_add(self.additional)
+            .context("Rails-compatible gas addition overflow")?;
         ensure!(limit <= MAX_GAS_LIMIT, "DEX gas limit exceeds safety cap");
         Ok(limit)
     }
@@ -426,9 +450,16 @@ impl DexExecutor {
                 "Uniswap V4 request deadline has expired"
             );
         }
-        self.ensure_allowance(&request)
-            .await
-            .with_context(|| format!("{} input-token approval failed", protocol.label()))?;
+        if request.submission_policy == SwapSubmissionPolicy::Immediate {
+            ensure!(
+                !self.allowance_mutations_enabled,
+                "immediate DEX submission requires startup-validated locked allowances"
+            );
+        } else {
+            self.ensure_allowance(&request)
+                .await
+                .with_context(|| format!("{} input-token approval failed", protocol.label()))?;
+        }
 
         let calldata = match request.route {
             SwapRoute::V3 { fee_pips, .. } => v3_exact_input(
@@ -462,6 +493,7 @@ impl DexExecutor {
                     quoted_gas: request.quoted_gas,
                     admitted_max_fee_per_gas: Some(request.maximum_fee_per_gas_wei),
                     confirmation_timeout: request.confirmation_timeout,
+                    submission_policy: request.submission_policy,
                 },
             )
             .await?;
@@ -606,6 +638,7 @@ impl DexExecutor {
                     quoted_gas: Some(RAILS_DEFAULT_GAS_LIMIT),
                     admitted_max_fee_per_gas: None,
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
+                    submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
             )
             .await?;
@@ -660,6 +693,7 @@ impl DexExecutor {
                     quoted_gas: Some(RAILS_PERMIT2_APPROVAL_GAS_LIMIT),
                     admitted_max_fee_per_gas: None,
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
+                    submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
             )
             .await?;
@@ -703,12 +737,23 @@ impl DexExecutor {
         }
         ensure!(self.nonce_lane.ready(), "DEX nonce lane is not ready");
         let rpc_call = call.rpc_call(self.wallet.address());
-        self.rpc
-            .simulate_transaction(&rpc_call)
-            .await
-            .context("DEX preflight simulation reverted")?;
-        let estimated_gas = self.rpc.estimate_gas(&rpc_call).await?;
-        let gas_limit = policy.gas.resolve(policy.quoted_gas, estimated_gas)?;
+        let (gas_limit, estimated_gas) = match policy.submission_policy {
+            SwapSubmissionPolicy::SimulateAndEstimate => {
+                self.rpc
+                    .simulate_transaction(&rpc_call)
+                    .await
+                    .context("DEX preflight simulation reverted")?;
+                let estimated_gas = self.rpc.estimate_gas(&rpc_call).await?;
+                (
+                    policy.gas.resolve(policy.quoted_gas, estimated_gas)?,
+                    Some(estimated_gas),
+                )
+            }
+            SwapSubmissionPolicy::Immediate => (
+                policy.gas.resolve_without_estimate(policy.quoted_gas)?,
+                None,
+            ),
+        };
         let gas_price = self.current_gas_price().await?;
         let max_fee_per_gas = gas_price
             .checked_add(RAILS_PRIORITY_FEE_WEI)
@@ -1102,8 +1147,8 @@ mod tests {
 
     use super::{
         DexExecutionService, DexExecutionServiceError, DexExecutor, ExactInputSwapRequest,
-        GasLimitPolicy, MAX_FEE_PER_GAS_WEI, MAX_GAS_LIMIT, SwapRoute, UniswapProtocol,
-        wallet_transfer_totals,
+        GasLimitPolicy, MAX_FEE_PER_GAS_WEI, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy,
+        UniswapProtocol, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
@@ -1178,6 +1223,7 @@ mod tests {
             maximum_fee_per_gas_wei: MAX_FEE_PER_GAS_WEI,
             deadline_unix_seconds: 1_800_000_000,
             confirmation_timeout: Duration::from_secs(5),
+            submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
         };
         assert!(request.validate().is_err());
     }
@@ -1187,7 +1233,7 @@ mod tests {
         let (endpoint, server) = spawn_mock_rpc(MockOutcome::Revert);
         let path = journal_path("revert");
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
-        let executor = DexExecutor::hydrate(
+        let mut executor = DexExecutor::hydrate(
             JsonRpcClient::new(endpoint).unwrap(),
             wallet,
             480,
@@ -1195,6 +1241,7 @@ mod tests {
         )
         .await
         .unwrap();
+        executor.allowance_mutations_enabled = false;
         let service = DexExecutionService::spawn(executor, 1).unwrap();
         let error = service
             .execute(v3_request("rustval-revert"))
@@ -1228,7 +1275,7 @@ mod tests {
         let (endpoint, server) = spawn_mock_rpc(MockOutcome::BroadcastRejected);
         let path = journal_path("broadcast-rejected");
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
-        let executor = DexExecutor::hydrate(
+        let mut executor = DexExecutor::hydrate(
             JsonRpcClient::new(endpoint).unwrap(),
             wallet,
             480,
@@ -1236,6 +1283,7 @@ mod tests {
         )
         .await
         .unwrap();
+        executor.allowance_mutations_enabled = false;
         let service = DexExecutionService::spawn(executor, 1).unwrap();
         let error = service
             .execute(v3_request("rustval-broadcast-rejected"))
@@ -1278,6 +1326,7 @@ mod tests {
         );
         request.quoted_gas = Some(100_000);
         request.confirmation_timeout = Duration::from_secs(2);
+        request.submission_policy = SwapSubmissionPolicy::Immediate;
         request
     }
 
@@ -1299,11 +1348,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request_count = match outcome {
-            MockOutcome::Revert => 10,
-            MockOutcome::BroadcastRejected => 9,
+            MockOutcome::Revert => 7,
+            MockOutcome::BroadcastRejected => 6,
         };
         let thread = std::thread::spawn(move || {
-            let mut eth_calls = 0_u8;
             let mut transaction_hash = None;
             for _ in 0..request_count {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1314,14 +1362,11 @@ mod tests {
                     "eth_chainId" => rpc_result(id, json!("0x1e0")),
                     "eth_getTransactionCount" => rpc_result(id, json!("0x7")),
                     "eth_call" => {
-                        eth_calls += 1;
-                        if eth_calls == 1 {
-                            rpc_result(id, json!(format!("0x{}", "ff".repeat(32))))
-                        } else {
-                            rpc_result(id, json!("0x"))
-                        }
+                        panic!("immediate swap unexpectedly called eth_call")
                     }
-                    "eth_estimateGas" => rpc_result(id, json!("0x186a0")),
+                    "eth_estimateGas" => {
+                        panic!("immediate swap unexpectedly called eth_estimateGas")
+                    }
                     "eth_gasPrice" => rpc_result(id, json!("0xf4240")),
                     "eth_getBalance" => rpc_result(id, json!("0xde0b6b3a7640000")),
                     "eth_sendRawTransaction" => match outcome {

@@ -676,7 +676,7 @@ mod tests {
     use super::{ArbitrageStrategy, BinanceProduct, LoadedDomainConfig, TokenBQuoteSizing};
 
     const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v4.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v5.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v6.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -723,8 +723,12 @@ mod tests {
         assert!(loaded.snapshot().live_trading_enabled);
         assert!(loaded.snapshot().pairs[0].execution_enabled);
         assert_eq!(
+            loaded.snapshot().pairs[0].binance.tick_size,
+            "0.000100000000000"
+        );
+        assert_eq!(
             loaded.fingerprint_sha256(),
-            "9eb9e9644ef3de8b0ea49410672bfa6b9cb46404ad218877ff31965e3cf5cec8"
+            "7463a62c0ec714275c86414d9fa4f1fb9a10086f9fdf668c45e9744d41028148"
         );
     }
 

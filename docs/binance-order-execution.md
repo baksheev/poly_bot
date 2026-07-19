@@ -1,6 +1,6 @@
 # Binance bounded execution
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-19
 
 The Rust runtime now has a typed, single-owner Binance Spot order boundary for
 `WLDUSDC`. Autonomous arbitrage entry remains disabled. The manual
@@ -15,7 +15,7 @@ autonomous arbitrage path is stricter:
 - LIMIT orders use `timeInForce=IOC`;
 - quantities are rounded down to the configured `0.1 WLD` step;
 - BUY protection is rounded up and SELL protection down to the configured
-  `0.001 USDC` tick;
+  `0.0001 USDC` live exchange tick;
 - a partial IOC execution is followed by another persisted LIMIT IOC for only
   the remaining sellable quantity, capped at the admission-time worst depth
   price;

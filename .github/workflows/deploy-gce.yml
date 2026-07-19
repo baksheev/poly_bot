@@ -2,16 +2,6 @@ name: Deploy GCE
 
 on:
   workflow_dispatch:
-    inputs:
-      execution_mode:
-        description: "GCE arbitrage execution mode"
-        required: true
-        default: full_live
-        type: choice
-        options:
-          - full_live
-          - paper_dex_first
-          - disabled
 
 permissions:
   contents: read
@@ -52,7 +42,6 @@ jobs:
           EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
           REBALANCE_MAX_WLD_AMOUNT: ${{ vars.REBALANCE_MAX_WLD_AMOUNT }}
           REBALANCE_MAX_USDC_AMOUNT: ${{ vars.REBALANCE_MAX_USDC_AMOUNT }}
-          EXECUTION_MODE: ${{ inputs.execution_mode }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
@@ -61,9 +50,9 @@ jobs:
           test -n "${GCP_WORKLOAD_IDENTITY_PROVIDER}"
           test -n "${GCP_DEPLOY_SERVICE_ACCOUNT}"
           [[ "${EVM_WALLET_ADDRESS}" =~ ^0x[0-9a-fA-F]{40}$ ]]
-          [[ "${EXECUTION_MODE}" =~ ^(disabled|paper_dex_first|full_live)$ ]]
           for limit in "${REBALANCE_MAX_WLD_AMOUNT}" "${REBALANCE_MAX_USDC_AMOUNT}"; do
             [[ "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+            [[ "${limit}" =~ [1-9] ]]
           done
 
       - name: Authenticate to Google Cloud
@@ -88,9 +77,11 @@ jobs:
           image_tag="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}:${SOURCE_SHA}"
           gcloud auth configure-docker "${registry}" --quiet
           docker build \
+            --platform linux/amd64 \
             --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
             --tag "${image_tag}" \
             .
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${image_tag}")" = "linux/amd64"
           docker push "${image_tag}"
           digest="$(gcloud artifacts docker images describe \
             "${image_tag}" \
@@ -101,7 +92,6 @@ jobs:
           echo "image=${image}" >>"${GITHUB_OUTPUT}"
 
       - name: Verify GKE live owner is disabled
-        if: inputs.execution_mode == 'full_live'
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
         run: |
@@ -123,38 +113,22 @@ jobs:
           EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
           REBALANCE_MAX_WLD_AMOUNT: ${{ vars.REBALANCE_MAX_WLD_AMOUNT }}
           REBALANCE_MAX_USDC_AMOUNT: ${{ vars.REBALANCE_MAX_USDC_AMOUNT }}
-          EXECUTION_MODE: ${{ inputs.execution_mode }}
         run: |
           set -euo pipefail
           release_id="${SOURCE_SHA:0:12}"
-          mode_label="${EXECUTION_MODE//_/-}"
-          domain_config_path="config/strategies/usdc-wld-world-chain.v4.json"
-          live_confirmation=""
-          rebalance_execution_mode="disabled"
-          rebalance_live_confirmation=""
-          rebalance_withdrawal_api_mode="standard"
-
-          if [[ "${EXECUTION_MODE}" == "full_live" ]]; then
-            domain_config_path="config/strategies/usdc-wld-world-chain.v5.json"
-            live_confirmation="ENABLE_FULL_LIVE_ARBITRAGE"
-            rebalance_execution_mode="full_live"
-            rebalance_live_confirmation="ENABLE_FULL_REBALANCE"
-            rebalance_withdrawal_api_mode="travel_rule"
-          fi
-
-          engine_id="arb-bot-rust-${mode_label}-gce-${release_id}"
+          engine_id="arb-bot-rust-full-live-gce-${release_id}"
           gcloud compute instances describe "${GCE_INSTANCE}" \
             --zone="${GCE_ZONE}" \
             --project="${GCP_PROJECT_ID}" >/dev/null
           gcloud compute instances add-metadata "${GCE_INSTANCE}" \
             --zone="${GCE_ZONE}" \
             --project="${GCP_PROJECT_ID}" \
-            --metadata="arb-bot-image=${IMAGE},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=${domain_config_path},arb-bot-arbitrage-execution-mode=${EXECUTION_MODE},arb-bot-arbitrage-live-confirmation=${live_confirmation},arb-bot-rebalance-execution-mode=${rebalance_execution_mode},arb-bot-rebalance-live-confirmation=${rebalance_live_confirmation},arb-bot-rebalance-max-wld-amount=${REBALANCE_MAX_WLD_AMOUNT},arb-bot-rebalance-max-usdc-amount=${REBALANCE_MAX_USDC_AMOUNT},arb-bot-rebalance-binance-withdrawal-api-mode=${rebalance_withdrawal_api_mode}" \
+            --metadata="arb-bot-image=${IMAGE},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v6.json,arb-bot-rebalance-execution-mode=full_live,arb-bot-rebalance-live-confirmation=ENABLE_FULL_REBALANCE,arb-bot-rebalance-max-wld-amount=${REBALANCE_MAX_WLD_AMOUNT},arb-bot-rebalance-max-usdc-amount=${REBALANCE_MAX_USDC_AMOUNT},arb-bot-rebalance-binance-withdrawal-api-mode=travel_rule" \
             --metadata-from-file="startup-script=infra/gcp/gce-startup.sh"
           gcloud compute instances add-labels "${GCE_INSTANCE}" \
             --zone="${GCE_ZONE}" \
             --project="${GCP_PROJECT_ID}" \
-            --labels="component=trading,mode=${mode_label},source-revision=${release_id}"
+            --labels="component=trading,mode=full-live,source-revision=${release_id}"
 
           status="$(gcloud compute instances describe "${GCE_INSTANCE}" \
             --zone="${GCE_ZONE}" \
@@ -196,6 +170,6 @@ jobs:
             echo "- Image: \`${IMAGE}\`"
             echo "- Instance: \`${GCE_INSTANCE}\` in \`${GCE_ZONE}\`"
             echo "- Engine: \`${{ steps.gce.outputs.engine_id }}\`"
-            echo "- Execution mode: \`${{ inputs.execution_mode }}\`"
-            echo "- Rebalance mode: \`${{ inputs.execution_mode == 'full_live' && 'full_live' || 'disabled' }}\`"
+            echo "- Execution mode: \`full_live\`"
+            echo "- Rebalance mode: \`full_live\`"
           } >>"${GITHUB_STEP_SUMMARY}"

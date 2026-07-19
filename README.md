@@ -114,10 +114,14 @@ points and applied conservatively to the Binance leg in both directions before
 thresholding and sizing. The selected slippage budget is emitted with every
 trade evaluation. It writes every evaluation and threshold-crossing
 opportunity asynchronously to ClickHouse. Market data and eventual execution
-now both use Spot. Before a paper plan is admitted, the entire hedge quantity
-must fit the sequence-consistent Spot depth; its worst consumed price is
-journaled as the recovery IOC limit. Admission charges the full-depth recovery
-loss and a conservative maximum DEX gas cost using a background `eth_gasPrice`
+now both use Spot. For `dex_first`, every real-time `bookTicker` update is
+evaluated immediately: the entire primary IOC quantity must fit its relevant
+best-price level, and that price is journaled as the execution bound.
+Sequence-consistent Spot depth is consulted only as a fallback when that top
+level is too small; concurrent execution retains the two-sided full-depth
+admission bound. Preflight rechecks the relevant top price and quantity, the
+exact DEX generation, and the swap deadline immediately before dispatch.
+Admission also charges a conservative maximum DEX gas cost using a background `eth_gasPrice`
 sample and the fresh ETHUSDT ask, verifies the wallet native balance, and
 atomically reserves executable token inventory. The DEX signer enforces the
 admission-time fee cap again before reserving a nonce.
@@ -169,13 +173,14 @@ cargo run -- run
 ```
 
 `paper_dex_first` and `paper_concurrent_hedged` consume threshold-crossing
-opportunities through a bounded background channel and exercise the durable
-parent coordinator. Their synthetic outcomes are emitted as
-`paper_arbitrage_result` and are deliberately excluded from the live
-`arbitrage_results` table. `full_live` additionally requires an exact operator
-confirmation, positive per-plan/cumulative/rate/durable-total limits, the
-separately reviewed v5 execution artifact, isolated identities, and persistent
-parent/Binance/wallet journals. The v4 default stays execution-disabled.
+opportunities through the same latest-wins single-lane mailbox as live
+execution and exercise the durable parent coordinator. Their synthetic
+outcomes are emitted as `paper_arbitrage_result` and are deliberately excluded
+from the live `arbitrage_results` table. The production GCE wrapper always
+runs `full_live` with the separately reviewed v6 execution artifact, isolated
+identities, and persistent parent/Binance/wallet journals. Local paper modes
+remain a test harness; they are not selectable through the production
+deployment path. The v4 default stays execution-disabled.
 
 `run` requires `EVM_WALLET_ADDRESS`, Binance read credentials, and the World
 Chain HTTP/WSS endpoints. Balance sync cadence and freshness are controlled by
