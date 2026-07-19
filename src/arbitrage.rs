@@ -76,7 +76,7 @@ pub struct TradeIntent {
 pub struct AdmissionRiskBounds {
     pub execution_slippage_bps: u16,
     pub cex_primary_limit_price: Decimal,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_decimal")]
     /// Non-zero only when admission was proven entirely from the relevant
     /// bookTicker level. Full-depth fallback cannot be revalidated from a
     /// top-of-book snapshot alone.
@@ -160,6 +160,10 @@ impl AdmissionRiskBounds {
 
 const fn is_zero_u128(value: &u128) -> bool {
     *value == 0
+}
+
+fn is_zero_decimal(value: &Decimal) -> bool {
+    *value == Decimal::ZERO
 }
 
 const fn is_zero_i128(value: &i128) -> bool {
@@ -1992,6 +1996,31 @@ mod tests {
             .bounded_profit_token_a_base_units = 0;
 
         intent.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_journal_checksum_survives_missing_primary_top_quantity() {
+        let mut trade_intent = intent(ExecutionMode::DexFirst);
+        trade_intent
+            .admission
+            .as_mut()
+            .unwrap()
+            .cex_primary_top_quantity = Decimal::ZERO;
+        let payload = super::WirePayload {
+            version: super::JOURNAL_VERSION,
+            sequence: 0,
+            recorded_at_unix_ms: 1_800_000_000_000,
+            operation: super::TradeOperation::prepared(trade_intent),
+        };
+        let record = super::WireRecord::new(payload).unwrap();
+        let encoded = serde_json::to_vec(&record).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains("cex_primary_top_quantity"),
+            "legacy-compatible default must not change the checksum payload"
+        );
+
+        let decoded: super::WireRecord = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate_checksum().unwrap();
     }
 
     #[test]
