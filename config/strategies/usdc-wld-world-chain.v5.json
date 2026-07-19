@@ -85,7 +85,7 @@
       "dex": {
         "allowed_providers": ["uniswap_v3", "uniswap_v4"],
         "uniswap_v3": {
-          "fee_tiers": [500, 3000, 5000, 10000]
+          "fee_tiers": [500, 3000, 10000]
         },
         "uniswap_v4": {
           "pools": [
