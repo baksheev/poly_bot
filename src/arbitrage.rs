@@ -76,6 +76,11 @@ pub struct TradeIntent {
 pub struct AdmissionRiskBounds {
     pub execution_slippage_bps: u16,
     pub cex_primary_limit_price: Decimal,
+    #[serde(default)]
+    /// Non-zero only when admission was proven entirely from the relevant
+    /// bookTicker level. Full-depth fallback cannot be revalidated from a
+    /// top-of-book snapshot alone.
+    pub cex_primary_top_quantity: Decimal,
     pub cex_recovery_limit_price: Decimal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cex_recovery_sell_limit_price: Option<Decimal>,
@@ -102,6 +107,10 @@ impl AdmissionRiskBounds {
         ensure!(
             self.cex_primary_limit_price > Decimal::ZERO,
             "CEX primary limit price is non-positive"
+        );
+        ensure!(
+            self.cex_primary_top_quantity >= Decimal::ZERO,
+            "CEX primary quantity is negative"
         );
         ensure!(
             self.cex_recovery_limit_price > Decimal::ZERO,
@@ -600,6 +609,21 @@ impl EntryPreflightHandle {
             }
             _ => {}
         }
+        if opportunity.admission.cex_primary_top_quantity > Decimal::ZERO {
+            let available = match opportunity.direction {
+                ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_quantity,
+                ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_quantity,
+            };
+            if available < opportunity.admission.cex_primary_top_quantity {
+                return Ok(Some(EntryPreflightRejection {
+                    reason: "cex_top_quantity_below_admission",
+                    detail: format!(
+                        "latest top quantity {} is below admission {}",
+                        available, opportunity.admission.cex_primary_top_quantity
+                    ),
+                }));
+            }
+        }
         let Some(current_generation) = state
             .dex_pool_generations
             .get(&opportunity.dex_pool_index)
@@ -619,6 +643,16 @@ impl EntryPreflightHandle {
                 detail: format!(
                     "current generation {} differs from admission generation {}",
                     current_generation, opportunity.dex_pool_generation
+                ),
+            }));
+        }
+        let now_unix_seconds = unix_timestamp_ms()? / 1_000;
+        if now_unix_seconds >= opportunity.dex_plan.deadline_unix_seconds {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "dex_plan_expired",
+                detail: format!(
+                    "DEX deadline {} is not after current time {}",
+                    opportunity.dex_plan.deadline_unix_seconds, now_unix_seconds
                 ),
             }));
         }
@@ -1296,10 +1330,19 @@ impl PaperTradeCoordinator {
                 finalize_balanced(&mut operation)?;
                 self.journal.append(operation)?;
             } else if operation.recovery_results.len() < MAX_RECOVERY_ATTEMPTS {
+                let target = -residual;
+                if operation.intent.mode == ExecutionMode::DexFirst
+                    && !dex_first_recovery_direction_is_valid(operation.intent.direction, target)
+                {
+                    operation.stage = TradeStage::Halted;
+                    operation.blocking_reason =
+                        Some("dex_first_recovery_direction_flipped".to_owned());
+                    self.journal.append(operation)?;
+                    return Ok(commands);
+                }
                 operation.stage = TradeStage::Recovering;
                 operation.recovery_inflight = true;
                 let attempt = operation.recovery_results.len() + 1;
-                let target = -residual;
                 commands.push(CoordinatorCommand::RecoverCex {
                     attempt,
                     target_token_b_delta_base_units: target,
@@ -1389,6 +1432,16 @@ impl PaperTradeCoordinator {
         };
         operation.blocking_reason = None;
         self.journal.append(operation)
+    }
+}
+
+const fn dex_first_recovery_direction_is_valid(
+    direction: ArbitrageDirection,
+    target_token_b_delta_base_units: i128,
+) -> bool {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => target_token_b_delta_base_units < 0,
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => target_token_b_delta_base_units > 0,
     }
 }
 
@@ -1892,6 +1945,7 @@ mod tests {
             admission: Some(super::AdmissionRiskBounds {
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::from(1),
+                cex_primary_top_quantity: Decimal::from(100),
                 cex_recovery_limit_price: Decimal::from(1),
                 cex_recovery_sell_limit_price: Some(Decimal::new(99, 2)),
                 cex_recovery_buy_limit_price: Some(Decimal::new(101, 2)),
@@ -1992,6 +2046,34 @@ mod tests {
             expected_result
         );
         drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dex_first_halts_instead_of_recovering_in_the_opposite_direction() {
+        let path = path("dex-first-direction-flip");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, filled(100, -1_000, "dex:flip"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, filled(-105, 1_080, "cex:flip"))
+            .unwrap();
+
+        assert!(coordinator.take_commands(&plan_id).unwrap().is_empty());
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, TradeStage::Halted);
+        assert_eq!(
+            operation.blocking_reason.as_deref(),
+            Some("dex_first_recovery_direction_flipped")
+        );
+        drop(coordinator);
         fs::remove_file(path).unwrap();
     }
 

@@ -10,7 +10,9 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use crate::{
-    admission::{AdmissionEconomics, AdmissionInputs, evaluate_admission},
+    admission::{
+        AdmissionEconomics, AdmissionInputs, evaluate_admission, evaluate_dex_first_admission,
+    },
     arbitrage::{
         AdmissionRiskBounds, ArbitrageDirection as TradeDirection, EntryPreflightHandle,
         PaperOpportunity, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
@@ -57,6 +59,7 @@ pub struct TradingEngine {
     binance_orders: BTreeMap<String, ExecutionReportEvent>,
     last_sequence_matched_quote_update: BTreeMap<String, u64>,
     latest_sequence_matched_depth: BTreeMap<String, SpotDepthBook>,
+    pending_depth_fallback: BTreeMap<String, u64>,
     gas_price_symbol: String,
     gas_price_connected: bool,
     gas_price_generation: u64,
@@ -98,6 +101,12 @@ struct RebalanceSettlementBarrier {
     binance_after: Instant,
     wallet_after: Instant,
     started_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionLiquidity<'a> {
+    DexFirstTop,
+    FullDepth(&'a SpotDepthBook),
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +243,7 @@ impl TradingEngine {
                 binance_orders: BTreeMap::new(),
                 last_sequence_matched_quote_update: BTreeMap::new(),
                 latest_sequence_matched_depth: BTreeMap::new(),
+                pending_depth_fallback: BTreeMap::new(),
                 gas_price_symbol,
                 gas_price_connected: false,
                 gas_price_generation: 0,
@@ -508,7 +518,13 @@ impl TradingEngine {
                 .collect();
             for quote in books {
                 let depth = self.matching_cached_depth(&quote).cloned();
-                self.evaluate_ready_quote(&quote, "dex_prepared", depth.as_ref())?;
+                let admission = if self.uses_dex_first_fast_path() {
+                    Some(AdmissionLiquidity::DexFirstTop)
+                } else {
+                    depth.as_ref().map(AdmissionLiquidity::FullDepth)
+                };
+                let needs_depth = self.evaluate_ready_quote(&quote, "dex_prepared", admission)?;
+                self.update_depth_fallback(&quote, needs_depth);
             }
         }
         Ok(())
@@ -529,6 +545,7 @@ impl TradingEngine {
                 self.last_sequence_matched_quote_update
                     .remove(symbol.as_ref());
                 self.latest_sequence_matched_depth.remove(symbol.as_ref());
+                self.pending_depth_fallback.remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_connected",
                     json!({
@@ -548,6 +565,7 @@ impl TradingEngine {
             } => {
                 self.state.on_disconnected(&symbol, generation);
                 self.latest_sequence_matched_depth.remove(symbol.as_ref());
+                self.pending_depth_fallback.remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_disconnected",
                     json!({
@@ -616,7 +634,19 @@ impl TradingEngine {
                 {
                     self.latest_sequence_matched_depth
                         .insert(symbol.to_string(), depth.clone());
-                    self.evaluate_sequence_matched_quote(&quote, "binance_depth", depth)?;
+                    if self.uses_dex_first_fast_path() {
+                        let waiting_for = self.pending_depth_fallback.get(symbol.as_ref()).copied();
+                        if waiting_for == Some(quote.update_id) {
+                            self.pending_depth_fallback.remove(symbol.as_ref());
+                            self.evaluate_sequence_matched_quote(
+                                &quote,
+                                "binance_depth_fallback",
+                                depth,
+                            )?;
+                        }
+                    } else {
+                        self.evaluate_sequence_matched_quote(&quote, "binance_depth", depth)?;
+                    }
                 }
             }
         }
@@ -1118,21 +1148,28 @@ impl TradingEngine {
                 // The decision is evaluated only after all readiness inputs are
                 // fresh. The calculation itself performs no RPC, I/O, or locks.
                 self.refresh_phase(Instant::now());
-                if self.state.phase == RuntimePhase::Ready
-                    && let Some(depth) = matching_depth
-                {
-                    self.evaluate_sequence_matched_quote(&quote, "binance_book_ticker", depth)?;
-                } else if self.state.phase == RuntimePhase::Ready {
-                    self.telemetry.emit(
-                        "binance_book_depth_mismatch",
-                        json!({
-                            "engine_id": self.config.engine_id,
-                            "product": "spot",
-                            "symbol": quote.symbol.as_ref(),
-                            "book_ticker_update_id": quote.update_id,
-                            "reason": "sequence_or_top_level_mismatch",
-                        }),
-                    );
+                if self.state.phase == RuntimePhase::Ready {
+                    if self.uses_dex_first_fast_path() {
+                        let needs_depth = self.evaluate_ready_quote(
+                            &quote,
+                            "binance_book_ticker",
+                            Some(AdmissionLiquidity::DexFirstTop),
+                        )?;
+                        self.update_depth_fallback(&quote, needs_depth);
+                    } else if let Some(depth) = matching_depth {
+                        self.evaluate_sequence_matched_quote(&quote, "binance_book_ticker", depth)?;
+                    } else {
+                        self.telemetry.emit(
+                            "binance_book_depth_mismatch",
+                            json!({
+                                "engine_id": self.config.engine_id,
+                                "product": "spot",
+                                "symbol": quote.symbol.as_ref(),
+                                "book_ticker_update_id": quote.update_id,
+                                "reason": "sequence_or_top_level_mismatch",
+                            }),
+                        );
+                    }
                 }
 
                 // Raw market telemetry is deliberately serialized only after
@@ -1168,7 +1205,8 @@ impl TradingEngine {
         ) {
             return Ok(());
         }
-        self.evaluate_ready_quote(quote, trigger, Some(depth))
+        self.evaluate_ready_quote(quote, trigger, Some(AdmissionLiquidity::FullDepth(depth)))?;
+        Ok(())
     }
 
     fn matching_cached_depth(&self, quote: &TopOfBook) -> Option<&SpotDepthBook> {
@@ -1190,8 +1228,8 @@ impl TradingEngine {
         &mut self,
         quote: &TopOfBook,
         trigger: &'static str,
-        depth: Option<&SpotDepthBook>,
-    ) -> anyhow::Result<()> {
+        admission: Option<AdmissionLiquidity<'_>>,
+    ) -> anyhow::Result<bool> {
         let calculation_started = Instant::now();
         if let Some(evaluation) = self.opportunities.evaluate(quote)? {
             self.hot_telemetry.emit_evaluation(
@@ -1201,21 +1239,37 @@ impl TradingEngine {
                 calculation_started.elapsed().as_micros(),
                 trigger,
             );
-            if let Some(depth) = depth {
-                self.submit_paper_opportunity(quote, evaluation, depth)?;
+            if let Some(admission) = admission {
+                return self.submit_paper_opportunity(quote, evaluation, admission);
             }
         }
-        Ok(())
+        Ok(false)
+    }
+
+    fn uses_dex_first_fast_path(&self) -> bool {
+        matches!(
+            self.config.arbitrage_execution_mode.as_str(),
+            "full_live" | "paper_dex_first"
+        )
+    }
+
+    fn update_depth_fallback(&mut self, quote: &TopOfBook, needs_depth: bool) {
+        if needs_depth {
+            self.pending_depth_fallback
+                .insert(quote.symbol.as_ref().to_owned(), quote.update_id);
+        } else {
+            self.pending_depth_fallback.remove(quote.symbol.as_ref());
+        }
     }
 
     fn submit_paper_opportunity(
         &mut self,
         quote: &TopOfBook,
         evaluation: PairEvaluation,
-        depth: &SpotDepthBook,
-    ) -> anyhow::Result<()> {
+        admission_liquidity: AdmissionLiquidity<'_>,
+    ) -> anyhow::Result<bool> {
         let Some(handle) = self.paper_trades.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         let pair = self.opportunities.pair(evaluation.pair_index)?;
         let pair_id = pair.pair_id.clone();
@@ -1240,6 +1294,7 @@ impl TradingEngine {
             .context("admission has no native-token price")?;
 
         let mut candidates = Vec::with_capacity(2);
+        let mut needs_depth_fallback = false;
         for direction in [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell] {
             // Rails executes the fixed token-A minimum-buy baseline. The
             // larger market-liquidity capacity remains telemetry only and must
@@ -1259,33 +1314,56 @@ impl TradingEngine {
                     TradeDirection::BuyTokenBOnCexSellOnDex
                 }
             };
-            let Some(economics) = evaluate_admission(
-                depth,
-                AdmissionInputs {
-                    symbol: &pair_symbol,
-                    direction: trade_direction,
-                    token_b_amount: trade.token_b_amount,
-                    token_a_decimals,
-                    token_b_decimals,
-                    binance_buy_fee_bps,
-                    binance_sell_fee_bps,
-                    expected_cost_token_a: trade.cost_token_a,
-                    expected_proceeds_token_a: trade.proceeds_token_a,
-                    opportunity_threshold_bps,
-                    network_gas_price_wei,
-                    native_price_token_a,
-                    wallet_native_balance_wei,
-                },
-            )?
-            else {
-                self.emit_admission_risk_rejection(
-                    quote,
-                    &pair_id,
-                    trade_direction,
-                    "insufficient_recovery_depth",
-                    None,
-                );
-                continue;
+            let inputs = AdmissionInputs {
+                symbol: &pair_symbol,
+                direction: trade_direction,
+                token_b_amount: trade.token_b_amount,
+                token_a_decimals,
+                token_b_decimals,
+                binance_buy_fee_bps,
+                binance_sell_fee_bps,
+                expected_cost_token_a: trade.cost_token_a,
+                expected_proceeds_token_a: trade.proceeds_token_a,
+                opportunity_threshold_bps,
+                network_gas_price_wei,
+                native_price_token_a,
+                wallet_native_balance_wei,
+            };
+            let (economics, liquidity_source) = match admission_liquidity {
+                AdmissionLiquidity::DexFirstTop => {
+                    let Some(economics) = evaluate_dex_first_admission(quote, inputs)? else {
+                        needs_depth_fallback = true;
+                        self.telemetry.emit(
+                            "arbitrage_admission_deferred",
+                            json!({
+                                "engine_id": self.config.engine_id,
+                                "pair_id": pair_id,
+                                "symbol": quote.symbol.as_ref(),
+                                "update_id": quote.update_id,
+                                "direction": match trade_direction {
+                                    TradeDirection::BuyTokenBOnDexSellOnCex => "buy_token_b_on_dex_sell_on_cex",
+                                    TradeDirection::BuyTokenBOnCexSellOnDex => "buy_token_b_on_cex_sell_on_dex",
+                                },
+                                "reason": "insufficient_relevant_top_quantity",
+                            }),
+                        );
+                        continue;
+                    };
+                    (economics, "book_ticker_relevant_top")
+                }
+                AdmissionLiquidity::FullDepth(depth) => {
+                    let Some(economics) = evaluate_admission(depth, inputs)? else {
+                        self.emit_admission_risk_rejection(
+                            quote,
+                            &pair_id,
+                            trade_direction,
+                            "insufficient_recovery_depth",
+                            None,
+                        );
+                        continue;
+                    };
+                    (economics, "sequence_matched_full_depth")
+                }
             };
             if !economics.native_gas_covered {
                 self.emit_admission_risk_rejection(
@@ -1301,13 +1379,13 @@ impl TradingEngine {
             // Keep the fully-burdened economics in telemetry and use them to
             // rank candidates, but do not turn them into a hidden Rust-only
             // threshold.
-            candidates.push((trade_direction, trade, economics));
+            candidates.push((trade_direction, trade, economics, liquidity_source));
         }
         let candidate = candidates
             .into_iter()
-            .max_by_key(|(_, _, economics)| economics.bounded_profit_token_a);
-        let Some((direction, trade, economics)) = candidate else {
-            return Ok(());
+            .max_by_key(|(_, _, economics, _)| economics.bounded_profit_token_a);
+        let Some((direction, trade, economics, liquidity_source)) = candidate else {
+            return Ok(needs_depth_fallback);
         };
         let dex_pool_generation = self.opportunities.pool_generation(trade.pool_index)?;
         if let Some(barrier) = self.arbitrage_settlement_barriers.get(&trade.pool_index)
@@ -1337,7 +1415,7 @@ impl TradingEngine {
                     "barrier_age_ms": barrier.started_at.elapsed().as_millis(),
                 }),
             );
-            return Ok(());
+            return Ok(false);
         }
         let pair_config = self
             .domain_config
@@ -1383,9 +1461,13 @@ impl TradingEngine {
                     TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
                     TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
                 },
+                cex_primary_top_quantity: match admission_liquidity {
+                    AdmissionLiquidity::DexFirstTop => economics.primary_quantity,
+                    AdmissionLiquidity::FullDepth(_) => Decimal::ZERO,
+                },
                 cex_recovery_limit_price: economics.recovery_limit_price,
-                cex_recovery_sell_limit_price: Some(economics.recovery_sell_limit_price),
-                cex_recovery_buy_limit_price: Some(economics.recovery_buy_limit_price),
+                cex_recovery_sell_limit_price: economics.recovery_sell_limit_price,
+                cex_recovery_buy_limit_price: economics.recovery_buy_limit_price,
                 recovery_quote_token_a_base_units: u256_to_u128(
                     economics.recovery_quote_token_a,
                     "paper recovery quote",
@@ -1471,7 +1553,7 @@ impl TradingEngine {
                     "claims": claim_details,
                 }),
             );
-            return Ok(());
+            return Ok(false);
         }
         self.arbitrage_plan_freshness.insert(
             plan_id.clone(),
@@ -1501,7 +1583,7 @@ impl TradingEngine {
                         "reason": "execution_lane_unavailable",
                     }),
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
         self.telemetry.emit(
@@ -1510,15 +1592,20 @@ impl TradingEngine {
                 "engine_id": self.config.engine_id,
                 "plan_id": &plan_id,
                 "mode": self.config.arbitrage_execution_mode,
+                "admission_liquidity_source": liquidity_source,
                 "balance_safety_multiplier": balance_safety_multiplier,
                 "execution_slippage_bps": trade.execution_slippage_bps,
                 "cex_primary_limit_price": match direction {
                     TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
                     TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price.to_string(),
                 },
+                "cex_primary_top_quantity": match admission_liquidity {
+                    AdmissionLiquidity::DexFirstTop => Some(economics.primary_quantity.to_string()),
+                    AdmissionLiquidity::FullDepth(_) => None,
+                },
                 "recovery_limit_price": economics.recovery_limit_price.to_string(),
-                "recovery_sell_limit_price": economics.recovery_sell_limit_price.to_string(),
-                "recovery_buy_limit_price": economics.recovery_buy_limit_price.to_string(),
+                "recovery_sell_limit_price": economics.recovery_sell_limit_price.map(|price| price.to_string()),
+                "recovery_buy_limit_price": economics.recovery_buy_limit_price.map(|price| price.to_string()),
                 "recovery_quote_token_a_base_units": economics.recovery_quote_token_a.to_string(),
                 "recovery_sell_quote_token_a_base_units": economics.recovery_sell_quote_token_a.to_string(),
                 "recovery_buy_quote_token_a_base_units": economics.recovery_buy_quote_token_a.to_string(),
@@ -1532,7 +1619,7 @@ impl TradingEngine {
                 "dex_plan": dex_plan_telemetry_value(&dex_plan),
             }),
         );
-        Ok(())
+        Ok(false)
     }
 
     fn emit_admission_risk_rejection(
@@ -1553,8 +1640,8 @@ impl TradingEngine {
                 "direction": format!("{direction:?}"),
                 "reason": reason,
                 "recovery_limit_price": economics.map(|value| value.recovery_limit_price.to_string()),
-                "recovery_sell_limit_price": economics.map(|value| value.recovery_sell_limit_price.to_string()),
-                "recovery_buy_limit_price": economics.map(|value| value.recovery_buy_limit_price.to_string()),
+                "recovery_sell_limit_price": economics.and_then(|value| value.recovery_sell_limit_price.map(|price| price.to_string())),
+                "recovery_buy_limit_price": economics.and_then(|value| value.recovery_buy_limit_price.map(|price| price.to_string())),
                 "recovery_quote_token_a_base_units": economics.map(|value| value.recovery_quote_token_a.to_string()),
                 "recovery_sell_quote_token_a_base_units": economics.map(|value| value.recovery_sell_quote_token_a.to_string()),
                 "recovery_buy_quote_token_a_base_units": economics.map(|value| value.recovery_buy_quote_token_a.to_string()),

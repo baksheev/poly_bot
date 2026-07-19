@@ -700,6 +700,7 @@ mod tests {
             admission: AdmissionRiskBounds {
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::ONE,
+                cex_primary_top_quantity: Decimal::from(100),
                 cex_recovery_limit_price: Decimal::ONE,
                 cex_recovery_sell_limit_price: Some(Decimal::new(99, 2)),
                 cex_recovery_buy_limit_price: Some(Decimal::new(101, 2)),
@@ -753,13 +754,29 @@ mod tests {
     }
 
     fn preflight_quote(bid: Decimal, ask: Decimal, update_id: u64) -> crate::state::TopOfBook {
-        crate::state::TopOfBook::new(
-            std::sync::Arc::from("WLDUSDC"),
-            update_id,
+        preflight_quote_with_quantities(
             bid,
             Decimal::new(100, 0),
             ask,
             Decimal::new(100, 0),
+            update_id,
+        )
+    }
+
+    fn preflight_quote_with_quantities(
+        bid: Decimal,
+        bid_quantity: Decimal,
+        ask: Decimal,
+        ask_quantity: Decimal,
+        update_id: u64,
+    ) -> crate::state::TopOfBook {
+        crate::state::TopOfBook::new(
+            std::sync::Arc::from("WLDUSDC"),
+            update_id,
+            bid,
+            bid_quantity,
+            ask,
+            ask_quantity,
             None,
             None,
             std::time::Instant::now(),
@@ -791,6 +808,35 @@ mod tests {
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
 
         assert_eq!(rejection.reason, "dex_pool_changed_after_quote");
+    }
+
+    #[test]
+    fn entry_preflight_rejects_relevant_top_quantity_drift() {
+        let handle = EntryPreflightHandle::default();
+        let quote = preflight_quote_with_quantities(
+            Decimal::ONE,
+            Decimal::from(99),
+            Decimal::new(101, 2),
+            Decimal::from(100),
+            8,
+        );
+        handle.update_quote(&quote);
+        handle.update_dex_pool_generation(0, 1);
+
+        let rejection = handle.check(&opportunity()).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "cex_top_quantity_below_admission");
+    }
+
+    #[test]
+    fn entry_preflight_rejects_expired_dex_plan() {
+        let handle = default_preflight();
+        let mut expired = opportunity();
+        expired.dex_plan.deadline_unix_seconds = 1;
+
+        let rejection = handle.check(&expired).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "dex_plan_expired");
     }
 
     #[test]
