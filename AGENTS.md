@@ -34,6 +34,22 @@ a time.
   repository-local `.gcloud/` configuration keeps this project's account,
   project, and ADC isolated from the global Google Cloud SDK configuration.
 
+## Production delivery
+
+- Do not use local Docker for this repository, including builds, tests, tags,
+  pushes, or production image inspection that requires pulling an image.
+- Deliver every production application revision through
+  `.github/workflows/deploy-gce.yml` on `main`. The GitHub Action must build and
+  push the `linux/amd64` image, resolve its immutable digest, and roll that exact
+  digest out to GCE.
+- Do not run `scripts/update-gce-worker`, build or push a production image from
+  a workstation, or directly change GCE image metadata/restart the instance for
+  an application rollout. Encode production changes in the workflow, commit
+  them, let CI pass, and use the `Deploy GCE` GitHub Action.
+- Local GCP access is for read-only inspection and explicitly requested
+  bootstrap or recovery work only. Routine production mutations belong in a
+  reviewed GitHub Action so the actor, revision, logs, and outcome are auditable.
+
 ## Clone boundaries
 
 - The Rails application keeps running independently. Do not move partial live
