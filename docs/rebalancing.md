@@ -193,7 +193,15 @@ rebalance legs.
 3. Revalidate the pinned direct network and withdrawal constraints.
 4. Submit the master-account withdrawal with a deterministic
    `withdrawOrderId`.
-5. Reconcile Binance withdrawal history and the World Chain wallet credit.
+5. Require completed Binance withdrawal history with a nonempty EVM transaction
+   hash, then verify the successful World Chain receipt contains an ERC-20
+   `Transfer` of at least the reported net amount, for the exact token and
+   wallet.
+
+The receipt is the credit proof. The current aggregate wallet balance is
+recorded after verification but is not compared with the pre-withdrawal
+balance: arbitrage remains independent from rebalancing and may spend the same
+token while a Binance withdrawal is in flight.
 
 ### Direct wallet to Binance
 

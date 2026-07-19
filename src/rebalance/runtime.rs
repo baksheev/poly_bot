@@ -335,14 +335,10 @@ impl RebalanceExecutor {
         operation = self
             .begin_binance_withdrawal(operation, withdrawal_submission_safe, &binance_network)
             .await?;
-        let (bridge_before, record) = match &operation.progress {
-            RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
-                bridge_balance_before,
-                ..
-            } => (
-                *bridge_balance_before,
-                self.wait_withdrawal(&operation).await?,
-            ),
+        let record = match &operation.progress {
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted { .. } => {
+                self.wait_withdrawal(&operation).await?
+            }
             RebalanceExecutionProgress::Completed { .. } => return Ok(operation),
             RebalanceExecutionProgress::Failed { reason } => {
                 bail!("rebalance previously failed: {reason}")
@@ -351,24 +347,15 @@ impl RebalanceExecutor {
         };
         let received = withdrawal_received_base_units(&record, operation.intent.token_decimals)?;
         let wallet_after = self
-            .wait_token_credit(
+            .wait_direct_withdrawal_credit(
                 &self.world,
                 operation.intent.token_contract,
                 operation.intent.wallet_owner,
-                bridge_before,
+                &record.tx_id,
                 received,
             )
             .await?;
         let binance_after = self.binance_balance(&operation).await?;
-        ensure!(
-            wallet_after
-                >= operation
-                    .intent
-                    .wallet_balance_before
-                    .checked_add(received)
-                    .context("wallet target overflow")?,
-            "World Chain balance did not receive the withdrawal"
-        );
         operation = self.execution_journal.advance(
             &operation.intent.operation_id,
             RebalanceExecutionProgress::Completed {
@@ -1350,6 +1337,27 @@ impl RebalanceExecutor {
         }
     }
 
+    async fn wait_direct_withdrawal_credit(
+        &self,
+        rpc: &JsonRpcClient,
+        token: Address,
+        owner: Address,
+        transaction_id: &str,
+        expected_delta: U256,
+    ) -> anyhow::Result<U256> {
+        let transaction_hash = B256::from_str(transaction_id)
+            .context("Binance withdrawal transaction id is not an EVM hash")?;
+        let receipt = wait_receipt(rpc, transaction_hash, self.limits.operation_timeout).await?;
+        validate_direct_withdrawal_receipt(
+            &receipt,
+            transaction_hash,
+            token,
+            owner,
+            expected_delta,
+        )?;
+        rpc.erc20_balance(token, owner).await
+    }
+
     async fn verify_route(
         &self,
         operation: &RebalanceExecutionOperation,
@@ -1586,6 +1594,48 @@ async fn wait_receipt(
     }
 }
 
+fn validate_direct_withdrawal_receipt(
+    receipt: &TransactionReceipt,
+    expected_hash: B256,
+    token: Address,
+    owner: Address,
+    expected_delta: U256,
+) -> anyhow::Result<()> {
+    ensure!(
+        receipt.transaction_hash == expected_hash,
+        "withdrawal receipt transaction hash changed"
+    );
+    ensure!(receipt.status == 1, "withdrawal transaction reverted");
+
+    let transfer_topic = keccak256("Transfer(address,address,uint256)");
+    let mut received = U256::ZERO;
+    for log in receipt
+        .logs
+        .iter()
+        .filter(|log| log.address == token && log.topics.first() == Some(&transfer_topic))
+    {
+        ensure!(
+            log.topics.len() == 3,
+            "withdrawal ERC-20 Transfer log has wrong topics"
+        );
+        ensure!(
+            log.data.len() == 32,
+            "withdrawal ERC-20 Transfer log amount is not one word"
+        );
+        let recipient = Address::from_slice(&log.topics[2].as_slice()[12..]);
+        if recipient == owner {
+            received = received
+                .checked_add(U256::from_be_slice(&log.data))
+                .context("withdrawal ERC-20 transfer sum overflow")?;
+        }
+    }
+    ensure!(
+        received >= expected_delta,
+        "withdrawal receipt did not transfer the expected token amount to the wallet"
+    );
+    Ok(())
+}
+
 fn validate_withdrawal_record(
     operation: &RebalanceExecutionOperation,
     record: &WithdrawalRecord,
@@ -1783,14 +1833,18 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, U256};
+    use alloy_primitives::{Address, B256, U256, keccak256};
     use rust_decimal::Decimal;
 
-    use crate::binance::capital::WithdrawalRecord;
+    use crate::{
+        binance::capital::WithdrawalRecord,
+        chain::rpc::{ReceiptLog, TransactionReceipt},
+    };
 
     use super::{
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, validate_approved_world_asset, withdrawal_received_base_units,
+        decimal_to_base_units_floor, validate_approved_world_asset,
+        validate_direct_withdrawal_receipt, withdrawal_received_base_units,
         withdrawal_requested_base_units,
     };
 
@@ -1867,6 +1921,59 @@ mod tests {
         assert_eq!(
             withdrawal_received_base_units(&wld, 18).unwrap(),
             U256::from(875_429_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn direct_withdrawal_receipt_proves_credit_despite_later_wallet_spending() {
+        fn address_topic(address: Address) -> B256 {
+            let mut word = [0_u8; 32];
+            word[12..].copy_from_slice(address.as_slice());
+            word.into()
+        }
+
+        let transaction_hash = B256::repeat_byte(0x44);
+        let token = Address::repeat_byte(0x11);
+        let wallet = Address::repeat_byte(0x22);
+        let received = U256::from(1_133_000_u64);
+        let receipt = TransactionReceipt {
+            transaction_hash,
+            block_number: 123,
+            status: 1,
+            gas_used: 50_000,
+            effective_gas_price: 1,
+            logs: vec![ReceiptLog {
+                address: token,
+                topics: vec![
+                    keccak256("Transfer(address,address,uint256)"),
+                    address_topic(Address::repeat_byte(0x33)),
+                    address_topic(wallet),
+                ],
+                data: received.to_be_bytes::<32>().to_vec(),
+            }],
+        };
+
+        validate_direct_withdrawal_receipt(&receipt, transaction_hash, token, wallet, received)
+            .unwrap();
+        assert!(
+            validate_direct_withdrawal_receipt(
+                &receipt,
+                transaction_hash,
+                token,
+                wallet,
+                received + U256::ONE,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_direct_withdrawal_receipt(
+                &receipt,
+                transaction_hash,
+                token,
+                Address::repeat_byte(0x55),
+                received,
+            )
+            .is_err()
         );
     }
 }
