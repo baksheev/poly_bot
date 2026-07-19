@@ -668,6 +668,7 @@ fn validate_transition(
             P::BridgePrepared { .. },
         ) => true,
         (Route::Across { .. }, _, P::BridgePrepared { .. }, P::BridgeMined { .. }) => true,
+        (Route::Across { .. }, _, P::BridgePrepared { .. }, P::BridgePrepared { .. }) => true,
         (Route::Across { .. }, _, P::BridgeMined { .. }, P::AcrossFilled { .. }) => true,
         (
             Route::Across { .. },
@@ -1132,6 +1133,61 @@ mod tests {
             } if recovered == &calldata && *calldata_hash == keccak256(&calldata)
         ));
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn allows_replacing_a_prepared_across_quote_before_broadcast() {
+        let path = path("replace-prepared-bridge");
+        let operation_id;
+        {
+            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+            let operation = journal
+                .reserve(&request(Direction::WalletToBinance, across()))
+                .unwrap();
+            operation_id = operation.intent.operation_id.clone();
+            let first_calldata = vec![0xad, 0x54, 0x25, 0xc6, 0x01];
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BridgePrepared {
+                        origin_chain_id: 10,
+                        input_amount: U256::from(2_000_000_u64),
+                        target: Address::repeat_byte(0x35),
+                        calldata_hash: keccak256(&first_calldata),
+                        calldata: first_calldata,
+                        minimum_output_amount: U256::from(1_990_000_u64),
+                        destination_balance_before: U256::from(10_000_000_u64),
+                    },
+                )
+                .unwrap();
+            let replacement_calldata = vec![0x8e, 0x02, 0x50, 0xee, 0x02];
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BridgePrepared {
+                        origin_chain_id: 10,
+                        input_amount: U256::from(2_000_000_u64),
+                        target: Address::repeat_byte(0x36),
+                        calldata_hash: keccak256(&replacement_calldata),
+                        calldata: replacement_calldata.clone(),
+                        minimum_output_amount: U256::from(1_985_000_u64),
+                        destination_balance_before: U256::from(10_000_500_u64),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                &journal.operations()[&operation_id].progress,
+                RebalanceExecutionProgress::BridgePrepared {
+                    target,
+                    calldata,
+                    minimum_output_amount,
+                    ..
+                } if *target == Address::repeat_byte(0x36)
+                    && calldata == &replacement_calldata
+                    && *minimum_output_amount == U256::from(1_985_000_u64)
+            ));
+        }
         fs::remove_file(path).unwrap();
     }
 

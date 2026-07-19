@@ -19,6 +19,10 @@ pub const WORLD_CHAIN_WLD: Address =
     alloy_primitives::address!("0x2cFc85d8E48F8EAB294be644d9E25C3030863003");
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_QUOTE_EXPIRY_SECONDS: u64 = 7_200;
+const ACROSS_DEPOSIT_V3_SELECTOR: [u8; 4] = [0xad, 0x54, 0x25, 0xc6];
+const CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR: [u8; 4] = [0x8e, 0x02, 0x50, 0xee];
+const CCTP_INTEGRATOR_DELIMITER: [u8; 3] = [0x1d, 0xc0, 0xde];
 
 pub struct AcrossClient {
     http: Client,
@@ -212,6 +216,14 @@ pub struct ValidatedErc20Quote {
     pub minimum_output_amount: u128,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedSwapCalldata {
+    bytes: Vec<u8>,
+    /// Some Across Swap API routes return a plain SpokePool deposit with an
+    /// on-chain fill deadline; CCTP burns do not have a calldata-level expiry.
+    finite_deadline_unix_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrossDepositStatus {
@@ -293,16 +305,6 @@ pub fn validate_quote(
         quote.expected_fill_time <= 600,
         "Across expected fill time exceeds the safety bound"
     );
-    let now = unix_timestamp_seconds()?;
-    ensure!(
-        quote.quote_expiry_timestamp > now,
-        "Across quote is already expired"
-    );
-    ensure!(
-        quote.quote_expiry_timestamp <= now + 7_200,
-        "Across quote expiry is outside the safety bound"
-    );
-
     ensure_check_token(&quote.checks.allowance.token, request.input_token)?;
     ensure_check_token(&quote.checks.balance.token, request.input_token)?;
     ensure!(
@@ -328,15 +330,50 @@ pub fn validate_quote(
         "Across ERC20 swap transaction has non-zero native value"
     );
     let swap_data = validate_swap_calldata(request, &quote.swap_tx.data, min_output)?;
+    let now = unix_timestamp_seconds()?;
+    validate_quote_expiry(
+        quote.quote_expiry_timestamp,
+        swap_data.finite_deadline_unix_seconds,
+        now,
+    )?;
     let approval = validate_approvals(request, quote, spender)?;
     Ok(ValidatedErc20Quote {
         approval,
         swap: ValidatedErc20Transaction {
             target: spender,
-            data: swap_data,
+            data: swap_data.bytes,
         },
         minimum_output_amount: min_output,
     })
+}
+
+fn validate_quote_expiry(
+    quote_expiry_timestamp: u64,
+    finite_deadline_unix_seconds: Option<u64>,
+    now: u64,
+) -> anyhow::Result<()> {
+    if quote_expiry_timestamp == 0 {
+        // Across Swap API currently returns quoteExpiryTimestamp=0 for CCTP V2
+        // TokenMessenger calldata. A zero top-level expiry means "not provided"
+        // here; route-specific calldata validation remains responsible for
+        // stale transaction rejection.
+        return Ok(());
+    }
+    ensure!(
+        quote_expiry_timestamp > now,
+        "Across quote is already expired"
+    );
+    ensure!(
+        quote_expiry_timestamp <= now + MAX_QUOTE_EXPIRY_SECONDS,
+        "Across quote expiry is outside the safety bound"
+    );
+    if let Some(deadline) = finite_deadline_unix_seconds {
+        ensure!(
+            quote_expiry_timestamp <= deadline,
+            "Across quote expiry exceeds calldata deadline"
+        );
+    }
+    Ok(())
 }
 
 fn ensure_token(token: &AcrossToken, chain_id: u64, address: Address) -> anyhow::Result<()> {
@@ -417,15 +454,29 @@ fn validate_swap_calldata(
     request: &AcrossQuoteRequest,
     data: &str,
     min_output: u128,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<ValidatedSwapCalldata> {
     let bytes = decode_calldata("swapTx.data", data)?;
     ensure!(
-        bytes.len() >= 4 + 6 * 32 && bytes.len() <= 16_384,
+        bytes.len() >= 4 + 7 * 32 && bytes.len() <= 16_384,
         "Across swap calldata length is invalid"
     );
+    match bytes[..4].try_into().expect("selector has four bytes") {
+        ACROSS_DEPOSIT_V3_SELECTOR => validate_deposit_v3_calldata(request, bytes, min_output),
+        CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR => {
+            validate_cctp_v2_deposit_for_burn_calldata(request, bytes, min_output)
+        }
+        _ => anyhow::bail!("Across swap calldata selector changed"),
+    }
+}
+
+fn validate_deposit_v3_calldata(
+    request: &AcrossQuoteRequest,
+    bytes: Vec<u8>,
+    min_output: u128,
+) -> anyhow::Result<ValidatedSwapCalldata> {
     ensure!(
-        bytes[..4] == [0xad, 0x54, 0x25, 0xc6],
-        "Across swap calldata selector changed"
+        bytes.len() >= 4 + 12 * 32,
+        "Across depositV3 calldata is truncated"
     );
     ensure!(
         address_word(&bytes, 0)? == request.depositor,
@@ -451,7 +502,118 @@ fn validate_swap_calldata(
         u256_word_fits_u128(&bytes, 5)? == min_output,
         "Across calldata minimum output mismatch"
     );
-    Ok(bytes)
+    ensure!(
+        u256_word_fits_u64(&bytes, 6)? == request.destination_chain_id,
+        "Across calldata destination chain mismatch"
+    );
+    let quote_timestamp = u256_word_fits_u64(&bytes, 8)?;
+    ensure!(
+        quote_timestamp > 0
+            && quote_timestamp <= unix_timestamp_seconds()? + MAX_QUOTE_EXPIRY_SECONDS,
+        "Across calldata quote timestamp is outside the safety bound"
+    );
+    let fill_deadline = u256_word_fits_u64(&bytes, 9)?;
+    let now = unix_timestamp_seconds()?;
+    if fill_deadline != u64::from(u32::MAX) {
+        ensure!(fill_deadline > now, "Across calldata fill deadline expired");
+        ensure!(
+            fill_deadline <= now + MAX_QUOTE_EXPIRY_SECONDS,
+            "Across calldata fill deadline is outside the safety bound"
+        );
+    }
+    let exclusivity_deadline = u256_word_fits_u64(&bytes, 10)?;
+    ensure!(
+        exclusivity_deadline <= fill_deadline,
+        "Across calldata exclusivity exceeds fill deadline"
+    );
+    Ok(ValidatedSwapCalldata {
+        bytes,
+        finite_deadline_unix_seconds: (fill_deadline != u64::from(u32::MAX))
+            .then_some(fill_deadline),
+    })
+}
+
+fn validate_cctp_v2_deposit_for_burn_calldata(
+    request: &AcrossQuoteRequest,
+    bytes: Vec<u8>,
+    min_output: u128,
+) -> anyhow::Result<ValidatedSwapCalldata> {
+    ensure!(
+        request.input_token == OPTIMISM_USDC || request.input_token == WORLD_CHAIN_USDC,
+        "Across CCTP calldata is only approved for USDC"
+    );
+    ensure!(
+        bytes.len() >= 4 + 7 * 32,
+        "Across CCTP calldata is truncated"
+    );
+    let trailing = &bytes[4 + 7 * 32..];
+    ensure!(
+        trailing.is_empty() || trailing.starts_with(&CCTP_INTEGRATOR_DELIMITER),
+        "Across CCTP calldata has unexpected trailing data"
+    );
+    ensure!(
+        u256_word_fits_u128(&bytes, 0)? == request.amount,
+        "Across CCTP input amount mismatch"
+    );
+    ensure!(
+        u256_word_fits_u64(&bytes, 1)? == circle_domain(request.destination_chain_id)?,
+        "Across CCTP destination domain mismatch"
+    );
+    ensure!(
+        address_word(&bytes, 2)? == request.recipient,
+        "Across CCTP mint recipient mismatch"
+    );
+    ensure!(
+        address_word(&bytes, 3)? == request.input_token,
+        "Across CCTP burn token mismatch"
+    );
+    // Circle represents destinationCaller as bytes32. Across currently uses a
+    // canonical address word here; zero is also valid for unrestricted minting.
+    let destination_caller = word(&bytes, 4)?;
+    ensure!(
+        destination_caller.iter().all(|byte| *byte == 0)
+            || destination_caller[..12].iter().all(|byte| *byte == 0),
+        "Across CCTP destination caller is not canonical"
+    );
+    let max_fee = u256_word_fits_u128(&bytes, 5)?;
+    ensure!(
+        request
+            .amount
+            .checked_sub(max_fee)
+            .is_some_and(|output| output >= min_output),
+        "Across CCTP max fee exceeds the accepted minimum output"
+    );
+    let min_finality_threshold = u256_word_fits_u64(&bytes, 6)?;
+    ensure!(
+        min_finality_threshold > 0 && min_finality_threshold <= u64::from(u32::MAX),
+        "Across CCTP finality threshold is invalid"
+    );
+    Ok(ValidatedSwapCalldata {
+        bytes,
+        finite_deadline_unix_seconds: None,
+    })
+}
+
+pub fn swap_calldata_is_stale(data: &[u8]) -> anyhow::Result<bool> {
+    ensure!(data.len() >= 4, "Across swap calldata is truncated");
+    if data[..4] != ACROSS_DEPOSIT_V3_SELECTOR {
+        return Ok(false);
+    }
+    ensure!(
+        data.len() >= 4 + 12 * 32,
+        "Across depositV3 calldata is truncated"
+    );
+    let fill_deadline = u256_word_fits_u64(data, 9)?;
+    Ok(fill_deadline != u64::from(u32::MAX) && fill_deadline <= unix_timestamp_seconds()?)
+}
+
+fn circle_domain(chain_id: u64) -> anyhow::Result<u64> {
+    match chain_id {
+        // Circle CCTP domain IDs, not EVM chain IDs.
+        OPTIMISM_CHAIN_ID => Ok(2),
+        WORLD_CHAIN_CHAIN_ID => Ok(14),
+        _ => anyhow::bail!("Across CCTP destination chain is not approved"),
+    }
 }
 
 fn decode_calldata(name: &str, value: &str) -> anyhow::Result<Vec<u8>> {
@@ -485,6 +647,17 @@ fn u256_word_fits_u128(bytes: &[u8], index: usize) -> anyhow::Result<u128> {
     );
     Ok(u128::from_be_bytes(
         word[16..].try_into().expect("word tail is 16 bytes"),
+    ))
+}
+
+fn u256_word_fits_u64(bytes: &[u8], index: usize) -> anyhow::Result<u64> {
+    let word = word(bytes, index)?;
+    ensure!(
+        word[..24].iter().all(|byte| *byte == 0),
+        "Across calldata integer exceeds u64"
+    );
+    Ok(u64::from_be_bytes(
+        word[24..].try_into().expect("word tail is 8 bytes"),
     ))
 }
 
@@ -723,6 +896,29 @@ mod tests {
         push_address_word(&mut bytes, request.output_token);
         push_u128_word(&mut bytes, request.amount);
         push_u128_word(&mut bytes, minimum_output);
+        push_u64_word(&mut bytes, request.destination_chain_id);
+        push_address_word(&mut bytes, Address::ZERO);
+        push_u64_word(&mut bytes, super::unix_timestamp_seconds().unwrap());
+        push_u64_word(&mut bytes, super::unix_timestamp_seconds().unwrap() + 60);
+        push_u64_word(&mut bytes, 0);
+        push_u64_word(&mut bytes, 12 * 32);
+        push_u64_word(&mut bytes, 0);
+        encode_hex(&bytes)
+    }
+
+    fn cctp_deposit_for_burn_calldata(request: &AcrossQuoteRequest, max_fee: u128) -> String {
+        let mut bytes = vec![0x8e, 0x02, 0x50, 0xee];
+        push_u128_word(&mut bytes, request.amount);
+        push_u64_word(
+            &mut bytes,
+            super::circle_domain(request.destination_chain_id).unwrap(),
+        );
+        push_address_word(&mut bytes, request.recipient);
+        push_address_word(&mut bytes, request.input_token);
+        push_address_word(&mut bytes, Address::ZERO);
+        push_u128_word(&mut bytes, max_fee);
+        push_u64_word(&mut bytes, 1_000);
+        bytes.extend([0x1d, 0xc0, 0xde]);
         encode_hex(&bytes)
     }
 
@@ -733,6 +929,11 @@ mod tests {
 
     fn push_u128_word(bytes: &mut Vec<u8>, value: u128) {
         bytes.extend([0_u8; 16]);
+        bytes.extend(value.to_be_bytes());
+    }
+
+    fn push_u64_word(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend([0_u8; 24]);
         bytes.extend(value.to_be_bytes());
     }
 
@@ -751,6 +952,32 @@ mod tests {
         let terms = validate_quote(&request(), &valid_quote()).unwrap();
         assert!(terms.approval.is_some());
         assert_eq!(terms.minimum_output_amount, 999_400);
+    }
+
+    #[test]
+    fn accepts_cctp_swap_api_calldata_with_zero_quote_expiry() {
+        let request = request();
+        let mut quote = valid_quote();
+        quote.quote_expiry_timestamp = 0;
+        quote.swap_tx.to = format!("{SPENDER:#x}");
+        quote.swap_tx.data = cctp_deposit_for_burn_calldata(&request, 600);
+        quote.min_output_amount = "999400".to_owned();
+        quote.expected_output_amount = "999400".to_owned();
+        let terms = validate_quote(&request, &quote).unwrap();
+        assert_eq!(terms.minimum_output_amount, 999_400);
+        assert!(terms.swap.data.starts_with(&[0x8e, 0x02, 0x50, 0xee]));
+    }
+
+    #[test]
+    fn rejects_expired_spokepool_calldata_even_when_quote_expiry_is_zero() {
+        let request = request();
+        let mut quote = valid_quote();
+        quote.quote_expiry_timestamp = 0;
+        let mut bytes = decode_calldata("swapTx.data", &quote.swap_tx.data).unwrap();
+        let deadline_word = 4 + 9 * 32;
+        bytes[deadline_word..deadline_word + 32].fill(0);
+        quote.swap_tx.data = encode_hex(&bytes);
+        assert!(validate_quote(&request, &quote).is_err());
     }
 
     #[test]

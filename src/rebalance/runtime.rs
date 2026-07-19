@@ -7,8 +7,8 @@ use rust_decimal::Decimal;
 use crate::{
     across::{
         AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WLD,
-        WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, validate_deposit_status,
-        validate_quote,
+        WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, swap_calldata_is_stale,
+        validate_deposit_status, validate_quote,
     },
     binance::{
         account::{AccountInformation, BinanceAccountClient},
@@ -581,12 +581,10 @@ impl RebalanceExecutor {
     ) -> anyhow::Result<RebalanceExecutionOperation> {
         if let RebalanceExecutionProgress::BridgePrepared {
             origin_chain_id: prepared_chain_id,
-            input_amount: _,
-            target,
+            input_amount,
             calldata,
             calldata_hash,
-            minimum_output_amount,
-            destination_balance_before,
+            ..
         } = &operation.progress
         {
             ensure!(
@@ -597,7 +595,41 @@ impl RebalanceExecutor {
                 keccak256(calldata) == *calldata_hash,
                 "journaled Across bridge calldata hash does not match"
             );
-            let call = WalletCall::validated_contract_call(*target, U256::ZERO, calldata.clone())?;
+            let stale = swap_calldata_is_stale(calldata)?;
+            tracing::warn!(
+                operation_id = %operation.intent.operation_id,
+                origin_chain_id,
+                stale,
+                "re-quoting journaled Across bridge calldata before broadcast"
+            );
+            let (_request, terms, destination_chain_id, output_token) = self
+                .quote_across_bridge(&operation, origin_chain_id, *input_amount)
+                .await?;
+            ensure!(
+                terms.approval.is_none(),
+                "Across requires approval while re-quoting a prepared bridge"
+            );
+            let (target, calldata, minimum_output_amount, destination_balance_before) = self
+                .materialize_across_bridge_terms(
+                    &operation,
+                    destination_chain_id,
+                    output_token,
+                    terms,
+                )
+                .await?;
+            let call = WalletCall::validated_contract_call(target, U256::ZERO, calldata.clone())?;
+            operation = self.execution_journal.advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::BridgePrepared {
+                    origin_chain_id,
+                    input_amount: *input_amount,
+                    target,
+                    calldata_hash: keccak256(&calldata),
+                    calldata,
+                    minimum_output_amount,
+                    destination_balance_before,
+                },
+            )?;
             let transaction_hash = self
                 .execute_on_chain(
                     origin_chain_id,
@@ -611,8 +643,8 @@ impl RebalanceExecutor {
                 RebalanceExecutionProgress::BridgeMined {
                     origin_chain_id,
                     transaction_hash,
-                    minimum_output_amount: *minimum_output_amount,
-                    destination_balance_before: *destination_balance_before,
+                    minimum_output_amount,
+                    destination_balance_before,
                 },
             );
         }
@@ -645,31 +677,9 @@ impl RebalanceExecutor {
             | RebalanceExecutionProgress::AcrossFilled { .. } => return Ok(operation),
             _ => bail!("Across operation is not ready to bridge"),
         };
-        let amount_u128 = u128::try_from(amount).context("Across amount exceeds u128")?;
-        let (destination_chain_id, input_token, output_token) = match origin_chain_id {
-            OPTIMISM_CHAIN_ID => (
-                WORLD_CHAIN_CHAIN_ID,
-                token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
-                token_on_chain(&operation.intent.token_symbol, WORLD_CHAIN_CHAIN_ID)?,
-            ),
-            WORLD_CHAIN_CHAIN_ID => (
-                OPTIMISM_CHAIN_ID,
-                token_on_chain(&operation.intent.token_symbol, WORLD_CHAIN_CHAIN_ID)?,
-                token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
-            ),
-            _ => bail!("unsupported Across origin chain"),
-        };
-        let request = AcrossQuoteRequest {
-            origin_chain_id,
-            destination_chain_id,
-            input_token,
-            output_token,
-            amount: amount_u128,
-            depositor: operation.intent.wallet_owner,
-            recipient: operation.intent.wallet_owner,
-        };
-        let quote = self.across.quote(&request).await?;
-        let mut terms = validate_quote(&request, &quote)?;
+        let (request, mut terms, destination_chain_id, output_token) = self
+            .quote_across_bridge(&operation, origin_chain_id, amount)
+            .await?;
         if let Some(approval) = terms.approval.take() {
             let call =
                 WalletCall::validated_contract_call(approval.target, U256::ZERO, approval.data)?;
@@ -701,23 +711,10 @@ impl RebalanceExecutor {
                 "Across still requires approval after mined approval"
             );
         }
-        let destination_balance_before = match destination_chain_id {
-            WORLD_CHAIN_CHAIN_ID => {
-                self.world
-                    .erc20_balance(output_token, operation.intent.wallet_owner)
-                    .await?
-            }
-            OPTIMISM_CHAIN_ID => {
-                self.optimism
-                    .erc20_balance(output_token, operation.intent.wallet_owner)
-                    .await?
-            }
-            _ => unreachable!(),
-        };
-        let target = terms.swap.target;
-        let calldata = terms.swap.data;
+        let (target, calldata, minimum_output_amount, destination_balance_before) = self
+            .materialize_across_bridge_terms(&operation, destination_chain_id, output_token, terms)
+            .await?;
         let call = WalletCall::validated_contract_call(target, U256::ZERO, calldata.clone())?;
-        let minimum_output_amount = U256::from(terms.minimum_output_amount);
         operation = self.execution_journal.advance(
             &operation.intent.operation_id,
             RebalanceExecutionProgress::BridgePrepared {
@@ -747,6 +744,73 @@ impl RebalanceExecutor {
                 destination_balance_before,
             },
         )
+    }
+
+    async fn quote_across_bridge(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        origin_chain_id: u64,
+        amount: U256,
+    ) -> anyhow::Result<(
+        AcrossQuoteRequest,
+        crate::across::ValidatedErc20Quote,
+        u64,
+        Address,
+    )> {
+        let amount_u128 = u128::try_from(amount).context("Across amount exceeds u128")?;
+        let (destination_chain_id, input_token, output_token) = match origin_chain_id {
+            OPTIMISM_CHAIN_ID => (
+                WORLD_CHAIN_CHAIN_ID,
+                token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
+                token_on_chain(&operation.intent.token_symbol, WORLD_CHAIN_CHAIN_ID)?,
+            ),
+            WORLD_CHAIN_CHAIN_ID => (
+                OPTIMISM_CHAIN_ID,
+                token_on_chain(&operation.intent.token_symbol, WORLD_CHAIN_CHAIN_ID)?,
+                token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
+            ),
+            _ => bail!("unsupported Across origin chain"),
+        };
+        let request = AcrossQuoteRequest {
+            origin_chain_id,
+            destination_chain_id,
+            input_token,
+            output_token,
+            amount: amount_u128,
+            depositor: operation.intent.wallet_owner,
+            recipient: operation.intent.wallet_owner,
+        };
+        let quote = self.across.quote(&request).await?;
+        let terms = validate_quote(&request, &quote)?;
+        Ok((request, terms, destination_chain_id, output_token))
+    }
+
+    async fn materialize_across_bridge_terms(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        destination_chain_id: u64,
+        output_token: Address,
+        terms: crate::across::ValidatedErc20Quote,
+    ) -> anyhow::Result<(Address, Vec<u8>, U256, U256)> {
+        let destination_balance_before = match destination_chain_id {
+            WORLD_CHAIN_CHAIN_ID => {
+                self.world
+                    .erc20_balance(output_token, operation.intent.wallet_owner)
+                    .await?
+            }
+            OPTIMISM_CHAIN_ID => {
+                self.optimism
+                    .erc20_balance(output_token, operation.intent.wallet_owner)
+                    .await?
+            }
+            _ => unreachable!(),
+        };
+        Ok((
+            terms.swap.target,
+            terms.swap.data,
+            U256::from(terms.minimum_output_amount),
+            destination_balance_before,
+        ))
     }
 
     async fn execute_on_chain(
