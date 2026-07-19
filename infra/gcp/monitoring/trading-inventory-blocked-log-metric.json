@@ -1,6 +1,6 @@
 {
   "description": "Critical poly_bot trading admission failures caused by insufficient available inventory.",
-  "filter": "(resource.type=\"gce_instance\" OR (resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\")) AND (jsonPayload.fields.message=\"arbitrage admission blocked by insufficient inventory\" OR textPayload:\"arbitrage admission blocked by insufficient inventory\")",
+  "filter": "(resource.type=\"gce_instance\" OR (resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\")) AND \"arbitrage admission blocked by insufficient inventory\"",
   "metricDescriptor": {
     "displayName": "poly_bot trading inventory blocked",
     "metricKind": "DELTA",

@@ -203,7 +203,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/docker rm --force arb-bot-rust-shadow
-ExecStart=/usr/bin/docker run --rm --name arb-bot-rust-shadow --network host --stop-signal SIGINT --env-file ${env_file} --volume /var/lib/arb-bot:/var/lib/arb-bot --log-driver journald ${image} run
+ExecStart=/usr/bin/docker run --rm --name arb-bot-rust-shadow --network host --stop-signal SIGINT --env-file ${env_file} --volume /var/lib/arb-bot:/var/lib/arb-bot --log-driver gcplogs --log-opt gcp-project=${project_id} ${image} run
 ExecStop=/usr/bin/docker stop --time 20 arb-bot-rust-shadow
 Restart=always
 RestartSec=1
