@@ -46,14 +46,14 @@ live_confirmation=""
 mode_label="${execution_mode//_/-}"
 
 if [[ "${execution_mode}" == "full_live" ]]; then
-  domain_config_path="${ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH:-config/strategies/usdc-wld-world-chain.v5.json}"
+  domain_config_path="${ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH:-config/strategies/usdc-wld-world-chain.v6.json}"
   live_confirmation="${ARBITRAGE_LIVE_CONFIRMATION:-}"
   if [[ "${live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then
     echo "full_live requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE" >&2
     exit 1
   fi
-  if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v5.json" ]]; then
-    echo "full_live requires ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v5.json" >&2
+  if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v6.json" ]]; then
+    echo "full_live requires ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v6.json" >&2
     exit 1
   fi
 fi

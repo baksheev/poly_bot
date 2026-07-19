@@ -313,6 +313,44 @@ mod tests {
     }
 
     #[test]
+    fn preserves_four_decimal_wldusdc_protection_prices() {
+        let mut fine_rules = rules();
+        fine_rules.price.step = Decimal::new(1, 4);
+
+        let buy = plan_limit_ioc(
+            "rustarb-fine-buy".to_owned(),
+            "rustarb-fine-buy".to_owned(),
+            10_000_000_000_000_000_000,
+            18,
+            Decimal::new(35981, 5),
+            &fine_rules,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            buy.request.kind,
+            BinanceOrderRequestKind::LimitIoc { side, price, .. }
+                if side == "BUY" && price == Decimal::new(3599, 4)
+        ));
+
+        let sell = plan_limit_ioc(
+            "rustarb-fine-sell".to_owned(),
+            "rustarb-fine-sell".to_owned(),
+            -10_000_000_000_000_000_000,
+            18,
+            Decimal::new(35989, 5),
+            &fine_rules,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            sell.request.kind,
+            BinanceOrderRequestKind::LimitIoc { side, price, .. }
+                if side == "SELL" && price == Decimal::new(3598, 4)
+        ));
+    }
+
+    #[test]
     fn sub_step_target_is_dust_and_recovery_ids_are_deterministic() {
         assert!(
             plan_limit_ioc(

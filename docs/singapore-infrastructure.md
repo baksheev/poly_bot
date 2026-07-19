@@ -124,7 +124,7 @@ scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION full_live
 ```
 
 The update path validates digest pinning, repository cleanliness, GCP label
-shape, the exact live confirmation, v5 selection, and zero competing GKE
+shape, the exact live confirmation, v6 selection, and zero competing GKE
 replicas before it changes VM metadata.
 
 ## Production checks

@@ -1,6 +1,6 @@
 # Live arbitrage operator runbook
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-19
 
 This runbook applies only to the isolated WLDUSDC Rust identities on
 `arb-bot-rust-shadow-gce` in `asia-southeast1-b`. Rails must continue to own its
@@ -12,15 +12,15 @@ overlap.
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v5 domain artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC baseline,
-  WLD step 0.1, tick 0.001, `profit_token_a`, 20 bps, V3/V4;
+- v6 domain artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC baseline,
+  WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
 - the dedicated wallet and Binance subaccount verified at startup;
 - persistent `/var/lib/arb-bot` parent, Binance-order, and wallet/nonce
   journals;
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
   active rebalance, and fresh Binance/depth/DEX/balance/gas inputs;
-- exact live confirmation, v5 domain selection, single-owner deployment, and
+- exact live confirmation, v6 domain selection, single-owner deployment, and
   entry-stop recovery controls.
 
 Run `scripts/quality.sh`, then deploy paper mode first:

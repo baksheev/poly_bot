@@ -57,8 +57,8 @@ if [[ ! "${domain_config_path}" =~ ^config/strategies/[a-z0-9.-]+\.json$ ]]; the
   exit 1
 fi
 if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
-  if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v5.json" ]]; then
-    echo "full_live requires the reviewed v5 domain artifact" >&2
+  if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v6.json" ]]; then
+    echo "full_live requires the reviewed v6 domain artifact" >&2
     exit 1
   fi
   if [[ "${arbitrage_live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then

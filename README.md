@@ -174,7 +174,7 @@ parent coordinator. Their synthetic outcomes are emitted as
 `paper_arbitrage_result` and are deliberately excluded from the live
 `arbitrage_results` table. `full_live` additionally requires an exact operator
 confirmation, positive per-plan/cumulative/rate/durable-total limits, the
-separately reviewed v5 execution artifact, isolated identities, and persistent
+separately reviewed v6 execution artifact, isolated identities, and persistent
 parent/Binance/wallet journals. The v4 default stays execution-disabled.
 
 `run` requires `EVM_WALLET_ADDRESS`, Binance read credentials, and the World
