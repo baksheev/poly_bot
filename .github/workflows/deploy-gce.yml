@@ -76,7 +76,7 @@ jobs:
       - name: Install Google Cloud CLI
         uses: google-github-actions/setup-gcloud@v3
         with:
-          install_components: gke-gcloud-auth-plugin
+          install_components: alpha,gke-gcloud-auth-plugin
 
       - name: Build and push immutable image
         id: image
