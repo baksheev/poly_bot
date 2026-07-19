@@ -22,7 +22,7 @@ const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_QUOTE_EXPIRY_SECONDS: u64 = 7_200;
 const ACROSS_DEPOSIT_V3_SELECTOR: [u8; 4] = [0xad, 0x54, 0x25, 0xc6];
 const CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR: [u8; 4] = [0x8e, 0x02, 0x50, 0xee];
-const CCTP_INTEGRATOR_DELIMITER: [u8; 3] = [0x1d, 0xc0, 0xde];
+const MAX_CCTP_TRAILING_INTEGRATOR_BYTES: usize = 32;
 
 pub struct AcrossClient {
     http: Client,
@@ -548,7 +548,7 @@ fn validate_cctp_v2_deposit_for_burn_calldata(
     );
     let trailing = &bytes[4 + 7 * 32..];
     ensure!(
-        trailing.is_empty() || trailing.starts_with(&CCTP_INTEGRATOR_DELIMITER),
+        trailing.len() <= MAX_CCTP_TRAILING_INTEGRATOR_BYTES,
         "Across CCTP calldata has unexpected trailing data"
     );
     ensure!(
