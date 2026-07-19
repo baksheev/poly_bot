@@ -85,13 +85,12 @@
       "dex": {
         "allowed_providers": ["uniswap_v3", "uniswap_v4"],
         "uniswap_v3": {
-          "fee_tiers": [500, 3000, 10000]
+          "fee_tiers": [500, 3000]
         },
         "uniswap_v4": {
           "pools": [
             {"fee_tier": 500, "tick_spacing": 10, "hooks": "0x0000000000000000000000000000000000000000"},
-            {"fee_tier": 3000, "tick_spacing": 60, "hooks": "0x0000000000000000000000000000000000000000"},
-            {"fee_tier": 10000, "tick_spacing": 200, "hooks": "0x0000000000000000000000000000000000000000"}
+            {"fee_tier": 3000, "tick_spacing": 60, "hooks": "0x0000000000000000000000000000000000000000"}
           ]
         }
       }
