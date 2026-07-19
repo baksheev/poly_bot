@@ -31,19 +31,13 @@ image="$(metadata arb-bot-image)"
 engine_id="$(metadata arb-bot-engine-id)"
 region="$(metadata arb-bot-region)"
 wallet_address="$(metadata arb-bot-wallet-address)"
-domain_config_path="$(metadata_or_default arb-bot-domain-config-path config/strategies/usdc-wld-world-chain.v4.json)"
-arbitrage_execution_mode="$(metadata_or_default arb-bot-arbitrage-execution-mode disabled)"
-arbitrage_live_confirmation="$(metadata_or_default arb-bot-arbitrage-live-confirmation '')"
+domain_config_path="$(metadata_or_default arb-bot-domain-config-path config/strategies/usdc-wld-world-chain.v6.json)"
 rebalance_execution_mode="$(metadata_or_default arb-bot-rebalance-execution-mode disabled)"
 rebalance_live_confirmation="$(metadata_or_default arb-bot-rebalance-live-confirmation '')"
 rebalance_max_wld_amount="$(metadata_or_default arb-bot-rebalance-max-wld-amount 0)"
 rebalance_max_usdc_amount="$(metadata_or_default arb-bot-rebalance-max-usdc-amount 0)"
 rebalance_binance_withdrawal_api_mode="$(metadata_or_default arb-bot-rebalance-binance-withdrawal-api-mode standard)"
 
-if [[ ! "${arbitrage_execution_mode}" =~ ^(disabled|paper_dex_first|paper_concurrent_hedged|full_live)$ ]]; then
-  echo "invalid arb-bot-arbitrage-execution-mode metadata" >&2
-  exit 1
-fi
 if [[ ! "${rebalance_execution_mode}" =~ ^(disabled|full_live)$ ]]; then
   echo "invalid arb-bot-rebalance-execution-mode metadata" >&2
   exit 1
@@ -56,15 +50,9 @@ if [[ ! "${domain_config_path}" =~ ^config/strategies/[a-z0-9.-]+\.json$ ]]; the
   echo "invalid arb-bot-domain-config-path metadata" >&2
   exit 1
 fi
-if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
-  if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v6.json" ]]; then
-    echo "full_live requires the reviewed v6 domain artifact" >&2
-    exit 1
-  fi
-  if [[ "${arbitrage_live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then
-    echo "full_live metadata confirmation is missing" >&2
-    exit 1
-  fi
+if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v6.json" ]]; then
+  echo "production requires the reviewed v6 domain artifact" >&2
+  exit 1
 fi
 if [[ "${rebalance_execution_mode}" == "full_live" ]]; then
   if [[ "${rebalance_live_confirmation}" != "ENABLE_FULL_REBALANCE" ]]; then
@@ -80,11 +68,7 @@ if [[ "${rebalance_execution_mode}" == "full_live" ]]; then
     exit 1
   fi
 fi
-if [[ "${arbitrage_execution_mode}" == "full_live" ]]; then
-  arbitrage_trade_journal="/var/lib/arb-bot/arbitrage-live-trades.jsonl"
-else
-  arbitrage_trade_journal="/var/lib/arb-bot/arbitrage-paper-trades.jsonl"
-fi
+arbitrage_trade_journal="/var/lib/arb-bot/arbitrage-live-trades.jsonl"
 
 token_response="$(curl --fail --silent --show-error \
   --header "${metadata_header}" \
@@ -130,8 +114,7 @@ umask 077
   printf 'BALANCE_SYNC_INTERVAL_MS=1000\n'
   printf 'BALANCE_MAX_AGE_MS=5000\n'
   printf 'BALANCE_EVENT_CHANNEL_CAPACITY=16\n'
-  printf 'ARBITRAGE_EXECUTION_MODE=%s\n' "${arbitrage_execution_mode}"
-  printf 'ARBITRAGE_LIVE_CONFIRMATION=%s\n' "${arbitrage_live_confirmation}"
+  printf 'ARBITRAGE_EXECUTION_MODE=full_live\n'
   printf 'ARBITRAGE_TRADE_JOURNAL_PATH=%s\n' "${arbitrage_trade_journal}"
   printf 'ARBITRAGE_WALLET_JOURNAL_PATH=/var/lib/arb-bot/arbitrage-wallet.jsonl\n'
   printf 'ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH=/var/lib/arb-bot/arbitrage-binance-orders.jsonl\n'
@@ -175,10 +158,8 @@ umask 077
     printf '\nBINANCE_SUBACCOUNT_EMAIL='
     fetch_secret BINANCE_SUBACCOUNT_EMAIL
   fi
-  if [[ "${arbitrage_execution_mode}" == "full_live" || "${rebalance_execution_mode}" == "full_live" ]]; then
-    printf '\nEVM_WALLET_PRIVATE_KEY='
-    fetch_secret EVM_WALLET_PRIVATE_KEY
-  fi
+  printf '\nEVM_WALLET_PRIVATE_KEY='
+  fetch_secret EVM_WALLET_PRIVATE_KEY
   printf '\n'
 } >"${env_file}"
 chmod 0600 "${env_file}"

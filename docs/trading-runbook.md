@@ -20,17 +20,14 @@ overlap.
   journals;
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
   active rebalance, and fresh Binance/depth/DEX/balance/gas inputs;
-- exact live confirmation, v6 domain selection, single-owner deployment, and
-  entry-stop recovery controls.
+- fixed full-live v6 deployment, single-owner enforcement, and entry-stop
+  recovery controls.
 
-Run `scripts/quality.sh`, then deploy paper mode first:
+Run `scripts/quality.sh`, then deploy the digest-pinned production image:
 
 ```bash
-scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION paper_dex_first
+scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION
 ```
-
-Paper results use a separate journal and the `paper_arbitrage_result` telemetry
-kind. They never count toward the 100-trade goal.
 
 ## Entry stop and recovery
 

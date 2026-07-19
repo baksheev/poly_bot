@@ -220,9 +220,6 @@ pub struct AppConfig {
     #[arg(long, env = "ARBITRAGE_EXECUTION_MODE", default_value = "disabled")]
     pub arbitrage_execution_mode: String,
 
-    #[arg(long, env = "ARBITRAGE_LIVE_CONFIRMATION", default_value = "")]
-    pub arbitrage_live_confirmation: String,
-
     #[arg(
         long,
         env = "ARBITRAGE_TRADE_JOURNAL_PATH",
@@ -352,12 +349,6 @@ impl AppConfig {
             !self.arbitrage_entry_stop_file.as_os_str().is_empty(),
             "ARBITRAGE_ENTRY_STOP_FILE is empty"
         );
-        if self.arbitrage_execution_mode == "full_live" {
-            ensure!(
-                self.arbitrage_live_confirmation == "ENABLE_FULL_LIVE_ARBITRAGE",
-                "full_live arbitrage requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE"
-            );
-        }
         ensure!(
             matches!(
                 self.rebalance_execution_mode.as_str(),
@@ -553,7 +544,6 @@ mod tests {
             balance_max_age_ms: 5_000,
             balance_event_channel_capacity: 16,
             arbitrage_execution_mode: "disabled".into(),
-            arbitrage_live_confirmation: String::new(),
             arbitrage_trade_journal_path: "/tmp/arbitrage-trades.jsonl".into(),
             arbitrage_execution_channel_capacity: 64,
             arbitrage_entry_stop_file: "/tmp/arbitrage-entry.stop".into(),
@@ -597,16 +587,6 @@ mod tests {
         let mut value = config();
         value.rebalance_execution_mode = "direct_wld_canary".into();
         assert!(value.validate().is_err());
-    }
-
-    #[test]
-    fn live_arbitrage_requires_confirmation() {
-        let mut value = config();
-        value.arbitrage_execution_mode = "full_live".into();
-        assert!(value.validate().is_err());
-
-        value.arbitrage_live_confirmation = "ENABLE_FULL_LIVE_ARBITRAGE".into();
-        value.validate().unwrap();
     }
 
     #[test]

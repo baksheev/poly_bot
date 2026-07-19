@@ -17,9 +17,10 @@ one deliberate Rust-clone divergence: both Binance market data and eventual
 execution use Spot. The v6 artifact contains the same pair/economics, uses the
 live Binance price tick, and has the global and pair execution gates enabled.
 Selecting v6 alone cannot trade:
-runtime `full_live`, exact confirmation, signer/order journals, single-owner
-deployment, and startup health checks are independently required. Earlier
-artifacts remain provenance for prior shadow stages.
+the production GCE wrapper fixes runtime execution to `full_live`, and
+signer/order journals, single-owner deployment, and startup health checks are
+independently required. Earlier artifacts remain provenance for prior shadow
+stages.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven

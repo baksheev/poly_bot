@@ -5,10 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="${ENV_FILE:-${repo_root}/.env.production}"
 image="${1:-}"
 source_revision="${2:-}"
-execution_mode="${3:-paper_dex_first}"
 
-if [[ -z "${image}" || -z "${source_revision}" ]]; then
-  echo "usage: scripts/update-gce-worker IMAGE SOURCE_REVISION [disabled|paper_dex_first|full_live]" >&2
+if (( $# != 2 )) || [[ -z "${image}" || -z "${source_revision}" ]]; then
+  echo "usage: scripts/update-gce-worker IMAGE SOURCE_REVISION" >&2
   exit 1
 fi
 if [[ ! -f "${env_file}" ]]; then
@@ -27,11 +26,6 @@ if [[ ! "${source_revision}" =~ ^[a-z0-9-]{1,63}$ ]]; then
   echo "SOURCE_REVISION must be a valid lowercase GCP label value" >&2
   exit 1
 fi
-if [[ ! "${execution_mode}" =~ ^(disabled|paper_dex_first|full_live)$ ]]; then
-  echo "execution mode must be disabled, paper_dex_first, or full_live" >&2
-  exit 1
-fi
-
 set -a
 # shellcheck disable=SC1090
 source "${env_file}"
@@ -41,22 +35,8 @@ set +a
 : "${GCP_REGION:?GCP_REGION is required}"
 : "${EVM_WALLET_ADDRESS:?EVM_WALLET_ADDRESS is required}"
 
-domain_config_path="config/strategies/usdc-wld-world-chain.v4.json"
-live_confirmation=""
-mode_label="${execution_mode//_/-}"
-
-if [[ "${execution_mode}" == "full_live" ]]; then
-  domain_config_path="${ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH:-config/strategies/usdc-wld-world-chain.v6.json}"
-  live_confirmation="${ARBITRAGE_LIVE_CONFIRMATION:-}"
-  if [[ "${live_confirmation}" != "ENABLE_FULL_LIVE_ARBITRAGE" ]]; then
-    echo "full_live requires ARBITRAGE_LIVE_CONFIRMATION=ENABLE_FULL_LIVE_ARBITRAGE" >&2
-    exit 1
-  fi
-  if [[ "${domain_config_path}" != "config/strategies/usdc-wld-world-chain.v6.json" ]]; then
-    echo "full_live requires ARBITRAGE_LIVE_DOMAIN_CONFIG_PATH=config/strategies/usdc-wld-world-chain.v6.json" >&2
-    exit 1
-  fi
-fi
+domain_config_path="config/strategies/usdc-wld-world-chain.v6.json"
+mode_label="full-live"
 
 gcloud_local="${repo_root}/scripts/gcloud-local"
 zone="${GCE_ZONE:-${GCP_REGION}-b}"
@@ -80,29 +60,31 @@ fi
 "${gcloud_local}" compute instances add-tags "${instance}" \
   --zone="${zone}" \
   --tags="${iap_tag}"
-if [[ "${execution_mode}" == "full_live" ]]; then
-  audit_kube_dir="$(mktemp -d)"
-  export KUBECONFIG="${audit_kube_dir}/config"
-  "${gcloud_local}" container clusters get-credentials arb-bot \
-    --zone="${zone}" >/dev/null
-  competing_replicas="$(kubectl get deployment arb-bot \
-    --namespace=arb-bot \
-    --output='jsonpath={.spec.replicas}')"
-  rm -r "${audit_kube_dir}"
-  unset KUBECONFIG
-  if [[ "${competing_replicas}" != "0" ]]; then
-    echo "full_live requires the competing GKE arb-bot deployment to be scaled to zero" >&2
-    exit 1
-  fi
-  "${gcloud_local}" secrets add-iam-policy-binding EVM_WALLET_PRIVATE_KEY \
-    --member="serviceAccount:${runtime_service_account}" \
-    --role=roles/secretmanager.secretAccessor \
-    --quiet >/dev/null
+audit_kube_dir="$(mktemp -d)"
+export KUBECONFIG="${audit_kube_dir}/config"
+"${gcloud_local}" container clusters get-credentials arb-bot \
+  --zone="${zone}" >/dev/null
+competing_replicas="$(kubectl get deployment arb-bot \
+  --namespace=arb-bot \
+  --output='jsonpath={.spec.replicas}')"
+rm -r "${audit_kube_dir}"
+unset KUBECONFIG
+if [[ "${competing_replicas}" != "0" ]]; then
+  echo "production requires the competing GKE arb-bot deployment to be scaled to zero" >&2
+  exit 1
 fi
+"${gcloud_local}" secrets add-iam-policy-binding EVM_WALLET_PRIVATE_KEY \
+  --member="serviceAccount:${runtime_service_account}" \
+  --role=roles/secretmanager.secretAccessor \
+  --quiet >/dev/null
 "${gcloud_local}" compute instances add-metadata "${instance}" \
   --zone="${zone}" \
-  --metadata="arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=${domain_config_path},arb-bot-arbitrage-execution-mode=${execution_mode},arb-bot-arbitrage-live-confirmation=${live_confirmation}" \
+  --metadata="arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=${domain_config_path}" \
   --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh"
+"${gcloud_local}" compute instances remove-metadata "${instance}" \
+  --zone="${zone}" \
+  --keys=arb-bot-arbitrage-execution-mode,arb-bot-arbitrage-live-confirmation \
+  --quiet
 "${gcloud_local}" compute instances add-labels "${instance}" \
   --zone="${zone}" \
   --labels="component=trading,mode=${mode_label},source-revision=${source_revision}"
@@ -119,4 +101,4 @@ else
     --command='sudo google_metadata_script_runner startup'
 fi
 
-echo "updated ${instance} to ${image} in ${execution_mode} mode"
+echo "updated ${instance} to ${image} in full_live mode"

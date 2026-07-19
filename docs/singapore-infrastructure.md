@@ -41,12 +41,11 @@ Registry with an ephemeral Docker config, and removes that config after the
 image pull. No long-lived service-account key or credential is stored in
 instance metadata.
 
-As of the 2026-07-17 audit the GCE VM is stopped and the older GKE deployment
-is the only running process. That deployment uses the same isolated Binance
-subaccount/wallet for full-live rebalance and must be scaled to zero before GCE
-`full_live` arbitrage can start. `scripts/update-gce-worker` enforces this
-single-owner condition. GCE paper mode is read-only and may run while the GKE
-rebalance owner remains active.
+The older GKE deployment uses the same isolated Binance subaccount/wallet for
+full-live rebalance and must be scaled to zero before the production GCE
+runtime can start. `scripts/create-gce-worker` and `scripts/update-gce-worker`
+both enforce this single-owner condition. The GCE lifecycle has no paper or
+disabled production mode.
 
 ## Binance diagnostic VM
 
@@ -116,16 +115,15 @@ creates the isolated network, subnet, static address, IAM bindings, and VM when
 missing. Replacing the production instance must be an explicit blue/green
 operation; do not silently mutate it in place.
 
-Update the existing VM with a committed digest and an explicit mode:
+Update the existing full-live VM with a committed digest:
 
 ```bash
-scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION paper_dex_first
-scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION full_live
+scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION
 ```
 
 The update path validates digest pinning, repository cleanliness, GCP label
-shape, the exact live confirmation, v6 selection, and zero competing GKE
-replicas before it changes VM metadata.
+shape, fixed v6 selection, and zero competing GKE replicas before it changes VM
+metadata.
 
 ## Production checks
 

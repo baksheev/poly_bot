@@ -172,10 +172,11 @@ cargo run -- run
 opportunities through a bounded background channel and exercise the durable
 parent coordinator. Their synthetic outcomes are emitted as
 `paper_arbitrage_result` and are deliberately excluded from the live
-`arbitrage_results` table. `full_live` additionally requires an exact operator
-confirmation, positive per-plan/cumulative/rate/durable-total limits, the
-separately reviewed v6 execution artifact, isolated identities, and persistent
-parent/Binance/wallet journals. The v4 default stays execution-disabled.
+`arbitrage_results` table. The production GCE wrapper always runs `full_live`
+with the separately reviewed v6 execution artifact, isolated identities, and
+persistent parent/Binance/wallet journals. Local paper modes remain a test
+harness; they are not selectable through the production deployment path. The
+v4 default stays execution-disabled.
 
 `run` requires `EVM_WALLET_ADDRESS`, Binance read credentials, and the World
 Chain HTTP/WSS endpoints. Balance sync cadence and freshness are controlled by

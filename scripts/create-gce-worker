@@ -36,7 +36,7 @@ subnet="arb-bot-singapore"
 address="arb-bot-gce-egress"
 instance="arb-bot-rust-shadow-gce"
 runtime_service_account="arb-bot-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
-engine_id="arb-bot-rust-shadow-gce-${source_revision}"
+engine_id="arb-bot-rust-full-live-gce-${source_revision}"
 iap_tag="arb-bot-runtime"
 iap_firewall="arb-bot-runtime-iap-ssh"
 
@@ -116,6 +116,20 @@ if "${gcloud_local}" compute instances describe "${instance}" \
   exit 1
 fi
 
+audit_kube_dir="$(mktemp -d)"
+export KUBECONFIG="${audit_kube_dir}/config"
+"${gcloud_local}" container clusters get-credentials arb-bot \
+  --zone="${zone}" >/dev/null
+competing_replicas="$(kubectl get deployment arb-bot \
+  --namespace=arb-bot \
+  --output='jsonpath={.spec.replicas}')"
+rm -r "${audit_kube_dir}"
+unset KUBECONFIG
+if [[ "${competing_replicas}" != "0" ]]; then
+  echo "production requires the competing GKE arb-bot deployment to be scaled to zero" >&2
+  exit 1
+fi
+
 "${gcloud_local}" compute instances create "${instance}" \
   --zone="${zone}" \
   --machine-type="${machine_type}" \
@@ -132,12 +146,12 @@ fi
   --service-account="${runtime_service_account}" \
   --tags="${iap_tag}" \
   --scopes=https://www.googleapis.com/auth/cloud-platform \
-  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v4.json,arb-bot-arbitrage-execution-mode=paper_dex_first" \
+  --metadata="enable-oslogin=TRUE,arb-bot-image=${image},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v6.json" \
   --metadata-from-file="startup-script=${repo_root}/infra/gcp/gce-startup.sh" \
   --shielded-secure-boot \
   --shielded-vtpm \
   --shielded-integrity-monitoring \
-  --labels="component=trading-shadow,mode=read-only,source-revision=${source_revision}" \
+  --labels="component=trading,mode=full-live,source-revision=${source_revision}" \
   --quiet
 
-echo "created ${instance} (${machine_type}, ${zone}) with ${image}"
+echo "created ${instance} (${machine_type}, ${zone}) with ${image} in full_live mode"
