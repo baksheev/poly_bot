@@ -34,10 +34,7 @@ use crate::{
         ArbitrageDirection, OpportunityEngine, PairEvaluation, PreparedPoolBuildRequest,
         PreparedPoolBuildResult,
     },
-    rebalance::{
-        Direction, RebalanceAction, RebalanceEvaluation, RebalanceExecutionOperation,
-        RebalanceTracker, Route,
-    },
+    rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
@@ -71,7 +68,6 @@ pub struct TradingEngine {
     rebalance_blocked: bool,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
-    last_rebalance_parallel_skip_key: Option<String>,
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
     arbitrage_settlement_barriers: BTreeMap<usize, ArbitrageSettlementBarrier>,
@@ -152,23 +148,6 @@ fn mark_sequence_matched_update(
     }
     last_updates.insert(symbol.to_owned(), update_id);
     true
-}
-
-fn rebalance_action_requires_wallet_nonce(action: &RebalanceAction) -> bool {
-    !matches!(
-        (&action.route, action.direction),
-        (Route::Direct { .. }, Direction::BinanceToWallet)
-    )
-}
-
-fn rebalance_parallel_skip_key(
-    evaluation: &RebalanceEvaluation,
-    action: &RebalanceAction,
-) -> String {
-    format!(
-        "{}:{:?}:{}:{:?}",
-        evaluation.token_symbol, action.direction, action.amount, action.route
-    )
 }
 
 impl RebalanceSettlementBarrier {
@@ -257,7 +236,6 @@ impl TradingEngine {
                 rebalance_blocked: false,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
-                last_rebalance_parallel_skip_key: None,
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
                 arbitrage_settlement_barriers: BTreeMap::new(),
@@ -1018,39 +996,10 @@ impl TradingEngine {
                     && self.rebalance_settlement.is_none()
                     && self.pending_rebalance.is_none()
                     && let Some(evaluation) = pending_action
-                    && let Some(action) = evaluation.plan.action.as_ref()
                 {
-                    if self.config.arbitrage_execution_mode == "full_live"
-                        && rebalance_action_requires_wallet_nonce(action)
-                    {
-                        let skip_key = rebalance_parallel_skip_key(&evaluation, action);
-                        if self
-                            .last_rebalance_parallel_skip_key
-                            .as_ref()
-                            .is_none_or(|last| last != &skip_key)
-                        {
-                            self.telemetry.emit(
-                                "rebalance_execution_skipped",
-                                json!({
-                                    "engine_id": self.config.engine_id,
-                                    "mode": mode,
-                                    "reason": "wallet_nonce_shared_with_live_arbitrage",
-                                    "token": evaluation.token_symbol,
-                                    "token_decimals": evaluation.token_decimals,
-                                    "action_direction": format!("{:?}", action.direction),
-                                    "action_amount_base_units": action.amount.to_string(),
-                                    "action_route": format!("{:?}", action.route),
-                                }),
-                            );
-                        }
-                        self.last_rebalance_parallel_skip_key = Some(skip_key);
-                        self.rebalance.mark_unbalanced();
-                    } else {
-                        self.last_rebalance_parallel_skip_key = None;
-                        self.rebalance_inflight = true;
-                        self.rebalance_inflight_since = Some(Instant::now());
-                        self.pending_rebalance = Some(evaluation);
-                    }
+                    self.rebalance_inflight = true;
+                    self.rebalance_inflight_since = Some(Instant::now());
+                    self.pending_rebalance = Some(evaluation);
                 }
             }
             Err(error) => {
@@ -1757,16 +1706,14 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
-    use alloy_primitives::U256;
-
     use crate::{
         execution_plan::{DexRoutePlan, DexSwapPlan},
-        rebalance::{Direction, RebalanceAction, Route},
+        rebalance::Direction,
     };
 
     use super::{
         RebalanceSettlementBarrier, TradingReadiness, mark_sequence_matched_update,
-        rebalance_action_requires_wallet_nonce, rebalance_health_state,
+        rebalance_health_state,
     };
 
     #[test]
@@ -1897,44 +1844,5 @@ mod tests {
         let settlement = rebalance_health_state(false, None, Some(timeout), timeout, timeout);
         assert!(settlement.settlement_stuck);
         assert!(!settlement.healthy);
-    }
-
-    #[test]
-    fn live_parallel_rebalance_allows_only_direct_binance_to_wallet_without_wallet_nonce() {
-        let direct_binance_to_wallet = RebalanceAction {
-            direction: Direction::BinanceToWallet,
-            amount: U256::ONE,
-            route: Route::Direct {
-                binance_network: "WLD".to_owned(),
-                chain_id: 480,
-            },
-        };
-        let direct_wallet_to_binance = RebalanceAction {
-            direction: Direction::WalletToBinance,
-            amount: U256::ONE,
-            route: Route::Direct {
-                binance_network: "WLD".to_owned(),
-                chain_id: 480,
-            },
-        };
-        let across_binance_to_wallet = RebalanceAction {
-            direction: Direction::BinanceToWallet,
-            amount: U256::ONE,
-            route: Route::Across {
-                binance_network: "OPTIMISM".to_owned(),
-                bridge_chain_id: 10,
-                wallet_chain_id: 480,
-            },
-        };
-
-        assert!(!rebalance_action_requires_wallet_nonce(
-            &direct_binance_to_wallet
-        ));
-        assert!(rebalance_action_requires_wallet_nonce(
-            &direct_wallet_to_binance
-        ));
-        assert!(rebalance_action_requires_wallet_nonce(
-            &across_binance_to_wallet
-        ));
     }
 }

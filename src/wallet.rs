@@ -16,7 +16,10 @@ pub use journal::{
     JournalIntent, JournalOperation, JournalOperationIdentity, JournalStatus, TransactionJournal,
     UnknownOutcomeReason,
 };
-pub use nonce::{NonceLane, NonceLaneState, NonceReconciliationOutcome, ReconciledNonceLane};
+pub use nonce::{
+    NonceLane, NonceLaneState, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
+    ReconciledNonceLane, acquire_process_nonce_lock,
+};
 
 pub const WALLET_PRIVATE_KEY_ENV: &str = "EVM_WALLET_PRIVATE_KEY";
 pub const WALLET_JOURNAL_PATH_ENV: &str = "EVM_WALLET_JOURNAL_PATH";

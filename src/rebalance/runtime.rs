@@ -17,9 +17,9 @@ use crate::{
     },
     chain::rpc::{JsonRpcClient, TransactionReceipt},
     wallet::{
-        EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, TransactionJournal,
-        UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
-        broadcast_signed_transaction,
+        EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
+        TransactionJournal, UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
+        acquire_process_nonce_lock, broadcast_signed_transaction,
     },
 };
 
@@ -1407,32 +1407,50 @@ async fn execute_wallet_call(
         max_fee_per_gas > 0 && max_fee_per_gas <= MAX_FEE_PER_GAS_WEI,
         "rebalance fee exceeds cap"
     );
-    let parameters = WalletTransactionParameters {
+    let fee_parameters = WalletTransactionParameters {
         chain_id: nonce_lane.chain_id(),
-        nonce: nonce_lane
-            .next_nonce()
-            .context("ready nonce lane has no nonce")?,
+        nonce: 0,
         gas_limit,
         max_fee_per_gas,
         max_priority_fee_per_gas: gas_price.min(max_fee_per_gas),
     };
-    let maximum_cost = call.maximum_native_cost(parameters)?;
+    let maximum_cost = call.maximum_native_cost(fee_parameters)?;
     ensure!(
         rpc.native_balance(wallet.address()).await? >= maximum_cost,
         "wallet native balance cannot cover rebalance gas"
     );
-    let identity = nonce_lane.reserve(journal, operation_id, purpose, call)?;
-    let signed = wallet.sign_call(
+    let mut nonce_guard = acquire_process_nonce_lock(
+        nonce_lane.chain_id(),
+        wallet.address(),
+        nonce_lane
+            .next_nonce()
+            .context("ready nonce lane has no nonce")?,
+    )
+    .await?;
+    let identity =
+        nonce_lane.reserve_with_nonce(journal, operation_id, purpose, call, nonce_guard.nonce())?;
+    let signed = match wallet.sign_call(
         call,
         WalletTransactionParameters {
             nonce: identity.nonce,
-            ..parameters
+            ..fee_parameters
         },
-    )?;
-    nonce_lane.record_signed(journal, &signed)?;
-    let submitted = match broadcast_signed_transaction(rpc, &signed).await {
-        Ok(hash) => hash,
+    ) {
+        Ok(signed) => signed,
         Err(error) => {
+            nonce_lane.cancel_before_signing(journal)?;
+            return Err(error);
+        }
+    };
+    nonce_lane.record_signed(journal, &signed)?;
+    let submitted = match tokio::time::timeout(
+        PROCESS_NONCE_LOCK_TTL,
+        broadcast_signed_transaction(rpc, &signed),
+    )
+    .await
+    {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(error)) => {
             let reason = if error.to_string().starts_with("JSON-RPC error") {
                 UnknownOutcomeReason::BroadcastRejected
             } else {
@@ -1441,16 +1459,17 @@ async fn execute_wallet_call(
             nonce_lane.record_unknown_outcome(journal, reason)?;
             return Err(error);
         }
+        Err(_elapsed) => {
+            nonce_lane.record_unknown_outcome(journal, UnknownOutcomeReason::BroadcastTransport)?;
+            bail!("rebalance wallet transaction broadcast timed out while holding nonce lock");
+        }
     };
     nonce_lane.record_broadcast(journal, submitted)?;
+    nonce_guard.advance_after_broadcast(identity.nonce)?;
+    drop(nonce_guard);
     let receipt = match wait_receipt(rpc, submitted, timeout).await {
         Ok(receipt) => receipt,
-        Err(error) => {
-            nonce_lane
-                .record_unknown_outcome(journal, UnknownOutcomeReason::ConfirmationTimeout)
-                .context("failed to journal unknown rebalance confirmation outcome")?;
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     nonce_lane.record_receipt(journal, receipt.clone())?;
     ensure!(receipt.status == 1, "rebalance wallet transaction reverted");

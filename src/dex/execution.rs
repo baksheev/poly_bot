@@ -11,9 +11,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     chain::rpc::{JsonRpcClient, ReceiptLog, TransactionReceipt},
     wallet::{
-        EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, TransactionJournal,
-        UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
-        broadcast_signed_transaction,
+        EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
+        TransactionJournal, UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
+        acquire_process_nonce_lock, broadcast_signed_transaction,
     },
 };
 
@@ -723,30 +723,39 @@ impl DexExecutor {
                 "current DEX fee exceeds the admission-time cap"
             );
         }
-        let parameters = WalletTransactionParameters {
+        let fee_parameters = WalletTransactionParameters {
             chain_id: self.nonce_lane.chain_id(),
-            nonce: self
-                .nonce_lane
-                .next_nonce()
-                .context("ready DEX nonce lane has no nonce")?,
+            nonce: 0,
             gas_limit,
             max_fee_per_gas,
             max_priority_fee_per_gas: RAILS_PRIORITY_FEE_WEI.min(max_fee_per_gas),
         };
-        let maximum_cost = call.maximum_native_cost(parameters)?;
+        let maximum_cost = call.maximum_native_cost(fee_parameters)?;
         ensure!(
             self.rpc.native_balance(self.wallet.address()).await? >= maximum_cost,
             "wallet native balance cannot cover maximum DEX gas"
         );
 
-        let identity =
+        let mut nonce_guard = acquire_process_nonce_lock(
+            self.nonce_lane.chain_id(),
+            self.wallet.address(),
             self.nonce_lane
-                .reserve(&mut self.journal, operation_id.clone(), purpose, call)?;
+                .next_nonce()
+                .context("ready DEX nonce lane has no nonce")?,
+        )
+        .await?;
+        let identity = self.nonce_lane.reserve_with_nonce(
+            &mut self.journal,
+            operation_id.clone(),
+            purpose,
+            call,
+            nonce_guard.nonce(),
+        )?;
         let signed = match self.wallet.sign_call(
             call,
             WalletTransactionParameters {
                 nonce: identity.nonce,
-                ..parameters
+                ..fee_parameters
             },
         ) {
             Ok(signed) => signed,
@@ -756,9 +765,14 @@ impl DexExecutor {
             }
         };
         self.nonce_lane.record_signed(&mut self.journal, &signed)?;
-        let submitted = match broadcast_signed_transaction(&self.rpc, &signed).await {
-            Ok(hash) => hash,
-            Err(error) => {
+        let submitted = match tokio::time::timeout(
+            PROCESS_NONCE_LOCK_TTL,
+            broadcast_signed_transaction(&self.rpc, &signed),
+        )
+        .await
+        {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(error)) => {
                 let reason = if error.to_string().starts_with("JSON-RPC error") {
                     UnknownOutcomeReason::BroadcastRejected
                 } else {
@@ -775,9 +789,18 @@ impl DexExecutor {
                 );
                 return Err(error);
             }
+            Err(_elapsed) => {
+                self.nonce_lane.record_unknown_outcome(
+                    &mut self.journal,
+                    UnknownOutcomeReason::BroadcastTransport,
+                )?;
+                bail!("DEX transaction broadcast timed out while holding nonce lock");
+            }
         };
         self.nonce_lane
             .record_broadcast(&mut self.journal, submitted)?;
+        nonce_guard.advance_after_broadcast(identity.nonce)?;
+        drop(nonce_guard);
         tracing::info!(
             operation_id,
             transaction_hash = %submitted,
@@ -791,23 +814,20 @@ impl DexExecutor {
             "DEX transaction broadcast and journaled"
         );
 
-        let receipt =
-            match wait_for_receipt(&self.rpc, submitted, policy.confirmation_timeout).await {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    self.nonce_lane.record_unknown_outcome(
-                        &mut self.journal,
-                        UnknownOutcomeReason::ConfirmationTimeout,
-                    )?;
-                    tracing::error!(
-                        operation_id,
-                        transaction_hash = %submitted,
-                        error = %error,
-                        "DEX transaction confirmation outcome is unknown and was journaled"
-                    );
-                    return Err(error);
-                }
-            };
+        let receipt = match wait_for_receipt(&self.rpc, submitted, policy.confirmation_timeout)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::error!(
+                    operation_id,
+                    transaction_hash = %submitted,
+                    error = %error,
+                    "DEX transaction confirmation timed out after broadcast; nonce lock is already released"
+                );
+                return Err(error);
+            }
+        };
         self.nonce_lane
             .record_receipt(&mut self.journal, receipt.clone())?;
         self.last_terminal_receipt = Some(receipt.clone());

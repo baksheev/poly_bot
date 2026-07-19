@@ -1,5 +1,12 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
 use alloy_primitives::{Address, B256, keccak256};
 use anyhow::{Context, ensure};
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 
 use crate::chain::rpc::{JsonRpcClient, RpcTransaction, TransactionReceipt};
 
@@ -7,6 +14,73 @@ use super::{
     JournalIntent, JournalOperationIdentity, SignedTransaction, TransactionJournal,
     UnknownOutcomeReason, WalletCall,
 };
+
+pub const PROCESS_NONCE_LOCK_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ProcessNonceKey {
+    chain_id: u64,
+    wallet: Address,
+}
+
+#[derive(Debug)]
+struct ProcessNonceState {
+    next_nonce: u64,
+}
+
+static PROCESS_NONCE_LOCKS: OnceLock<
+    std::sync::Mutex<BTreeMap<ProcessNonceKey, Arc<TokioMutex<ProcessNonceState>>>>,
+> = OnceLock::new();
+
+pub struct ProcessNonceGuard {
+    guard: OwnedMutexGuard<ProcessNonceState>,
+}
+
+impl ProcessNonceGuard {
+    pub fn nonce(&self) -> u64 {
+        self.guard.next_nonce
+    }
+
+    pub fn advance_after_broadcast(&mut self, nonce: u64) -> anyhow::Result<()> {
+        ensure!(
+            self.guard.next_nonce == nonce,
+            "process nonce lock advanced by another operation"
+        );
+        self.guard.next_nonce = nonce
+            .checked_add(1)
+            .context("process nonce allocator overflow after broadcast")?;
+        Ok(())
+    }
+}
+
+pub async fn acquire_process_nonce_lock(
+    chain_id: u64,
+    wallet: Address,
+    floor_next_nonce: u64,
+) -> anyhow::Result<ProcessNonceGuard> {
+    ensure!(chain_id > 0, "process nonce lock chain id is zero");
+    ensure!(wallet != Address::ZERO, "process nonce lock wallet is zero");
+    let key = ProcessNonceKey { chain_id, wallet };
+    let lane = {
+        let mut locks = PROCESS_NONCE_LOCKS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process nonce lock registry is poisoned"))?;
+        locks
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(TokioMutex::new(ProcessNonceState {
+                    next_nonce: floor_next_nonce,
+                }))
+            })
+            .clone()
+    };
+    let mut guard = tokio::time::timeout(PROCESS_NONCE_LOCK_TTL, lane.lock_owned())
+        .await
+        .context("timed out waiting for process wallet nonce lock")?;
+    guard.next_nonce = guard.next_nonce.max(floor_next_nonce);
+    Ok(ProcessNonceGuard { guard })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NonceLaneState {
@@ -185,10 +259,10 @@ impl NonceLane {
             );
         }
 
-        let unresolved = journal.unresolved_for(chain_id, wallet);
+        let unresolved = journal.recovery_blocking_for(chain_id, wallet);
         ensure!(
             unresolved.len() <= 1,
-            "nonce lane has multiple unresolved journal operations"
+            "nonce lane has multiple recovery-blocking journal operations"
         );
         let state = if let Some(operation) = unresolved.first() {
             ensure!(
@@ -198,11 +272,6 @@ impl NonceLane {
             NonceLaneState::RecoveryRequired {
                 identity: operation.intent.identity.clone(),
                 transaction_hash: operation.status.transaction_hash(),
-            }
-        } else if latest_nonce != pending_nonce {
-            NonceLaneState::UntrackedPending {
-                latest_nonce,
-                pending_nonce,
             }
         } else {
             NonceLaneState::Ready {
@@ -251,11 +320,32 @@ impl NonceLane {
         let NonceLaneState::Ready { next_nonce } = self.state else {
             anyhow::bail!("nonce lane is not ready for a new operation");
         };
+        self.reserve_with_nonce(journal, operation_id, purpose, call, next_nonce)
+    }
+
+    /// Reserves an explicit nonce that was assigned by the process-level nonce
+    /// lock. This allows independent executors for the same wallet to share a
+    /// single hot-path allocator while keeping their local durable journals.
+    pub fn reserve_with_nonce(
+        &mut self,
+        journal: &mut TransactionJournal,
+        operation_id: impl Into<String>,
+        purpose: impl Into<String>,
+        call: &WalletCall,
+        nonce: u64,
+    ) -> anyhow::Result<JournalOperationIdentity> {
+        let NonceLaneState::Ready { next_nonce } = self.state else {
+            anyhow::bail!("nonce lane is not ready for a new operation");
+        };
+        ensure!(
+            nonce >= next_nonce,
+            "process nonce is behind the local nonce lane"
+        );
         let identity = JournalOperationIdentity {
             operation_id: operation_id.into(),
             chain_id: self.chain_id,
             wallet: self.wallet,
-            nonce: next_nonce,
+            nonce,
         };
         let intent = JournalIntent {
             identity: identity.clone(),
@@ -313,10 +403,11 @@ impl NonceLane {
             "broadcast hash does not match signed transaction"
         );
         journal.record_broadcast(&identity, transaction_hash)?;
-        self.state = NonceLaneState::Broadcast {
-            identity,
-            transaction_hash,
-        };
+        let next_nonce = identity
+            .nonce
+            .checked_add(1)
+            .context("nonce lane overflow after broadcast")?;
+        self.state = NonceLaneState::Ready { next_nonce };
         Ok(())
     }
 
@@ -362,7 +453,12 @@ impl NonceLane {
                 identity,
                 transaction_hash: Some(transaction_hash),
             } => (identity.clone(), *transaction_hash),
-            _ => anyhow::bail!("nonce lane has no hashed transaction to reconcile"),
+            _ => {
+                let operation = journal
+                    .operation_by_transaction_hash(receipt.transaction_hash)
+                    .context("nonce lane has no journaled transaction to reconcile")?;
+                (operation.intent.identity.clone(), receipt.transaction_hash)
+            }
         };
         ensure!(
             receipt.transaction_hash == expected_hash,
@@ -382,7 +478,14 @@ impl NonceLane {
             .nonce
             .checked_add(1)
             .context("nonce lane overflow after mined transaction")?;
-        self.state = NonceLaneState::Ready { next_nonce };
+        self.state = match self.state {
+            NonceLaneState::Ready {
+                next_nonce: current,
+            } => NonceLaneState::Ready {
+                next_nonce: current.max(next_nonce),
+            },
+            _ => NonceLaneState::Ready { next_nonce },
+        };
         Ok(())
     }
 
@@ -648,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn journals_intent_before_reserving_and_advances_only_after_receipt() {
+    fn journals_intent_before_reserving_and_advances_after_broadcast() {
         let path = journal_path("lifecycle");
         let mut journal = TransactionJournal::open(&path).unwrap();
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
@@ -676,7 +779,7 @@ mod tests {
         lane.record_signed(&mut journal, &transaction).unwrap();
         lane.record_broadcast(&mut journal, transaction.hash)
             .unwrap();
-        assert!(!lane.ready());
+        assert_eq!(lane.state(), &NonceLaneState::Ready { next_nonce: 8 });
         lane.record_receipt(
             &mut journal,
             TransactionReceipt {
@@ -741,19 +844,29 @@ mod tests {
     }
 
     #[test]
-    fn untracked_pending_nonce_blocks_new_work() {
+    fn untracked_pending_nonce_becomes_the_next_assignable_nonce() {
         let path = journal_path("untracked");
         let journal = TransactionJournal::open(&path).unwrap();
         let lane = NonceLane::hydrate(480, Address::repeat_byte(0x11), 7, 8, &journal).unwrap();
-        assert_eq!(
-            lane.state(),
-            &NonceLaneState::UntrackedPending {
-                latest_nonce: 7,
-                pending_nonce: 8,
-            }
-        );
-        assert!(!lane.ready());
+        assert_eq!(lane.state(), &NonceLaneState::Ready { next_nonce: 8 });
+        assert!(lane.ready());
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_nonce_lock_shares_the_advanced_nonce_between_lanes() {
+        let wallet = Address::repeat_byte(0x71);
+        let mut first = super::acquire_process_nonce_lock(480, wallet, 7)
+            .await
+            .unwrap();
+        assert_eq!(first.nonce(), 7);
+        first.advance_after_broadcast(7).unwrap();
+        drop(first);
+
+        let second = super::acquire_process_nonce_lock(480, wallet, 7)
+            .await
+            .unwrap();
+        assert_eq!(second.nonce(), 8);
     }
 
     #[test]

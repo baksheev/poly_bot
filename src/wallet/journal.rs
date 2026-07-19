@@ -241,6 +241,34 @@ impl TransactionJournal {
             .collect()
     }
 
+    pub fn recovery_blocking_for(&self, chain_id: u64, wallet: Address) -> Vec<&JournalOperation> {
+        self.operations
+            .values()
+            .filter(|operation| {
+                operation.intent.identity.chain_id == chain_id
+                    && operation.intent.identity.wallet == wallet
+                    && matches!(
+                        operation.status,
+                        JournalStatus::IntentRecorded
+                            | JournalStatus::Signed { .. }
+                            | JournalStatus::OutcomeUnknown { .. }
+                    )
+            })
+            .collect()
+    }
+
+    pub fn operation_by_transaction_hash(
+        &self,
+        transaction_hash: B256,
+    ) -> Option<&JournalOperation> {
+        self.operations.values().find(|operation| {
+            operation
+                .status
+                .transaction_hash()
+                .is_some_and(|hash| hash == transaction_hash)
+        })
+    }
+
     pub fn highest_consumed_nonce(&self, chain_id: u64, wallet: Address) -> Option<u64> {
         self.operations
             .values()
