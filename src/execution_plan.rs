@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     arbitrage::ArbitrageDirection,
     dex::{
-        execution::{ExactInputSwapRequest, SwapRoute},
+        execution::{ExactInputSwapRequest, SwapRoute, SwapSubmissionPolicy},
         hydration::{HydratedPool, PoolIdentity},
         pool_id::V4PoolKey,
     },
@@ -218,6 +218,7 @@ impl DexSwapPlan {
         );
         request.maximum_fee_per_gas_wei = maximum_fee_per_gas_wei;
         request.confirmation_timeout = Duration::from_secs(5);
+        request.submission_policy = SwapSubmissionPolicy::Immediate;
         request.validate()?;
         Ok(request)
     }
@@ -266,7 +267,10 @@ fn parse_hooks_address(name: &str, value: &str) -> anyhow::Result<Address> {
 mod tests {
     use alloy_primitives::{Address, U256};
 
-    use crate::dex::{execution::SwapRoute, pool_id::V4PoolKey};
+    use crate::dex::{
+        execution::{SwapRoute, SwapSubmissionPolicy},
+        pool_id::V4PoolKey,
+    };
 
     use super::{DexRoutePlan, DexSwapPlan};
 
@@ -291,6 +295,7 @@ mod tests {
         assert_eq!(request.amount_in, U256::from(10_000_000_u64));
         assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
         assert_eq!(request.maximum_fee_per_gas_wei, 2_500_000);
+        assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
     }
 
     #[test]
@@ -321,6 +326,7 @@ mod tests {
         assert_eq!(request.amount_in, U256::from(10_000_000_u64));
         assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
         assert_eq!(request.maximum_fee_per_gas_wei, 2_500_000);
+        assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
         assert!(matches!(
             request.route,
             SwapRoute::V4 { pool_key, .. }

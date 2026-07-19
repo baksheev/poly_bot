@@ -33,7 +33,7 @@ channel feeds a single owner of the process-scoped signer, HTTP RPC client,
 nonce lane, and append-only transaction journal. Approval and swap calls cannot
 race each other inside the service.
 
-Every submitted transaction follows this order:
+Approval and manual validation transactions follow this order:
 
 1. Validate addresses, amounts, pool identity, deadline, and slippage floor.
 2. Simulate with `eth_call`, estimate gas, check the fee cap and ETH balance.
@@ -41,6 +41,15 @@ Every submitted transaction follows this order:
 4. Sign and fsync the transaction hash.
 5. Broadcast and fsync the broadcast state.
 6. Poll the receipt and fsync either `mined_success` or `mined_reverted`.
+
+Latency-sensitive live arbitrage swaps use immediate submission. Their route,
+amount, slippage floor, fee ceiling, deadline, inventory, and allowance are
+validated before dispatch, then the executor uses the Rails-compatible quoted
+or fallback gas limit and proceeds directly to fee/balance checks, journaling,
+signing, and broadcast. It does not call `eth_call` or `eth_estimateGas` between
+dispatch and nonce reservation; an on-chain revert is journaled and charged to
+the parent result. Immediate submission is accepted only after startup has
+validated and permanently locked the required router allowances.
 
 Receipt availability can lead an RPC provider's `latest` state by a block. The
 validation path therefore waits until `latest.number >= receipt.block_number`
