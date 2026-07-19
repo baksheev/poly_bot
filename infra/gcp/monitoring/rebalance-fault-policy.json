@@ -6,18 +6,12 @@
     {
       "displayName": "Rebalance fault log observed",
       "conditionThreshold": {
-        "filter": "resource.type = \"k8s_container\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_fault\" AND resource.labels.cluster_name = \"arb-bot\" AND resource.labels.namespace_name = \"arb-bot\" AND resource.labels.container_name = \"arb-bot\"",
+        "filter": "resource.type = \"gce_instance\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_fault\"",
         "aggregations": [
           {
             "alignmentPeriod": "60s",
             "perSeriesAligner": "ALIGN_RATE",
-            "crossSeriesReducer": "REDUCE_SUM",
-            "groupByFields": [
-              "resource.label.project_id",
-              "resource.label.cluster_name",
-              "resource.label.namespace_name",
-              "resource.label.container_name"
-            ]
+            "crossSeriesReducer": "REDUCE_SUM"
           }
         ],
         "comparison": "COMPARISON_GT",

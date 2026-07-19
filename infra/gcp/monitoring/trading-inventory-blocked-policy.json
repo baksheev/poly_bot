@@ -1,0 +1,37 @@
+{
+  "displayName": "poly_bot trading inventory blocked",
+  "combiner": "OR",
+  "enabled": true,
+  "conditions": [
+    {
+      "displayName": "Trading admission blocked by insufficient inventory",
+      "conditionThreshold": {
+        "filter": "resource.type = \"gce_instance\" AND metric.type = \"logging.googleapis.com/user/poly_bot_trading_inventory_blocked\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_RATE",
+            "crossSeriesReducer": "REDUCE_SUM"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "trigger": {
+          "count": 1
+        }
+      }
+    }
+  ],
+  "documentation": {
+    "mimeType": "text/markdown",
+    "content": "The production `poly_bot` runtime saw a viable arbitrage candidate but rejected admission because available inventory was insufficient. Inspect the log fields for `claims`, which include venue, asset, required, observed, reserved, and available base units. Then inspect rebalance progress and venue balances before forcing new trades."
+  },
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "userLabels": {
+    "service": "poly_bot",
+    "component": "trading"
+  }
+}

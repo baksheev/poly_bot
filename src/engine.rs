@@ -68,6 +68,7 @@ pub struct TradingEngine {
     rebalance_blocked: bool,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
+    last_inventory_blocked_alert_at: Option<Instant>,
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
     arbitrage_settlement_barriers: BTreeMap<usize, ArbitrageSettlementBarrier>,
@@ -85,6 +86,7 @@ pub struct BinanceFeeBps {
 }
 
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
@@ -132,6 +134,13 @@ fn rebalance_health_state(
         healthy: !blocked && !inflight_stuck && !settlement_stuck,
         inflight_stuck,
         settlement_stuck,
+    }
+}
+
+fn inventory_venue_label(venue: InventoryVenue) -> &'static str {
+    match venue {
+        InventoryVenue::Binance => "binance",
+        InventoryVenue::Wallet => "wallet",
     }
 }
 
@@ -236,6 +245,7 @@ impl TradingEngine {
                 rebalance_blocked: false,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
+                last_inventory_blocked_alert_at: None,
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
                 arbitrage_settlement_barriers: BTreeMap::new(),
@@ -1364,12 +1374,14 @@ impl TradingEngine {
         let request = ReservationRequest {
             operation_id: plan_id.clone(),
             purpose: ReservationPurpose::TradePrimary,
-            claims,
+            claims: claims.clone(),
             settlement_venues: [InventoryVenue::Binance, InventoryVenue::Wallet]
                 .into_iter()
                 .collect(),
         };
         if let Err(error) = self.inventory.reserve(request) {
+            let claim_details = self.inventory_claim_details(&claims);
+            self.log_trading_inventory_blocked(&pair_id, &pair_symbol, &plan_id, &claim_details);
             self.telemetry.emit(
                 "arbitrage_admission_rejected",
                 json!({
@@ -1377,6 +1389,7 @@ impl TradingEngine {
                     "plan_id": plan_id,
                     "reason": "insufficient_available_inventory",
                     "error": format!("{error:#}"),
+                    "claims": claim_details,
                 }),
             );
             return Ok(());
@@ -1464,6 +1477,50 @@ impl TradingEngine {
                 "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
             }),
         );
+    }
+
+    fn log_trading_inventory_blocked(
+        &mut self,
+        pair_id: &str,
+        pair_symbol: &str,
+        plan_id: &str,
+        claim_details: &[Value],
+    ) {
+        let now = Instant::now();
+        if self.last_inventory_blocked_alert_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < TRADING_INVENTORY_ALERT_LOG_INTERVAL
+        }) {
+            return;
+        }
+        self.last_inventory_blocked_alert_at = Some(now);
+        let claims = Value::Array(claim_details.to_vec());
+        tracing::error!(
+            engine_id = %self.config.engine_id,
+            pair_id,
+            pair_symbol,
+            plan_id,
+            claims = %claims,
+            "arbitrage admission blocked by insufficient inventory"
+        );
+    }
+
+    fn inventory_claim_details(&self, claims: &[InventoryClaim]) -> Vec<Value> {
+        claims
+            .iter()
+            .map(|claim| {
+                let observed = self.inventory.observed(&claim.key);
+                let reserved = self.inventory.reserved(&claim.key);
+                let available = self.inventory.available(&claim.key).ok();
+                json!({
+                    "venue": inventory_venue_label(claim.key.venue),
+                    "asset": claim.key.asset.as_str(),
+                    "required_base_units": claim.amount.to_string(),
+                    "observed_base_units": observed.map(|amount| amount.to_string()),
+                    "reserved_base_units": reserved.to_string(),
+                    "available_base_units": available.map(|amount| amount.to_string()),
+                })
+            })
+            .collect()
     }
 
     fn reconcile_arbitrage_settlement(&mut self, pool_index: usize, prepared_generation: u64) {

@@ -179,6 +179,12 @@ jobs:
           echo "engine_id=${engine_id}" >>"${GITHUB_OUTPUT}"
           echo "release_id=${release_id}" >>"${GITHUB_OUTPUT}"
 
+      - name: Apply production runtime monitoring
+        env:
+          ALERT_EMAIL: baksheev@me.com
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: GCLOUD_BIN=gcloud scripts/apply-gcp-rebalance-monitoring
+
       - name: Publish deployment summary
         env:
           IMAGE: ${{ steps.image.outputs.image }}

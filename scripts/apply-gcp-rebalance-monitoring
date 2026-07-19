@@ -38,6 +38,9 @@ upsert_log_metric \
 upsert_log_metric \
   poly_bot_rebalance_fault \
   "${monitoring_dir}/rebalance-fault-log-metric.json"
+upsert_log_metric \
+  poly_bot_trading_inventory_blocked \
+  "${monitoring_dir}/trading-inventory-blocked-log-metric.json"
 
 channels_json="$("${gcloud_bin}" alpha monitoring channels list \
   "${project_args[@]}" \
@@ -57,19 +60,19 @@ fi
 if [[ "${#matching_channels[@]}" -eq 0 ]]; then
   notification_channel="$("${gcloud_bin}" alpha monitoring channels create \
     --display-name="poly_bot rebalance operator" \
-    --description="Critical production rebalance alerts" \
+    --description="Critical production trading and rebalance alerts" \
     --type=email \
     --channel-labels="email_address=${ALERT_EMAIL}" \
-    --user-labels="service=poly_bot,component=rebalance" \
+    --user-labels="service=poly_bot,component=runtime" \
     "${project_args[@]}" \
     --format='value(name)')"
 else
   notification_channel="${matching_channels[0]}"
   "${gcloud_bin}" alpha monitoring channels update "${notification_channel}" \
     --display-name="poly_bot rebalance operator" \
-    --description="Critical production rebalance alerts" \
+    --description="Critical production trading and rebalance alerts" \
     --enabled \
-    --update-user-labels="service=poly_bot,component=rebalance" \
+    --update-user-labels="service=poly_bot,component=runtime" \
     "${project_args[@]}" >/dev/null
 fi
 if [[ -z "${notification_channel}" ]]; then
@@ -123,5 +126,8 @@ upsert_policy \
 upsert_policy \
   "poly_bot rebalance heartbeat missing" \
   "${monitoring_dir}/rebalance-heartbeat-missing-policy.json"
+upsert_policy \
+  "poly_bot trading inventory blocked" \
+  "${monitoring_dir}/trading-inventory-blocked-policy.json"
 
-echo "rebalance monitoring configured for ${ALERT_EMAIL}"
+echo "production runtime monitoring configured for ${ALERT_EMAIL}"

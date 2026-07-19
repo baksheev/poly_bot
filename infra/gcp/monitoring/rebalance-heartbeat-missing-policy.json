@@ -6,18 +6,12 @@
     {
       "displayName": "No rebalance health heartbeat for 5 minutes",
       "conditionAbsent": {
-        "filter": "resource.type = \"k8s_container\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_health_heartbeat\" AND resource.labels.cluster_name = \"arb-bot\" AND resource.labels.namespace_name = \"arb-bot\" AND resource.labels.container_name = \"arb-bot\"",
+        "filter": "resource.type = \"gce_instance\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_health_heartbeat\"",
         "aggregations": [
           {
             "alignmentPeriod": "60s",
             "perSeriesAligner": "ALIGN_SUM",
-            "crossSeriesReducer": "REDUCE_SUM",
-            "groupByFields": [
-              "resource.label.project_id",
-              "resource.label.cluster_name",
-              "resource.label.namespace_name",
-              "resource.label.container_name"
-            ]
+            "crossSeriesReducer": "REDUCE_SUM"
           }
         ],
         "duration": "300s",
@@ -29,7 +23,7 @@
   ],
   "documentation": {
     "mimeType": "text/markdown",
-    "content": "The production `poly_bot` runtime has not emitted a rebalance health heartbeat for five minutes. The process, GKE pod, logging path, or event loop may be unavailable. Check the `arb-bot` Deployment and pod logs, then verify that the durable rebalance journal has one owner before restarting or recovering anything."
+    "content": "The production `poly_bot` runtime has not emitted a rebalance health heartbeat for five minutes. The process, GCE instance/systemd service, GKE pod, logging path, or event loop may be unavailable. Check the active runtime logs, then verify that the durable rebalance journal has one owner before restarting or recovering anything."
   },
   "alertStrategy": {
     "autoClose": "1800s"

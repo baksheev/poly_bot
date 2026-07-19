@@ -1,6 +1,6 @@
 {
-  "description": "Critical poly_bot rebalance planner, executor, blocked, or stuck health signals from the production GKE runtime.",
-  "filter": "resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\" AND (jsonPayload.fields.message=\"rebalance executor failed closed\" OR jsonPayload.fields.message=\"rebalance planning failed closed\" OR (jsonPayload.fields.message=\"rebalance health heartbeat\" AND jsonPayload.fields.healthy=false))",
+  "description": "Critical poly_bot rebalance planner, executor, blocked, or stuck health signals from the production runtime.",
+  "filter": "(resource.type=\"gce_instance\" OR (resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\")) AND (jsonPayload.fields.message=\"rebalance executor failed closed\" OR jsonPayload.fields.message=\"rebalance planning failed closed\" OR (jsonPayload.fields.message=\"rebalance health heartbeat\" AND jsonPayload.fields.healthy=false) OR textPayload:\"rebalance executor failed closed\" OR textPayload:\"rebalance planning failed closed\" OR textPayload:\"healthy=false\")",
   "metricDescriptor": {
     "displayName": "poly_bot rebalance fault",
     "metricKind": "DELTA",
