@@ -229,10 +229,10 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        env = "ARBITRAGE_EXECUTION_CHANNEL_CAPACITY",
+        env = "ARBITRAGE_LEG_EXECUTION_CHANNEL_CAPACITY",
         default_value_t = 64
     )]
-    pub arbitrage_execution_channel_capacity: usize,
+    pub arbitrage_leg_execution_channel_capacity: usize,
 
     #[arg(
         long,
@@ -342,8 +342,8 @@ impl AppConfig {
             "ARBITRAGE_TRADE_JOURNAL_PATH is empty"
         );
         ensure!(
-            self.arbitrage_execution_channel_capacity > 0,
-            "ARBITRAGE_EXECUTION_CHANNEL_CAPACITY must be greater than zero"
+            self.arbitrage_leg_execution_channel_capacity > 0,
+            "ARBITRAGE_LEG_EXECUTION_CHANNEL_CAPACITY must be greater than zero"
         );
         ensure!(
             !self.arbitrage_entry_stop_file.as_os_str().is_empty(),
@@ -545,7 +545,7 @@ mod tests {
             balance_event_channel_capacity: 16,
             arbitrage_execution_mode: "disabled".into(),
             arbitrage_trade_journal_path: "/tmp/arbitrage-trades.jsonl".into(),
-            arbitrage_execution_channel_capacity: 64,
+            arbitrage_leg_execution_channel_capacity: 64,
             arbitrage_entry_stop_file: "/tmp/arbitrage-entry.stop".into(),
             rebalance_execution_mode: "disabled".into(),
             rebalance_executor_journal_path: "/tmp/rebalance-executor.jsonl".into(),

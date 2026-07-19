@@ -14,6 +14,7 @@ use crate::{
     arbitrage::{
         AdmissionRiskBounds, ArbitrageDirection as TradeDirection, EntryPreflightHandle,
         PaperOpportunity, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
+        PaperTradeSubmitResult,
     },
     balances::BalanceEvent,
     binance::{
@@ -1480,24 +1481,34 @@ impl TradingEngine {
                 pool_generation: dex_pool_generation,
             },
         );
-        if !handle.try_submit(opportunity) {
-            self.arbitrage_plan_freshness.remove(&plan_id);
-            self.inventory.release_unsubmitted(&plan_id)?;
-            self.telemetry.emit(
-                "arbitrage_admission_rejected",
-                json!({
-                    "engine_id": self.config.engine_id,
-                    "plan_id": plan_id,
-                    "reason": "paper_execution_queue_full",
-                }),
-            );
-            return Ok(());
+        match handle.try_submit(opportunity) {
+            PaperTradeSubmitResult::Accepted => {}
+            PaperTradeSubmitResult::Superseded(previous) => {
+                self.release_pending_opportunity(
+                    *previous,
+                    "execution_pending_superseded",
+                    Some(&plan_id),
+                )?;
+            }
+            PaperTradeSubmitResult::Unavailable => {
+                self.arbitrage_plan_freshness.remove(&plan_id);
+                self.inventory.release_unsubmitted(&plan_id)?;
+                self.telemetry.emit(
+                    "arbitrage_admission_rejected",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "plan_id": plan_id,
+                        "reason": "execution_lane_unavailable",
+                    }),
+                );
+                return Ok(());
+            }
         }
         self.telemetry.emit(
             "arbitrage_admitted",
             json!({
                 "engine_id": self.config.engine_id,
-                "plan_id": plan_id,
+                "plan_id": &plan_id,
                 "mode": self.config.arbitrage_execution_mode,
                 "balance_safety_multiplier": balance_safety_multiplier,
                 "execution_slippage_bps": trade.execution_slippage_bps,
@@ -1624,9 +1635,17 @@ impl TradingEngine {
                 "settlement_age_ms": barrier.started_at.elapsed().as_millis(),
             }),
         );
+        if let Some(handle) = &self.paper_trades {
+            let pending = handle.finish(PaperTradeEventState::Balanced);
+            debug_assert!(
+                pending.is_none(),
+                "settlement lane must not contain work admitted behind its barrier"
+            );
+        }
     }
 
     pub fn on_paper_trade_event(&mut self, event: PaperTradeEvent) -> anyhow::Result<()> {
+        let mut waiting_for_dex_settlement = false;
         match event.state {
             PaperTradeEventState::Balanced => {
                 if self.inventory.reservation(&event.plan_id).is_some() {
@@ -1649,6 +1668,7 @@ impl TradingEngine {
                             started_at: Instant::now(),
                         },
                     );
+                    waiting_for_dex_settlement = true;
                 }
             }
             PaperTradeEventState::RejectedUnsubmitted => {
@@ -1666,6 +1686,21 @@ impl TradingEngine {
                 self.arbitrage_plan_freshness.remove(&event.plan_id);
             }
         }
+        let pending = self.paper_trades.as_ref().and_then(|handle| {
+            if waiting_for_dex_settlement {
+                handle.hold_for_settlement()
+            } else {
+                handle.finish(event.state)
+            }
+        });
+        if let Some(pending) = pending {
+            let reason = if waiting_for_dex_settlement {
+                "execution_pending_invalidated_by_dex_settlement"
+            } else {
+                "execution_lane_blocked_unknown"
+            };
+            self.release_pending_opportunity(pending, reason, None)?;
+        }
         self.telemetry.emit(
             "arbitrage_inventory_state",
             json!({
@@ -1673,6 +1708,38 @@ impl TradingEngine {
                 "plan_id": event.plan_id,
                 "state": format!("{:?}", event.state),
                 "reservation_held": self.inventory.reservation(&event.plan_id).is_some(),
+            }),
+        );
+        Ok(())
+    }
+
+    fn release_pending_opportunity(
+        &mut self,
+        opportunity: PaperOpportunity,
+        reason: &'static str,
+        superseded_by_plan_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let plan_id = opportunity.plan_id();
+        self.arbitrage_plan_freshness.remove(&plan_id);
+        if self.inventory.reservation(&plan_id).is_some() {
+            self.inventory.release_unsubmitted(&plan_id)?;
+        }
+        self.telemetry.emit(
+            "arbitrage_execution_pending_discarded",
+            json!({
+                "engine_id": self.config.engine_id,
+                "plan_id": &plan_id,
+                "reason": reason,
+                "superseded_by_plan_id": superseded_by_plan_id,
+            }),
+        );
+        self.telemetry.emit(
+            "arbitrage_inventory_state",
+            json!({
+                "engine_id": self.config.engine_id,
+                "plan_id": plan_id,
+                "state": "RejectedUnsubmitted",
+                "reservation_held": false,
             }),
         );
         Ok(())

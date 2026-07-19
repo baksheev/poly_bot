@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     arbitrage::{
-        CoordinatorCommand, EntryPreflightHandle, ExecutionMode, LegResult, LegRole, LegStatus,
-        PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent, PaperTradeEventState,
-        PaperTradeHandle, TradeIntent, TradeOperation, TradeStage,
+        CoordinatorCommand, EntryPreflightHandle, ExecutionMode, LatestOpportunityReceiver,
+        LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent,
+        PaperTradeEventState, PaperTradeHandle, TradeIntent, TradeOperation, TradeStage,
+        initial_execution_lane,
     },
     binance::{
         account::SymbolRules,
@@ -374,7 +375,7 @@ impl LiveLegExecutor for ComposedLiveLegExecutor {
 }
 
 pub struct LiveTradeTask<E> {
-    receiver: mpsc::Receiver<PaperOpportunity>,
+    receiver: LatestOpportunityReceiver,
     coordinator: PaperTradeCoordinator,
     executor: Arc<E>,
     telemetry: TelemetryHandle,
@@ -401,7 +402,6 @@ impl LiveRiskLimits {
 
 pub fn live_trade_channel<E: LiveLegExecutor>(
     path: impl AsRef<Path>,
-    capacity: usize,
     executor: E,
     telemetry: TelemetryHandle,
     engine_id: String,
@@ -411,10 +411,10 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
     LiveTradeTask<E>,
     mpsc::UnboundedReceiver<PaperTradeEvent>,
 )> {
-    ensure!(capacity > 0, "live trade channel capacity is zero");
     risk_limits.validate()?;
     let coordinator = PaperTradeCoordinator::open(path)?;
-    let (handle, receiver, _dropped) = PaperTradeHandle::channel(capacity);
+    let initial_lane = initial_execution_lane(&coordinator);
+    let (handle, receiver, _discarded) = PaperTradeHandle::channel(initial_lane);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     Ok((
         handle,
@@ -653,7 +653,7 @@ mod tests {
         arbitrage::{
             AdmissionRiskBounds, ArbitrageDirection, CoordinatorCommand, EntryPreflightHandle,
             ExecutionMode, LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator,
-            TerminalOutcome, TradeIntent,
+            PaperTradeEventState, PaperTradeSubmitResult, TerminalOutcome, TradeIntent,
         },
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
@@ -824,6 +824,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_execution_mailbox_keeps_only_the_latest_pending_opportunity() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-latest-mailbox-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+
+        let first = opportunity();
+        assert!(matches!(
+            handle.try_submit(first.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        assert_eq!(
+            task.receiver.recv().await.unwrap().plan_id(),
+            first.plan_id()
+        );
+
+        let mut second = opportunity();
+        second.received_unix_us += 1;
+        second.update_id += 1;
+        assert!(matches!(
+            handle.try_submit(second.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+
+        let mut latest = opportunity();
+        latest.received_unix_us += 2;
+        latest.update_id += 2;
+        let superseded = match handle.try_submit(latest.clone()) {
+            PaperTradeSubmitResult::Superseded(opportunity) => opportunity,
+            other => panic!("expected a superseded opportunity, got {other:?}"),
+        };
+        assert_eq!(superseded.plan_id(), second.plan_id());
+
+        assert!(handle.finish(PaperTradeEventState::Balanced).is_none());
+        assert_eq!(
+            task.receiver.recv().await.unwrap().plan_id(),
+            latest.plan_id()
+        );
+
+        drop(handle);
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_outcome_blocks_the_lane_and_discards_pending_work() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-unknown-mailbox-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+
+        let first = opportunity();
+        assert!(matches!(
+            handle.try_submit(first),
+            PaperTradeSubmitResult::Accepted
+        ));
+        task.receiver.recv().await.unwrap();
+
+        let mut pending = opportunity();
+        pending.received_unix_us += 1;
+        pending.update_id += 1;
+        assert!(matches!(
+            handle.try_submit(pending.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        assert_eq!(
+            handle
+                .finish(PaperTradeEventState::BlockedUnknown)
+                .unwrap()
+                .plan_id(),
+            pending.plan_id()
+        );
+
+        let mut next = opportunity();
+        next.received_unix_us += 2;
+        next.update_id += 2;
+        assert!(matches!(
+            handle.try_submit(next),
+            PaperTradeSubmitResult::Unavailable
+        ));
+
+        drop(handle);
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dex_settlement_keeps_the_lane_busy_and_invalidates_pending_work() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-settlement-mailbox-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle.try_submit(opportunity()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        task.receiver.recv().await.unwrap();
+
+        let mut stale = opportunity();
+        stale.received_unix_us += 1;
+        stale.update_id += 1;
+        assert!(matches!(
+            handle.try_submit(stale.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        assert_eq!(
+            handle.hold_for_settlement().unwrap().plan_id(),
+            stale.plan_id()
+        );
+
+        let mut fresh = opportunity();
+        fresh.received_unix_us += 2;
+        fresh.update_id += 2;
+        assert!(matches!(
+            handle.try_submit(fresh.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        assert!(handle.finish(PaperTradeEventState::Balanced).is_none());
+        assert_eq!(
+            task.receiver.recv().await.unwrap().plan_id(),
+            fresh.plan_id()
+        );
+
+        drop(handle);
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
     async fn composed_task_recovers_only_the_actual_residual_and_finishes_balanced() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-composed-{}-{}.jsonl",
@@ -844,7 +1019,6 @@ mod tests {
         };
         let (_handle, mut task, _events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
@@ -892,7 +1066,6 @@ mod tests {
         };
         let (_handle, mut task, _events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
@@ -945,7 +1118,6 @@ mod tests {
         };
         let (_handle, mut task, _events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
@@ -989,7 +1161,6 @@ mod tests {
         };
         let (_handle, mut task, mut events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
@@ -1049,7 +1220,6 @@ mod tests {
         };
         let (_handle, mut task, _events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
@@ -1117,7 +1287,6 @@ mod tests {
         };
         let (_handle, mut task, _events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
@@ -1168,7 +1337,6 @@ mod tests {
         };
         let (_handle, mut task, _events) = live_trade_channel(
             &journal,
-            4,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),

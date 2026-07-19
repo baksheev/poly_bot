@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::{execution_plan::DexSwapPlan, state::TopOfBook, telemetry::TelemetryHandle};
 
@@ -657,51 +657,182 @@ pub struct PaperTradeEvent {
     pub dex_filled: bool,
 }
 
-#[derive(Clone)]
 pub struct PaperTradeHandle {
-    sender: mpsc::Sender<PaperOpportunity>,
-    dropped: Arc<AtomicU64>,
+    mailbox: Arc<LatestOpportunityMailbox>,
+    discarded: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+pub enum PaperTradeSubmitResult {
+    Accepted,
+    Superseded(Box<PaperOpportunity>),
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionLaneState {
+    Available,
+    Busy,
+    BlockedUnknown,
+}
+
+#[derive(Debug)]
+struct LatestOpportunityState {
+    pending: Option<PaperOpportunity>,
+    lane: ExecutionLaneState,
+    senders: usize,
+    receiver_open: bool,
+}
+
+#[derive(Debug)]
+struct LatestOpportunityMailbox {
+    state: Mutex<LatestOpportunityState>,
+    notify: Notify,
+}
+
+pub(crate) struct LatestOpportunityReceiver {
+    mailbox: Arc<LatestOpportunityMailbox>,
+}
+
+impl Clone for PaperTradeHandle {
+    fn clone(&self) -> Self {
+        if let Ok(mut state) = self.mailbox.state.lock() {
+            state.senders = state.senders.saturating_add(1);
+        }
+        Self {
+            mailbox: Arc::clone(&self.mailbox),
+            discarded: Arc::clone(&self.discarded),
+        }
+    }
+}
+
+impl Drop for PaperTradeHandle {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.mailbox.state.lock() {
+            state.senders = state.senders.saturating_sub(1);
+        }
+        self.mailbox.notify.notify_waiters();
+    }
 }
 
 impl PaperTradeHandle {
     pub(crate) fn channel(
-        capacity: usize,
-    ) -> (Self, mpsc::Receiver<PaperOpportunity>, Arc<AtomicU64>) {
-        let (sender, receiver) = mpsc::channel(capacity);
-        let dropped = Arc::new(AtomicU64::new(0));
+        initial_lane: ExecutionLaneState,
+    ) -> (Self, LatestOpportunityReceiver, Arc<AtomicU64>) {
+        let discarded = Arc::new(AtomicU64::new(0));
+        let mailbox = Arc::new(LatestOpportunityMailbox {
+            state: Mutex::new(LatestOpportunityState {
+                pending: None,
+                lane: initial_lane,
+                senders: 1,
+                receiver_open: true,
+            }),
+            notify: Notify::new(),
+        });
         (
             Self {
-                sender,
-                dropped: Arc::clone(&dropped),
+                mailbox: Arc::clone(&mailbox),
+                discarded: Arc::clone(&discarded),
             },
-            receiver,
-            dropped,
+            LatestOpportunityReceiver { mailbox },
+            discarded,
         )
     }
 
-    /// Never awaits or writes to disk on the opportunity path.
-    pub fn try_submit(&self, opportunity: PaperOpportunity) -> bool {
-        if self.sender.try_send(opportunity).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return false;
+    /// Replaces an older pending opportunity without waiting or writing to disk.
+    pub fn try_submit(&self, opportunity: PaperOpportunity) -> PaperTradeSubmitResult {
+        let Ok(mut state) = self.mailbox.state.lock() else {
+            self.discarded.fetch_add(1, Ordering::Relaxed);
+            return PaperTradeSubmitResult::Unavailable;
+        };
+        if !state.receiver_open || state.lane == ExecutionLaneState::BlockedUnknown {
+            self.discarded.fetch_add(1, Ordering::Relaxed);
+            return PaperTradeSubmitResult::Unavailable;
         }
-        true
+        let previous = state.pending.replace(opportunity);
+        drop(state);
+        self.mailbox.notify.notify_one();
+        match previous {
+            Some(previous) => {
+                self.discarded.fetch_add(1, Ordering::Relaxed);
+                PaperTradeSubmitResult::Superseded(Box::new(previous))
+            }
+            None => PaperTradeSubmitResult::Accepted,
+        }
+    }
+
+    pub fn finish(&self, state: PaperTradeEventState) -> Option<PaperOpportunity> {
+        let Ok(mut mailbox) = self.mailbox.state.lock() else {
+            return None;
+        };
+        let discarded = if state == PaperTradeEventState::BlockedUnknown {
+            mailbox.lane = ExecutionLaneState::BlockedUnknown;
+            mailbox.pending.take()
+        } else {
+            mailbox.lane = ExecutionLaneState::Available;
+            None
+        };
+        drop(mailbox);
+        self.mailbox.notify.notify_waiters();
+        discarded
+    }
+
+    /// Keeps the lane occupied while an external state transition settles.
+    /// Any opportunity admitted against the pre-settlement state is invalid.
+    pub fn hold_for_settlement(&self) -> Option<PaperOpportunity> {
+        let Ok(mut mailbox) = self.mailbox.state.lock() else {
+            return None;
+        };
+        if mailbox.lane != ExecutionLaneState::BlockedUnknown {
+            mailbox.lane = ExecutionLaneState::Busy;
+        }
+        mailbox.pending.take()
+    }
+}
+
+impl LatestOpportunityReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<PaperOpportunity> {
+        loop {
+            let notified = self.mailbox.notify.notified();
+            {
+                let mut state = self.mailbox.state.lock().ok()?;
+                if state.lane == ExecutionLaneState::Available
+                    && let Some(opportunity) = state.pending.take()
+                {
+                    state.lane = ExecutionLaneState::Busy;
+                    return Some(opportunity);
+                }
+                if state.senders == 0 || !state.receiver_open {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for LatestOpportunityReceiver {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.mailbox.state.lock() {
+            state.receiver_open = false;
+            state.pending = None;
+        }
+        self.mailbox.notify.notify_waiters();
     }
 }
 
 pub struct PaperTradeTask {
-    receiver: mpsc::Receiver<PaperOpportunity>,
+    receiver: LatestOpportunityReceiver,
     coordinator: PaperTradeCoordinator,
     mode: ExecutionMode,
     telemetry: TelemetryHandle,
     engine_id: String,
-    dropped: Arc<AtomicU64>,
+    discarded: Arc<AtomicU64>,
     event_sender: mpsc::UnboundedSender<PaperTradeEvent>,
 }
 
 pub fn paper_trade_channel(
     path: impl AsRef<Path>,
-    capacity: usize,
     mode: ExecutionMode,
     telemetry: TelemetryHandle,
     engine_id: String,
@@ -710,10 +841,10 @@ pub fn paper_trade_channel(
     PaperTradeTask,
     mpsc::UnboundedReceiver<PaperTradeEvent>,
 )> {
-    ensure!(capacity > 0, "paper trade channel capacity is zero");
     validate_id("engine id", &engine_id, 96)?;
     let coordinator = PaperTradeCoordinator::open(path)?;
-    let (handle, receiver, dropped) = PaperTradeHandle::channel(capacity);
+    let initial_lane = initial_execution_lane(&coordinator);
+    let (handle, receiver, discarded) = PaperTradeHandle::channel(initial_lane);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     Ok((
         handle,
@@ -723,7 +854,7 @@ pub fn paper_trade_channel(
             mode,
             telemetry,
             engine_id,
-            dropped,
+            discarded,
             event_sender,
         },
         event_receiver,
@@ -750,11 +881,11 @@ impl PaperTradeTask {
                 self.publish_event(plan_id, state, false)?;
             }
         }
-        let dropped = self.dropped.swap(0, Ordering::Relaxed);
-        if dropped > 0 {
+        let discarded = self.discarded.swap(0, Ordering::Relaxed);
+        if discarded > 0 {
             tracing::warn!(
-                dropped,
-                "paper arbitrage opportunities dropped outside hot path"
+                discarded,
+                "paper arbitrage opportunities superseded or rejected outside hot path"
             );
         }
         Ok(())
@@ -867,6 +998,20 @@ impl PaperTradeTask {
                 dex_filled,
             })
             .map_err(|_| anyhow::anyhow!("paper trade event receiver is closed"))
+    }
+}
+
+pub(crate) fn initial_execution_lane(coordinator: &PaperTradeCoordinator) -> ExecutionLaneState {
+    let active = coordinator.active_operations();
+    if active
+        .iter()
+        .any(|operation| operation.stage == TradeStage::UnknownExposure)
+    {
+        ExecutionLaneState::BlockedUnknown
+    } else if active.is_empty() {
+        ExecutionLaneState::Available
+    } else {
+        ExecutionLaneState::Busy
     }
 }
 
