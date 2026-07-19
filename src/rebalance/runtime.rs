@@ -1010,15 +1010,21 @@ impl RebalanceExecutor {
         } = operation.progress
         {
             let binance_after = self.binance_balance(&operation).await?;
-            ensure!(
-                binance_after
-                    >= operation
-                        .intent
-                        .binance_balance_before
-                        .checked_add(credited_base_units)
-                        .context("Binance balance target overflow")?,
-                "Binance free balance did not include credited deposit"
-            );
+            let expected_without_parallel_spend = operation
+                .intent
+                .binance_balance_before
+                .checked_add(credited_base_units)
+                .context("Binance balance target overflow")?;
+            if binance_after < expected_without_parallel_spend {
+                tracing::warn!(
+                    operation_id = operation.intent.operation_id,
+                    token = operation.intent.token_symbol,
+                    binance_balance_after = binance_after.to_string(),
+                    credited_base_units = credited_base_units.to_string(),
+                    expected_without_parallel_spend = expected_without_parallel_spend.to_string(),
+                    "Binance free balance is below pre-deposit balance plus credited deposit; treating Binance deposit history as settlement evidence because live trading may have consumed free balance"
+                );
+            }
             let wallet_after = self
                 .world
                 .erc20_balance(
