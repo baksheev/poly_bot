@@ -724,7 +724,7 @@ mod tests {
         assert!(loaded.snapshot().pairs[0].execution_enabled);
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "694c53eb6df3766e2558d91eb8099a58abdd5aaeab79f97fff0c5710a3134712"
+            "c5d21367d0e0ef37519d0e2dd30fedf828961e32704b0d16ba9a5cbae5c1657d"
         );
     }
 

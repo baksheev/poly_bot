@@ -37,6 +37,8 @@ pub struct UnavailablePool {
     pub pair_id: String,
     pub protocol: DexProvider,
     pub fee_pips: u32,
+    pub address: Option<Address>,
+    pub pool_id: Option<B256>,
     pub reason: UnavailableReason,
 }
 
@@ -45,6 +47,16 @@ pub enum UnavailableReason {
     NotCreated,
     Uninitialized,
     ZeroLiquidity,
+}
+
+impl UnavailableReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotCreated => "not_created",
+            Self::Uninitialized => "uninitialized",
+            Self::ZeroLiquidity => "zero_liquidity",
+        }
+    }
 }
 
 pub struct DexHydrator<'client> {
@@ -124,6 +136,8 @@ impl<'client> DexHydrator<'client> {
                     pair_id: pair.id.clone(),
                     protocol: DexProvider::UniswapV3,
                     fee_pips,
+                    address: None,
+                    pool_id: None,
                     reason: UnavailableReason::NotCreated,
                 });
                 continue;
@@ -155,6 +169,8 @@ impl<'client> DexHydrator<'client> {
                     pair_id: pair.id.clone(),
                     protocol: DexProvider::UniswapV3,
                     fee_pips,
+                    address: Some(address),
+                    pool_id: None,
                     reason: UnavailableReason::Uninitialized,
                 });
                 continue;
@@ -166,6 +182,8 @@ impl<'client> DexHydrator<'client> {
                     pair_id: pair.id.clone(),
                     protocol: DexProvider::UniswapV3,
                     fee_pips,
+                    address: Some(address),
+                    pool_id: None,
                     reason: UnavailableReason::ZeroLiquidity,
                 });
                 continue;
@@ -264,6 +282,8 @@ impl<'client> DexHydrator<'client> {
                     pair_id: pair.id.clone(),
                     protocol: DexProvider::UniswapV4,
                     fee_pips: configured_pool.fee_tier,
+                    address: None,
+                    pool_id: Some(pool_id),
                     reason: UnavailableReason::Uninitialized,
                 });
                 continue;
@@ -280,6 +300,8 @@ impl<'client> DexHydrator<'client> {
                     pair_id: pair.id.clone(),
                     protocol: DexProvider::UniswapV4,
                     fee_pips: configured_pool.fee_tier,
+                    address: None,
+                    pool_id: Some(pool_id),
                     reason: UnavailableReason::ZeroLiquidity,
                 });
                 continue;

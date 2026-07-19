@@ -159,6 +159,10 @@ impl DexMirror {
         self.unavailable.len()
     }
 
+    pub fn unavailable_pools(&self) -> &[UnavailablePool] {
+        &self.unavailable
+    }
+
     pub const fn latest_head(&self) -> CanonicalBlock {
         self.latest_head
     }

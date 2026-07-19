@@ -22,7 +22,7 @@ use crate::{
     },
     config::AppConfig,
     dex::mirror::{DexMirror, LogApplyResult},
-    domain::config::LoadedDomainConfig,
+    domain::config::{DexProvider, LoadedDomainConfig},
     execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
     inventory::{
@@ -267,6 +267,25 @@ impl TradingEngine {
     }
 
     pub fn start(&mut self) {
+        let unavailable_dex_pools: Vec<Value> = self
+            .dex
+            .unavailable_pools()
+            .iter()
+            .map(|pool| {
+                json!({
+                    "pair_id": pool.pair_id,
+                    "protocol": match pool.protocol {
+                        DexProvider::ZeroX => "zero_x",
+                        DexProvider::UniswapV3 => "uniswap_v3",
+                        DexProvider::UniswapV4 => "uniswap_v4",
+                    },
+                    "fee_pips": pool.fee_pips,
+                    "address": pool.address.map(|address| format!("{address:?}")),
+                    "pool_id": pool.pool_id.map(|pool_id| format!("{pool_id:?}")),
+                    "reason": pool.reason.as_str(),
+                })
+            })
+            .collect();
         self.telemetry.emit(
             "runtime_starting",
             json!({
@@ -281,6 +300,7 @@ impl TradingEngine {
                 "binance_symbols": self.domain_config.binance_symbols(),
                 "dex_pools": self.dex.pool_count(),
                 "dex_unavailable_pools": self.dex.unavailable_count(),
+                "dex_unavailable_pool_details": unavailable_dex_pools,
                 "world_chain_block": self.dex.latest_head().number,
             }),
         );
