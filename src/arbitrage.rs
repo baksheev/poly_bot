@@ -176,6 +176,37 @@ impl TradeIntent {
             .saturating_sub(self.expected_cost_token_a_base_units)
     }
 
+    fn expected_recovery_loss_token_a_base_units(&self) -> Option<i128> {
+        self.admission.as_ref().map(|admission| {
+            u128_to_i128_saturating(admission.maximum_recovery_loss_token_a_base_units)
+        })
+    }
+
+    fn expected_gas_cost_token_a_base_units(&self) -> Option<i128> {
+        self.admission
+            .as_ref()
+            .map(|admission| u128_to_i128_saturating(admission.maximum_gas_cost_token_a_base_units))
+    }
+
+    fn expected_fully_burdened_cost_token_a_base_units(&self) -> Option<i128> {
+        let admission = self.admission.as_ref()?;
+        Some(
+            self.expected_cost_token_a_base_units
+                .saturating_add(u128_to_i128_saturating(
+                    admission.maximum_recovery_loss_token_a_base_units,
+                ))
+                .saturating_add(u128_to_i128_saturating(
+                    admission.maximum_gas_cost_token_a_base_units,
+                )),
+        )
+    }
+
+    fn expected_bounded_profit_token_a_base_units(&self) -> Option<i128> {
+        self.admission
+            .as_ref()
+            .map(|admission| u128_to_i128_saturating(admission.bounded_profit_token_a_base_units))
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         validate_id("plan id", &self.plan_id, 96)?;
         validate_id("source revision", &self.source_revision, 96)?;
@@ -213,6 +244,21 @@ impl TradeIntent {
         }
         Ok(())
     }
+}
+
+fn u128_to_i128_saturating(value: u128) -> i128 {
+    i128::try_from(value).unwrap_or(i128::MAX)
+}
+
+fn optional_i128_string(value: Option<i128>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+fn profit_bps_x100(profit: i128, cost: i128) -> Option<i128> {
+    if cost <= 0 {
+        return None;
+    }
+    Some(profit.saturating_mul(1_000_000).saturating_div(cost))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -361,6 +407,28 @@ impl TradeOperation {
         (token_a.saturating_sub(gas_i128), gas)
     }
 
+    fn recovery_token_a_delta_base_units(&self) -> i128 {
+        self.recovery_results.iter().fold(0_i128, |total, result| {
+            total.saturating_add(result.token_a_delta_base_units)
+        })
+    }
+
+    fn realized_primary_cost_and_proceeds_token_a_base_units(&self) -> Option<(i128, i128)> {
+        let dex = self.dex_result.as_ref()?;
+        let cex = self.cex_result.as_ref()?;
+        let (cost, proceeds) = match self.intent.direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
+                dex.token_a_delta_base_units.saturating_neg(),
+                cex.token_a_delta_base_units,
+            ),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
+                cex.token_a_delta_base_units.saturating_neg(),
+                dex.token_a_delta_base_units,
+            ),
+        };
+        Some((cost.max(0), proceeds.max(0)))
+    }
+
     fn has_unknown_leg(&self) -> bool {
         self.dex_result
             .iter()
@@ -382,6 +450,60 @@ impl TradeOperation {
             ),
             "arbitrage result is not balanced"
         );
+        let expected_profit = self.intent.expected_profit_token_a_base_units();
+        let expected_recovery_loss = self.intent.expected_recovery_loss_token_a_base_units();
+        let expected_gas_cost = self.intent.expected_gas_cost_token_a_base_units();
+        let expected_fully_burdened_cost = self
+            .intent
+            .expected_fully_burdened_cost_token_a_base_units();
+        let expected_bounded_profit = self.intent.expected_bounded_profit_token_a_base_units();
+        let expected_profit_bps_x100 = profit_bps_x100(
+            expected_profit,
+            self.intent.expected_cost_token_a_base_units,
+        );
+        let expected_bounded_profit_bps_x100 =
+            expected_fully_burdened_cost.and_then(|expected_cost| {
+                expected_bounded_profit
+                    .and_then(|expected_profit| profit_bps_x100(expected_profit, expected_cost))
+            });
+        let (realized_primary_cost, realized_primary_proceeds) = self
+            .realized_primary_cost_and_proceeds_token_a_base_units()
+            .map_or((None, None), |(cost, proceeds)| {
+                (Some(cost), Some(proceeds))
+            });
+        let realized_primary_profit = realized_primary_cost
+            .zip(realized_primary_proceeds)
+            .map(|(cost, proceeds)| proceeds.saturating_sub(cost));
+        let realized_recovery_delta = self.recovery_token_a_delta_base_units();
+        let realized_recovery_loss = result.recovery_loss_token_a_base_units;
+        let realized_gas_cost = u128_to_i128_saturating(result.gas_cost_token_a_base_units);
+        let realized_total_cost = realized_primary_cost.map(|cost| {
+            cost.saturating_add(realized_recovery_loss)
+                .saturating_add(realized_gas_cost)
+        });
+        let realized_bounded_profit = realized_primary_proceeds
+            .zip(realized_total_cost)
+            .map(|(proceeds, total_cost)| proceeds.saturating_sub(total_cost));
+        let realized_primary_profit_bps_x100 = realized_primary_cost.and_then(|cost| {
+            realized_primary_profit.and_then(|profit| profit_bps_x100(profit, cost))
+        });
+        let realized_bounded_profit_bps_x100 = realized_total_cost.and_then(|cost| {
+            realized_bounded_profit.and_then(|profit| profit_bps_x100(profit, cost))
+        });
+        let primary_profit_error =
+            realized_primary_profit.map(|realized| realized.saturating_sub(expected_profit));
+        let bounded_profit_error = realized_bounded_profit
+            .zip(expected_bounded_profit)
+            .map(|(realized, expected)| realized.saturating_sub(expected));
+        let gas_cost_error =
+            expected_gas_cost.map(|expected| realized_gas_cost.saturating_sub(expected));
+        let recovery_loss_error =
+            expected_recovery_loss.map(|expected| realized_recovery_loss.saturating_sub(expected));
+        let comparable_profit_vs_expected_bounded_error = expected_bounded_profit.map(|expected| {
+            result
+                .comparable_profit_token_a_base_units
+                .saturating_sub(expected)
+        });
         Ok(json!({
             "engine_id": engine_id,
             "plan_id": self.intent.plan_id,
@@ -390,13 +512,34 @@ impl TradeOperation {
             "execution_mode": enum_json(&self.intent.mode)?,
             "direction": enum_json(&self.intent.direction)?,
             "outcome": enum_json(&result.outcome)?,
+            "expected_cost_token_a_base_units": self.intent.expected_cost_token_a_base_units.to_string(),
+            "expected_proceeds_token_a_base_units": self.intent.expected_proceeds_token_a_base_units.to_string(),
             "expected_profit_token_a_base_units": result.expected_profit_token_a_base_units.to_string(),
+            "expected_profit_bps_x100": optional_i128_string(expected_profit_bps_x100),
+            "expected_recovery_loss_token_a_base_units": optional_i128_string(expected_recovery_loss),
+            "expected_gas_cost_token_a_base_units": optional_i128_string(expected_gas_cost),
+            "expected_fully_burdened_cost_token_a_base_units": optional_i128_string(expected_fully_burdened_cost),
+            "expected_bounded_profit_token_a_base_units": optional_i128_string(expected_bounded_profit),
+            "expected_bounded_profit_bps_x100": optional_i128_string(expected_bounded_profit_bps_x100),
+            "realized_primary_cost_token_a_base_units": optional_i128_string(realized_primary_cost),
+            "realized_primary_proceeds_token_a_base_units": optional_i128_string(realized_primary_proceeds),
+            "realized_primary_profit_token_a_base_units": optional_i128_string(realized_primary_profit),
+            "realized_primary_profit_bps_x100": optional_i128_string(realized_primary_profit_bps_x100),
+            "realized_recovery_token_a_delta_base_units": realized_recovery_delta.to_string(),
+            "realized_total_cost_token_a_base_units": optional_i128_string(realized_total_cost),
+            "realized_bounded_profit_token_a_base_units": optional_i128_string(realized_bounded_profit),
+            "realized_bounded_profit_bps_x100": optional_i128_string(realized_bounded_profit_bps_x100),
             "realized_profit_token_a_base_units": result.realized_profit_token_a_base_units.to_string(),
             "residual_value_token_a_base_units": result.residual_value_token_a_base_units.to_string(),
             "comparable_profit_token_a_base_units": result.comparable_profit_token_a_base_units.to_string(),
             "token_b_residual_base_units": result.token_b_residual_base_units.to_string(),
             "gas_cost_token_a_base_units": result.gas_cost_token_a_base_units.to_string(),
             "recovery_loss_token_a_base_units": result.recovery_loss_token_a_base_units.to_string(),
+            "cost_model_primary_profit_error_token_a_base_units": optional_i128_string(primary_profit_error),
+            "cost_model_bounded_profit_error_token_a_base_units": optional_i128_string(bounded_profit_error),
+            "cost_model_gas_cost_error_token_a_base_units": optional_i128_string(gas_cost_error),
+            "cost_model_recovery_loss_error_token_a_base_units": optional_i128_string(recovery_loss_error),
+            "cost_model_comparable_profit_vs_expected_bounded_error_token_a_base_units": optional_i128_string(comparable_profit_vs_expected_bounded_error),
             "dex": self.dex_result.as_ref().map(leg_payload),
             "cex": self.cex_result.as_ref().map(leg_payload),
             "recoveries": self.recovery_results.iter().map(leg_payload).collect::<Vec<_>>(),
@@ -2065,6 +2208,48 @@ mod tests {
             .unwrap();
         assert_eq!(payload["realized_profit_token_a_base_units"], "25");
         assert_eq!(payload["comparable_profit_token_a_base_units"], "25");
+        assert_eq!(payload["expected_cost_token_a_base_units"], "1000");
+        assert_eq!(payload["expected_proceeds_token_a_base_units"], "1030");
+        assert_eq!(payload["expected_profit_bps_x100"], "30000");
+        assert_eq!(payload["expected_recovery_loss_token_a_base_units"], "10");
+        assert_eq!(payload["expected_gas_cost_token_a_base_units"], "1");
+        assert_eq!(
+            payload["expected_fully_burdened_cost_token_a_base_units"],
+            "1011"
+        );
+        assert_eq!(payload["expected_bounded_profit_token_a_base_units"], "19");
+        assert_eq!(payload["expected_bounded_profit_bps_x100"], "18793");
+        assert_eq!(payload["realized_primary_cost_token_a_base_units"], "1000");
+        assert_eq!(
+            payload["realized_primary_proceeds_token_a_base_units"],
+            "1025"
+        );
+        assert_eq!(payload["realized_primary_profit_token_a_base_units"], "25");
+        assert_eq!(payload["realized_primary_profit_bps_x100"], "25000");
+        assert_eq!(payload["realized_recovery_token_a_delta_base_units"], "0");
+        assert_eq!(payload["realized_total_cost_token_a_base_units"], "1000");
+        assert_eq!(payload["realized_bounded_profit_token_a_base_units"], "25");
+        assert_eq!(payload["realized_bounded_profit_bps_x100"], "25000");
+        assert_eq!(
+            payload["cost_model_primary_profit_error_token_a_base_units"],
+            "-5"
+        );
+        assert_eq!(
+            payload["cost_model_bounded_profit_error_token_a_base_units"],
+            "6"
+        );
+        assert_eq!(
+            payload["cost_model_gas_cost_error_token_a_base_units"],
+            "-1"
+        );
+        assert_eq!(
+            payload["cost_model_recovery_loss_error_token_a_base_units"],
+            "-10"
+        );
+        assert_eq!(
+            payload["cost_model_comparable_profit_vs_expected_bounded_error_token_a_base_units"],
+            "6"
+        );
         assert_eq!(payload["execution_mode"], "dex_first");
         assert_eq!(payload["dex"]["token_b_delta_base_units"], "97");
         let expected_result = operation.result.clone();
