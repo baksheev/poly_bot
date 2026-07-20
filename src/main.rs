@@ -50,7 +50,7 @@ use arb_bot::{
         RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
         RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
     },
-    telemetry::{ARBITRAGE_RESULT_KIND, TelemetryWriter},
+    telemetry::{ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryWriter},
     wallet::{
         EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV,
         hydrate_chain_wallet,
@@ -1096,14 +1096,18 @@ async fn run(
         dex_executor
             .prepare_and_lock_allowances(&allowance_requirements)
             .await?;
+        let execution_latency_telemetry =
+            ExecutionLatencyTelemetry::new(telemetry.clone(), config.engine_id.clone());
+        dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
         let dex_service = DexExecutionService::spawn(
             dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?;
-        let binance_service = BinanceExecutionService::spawn(
+        let binance_service = BinanceExecutionService::spawn_instrumented(
             multiplexed_binance_api.clone(),
             binance_journal_path.into(),
             config.arbitrage_leg_execution_channel_capacity,
+            execution_latency_telemetry,
         )
         .await?;
         let market_buy_recovery_fee_bps = binance_account

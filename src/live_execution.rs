@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, ensure};
@@ -24,7 +24,7 @@ use crate::{
     },
     dex::execution::{DexExecutionService, DexExecutionServiceError},
     execution_accounting::{binance_leg_result, dex_leg_result, native_gas_to_token_a_base_units},
-    telemetry::{ARBITRAGE_RESULT_KIND, TelemetryHandle},
+    telemetry::{ARBITRAGE_EXECUTION_STAGE_KIND, ARBITRAGE_RESULT_KIND, TelemetryHandle},
 };
 
 type LegFuture<'a> = Pin<Box<dyn Future<Output = (LegRole, LegResult)> + Send + 'a>>;
@@ -449,7 +449,39 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         self.resume_active().await?;
         while let Some(opportunity) = self.receiver.recv().await {
             let plan_id = opportunity.plan_id();
-            if let Err(error) = self.execute(opportunity).await {
+            let received_unix_us = opportunity.received_unix_us;
+            let live_task_started = Instant::now();
+            self.emit_live_stage(
+                &plan_id,
+                &plan_id,
+                "mailbox_wait",
+                elapsed_since_unix_us(received_unix_us),
+                "success",
+                None,
+            );
+            let execution_result = self.execute(opportunity).await;
+            let outcome = if execution_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            };
+            self.emit_live_stage(
+                &plan_id,
+                &plan_id,
+                "live_task_total",
+                duration_us(live_task_started.elapsed()),
+                outcome,
+                None,
+            );
+            self.emit_live_stage(
+                &plan_id,
+                &plan_id,
+                "market_to_terminal",
+                elapsed_since_unix_us(received_unix_us),
+                outcome,
+                None,
+            );
+            if let Err(error) = execution_result {
                 tracing::error!(plan_id, error = %error, "live arbitrage execution failed closed");
                 let state = self.coordinator.operation(&plan_id).map_or(
                     PaperTradeEventState::RejectedUnsubmitted,
@@ -491,7 +523,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     .context("live trade disappeared during restart")?
                     .intent
                     .clone();
-                let (role, result) = self.executor.execute(&intent, &command).await;
+                let (role, result) = self.execute_leg_timed(&intent, &command).await;
                 self.coordinator.record_result(&plan_id, role, result)?;
             }
             self.drive(&plan_id).await?;
@@ -500,15 +532,44 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
     }
 
     async fn execute(&mut self, opportunity: PaperOpportunity) -> anyhow::Result<()> {
-        opportunity.validate()?;
-        self.authorize_entry(&opportunity)?;
+        let plan_id = opportunity.plan_id();
+        let preflight_started = Instant::now();
+        let preflight_result = opportunity
+            .validate()
+            .and_then(|()| self.authorize_entry(&opportunity));
+        self.emit_live_stage(
+            &plan_id,
+            &plan_id,
+            "entry_validation_preflight",
+            duration_us(preflight_started.elapsed()),
+            if preflight_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+            None,
+        );
+        preflight_result?;
         let intent = opportunity.intent(ExecutionMode::DexFirst);
-        let plan_id = intent.plan_id.clone();
         ensure!(
             intent.admission.is_some() && intent.dex_plan.is_some(),
             "live intent is incomplete"
         );
-        self.coordinator.admit(intent)?;
+        let coordinator_admit_started = Instant::now();
+        let admit_result = self.coordinator.admit(intent);
+        self.emit_live_stage(
+            &plan_id,
+            &plan_id,
+            "coordinator_admit_journal",
+            duration_us(coordinator_admit_started.elapsed()),
+            if admit_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+            None,
+        );
+        admit_result?;
         self.drive(&plan_id).await
     }
 
@@ -539,7 +600,21 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
 
     async fn drive(&mut self, plan_id: &str) -> anyhow::Result<()> {
         loop {
-            let commands = self.coordinator.take_commands(plan_id)?;
+            let take_commands_started = Instant::now();
+            let commands_result = self.coordinator.take_commands(plan_id);
+            self.emit_live_stage(
+                plan_id,
+                plan_id,
+                "coordinator_take_commands_journal",
+                duration_us(take_commands_started.elapsed()),
+                if commands_result.is_ok() {
+                    "success"
+                } else {
+                    "failed"
+                },
+                None,
+            );
+            let commands = commands_result?;
             if commands.is_empty() {
                 let operation = self
                     .coordinator
@@ -579,20 +654,79 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 .intent
                 .clone();
             let results = match commands.as_slice() {
-                [command] => vec![self.executor.execute(&intent, command).await],
+                [command] => vec![self.execute_leg_timed(&intent, command).await],
                 [first, second] => {
                     let (first, second) = tokio::join!(
-                        self.executor.execute(&intent, first),
-                        self.executor.execute(&intent, second),
+                        self.execute_leg_timed(&intent, first),
+                        self.execute_leg_timed(&intent, second),
                     );
                     vec![first, second]
                 }
                 _ => anyhow::bail!("coordinator emitted an invalid command count"),
             };
             for (role, result) in results {
-                self.coordinator.record_result(plan_id, role, result)?;
+                let record_started = Instant::now();
+                let status = result.status;
+                let record_result = self.coordinator.record_result(plan_id, role, result);
+                self.emit_live_stage(
+                    plan_id,
+                    plan_id,
+                    "coordinator_record_result_journal",
+                    duration_us(record_started.elapsed()),
+                    if record_result.is_ok() {
+                        "success"
+                    } else {
+                        "failed"
+                    },
+                    Some((role, status)),
+                );
+                record_result?;
             }
         }
+    }
+
+    async fn execute_leg_timed(
+        &self,
+        intent: &TradeIntent,
+        command: &CoordinatorCommand,
+    ) -> (LegRole, LegResult) {
+        let operation_id = command_operation_id(intent, command);
+        let started_at = Instant::now();
+        let (role, result) = self.executor.execute(intent, command).await;
+        self.emit_live_stage(
+            &intent.plan_id,
+            &operation_id,
+            "leg_execution_total",
+            duration_us(started_at.elapsed()),
+            leg_status_label(result.status),
+            Some((role, result.status)),
+        );
+        (role, result)
+    }
+
+    fn emit_live_stage(
+        &self,
+        plan_id: &str,
+        operation_id: &str,
+        stage: &'static str,
+        duration_us: u64,
+        outcome: &str,
+        leg: Option<(LegRole, LegStatus)>,
+    ) {
+        self.telemetry.emit(
+            ARBITRAGE_EXECUTION_STAGE_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "venue": "orchestrator",
+                "plan_id": plan_id,
+                "operation_id": operation_id,
+                "stage": stage,
+                "duration_us": duration_us,
+                "outcome": outcome,
+                "leg_role": leg.map(|(role, _)| leg_role_label(role)),
+                "leg_status": leg.map(|(_, status)| leg_status_label(status)),
+            }),
+        );
     }
 
     fn publish_event(
@@ -609,6 +743,48 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             })
             .map_err(|_| anyhow::anyhow!("live trade event receiver is closed"))
     }
+}
+
+fn command_operation_id(intent: &TradeIntent, command: &CoordinatorCommand) -> String {
+    match command {
+        CoordinatorCommand::DispatchDex { operation_id, .. } => operation_id.clone(),
+        CoordinatorCommand::DispatchCex {
+            client_order_id, ..
+        } => client_order_id.clone(),
+        CoordinatorCommand::RecoverCex { attempt, .. } => {
+            recovery_client_order_id(&intent.cex_client_order_id, *attempt)
+                .unwrap_or_else(|_| format!("{}-recovery-{attempt}", intent.plan_id))
+        }
+    }
+}
+
+const fn leg_role_label(role: LegRole) -> &'static str {
+    match role {
+        LegRole::Dex => "dex",
+        LegRole::Cex => "cex",
+        LegRole::RecoveryCex => "recovery_cex",
+    }
+}
+
+const fn leg_status_label(status: LegStatus) -> &'static str {
+    match status {
+        LegStatus::Filled => "filled",
+        LegStatus::Failed => "failed",
+        LegStatus::Unknown => "unknown",
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_since_unix_us(received_unix_us: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(received_unix_us)
+        .saturating_sub(received_unix_us)
 }
 
 fn dex_filled(operation: &TradeOperation) -> bool {

@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     chain::rpc::{JsonRpcClient, ReceiptLog, TransactionReceipt},
+    telemetry::ExecutionLatencyTelemetry,
     wallet::{
         EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
         TransactionJournal, UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
@@ -302,6 +303,7 @@ pub struct DexExecutor {
     gas_price: Option<(Instant, u128)>,
     allowance_mutations_enabled: bool,
     last_terminal_receipt: Option<TransactionReceipt>,
+    latency_telemetry: Option<ExecutionLatencyTelemetry>,
 }
 
 impl std::fmt::Debug for DexExecutor {
@@ -362,7 +364,30 @@ impl DexExecutor {
             gas_price: None,
             allowance_mutations_enabled: true,
             last_terminal_receipt: None,
+            latency_telemetry: None,
         })
+    }
+
+    pub fn set_latency_telemetry(&mut self, telemetry: ExecutionLatencyTelemetry) {
+        self.latency_telemetry = Some(telemetry);
+    }
+
+    fn emit_latency_stage(
+        &self,
+        operation_id: &str,
+        stage: &'static str,
+        started_at: Instant,
+        outcome: &'static str,
+    ) {
+        if let Some(telemetry) = &self.latency_telemetry {
+            telemetry.emit_stage(
+                "dex",
+                operation_id,
+                stage,
+                duration_us(started_at.elapsed()),
+                outcome,
+            );
+        }
     }
 
     pub fn wallet_address(&self) -> Address {
@@ -737,23 +762,40 @@ impl DexExecutor {
         }
         ensure!(self.nonce_lane.ready(), "DEX nonce lane is not ready");
         let rpc_call = call.rpc_call(self.wallet.address());
-        let (gas_limit, estimated_gas) = match policy.submission_policy {
+        let preflight_started = Instant::now();
+        let gas_limit_result: anyhow::Result<(u64, Option<u64>)> = match policy.submission_policy {
             SwapSubmissionPolicy::SimulateAndEstimate => {
-                self.rpc
-                    .simulate_transaction(&rpc_call)
-                    .await
-                    .context("DEX preflight simulation reverted")?;
-                let estimated_gas = self.rpc.estimate_gas(&rpc_call).await?;
-                (
-                    policy.gas.resolve(policy.quoted_gas, estimated_gas)?,
-                    Some(estimated_gas),
-                )
+                async {
+                    self.rpc
+                        .simulate_transaction(&rpc_call)
+                        .await
+                        .context("DEX preflight simulation reverted")?;
+                    let estimated_gas = self.rpc.estimate_gas(&rpc_call).await?;
+                    Ok((
+                        policy.gas.resolve(policy.quoted_gas, estimated_gas)?,
+                        Some(estimated_gas),
+                    ))
+                }
+                .await
             }
-            SwapSubmissionPolicy::Immediate => (
-                policy.gas.resolve_without_estimate(policy.quoted_gas)?,
-                None,
-            ),
+            SwapSubmissionPolicy::Immediate => policy
+                .gas
+                .resolve_without_estimate(policy.quoted_gas)
+                .map(|gas_limit| (gas_limit, None)),
         };
+        self.emit_latency_stage(
+            &operation_id,
+            "preflight",
+            preflight_started,
+            if gas_limit_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+        );
+        let (gas_limit, estimated_gas) = gas_limit_result?;
+
+        let gas_and_balance_started = Instant::now();
         let gas_price = self.current_gas_price().await?;
         let max_fee_per_gas = gas_price
             .checked_add(RAILS_PRIORITY_FEE_WEI)
@@ -780,7 +822,14 @@ impl DexExecutor {
             self.rpc.native_balance(self.wallet.address()).await? >= maximum_cost,
             "wallet native balance cannot cover maximum DEX gas"
         );
+        self.emit_latency_stage(
+            &operation_id,
+            "gas_and_balance_rpc",
+            gas_and_balance_started,
+            "success",
+        );
 
+        let nonce_and_sign_started = Instant::now();
         let mut nonce_guard = acquire_process_nonce_lock(
             self.nonce_lane.chain_id(),
             self.wallet.address(),
@@ -810,12 +859,30 @@ impl DexExecutor {
             }
         };
         self.nonce_lane.record_signed(&mut self.journal, &signed)?;
-        let submitted = match tokio::time::timeout(
+        self.emit_latency_stage(
+            &operation_id,
+            "nonce_reserve_sign_journal",
+            nonce_and_sign_started,
+            "success",
+        );
+
+        let broadcast_started = Instant::now();
+        let broadcast_result = tokio::time::timeout(
             PROCESS_NONCE_LOCK_TTL,
             broadcast_signed_transaction(&self.rpc, &signed),
         )
-        .await
-        {
+        .await;
+        self.emit_latency_stage(
+            &operation_id,
+            "broadcast_rpc",
+            broadcast_started,
+            if matches!(&broadcast_result, Ok(Ok(_))) {
+                "success"
+            } else {
+                "failed"
+            },
+        );
+        let submitted = match broadcast_result {
             Ok(Ok(hash)) => hash,
             Ok(Err(error)) => {
                 let reason = if error.to_string().starts_with("JSON-RPC error") {
@@ -859,9 +926,20 @@ impl DexExecutor {
             "DEX transaction broadcast and journaled"
         );
 
-        let receipt = match wait_for_receipt(&self.rpc, submitted, policy.confirmation_timeout)
-            .await
-        {
+        let confirmation_started = Instant::now();
+        let receipt_result =
+            wait_for_receipt(&self.rpc, submitted, policy.confirmation_timeout).await;
+        self.emit_latency_stage(
+            &operation_id,
+            "confirmation_rpc",
+            confirmation_started,
+            if receipt_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+        );
+        let receipt = match receipt_result {
             Ok(receipt) => receipt,
             Err(error) => {
                 tracing::error!(
@@ -873,9 +951,16 @@ impl DexExecutor {
                 return Err(error);
             }
         };
+        let receipt_journal_started = Instant::now();
         self.nonce_lane
             .record_receipt(&mut self.journal, receipt.clone())?;
         self.last_terminal_receipt = Some(receipt.clone());
+        self.emit_latency_stage(
+            &operation_id,
+            "receipt_journal",
+            receipt_journal_started,
+            "success",
+        );
         if receipt.status == 1 {
             tracing::info!(
                 operation_id,
@@ -950,6 +1035,7 @@ fn wallet_transfer_totals(
 
 struct WorkItem {
     request: ExactInputSwapRequest,
+    enqueued_at: Instant,
     response: oneshot::Sender<Result<SwapExecutionOutcome, DexExecutionServiceError>>,
 }
 
@@ -1022,6 +1108,13 @@ impl DexExecutionService {
                 while let Some(work) = receiver.blocking_recv() {
                     let operation_id = work.request.operation_id.clone();
                     let journal_operation_id = format!("{operation_id}.swap");
+                    executor.emit_latency_stage(
+                        &operation_id,
+                        "worker_queue",
+                        work.enqueued_at,
+                        "success",
+                    );
+                    let execution_started = Instant::now();
                     let result = runtime
                         .block_on(executor.execute_exact_input(work.request))
                         .map_err(|error| {
@@ -1030,6 +1123,12 @@ impl DexExecutionService {
                                 format!("{error:#}"),
                             )
                         });
+                    executor.emit_latency_stage(
+                        &operation_id,
+                        "worker_total",
+                        execution_started,
+                        if result.is_ok() { "success" } else { "failed" },
+                    );
                     if let Err(error) = &result {
                         tracing::error!(
                             operation_id,
@@ -1071,7 +1170,11 @@ impl DexExecutionService {
                 })?;
         let (response, receiver) = oneshot::channel();
         sender
-            .send(WorkItem { request, response })
+            .send(WorkItem {
+                request,
+                enqueued_at: Instant::now(),
+                response,
+            })
             .await
             .map_err(|_| DexExecutionServiceError::OutcomeUnknown {
                 reason: "DEX executor thread stopped".to_owned(),
@@ -1082,6 +1185,10 @@ impl DexExecutionService {
                 reason: "DEX executor dropped its response".to_owned(),
             })?
     }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 impl Drop for DexExecutionService {

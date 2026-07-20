@@ -2059,6 +2059,7 @@ impl TradingEngine {
         admission_liquidity: AdmissionLiquidity<'_>,
         depth: Option<&SpotDepthBook>,
     ) -> anyhow::Result<bool> {
+        let admission_started = Instant::now();
         let Some(handle) = self.paper_trades.clone() else {
             return Ok(false);
         };
@@ -2472,6 +2473,7 @@ impl TradingEngine {
                 .into_iter()
                 .collect(),
         };
+        let reservation_started = Instant::now();
         match reservation_precheck(&self.inventory, &request) {
             ReservationPrecheck::Duplicate => {
                 self.telemetry.emit(
@@ -2519,6 +2521,7 @@ impl TradingEngine {
             );
             return Ok(false);
         }
+        let inventory_reservation_us = duration_us(reservation_started.elapsed());
         self.arbitrage_plan_freshness.insert(
             plan_id.clone(),
             ArbitragePlanFreshness {
@@ -2527,6 +2530,7 @@ impl TradingEngine {
                 pool_generation: dex_pool_generation,
             },
         );
+        let mailbox_submit_started = Instant::now();
         match handle.try_submit(opportunity) {
             PaperTradeSubmitResult::Accepted => {}
             PaperTradeSubmitResult::Superseded(previous) => {
@@ -2550,6 +2554,7 @@ impl TradingEngine {
                 return Ok(false);
             }
         }
+        let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
         self.telemetry.emit(
             "arbitrage_admitted",
             json!({
@@ -2565,6 +2570,10 @@ impl TradingEngine {
                 "top_matches": execution_depth_health.top_matches,
                 "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
                 "inventory_reservation_policy": "exact_execution_envelope_v1",
+                "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
+                "admission_total_us": duration_us(admission_started.elapsed()),
+                "inventory_reservation_us": inventory_reservation_us,
+                "mailbox_submit_us": mailbox_submit_us,
                 "inventory_claims": self.inventory_claim_details(&claims),
                 "execution_slippage_bps": trade.execution_slippage_bps,
                 "cex_primary_limit_price": match direction {
@@ -3075,6 +3084,10 @@ fn depth_top_mismatch_reason(
 fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
     let value = u128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds u128"))?;
     i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn exact_execution_envelope_amounts(
