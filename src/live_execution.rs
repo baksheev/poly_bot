@@ -732,6 +732,7 @@ mod tests {
             cost_token_a_base_units: 1_000,
             proceeds_token_a_base_units: 1_030,
             admission: AdmissionRiskBounds {
+                opportunity_threshold_met: true,
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::ONE,
                 cex_primary_top_quantity: Decimal::from(100),

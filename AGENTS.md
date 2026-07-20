@@ -50,13 +50,16 @@ a time.
   push the production image, resolve its immutable digest, and roll that exact
   digest out to the existing fixed GKE node only after CI passes and the
   `production` environment is approved.
-- The production GKE Pod must use the reviewed v8 adaptive-live domain artifact
+- The production GKE Pod must use the reviewed v9 adaptive-live domain artifact
   with both arbitrage and rebalancing in `full_live`. Adaptive sizing may select
   up to the configured 200 USDC cap only from sequence-matched full depth; an
   optimizer failure falls back to the 20 USDC baseline. Inventory reservations
   use `exact_execution_envelope_v1`, including native gas, and must never apply
-  the legacy Rails `3x` multiplier. The deployment workflow must verify these
-  startup fields before it reports success.
+  the legacy Rails `3x` multiplier. The configured 20 bps primary spread is the
+  profitability gate; worst-case recovery loss and gas remain reservation and
+  risk-cap inputs rather than a requirement that failure recovery be
+  profitable. The deployment workflow must verify these startup fields before
+  it reports success.
 - Do not use `.github/workflows/deploy-gce.yml` for routine production delivery.
   It is retained only for an explicitly reviewed rollback after the GKE owner
   is scaled to zero and all active operations are reconciled.

@@ -31,7 +31,10 @@ pub struct AdmissionInputs<'a> {
     pub binance_sell_fee_bps: u16,
     pub expected_cost_token_a: U256,
     pub expected_proceeds_token_a: U256,
-    pub opportunity_threshold_bps: u16,
+    /// Exact `TradeEvaluation` verdict for the configured gross venue-spread
+    /// threshold. Admission preserves this proof instead of recomputing the
+    /// threshold from fee/reserve-adjusted execution amounts.
+    pub opportunity_threshold_met: bool,
     pub network_gas_price_wei: u128,
     pub native_price_token_a: Decimal,
     pub wallet_native_balance_wei: U256,
@@ -50,6 +53,11 @@ pub struct AdmissionEconomics {
     pub maximum_gas_wei: U256,
     pub maximum_fee_per_gas_wei: u128,
     pub maximum_gas_cost_token_a: U256,
+    /// Expected primary spread profit after venue fees and the DEX execution
+    /// reserve already embedded in the candidate cost/proceeds.
+    pub expected_profit_token_a: U256,
+    /// Worst-case capital-at-risk diagnostic. This is intentionally not the
+    /// normal opportunity threshold or adaptive-sizing objective.
     pub fully_burdened_cost_token_a: U256,
     pub bounded_profit_token_a: U256,
     pub native_gas_covered: bool,
@@ -278,6 +286,9 @@ fn finish_admission(
         inputs.native_price_token_a,
         inputs.token_a_decimals,
     )?);
+    let expected_profit_token_a = inputs
+        .expected_proceeds_token_a
+        .saturating_sub(inputs.expected_cost_token_a);
     let fully_burdened_cost_token_a = inputs
         .expected_cost_token_a
         .checked_add(recovery_loss_token_a)
@@ -286,11 +297,7 @@ fn finish_admission(
     let bounded_profit_token_a = inputs
         .expected_proceeds_token_a
         .saturating_sub(fully_burdened_cost_token_a);
-    let meets_threshold = meets_threshold(
-        inputs.expected_proceeds_token_a,
-        fully_burdened_cost_token_a,
-        inputs.opportunity_threshold_bps,
-    )?;
+    let meets_threshold = inputs.opportunity_threshold_met;
 
     Ok(Some(AdmissionEconomics {
         primary_quantity,
@@ -304,6 +311,7 @@ fn finish_admission(
         maximum_gas_wei,
         maximum_fee_per_gas_wei: maximum_fee_per_gas,
         maximum_gas_cost_token_a,
+        expected_profit_token_a,
         fully_burdened_cost_token_a,
         bounded_profit_token_a,
         native_gas_covered: inputs.wallet_native_balance_wei >= maximum_gas_wei,
@@ -338,16 +346,6 @@ fn subtract_bps_floor(value: U256, bps: u16) -> anyhow::Result<U256> {
         .checked_mul(U256::from(10_000_u64 - u64::from(bps)))
         .map(|value| value / U256::from(10_000_u64))
         .context("admission fee multiplication overflow")
-}
-
-fn meets_threshold(proceeds: U256, cost: U256, threshold_bps: u16) -> anyhow::Result<bool> {
-    let left = proceeds
-        .checked_mul(U256::from(10_000_u64))
-        .context("admission threshold proceeds overflow")?;
-    let right = cost
-        .checked_mul(U256::from(10_000_u64 + u64::from(threshold_bps)))
-        .context("admission threshold cost overflow")?;
-    Ok(left >= right)
 }
 
 fn pow10(exponent: u32) -> anyhow::Result<U256> {
@@ -416,7 +414,7 @@ mod tests {
             binance_sell_fee_bps: 10,
             expected_cost_token_a: U256::from(10_000_000_u64),
             expected_proceeds_token_a: U256::from(10_300_000_u64),
-            opportunity_threshold_bps: 20,
+            opportunity_threshold_met: true,
             network_gas_price_wei: 1_000_000,
             native_price_token_a: Decimal::from(3_000),
             wallet_native_balance_wei: U256::from(10_u8).pow(U256::from(18)),
@@ -536,8 +534,29 @@ mod tests {
             U256::from(12_500_000_000_000_u64)
         );
         assert_eq!(economics.maximum_gas_cost_token_a, U256::from(37_500_u64));
+        assert_eq!(economics.expected_profit_token_a, U256::from(300_000_u64));
+        assert_eq!(
+            economics.fully_burdened_cost_token_a,
+            U256::from(10_397_450_u64)
+        );
+        assert_eq!(economics.bounded_profit_token_a, U256::ZERO);
         assert!(economics.native_gas_covered);
-        assert!(!economics.meets_threshold);
+        assert!(economics.meets_threshold);
+    }
+
+    #[test]
+    fn exact_spread_threshold_verdict_is_independent_of_execution_envelope() {
+        let mut request = inputs(ArbitrageDirection::BuyTokenBOnDexSellOnCex);
+        request.expected_proceeds_token_a = U256::from(10_001_000_u64);
+        let admitted = evaluate_admission(&book(), request).unwrap().unwrap();
+
+        assert!(admitted.meets_threshold);
+        assert_eq!(admitted.expected_profit_token_a, U256::from(1_000_u64));
+        assert_eq!(admitted.bounded_profit_token_a, U256::ZERO);
+
+        request.opportunity_threshold_met = false;
+        let rejected = evaluate_admission(&book(), request).unwrap().unwrap();
+        assert!(!rejected.meets_threshold);
     }
 
     #[test]

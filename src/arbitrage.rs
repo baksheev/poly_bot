@@ -74,6 +74,10 @@ pub struct TradeIntent {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionRiskBounds {
+    /// Persisted proof that the exact candidate crossed the configured gross
+    /// venue-spread threshold before admission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opportunity_threshold_met: bool,
     pub execution_slippage_bps: u16,
     pub cex_primary_limit_price: Decimal,
     #[serde(default, skip_serializing_if = "is_zero_decimal")]
@@ -160,6 +164,10 @@ impl AdmissionRiskBounds {
 
 const fn is_zero_u128(value: &u128) -> bool {
     *value == 0
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_zero_decimal(value: &Decimal) -> bool {
@@ -1304,8 +1312,8 @@ impl PaperTradeCoordinator {
             intent
                 .admission
                 .as_ref()
-                .is_none_or(|admission| admission.bounded_profit_token_a_base_units > 0),
-            "bounded admission profit must be positive"
+                .is_none_or(|admission| admission.opportunity_threshold_met),
+            "opportunity threshold must be met before admission"
         );
         ensure!(
             self.journal.active_operations().is_empty(),
@@ -2097,6 +2105,7 @@ mod tests {
             dex_operation_id: "arb-plan-dex".to_owned(),
             cex_client_order_id: "arbplancex".to_owned(),
             admission: Some(super::AdmissionRiskBounds {
+                opportunity_threshold_met: true,
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::from(1),
                 cex_primary_top_quantity: Decimal::from(100),
@@ -2137,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_bounded_profit_is_valid_for_legacy_decode_but_rejected_on_admit() {
+    fn zero_bounded_profit_is_admitted_when_expected_spread_profit_is_positive() {
         let mut intent = intent(ExecutionMode::DexFirst);
         intent
             .admission
@@ -2147,26 +2156,35 @@ mod tests {
 
         intent.validate().unwrap();
 
-        let path = path("zero-bounded-profit-rejected");
+        let path = path("zero-bounded-profit-admitted");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        coordinator.admit(intent).unwrap();
+    }
+
+    #[test]
+    fn newly_admitted_trade_requires_persisted_opportunity_threshold_proof() {
+        let mut intent = intent(ExecutionMode::DexFirst);
+        intent.admission.as_mut().unwrap().opportunity_threshold_met = false;
+
+        let path = path("opportunity-threshold-not-met");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
         let error = coordinator.admit(intent).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("bounded admission profit must be positive"),
+                .contains("opportunity threshold must be met before admission"),
             "{error:#}"
         );
     }
 
     #[test]
-    fn legacy_journal_checksum_survives_missing_primary_top_quantity() {
+    fn legacy_journal_checksum_survives_missing_default_admission_fields() {
         let mut trade_intent = intent(ExecutionMode::DexFirst);
-        trade_intent
-            .admission
-            .as_mut()
-            .unwrap()
-            .cex_primary_top_quantity = Decimal::ZERO;
+        let admission = trade_intent.admission.as_mut().unwrap();
+        admission.cex_primary_top_quantity = Decimal::ZERO;
+        admission.opportunity_threshold_met = false;
         let payload = super::WirePayload {
             version: super::JOURNAL_VERSION,
             sequence: 0,
@@ -2177,6 +2195,10 @@ mod tests {
         let encoded = serde_json::to_vec(&record).unwrap();
         assert!(
             !String::from_utf8_lossy(&encoded).contains("cex_primary_top_quantity"),
+            "legacy-compatible default must not change the checksum payload"
+        );
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains("opportunity_threshold_met"),
             "legacy-compatible default must not change the checksum payload"
         );
 

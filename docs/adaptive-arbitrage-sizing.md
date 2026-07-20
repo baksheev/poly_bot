@@ -1,14 +1,14 @@
 # Adaptive arbitrage sizing
 
-Status: v8 adaptive execution implemented for GKE production
+Status: v9 adaptive spread-threshold execution implemented for GKE production
 Last reviewed: 2026-07-20
 
 ## Implementation status
 
-The v8 production artifact enables `mode = adaptive` with a 200 USDC maximum
+The v9 production artifact enables `mode = adaptive` with a 200 USDC maximum
 trade-notional cap. Rust evaluates exact Binance-step quantities for every
 enabled pool against prepared DEX curves and sequence-matched full Binance
-depth, ranks them by bounded absolute profit, and publishes the selected
+depth, ranks them by expected primary spread profit, and publishes the selected
 candidate as the immutable execution plan. The configured 20 USDC amount stays
 the detector/control and fail-closed fallback. Adaptive mode never admits from
 bookTicker alone: it requests sequence-matched depth before selection.
@@ -68,8 +68,11 @@ dispatch remain separate designs and rollouts.
   one Binance top-of-book level, DEX liquidity, and the gross opportunity
   threshold. It remains telemetry and an optional search bound; it is not an
   executable size.
-- **Bounded profit**: expected selected-trade profit after the admission-time
-  maximum recovery loss and maximum DEX gas charge.
+- **Expected spread profit**: selected candidate proceeds minus cost after the
+  venue fees and DEX execution reserve already embedded in those values. This
+  is the adaptive-sizing objective after the configured 20 bps gate passes.
+- **Bounded profit**: a worst-case diagnostic after maximum recovery loss and
+  maximum DEX gas. It is not the normal-entry profitability gate.
 
 ## Current behavior and verified constraints
 
@@ -93,16 +96,17 @@ Important implementation facts:
 - `TradeEvaluation.cost_token_a` and `proceeds_token_a` already include the
   conservative Binance commission and DEX slippage/fee reserve. Admission must
   not subtract those charges a second time.
-- `AdmissionEconomics.meets_threshold` is calculated, but baseline execution
-  currently uses fully burdened economics for ranking and telemetry rather than
-  as a second 20 bps gate. Adaptive sizing must not silently change baseline
-  eligibility.
+- `TradeEvaluation.meets_threshold` compares the exact gross venue proceeds
+  and cost at the configured 20 bps before the Rails-compatible commission and
+  execution reserve. Admission persists that exact verdict instead of
+  recomputing it from a different cost basis. Maximum gas and recovery loss do
+  not alter the verdict; they remain hard coverage/cap inputs.
 - `balance_safety_multiplier = 3` is a conservative Rails compatibility rule,
   not a Rust runtime invariant. Rails needed headroom around slow balance
   refresh and overlapping jobs. Rust has a single inventory owner, continuous
   venue updates, explicit in-flight plans, and deterministic recovery bounds;
   Rust therefore ignores it for all trade claims. Old artifacts remain
-  readable, while v8 omits the field entirely.
+  readable, while v8 and v9 omit the field entirely.
 - The execution input is a latest-pending mailbox with lane states `available`,
   `busy`, and `blocked_unknown`. It holds at most one pending opportunity.
   A newer admission currently supersedes the pending opportunity
@@ -177,7 +181,8 @@ Adaptive mode must preserve all of the following:
 
 Add an optional pair-level `adaptive_sizing` object. Its absence means
 `baseline_only`, so v1-v6 artifacts retain their existing behavior. V7 records
-the shadow predecessor and reviewed v8 uses active adaptive mode.
+the shadow predecessor, v8 records exact-envelope activation, and reviewed v9
+uses active adaptive mode with the spread threshold separated from tail risk.
 
 ```json
 "adaptive_sizing": {
@@ -185,8 +190,8 @@ the shadow predecessor and reviewed v8 uses active adaptive mode.
   "max_trade_notional_token_a_base_units": "200000000",
   "max_unhedged_notional_token_a_base_units": "220000000",
   "max_recovery_loss_token_a_base_units": "2000000",
-  "min_bounded_profit_token_a_base_units": "0",
-  "min_incremental_bounded_profit_token_a_base_units": "0"
+  "min_expected_profit_token_a_base_units": "0",
+  "min_incremental_expected_profit_token_a_base_units": "0"
 }
 ```
 
@@ -204,8 +209,12 @@ above. This makes the rollback form `{ "mode": "baseline_only" }` complete and
 valid rather than an abbreviated partial config.
 
 The numeric values above illustrate the schema, not approved live limits.
-`max_recovery_loss` and the two minimum-profit values must be calibrated from
+`max_recovery_loss` and the two expected-profit values must be calibrated from
 shadow data before `adaptive` is committed.
+
+V7-v8 artifacts using the former `min_bounded_profit_*` names remain readable
+as aliases. New artifacts must use the expected-profit names so configuration
+does not imply that worst-case recovery economics control normal entry.
 
 For `shadow` and `adaptive`, validation must reject the artifact unless:
 
@@ -276,7 +285,7 @@ For each pool and direction, select:
 
 ```text
 argmax over feasible whole-step quantities q of
-  bounded_profit_token_a(q)
+  expected_profit_token_a(q)
 ```
 
 Then compare the per-pool winners across both directions. The proposed 200 USDC
@@ -312,7 +321,24 @@ bound, but every final candidate must pass the exact dynamic evaluation above.
 For each exact candidate, call the existing full-depth admission calculation
 using the candidate token-B amount and expected cost/proceeds.
 
-The fully burdened formula is:
+Normal-entry profitability is:
+
+```text
+expected_profit_token_a =
+  max(candidate.proceeds_token_a - candidate.cost_token_a, 0)
+
+meets_threshold =
+  candidate.gross_venue_proceeds_token_a * 10_000
+    >= candidate.gross_venue_cost_token_a
+         * (10_000 + opportunity_threshold_bps)
+```
+
+The exact `TradeEvaluation` computes this verdict before applying the
+Rails-compatible commission and DEX execution reserve, then admission persists
+the boolean proof in the immutable plan. It must not approximate or recompute
+the threshold from fee/reserve-adjusted amounts.
+
+The separate worst-case diagnostic remains:
 
 ```text
 fully_burdened_cost_token_a =
@@ -346,15 +372,14 @@ An adaptive candidate is eligible only if:
 - native gas is covered at the admitted maximum fee;
 - `trade_notional`, `unhedged_notional`, and `maximum_recovery_loss` are within
   their config caps;
-- `candidate.proceeds_token_a > fully_burdened_cost_token_a` and bounded profit
-  is at least `min_bounded_profit`;
+- expected spread profit is at least `min_expected_profit` (zero in v9); the
+  configured 20 bps threshold is the authoritative profitability gate;
 - the exact direction-specific reservation fits currently available inventory;
 - the quote, pool generation, balances, account state, order counters, nonce
   owner, and settlement barrier pass the existing readiness checks.
 
-Baseline fallback retains the current baseline admission contract during this
-change. Tightening baseline admission to require positive bounded profit is a
-separate policy decision and must be measured independently.
+Baseline and adaptive candidates use the same 20 bps profitability contract.
+Neither requires the full failure/recovery scenario to remain profitable.
 
 ## Inventory reservation
 
@@ -428,8 +453,8 @@ envelope until explicit reconciliation.
 
 ### Migration from the Rails multiplier
 
-The v8 artifact records the migration in its immutable snapshot ID and source
-evidence. `exact_execution_envelope_v1` is a Rust safety invariant rather than
+The v8 artifact records the reservation migration in its immutable snapshot ID
+and source evidence. `exact_execution_envelope_v1` is a Rust safety invariant rather than
 an operator-selectable policy, so configuration cannot switch live execution
 back to the legacy multiplier. Explicit per-venue minimum-free floors may be
 added later if an operator decides to segregate working capital.
@@ -437,7 +462,7 @@ added later if an operator decides to segregate working capital.
 - Apply the exact-envelope policy to baseline and adaptive trades through the
   same coordinator boundary; do not maintain two reservation algorithms.
 - Keep `balance_safety_multiplier` readable only for old artifact compatibility
-  while older snapshots remain replayable. V8 omits it, and Rust does not use
+  while older snapshots remain replayable. V8-v9 omit it, and Rust does not use
   it for baseline or adaptive claims.
 - Rebalance continues to reserve its exact source debit through the shared
   inventory owner.
@@ -737,11 +762,11 @@ baseline = current direction baseline
 for each direction whose baseline clears the existing threshold:
   for each enabled pool:
     build the feasible whole-step sizing domain
-    find the exact bounded-profit maximum within that domain
+    find the exact expected-profit maximum within that domain
     retain the pool winner
 
 adaptive winner = max eligible candidate by:
-  1. bounded_profit_token_a descending
+  1. expected_profit_token_a descending
   2. unhedged_notional_token_a ascending
   3. trade_notional_token_a ascending
   4. token_b_amount ascending
@@ -750,14 +775,15 @@ adaptive winner = max eligible candidate by:
 
 select adaptive winner only if:
   winner is larger than its direction baseline
-  AND winner bounded profit >= baseline bounded profit
-      + min_incremental_bounded_profit
+  AND winner expected profit >= baseline expected profit
+      + min_incremental_expected_profit
 
 otherwise select baseline fallback
 ```
 
-The objective is maximum conservative absolute profit, not maximum size or
-maximum profit bps. A larger candidate with lower bounded profit must not win.
+The objective is maximum expected absolute spread profit among candidates that
+each pass the 20 bps threshold and all hard safety caps, not maximum size or
+maximum profit bps. A larger candidate with lower expected profit must not win.
 The smaller-risk tie breakers keep replay deterministic and avoid taking extra
 exposure for no modeled benefit.
 
@@ -792,13 +818,13 @@ invalidates pending work admitted against the pre-settlement generation.
 
 Adaptive v1 retains the current newest-wins replacement rule. This isolates the
 sizing experiment from a scheduling-policy change, but it means that a fresher
-smaller candidate may replace a pending larger candidate with higher bounded
+smaller candidate may replace a pending larger candidate with higher expected
 profit. Extend discard telemetry with both candidates' selected quantity,
-notional, bounded profit, market generation, and pending age so the opportunity
+notional, expected profit, market generation, and pending age so the opportunity
 cost is visible.
 
 An economic replacement policy can be a later reviewed change. It must define
-freshness precedence, a minimum bounded-profit improvement, expiry handling,
+freshness precedence, a minimum expected-profit improvement, expiry handling,
 reservation ownership transfer, and deterministic behavior when submission
 races with receiver pickup. It must never keep a pending plan whose preflight
 inputs are already known to be stale.
@@ -830,11 +856,12 @@ Add `arbitrage_adaptive_sizing_evaluated` with:
 - configured mode/caps, optimizer version, sizing-domain bounds, breakpoint
   count, exact evaluation count, and exhaustive-or-optimized search mode;
 - selected direction, pool, exact token-B amount, notional, and sizing mode;
-- selected bounded profit, incremental bounded profit, trade notional,
-  unhedged notional, recovery loss, and reservation fit;
+- selected expected profit, incremental expected profit, bounded-profit tail
+  diagnostic, trade notional, unhedged notional, recovery loss, and reservation
+  fit;
 - rejection counts by stable reason, including gross threshold, DEX liquidity,
   primary/recovery depth, gas, trade cap, exposure cap, recovery-loss cap,
-  bounded-profit floor, incremental-profit floor, inventory, freshness, and
+  expected-profit floor, incremental-profit floor, inventory, freshness, and
   settlement barrier;
 - calculation and total decision latency.
 
@@ -958,7 +985,8 @@ existing plans.
 6. Add plan/journal/result fields and baseline/adaptive coordinator fixtures.
 7. Extend latest-pending supersession telemetry with old/new sizing economics.
 8. Enable exact-envelope reservations and adaptive sizing in the shared
-   paper/live coordinator path. Complete in v8; production evidence continues.
+   paper/live coordinator path. Complete in v8; v9 separates spread admission
+   from worst-case envelope economics.
 9. Make the rebalance trigger account for active/pending trade reservations and
    the maximum next-plan debit; emit projected/realized post-trigger runway.
 10. Add durable rebalance cycle IDs and a replay/report that calculates joint
@@ -979,7 +1007,7 @@ Primary code touch points:
 - `src/arbitrage.rs` and `src/live_execution.rs` for immutable plan fields and
   entry-channel behavior;
 - `src/hot_telemetry.rs` and result payloads;
-- `config/strategies/usdc-wld-world-chain.v8.json`;
+- `config/strategies/usdc-wld-world-chain.v9.json`;
 - monitor/comparison scripts and `docs/trading-runbook.md`.
 
 ## Verification and acceptance
@@ -991,7 +1019,7 @@ Required tests before shadow:
 - direction-specific token-B derivation and conservative step rounding;
 - pool choice can change with size and remains deterministic;
 - a larger size is rejected independently by DEX liquidity, gross threshold,
-  primary depth, reverse depth, gas, every cap, bounded-profit floor,
+  primary depth, reverse depth, gas, every cap, expected-profit floor,
   incremental-profit floor, and inventory;
 - dynamic optimizer matches exhaustive whole-step argmax fixtures and captured
   replays, including DEX/depth breakpoints and rounding plateaus;
