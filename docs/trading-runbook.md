@@ -23,11 +23,13 @@ and must never run while the GKE Deployment has a nonzero replica count.
 - fixed full-live v10 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
   recovery controls.
 
-Run `scripts/quality.sh`, merge the reviewed PR to `main`, wait for CI, approve
-the `production` environment, and deploy only with the `Deploy GKE` workflow.
-The workflow builds the image, resolves its immutable digest, reuses the fixed
-node, and verifies the v10/full-live runtime config. Do not deploy from a
-workstation or use the GCE updater.
+Run `scripts/quality.sh`, fetch `origin/main`, require a clean fast-forward,
+push the validated commit directly to `main`, approve the `production`
+environment when requested, and deploy only with the `Deploy GKE` workflow. Do
+not open a routine production PR, force-push, or overwrite remote commits. The
+workflow builds the image, resolves its immutable digest, reuses the fixed node,
+and verifies the v10/full-live runtime config. Do not deploy from a workstation
+or use the GCE updater.
 
 ```bash
 gh workflow run deploy-gke.yml --ref main

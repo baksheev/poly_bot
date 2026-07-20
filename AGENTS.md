@@ -50,6 +50,13 @@ a time.
   push the production image, resolve its immutable digest, and roll that exact
   digest out to the existing fixed GKE node only after CI passes and the
   `production` environment is approved.
+- Do not open a pull request for routine production changes. After the intended
+  scope is committed and `scripts/quality.sh` passes, fetch `origin/main`,
+  require a clean fast-forward integration, push the resulting commit directly
+  to `origin/main`, trigger the `Deploy GKE` workflow for that exact `main`
+  revision, and monitor it through rollout verification. Never force-push or
+  discard remote commits; stop and report if `main` cannot be fast-forwarded or
+  branch protection rejects the direct push.
 - The production GKE Pod must use the reviewed v10 adaptive-live domain artifact
   with both arbitrage and rebalancing in `full_live`. Adaptive sizing may select
   up to the configured 200 USDC cap from sequence-matched full depth or recent
@@ -76,7 +83,7 @@ a time.
   an explicit capacity plan, rollback plan, and reviewed GitHub Action.
 - Local GCP access is for read-only inspection and explicitly requested
   bootstrap or recovery work only. Routine production mutations belong in a
-  reviewed GitHub Action so the actor, revision, logs, and outcome are auditable.
+  GitHub Action so the actor, revision, logs, and outcome are auditable.
 
 ## Clone boundaries
 
