@@ -50,6 +50,9 @@ a time.
   push the production image, resolve its immutable digest, and roll that exact
   digest out to the existing fixed GKE node only after CI passes and the
   `production` environment is approved.
+- The production GKE Pod must use the reviewed v6 live domain artifact with
+  both arbitrage and rebalancing in `full_live`. The deployment workflow must
+  verify those startup fields before it reports success.
 - Do not use `.github/workflows/deploy-gce.yml` for routine production delivery.
   It is retained only for an explicitly reviewed rollback after the GKE owner
   is scaled to zero and all active operations are reconciled.
