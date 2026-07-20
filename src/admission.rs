@@ -460,6 +460,22 @@ mod tests {
     }
 
     #[test]
+    fn dex_first_admission_preserves_the_gross_spread_verdict() {
+        let quote = top_of_book(Decimal::from(10), Decimal::ONE);
+        let mut request = inputs(ArbitrageDirection::BuyTokenBOnDexSellOnCex);
+        request.expected_cost_token_a = U256::from(10_010_000_u64);
+        request.expected_proceeds_token_a = U256::from(10_000_000_u64);
+
+        let economics = evaluate_dex_first_admission(&quote, request)
+            .unwrap()
+            .unwrap();
+
+        assert!(economics.meets_threshold);
+        assert_eq!(economics.expected_profit_token_a, U256::ZERO);
+        assert_eq!(economics.bounded_profit_token_a, U256::ZERO);
+    }
+
+    #[test]
     fn dex_first_admission_defers_when_relevant_top_is_too_small() {
         let quote = top_of_book(Decimal::from(9), Decimal::from(100));
 
