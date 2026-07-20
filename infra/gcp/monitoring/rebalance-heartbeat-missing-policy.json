@@ -6,7 +6,7 @@
     {
       "displayName": "No rebalance health heartbeat for 5 minutes",
       "conditionAbsent": {
-        "filter": "resource.type = \"gce_instance\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_health_heartbeat\"",
+        "filter": "resource.type = \"k8s_container\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_health_heartbeat\"",
         "aggregations": [
           {
             "alignmentPeriod": "60s",
