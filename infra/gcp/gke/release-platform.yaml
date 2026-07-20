@@ -11,17 +11,22 @@ data:
   BINANCE_REST_BASE_URL: https://api.binance.com
   BINANCE_WS_API_URL: wss://ws-api.binance.com:443/ws-api/v3
   EVM_WALLET_ADDRESS: __EVM_WALLET_ADDRESS__
-  DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v4.json
+  DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v6.json
   MARKET_DATA_MAX_AGE_MS: "5000"
   DEX_EVENT_CHANNEL_CAPACITY: "8192"
   DEX_HEAD_MAX_AGE_MS: "10000"
   BALANCE_SYNC_INTERVAL_MS: "1000"
   BALANCE_MAX_AGE_MS: "5000"
   BALANCE_EVENT_CHANNEL_CAPACITY: "16"
-  REBALANCE_EXECUTION_MODE: disabled
+  ARBITRAGE_EXECUTION_MODE: full_live
+  ARBITRAGE_TRADE_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-live-trades.jsonl
+  ARBITRAGE_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-wallet.jsonl
+  ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-binance-orders.jsonl
+  ARBITRAGE_ENTRY_STOP_FILE: /var/lib/arb-bot/arbitrage-entry.stop
+  REBALANCE_EXECUTION_MODE: full_live
   REBALANCE_EXECUTOR_JOURNAL_PATH: /var/lib/arb-bot/rebalance-executor.jsonl
   REBALANCE_EXECUTOR_TIMEOUT_SECONDS: "1800"
-  EVM_WALLET_JOURNAL_PATH: /var/lib/arb-bot/evm-wallet.jsonl
+  EVM_WALLET_JOURNAL_PATH: /var/lib/arb-bot/rebalance-wallet.jsonl
   CLICKHOUSE_DATABASE: arb_bot_prod
   CLICKHOUSE_USER: default
   TELEMETRY_CHANNEL_CAPACITY: "8192"

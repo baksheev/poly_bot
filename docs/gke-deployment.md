@@ -28,12 +28,14 @@ GB, leaving a safe scheduling and runtime margin without moving to C4-16.
 If image startup or readiness fails, the Deployment is restored to its previous
 revision on the same fixed pool.
 
-The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable rebalance
-journal and provides a second single-writer boundary on C4. Recreate rollout
-plus the journal file lock prevent two processes from owning the same rebalance
-operation. The full executor places its high-level and nonce journals on this
-disk. The current manifest selects `full_live`, mounts the wallet signer, and
-uses separate Binance subaccount and master treasury credentials.
+The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable execution
+journals and provides a second single-writer boundary on C4. Recreate rollout
+plus the journal file locks prevent two processes from owning the same trade or
+rebalance operation. The current manifest selects `full_live` for arbitrage and
+rebalancing, loads the reviewed v6 live domain artifact, mounts the wallet
+signer, and uses separate Binance subaccount and master treasury credentials.
+The parent-trade, Binance-order, arbitrage-wallet, rebalance-executor, and
+rebalance-wallet journals all live on this disk.
 
 ## Networking and secrets
 
@@ -139,9 +141,11 @@ Kubernetes retains five Deployment revisions.
 6. Run the workflow and verify startup recovery, Binance freshness, DEX heads,
    balances, ClickHouse telemetry, and decision latency using the new GKE
    engine identity.
-7. Confirm that the startup log reports `rebalance_execution_mode=full_live`,
-   the journal has no unexpected active operation, and only the new release
-   node pool remains after workflow cleanup.
+7. Confirm that the startup log reports
+   `arbitrage_execution_mode=full_live`,
+   `rebalance_execution_mode=full_live`, and the reviewed v6 domain snapshot;
+   verify that the journals have no unexpected active operation and only the
+   new release emits telemetry from the fixed node pool.
 8. Confirm that both `poly_bot rebalance` alert policies are enabled and target
    the `baksheev@me.com` notification channel.
 9. Keep the stopped VM, its digest, and configuration as the rollback target

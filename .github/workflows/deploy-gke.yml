@@ -262,6 +262,16 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
             -o wide
+          pod_name="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            -o jsonpath='{.items[0].metadata.name}')"
+          startup_modes="$(kubectl logs "${pod_name}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --since=15m \
+            | jq -r 'select(.fields.message == "arbitrage shadow service started with authenticated Binance account state") | [.fields.arbitrage_execution_mode, .fields.rebalance_execution_mode, .fields.domain_snapshot_id] | @tsv' \
+            | tail -n 1)"
+          test "${startup_modes}" = $'full_live\tfull_live\tarb-bot-production-usdc-wld-world-chain-v6-live-exchange-tick'
           rollout_succeeded=true
 
           while IFS= read -r pool; do
