@@ -272,7 +272,7 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
-            = config/strategies/usdc-wld-world-chain.v6.json
+            = config/strategies/usdc-wld-world-chain.v7.json
           test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${runtime_config}")" \
             = full_live
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \

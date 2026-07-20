@@ -12,7 +12,7 @@ overlap.
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v6 domain artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC baseline,
+- v7 adaptive-shadow artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC executed baseline and 200 USDC shadow cap,
   WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
 - the dedicated wallet and Binance subaccount verified at startup;
@@ -20,7 +20,7 @@ overlap.
   journals;
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
   active rebalance, and fresh Binance/depth/DEX/balance/gas inputs;
-- fixed full-live v6 deployment, single-owner enforcement, and entry-stop
+- fixed full-live v7 adaptive-shadow deployment, single-owner enforcement, and entry-stop
   recovery controls.
 
 Run `scripts/quality.sh`, then deploy the digest-pinned production image:
