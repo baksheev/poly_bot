@@ -1301,6 +1301,13 @@ impl PaperTradeCoordinator {
     pub fn admit(&mut self, intent: TradeIntent) -> anyhow::Result<()> {
         intent.validate()?;
         ensure!(
+            intent
+                .admission
+                .as_ref()
+                .is_none_or(|admission| admission.bounded_profit_token_a_base_units > 0),
+            "bounded admission profit must be positive"
+        );
+        ensure!(
             self.journal.active_operations().is_empty(),
             "another trade is active or has unknown exposure"
         );
@@ -2130,7 +2137,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_bounded_profit_is_valid_for_rails_style_admission() {
+    fn zero_bounded_profit_is_valid_for_legacy_decode_but_rejected_on_admit() {
         let mut intent = intent(ExecutionMode::DexFirst);
         intent
             .admission
@@ -2139,6 +2146,17 @@ mod tests {
             .bounded_profit_token_a_base_units = 0;
 
         intent.validate().unwrap();
+
+        let path = path("zero-bounded-profit-rejected");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let error = coordinator.admit(intent).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bounded admission profit must be positive"),
+            "{error:#}"
+        );
     }
 
     #[test]

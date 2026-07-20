@@ -1396,6 +1396,16 @@ impl TradingEngine {
                 );
                 continue;
             }
+            if economics.bounded_profit_token_a == U256::ZERO {
+                self.emit_admission_risk_rejection(
+                    quote,
+                    &pair_id,
+                    trade_direction,
+                    "non_positive_bounded_profit",
+                    Some(economics),
+                );
+                continue;
+            }
             // Rails gates opportunity admission on the gross venue spread.
             // Keep the fully-burdened economics in telemetry and use them to
             // rank candidates, but do not turn them into a hidden Rust-only
