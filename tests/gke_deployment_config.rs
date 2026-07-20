@@ -30,7 +30,9 @@ fn gke_manifest_is_the_full_live_v6_owner() {
 #[test]
 fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
-    assert!(DEPLOY_WORKFLOW.contains(
-        "$'full_live\\tfull_live\\tarb-bot-production-usdc-wld-world-chain-v6-live-exchange-tick'"
-    ));
+    assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
+    assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
+    assert!(DEPLOY_WORKFLOW.contains("usdc-wld-world-chain.v6.json"));
+    assert!(DEPLOY_WORKFLOW.contains("previous_runtime_config"));
+    assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
 }

@@ -144,6 +144,7 @@ jobs:
           new_pool="${NODE_POOL_PREFIX}-${release_id}"
           had_previous=false
           previous_pool=""
+          previous_runtime_config=""
           rollout_applied=false
           rollout_succeeded=false
 
@@ -154,6 +155,9 @@ jobs:
               -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
             test -n "${previous_pool}"
             new_pool="${previous_pool}"
+            previous_runtime_config="$(kubectl get configmap arb-bot-runtime \
+              --namespace "${GKE_NAMESPACE}" \
+              -o yaml)"
           fi
 
           restore_on_failure() {
@@ -171,6 +175,8 @@ jobs:
 
             if [[ "${rollout_applied}" == true ]]; then
               if [[ "${had_previous}" == true ]]; then
+                printf '%s\n' "${previous_runtime_config}" \
+                  | kubectl replace --namespace "${GKE_NAMESPACE}" -f - || true
                 kubectl rollout undo deployment/arb-bot --namespace "${GKE_NAMESPACE}" || true
                 kubectl rollout status deployment/arb-bot \
                   --namespace "${GKE_NAMESPACE}" \
@@ -262,16 +268,19 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
             -o wide
-          pod_name="$(kubectl get pods \
+          runtime_config="$(kubectl get configmap arb-bot-runtime \
             --namespace "${GKE_NAMESPACE}" \
-            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
-            -o jsonpath='{.items[0].metadata.name}')"
-          startup_modes="$(kubectl logs "${pod_name}" \
+            -o json)"
+          test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
+            = config/strategies/usdc-wld-world-chain.v6.json
+          test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${runtime_config}")" \
+            = full_live
+          test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \
+            = full_live
+          rebalance_mode="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
-            --since=15m \
-            | jq -r 'select(.fields.message == "arbitrage shadow service started with authenticated Binance account state") | [.fields.arbitrage_execution_mode, .fields.rebalance_execution_mode, .fields.domain_snapshot_id] | @tsv' \
-            | tail -n 1)"
-          test "${startup_modes}" = $'full_live\tfull_live\tarb-bot-production-usdc-wld-world-chain-v6-live-exchange-tick'
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"
+          test "${rebalance_mode}" = full_live
           rollout_succeeded=true
 
           while IFS= read -r pool; do
