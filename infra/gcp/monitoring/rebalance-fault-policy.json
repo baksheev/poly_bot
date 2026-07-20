@@ -6,7 +6,7 @@
     {
       "displayName": "Rebalance fault log observed",
       "conditionThreshold": {
-        "filter": "resource.type = \"gce_instance\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_fault\"",
+        "filter": "resource.type = \"k8s_container\" AND metric.type = \"logging.googleapis.com/user/poly_bot_rebalance_fault\"",
         "aggregations": [
           {
             "alignmentPeriod": "60s",
