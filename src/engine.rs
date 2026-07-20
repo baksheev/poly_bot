@@ -1883,16 +1883,19 @@ impl TradingEngine {
         let adaptive_limits = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)?;
         if adaptive_execution && matches!(admission_liquidity, AdmissionLiquidity::DexFirstTop) {
             self.telemetry.emit(
-                "arbitrage_admission_deferred",
+                "arbitrage_adaptive_sizing_evaluated",
                 json!({
                     "engine_id": self.config.engine_id,
                     "pair_id": pair_id,
                     "symbol": quote.symbol.as_ref(),
                     "update_id": quote.update_id,
-                    "reason": "adaptive_requires_sequence_matched_full_depth",
+                    "configured_mode": pair_config.adaptive_sizing.mode(),
+                    "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+                    "selected_sizing_mode": "baseline",
+                    "fallback_reason": "sequence_matched_full_depth_unavailable",
+                    "execution_size_changed": false,
                 }),
             );
-            return Ok(true);
         }
         let token_a_decimals = pair.token_a_decimals;
         let token_b_decimals = pair.token_b_decimals;

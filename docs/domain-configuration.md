@@ -37,7 +37,9 @@ The v4-v9 snapshots record:
 - Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
   step/tick size;
 - fixed 20 USDC detector/control notional; v8-v9 execute adaptive whole-step
-  sizing from sequence-matched depth up to the 200 USDC cap;
+  sizing from sequence-matched depth up to the 200 USDC cap, while retaining
+  immediate bookTicker admission for a threshold-clearing baseline when
+  matched depth is unavailable;
 - token-B quote sizing derived from the latest Binance ask, matching
   `UpdateMinBuyAmountJob` without its database update loop;
 - opportunity capacity expressed as whole Binance token-B steps, starting at

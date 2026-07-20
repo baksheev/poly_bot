@@ -10,8 +10,11 @@ trade-notional cap. Rust evaluates exact Binance-step quantities for every
 enabled pool against prepared DEX curves and sequence-matched full Binance
 depth, ranks them by expected primary spread profit, and publishes the selected
 candidate as the immutable execution plan. The configured 20 USDC amount stays
-the detector/control and fail-closed fallback. Adaptive mode never admits from
-bookTicker alone: it requests sequence-matched depth before selection.
+the detector/control and fast-path fallback. When sequence-matched full depth
+is unavailable, a baseline that clears the 20 bps spread gate may still be
+admitted from the current bookTicker under the existing DEX-first top-level
+quantity, gas, risk-cap, freshness, and exact-reservation checks. Full depth is
+required only to select a larger adaptive size.
 
 The first shadow optimizer is the exhaustive whole-step reference oracle. It
 is capped at 8,192 exact evaluations per pool; exhausting the cap selects no
@@ -781,15 +784,23 @@ select adaptive winner only if:
 otherwise select baseline fallback
 ```
 
+If sequence-matched full depth is not available at the decision instant, skip
+the adaptive search and immediately evaluate that same baseline against the
+current relevant bookTicker top level. Do not defer a threshold-clearing
+baseline merely because a larger adaptive size cannot be calculated.
+
 The objective is maximum expected absolute spread profit among candidates that
 each pass the 20 bps threshold and all hard safety caps, not maximum size or
 maximum profit bps. A larger candidate with lower expected profit must not win.
 The smaller-risk tie breakers keep replay deterministic and avoid taking extra
 exposure for no modeled benefit.
 
-The baseline comparison uses admission economics recalculated from the same
-depth/gas snapshot as the adaptive candidates. It does not change whether the
-baseline itself is allowed to execute.
+When full depth is available, the baseline comparison uses admission economics
+recalculated from the same depth/gas snapshot as the adaptive candidates. On
+the DEX-first fast path without matched depth, the baseline uses the current
+relevant bookTicker top level and the same gas/risk checks instead. Adaptive
+depth availability does not change whether the baseline itself is allowed to
+execute.
 
 ## Immutable plan and restart contract
 
