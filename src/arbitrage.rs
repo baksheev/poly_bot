@@ -78,6 +78,16 @@ pub struct AdmissionRiskBounds {
     /// venue-spread threshold before admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub opportunity_threshold_met: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_update_delta: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_matches: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_mismatch_reason: Option<String>,
     pub execution_slippage_bps: u16,
     pub cex_primary_limit_price: Decimal,
     #[serde(default, skip_serializing_if = "is_zero_decimal")]
@@ -104,6 +114,17 @@ pub struct AdmissionRiskBounds {
 
 impl AdmissionRiskBounds {
     fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.depth_source.as_deref().is_none_or(|source| matches!(
+                source,
+                "sequence_matched_full_depth" | "recent_full_depth" | "top_of_book_only"
+            )),
+            "admission depth source is invalid"
+        );
+        ensure!(
+            self.top_matches != Some(true) || self.top_mismatch_reason.is_none(),
+            "matching admission top cannot have a mismatch reason"
+        );
         ensure!(
             self.execution_slippage_bps <= 10_000,
             "execution slippage exceeds 100%"
@@ -512,7 +533,7 @@ impl TradeOperation {
                 .comparable_profit_token_a_base_units
                 .saturating_sub(expected)
         });
-        Ok(json!({
+        let mut payload = json!({
             "engine_id": engine_id,
             "plan_id": self.intent.plan_id,
             "source_revision": self.intent.source_revision,
@@ -551,7 +572,32 @@ impl TradeOperation {
             "dex": self.dex_result.as_ref().map(leg_payload),
             "cex": self.cex_result.as_ref().map(leg_payload),
             "recoveries": self.recovery_results.iter().map(leg_payload).collect::<Vec<_>>(),
-        }))
+        });
+        let object = payload
+            .as_object_mut()
+            .context("arbitrage result telemetry payload is not an object")?;
+        let admission = self.intent.admission.as_ref();
+        object.insert(
+            "depth_source".to_owned(),
+            json!(admission.and_then(|admission| admission.depth_source.as_deref())),
+        );
+        object.insert(
+            "depth_age_ms".to_owned(),
+            json!(admission.and_then(|admission| admission.depth_age_ms)),
+        );
+        object.insert(
+            "depth_update_delta".to_owned(),
+            json!(admission.and_then(|admission| admission.depth_update_delta)),
+        );
+        object.insert(
+            "top_matches".to_owned(),
+            json!(admission.and_then(|admission| admission.top_matches)),
+        );
+        object.insert(
+            "top_mismatch_reason".to_owned(),
+            json!(admission.and_then(|admission| admission.top_mismatch_reason.as_deref())),
+        );
+        Ok(payload)
     }
 }
 
@@ -2106,6 +2152,11 @@ mod tests {
             cex_client_order_id: "arbplancex".to_owned(),
             admission: Some(super::AdmissionRiskBounds {
                 opportunity_threshold_met: true,
+                depth_source: None,
+                depth_age_ms: None,
+                depth_update_delta: None,
+                top_matches: None,
+                top_mismatch_reason: None,
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::from(1),
                 cex_primary_top_quantity: Decimal::from(100),
@@ -2201,6 +2252,10 @@ mod tests {
             !String::from_utf8_lossy(&encoded).contains("opportunity_threshold_met"),
             "legacy-compatible default must not change the checksum payload"
         );
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains("depth_source"),
+            "missing legacy depth metadata must not change the checksum payload"
+        );
 
         let decoded: super::WireRecord = serde_json::from_slice(&encoded).unwrap();
         decoded.validate_checksum().unwrap();
@@ -2211,7 +2266,13 @@ mod tests {
         let path = path("dex-first");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
-        let intent = intent(ExecutionMode::DexFirst);
+        let mut intent = intent(ExecutionMode::DexFirst);
+        let admission = intent.admission.as_mut().unwrap();
+        admission.depth_source = Some("recent_full_depth".to_owned());
+        admission.depth_age_ms = Some(635);
+        admission.depth_update_delta = Some(5);
+        admission.top_matches = Some(false);
+        admission.top_mismatch_reason = Some("bid_quantity_mismatch".to_owned());
         let plan_id = intent.plan_id.clone();
         coordinator.admit(intent).unwrap();
         assert!(matches!(
@@ -2250,6 +2311,11 @@ mod tests {
         assert_eq!(payload["comparable_profit_token_a_base_units"], "25");
         assert_eq!(payload["expected_cost_token_a_base_units"], "1000");
         assert_eq!(payload["expected_proceeds_token_a_base_units"], "1030");
+        assert_eq!(payload["depth_source"], "recent_full_depth");
+        assert_eq!(payload["depth_age_ms"], 635);
+        assert_eq!(payload["depth_update_delta"], 5);
+        assert_eq!(payload["top_matches"], false);
+        assert_eq!(payload["top_mismatch_reason"], "bid_quantity_mismatch");
         assert_eq!(payload["expected_profit_bps_x100"], "30000");
         assert_eq!(payload["expected_recovery_loss_token_a_base_units"], "10");
         assert_eq!(payload["expected_gas_cost_token_a_base_units"], "1");

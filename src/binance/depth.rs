@@ -95,6 +95,52 @@ impl SpotDepthBook {
                 .is_some_and(|ask| ask.price == ask_price && ask.quantity == ask_quantity)
     }
 
+    pub fn from_top(
+        symbol: String,
+        update_id: u64,
+        bid_price: Decimal,
+        bid_quantity: Decimal,
+        ask_price: Decimal,
+        ask_quantity: Decimal,
+    ) -> anyhow::Result<Self> {
+        Self::from_snapshot(
+            symbol,
+            DepthSnapshot {
+                last_update_id: update_id,
+                bids: vec![DepthLevel {
+                    price: bid_price,
+                    quantity: bid_quantity,
+                }],
+                asks: vec![DepthLevel {
+                    price: ask_price,
+                    quantity: ask_quantity,
+                }],
+            },
+        )
+    }
+
+    /// Replaces the possibly stale top of a recent sequence-consistent book
+    /// with the current bookTicker top. Better stale levels are removed while
+    /// deeper levels are retained, so recovery quotes never assume liquidity
+    /// ahead of the observed top.
+    pub fn reconciled_with_top(
+        &self,
+        update_id: u64,
+        bid_price: Decimal,
+        bid_quantity: Decimal,
+        ask_price: Decimal,
+        ask_quantity: Decimal,
+    ) -> anyhow::Result<Self> {
+        let mut book = self.clone();
+        book.bids.retain(|price, _| *price <= bid_price);
+        book.asks.retain(|price, _| *price >= ask_price);
+        book.bids.insert(bid_price, bid_quantity);
+        book.asks.insert(ask_price, ask_quantity);
+        book.last_update_id = update_id;
+        book.validate_top()?;
+        Ok(book)
+    }
+
     pub fn best_bid(&self) -> Option<DepthLevel> {
         self.bids
             .last_key_value()
@@ -323,6 +369,8 @@ struct WireDepthUpdate<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use rust_decimal::Decimal;
 
     use super::{DepthApplyResult, SpotDepthBook, parse_depth_snapshot, parse_depth_update};
@@ -336,6 +384,91 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn recent_depth_reconciliation_replaces_the_top_and_keeps_deeper_levels() {
+        let book = snapshot();
+        let reconciled = book
+            .reconciled_with_top(
+                12,
+                Decimal::from_str("1.00").unwrap(),
+                Decimal::ONE,
+                Decimal::from_str("1.01").unwrap(),
+                Decimal::ONE,
+            )
+            .unwrap();
+
+        assert!(reconciled.matches_top(
+            "WLDUSDC",
+            12,
+            Decimal::from_str("1.00").unwrap(),
+            Decimal::ONE,
+            Decimal::from_str("1.01").unwrap(),
+            Decimal::ONE,
+        ));
+        assert_eq!(
+            reconciled
+                .quote_market_sell(Decimal::from(3))
+                .unwrap()
+                .unwrap()
+                .worst_price,
+            Decimal::from_str("0.99").unwrap()
+        );
+        assert_eq!(
+            reconciled
+                .quote_market_buy(Decimal::from(4))
+                .unwrap()
+                .unwrap()
+                .worst_price,
+            Decimal::from_str("1.02").unwrap()
+        );
+    }
+
+    #[test]
+    fn recent_depth_reconciliation_removes_levels_better_than_the_current_top() {
+        let book = SpotDepthBook::from_snapshot(
+            "WLDUSDC".to_owned(),
+            parse_depth_snapshot(
+                br#"{"lastUpdateId":100,"bids":[["1.00","9"],["0.99","5"],["0.98","6"]],"asks":[["1.01","9"],["1.02","5"],["1.03","6"]]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let reconciled = book
+            .reconciled_with_top(
+                102,
+                Decimal::from_str("0.99").unwrap(),
+                Decimal::ONE,
+                Decimal::from_str("1.02").unwrap(),
+                Decimal::ONE,
+            )
+            .unwrap();
+
+        assert_eq!(
+            reconciled.best_bid().unwrap().price,
+            Decimal::from_str("0.99").unwrap()
+        );
+        assert_eq!(
+            reconciled.best_ask().unwrap().price,
+            Decimal::from_str("1.02").unwrap()
+        );
+        assert_eq!(
+            reconciled
+                .quote_market_sell(Decimal::from(2))
+                .unwrap()
+                .unwrap()
+                .worst_price,
+            Decimal::from_str("0.98").unwrap()
+        );
+        assert_eq!(
+            reconciled
+                .quote_market_buy(Decimal::from(2))
+                .unwrap()
+                .unwrap()
+                .worst_price,
+            Decimal::from_str("1.03").unwrap()
+        );
     }
 
     #[test]

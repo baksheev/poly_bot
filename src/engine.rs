@@ -59,7 +59,7 @@ pub struct TradingEngine {
     binance_orders: BTreeMap<String, ExecutionReportEvent>,
     last_sequence_matched_quote_update: BTreeMap<String, u64>,
     latest_sequence_matched_depth: BTreeMap<String, SpotDepthBook>,
-    pending_depth_fallback: BTreeMap<String, u64>,
+    depth_health_by_symbol: BTreeMap<String, DepthHealthObservation>,
     gas_price_symbol: String,
     wallet_gas_symbol: String,
     gas_price_connected: bool,
@@ -73,6 +73,7 @@ pub struct TradingEngine {
     rebalance_blocked: bool,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
+    last_depth_health_log_at: Option<Instant>,
     last_inventory_blocked_alert_at: Option<Instant>,
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
@@ -91,6 +92,7 @@ pub struct BinanceFeeBps {
 }
 
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const DEPTH_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 const ADAPTIVE_OPTIMIZER_VERSION: &str = "exhaustive_whole_step_v1";
@@ -112,6 +114,55 @@ enum AdmissionLiquidity<'a> {
     FullDepth(&'a SpotDepthBook),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdaptiveDepthSource {
+    SequenceMatchedFullDepth,
+    RecentFullDepth,
+    TopOfBookOnly,
+}
+
+impl AdaptiveDepthSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SequenceMatchedFullDepth => "sequence_matched_full_depth",
+            Self::RecentFullDepth => "recent_full_depth",
+            Self::TopOfBookOnly => "top_of_book_only",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DepthObservation {
+    age_ms: Option<u64>,
+    update_delta: Option<u64>,
+    top_matches: bool,
+    top_mismatch_reason: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DepthHealthObservation {
+    source: AdaptiveDepthSource,
+    source_reason: &'static str,
+    age_ms: Option<u64>,
+    update_delta: Option<u64>,
+    top_matches: bool,
+    top_mismatch_reason: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct AdaptiveDepthSelection {
+    book: SpotDepthBook,
+    health: DepthHealthObservation,
+    max_trade_notional: U256,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdmissionRuntimeContext {
+    network_gas_price_wei: u128,
+    native_price_token_a: Decimal,
+    wallet_native_balance_wei: U256,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AdaptiveSizingRuntimeLimits {
     max_trade_notional: U256,
@@ -119,6 +170,9 @@ struct AdaptiveSizingRuntimeLimits {
     max_recovery_loss: U256,
     min_expected_profit: U256,
     min_incremental_expected_profit: U256,
+    recent_full_depth_max_age_ms: u64,
+    recent_full_depth_max_update_delta: u64,
+    top_of_book_max_trade_notional: U256,
 }
 
 impl AdaptiveSizingRuntimeLimits {
@@ -138,6 +192,16 @@ impl AdaptiveSizingRuntimeLimits {
             min_incremental_expected_profit: parse(
                 limits.min_incremental_expected_profit,
                 "incremental-profit floor",
+            )?,
+            recent_full_depth_max_age_ms: limits.depth_policy.recent_full_depth_max_age_ms,
+            recent_full_depth_max_update_delta: limits
+                .depth_policy
+                .recent_full_depth_max_update_delta,
+            top_of_book_max_trade_notional: parse(
+                &limits
+                    .depth_policy
+                    .top_of_book_max_trade_notional_token_a_base_units,
+                "top-of-book trade cap",
             )?,
         }))
     }
@@ -365,11 +429,17 @@ impl TradingEngine {
         }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
+        let require_binance_depth =
+            requires_depth_for_runtime_phase(config.arbitrage_execution_mode.as_str());
         Ok((
             Self {
                 config,
                 domain_config,
-                state: RuntimeState::new_with_depth(symbols),
+                state: if require_binance_depth {
+                    RuntimeState::new_with_depth(symbols)
+                } else {
+                    RuntimeState::new(symbols)
+                },
                 dex,
                 opportunities,
                 rebalance,
@@ -383,7 +453,7 @@ impl TradingEngine {
                 binance_orders: BTreeMap::new(),
                 last_sequence_matched_quote_update: BTreeMap::new(),
                 latest_sequence_matched_depth: BTreeMap::new(),
-                pending_depth_fallback: BTreeMap::new(),
+                depth_health_by_symbol: BTreeMap::new(),
                 gas_price_symbol,
                 wallet_gas_symbol,
                 gas_price_connected: false,
@@ -397,6 +467,7 @@ impl TradingEngine {
                 rebalance_blocked: false,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
+                last_depth_health_log_at: None,
                 last_inventory_blocked_alert_at: None,
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
@@ -659,13 +730,15 @@ impl TradingEngine {
                 .collect();
             for quote in books {
                 let depth = self.matching_cached_depth(&quote).cloned();
-                let admission = if self.uses_dex_first_fast_path() {
-                    Some(AdmissionLiquidity::DexFirstTop)
+                let (admission, adaptive_depth) = if self.uses_dex_first_fast_path() {
+                    (Some(AdmissionLiquidity::DexFirstTop), depth.as_ref())
                 } else {
-                    depth.as_ref().map(AdmissionLiquidity::FullDepth)
+                    (
+                        depth.as_ref().map(AdmissionLiquidity::FullDepth),
+                        depth.as_ref(),
+                    )
                 };
-                let needs_depth = self.evaluate_ready_quote(&quote, "dex_prepared", admission)?;
-                self.update_depth_fallback(&quote, needs_depth);
+                self.evaluate_ready_quote(&quote, "dex_prepared", admission, adaptive_depth)?;
             }
         }
         Ok(())
@@ -686,7 +759,7 @@ impl TradingEngine {
                 self.last_sequence_matched_quote_update
                     .remove(symbol.as_ref());
                 self.latest_sequence_matched_depth.remove(symbol.as_ref());
-                self.pending_depth_fallback.remove(symbol.as_ref());
+                self.depth_health_by_symbol.remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_connected",
                     json!({
@@ -706,7 +779,7 @@ impl TradingEngine {
             } => {
                 self.state.on_disconnected(&symbol, generation);
                 self.latest_sequence_matched_depth.remove(symbol.as_ref());
-                self.pending_depth_fallback.remove(symbol.as_ref());
+                self.depth_health_by_symbol.remove(symbol.as_ref());
                 self.telemetry.emit(
                     "binance_feed_disconnected",
                     json!({
@@ -720,17 +793,7 @@ impl TradingEngine {
                 );
             }
             MarketEvent::BinanceTopOfBook(quote) => {
-                let matching_depth = depth.filter(|depth| {
-                    depth.matches_top(
-                        quote.symbol.as_ref(),
-                        quote.update_id,
-                        quote.bid_price,
-                        quote.bid_quantity,
-                        quote.ask_price,
-                        quote.ask_quantity,
-                    )
-                });
-                self.on_binance_quote(quote, matching_depth)?;
+                self.on_binance_quote(quote, depth)?;
             }
             MarketEvent::BinanceDepthApplied {
                 symbol,
@@ -775,17 +838,7 @@ impl TradingEngine {
                 {
                     self.latest_sequence_matched_depth
                         .insert(symbol.to_string(), depth.clone());
-                    if self.uses_dex_first_fast_path() {
-                        let waiting_for = self.pending_depth_fallback.get(symbol.as_ref()).copied();
-                        if waiting_for == Some(quote.update_id) {
-                            self.pending_depth_fallback.remove(symbol.as_ref());
-                            self.evaluate_sequence_matched_quote(
-                                &quote,
-                                "binance_depth_fallback",
-                                depth,
-                            )?;
-                        }
-                    } else {
+                    if !self.uses_dex_first_fast_path() {
                         self.evaluate_sequence_matched_quote(&quote, "binance_depth", depth)?;
                     }
                 }
@@ -1286,24 +1339,34 @@ impl TradingEngine {
     fn on_binance_quote(
         &mut self,
         quote: TopOfBook,
-        matching_depth: Option<&SpotDepthBook>,
+        depth: Option<&SpotDepthBook>,
     ) -> anyhow::Result<()> {
         let result = self.state.apply_quote(quote.clone());
         match result {
             QuoteApplyResult::Accepted => {
                 self.entry_preflight.update_quote(&quote);
+                self.record_depth_health(&quote, depth, Instant::now())?;
                 // The decision is evaluated only after all readiness inputs are
                 // fresh. The calculation itself performs no RPC, I/O, or locks.
                 self.refresh_phase(Instant::now());
                 if self.state.phase == RuntimePhase::Ready {
                     if self.uses_dex_first_fast_path() {
-                        let needs_depth = self.evaluate_ready_quote(
+                        self.evaluate_ready_quote(
                             &quote,
                             "binance_book_ticker",
                             Some(AdmissionLiquidity::DexFirstTop),
+                            depth,
                         )?;
-                        self.update_depth_fallback(&quote, needs_depth);
-                    } else if let Some(depth) = matching_depth {
+                    } else if let Some(depth) = depth.filter(|depth| {
+                        depth.matches_top(
+                            quote.symbol.as_ref(),
+                            quote.update_id,
+                            quote.bid_price,
+                            quote.bid_quantity,
+                            quote.ask_price,
+                            quote.ask_quantity,
+                        )
+                    }) {
                         self.evaluate_sequence_matched_quote(&quote, "binance_book_ticker", depth)?;
                     } else {
                         self.telemetry.emit(
@@ -1352,7 +1415,12 @@ impl TradingEngine {
         ) {
             return Ok(());
         }
-        self.evaluate_ready_quote(quote, trigger, Some(AdmissionLiquidity::FullDepth(depth)))?;
+        self.evaluate_ready_quote(
+            quote,
+            trigger,
+            Some(AdmissionLiquidity::FullDepth(depth)),
+            Some(depth),
+        )?;
         Ok(())
     }
 
@@ -1376,7 +1444,8 @@ impl TradingEngine {
         quote: &TopOfBook,
         trigger: &'static str,
         admission: Option<AdmissionLiquidity<'_>>,
-    ) -> anyhow::Result<bool> {
+        adaptive_depth: Option<&SpotDepthBook>,
+    ) -> anyhow::Result<()> {
         let calculation_started = Instant::now();
         if let Some(evaluation) = self.opportunities.evaluate(quote)? {
             self.hot_telemetry.emit_evaluation(
@@ -1387,10 +1456,10 @@ impl TradingEngine {
                 trigger,
             );
             if let Some(admission) = admission {
-                return self.submit_paper_opportunity(quote, evaluation, admission);
+                self.submit_paper_opportunity(quote, evaluation, admission, adaptive_depth)?;
             }
         }
-        Ok(false)
+        Ok(())
     }
 
     fn uses_dex_first_fast_path(&self) -> bool {
@@ -1400,23 +1469,115 @@ impl TradingEngine {
         )
     }
 
-    fn update_depth_fallback(&mut self, quote: &TopOfBook, needs_depth: bool) {
-        if needs_depth {
-            self.pending_depth_fallback
-                .insert(quote.symbol.as_ref().to_owned(), quote.update_id);
-        } else {
-            self.pending_depth_fallback.remove(quote.symbol.as_ref());
+    fn record_depth_health(
+        &mut self,
+        quote: &TopOfBook,
+        depth: Option<&SpotDepthBook>,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        let pair_config = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.binance.symbol == quote.symbol.as_ref())
+            .context("depth health symbol is absent from domain config")?;
+        let limits = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)?;
+        let observation = self.depth_observation(quote, depth, now);
+        let health = classify_depth_health(observation, depth.is_some(), limits);
+        self.depth_health_by_symbol
+            .insert(quote.symbol.to_string(), health);
+        Ok(())
+    }
+
+    fn depth_observation(
+        &self,
+        quote: &TopOfBook,
+        depth: Option<&SpotDepthBook>,
+        now: Instant,
+    ) -> DepthObservation {
+        let feed = self.state.binance_feeds.get(quote.symbol.as_ref());
+        let age_ms = depth.and_then(|depth| {
+            feed.and_then(|feed| {
+                (feed.depth_update_id == Some(depth.last_update_id()))
+                    .then_some(feed.depth_received_at)
+                    .flatten()
+            })
+            .map(|received_at| {
+                u64::try_from(now.saturating_duration_since(received_at).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+        });
+        let update_delta = depth.map(|depth| quote.update_id.abs_diff(depth.last_update_id()));
+        let top_mismatch_reason = depth_top_mismatch_reason(quote, depth);
+        DepthObservation {
+            age_ms,
+            update_delta,
+            top_matches: top_mismatch_reason.is_none(),
+            top_mismatch_reason,
         }
+    }
+
+    fn select_adaptive_depth(
+        &self,
+        quote: &TopOfBook,
+        depth: Option<&SpotDepthBook>,
+        limits: AdaptiveSizingRuntimeLimits,
+        baseline_token_a: U256,
+        now: Instant,
+    ) -> anyhow::Result<AdaptiveDepthSelection> {
+        let observation = self.depth_observation(quote, depth, now);
+        let health = classify_depth_health(observation, depth.is_some(), Some(limits));
+        let (book, max_trade_notional) = match health.source {
+            AdaptiveDepthSource::SequenceMatchedFullDepth => (
+                depth.context("sequence-matched depth disappeared")?.clone(),
+                limits.max_trade_notional,
+            ),
+            AdaptiveDepthSource::RecentFullDepth => (
+                depth
+                    .context("recent full depth disappeared")?
+                    .reconciled_with_top(
+                        quote.update_id,
+                        quote.bid_price,
+                        quote.bid_quantity,
+                        quote.ask_price,
+                        quote.ask_quantity,
+                    )?,
+                limits.max_trade_notional,
+            ),
+            AdaptiveDepthSource::TopOfBookOnly => {
+                let configured_cap = if limits.top_of_book_max_trade_notional.is_zero() {
+                    baseline_token_a
+                } else {
+                    limits.top_of_book_max_trade_notional
+                };
+                (
+                    SpotDepthBook::from_top(
+                        quote.symbol.to_string(),
+                        quote.update_id,
+                        quote.bid_price,
+                        quote.bid_quantity,
+                        quote.ask_price,
+                        quote.ask_quantity,
+                    )?,
+                    configured_cap.min(limits.max_trade_notional),
+                )
+            }
+        };
+        Ok(AdaptiveDepthSelection {
+            book,
+            health,
+            max_trade_notional,
+        })
     }
 
     fn evaluate_adaptive_sizing(
         &self,
         quote: &TopOfBook,
-        depth: &SpotDepthBook,
+        selection: &AdaptiveDepthSelection,
         evaluation: PairEvaluation,
-        network_gas_price_wei: u128,
-        native_price_token_a: Decimal,
-        wallet_native_balance_wei: U256,
+        mut limits: AdaptiveSizingRuntimeLimits,
+        admission_context: AdmissionRuntimeContext,
     ) -> anyhow::Result<Option<AdaptiveCandidate>> {
         let started = Instant::now();
         let pair = self.opportunities.pair(evaluation.pair_index)?;
@@ -1427,9 +1588,8 @@ impl TradingEngine {
             .iter()
             .find(|config| config.id == pair.pair_id)
             .context("adaptive sizing pair is absent from domain config")?;
-        let Some(limits) = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)? else {
-            return Ok(None);
-        };
+        limits.max_trade_notional = selection.max_trade_notional;
+        let depth = &selection.book;
         let directions = [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell];
         let mut baseline_by_direction: [Option<AdaptiveCandidate>; 2] = [None, None];
         let mut winner: Option<AdaptiveCandidate> = None;
@@ -1456,9 +1616,9 @@ impl TradingEngine {
                 expected_cost_token_a: baseline_trade.cost_token_a,
                 expected_proceeds_token_a: baseline_trade.proceeds_token_a,
                 opportunity_threshold_met: baseline_trade.meets_threshold,
-                network_gas_price_wei,
-                native_price_token_a,
-                wallet_native_balance_wei,
+                network_gas_price_wei: admission_context.network_gas_price_wei,
+                native_price_token_a: admission_context.native_price_token_a,
+                wallet_native_balance_wei: admission_context.wallet_native_balance_wei,
             };
             if let Some(economics) = evaluate_admission(depth, baseline_inputs)? {
                 baseline_by_direction[direction_index] = Some(AdaptiveCandidate {
@@ -1490,9 +1650,9 @@ impl TradingEngine {
                     baseline_trade.token_b_amount,
                     direction_evaluation.cex_top_token_b_amount,
                     limits,
-                    network_gas_price_wei,
-                    native_price_token_a,
-                    wallet_native_balance_wei,
+                    admission_context.network_gas_price_wei,
+                    admission_context.native_price_token_a,
+                    admission_context.wallet_native_balance_wei,
                 )?;
                 exact_evaluations = exact_evaluations.saturating_add(search.exact_evaluations);
                 limit_exhausted |= search.limit_exhausted;
@@ -1559,49 +1719,84 @@ impl TradingEngine {
             .map(|(reason, count)| (reason.to_owned(), Value::from(count)))
             .collect::<serde_json::Map<_, _>>();
         let calculation_us = started.elapsed().as_micros();
-        self.telemetry.emit(
-            "arbitrage_adaptive_sizing_evaluated",
-            json!({
-                "engine_id": self.config.engine_id,
-                "pair_id": pair.pair_id,
-                "symbol": quote.symbol.as_ref(),
-                "update_id": quote.update_id,
-                "configured_mode": pair_config.adaptive_sizing.mode(),
-                "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
-                "search_mode": "exhaustive_whole_step",
-                "max_exact_evaluations_per_pool": MAX_ADAPTIVE_EXACT_EVALUATIONS,
-                "exact_evaluation_count": exact_evaluations,
-                "max_trade_notional_token_a_base_units": limits.max_trade_notional.to_string(),
-                "max_unhedged_notional_token_a_base_units": limits.max_unhedged_notional.to_string(),
-                "max_recovery_loss_token_a_base_units": limits.max_recovery_loss.to_string(),
-                "min_expected_profit_token_a_base_units": limits.min_expected_profit.to_string(),
-                "min_incremental_expected_profit_token_a_base_units": limits.min_incremental_expected_profit.to_string(),
-                "baseline_direction": baseline.map(|candidate| candidate.direction.as_str()),
-                "baseline_pool_index": baseline.map(|candidate| candidate.trade.pool_index),
-                "baseline_token_b_base_units": baseline.map(|candidate| candidate.trade.token_b_amount.to_string()),
-                "baseline_cost_token_a_base_units": baseline.map(|candidate| candidate.trade.cost_token_a.to_string()),
-                "baseline_proceeds_token_a_base_units": baseline.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
-                "baseline_expected_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
-                "baseline_bounded_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
-                "selected_sizing_mode": if selected.is_some() { "adaptive" } else { "baseline" },
-                "selected_direction": selected_for_telemetry.map(|candidate| candidate.direction.as_str()),
-                "selected_pool_index": selected_for_telemetry.map(|candidate| candidate.trade.pool_index),
-                "selected_token_b_base_units": selected_for_telemetry.map(|candidate| candidate.trade.token_b_amount.to_string()),
-                "selected_cost_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.cost_token_a.to_string()),
-                "selected_proceeds_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
-                "selected_expected_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
-                "selected_bounded_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
-                "selected_trade_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade_notional.to_string()),
-                "selected_unhedged_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.unhedged_notional.to_string()),
-                "selected_recovery_loss_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
-                "selected_reservation_fits": selected_for_telemetry.map(|candidate| candidate.reservation_fits),
-                "fallback_reason": selected.is_none().then_some(fallback_reason),
-                "rejection_counts": Value::Object(rejection_counts),
-                "calculation_us": calculation_us,
-                "execution_size_changed": execution_candidate.is_some(),
-                "admission_liquidity_source": "sequence_matched_full_depth",
-            }),
+        let mut payload = json!({
+            "engine_id": self.config.engine_id,
+            "pair_id": pair.pair_id,
+            "symbol": quote.symbol.as_ref(),
+            "update_id": quote.update_id,
+            "configured_mode": pair_config.adaptive_sizing.mode(),
+            "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+            "search_mode": "exhaustive_whole_step",
+            "max_exact_evaluations_per_pool": MAX_ADAPTIVE_EXACT_EVALUATIONS,
+            "exact_evaluation_count": exact_evaluations,
+            "max_trade_notional_token_a_base_units": limits.max_trade_notional.to_string(),
+            "max_unhedged_notional_token_a_base_units": limits.max_unhedged_notional.to_string(),
+            "max_recovery_loss_token_a_base_units": limits.max_recovery_loss.to_string(),
+            "min_expected_profit_token_a_base_units": limits.min_expected_profit.to_string(),
+            "min_incremental_expected_profit_token_a_base_units": limits.min_incremental_expected_profit.to_string(),
+            "baseline_direction": baseline.map(|candidate| candidate.direction.as_str()),
+            "baseline_pool_index": baseline.map(|candidate| candidate.trade.pool_index),
+            "baseline_token_b_base_units": baseline.map(|candidate| candidate.trade.token_b_amount.to_string()),
+            "baseline_cost_token_a_base_units": baseline.map(|candidate| candidate.trade.cost_token_a.to_string()),
+            "baseline_proceeds_token_a_base_units": baseline.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
+            "baseline_expected_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
+            "baseline_bounded_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
+            "selected_sizing_mode": if selected.is_some() { "adaptive" } else { "baseline" },
+            "selected_direction": selected_for_telemetry.map(|candidate| candidate.direction.as_str()),
+            "selected_pool_index": selected_for_telemetry.map(|candidate| candidate.trade.pool_index),
+            "selected_token_b_base_units": selected_for_telemetry.map(|candidate| candidate.trade.token_b_amount.to_string()),
+            "selected_cost_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.cost_token_a.to_string()),
+            "selected_proceeds_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
+            "selected_expected_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
+            "selected_bounded_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
+            "selected_trade_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade_notional.to_string()),
+            "selected_unhedged_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.unhedged_notional.to_string()),
+            "selected_recovery_loss_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
+            "selected_reservation_fits": selected_for_telemetry.map(|candidate| candidate.reservation_fits),
+            "fallback_reason": selected.is_none().then_some(fallback_reason),
+            "rejection_counts": Value::Object(rejection_counts),
+            "calculation_us": calculation_us,
+            "execution_size_changed": execution_candidate.is_some(),
+        });
+        let object = payload
+            .as_object_mut()
+            .expect("adaptive sizing telemetry payload is an object");
+        object.insert(
+            "configured_max_trade_notional_token_a_base_units".to_owned(),
+            json!(
+                pair_config
+                    .adaptive_sizing
+                    .limits()
+                    .map(|limits| limits.max_trade_notional)
+            ),
         );
+        object.insert(
+            "admission_liquidity_source".to_owned(),
+            json!(selection.health.source.as_str()),
+        );
+        object.insert(
+            "depth_source".to_owned(),
+            json!(selection.health.source.as_str()),
+        );
+        object.insert(
+            "depth_source_reason".to_owned(),
+            json!(selection.health.source_reason),
+        );
+        object.insert("depth_age_ms".to_owned(), json!(selection.health.age_ms));
+        object.insert(
+            "depth_update_delta".to_owned(),
+            json!(selection.health.update_delta),
+        );
+        object.insert(
+            "top_matches".to_owned(),
+            Value::Bool(selection.health.top_matches),
+        );
+        object.insert(
+            "top_mismatch_reason".to_owned(),
+            json!(selection.health.top_mismatch_reason),
+        );
+        self.telemetry
+            .emit("arbitrage_adaptive_sizing_evaluated", payload);
         Ok(execution_candidate)
     }
 
@@ -1862,6 +2057,7 @@ impl TradingEngine {
         quote: &TopOfBook,
         evaluation: PairEvaluation,
         admission_liquidity: AdmissionLiquidity<'_>,
+        depth: Option<&SpotDepthBook>,
     ) -> anyhow::Result<bool> {
         let Some(handle) = self.paper_trades.clone() else {
             return Ok(false);
@@ -1876,26 +2072,17 @@ impl TradingEngine {
             .iter()
             .find(|config| config.id == pair_id)
             .context("paper opportunity pair is absent from domain config")?;
-        let adaptive_execution = matches!(
-            pair_config.adaptive_sizing,
-            AdaptiveSizingConfig::Adaptive { .. }
-        );
         let adaptive_limits = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)?;
-        if adaptive_execution && matches!(admission_liquidity, AdmissionLiquidity::DexFirstTop) {
-            self.telemetry.emit(
-                "arbitrage_adaptive_sizing_evaluated",
-                json!({
-                    "engine_id": self.config.engine_id,
-                    "pair_id": pair_id,
-                    "symbol": quote.symbol.as_ref(),
-                    "update_id": quote.update_id,
-                    "configured_mode": pair_config.adaptive_sizing.mode(),
-                    "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
-                    "selected_sizing_mode": "baseline",
-                    "fallback_reason": "sequence_matched_full_depth_unavailable",
-                    "execution_size_changed": false,
-                }),
-            );
+        if !evaluation
+            .dex_buy_cex_sell
+            .baseline
+            .is_some_and(|trade| trade.meets_threshold)
+            && !evaluation
+                .cex_buy_dex_sell
+                .baseline
+                .is_some_and(|trade| trade.meets_threshold)
+        {
+            return Ok(false);
         }
         let token_a_decimals = pair.token_a_decimals;
         let token_b_decimals = pair.token_b_decimals;
@@ -1915,14 +2102,24 @@ impl TradingEngine {
             .native_price_token_a()
             .context("admission has no native-token price")?;
 
-        let adaptive_candidate = if let AdmissionLiquidity::FullDepth(depth) = admission_liquidity {
+        let adaptive_selection = adaptive_limits
+            .map(|limits| {
+                self.select_adaptive_depth(quote, depth, limits, baseline_token_a, Instant::now())
+            })
+            .transpose()?;
+        let adaptive_candidate = if let (Some(selection), Some(limits)) =
+            (adaptive_selection.as_ref(), adaptive_limits)
+        {
             match self.evaluate_adaptive_sizing(
                 quote,
-                depth,
+                selection,
                 evaluation,
-                network_gas_price_wei,
-                native_price_token_a,
-                wallet_native_balance_wei,
+                limits,
+                AdmissionRuntimeContext {
+                    network_gas_price_wei,
+                    native_price_token_a,
+                    wallet_native_balance_wei,
+                },
             ) {
                 Ok(candidate) => candidate,
                 Err(error) => {
@@ -1938,6 +2135,12 @@ impl TradingEngine {
                             "fallback_reason": "optimizer_error",
                             "error": format!("{error:#}"),
                             "execution_size_changed": false,
+                            "depth_source": selection.health.source.as_str(),
+                            "depth_source_reason": selection.health.source_reason,
+                            "depth_age_ms": selection.health.age_ms,
+                            "depth_update_delta": selection.health.update_delta,
+                            "top_matches": selection.health.top_matches,
+                            "top_mismatch_reason": selection.health.top_mismatch_reason,
                         }),
                     );
                     None
@@ -1947,6 +2150,28 @@ impl TradingEngine {
             None
         };
 
+        let observed_depth_health = adaptive_selection
+            .as_ref()
+            .map(|selection| selection.health)
+            .unwrap_or_else(|| {
+                classify_depth_health(
+                    self.depth_observation(quote, depth, Instant::now()),
+                    depth.is_some(),
+                    adaptive_limits,
+                )
+            });
+        let execution_depth_health = if adaptive_candidate.is_some() {
+            observed_depth_health
+        } else if matches!(admission_liquidity, AdmissionLiquidity::DexFirstTop) {
+            DepthHealthObservation {
+                source: AdaptiveDepthSource::TopOfBookOnly,
+                source_reason: "baseline_dex_first_fast_path",
+                ..observed_depth_health
+            }
+        } else {
+            observed_depth_health
+        };
+
         let mut candidates = Vec::with_capacity(2);
         let mut needs_depth_fallback = false;
         if let Some(candidate) = adaptive_candidate {
@@ -1954,7 +2179,10 @@ impl TradingEngine {
                 adaptive_trade_direction(candidate.direction),
                 candidate.trade,
                 candidate.economics,
-                "sequence_matched_full_depth_adaptive",
+                adaptive_selection
+                    .as_ref()
+                    .map(|selection| selection.health.source.as_str())
+                    .unwrap_or("top_of_book_only"),
             ));
         }
         for direction in adaptive_candidate
@@ -2154,6 +2382,13 @@ impl TradingEngine {
             )?,
             admission: AdmissionRiskBounds {
                 opportunity_threshold_met: economics.meets_threshold,
+                depth_source: Some(execution_depth_health.source.as_str().to_owned()),
+                depth_age_ms: execution_depth_health.age_ms,
+                depth_update_delta: execution_depth_health.update_delta,
+                top_matches: Some(execution_depth_health.top_matches),
+                top_mismatch_reason: execution_depth_health
+                    .top_mismatch_reason
+                    .map(str::to_owned),
                 execution_slippage_bps: trade.execution_slippage_bps,
                 cex_primary_limit_price: match direction {
                     TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
@@ -2323,6 +2558,12 @@ impl TradingEngine {
                 "mode": self.config.arbitrage_execution_mode,
                 "admission_liquidity_source": liquidity_source,
                 "sizing_mode": if adaptive_candidate.is_some() { "adaptive" } else { "baseline" },
+                "depth_source": execution_depth_health.source.as_str(),
+                "depth_source_reason": execution_depth_health.source_reason,
+                "depth_age_ms": execution_depth_health.age_ms,
+                "depth_update_delta": execution_depth_health.update_delta,
+                "top_matches": execution_depth_health.top_matches,
+                "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
                 "inventory_reservation_policy": "exact_execution_envelope_v1",
                 "inventory_claims": self.inventory_claim_details(&claims),
                 "execution_slippage_bps": trade.execution_slippage_bps,
@@ -2568,7 +2809,62 @@ impl TradingEngine {
     pub fn refresh_health(&mut self) {
         let now = Instant::now();
         self.refresh_phase(now);
+        self.log_depth_health(now);
         self.log_rebalance_health(now);
+    }
+
+    fn log_depth_health(&mut self, now: Instant) {
+        if self
+            .last_depth_health_log_at
+            .is_some_and(|last| now.saturating_duration_since(last) < DEPTH_HEALTH_LOG_INTERVAL)
+        {
+            return;
+        }
+
+        for (symbol, health) in &self.depth_health_by_symbol {
+            let healthy = !matches!(health.source, AdaptiveDepthSource::TopOfBookOnly);
+            if healthy {
+                tracing::info!(
+                    healthy,
+                    symbol,
+                    depth_source = health.source.as_str(),
+                    depth_source_reason = health.source_reason,
+                    depth_age_ms = health.age_ms,
+                    depth_update_delta = health.update_delta,
+                    top_matches = health.top_matches,
+                    top_mismatch_reason = health.top_mismatch_reason,
+                    "Binance depth health heartbeat"
+                );
+            } else {
+                tracing::warn!(
+                    healthy,
+                    symbol,
+                    depth_source = health.source.as_str(),
+                    depth_source_reason = health.source_reason,
+                    depth_age_ms = health.age_ms,
+                    depth_update_delta = health.update_delta,
+                    top_matches = health.top_matches,
+                    top_mismatch_reason = health.top_mismatch_reason,
+                    "Binance depth health heartbeat"
+                );
+            }
+            self.telemetry.emit(
+                "binance_depth_health",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "symbol": symbol,
+                    "healthy": healthy,
+                    "runtime_phase": self.state.phase,
+                    "depth_source": health.source.as_str(),
+                    "depth_source_reason": health.source_reason,
+                    "depth_age_ms": health.age_ms,
+                    "depth_update_delta": health.update_delta,
+                    "top_matches": health.top_matches,
+                    "top_mismatch_reason": health.top_mismatch_reason,
+                }),
+            );
+        }
+        self.last_depth_health_log_at = Some(now);
     }
 
     fn log_rebalance_health(&mut self, now: Instant) {
@@ -2684,6 +2980,98 @@ impl TradingEngine {
     }
 }
 
+fn requires_depth_for_runtime_phase(arbitrage_execution_mode: &str) -> bool {
+    matches!(arbitrage_execution_mode, "paper_concurrent_hedged")
+}
+
+fn classify_depth_health(
+    observation: DepthObservation,
+    depth_available: bool,
+    limits: Option<AdaptiveSizingRuntimeLimits>,
+) -> DepthHealthObservation {
+    let recent_caps = limits.and_then(|limits| {
+        (limits.recent_full_depth_max_age_ms > 0 && limits.recent_full_depth_max_update_delta > 0)
+            .then_some((
+                limits.recent_full_depth_max_age_ms,
+                limits.recent_full_depth_max_update_delta,
+            ))
+    });
+    let (source, source_reason) = if observation.top_matches {
+        (
+            AdaptiveDepthSource::SequenceMatchedFullDepth,
+            "exact_top_match",
+        )
+    } else if !depth_available {
+        (AdaptiveDepthSource::TopOfBookOnly, "depth_unavailable")
+    } else if recent_caps.is_none() {
+        (
+            AdaptiveDepthSource::TopOfBookOnly,
+            "recent_full_depth_disabled",
+        )
+    } else if observation.age_ms.is_none() {
+        (AdaptiveDepthSource::TopOfBookOnly, "depth_age_unknown")
+    } else if observation.age_ms > recent_caps.map(|(max_age_ms, _)| max_age_ms) {
+        (AdaptiveDepthSource::TopOfBookOnly, "depth_age_cap_exceeded")
+    } else if observation.update_delta.is_none() {
+        (
+            AdaptiveDepthSource::TopOfBookOnly,
+            "depth_update_delta_unknown",
+        )
+    } else if observation.update_delta > recent_caps.map(|(_, max_update_delta)| max_update_delta) {
+        (
+            AdaptiveDepthSource::TopOfBookOnly,
+            "depth_update_delta_cap_exceeded",
+        )
+    } else {
+        (
+            AdaptiveDepthSource::RecentFullDepth,
+            "within_recent_depth_caps",
+        )
+    };
+    DepthHealthObservation {
+        source,
+        source_reason,
+        age_ms: observation.age_ms,
+        update_delta: observation.update_delta,
+        top_matches: observation.top_matches,
+        top_mismatch_reason: observation.top_mismatch_reason,
+    }
+}
+
+fn depth_top_mismatch_reason(
+    quote: &TopOfBook,
+    depth: Option<&SpotDepthBook>,
+) -> Option<&'static str> {
+    let Some(depth) = depth else {
+        return Some("depth_unavailable");
+    };
+    if depth.symbol() != quote.symbol.as_ref() {
+        return Some("symbol_mismatch");
+    }
+    if depth.last_update_id() < quote.update_id {
+        return Some("depth_update_behind_book_ticker");
+    }
+    let Some(bid) = depth.best_bid() else {
+        return Some("depth_bid_missing");
+    };
+    if bid.price != quote.bid_price {
+        return Some("bid_price_mismatch");
+    }
+    if bid.quantity != quote.bid_quantity {
+        return Some("bid_quantity_mismatch");
+    }
+    let Some(ask) = depth.best_ask() else {
+        return Some("depth_ask_missing");
+    };
+    if ask.price != quote.ask_price {
+        return Some("ask_price_mismatch");
+    }
+    if ask.quantity != quote.ask_quantity {
+        return Some("ask_quantity_mismatch");
+    }
+    None
+}
+
 fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
     let value = u128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds u128"))?;
     i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
@@ -2765,10 +3153,102 @@ mod tests {
     };
 
     use super::{
-        AdaptiveCandidate, RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
-        adaptive_candidate_is_better, exact_execution_envelope_amounts,
-        mark_sequence_matched_update, rebalance_health_state, reservation_precheck,
+        AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
+        RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
+        adaptive_candidate_is_better, classify_depth_health, exact_execution_envelope_amounts,
+        mark_sequence_matched_update, rebalance_health_state, requires_depth_for_runtime_phase,
+        reservation_precheck,
     };
+
+    fn adaptive_depth_limits() -> AdaptiveSizingRuntimeLimits {
+        AdaptiveSizingRuntimeLimits {
+            max_trade_notional: U256::from(200_000_000_u64),
+            max_unhedged_notional: U256::from(220_000_000_u64),
+            max_recovery_loss: U256::from(2_000_000_u64),
+            min_expected_profit: U256::ZERO,
+            min_incremental_expected_profit: U256::ZERO,
+            recent_full_depth_max_age_ms: 750,
+            recent_full_depth_max_update_delta: 8,
+            top_of_book_max_trade_notional: U256::from(40_000_000_u64),
+        }
+    }
+
+    #[test]
+    fn dex_first_runtime_phase_does_not_require_depth() {
+        assert!(!requires_depth_for_runtime_phase("full_live"));
+        assert!(!requires_depth_for_runtime_phase("paper_dex_first"));
+        assert!(requires_depth_for_runtime_phase("paper_concurrent_hedged"));
+    }
+
+    #[test]
+    fn adaptive_depth_sources_degrade_by_explicit_caps() {
+        let limits = adaptive_depth_limits();
+        let exact = classify_depth_health(
+            DepthObservation {
+                age_ms: Some(900),
+                update_delta: Some(12),
+                top_matches: true,
+                top_mismatch_reason: None,
+            },
+            true,
+            Some(limits),
+        );
+        assert_eq!(exact.source, AdaptiveDepthSource::SequenceMatchedFullDepth);
+
+        let recent = classify_depth_health(
+            DepthObservation {
+                age_ms: Some(635),
+                update_delta: Some(5),
+                top_matches: false,
+                top_mismatch_reason: Some("bid_quantity_mismatch"),
+            },
+            true,
+            Some(limits),
+        );
+        assert_eq!(recent.source, AdaptiveDepthSource::RecentFullDepth);
+
+        let stale = classify_depth_health(
+            DepthObservation {
+                age_ms: Some(751),
+                update_delta: Some(5),
+                top_matches: false,
+                top_mismatch_reason: Some("bid_quantity_mismatch"),
+            },
+            true,
+            Some(limits),
+        );
+        assert_eq!(stale.source, AdaptiveDepthSource::TopOfBookOnly);
+        assert_eq!(stale.source_reason, "depth_age_cap_exceeded");
+
+        let too_many_updates = classify_depth_health(
+            DepthObservation {
+                age_ms: Some(500),
+                update_delta: Some(9),
+                top_matches: false,
+                top_mismatch_reason: Some("ask_price_mismatch"),
+            },
+            true,
+            Some(limits),
+        );
+        assert_eq!(too_many_updates.source, AdaptiveDepthSource::TopOfBookOnly);
+        assert_eq!(
+            too_many_updates.source_reason,
+            "depth_update_delta_cap_exceeded"
+        );
+
+        let unavailable = classify_depth_health(
+            DepthObservation {
+                age_ms: None,
+                update_delta: None,
+                top_matches: false,
+                top_mismatch_reason: Some("depth_unavailable"),
+            },
+            false,
+            Some(limits),
+        );
+        assert_eq!(unavailable.source, AdaptiveDepthSource::TopOfBookOnly);
+        assert_eq!(unavailable.source_reason, "depth_unavailable");
+    }
 
     #[test]
     fn sequence_matched_market_updates_are_deduplicated_per_symbol() {

@@ -1,6 +1,6 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated v9 adaptive-live artifact implemented
+Status: v4 read/paper default and separately gated v10 adaptive-live artifact implemented
 Last reviewed: 2026-07-20
 
 ## Runtime boundary
@@ -29,24 +29,24 @@ attached to the production runtime.
 
 ## Captured behavior
 
-The v4-v9 snapshots record:
+The v4-v10 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
 - USDC as token A and WLD as token B, with base-unit decimals;
 - Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
   step/tick size;
-- fixed 20 USDC detector/control notional; v8-v9 execute adaptive whole-step
-  sizing from sequence-matched depth up to the 200 USDC cap, while retaining
-  immediate bookTicker admission for a threshold-clearing baseline when
-  matched depth is unavailable;
+- fixed 20 USDC detector/control notional; v10 executes adaptive whole-step
+  sizing from sequence-matched depth, capped recent depth, or a 40 USDC-capped
+  top-only book up to the global 200 USDC cap, while retaining immediate
+  bookTicker admission for a threshold-clearing baseline;
 - token-B quote sizing derived from the latest Binance ask, matching
   `UpdateMinBuyAmountJob` without its database update loop;
 - opportunity capacity expressed as whole Binance token-B steps, starting at
   that derived baseline and bounded by DEX liquidity, the profit threshold,
   and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, quote age, slippage reserve,
-  DEX fee reserve, and exact execution-envelope inventory reservations; v9
+  DEX fee reserve, and exact execution-envelope inventory reservations; v9-v10
   makes this 20 bps spread the entry verdict independently of worst-case gas
   and recovery coverage;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
@@ -70,7 +70,7 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v9 artifact has
+The committed v4 default has both execution gates false. The v10 artifact has
 both true and is valid only for the explicitly confirmed GKE live path. V7 is
 the immutable adaptive-shadow predecessor; v8 is the exact-envelope predecessor;
 v5-v6 remain provenance for earlier live releases and deserialize to

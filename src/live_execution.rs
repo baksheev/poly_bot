@@ -733,6 +733,11 @@ mod tests {
             proceeds_token_a_base_units: 1_030,
             admission: AdmissionRiskBounds {
                 opportunity_threshold_met: true,
+                depth_source: None,
+                depth_age_ms: None,
+                depth_update_delta: None,
+                top_matches: None,
+                top_mismatch_reason: None,
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::ONE,
                 cex_primary_top_quantity: Decimal::from(100),

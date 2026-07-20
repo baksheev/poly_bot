@@ -1,20 +1,23 @@
 # Adaptive arbitrage sizing
 
-Status: v9 adaptive spread-threshold execution implemented for GKE production
+Status: v10 tiered-depth adaptive execution implemented for GKE production
 Last reviewed: 2026-07-20
 
 ## Implementation status
 
-The v9 production artifact enables `mode = adaptive` with a 200 USDC maximum
-trade-notional cap. Rust evaluates exact Binance-step quantities for every
-enabled pool against prepared DEX curves and sequence-matched full Binance
-depth, ranks them by expected primary spread profit, and publishes the selected
-candidate as the immutable execution plan. The configured 20 USDC amount stays
-the detector/control and fast-path fallback. When sequence-matched full depth
-is unavailable, a baseline that clears the 20 bps spread gate may still be
-admitted from the current bookTicker under the existing DEX-first top-level
-quantity, gas, risk-cap, freshness, and exact-reservation checks. Full depth is
-required only to select a larger adaptive size.
+The v10 production artifact enables `mode = adaptive` with a 200 USDC maximum
+trade-notional cap and tiered Binance depth. Rust evaluates exact Binance-step
+quantities for every enabled pool against prepared DEX curves using, in order:
+sequence-matched full depth; recent full depth within 750 ms and update delta 8;
+or a synthetic top-of-book-only book capped at 40 USDC. A recent book has its
+top replaced by the current bookTicker and discards stale levels better than
+that top before it is used. Every selected size must still fit the relevant
+current top and all gas, recovery-loss, exposure, freshness, and exact
+reservation checks.
+
+The configured 20 USDC amount remains the detector/control and DEX-first fast
+path. Full-depth freshness is reported separately and does not move a
+`full_live`/DEX-first runtime from `Ready` to `Degraded`.
 
 The first shadow optimizer is the exhaustive whole-step reference oracle. It
 is capped at 8,192 exact evaluations per pool; exhausting the cap selects no
@@ -194,7 +197,12 @@ uses active adaptive mode with the spread threshold separated from tail risk.
   "max_unhedged_notional_token_a_base_units": "220000000",
   "max_recovery_loss_token_a_base_units": "2000000",
   "min_expected_profit_token_a_base_units": "0",
-  "min_incremental_expected_profit_token_a_base_units": "0"
+  "min_incremental_expected_profit_token_a_base_units": "0",
+  "depth_policy": {
+    "recent_full_depth_max_age_ms": 750,
+    "recent_full_depth_max_update_delta": 8,
+    "top_of_book_max_trade_notional_token_a_base_units": "40000000"
+  }
 }
 ```
 
@@ -375,7 +383,7 @@ An adaptive candidate is eligible only if:
 - native gas is covered at the admitted maximum fee;
 - `trade_notional`, `unhedged_notional`, and `maximum_recovery_loss` are within
   their config caps;
-- expected spread profit is at least `min_expected_profit` (zero in v9); the
+- expected spread profit is at least `min_expected_profit` (zero in v9-v10); the
   configured 20 bps threshold is the authoritative profitability gate;
 - the exact direction-specific reservation fits currently available inventory;
 - the quote, pool generation, balances, account state, order counters, nonce
@@ -784,10 +792,16 @@ select adaptive winner only if:
 otherwise select baseline fallback
 ```
 
-If sequence-matched full depth is not available at the decision instant, skip
-the adaptive search and immediately evaluate that same baseline against the
-current relevant bookTicker top level. Do not defer a threshold-clearing
-baseline merely because a larger adaptive size cannot be calculated.
+Select the adaptive depth tier at the decision instant:
+
+1. use `sequence_matched_full_depth` when update and top are exact;
+2. otherwise use `recent_full_depth` only when both configured age and update
+   delta caps pass, after reconciling its top with the current bookTicker;
+3. otherwise use `top_of_book_only`, search only liquidity covered by both
+   observed top levels, and apply its separate notional cap.
+
+Do not defer a threshold-clearing baseline merely because a larger adaptive
+size cannot be calculated.
 
 The objective is maximum expected absolute spread profit among candidates that
 each pass the 20 bps threshold and all hard safety caps, not maximum size or
@@ -808,6 +822,8 @@ Persist the following with every admitted plan and copy it into result
 telemetry:
 
 - `sizing_mode`: `baseline` or `adaptive`;
+- `depth_source`, `depth_age_ms`, `depth_update_delta`, `top_matches`, and
+  `top_mismatch_reason`;
 - configured notional cap, optimizer version, search upper bound, exact
   evaluation count, and fallback reason when applicable;
 - baseline token-B amount, cost, proceeds, gross profit bps, and bounded profit;
@@ -1018,7 +1034,7 @@ Primary code touch points:
 - `src/arbitrage.rs` and `src/live_execution.rs` for immutable plan fields and
   entry-channel behavior;
 - `src/hot_telemetry.rs` and result payloads;
-- `config/strategies/usdc-wld-world-chain.v9.json`;
+- `config/strategies/usdc-wld-world-chain.v10.json`;
 - monitor/comparison scripts and `docs/trading-runbook.md`.
 
 ## Verification and acceptance

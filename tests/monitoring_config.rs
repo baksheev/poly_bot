@@ -12,6 +12,8 @@ const TRADING_INVENTORY_BLOCKED_METRIC: &str =
     include_str!("../infra/gcp/monitoring/trading-inventory-blocked-log-metric.json");
 const TRADING_INVENTORY_BLOCKED_POLICY: &str =
     include_str!("../infra/gcp/monitoring/trading-inventory-blocked-policy.json");
+const BINANCE_DEPTH_UNHEALTHY_METRIC: &str =
+    include_str!("../infra/gcp/monitoring/binance-depth-unhealthy-log-metric.json");
 
 fn filter_from(config: &str, name: &str) -> String {
     let config: Value = serde_json::from_str(config).unwrap_or_else(|error| {
@@ -113,4 +115,18 @@ fn trading_inventory_blocked_monitoring_accepts_runtime_logs_and_targets_active_
     assert!(policy_filter.contains(
         r#"metric.type = "logging.googleapis.com/user/poly_bot_trading_inventory_blocked""#
     ));
+}
+
+#[test]
+fn binance_depth_health_is_a_separate_gke_metric() {
+    let filter = filter_from(
+        BINANCE_DEPTH_UNHEALTHY_METRIC,
+        "Binance depth unhealthy log metric",
+    );
+
+    assert!(filter.contains(r#"resource.type="k8s_container""#));
+    assert!(filter.contains(r#"resource.labels.cluster_name="arb-bot""#));
+    assert!(filter.contains(r#"jsonPayload.fields.message="Binance depth health heartbeat""#));
+    assert!(filter.contains(r#"jsonPayload.fields.healthy=false"#));
+    assert!(!filter.contains("runtime phase changed"));
 }

@@ -41,6 +41,9 @@ upsert_log_metric \
 upsert_log_metric \
   poly_bot_trading_inventory_blocked \
   "${monitoring_dir}/trading-inventory-blocked-log-metric.json"
+upsert_log_metric \
+  poly_bot_binance_depth_unhealthy \
+  "${monitoring_dir}/binance-depth-unhealthy-log-metric.json"
 
 channels_json="$("${gcloud_bin}" alpha monitoring channels list \
   "${project_args[@]}" \

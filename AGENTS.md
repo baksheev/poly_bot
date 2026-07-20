@@ -50,12 +50,15 @@ a time.
   push the production image, resolve its immutable digest, and roll that exact
   digest out to the existing fixed GKE node only after CI passes and the
   `production` environment is approved.
-- The production GKE Pod must use the reviewed v9 adaptive-live domain artifact
+- The production GKE Pod must use the reviewed v10 adaptive-live domain artifact
   with both arbitrage and rebalancing in `full_live`. Adaptive sizing may select
-  up to the configured 200 USDC cap only from sequence-matched full depth; an
-  optimizer failure falls back to the 20 USDC baseline. Inventory reservations
-  use `exact_execution_envelope_v1`, including native gas, and must never apply
-  the legacy Rails `3x` multiplier. The configured 20 bps primary spread is the
+  up to the configured 200 USDC cap from sequence-matched full depth or recent
+  full depth within the reviewed age/update-delta caps. Top-of-book-only sizing
+  is separately capped at 40 USDC and must fit the observed top levels. Full
+  depth health is telemetry and a log-based metric; it must not change
+  `RuntimePhase::Ready` in `full_live`/DEX-first mode. Inventory reservations use
+  `exact_execution_envelope_v1`, including native gas, and must never apply the
+  legacy Rails `3x` multiplier. The configured 20 bps primary spread is the
   profitability gate; worst-case recovery loss and gas remain reservation and
   risk-cap inputs rather than a requirement that failure recovery be
   profitable. The deployment workflow must verify these startup fields before

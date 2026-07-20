@@ -11,21 +11,22 @@ and must never run while the GKE Deployment has a nonzero replica count.
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v9 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback and 200 USDC active cap,
+- v10 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback, 200 USDC global cap, 750 ms / delta 8 recent-depth caps, and 40 USDC top-only cap,
   WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
 - the dedicated wallet and Binance subaccount verified at startup;
 - persistent `/var/lib/arb-bot` parent, Binance-order, and wallet/nonce
   journals;
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
-  active rebalance, and fresh Binance/depth/DEX/balance/gas inputs;
-- fixed full-live v9 adaptive deployment, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
+  active rebalance, and fresh Binance top-of-book/DEX/balance/gas inputs; full
+  depth health is observed separately and does not gate DEX-first readiness;
+- fixed full-live v10 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
   recovery controls.
 
 Run `scripts/quality.sh`, merge the reviewed PR to `main`, wait for CI, approve
 the `production` environment, and deploy only with the `Deploy GKE` workflow.
 The workflow builds the image, resolves its immutable digest, reuses the fixed
-node, and verifies the v9/full-live runtime config. Do not deploy from a
+node, and verifies the v10/full-live runtime config. Do not deploy from a
 workstation or use the GCE updater.
 
 ```bash
