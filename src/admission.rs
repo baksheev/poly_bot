@@ -142,6 +142,14 @@ fn validate_inputs_and_base_quantity(inputs: AdmissionInputs<'_>) -> anyhow::Res
         inputs.expected_cost_token_a > U256::ZERO && inputs.expected_proceeds_token_a > U256::ZERO,
         "admission economics are non-positive"
     );
+    if let Ok(amount) = u128::try_from(inputs.token_b_amount)
+        && amount <= i128::MAX as u128
+    {
+        return Ok(Decimal::from_i128_with_scale(
+            amount as i128,
+            u32::from(inputs.token_b_decimals),
+        ));
+    }
     Decimal::from_str(&format_base_units(
         inputs.token_b_amount,
         inputs.token_b_decimals,

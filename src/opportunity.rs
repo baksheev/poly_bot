@@ -260,6 +260,40 @@ impl OpportunityEngine {
         })
     }
 
+    /// Evaluates one exact Binance-step-aligned quantity against one prepared
+    /// pool without changing the baseline detector or any execution state.
+    pub fn evaluate_exact_candidate(
+        &self,
+        pair_index: usize,
+        quote: &TopOfBook,
+        direction: ArbitrageDirection,
+        pool_index: usize,
+        token_b_amount: U256,
+    ) -> anyhow::Result<Option<TradeEvaluation>> {
+        let pair = self.pair(pair_index)?;
+        ensure!(
+            pair.pool_indices.contains(&pool_index),
+            "adaptive candidate pool does not belong to pair"
+        );
+        ensure!(
+            token_b_amount % pair.token_b_step == U256::ZERO,
+            "adaptive candidate is not Binance-step aligned"
+        );
+        let Some(mut trade) = evaluate_trade(
+            pair,
+            &self.prepared_pools,
+            quote,
+            direction,
+            pool_index,
+            token_b_amount,
+        )?
+        else {
+            return Ok(None);
+        };
+        finalize_trade_profit(&mut trade)?;
+        Ok(Some(trade))
+    }
+
     pub fn evaluate(&mut self, quote: &TopOfBook) -> anyhow::Result<Option<PairEvaluation>> {
         let Some(&pair_index) = self.pair_indices_by_symbol.get(quote.symbol.as_ref()) else {
             return Ok(None);
@@ -507,6 +541,10 @@ impl PairRuntime {
 
     pub fn token_b_step(&self) -> U256 {
         self.token_b_step
+    }
+
+    pub fn pool_indices(&self) -> &[usize] {
+        &self.pool_indices
     }
 
     fn new(config: &PairConfig, dex: &DexMirror) -> anyhow::Result<Self> {
@@ -1242,7 +1280,7 @@ pub fn format_base_units(amount: U256, decimals: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::Arc, time::Instant};
+    use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
 
     use alloy_primitives::{Address, B256, U256, address};
     use rust_decimal::Decimal;
@@ -1340,6 +1378,47 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn exact_candidate_api_requires_binance_step_alignment() {
+        let (pair, dex) = fixture();
+        let prepared = super::prepare_pool_quotes(&pair, &dex, 0, 1).unwrap();
+        let engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(prepared)],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let book = quote("1.10", "100", "1.11", "100");
+        let step = engine.pair(0).unwrap().token_b_step();
+        let aligned = step * U256::from(20_u8);
+        let candidate = engine
+            .evaluate_exact_candidate(
+                0,
+                &book,
+                ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                0,
+                aligned,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.token_b_amount, aligned);
+        assert!(candidate.proceeds_token_a > candidate.cost_token_a);
+
+        assert!(
+            engine
+                .evaluate_exact_candidate(
+                    0,
+                    &book,
+                    ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                    0,
+                    aligned + U256::ONE,
+                )
+                .is_err()
+        );
     }
 
     #[test]

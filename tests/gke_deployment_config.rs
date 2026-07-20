@@ -2,10 +2,10 @@ const RELEASE_PLATFORM: &str = include_str!("../infra/gcp/gke/release-platform.y
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
 
 #[test]
-fn gke_manifest_is_the_full_live_v6_owner() {
+fn gke_manifest_is_the_full_live_v7_adaptive_shadow_owner() {
     assert!(
         RELEASE_PLATFORM
-            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v6.json")
+            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v7.json")
     );
     assert!(RELEASE_PLATFORM.contains("ARBITRAGE_EXECUTION_MODE: full_live"));
     assert!(RELEASE_PLATFORM.contains("REBALANCE_EXECUTION_MODE: full_live"));
@@ -32,7 +32,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
-    assert!(DEPLOY_WORKFLOW.contains("usdc-wld-world-chain.v6.json"));
+    assert!(DEPLOY_WORKFLOW.contains("usdc-wld-world-chain.v7.json"));
     assert!(DEPLOY_WORKFLOW.contains("previous_runtime_config"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
 }

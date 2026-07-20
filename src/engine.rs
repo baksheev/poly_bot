@@ -25,7 +25,7 @@ use crate::{
     },
     config::AppConfig,
     dex::mirror::{DexMirror, LogApplyResult},
-    domain::config::{DexProvider, LoadedDomainConfig},
+    domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
     execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
     inventory::{
@@ -35,7 +35,7 @@ use crate::{
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{
         ArbitrageDirection, OpportunityEngine, PairEvaluation, PreparedPoolBuildRequest,
-        PreparedPoolBuildResult,
+        PreparedPoolBuildResult, TradeEvaluation,
     },
     rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
@@ -92,6 +92,8 @@ pub struct BinanceFeeBps {
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
+const ADAPTIVE_OPTIMIZER_VERSION: &str = "exhaustive_whole_step_v1";
+const MAX_ADAPTIVE_EXACT_EVALUATIONS: u16 = 8_192;
 
 #[derive(Debug)]
 struct RebalanceSettlementBarrier {
@@ -107,6 +109,83 @@ struct RebalanceSettlementBarrier {
 enum AdmissionLiquidity<'a> {
     DexFirstTop,
     FullDepth(&'a SpotDepthBook),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveSizingRuntimeLimits {
+    max_trade_notional: U256,
+    max_unhedged_notional: U256,
+    max_recovery_loss: U256,
+    min_bounded_profit: U256,
+    min_incremental_bounded_profit: U256,
+}
+
+impl AdaptiveSizingRuntimeLimits {
+    fn parse(config: &AdaptiveSizingConfig) -> anyhow::Result<Option<Self>> {
+        let Some(limits) = config.limits() else {
+            return Ok(None);
+        };
+        let parse = |value: &str, name: &str| {
+            U256::from_str_radix(value, 10)
+                .with_context(|| format!("validated adaptive sizing {name} is invalid"))
+        };
+        Ok(Some(Self {
+            max_trade_notional: parse(limits.max_trade_notional, "trade cap")?,
+            max_unhedged_notional: parse(limits.max_unhedged_notional, "exposure cap")?,
+            max_recovery_loss: parse(limits.max_recovery_loss, "recovery-loss cap")?,
+            min_bounded_profit: parse(limits.min_bounded_profit, "bounded-profit floor")?,
+            min_incremental_bounded_profit: parse(
+                limits.min_incremental_bounded_profit,
+                "incremental-profit floor",
+            )?,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveCandidate {
+    direction: ArbitrageDirection,
+    trade: TradeEvaluation,
+    economics: AdmissionEconomics,
+    trade_notional: U256,
+    unhedged_notional: U256,
+    reservation_fits: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveProbe {
+    candidate: Option<AdaptiveCandidate>,
+    rejection: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct AdaptivePoolSearch {
+    cached_probes: Vec<(U256, AdaptiveProbe)>,
+    rejection_counts: BTreeMap<&'static str, u32>,
+    cache_new_probes: bool,
+    exact_evaluations: u16,
+    limit_exhausted: bool,
+}
+
+impl AdaptivePoolSearch {
+    fn new() -> Self {
+        Self {
+            cached_probes: Vec::with_capacity(32),
+            rejection_counts: BTreeMap::new(),
+            cache_new_probes: true,
+            exact_evaluations: 0,
+            limit_exhausted: false,
+        }
+    }
+
+    fn record(&mut self, amount: U256, probe: AdaptiveProbe) {
+        if let Some(reason) = probe.rejection {
+            *self.rejection_counts.entry(reason).or_default() += 1;
+        }
+        if self.cache_new_probes {
+            self.cached_probes.push((amount, probe));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +237,37 @@ fn inventory_venue_label(venue: InventoryVenue) -> &'static str {
     match venue {
         InventoryVenue::Binance => "binance",
         InventoryVenue::Wallet => "wallet",
+    }
+}
+
+fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveCandidate) -> bool {
+    candidate.economics.bounded_profit_token_a > current.economics.bounded_profit_token_a
+        || (candidate.economics.bounded_profit_token_a == current.economics.bounded_profit_token_a
+            && (candidate.unhedged_notional < current.unhedged_notional
+                || (candidate.unhedged_notional == current.unhedged_notional
+                    && (candidate.trade_notional < current.trade_notional
+                        || (candidate.trade_notional == current.trade_notional
+                            && (candidate.trade.token_b_amount < current.trade.token_b_amount
+                                || (candidate.trade.token_b_amount
+                                    == current.trade.token_b_amount
+                                    && (adaptive_direction_order(candidate.direction)
+                                        < adaptive_direction_order(current.direction)
+                                        || (candidate.direction == current.direction
+                                            && candidate.trade.pool_index
+                                                < current.trade.pool_index)))))))))
+}
+
+const fn adaptive_direction_order(direction: ArbitrageDirection) -> u8 {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => 0,
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => 1,
+    }
+}
+
+const fn adaptive_trade_direction(direction: ArbitrageDirection) -> TradeDirection {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => TradeDirection::BuyTokenBOnDexSellOnCex,
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => TradeDirection::BuyTokenBOnCexSellOnDex,
     }
 }
 
@@ -1283,6 +1393,427 @@ impl TradingEngine {
         }
     }
 
+    fn emit_adaptive_sizing_shadow(
+        &self,
+        quote: &TopOfBook,
+        depth: &SpotDepthBook,
+        evaluation: PairEvaluation,
+        network_gas_price_wei: u128,
+        native_price_token_a: Decimal,
+        wallet_native_balance_wei: U256,
+    ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let pair = self.opportunities.pair(evaluation.pair_index)?;
+        let pair_config = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|config| config.id == pair.pair_id)
+            .context("adaptive sizing pair is absent from domain config")?;
+        let Some(limits) = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)? else {
+            return Ok(());
+        };
+        let directions = [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell];
+        let mut baseline_by_direction: [Option<AdaptiveCandidate>; 2] = [None, None];
+        let mut winner: Option<AdaptiveCandidate> = None;
+        let mut exact_evaluations = 0_u16;
+        let mut limit_exhausted = false;
+        let mut rejection_counts: BTreeMap<&'static str, u32> = BTreeMap::new();
+
+        for (direction_index, direction_evaluation) in directions.into_iter().enumerate() {
+            let Some(baseline_trade) = direction_evaluation
+                .baseline
+                .filter(|trade| trade.meets_threshold)
+            else {
+                continue;
+            };
+            let baseline_inputs = AdmissionInputs {
+                symbol: &pair.symbol,
+                direction: adaptive_trade_direction(direction_evaluation.direction),
+                token_b_amount: baseline_trade.token_b_amount,
+                token_a_decimals: pair.token_a_decimals,
+                token_b_decimals: pair.token_b_decimals,
+                binance_buy_fee_bps: pair.binance_buy_fee_bps,
+                binance_sell_fee_bps: pair.binance_sell_fee_bps,
+                expected_cost_token_a: baseline_trade.cost_token_a,
+                expected_proceeds_token_a: baseline_trade.proceeds_token_a,
+                opportunity_threshold_bps: pair.opportunity_threshold_bps,
+                network_gas_price_wei,
+                native_price_token_a,
+                wallet_native_balance_wei,
+            };
+            if let Some(economics) = evaluate_admission(depth, baseline_inputs)? {
+                baseline_by_direction[direction_index] = Some(AdaptiveCandidate {
+                    direction: direction_evaluation.direction,
+                    trade: baseline_trade,
+                    economics,
+                    trade_notional: baseline_trade
+                        .cost_token_a
+                        .max(baseline_trade.proceeds_token_a),
+                    unhedged_notional: economics
+                        .recovery_sell_quote_token_a
+                        .max(economics.recovery_buy_quote_token_a),
+                    reservation_fits: self.adaptive_primary_reservation_fits(
+                        pair,
+                        direction_evaluation.direction,
+                        baseline_trade,
+                    )?,
+                });
+            }
+
+            for &pool_index in pair.pool_indices() {
+                let (pool_winner, search) = self.search_adaptive_pool(
+                    quote,
+                    depth,
+                    evaluation.pair_index,
+                    direction_evaluation.direction,
+                    pool_index,
+                    baseline_trade.token_b_amount,
+                    direction_evaluation.cex_top_token_b_amount,
+                    limits,
+                    network_gas_price_wei,
+                    native_price_token_a,
+                    wallet_native_balance_wei,
+                )?;
+                exact_evaluations = exact_evaluations.saturating_add(search.exact_evaluations);
+                limit_exhausted |= search.limit_exhausted;
+                for (reason, count) in search.rejection_counts {
+                    *rejection_counts.entry(reason).or_default() += count;
+                }
+                if let Some(candidate) = pool_winner
+                    && winner
+                        .as_ref()
+                        .is_none_or(|current| adaptive_candidate_is_better(candidate, *current))
+                {
+                    winner = Some(candidate);
+                }
+            }
+        }
+
+        let direction_index = |direction| match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => 0,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => 1,
+        };
+        let mut fallback_reason = "no_eligible_candidate";
+        let mut selected = winner.filter(|candidate| {
+            let Some(baseline) = baseline_by_direction[direction_index(candidate.direction)] else {
+                fallback_reason = "baseline_admission_unavailable";
+                return false;
+            };
+            if candidate.trade.token_b_amount <= baseline.trade.token_b_amount {
+                fallback_reason = "not_larger_than_baseline";
+                return false;
+            }
+            let required = baseline
+                .economics
+                .bounded_profit_token_a
+                .checked_add(limits.min_incremental_bounded_profit);
+            if required.is_none_or(|required| candidate.economics.bounded_profit_token_a < required)
+            {
+                fallback_reason = "incremental_profit_floor";
+                return false;
+            }
+            true
+        });
+        if limit_exhausted {
+            fallback_reason = "evaluation_limit";
+            selected = None;
+        }
+        let baseline = selected
+            .and_then(|candidate| baseline_by_direction[direction_index(candidate.direction)])
+            .or_else(|| {
+                baseline_by_direction
+                    .into_iter()
+                    .flatten()
+                    .max_by_key(|candidate| candidate.economics.bounded_profit_token_a)
+            });
+        let selected_for_telemetry = selected.or(baseline);
+        let rejection_counts = rejection_counts
+            .into_iter()
+            .map(|(reason, count)| (reason.to_owned(), Value::from(count)))
+            .collect::<serde_json::Map<_, _>>();
+        let calculation_us = started.elapsed().as_micros();
+        self.telemetry.emit(
+            "arbitrage_adaptive_sizing_evaluated",
+            json!({
+                "engine_id": self.config.engine_id,
+                "pair_id": pair.pair_id,
+                "symbol": quote.symbol.as_ref(),
+                "update_id": quote.update_id,
+                "configured_mode": pair_config.adaptive_sizing.mode(),
+                "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+                "search_mode": "exhaustive_whole_step",
+                "max_exact_evaluations_per_pool": MAX_ADAPTIVE_EXACT_EVALUATIONS,
+                "exact_evaluation_count": exact_evaluations,
+                "max_trade_notional_token_a_base_units": limits.max_trade_notional.to_string(),
+                "max_unhedged_notional_token_a_base_units": limits.max_unhedged_notional.to_string(),
+                "max_recovery_loss_token_a_base_units": limits.max_recovery_loss.to_string(),
+                "min_bounded_profit_token_a_base_units": limits.min_bounded_profit.to_string(),
+                "min_incremental_bounded_profit_token_a_base_units": limits.min_incremental_bounded_profit.to_string(),
+                "baseline_direction": baseline.map(|candidate| candidate.direction.as_str()),
+                "baseline_pool_index": baseline.map(|candidate| candidate.trade.pool_index),
+                "baseline_token_b_base_units": baseline.map(|candidate| candidate.trade.token_b_amount.to_string()),
+                "baseline_cost_token_a_base_units": baseline.map(|candidate| candidate.trade.cost_token_a.to_string()),
+                "baseline_proceeds_token_a_base_units": baseline.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
+                "baseline_bounded_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
+                "selected_sizing_mode": if selected.is_some() { "adaptive" } else { "baseline" },
+                "selected_direction": selected_for_telemetry.map(|candidate| candidate.direction.as_str()),
+                "selected_pool_index": selected_for_telemetry.map(|candidate| candidate.trade.pool_index),
+                "selected_token_b_base_units": selected_for_telemetry.map(|candidate| candidate.trade.token_b_amount.to_string()),
+                "selected_cost_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.cost_token_a.to_string()),
+                "selected_proceeds_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
+                "selected_bounded_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
+                "selected_trade_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade_notional.to_string()),
+                "selected_unhedged_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.unhedged_notional.to_string()),
+                "selected_recovery_loss_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
+                "selected_reservation_fits": selected_for_telemetry.map(|candidate| candidate.reservation_fits),
+                "fallback_reason": selected.is_none().then_some(fallback_reason),
+                "rejection_counts": Value::Object(rejection_counts),
+                "calculation_us": calculation_us,
+                "execution_size_changed": false,
+                "admission_liquidity_source": "sequence_matched_full_depth",
+            }),
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adaptive_probe(
+        &self,
+        search: &mut AdaptivePoolSearch,
+        quote: &TopOfBook,
+        depth: &SpotDepthBook,
+        pair_index: usize,
+        direction: ArbitrageDirection,
+        pool_index: usize,
+        token_b_amount: U256,
+        limits: AdaptiveSizingRuntimeLimits,
+        network_gas_price_wei: u128,
+        native_price_token_a: Decimal,
+        wallet_native_balance_wei: U256,
+    ) -> anyhow::Result<AdaptiveProbe> {
+        if let Some((_, probe)) = search
+            .cached_probes
+            .iter()
+            .find(|(amount, _)| *amount == token_b_amount)
+        {
+            return Ok(*probe);
+        }
+        if search.exact_evaluations >= MAX_ADAPTIVE_EXACT_EVALUATIONS {
+            search.limit_exhausted = true;
+            return Ok(AdaptiveProbe {
+                candidate: None,
+                rejection: Some("evaluation_limit"),
+            });
+        }
+        search.exact_evaluations += 1;
+        let pair = self.opportunities.pair(pair_index)?;
+        let rejection = |reason| AdaptiveProbe {
+            candidate: None,
+            rejection: Some(reason),
+        };
+        let Some(trade) = self.opportunities.evaluate_exact_candidate(
+            pair_index,
+            quote,
+            direction,
+            pool_index,
+            token_b_amount,
+        )?
+        else {
+            let probe = rejection("dex_liquidity");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        };
+        if !trade.meets_threshold {
+            let probe = rejection("gross_threshold");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        let trade_notional = trade.cost_token_a.max(trade.proceeds_token_a);
+        if trade_notional > limits.max_trade_notional {
+            let probe = rejection("trade_cap");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        let inputs = AdmissionInputs {
+            symbol: &pair.symbol,
+            direction: adaptive_trade_direction(direction),
+            token_b_amount,
+            token_a_decimals: pair.token_a_decimals,
+            token_b_decimals: pair.token_b_decimals,
+            binance_buy_fee_bps: pair.binance_buy_fee_bps,
+            binance_sell_fee_bps: pair.binance_sell_fee_bps,
+            expected_cost_token_a: trade.cost_token_a,
+            expected_proceeds_token_a: trade.proceeds_token_a,
+            opportunity_threshold_bps: pair.opportunity_threshold_bps,
+            network_gas_price_wei,
+            native_price_token_a,
+            wallet_native_balance_wei,
+        };
+        let Some(economics) = evaluate_admission(depth, inputs)? else {
+            let probe = rejection("recovery_depth");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        };
+        if !economics.native_gas_covered {
+            let probe = rejection("gas");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        let unhedged_notional = economics
+            .recovery_sell_quote_token_a
+            .max(economics.recovery_buy_quote_token_a);
+        if unhedged_notional > limits.max_unhedged_notional {
+            let probe = rejection("exposure_cap");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        if economics.recovery_loss_token_a > limits.max_recovery_loss {
+            let probe = rejection("recovery_loss_cap");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        if economics.bounded_profit_token_a < limits.min_bounded_profit {
+            let probe = rejection("bounded_profit_floor");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        let reservation_fits = self.adaptive_primary_reservation_fits(pair, direction, trade)?;
+        if !reservation_fits {
+            let probe = rejection("inventory");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        let probe = AdaptiveProbe {
+            candidate: Some(AdaptiveCandidate {
+                direction,
+                trade,
+                economics,
+                trade_notional,
+                unhedged_notional,
+                reservation_fits,
+            }),
+            rejection: None,
+        };
+        search.record(token_b_amount, probe);
+        Ok(probe)
+    }
+
+    fn adaptive_primary_reservation_fits(
+        &self,
+        pair: &crate::opportunity::PairRuntime,
+        direction: ArbitrageDirection,
+        trade: TradeEvaluation,
+    ) -> anyhow::Result<bool> {
+        let ((token_a_venue, token_a_amount), (token_b_venue, token_b_amount)) = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
+                (InventoryVenue::Wallet, trade.cost_token_a),
+                (InventoryVenue::Binance, trade.token_b_amount),
+            ),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
+                (InventoryVenue::Binance, trade.cost_token_a),
+                (InventoryVenue::Wallet, trade.token_b_amount),
+            ),
+        };
+        Ok(self
+            .inventory
+            .available_asset(token_a_venue, &pair.token_a_symbol)
+            .is_ok_and(|available| available >= token_a_amount)
+            && self
+                .inventory
+                .available_asset(token_b_venue, &pair.token_b_symbol)
+                .is_ok_and(|available| available >= token_b_amount))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_adaptive_pool(
+        &self,
+        quote: &TopOfBook,
+        depth: &SpotDepthBook,
+        pair_index: usize,
+        direction: ArbitrageDirection,
+        pool_index: usize,
+        baseline_amount: U256,
+        cex_top_amount: U256,
+        limits: AdaptiveSizingRuntimeLimits,
+        network_gas_price_wei: u128,
+        native_price_token_a: Decimal,
+        wallet_native_balance_wei: U256,
+    ) -> anyhow::Result<(Option<AdaptiveCandidate>, AdaptivePoolSearch)> {
+        let step = self.opportunities.pair(pair_index)?.token_b_step();
+        let low_steps = baseline_amount / step;
+        let high_steps = cex_top_amount / step;
+        let mut search = AdaptivePoolSearch::new();
+        if low_steps == U256::ZERO || high_steps < low_steps {
+            return Ok((None, search));
+        }
+        let probe_steps = |steps: U256, search: &mut AdaptivePoolSearch| {
+            let amount = steps
+                .checked_mul(step)
+                .context("adaptive candidate amount overflow")?;
+            self.adaptive_probe(
+                search,
+                quote,
+                depth,
+                pair_index,
+                direction,
+                pool_index,
+                amount,
+                limits,
+                network_gas_price_wei,
+                native_price_token_a,
+                wallet_native_balance_wei,
+            )
+        };
+        let Some(low_candidate) = probe_steps(low_steps, &mut search)?.candidate else {
+            return Ok((None, search));
+        };
+
+        // Locate the monotone end of the feasible sizing domain first. The
+        // exhaustive pass below still checks every whole step inside it.
+        let upper_steps = if probe_steps(high_steps, &mut search)?.candidate.is_some() {
+            high_steps
+        } else {
+            let mut low = low_steps;
+            let mut high = high_steps;
+            while high - low > U256::ONE {
+                let mid = low + ((high - low) / U256::from(2_u8));
+                if probe_steps(mid, &mut search)?.candidate.is_some() {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            low
+        };
+
+        let domain_size = upper_steps
+            .checked_sub(low_steps)
+            .and_then(|delta| delta.checked_add(U256::ONE))
+            .context("adaptive sizing domain overflow")?;
+        let remaining_budget =
+            MAX_ADAPTIVE_EXACT_EVALUATIONS.saturating_sub(search.exact_evaluations);
+        if domain_size > U256::from(remaining_budget) {
+            search.limit_exhausted = true;
+            return Ok((None, search));
+        }
+        search.cache_new_probes = false;
+        let mut winner = low_candidate;
+        let mut steps = low_steps;
+        while steps <= upper_steps {
+            if let Some(candidate) = probe_steps(steps, &mut search)?.candidate
+                && adaptive_candidate_is_better(candidate, winner)
+            {
+                winner = candidate;
+            }
+            steps = steps
+                .checked_add(U256::ONE)
+                .context("adaptive step index overflow")?;
+        }
+        Ok((Some(winner), search))
+    }
+
     fn submit_paper_opportunity(
         &mut self,
         quote: &TopOfBook,
@@ -1313,6 +1844,32 @@ impl TradingEngine {
         let native_price_token_a = self
             .native_price_token_a()
             .context("admission has no native-token price")?;
+
+        if let AdmissionLiquidity::FullDepth(depth) = admission_liquidity
+            && let Err(error) = self.emit_adaptive_sizing_shadow(
+                quote,
+                depth,
+                evaluation,
+                network_gas_price_wei,
+                native_price_token_a,
+                wallet_native_balance_wei,
+            )
+        {
+            self.telemetry.emit(
+                "arbitrage_adaptive_sizing_evaluated",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": pair_id,
+                    "symbol": quote.symbol.as_ref(),
+                    "update_id": quote.update_id,
+                    "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+                    "selected_sizing_mode": "baseline",
+                    "fallback_reason": "optimizer_error",
+                    "error": format!("{error:#}"),
+                    "execution_size_changed": false,
+                }),
+            );
+        }
 
         let mut candidates = Vec::with_capacity(2);
         let mut needs_depth_fallback = false;
