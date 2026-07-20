@@ -21,7 +21,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
-use crate::{execution_plan::DexSwapPlan, state::TopOfBook, telemetry::TelemetryHandle};
+use crate::{
+    admission::EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, execution_plan::DexSwapPlan,
+    state::TopOfBook, telemetry::TelemetryHandle,
+};
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -217,6 +220,16 @@ impl TradeIntent {
             .map(|admission| u128_to_i128_saturating(admission.maximum_gas_cost_token_a_base_units))
     }
 
+    fn expected_gas_burdened_cost_token_a_base_units(&self) -> Option<i128> {
+        let admission = self.admission.as_ref()?;
+        Some(
+            self.expected_cost_token_a_base_units
+                .saturating_add(u128_to_i128_saturating(
+                    admission.maximum_gas_cost_token_a_base_units,
+                )),
+        )
+    }
+
     fn expected_fully_burdened_cost_token_a_base_units(&self) -> Option<i128> {
         let admission = self.admission.as_ref()?;
         Some(
@@ -234,6 +247,10 @@ impl TradeIntent {
         self.admission
             .as_ref()
             .map(|admission| u128_to_i128_saturating(admission.bounded_profit_token_a_base_units))
+    }
+
+    fn expected_profit_after_gas_token_a_base_units(&self) -> Option<i128> {
+        self.expected_bounded_profit_token_a_base_units()
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -288,6 +305,27 @@ fn profit_bps_x100(profit: i128, cost: i128) -> Option<i128> {
         return None;
     }
     Some(profit.saturating_mul(1_000_000).saturating_div(cost))
+}
+
+fn meets_expected_profit_after_gas_threshold(
+    proceeds_token_a_base_units: i128,
+    cost_token_a_base_units: i128,
+    gas_cost_token_a_base_units: u128,
+) -> anyhow::Result<bool> {
+    let proceeds = u128::try_from(proceeds_token_a_base_units)
+        .context("expected proceeds cannot be represented as unsigned base units")?;
+    let cost = u128::try_from(cost_token_a_base_units)
+        .context("expected cost cannot be represented as unsigned base units")?;
+    let gas_burdened_cost = cost
+        .checked_add(gas_cost_token_a_base_units)
+        .context("expected after-gas cost overflow")?;
+    let left = proceeds
+        .checked_mul(10_000)
+        .context("expected after-gas proceeds threshold overflow")?;
+    let right = gas_burdened_cost
+        .checked_mul(10_000 + u128::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS))
+        .context("expected after-gas threshold cost overflow")?;
+    Ok(left >= right)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -482,19 +520,23 @@ impl TradeOperation {
         let expected_profit = self.intent.expected_profit_token_a_base_units();
         let expected_recovery_loss = self.intent.expected_recovery_loss_token_a_base_units();
         let expected_gas_cost = self.intent.expected_gas_cost_token_a_base_units();
+        let expected_gas_burdened_cost =
+            self.intent.expected_gas_burdened_cost_token_a_base_units();
         let expected_fully_burdened_cost = self
             .intent
             .expected_fully_burdened_cost_token_a_base_units();
         let expected_bounded_profit = self.intent.expected_bounded_profit_token_a_base_units();
+        let expected_profit_after_gas = self.intent.expected_profit_after_gas_token_a_base_units();
         let expected_profit_bps_x100 = profit_bps_x100(
             expected_profit,
             self.intent.expected_cost_token_a_base_units,
         );
-        let expected_bounded_profit_bps_x100 =
-            expected_fully_burdened_cost.and_then(|expected_cost| {
-                expected_bounded_profit
+        let expected_profit_after_gas_bps_x100 =
+            expected_gas_burdened_cost.and_then(|expected_cost| {
+                expected_profit_after_gas
                     .and_then(|expected_profit| profit_bps_x100(expected_profit, expected_cost))
             });
+        let expected_bounded_profit_bps_x100 = expected_profit_after_gas_bps_x100;
         let (realized_primary_cost, realized_primary_proceeds) = self
             .realized_primary_cost_and_proceeds_token_a_base_units()
             .map_or((None, None), |(cost, proceeds)| {
@@ -577,6 +619,22 @@ impl TradeOperation {
             .as_object_mut()
             .context("arbitrage result telemetry payload is not an object")?;
         let admission = self.intent.admission.as_ref();
+        object.insert(
+            "recovery_loss_bound_token_a_base_units".to_owned(),
+            json!(optional_i128_string(expected_recovery_loss)),
+        );
+        object.insert(
+            "expected_gas_burdened_cost_token_a_base_units".to_owned(),
+            json!(optional_i128_string(expected_gas_burdened_cost)),
+        );
+        object.insert(
+            "expected_profit_after_gas_token_a_base_units".to_owned(),
+            json!(optional_i128_string(expected_profit_after_gas)),
+        );
+        object.insert(
+            "expected_profit_after_gas_bps_x100".to_owned(),
+            json!(optional_i128_string(expected_profit_after_gas_bps_x100)),
+        );
         object.insert(
             "depth_source".to_owned(),
             json!(admission.and_then(|admission| admission.depth_source.as_deref())),
@@ -1381,6 +1439,17 @@ impl PaperTradeCoordinator {
                 .is_none_or(|admission| admission.opportunity_threshold_met),
             "opportunity threshold must be met before admission"
         );
+        if let Some(admission) = intent.admission.as_ref() {
+            ensure!(
+                meets_expected_profit_after_gas_threshold(
+                    intent.expected_proceeds_token_a_base_units,
+                    intent.expected_cost_token_a_base_units,
+                    admission.maximum_gas_cost_token_a_base_units,
+                )?,
+                "expected profit after gas must be at least {} bps before admission",
+                EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS
+            );
+        }
         ensure!(
             self.journal.active_operations().is_empty(),
             "another trade is active or has unknown exposure"
@@ -2217,8 +2286,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_bounded_profit_is_admitted_when_expected_spread_profit_is_positive() {
+    fn newly_admitted_trade_requires_expected_profit_after_gas_threshold() {
         let mut intent = intent(ExecutionMode::DexFirst);
+        intent.expected_proceeds_token_a_base_units = 1_001;
         intent
             .admission
             .as_mut()
@@ -2227,10 +2297,16 @@ mod tests {
 
         intent.validate().unwrap();
 
-        let path = path("zero-bounded-profit-admitted");
+        let path = path("after-gas-threshold-not-met");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
-        coordinator.admit(intent).unwrap();
+        let error = coordinator.admit(intent).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected profit after gas must be at least 5 bps"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -2338,13 +2414,23 @@ mod tests {
         assert_eq!(payload["top_mismatch_reason"], "bid_quantity_mismatch");
         assert_eq!(payload["expected_profit_bps_x100"], "30000");
         assert_eq!(payload["expected_recovery_loss_token_a_base_units"], "10");
+        assert_eq!(payload["recovery_loss_bound_token_a_base_units"], "10");
         assert_eq!(payload["expected_gas_cost_token_a_base_units"], "1");
+        assert_eq!(
+            payload["expected_gas_burdened_cost_token_a_base_units"],
+            "1001"
+        );
         assert_eq!(
             payload["expected_fully_burdened_cost_token_a_base_units"],
             "1011"
         );
+        assert_eq!(
+            payload["expected_profit_after_gas_token_a_base_units"],
+            "19"
+        );
+        assert_eq!(payload["expected_profit_after_gas_bps_x100"], "18981");
         assert_eq!(payload["expected_bounded_profit_token_a_base_units"], "19");
-        assert_eq!(payload["expected_bounded_profit_bps_x100"], "18793");
+        assert_eq!(payload["expected_bounded_profit_bps_x100"], "18981");
         assert_eq!(payload["realized_primary_cost_token_a_base_units"], "1000");
         assert_eq!(
             payload["realized_primary_proceeds_token_a_base_units"],

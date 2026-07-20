@@ -323,6 +323,16 @@ fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveC
                                                 < current.trade.pool_index)))))))))
 }
 
+fn admission_threshold_rejection_reason(economics: AdmissionEconomics) -> &'static str {
+    if !economics.opportunity_threshold_met {
+        "opportunity_threshold_not_met"
+    } else if economics.expected_profit_after_gas_token_a.is_zero() {
+        "non_positive_bounded_profit"
+    } else {
+        "expected_profit_after_gas_below_threshold"
+    }
+}
+
 const fn adaptive_direction_order(direction: ArbitrageDirection) -> u8 {
     match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => 0,
@@ -1757,7 +1767,9 @@ impl TradingEngine {
             "baseline_cost_token_a_base_units": baseline.map(|candidate| candidate.trade.cost_token_a.to_string()),
             "baseline_proceeds_token_a_base_units": baseline.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
             "baseline_expected_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
+            "baseline_expected_profit_after_gas_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_after_gas_token_a.to_string()),
             "baseline_bounded_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
+            "baseline_recovery_loss_bound_token_a_base_units": baseline.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
             "selected_sizing_mode": if selected.is_some() { "adaptive" } else { "baseline" },
             "selected_direction": selected_for_telemetry.map(|candidate| candidate.direction.as_str()),
             "selected_pool_index": selected_for_telemetry.map(|candidate| candidate.trade.pool_index),
@@ -1765,10 +1777,12 @@ impl TradingEngine {
             "selected_cost_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.cost_token_a.to_string()),
             "selected_proceeds_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
             "selected_expected_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
+            "selected_expected_profit_after_gas_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_after_gas_token_a.to_string()),
             "selected_bounded_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
             "selected_trade_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade_notional.to_string()),
             "selected_unhedged_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.unhedged_notional.to_string()),
             "selected_recovery_loss_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
+            "selected_recovery_loss_bound_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
             "selected_reservation_fits": selected_for_telemetry.map(|candidate| candidate.reservation_fits),
             "fallback_reason": selected.is_none().then_some(fallback_reason),
             "rejection_counts": Value::Object(rejection_counts),
@@ -1902,7 +1916,7 @@ impl TradingEngine {
             return Ok(probe);
         }
         if !economics.meets_threshold {
-            let probe = rejection("spread_threshold");
+            let probe = rejection(admission_threshold_rejection_reason(economics));
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
@@ -2314,7 +2328,7 @@ impl TradingEngine {
                     quote,
                     &pair_id,
                     trade_direction,
-                    "opportunity_threshold_not_met",
+                    admission_threshold_rejection_reason(economics),
                     Some(economics),
                 );
                 continue;
@@ -2346,9 +2360,9 @@ impl TradingEngine {
                     continue;
                 }
             }
-            // The configured spread threshold is the profitability gate.
-            // Worst-case gas/recovery remain reservation and risk-cap inputs,
-            // not a requirement that every failure scenario remain profitable.
+            // Admission requires the candidate to clear both the configured
+            // gross spread proof and the after-gas bounded-profit threshold.
+            // Recovery loss remains a separate risk bound and telemetry field.
             candidates.push((trade_direction, trade, economics, liquidity_source));
         }
         let candidate = candidates
@@ -2419,7 +2433,7 @@ impl TradingEngine {
                 "paper token-A proceeds",
             )?,
             admission: AdmissionRiskBounds {
-                opportunity_threshold_met: economics.meets_threshold,
+                opportunity_threshold_met: economics.opportunity_threshold_met,
                 depth_source: Some(execution_depth_health.source.as_str().to_owned()),
                 depth_age_ms: execution_depth_health.age_ms,
                 depth_update_delta: execution_depth_health.update_delta,
@@ -2592,54 +2606,75 @@ impl TradingEngine {
             }
         }
         let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
-        self.telemetry.emit(
-            "arbitrage_admitted",
-            json!({
-                "engine_id": self.config.engine_id,
-                "plan_id": &plan_id,
-                "mode": self.config.arbitrage_execution_mode,
-                "admission_liquidity_source": liquidity_source,
-                "sizing_mode": if adaptive_candidate.is_some() { "adaptive" } else { "baseline" },
-                "depth_source": execution_depth_health.source.as_str(),
-                "depth_source_reason": execution_depth_health.source_reason,
-                "depth_age_ms": execution_depth_health.age_ms,
-                "depth_update_delta": execution_depth_health.update_delta,
-                "top_matches": execution_depth_health.top_matches,
-                "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
-                "inventory_reservation_policy": "exact_execution_envelope_v1",
-                "evaluation_trigger": evaluation_trigger,
-                "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
-                "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
-                "admission_total_us": duration_us(admission_started.elapsed()),
-                "inventory_reservation_us": inventory_reservation_us,
-                "mailbox_submit_us": mailbox_submit_us,
-                "inventory_claims": self.inventory_claim_details(&claims),
-                "execution_slippage_bps": trade.execution_slippage_bps,
-                "cex_primary_limit_price": match direction {
-                    TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
-                    TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price.to_string(),
-                },
-                "cex_primary_top_quantity": match admission_liquidity {
-                    AdmissionLiquidity::DexFirstTop => Some(economics.primary_quantity.to_string()),
-                    AdmissionLiquidity::FullDepth(_) => None,
-                },
-                "recovery_limit_price": economics.recovery_limit_price.to_string(),
-                "recovery_sell_limit_price": economics.recovery_sell_limit_price.map(|price| price.to_string()),
-                "recovery_buy_limit_price": economics.recovery_buy_limit_price.map(|price| price.to_string()),
-                "recovery_quote_token_a_base_units": economics.recovery_quote_token_a.to_string(),
-                "recovery_sell_quote_token_a_base_units": economics.recovery_sell_quote_token_a.to_string(),
-                "recovery_buy_quote_token_a_base_units": economics.recovery_buy_quote_token_a.to_string(),
-                "recovery_loss_token_a_base_units": economics.recovery_loss_token_a.to_string(),
-                "maximum_gas_wei": economics.maximum_gas_wei.to_string(),
-                "maximum_fee_per_gas_wei": economics.maximum_fee_per_gas_wei.to_string(),
-                "gas_conversion_price_token_a": native_price_token_a.to_string(),
-                "maximum_gas_cost_token_a_base_units": economics.maximum_gas_cost_token_a.to_string(),
-                "expected_profit_token_a_base_units": economics.expected_profit_token_a.to_string(),
-                "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
-                "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
-                "dex_plan": dex_plan_telemetry_value(&dex_plan),
-            }),
+        let mut admitted_payload = json!({
+            "engine_id": self.config.engine_id,
+            "plan_id": &plan_id,
+            "mode": self.config.arbitrage_execution_mode,
+            "admission_liquidity_source": liquidity_source,
+            "sizing_mode": if adaptive_candidate.is_some() { "adaptive" } else { "baseline" },
+            "depth_source": execution_depth_health.source.as_str(),
+            "depth_source_reason": execution_depth_health.source_reason,
+            "depth_age_ms": execution_depth_health.age_ms,
+            "depth_update_delta": execution_depth_health.update_delta,
+            "top_matches": execution_depth_health.top_matches,
+            "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
+            "inventory_reservation_policy": "exact_execution_envelope_v1",
+            "evaluation_trigger": evaluation_trigger,
+            "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
+            "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
+            "admission_total_us": duration_us(admission_started.elapsed()),
+            "inventory_reservation_us": inventory_reservation_us,
+            "mailbox_submit_us": mailbox_submit_us,
+            "inventory_claims": self.inventory_claim_details(&claims),
+            "execution_slippage_bps": trade.execution_slippage_bps,
+            "cex_primary_limit_price": match direction {
+                TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
+                TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price.to_string(),
+            },
+            "cex_primary_top_quantity": match admission_liquidity {
+                AdmissionLiquidity::DexFirstTop => Some(economics.primary_quantity.to_string()),
+                AdmissionLiquidity::FullDepth(_) => None,
+            },
+            "recovery_limit_price": economics.recovery_limit_price.to_string(),
+            "recovery_sell_limit_price": economics.recovery_sell_limit_price.map(|price| price.to_string()),
+            "recovery_buy_limit_price": economics.recovery_buy_limit_price.map(|price| price.to_string()),
+            "recovery_quote_token_a_base_units": economics.recovery_quote_token_a.to_string(),
+            "recovery_sell_quote_token_a_base_units": economics.recovery_sell_quote_token_a.to_string(),
+            "recovery_buy_quote_token_a_base_units": economics.recovery_buy_quote_token_a.to_string(),
+            "recovery_loss_token_a_base_units": economics.recovery_loss_token_a.to_string(),
+            "maximum_gas_wei": economics.maximum_gas_wei.to_string(),
+            "maximum_fee_per_gas_wei": economics.maximum_fee_per_gas_wei.to_string(),
+            "gas_conversion_price_token_a": native_price_token_a.to_string(),
+            "maximum_gas_cost_token_a_base_units": economics.maximum_gas_cost_token_a.to_string(),
+            "expected_profit_token_a_base_units": economics.expected_profit_token_a.to_string(),
+            "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
+            "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
+            "dex_plan": dex_plan_telemetry_value(&dex_plan),
+        });
+        let admitted_object = admitted_payload
+            .as_object_mut()
+            .context("arbitrage admission telemetry payload is not an object")?;
+        admitted_object.insert(
+            "recovery_loss_bound_token_a_base_units".to_owned(),
+            json!(economics.recovery_loss_token_a.to_string()),
         );
+        admitted_object.insert(
+            "gas_burdened_cost_token_a_base_units".to_owned(),
+            json!(economics.gas_burdened_cost_token_a.to_string()),
+        );
+        admitted_object.insert(
+            "expected_profit_after_gas_token_a_base_units".to_owned(),
+            json!(economics.expected_profit_after_gas_token_a.to_string()),
+        );
+        admitted_object.insert(
+            "expected_profit_after_gas_threshold_bps".to_owned(),
+            json!(economics.expected_profit_after_gas_threshold_bps),
+        );
+        admitted_object.insert(
+            "expected_profit_after_gas_threshold_met".to_owned(),
+            json!(economics.expected_profit_after_gas_threshold_met),
+        );
+        self.telemetry.emit("arbitrage_admitted", admitted_payload);
         Ok(false)
     }
 
@@ -2667,12 +2702,17 @@ impl TradingEngine {
                 "recovery_sell_quote_token_a_base_units": economics.map(|value| value.recovery_sell_quote_token_a.to_string()),
                 "recovery_buy_quote_token_a_base_units": economics.map(|value| value.recovery_buy_quote_token_a.to_string()),
                 "recovery_loss_token_a_base_units": economics.map(|value| value.recovery_loss_token_a.to_string()),
+                "recovery_loss_bound_token_a_base_units": economics.map(|value| value.recovery_loss_token_a.to_string()),
                 "maximum_gas_wei": economics.map(|value| value.maximum_gas_wei.to_string()),
                 "maximum_fee_per_gas_wei": economics.map(|value| value.maximum_fee_per_gas_wei.to_string()),
                 "maximum_gas_cost_token_a_base_units": economics.map(|value| value.maximum_gas_cost_token_a.to_string()),
                 "expected_profit_token_a_base_units": economics.map(|value| value.expected_profit_token_a.to_string()),
+                "gas_burdened_cost_token_a_base_units": economics.map(|value| value.gas_burdened_cost_token_a.to_string()),
+                "expected_profit_after_gas_token_a_base_units": economics.map(|value| value.expected_profit_after_gas_token_a.to_string()),
                 "fully_burdened_cost_token_a_base_units": economics.map(|value| value.fully_burdened_cost_token_a.to_string()),
                 "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
+                "expected_profit_after_gas_threshold_bps": economics.map(|value| value.expected_profit_after_gas_threshold_bps),
+                "expected_profit_after_gas_threshold_met": economics.map(|value| value.expected_profit_after_gas_threshold_met),
             }),
         );
     }
@@ -3434,8 +3474,13 @@ mod tests {
             maximum_fee_per_gas_wei: 5,
             maximum_gas_cost_token_a: U256::from(2),
             expected_profit_token_a: U256::from(20),
+            gas_burdened_cost_token_a: U256::from(1_012),
+            expected_profit_after_gas_token_a: U256::from(18),
             fully_burdened_cost_token_a: U256::from(1_077),
-            bounded_profit_token_a: U256::from(1),
+            bounded_profit_token_a: U256::from(18),
+            opportunity_threshold_met: true,
+            expected_profit_after_gas_threshold_bps: 5,
+            expected_profit_after_gas_threshold_met: true,
             native_gas_covered: true,
             meets_threshold: true,
         };
@@ -3501,8 +3546,13 @@ mod tests {
                 maximum_fee_per_gas_wei: 5,
                 maximum_gas_cost_token_a: U256::from(2),
                 expected_profit_token_a: U256::from(expected_profit),
+                gas_burdened_cost_token_a: U256::from(1_002),
+                expected_profit_after_gas_token_a: U256::from(bounded_profit),
                 fully_burdened_cost_token_a: U256::from(1_077),
                 bounded_profit_token_a: U256::from(bounded_profit),
+                opportunity_threshold_met: true,
+                expected_profit_after_gas_threshold_bps: 5,
+                expected_profit_after_gas_threshold_met: true,
                 native_gas_covered: true,
                 meets_threshold: true,
             },
