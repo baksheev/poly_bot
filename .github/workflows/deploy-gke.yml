@@ -21,6 +21,7 @@ env:
   GKE_ZONE: asia-southeast1-b
   GKE_CLUSTER: arb-bot
   GKE_NAMESPACE: arb-bot
+  GCE_INSTANCE: arb-bot-rust-shadow-gce
   ARTIFACT_REPOSITORY: poly-bot
   IMAGE_NAME: poly-bot
   NODE_POOL_PREFIX: arb
@@ -86,6 +87,17 @@ jobs:
         with:
           install_components: alpha
 
+      - name: Verify GCE live owner is stopped
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          status="$(gcloud compute instances describe "${GCE_INSTANCE}" \
+            --zone="${GKE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --format='value(status)')"
+          test "${status}" = "TERMINATED"
+
       - name: Build and push immutable image
         id: image
         env:
@@ -117,7 +129,7 @@ jobs:
           namespace: ${{ env.GKE_NAMESPACE }}
           use_dns_based_endpoint: true
 
-      - name: Replace the fixed release node and roll out
+      - name: Roll out on the fixed node
         id: rollout
         env:
           IMAGE: ${{ steps.image.outputs.image }}
@@ -140,6 +152,8 @@ jobs:
             previous_pool="$(kubectl get deployment arb-bot \
               --namespace "${GKE_NAMESPACE}" \
               -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+            test -n "${previous_pool}"
+            new_pool="${previous_pool}"
           fi
 
           restore_on_failure() {
@@ -200,14 +214,12 @@ jobs:
             --zone="${GKE_ZONE}" \
             --format='value(name)')
 
-          if [[ "${new_pool}" != "${previous_pool}" ]]; then
-            GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
-            GKE_CLUSTER="${GKE_CLUSTER}" \
-            GKE_ZONE="${GKE_ZONE}" \
-            GKE_RELEASE_ID="${release_id}" \
-            GCLOUD_BIN=gcloud \
-              scripts/create-gke-node-pool "${new_pool}"
-          fi
+          GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
+          GKE_CLUSTER="${GKE_CLUSTER}" \
+          GKE_ZONE="${GKE_ZONE}" \
+          GKE_RELEASE_ID="${release_id}" \
+          GCLOUD_BIN=gcloud \
+            scripts/create-gke-node-pool "${new_pool}"
 
           sed \
             -e "s|__GCP_PROJECT_ID__|${GCP_PROJECT_ID}|g" \

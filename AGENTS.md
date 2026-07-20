@@ -6,8 +6,15 @@ a time.
 
 ## Runtime architecture
 
-- Production is one GCP Compute Engine process on a `c4-highcpu-8` VM in
-  `asia-southeast1-b`. Cloud Run is not the latency-sensitive runtime.
+- Production is one application Pod on the private zonal GKE Standard cluster
+  `arb-bot` in `asia-southeast1-b`. It runs on one fixed `c4-highcpu-8` node;
+  Cluster Autoscaler is disabled and application releases reuse that allocated
+  node rather than creating a replacement node pool.
+- The `arb-bot-rust-shadow-gce` VM is a stopped rollback target only. It must
+  remain `TERMINATED` while the GKE Deployment has a nonzero replica count.
+  Never let GCE and GKE control the same wallet, Binance account, orders,
+  journals, or nonces concurrently.
+- Cloud Run is not the latency-sensitive runtime.
 - Keep Binance and DEX market data, strategy state, balances, reservations,
   nonces, positions, and execution context in memory.
 - Postgres and ClickHouse are never part of the critical trading path.
@@ -19,7 +26,7 @@ a time.
   proves another topology is better.
 - Load strategy/chain/token/instrument configuration once from a versioned,
   validated artifact. Rails Postgres is an operator-only export source and must
-  never be a runtime dependency or a GCE runtime secret.
+  never be a runtime dependency or a production runtime secret.
 - Derive Binance subscriptions from the domain artifact; do not create a second
   symbol allowlist in environment variables.
 - Use fixed-point integer or validated decimal representations for financial
@@ -39,13 +46,21 @@ a time.
 - Do not use local Docker for this repository, including builds, tests, tags,
   pushes, or production image inspection that requires pulling an image.
 - Deliver every production application revision through
-  `.github/workflows/deploy-gce.yml` on `main`. The GitHub Action must build and
-  push the `linux/amd64` image, resolve its immutable digest, and roll that exact
-  digest out to GCE.
+  `.github/workflows/deploy-gke.yml` on `main`. The GitHub Action must build and
+  push the production image, resolve its immutable digest, and roll that exact
+  digest out to the existing fixed GKE node only after CI passes and the
+  `production` environment is approved.
+- Do not use `.github/workflows/deploy-gce.yml` for routine production delivery.
+  It is retained only for an explicitly reviewed rollback after the GKE owner
+  is scaled to zero and all active operations are reconciled.
 - Do not run `scripts/update-gce-worker`, build or push a production image from
-  a workstation, or directly change GCE image metadata/restart the instance for
-  an application rollout. Encode production changes in the workflow, commit
-  them, let CI pass, and use the `Deploy GCE` GitHub Action.
+  a workstation, directly restart GCE, run `kubectl apply`/`rollout`/`scale`
+  locally, or create/delete GKE node pools for an application release. Encode
+  production changes in the workflow, commit them, let CI pass, and use the
+  `Deploy GKE` GitHub Action.
+- Application releases must not allocate a fresh C4 node. Replacing or
+  upgrading the fixed node pool is a separate infrastructure change requiring
+  an explicit capacity plan, rollback plan, and reviewed GitHub Action.
 - Local GCP access is for read-only inspection and explicitly requested
   bootstrap or recovery work only. Routine production mutations belong in a
   reviewed GitHub Action so the actor, revision, logs, and outcome are auditable.
