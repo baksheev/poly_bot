@@ -125,6 +125,13 @@ struct ArbitrageSettlementBarrier {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReservationPrecheck {
+    Vacant,
+    Duplicate,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct RebalanceHealthState {
     healthy: bool,
     inflight_stuck: bool,
@@ -151,6 +158,20 @@ fn inventory_venue_label(venue: InventoryVenue) -> &'static str {
     match venue {
         InventoryVenue::Binance => "binance",
         InventoryVenue::Wallet => "wallet",
+    }
+}
+
+fn reservation_precheck(
+    inventory: &InventoryReservations,
+    request: &ReservationRequest,
+) -> ReservationPrecheck {
+    let Some(existing) = inventory.reservation(&request.operation_id) else {
+        return ReservationPrecheck::Vacant;
+    };
+    if existing.request == *request {
+        ReservationPrecheck::Duplicate
+    } else {
+        ReservationPrecheck::Conflict
     }
 }
 
@@ -1540,6 +1561,38 @@ impl TradingEngine {
                 .into_iter()
                 .collect(),
         };
+        match reservation_precheck(&self.inventory, &request) {
+            ReservationPrecheck::Duplicate => {
+                self.telemetry.emit(
+                    "arbitrage_admission_rejected",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "plan_id": plan_id,
+                        "reason": "duplicate_plan_inflight",
+                    }),
+                );
+                return Ok(false);
+            }
+            ReservationPrecheck::Conflict => {
+                tracing::error!(
+                    engine_id = %self.config.engine_id,
+                    pair_id,
+                    pair_symbol,
+                    plan_id,
+                    "arbitrage plan conflicts with its active inventory reservation"
+                );
+                self.telemetry.emit(
+                    "arbitrage_admission_rejected",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "plan_id": plan_id,
+                        "reason": "inventory_reservation_conflict",
+                    }),
+                );
+                return Ok(false);
+            }
+            ReservationPrecheck::Vacant => {}
+        }
         if let Err(error) = self.inventory.reserve(request) {
             let claim_details = self.inventory_claim_details(&claims);
             self.log_trading_inventory_blocked(&pair_id, &pair_symbol, &plan_id, &claim_details);
@@ -1995,14 +2048,20 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
+    use alloy_primitives::U256;
+
     use crate::{
         execution_plan::{DexRoutePlan, DexSwapPlan},
+        inventory::{
+            InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue,
+            ReservationPurpose, ReservationRequest,
+        },
         rebalance::Direction,
     };
 
     use super::{
-        RebalanceSettlementBarrier, TradingReadiness, mark_sequence_matched_update,
-        rebalance_health_state,
+        RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
+        mark_sequence_matched_update, rebalance_health_state, reservation_precheck,
     };
 
     #[test]
@@ -2013,6 +2072,44 @@ mod tests {
         assert!(!mark_sequence_matched_update(&mut updates, "WLDUSDC", 99));
         assert!(mark_sequence_matched_update(&mut updates, "WLDUSDC", 101));
         assert!(mark_sequence_matched_update(&mut updates, "ETHUSDT", 1));
+    }
+
+    #[test]
+    fn active_identical_reservation_is_a_duplicate_not_an_inventory_shortage() {
+        let mut inventory = InventoryReservations::default();
+        inventory
+            .update_venue(
+                InventoryVenue::Binance,
+                1,
+                [("USDC".to_owned(), U256::from(1_000))],
+            )
+            .unwrap();
+        let request = ReservationRequest {
+            operation_id: "paper-plan-1".to_owned(),
+            purpose: ReservationPurpose::TradePrimary,
+            claims: vec![InventoryClaim {
+                key: InventoryKey::new(InventoryVenue::Binance, "USDC").unwrap(),
+                amount: U256::from(100),
+            }],
+            settlement_venues: [InventoryVenue::Binance].into_iter().collect(),
+        };
+
+        assert_eq!(
+            reservation_precheck(&inventory, &request),
+            ReservationPrecheck::Vacant
+        );
+        inventory.reserve(request.clone()).unwrap();
+        assert_eq!(
+            reservation_precheck(&inventory, &request),
+            ReservationPrecheck::Duplicate
+        );
+
+        let mut conflicting = request;
+        conflicting.claims[0].amount = U256::from(200);
+        assert_eq!(
+            reservation_precheck(&inventory, &conflicting),
+            ReservationPrecheck::Conflict
+        );
     }
 
     #[test]
