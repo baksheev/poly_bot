@@ -23,7 +23,8 @@
       "explicit reviewed Rust decision: top-of-book-only adaptive sizing is capped at 40 USDC and must fit the observed top level",
       "explicit reviewed Rust decision: full_live DEX-first runtime readiness is independent of full-depth freshness",
       "explicit reviewed Rust decision: exact execution-envelope inventory claims replace the legacy Rails 3x multiplier",
-      "explicit reviewed Rust decision: the configured 20 bps primary spread is the profitability gate; worst-case gas and recovery remain reservation and risk-cap inputs"
+      "explicit reviewed Rust decision: the configured 20 bps primary spread is the profitability gate; worst-case gas and recovery remain reservation and risk-cap inputs",
+      "explicit reviewed Rust decision: admission rejects Binance top-of-book quotes older than 1000 ms, including DEX-triggered reevaluation"
     ]
   },
   "live_trading_enabled": true,
@@ -78,7 +79,7 @@
       "strategy": {
         "kind": "profit_token_a",
         "opportunity_threshold_bps": 20,
-        "max_quote_age_ms": 30000,
+        "max_quote_age_ms": 1000,
         "min_slippage_bps": 5,
         "max_slippage_bps": 50,
         "slippage_profit_share_bps": 5000,

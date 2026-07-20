@@ -1015,6 +1015,20 @@ mod tests {
     }
 
     #[test]
+    fn entry_preflight_rejects_an_expired_latest_quote() {
+        let handle = EntryPreflightHandle::default();
+        let mut quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 8);
+        quote.received_at = std::time::Instant::now() - std::time::Duration::from_millis(1_001);
+        handle.update_quote(&quote);
+        handle.configure_quote_max_age("WLDUSDC", 1_000);
+        handle.update_dex_pool_generation(0, 1);
+
+        let rejection = handle.check(&opportunity()).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "preflight_quote_age_exceeded");
+    }
+
+    #[test]
     fn entry_preflight_rejects_dex_generation_drift_after_admission() {
         let handle = EntryPreflightHandle::default();
         let quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 8);

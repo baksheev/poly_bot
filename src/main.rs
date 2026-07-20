@@ -833,6 +833,7 @@ async fn run(
         rpc: wallet_rpc,
     } = initialize_dex(&config, domain_config.as_ref()).await?;
     let initial_wallet_head = mirror.latest_head();
+    let (receipt_heads, receipt_head_receiver) = tokio::sync::watch::channel(initial_wallet_head);
     let AlchemyDexStream {
         receiver: mut dex_receiver,
         task: mut dex_task,
@@ -1059,6 +1060,7 @@ async fn run(
             wallet_journal_path.into(),
         )
         .await?;
+        dex_executor.set_receipt_heads(receipt_head_receiver.clone());
         let mut allowance_requirements = Vec::new();
         for token in &initial_wallet_balances.token_balances {
             let required = token.base_units.max(U256::ONE);
@@ -1375,6 +1377,11 @@ async fn run(
                     && *wallet_heads.borrow() != head
                 {
                     wallet_heads.send_replace(head);
+                }
+                if let Some(head) = wallet_head
+                    && *receipt_heads.borrow() != head
+                {
+                    receipt_heads.send_replace(head);
                 }
             }
             result = prepared_receiver.recv() => {

@@ -6,10 +6,10 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, bail, ensure};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    chain::rpc::{JsonRpcClient, ReceiptLog, TransactionReceipt},
+    chain::rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
         EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
@@ -36,7 +36,9 @@ const RAILS_PERMIT2_APPROVAL_GAS_LIMIT: u64 = 120_000;
 const GAS_PRICE_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_SWAP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 const APPROVAL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
-const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const FAST_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const FAST_RECEIPT_POLL_WINDOW: Duration = Duration::from_secs(1);
+const SLOW_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_GAS_LIMIT: u64 = 5_000_000;
 const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
 const PERMIT2_APPROVAL_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -303,6 +305,7 @@ pub struct DexExecutor {
     gas_price: Option<(Instant, u128)>,
     allowance_mutations_enabled: bool,
     last_terminal_receipt: Option<TransactionReceipt>,
+    receipt_heads: Option<watch::Receiver<CanonicalBlock>>,
     latency_telemetry: Option<ExecutionLatencyTelemetry>,
 }
 
@@ -347,9 +350,10 @@ impl DexExecutor {
             transaction_hash, ..
         } = reconciled.outcome
         {
-            let receipt = wait_for_receipt(&rpc, transaction_hash, APPROVAL_CONFIRMATION_TIMEOUT)
-                .await
-                .context("failed to finish known DEX transaction recovery")?;
+            let receipt =
+                wait_for_receipt(&rpc, None, transaction_hash, APPROVAL_CONFIRMATION_TIMEOUT)
+                    .await
+                    .context("failed to finish known DEX transaction recovery")?;
             nonce_lane.record_receipt(&mut journal, receipt)?;
         }
         ensure!(
@@ -364,12 +368,19 @@ impl DexExecutor {
             gas_price: None,
             allowance_mutations_enabled: true,
             last_terminal_receipt: None,
+            receipt_heads: None,
             latency_telemetry: None,
         })
     }
 
     pub fn set_latency_telemetry(&mut self, telemetry: ExecutionLatencyTelemetry) {
         self.latency_telemetry = Some(telemetry);
+    }
+
+    /// Wake receipt lookup from the process-wide Alchemy new-head stream.
+    /// Timed HTTP polling remains the fallback for missed notifications.
+    pub fn set_receipt_heads(&mut self, receiver: watch::Receiver<CanonicalBlock>) {
+        self.receipt_heads = Some(receiver);
     }
 
     fn emit_latency_stage(
@@ -795,7 +806,7 @@ impl DexExecutor {
         );
         let (gas_limit, estimated_gas) = gas_limit_result?;
 
-        let gas_and_balance_started = Instant::now();
+        let gas_price_started = Instant::now();
         let gas_price = self.current_gas_price().await?;
         let max_fee_per_gas = gas_price
             .checked_add(RAILS_PRIORITY_FEE_WEI)
@@ -817,17 +828,18 @@ impl DexExecutor {
             max_fee_per_gas,
             max_priority_fee_per_gas: RAILS_PRIORITY_FEE_WEI.min(max_fee_per_gas),
         };
-        let maximum_cost = call.maximum_native_cost(fee_parameters)?;
-        ensure!(
-            self.rpc.native_balance(self.wallet.address()).await? >= maximum_cost,
-            "wallet native balance cannot cover maximum DEX gas"
-        );
-        self.emit_latency_stage(
-            &operation_id,
-            "gas_and_balance_rpc",
-            gas_and_balance_started,
-            "success",
-        );
+        // Immediate live swaps already passed admission against the in-memory
+        // wallet snapshot and reserve their exact maximum gas envelope. Avoid
+        // repeating eth_getBalance on the latency-sensitive path. Startup
+        // approval writes retain the direct RPC guard.
+        if policy.submission_policy == SwapSubmissionPolicy::SimulateAndEstimate {
+            let maximum_cost = call.maximum_native_cost(fee_parameters)?;
+            ensure!(
+                self.rpc.native_balance(self.wallet.address()).await? >= maximum_cost,
+                "wallet native balance cannot cover maximum DEX gas"
+            );
+        }
+        self.emit_latency_stage(&operation_id, "gas_price_rpc", gas_price_started, "success");
 
         let nonce_and_sign_started = Instant::now();
         let mut nonce_guard = acquire_process_nonce_lock(
@@ -927,8 +939,13 @@ impl DexExecutor {
         );
 
         let confirmation_started = Instant::now();
-        let receipt_result =
-            wait_for_receipt(&self.rpc, submitted, policy.confirmation_timeout).await;
+        let receipt_result = wait_for_receipt(
+            &self.rpc,
+            self.receipt_heads.as_mut(),
+            submitted,
+            policy.confirmation_timeout,
+        )
+        .await;
         self.emit_latency_stage(
             &operation_id,
             "confirmation_rpc",
@@ -1214,19 +1231,40 @@ fn erc20_allowance_calldata(owner: Address, spender: Address) -> Vec<u8> {
 
 async fn wait_for_receipt(
     rpc: &JsonRpcClient,
+    mut head_receiver: Option<&mut watch::Receiver<CanonicalBlock>>,
     transaction_hash: B256,
     timeout: Duration,
 ) -> anyhow::Result<TransactionReceipt> {
+    let started_at = tokio::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(receipt) = rpc.transaction_receipt(transaction_hash).await? {
             return Ok(receipt);
         }
+        let now = tokio::time::Instant::now();
         ensure!(
-            tokio::time::Instant::now() < deadline,
+            now < deadline,
             "timed out waiting for DEX transaction receipt"
         );
-        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+        let interval = if now.duration_since(started_at) < FAST_RECEIPT_POLL_WINDOW {
+            FAST_RECEIPT_POLL_INTERVAL
+        } else {
+            SLOW_RECEIPT_POLL_INTERVAL
+        };
+        let sleep = tokio::time::sleep(interval.min(deadline - now));
+        tokio::pin!(sleep);
+        let head_stream_closed = if let Some(receiver) = head_receiver.as_mut() {
+            tokio::select! {
+                result = receiver.changed() => result.is_err(),
+                () = &mut sleep => false,
+            }
+        } else {
+            sleep.await;
+            false
+        };
+        if head_stream_closed {
+            head_receiver = None;
+        }
     }
 }
 
@@ -1455,8 +1493,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request_count = match outcome {
-            MockOutcome::Revert => 7,
-            MockOutcome::BroadcastRejected => 6,
+            MockOutcome::Revert => 6,
+            MockOutcome::BroadcastRejected => 5,
         };
         let thread = std::thread::spawn(move || {
             let mut transaction_hash = None;
@@ -1475,7 +1513,9 @@ mod tests {
                         panic!("immediate swap unexpectedly called eth_estimateGas")
                     }
                     "eth_gasPrice" => rpc_result(id, json!("0xf4240")),
-                    "eth_getBalance" => rpc_result(id, json!("0xde0b6b3a7640000")),
+                    "eth_getBalance" => {
+                        panic!("immediate swap unexpectedly called eth_getBalance")
+                    }
                     "eth_sendRawTransaction" => match outcome {
                         MockOutcome::Revert => {
                             let raw = request["params"][0].as_str().unwrap();

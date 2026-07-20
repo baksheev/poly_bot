@@ -981,6 +981,50 @@ was a separate production release.
 Changing `dex_first`/`concurrent_hedged` assignment or adding wallets during
 these stages invalidates the isolated adaptive-sizing comparison.
 
+## DEX hot-path freshness and confirmation
+
+Admission uses two distinct clocks and must report both:
+
+- `market_to_admitted_us` is the age of the Binance top-of-book used for the
+  decision;
+- `trigger_to_admitted_us` starts when the event that caused reevaluation is
+  handled (`binance_book_ticker` or `dex_prepared`).
+
+The production artifact sets `strategy.max_quote_age_ms = 1000`. This is an
+execution gate, not telemetry: a DEX-triggered reevaluation of an older Binance
+quote is rejected with `reason = quote_age_exceeded`. Runtime readiness can use
+a different market-data health window; it must not implicitly widen the
+admission quote lifetime.
+
+The immediate live DEX path performs local request validation and resolves the
+predeclared gas envelope without `eth_call` or `eth_estimateGas`. Its native-gas
+capacity is checked during admission against the in-memory wallet snapshot and
+atomically reserved in the exact execution envelope. It therefore must not
+repeat `eth_getBalance` before broadcast. Startup approval transactions retain
+simulation, estimation, and a direct native-balance check.
+
+Receipt detection uses the process-scoped Alchemy `newHeads` subscription to
+wake a lookup immediately. HTTP receipt lookup remains a fail-safe: every 50 ms
+for the first second, then every 250 ms until the bounded confirmation timeout.
+The canonical receipt remains the only source of executed amounts and success
+or revert status.
+
+Waiting for a receipt need not permanently serialize all future DEX execution,
+but multiple in-flight swaps must not be enabled by merely releasing the
+executor mailbox after broadcast. A bounded pipeline first requires:
+
+1. nonce-indexed pending transaction ownership and unknown-outcome recovery;
+2. exact inventory and gas reservations for every in-flight plan;
+3. an in-memory pending-pool overlay that applies each broadcast swap's
+   conservative self-impact before sizing the next opportunity;
+4. ordered canonical receipt application with rollback/rebuild on reorg or
+   revert;
+5. per-plan DEX-first Binance hedging only after that plan's canonical receipt;
+6. a configured maximum in-flight count and a fail-closed stop when the overlay,
+   head stream, nonce lane, or any outcome is uncertain.
+
+Until these invariants exist, the single DEX lane remains the safety boundary.
+
 ## Rollback
 
 For an immediate safety stop, activate the existing live entry-stop control.

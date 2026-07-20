@@ -427,6 +427,16 @@ impl TradingEngine {
                 .entry_preflight
                 .update_dex_pool_generation(pool_index, generation);
         }
+        for pair in domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .filter(|pair| pair.execution_enabled)
+        {
+            execution
+                .entry_preflight
+                .configure_quote_max_age(&pair.binance.symbol, pair.strategy.max_quote_age_ms);
+        }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
         let require_binance_depth =
@@ -1456,7 +1466,14 @@ impl TradingEngine {
                 trigger,
             );
             if let Some(admission) = admission {
-                self.submit_paper_opportunity(quote, evaluation, admission, adaptive_depth)?;
+                self.submit_paper_opportunity(
+                    quote,
+                    evaluation,
+                    admission,
+                    adaptive_depth,
+                    trigger,
+                    calculation_started,
+                )?;
             }
         }
         Ok(())
@@ -2058,6 +2075,8 @@ impl TradingEngine {
         evaluation: PairEvaluation,
         admission_liquidity: AdmissionLiquidity<'_>,
         depth: Option<&SpotDepthBook>,
+        evaluation_trigger: &'static str,
+        evaluation_started_at: Instant,
     ) -> anyhow::Result<bool> {
         let admission_started = Instant::now();
         let Some(handle) = self.paper_trades.clone() else {
@@ -2073,6 +2092,24 @@ impl TradingEngine {
             .iter()
             .find(|config| config.id == pair_id)
             .context("paper opportunity pair is absent from domain config")?;
+        let quote_age = quote.received_at.elapsed();
+        if quote_age > Duration::from_millis(pair_config.strategy.max_quote_age_ms) {
+            self.telemetry.emit(
+                "arbitrage_admission_rejected",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": pair_id,
+                    "symbol": quote.symbol.as_ref(),
+                    "update_id": quote.update_id,
+                    "reason": "quote_age_exceeded",
+                    "evaluation_trigger": evaluation_trigger,
+                    "quote_age_ms": duration_us(quote_age) / 1_000,
+                    "max_quote_age_ms": pair_config.strategy.max_quote_age_ms,
+                    "trigger_to_rejection_us": duration_us(evaluation_started_at.elapsed()),
+                }),
+            );
+            return Ok(false);
+        }
         let adaptive_limits = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)?;
         if !evaluation
             .dex_buy_cex_sell
@@ -2570,7 +2607,9 @@ impl TradingEngine {
                 "top_matches": execution_depth_health.top_matches,
                 "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
                 "inventory_reservation_policy": "exact_execution_envelope_v1",
+                "evaluation_trigger": evaluation_trigger,
                 "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
+                "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
                 "admission_total_us": duration_us(admission_started.elapsed()),
                 "inventory_reservation_us": inventory_reservation_us,
                 "mailbox_submit_us": mailbox_submit_us,

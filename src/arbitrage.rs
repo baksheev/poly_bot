@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -734,6 +734,7 @@ pub struct EntryPreflightHandle {
 #[derive(Clone, Debug, Default)]
 struct EntryPreflightState {
     quotes: BTreeMap<String, TopOfBook>,
+    quote_max_age_ms: BTreeMap<String, u64>,
     dex_pool_generations: BTreeMap<usize, u64>,
 }
 
@@ -744,6 +745,13 @@ pub struct EntryPreflightRejection {
 }
 
 impl EntryPreflightHandle {
+    pub fn configure_quote_max_age(&self, symbol: &str, max_age_ms: u64) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        state.quote_max_age_ms.insert(symbol.to_owned(), max_age_ms);
+    }
+
     pub fn update_quote(&self, quote: &TopOfBook) {
         let Ok(mut state) = self.inner.write() else {
             return;
@@ -785,6 +793,18 @@ impl EntryPreflightHandle {
                 detail: format!("no latest quote for {}", opportunity.symbol),
             }));
         };
+        if let Some(max_age_ms) = state.quote_max_age_ms.get(&opportunity.symbol).copied()
+            && quote.received_at.elapsed() > Duration::from_millis(max_age_ms)
+        {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "preflight_quote_age_exceeded",
+                detail: format!(
+                    "latest quote age {} ms exceeds configured {} ms",
+                    quote.received_at.elapsed().as_millis(),
+                    max_age_ms
+                ),
+            }));
+        }
         if quote.update_id < opportunity.update_id {
             return Ok(Some(EntryPreflightRejection {
                 reason: "stale_preflight_quote",

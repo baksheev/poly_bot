@@ -1042,13 +1042,14 @@ mod tests {
                 .balance_safety_multiplier,
             1
         );
+        assert_eq!(loaded.snapshot().pairs[0].strategy.max_quote_age_ms, 1_000);
         assert_eq!(
             loaded.snapshot().pairs[0].binance.tick_size,
             "0.000100000000000"
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "352790e70f428b496394f16fe9366000a1e11b11f1b25cfb83eeab11e06c7062"
+            "19ac100b29724f7269a053aca566776168ebe5cdd919a63d50aeb7d962a404fe"
         );
     }
 
