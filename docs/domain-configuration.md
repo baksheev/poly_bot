@@ -1,6 +1,6 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated v7 adaptive-shadow live artifact implemented
+Status: v4 read/paper default and separately gated v8 adaptive-live artifact implemented
 Last reviewed: 2026-07-20
 
 ## Runtime boundary
@@ -29,22 +29,22 @@ attached to the production runtime.
 
 ## Captured behavior
 
-The v4-v7 snapshots record:
+The v4-v8 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
 - USDC as token A and WLD as token B, with base-unit decimals;
 - Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
   step/tick size;
-- fixed 20 USDC detector/control notional; v7 additionally records the 200
-  USDC adaptive shadow cap;
+- fixed 20 USDC detector/control notional; v8 executes adaptive whole-step
+  sizing from sequence-matched depth up to the 200 USDC cap;
 - token-B quote sizing derived from the latest Binance ask, matching
   `UpdateMinBuyAmountJob` without its database update loop;
 - opportunity capacity expressed as whole Binance token-B steps, starting at
   that derived baseline and bounded by DEX liquidity, the profit threshold,
   and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, quote age, slippage reserve,
-  DEX fee reserve, and balance safety multiplier;
+  DEX fee reserve, and exact execution-envelope inventory reservations;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
   process's initial combined inventory;
 - the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.
@@ -66,10 +66,11 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v7 artifact has
-both true and is valid only for the explicitly confirmed GKE live path. The
-v5-v6 artifacts remain immutable provenance for previous live releases and
-deserialize to `baseline_only` because they predate `adaptive_sizing`.
+The committed v4 default has both execution gates false. The v8 artifact has
+both true and is valid only for the explicitly confirmed GKE live path. V7 is
+the immutable adaptive-shadow predecessor; v5-v6 remain provenance for earlier
+live releases and deserialize to `baseline_only` because they predate
+`adaptive_sizing`.
 
 ## Refreshing the source data
 

@@ -1,19 +1,17 @@
 # Adaptive arbitrage sizing
 
-Status: Stage 1 shadow implemented; adaptive execution remains disabled
+Status: v8 adaptive execution implemented for GKE production
 Last reviewed: 2026-07-20
 
 ## Implementation status
 
-The v7 production artifact enables `mode = shadow` with a 200 USDC maximum
+The v8 production artifact enables `mode = adaptive` with a 200 USDC maximum
 trade-notional cap. Rust evaluates exact Binance-step quantities for every
 enabled pool against prepared DEX curves and sequence-matched full Binance
-depth, ranks them by bounded absolute profit, and emits
-`arbitrage_adaptive_sizing_evaluated`. The executed plan is still the unchanged
-20 USDC baseline and the event records `execution_size_changed = false`.
-Although `adaptive` is reserved in the typed schema, validation currently
-rejects that mode. This prevents an artifact from claiming active sizing before
-the exact reservation and paper fault-matrix stages are complete.
+depth, ranks them by bounded absolute profit, and publishes the selected
+candidate as the immutable execution plan. The configured 20 USDC amount stays
+the detector/control and fail-closed fallback. Adaptive mode never admits from
+bookTicker alone: it requests sequence-matched depth before selection.
 
 The first shadow optimizer is the exhaustive whole-step reference oracle. It
 is capped at 8,192 exact evaluations per pool; exhausting the cap selects no
@@ -27,10 +25,10 @@ admission batch at about 3.7 ms (676 ns/candidate), while prepared CLMM quotes
 measured 237--360 ns/candidate. Production telemetry, not the workstation
 microbenchmark, decides whether the exhaustive oracle remains enabled.
 
-Active trade reservations intentionally remain on the legacy 3x policy during
-Stage 1. Shadow candidates perform a read-only fit check using their exact
-primary debit; compiling and validating the full branch-prefix execution
-envelope is the next safety slice before any adaptive quantity may execute.
+Trade reservations use `exact_execution_envelope_v1`. The envelope reserves
+the immutable DEX input, the maximum reachable Binance debit, and maximum
+native gas under the same single-owner ledger. The legacy Rails `3x` field is
+readable only for old-artifact compatibility and never multiplies Rust claims.
 
 ## Decision
 
@@ -79,13 +77,12 @@ The current path in `src/engine.rs`:
 
 1. evaluates both directions at the Rails-compatible 20 USDC baseline;
 2. calculates `market_liquidity_capacity` for telemetry;
-3. admits only `direction.baseline`;
-4. evaluates both sides of sequence-consistent Binance depth for the entire
-   token-B quantity;
+3. uses the baseline crossing to open the adaptive search;
+4. evaluates every feasible whole Binance step against both sides of
+   sequence-consistent full depth and every prepared DEX pool;
 5. calculates maximum recovery loss and maximum DEX gas cost;
-6. atomically reserves wallet and Binance inventory; the current implementation
-   still multiplies trade claims by the Rails-era `3x` safety multiplier, which
-   this design replaces with an exact execution-envelope reservation;
+6. atomically reserves the exact wallet, Binance, and native-gas execution
+   envelope with no multiplicative safety factor;
 7. publishes the immutable plan into a latest-pending execution mailbox.
 
 Important implementation facts:
@@ -104,8 +101,8 @@ Important implementation facts:
   not a Rust runtime invariant. Rails needed headroom around slow balance
   refresh and overlapping jobs. Rust has a single inventory owner, continuous
   venue updates, explicit in-flight plans, and deterministic recovery bounds;
-  keeping the multiplier would reject safe larger trades and hide mistakes in
-  the actual execution envelope.
+  Rust therefore ignores it for all trade claims. Old artifacts remain
+  readable, while v8 omits the field entirely.
 - The execution input is a latest-pending mailbox with lane states `available`,
   `busy`, and `blocked_unknown`. It holds at most one pending opportunity.
   A newer admission currently supersedes the pending opportunity
@@ -179,12 +176,12 @@ Adaptive mode must preserve all of the following:
 ## Configuration contract
 
 Add an optional pair-level `adaptive_sizing` object. Its absence means
-`baseline_only`, so v1-v6 artifacts retain their existing behavior. The
-explicit object is present in the reviewed v7 shadow artifact.
+`baseline_only`, so v1-v6 artifacts retain their existing behavior. V7 records
+the shadow predecessor and reviewed v8 uses active adaptive mode.
 
 ```json
 "adaptive_sizing": {
-  "mode": "shadow",
+  "mode": "adaptive",
   "max_trade_notional_token_a_base_units": "200000000",
   "max_unhedged_notional_token_a_base_units": "220000000",
   "max_recovery_loss_token_a_base_units": "2000000",
@@ -386,11 +383,14 @@ The envelope must include:
 - any fee charged in a third asset as its own `(Binance, asset)` claim when the
   hydrated commission mode permits it.
 
-For DEX-buy/CEX-sell, the common primary claims are wallet token A, wallet
-native gas, and Binance token B. For CEX-buy/DEX-sell, they are Binance token A,
-wallet token B, and wallet native gas. Recovery branches can add or increase
-claims; the state-machine calculation, not a direction shortcut, is
-authoritative.
+For DEX-buy/CEX-sell, the executor accounts at most the immutable planned
+token-B amount as hedgeable output; favorable output above that bound remains
+in wallet inventory. Therefore the primary plus residual-recovery Binance WLD
+debit cannot exceed the planned amount. The claims are the exact wallet USDC
+input, planned Binance WLD, and admitted maximum wallet gas. For
+CEX-buy/DEX-sell, the Binance USDC claim is the greater of the admitted primary
+cost and the full-quantity fee-grossed recovery-buy quote; wallet WLD is the
+immutable DEX input, and wallet gas is claimed separately.
 
 Take the maximum cumulative debit across branch prefixes. Taking only the
 largest individual order can under-reserve sequential primary/recovery debits;
@@ -428,31 +428,21 @@ envelope until explicit reconciliation.
 
 ### Migration from the Rails multiplier
 
-Record the migration explicitly in the next pair artifact:
-
-```json
-"inventory_reservation": {
-  "policy": "exact_execution_envelope_v1",
-  "minimum_free_after_reservation": []
-}
-```
-
-`minimum_free_after_reservation` is an optional list of unique
-`(venue, asset, base_units)` floors. It is empty unless an operator explicitly
-allocates inventory that trading may not consume. Values are non-negative
-base-unit integers and duplicate keys fail validation.
+The v8 artifact records the migration in its immutable snapshot ID and source
+evidence. `exact_execution_envelope_v1` is a Rust safety invariant rather than
+an operator-selectable policy, so configuration cannot switch live execution
+back to the legacy multiplier. Explicit per-venue minimum-free floors may be
+added later if an operator decides to segregate working capital.
 
 - Apply the exact-envelope policy to baseline and adaptive trades through the
   same coordinator boundary; do not maintain two reservation algorithms.
 - Keep `balance_safety_multiplier` readable only for old artifact compatibility
-  while v1-v5 remain replayable. The next artifact records the exact-envelope
-  policy explicitly and does not use the multiplier for trade claims.
+  while older snapshots remain replayable. V8 omits it, and Rust does not use
+  it for baseline or adaptive claims.
 - Rebalance continues to reserve its exact source debit through the shared
   inventory owner.
-- Compare legacy `3x` claims and exact-envelope claims in shadow telemetry
-  before changing live admission. Any case where the exact envelope exceeds the
-  legacy claim blocks rollout until explained; it can expose either an unsafe
-  legacy heuristic or a defect in the new branch model.
+- Emit the exact claims with each admission so production reconciliation can
+  compare the immutable envelope with realized venue debits.
 
 ## Capital budget for trading during rebalance
 
@@ -879,6 +869,11 @@ each comparison.
 
 ## Rollout
 
+V8 is the explicitly reviewed capped-live artifact. It activates the 200 USDC
+cap directly by operator decision; the stages below remain the evidence model
+and rollback checklist rather than an assertion that every intermediate cap
+was a separate production release.
+
 ### Stage 0: implementation without execution-size changes
 
 - Add config, types, dynamic sizing, selection, and telemetry.
@@ -953,18 +948,17 @@ existing plans.
 ## Implementation slices
 
 1. Add `AdaptiveSizingConfig`, validation, old-artifact compatibility, and a v7
-   shadow artifact.
+   shadow artifact. Complete.
 2. Add pure direction-specific exact candidate evaluation over every prepared
    pool and whole-step quantity.
 3. Compile exact per-key reservation envelopes from the persisted coordinator
-   command graph and emit legacy-versus-exact shadow telemetry.
-4. Add exact admission/cap evaluation and deterministic selection with no
-   execution-size change.
-5. Add shadow telemetry and replay/latency benchmarks.
+   graph, including native gas. Complete in v8.
+4. Add exact admission/cap evaluation and deterministic selection. Complete.
+5. Add shadow telemetry and replay/latency benchmarks. Complete in v7.
 6. Add plan/journal/result fields and baseline/adaptive coordinator fixtures.
 7. Extend latest-pending supersession telemetry with old/new sizing economics.
-8. Enable exact-envelope reservations and adaptive sizing in paper; complete
-   composed fault/restart tests.
+8. Enable exact-envelope reservations and adaptive sizing in the shared
+   paper/live coordinator path. Complete in v8; production evidence continues.
 9. Make the rebalance trigger account for active/pending trade reservations and
    the maximum next-plan debit; emit projected/realized post-trigger runway.
 10. Add durable rebalance cycle IDs and a replay/report that calculates joint
@@ -985,7 +979,7 @@ Primary code touch points:
 - `src/arbitrage.rs` and `src/live_execution.rs` for immutable plan fields and
   entry-channel behavior;
 - `src/hot_telemetry.rs` and result payloads;
-- `config/strategies/usdc-wld-world-chain.v7.json`;
+- `config/strategies/usdc-wld-world-chain.v8.json`;
 - monitor/comparison scripts and `docs/trading-runbook.md`.
 
 ## Verification and acceptance

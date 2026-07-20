@@ -166,10 +166,11 @@ repeating a transfer while adding no fixed delay after the balances refresh.
 The barrier does not affect trading readiness.
 
 This matches the production Rails behavior: rebalance runs independently,
-while an arbitrage opportunity is admitted only after checking the exact
-wallet and Binance sell assets. Rails requires the configured `3x` balance
-safety multiplier and atomically reserves the wallet sell amount before
-enqueueing execution. Rails separately uses a 10-second
+while an arbitrage opportunity is admitted only after atomically reserving its
+exact direction-specific wallet, Binance, and native-gas execution envelope.
+Rails requires a configured `3x` balance multiplier; Rust deliberately removes
+that slow-refresh heuristic and owns every in-flight debit explicitly. Rails
+separately uses a 10-second
 `RebalanceTransferLock` keyed by wallet, token, and direction after completed
 transfers. Rust replaces that heuristic TTL with executor credit evidence plus
 the continuous-snapshot settlement barrier. Neither implementation rejects

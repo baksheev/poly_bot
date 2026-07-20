@@ -64,6 +64,11 @@ jobs:
             [[ "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]
             test -n "${limit//[0.]/}"
           done
+          domain_config=config/strategies/usdc-wld-world-chain.v8.json
+          test "$(jq -r '.pairs[0].adaptive_sizing.mode' "${domain_config}")" = adaptive
+          test "$(jq -r '.pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units' "${domain_config}")" = 200000000
+          test "$(jq -r '.pairs[0].quote_sizing.token_a_base_units' "${domain_config}")" = 20000000
+          test "$(jq -r '.pairs[0].strategy | has("balance_safety_multiplier")' "${domain_config}")" = false
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -272,7 +277,7 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
-            = config/strategies/usdc-wld-world-chain.v7.json
+            = config/strategies/usdc-wld-world-chain.v8.json
           test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${runtime_config}")" \
             = full_live
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \

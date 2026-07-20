@@ -288,10 +288,6 @@ impl AdaptiveSizingConfig {
     }
 
     fn validate(&self, baseline_token_a: &str) -> anyhow::Result<()> {
-        ensure!(
-            !matches!(self, Self::Adaptive { .. }),
-            "adaptive sizing execution is not enabled; use shadow"
-        );
         let Some(limits) = self.limits() else {
             return Ok(());
         };
@@ -547,7 +543,14 @@ pub struct StrategyConfig {
     pub max_slippage_bps: u16,
     pub slippage_profit_share_bps: u16,
     pub dex_fee_reserve_bps: u16,
+    /// Read-only compatibility for pre-adaptive artifacts. Rust inventory
+    /// reservations use an exact execution envelope and never multiply claims.
+    #[serde(default = "default_legacy_balance_safety_multiplier")]
     pub balance_safety_multiplier: u16,
+}
+
+const fn default_legacy_balance_safety_multiplier() -> u16 {
+    1
 }
 
 impl StrategyConfig {
@@ -835,7 +838,9 @@ mod tests {
     const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v4.json");
     const LEGACY_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v6.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v7.json");
+    const SHADOW_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v7.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v8.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -910,7 +915,11 @@ mod tests {
                 "min_incremental_bounded_profit_token_a_base_units": "0"
             });
         });
-        assert!(load(&active).is_err());
+        let loaded = load(&active).unwrap();
+        assert_eq!(
+            loaded.snapshot().pairs[0].adaptive_sizing.mode(),
+            "adaptive"
+        );
     }
 
     #[test]
@@ -929,14 +938,23 @@ mod tests {
         let loaded = load(LIVE_CONFIG.as_bytes()).unwrap();
         assert!(loaded.snapshot().live_trading_enabled);
         assert!(loaded.snapshot().pairs[0].execution_enabled);
-        assert_eq!(loaded.snapshot().pairs[0].adaptive_sizing.mode(), "shadow");
+        assert_eq!(
+            loaded.snapshot().pairs[0].adaptive_sizing.mode(),
+            "adaptive"
+        );
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .strategy
+                .balance_safety_multiplier,
+            1
+        );
         assert_eq!(
             loaded.snapshot().pairs[0].binance.tick_size,
             "0.000100000000000"
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "ee10bb77f0aa4e14f15076239f13c63784c9eee51ff2a73d5f62f9220ddc30fb"
+            "cbe3d3ab9cc5f3ca29886b8804970250e06acbae3d3d5e9e5c385455d351da93"
         );
     }
 
@@ -946,6 +964,18 @@ mod tests {
         assert_eq!(
             loaded.snapshot().pairs[0].adaptive_sizing,
             AdaptiveSizingConfig::BaselineOnly
+        );
+    }
+
+    #[test]
+    fn v7_live_snapshot_remains_readable_as_adaptive_shadow() {
+        let loaded = load(SHADOW_LIVE_CONFIG.as_bytes()).unwrap();
+        assert_eq!(loaded.snapshot().pairs[0].adaptive_sizing.mode(), "shadow");
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .strategy
+                .balance_safety_multiplier,
+            3
         );
     }
 

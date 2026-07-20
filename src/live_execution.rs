@@ -152,7 +152,20 @@ impl ComposedLiveLegExecutor {
                             );
                         }
                         match dex_leg_result(intent.direction, outcome, gas) {
-                            Ok(result) => (role, result),
+                            Ok(mut result) => {
+                                if let Some(surplus) = cap_dex_credit_to_execution_envelope(
+                                    intent.direction,
+                                    intent.planned_token_b_base_units,
+                                    &mut result,
+                                ) {
+                                    tracing::info!(
+                                        operation_id,
+                                        surplus_token_b_base_units = surplus,
+                                        "favorable DEX output above the immutable hedge envelope remains in wallet inventory"
+                                    );
+                                }
+                                (role, result)
+                            }
                             Err(error) => {
                                 tracing::error!(operation_id, error = %error, "DEX receipt accounting is unknown");
                                 unknown(role, "dex:accounting-unknown")
@@ -605,6 +618,27 @@ fn dex_filled(operation: &TradeOperation) -> bool {
     })
 }
 
+/// Keeps every Binance sell command reachable from a DEX-buy plan inside the
+/// immutable WLD reservation. Favorable DEX output is real wallet inventory,
+/// but it is outside this trade's hedge/recovery graph and is reconciled by the
+/// next wallet snapshot and rebalance cycle.
+fn cap_dex_credit_to_execution_envelope(
+    direction: crate::arbitrage::ArbitrageDirection,
+    planned_token_b_base_units: i128,
+    result: &mut LegResult,
+) -> Option<i128> {
+    if direction != crate::arbitrage::ArbitrageDirection::BuyTokenBOnDexSellOnCex
+        || result.token_b_delta_base_units <= planned_token_b_base_units
+    {
+        return None;
+    }
+    let surplus = result
+        .token_b_delta_base_units
+        .saturating_sub(planned_token_b_base_units);
+    result.token_b_delta_base_units = planned_token_b_base_units;
+    Some(surplus)
+}
+
 fn failed(role: LegRole, reference: &str) -> (LegRole, LegResult) {
     failed_with_gas(role, 0, reference)
 }
@@ -657,8 +691,8 @@ mod tests {
         },
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
-            LegFuture, LiveLegExecutor, LiveRiskLimits, failed, failed_with_gas,
-            live_trade_channel, unknown,
+            LegFuture, LiveLegExecutor, LiveRiskLimits, cap_dex_credit_to_execution_envelope,
+            failed, failed_with_gas, live_trade_channel, unknown,
         },
         telemetry::TelemetryHandle,
     };
@@ -855,6 +889,31 @@ mod tests {
                 .gas_cost_token_a_base_units,
             123
         );
+    }
+
+    #[test]
+    fn favorable_dex_buy_surplus_stays_outside_the_cex_execution_envelope() {
+        let mut dex_result = result(125, -1_000, 5, "dex:surplus");
+
+        let surplus = cap_dex_credit_to_execution_envelope(
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            100,
+            &mut dex_result,
+        );
+
+        assert_eq!(surplus, Some(25));
+        assert_eq!(dex_result.token_b_delta_base_units, 100);
+
+        let mut dex_sell = result(-100, 1_025, 5, "dex:sell");
+        assert_eq!(
+            cap_dex_credit_to_execution_envelope(
+                ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+                100,
+                &mut dex_sell,
+            ),
+            None
+        );
+        assert_eq!(dex_sell.token_b_delta_base_units, -100);
     }
 
     #[test]
