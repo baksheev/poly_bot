@@ -2934,8 +2934,12 @@ impl TradingEngine {
 
     fn refresh_phase(&mut self, now: Instant) {
         let previous = self.state.phase;
-        let dex_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms)
-            && self.opportunities.is_ready();
+        let binance_ready = self
+            .state
+            .binance_ready(now, self.config.market_data_max_age_ms);
+        let dex_mirror_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms);
+        let dex_prepared_ready = self.opportunities.is_ready();
+        let dex_ready = dex_mirror_ready && dex_prepared_ready;
         let balances_ready = self
             .state
             .balances
@@ -2945,15 +2949,17 @@ impl TradingEngine {
         // serialize only rebalance operations. Trading remains gated by fresh
         // market/DEX/balance inputs; an execution coordinator must separately
         // reserve and validate the assets required by its concrete trade.
+        let user_data_ready = self.binance_user_data_connected && self.binance_user_data_clean;
+        let gas_price_fresh = self.gas_price_book.as_ref().is_some_and(|book| {
+            now.saturating_duration_since(book.received_at).as_millis()
+                <= u128::from(self.config.market_data_max_age_ms)
+        });
+        let gas_price_ready = self.gas_price_connected && gas_price_fresh;
         let trading_readiness = TradingReadiness {
             dex_ready,
             balances_ready,
-            user_data_ready: self.binance_user_data_connected && self.binance_user_data_clean,
-            gas_price_ready: self.gas_price_connected
-                && self.gas_price_book.as_ref().is_some_and(|book| {
-                    now.saturating_duration_since(book.received_at).as_millis()
-                        <= u128::from(self.config.market_data_max_age_ms)
-                }),
+            user_data_ready,
+            gas_price_ready,
         };
         let current = self.state.refresh_phase(
             now,
@@ -2961,6 +2967,17 @@ impl TradingEngine {
             trading_readiness.ready(),
         );
         if previous != current {
+            let blocking_inputs = [
+                (!binance_ready).then_some("binance_top"),
+                (!dex_mirror_ready).then_some("dex_mirror"),
+                (!dex_prepared_ready).then_some("dex_prepared"),
+                (!balances_ready).then_some("balances"),
+                (!user_data_ready).then_some("binance_user_data"),
+                (!gas_price_ready).then_some("gas_price"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
             tracing::info!(?previous, ?current, "runtime phase changed");
             self.telemetry.emit(
                 "runtime_phase_changed",
@@ -2968,6 +2985,17 @@ impl TradingEngine {
                     "engine_id": self.config.engine_id,
                     "previous": previous,
                     "current": current,
+                    "binance_top_ready": binance_ready,
+                    "dex_mirror_ready": dex_mirror_ready,
+                    "dex_prepared_ready": dex_prepared_ready,
+                    "balances_ready": balances_ready,
+                    "binance_user_data_connected": self.binance_user_data_connected,
+                    "binance_user_data_clean": self.binance_user_data_clean,
+                    "binance_user_data_ready": user_data_ready,
+                    "gas_price_connected": self.gas_price_connected,
+                    "gas_price_fresh": gas_price_fresh,
+                    "gas_price_ready": gas_price_ready,
+                    "blocking_inputs": blocking_inputs,
                 }),
             );
         }

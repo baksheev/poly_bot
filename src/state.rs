@@ -270,8 +270,21 @@ impl RuntimeState {
             return self.phase;
         }
 
-        let ready = external_ready
-            && !self.binance_feeds.is_empty()
+        let ready = external_ready && self.binance_ready(now, max_age_ms);
+
+        self.phase = if ready {
+            self.ever_ready = true;
+            RuntimePhase::Ready
+        } else if self.ever_ready {
+            RuntimePhase::Degraded
+        } else {
+            RuntimePhase::Starting
+        };
+        self.phase
+    }
+
+    pub fn binance_ready(&self, now: Instant, max_age_ms: u64) -> bool {
+        !self.binance_feeds.is_empty()
             && self.binance_feeds.values().all(|feed| {
                 feed.connected
                     && feed.book.as_ref().is_some_and(|book| {
@@ -283,17 +296,7 @@ impl RuntimeState {
                             now.saturating_duration_since(received_at).as_millis()
                                 <= u128::from(max_age_ms)
                         }))
-            });
-
-        self.phase = if ready {
-            self.ever_ready = true;
-            RuntimePhase::Ready
-        } else if self.ever_ready {
-            RuntimePhase::Degraded
-        } else {
-            RuntimePhase::Starting
-        };
-        self.phase
+            })
     }
 
     pub fn stop(&mut self) {
