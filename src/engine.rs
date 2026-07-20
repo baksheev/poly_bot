@@ -117,8 +117,8 @@ struct AdaptiveSizingRuntimeLimits {
     max_trade_notional: U256,
     max_unhedged_notional: U256,
     max_recovery_loss: U256,
-    min_bounded_profit: U256,
-    min_incremental_bounded_profit: U256,
+    min_expected_profit: U256,
+    min_incremental_expected_profit: U256,
 }
 
 impl AdaptiveSizingRuntimeLimits {
@@ -134,9 +134,9 @@ impl AdaptiveSizingRuntimeLimits {
             max_trade_notional: parse(limits.max_trade_notional, "trade cap")?,
             max_unhedged_notional: parse(limits.max_unhedged_notional, "exposure cap")?,
             max_recovery_loss: parse(limits.max_recovery_loss, "recovery-loss cap")?,
-            min_bounded_profit: parse(limits.min_bounded_profit, "bounded-profit floor")?,
-            min_incremental_bounded_profit: parse(
-                limits.min_incremental_bounded_profit,
+            min_expected_profit: parse(limits.min_expected_profit, "expected-profit floor")?,
+            min_incremental_expected_profit: parse(
+                limits.min_incremental_expected_profit,
                 "incremental-profit floor",
             )?,
         }))
@@ -242,8 +242,9 @@ fn inventory_venue_label(venue: InventoryVenue) -> &'static str {
 }
 
 fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveCandidate) -> bool {
-    candidate.economics.bounded_profit_token_a > current.economics.bounded_profit_token_a
-        || (candidate.economics.bounded_profit_token_a == current.economics.bounded_profit_token_a
+    candidate.economics.expected_profit_token_a > current.economics.expected_profit_token_a
+        || (candidate.economics.expected_profit_token_a
+            == current.economics.expected_profit_token_a
             && (candidate.unhedged_notional < current.unhedged_notional
                 || (candidate.unhedged_notional == current.unhedged_notional
                     && (candidate.trade_notional < current.trade_notional
@@ -1454,7 +1455,7 @@ impl TradingEngine {
                 binance_sell_fee_bps: pair.binance_sell_fee_bps,
                 expected_cost_token_a: baseline_trade.cost_token_a,
                 expected_proceeds_token_a: baseline_trade.proceeds_token_a,
-                opportunity_threshold_bps: pair.opportunity_threshold_bps,
+                opportunity_threshold_met: baseline_trade.meets_threshold,
                 network_gas_price_wei,
                 native_price_token_a,
                 wallet_native_balance_wei,
@@ -1524,9 +1525,10 @@ impl TradingEngine {
             }
             let required = baseline
                 .economics
-                .bounded_profit_token_a
-                .checked_add(limits.min_incremental_bounded_profit);
-            if required.is_none_or(|required| candidate.economics.bounded_profit_token_a < required)
+                .expected_profit_token_a
+                .checked_add(limits.min_incremental_expected_profit);
+            if required
+                .is_none_or(|required| candidate.economics.expected_profit_token_a < required)
             {
                 fallback_reason = "incremental_profit_floor";
                 return false;
@@ -1543,7 +1545,7 @@ impl TradingEngine {
                 baseline_by_direction
                     .into_iter()
                     .flatten()
-                    .max_by_key(|candidate| candidate.economics.bounded_profit_token_a)
+                    .max_by_key(|candidate| candidate.economics.expected_profit_token_a)
             });
         let selected_for_telemetry = selected.or(baseline);
         let execution_candidate = matches!(
@@ -1572,13 +1574,14 @@ impl TradingEngine {
                 "max_trade_notional_token_a_base_units": limits.max_trade_notional.to_string(),
                 "max_unhedged_notional_token_a_base_units": limits.max_unhedged_notional.to_string(),
                 "max_recovery_loss_token_a_base_units": limits.max_recovery_loss.to_string(),
-                "min_bounded_profit_token_a_base_units": limits.min_bounded_profit.to_string(),
-                "min_incremental_bounded_profit_token_a_base_units": limits.min_incremental_bounded_profit.to_string(),
+                "min_expected_profit_token_a_base_units": limits.min_expected_profit.to_string(),
+                "min_incremental_expected_profit_token_a_base_units": limits.min_incremental_expected_profit.to_string(),
                 "baseline_direction": baseline.map(|candidate| candidate.direction.as_str()),
                 "baseline_pool_index": baseline.map(|candidate| candidate.trade.pool_index),
                 "baseline_token_b_base_units": baseline.map(|candidate| candidate.trade.token_b_amount.to_string()),
                 "baseline_cost_token_a_base_units": baseline.map(|candidate| candidate.trade.cost_token_a.to_string()),
                 "baseline_proceeds_token_a_base_units": baseline.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
+                "baseline_expected_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
                 "baseline_bounded_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
                 "selected_sizing_mode": if selected.is_some() { "adaptive" } else { "baseline" },
                 "selected_direction": selected_for_telemetry.map(|candidate| candidate.direction.as_str()),
@@ -1586,6 +1589,7 @@ impl TradingEngine {
                 "selected_token_b_base_units": selected_for_telemetry.map(|candidate| candidate.trade.token_b_amount.to_string()),
                 "selected_cost_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.cost_token_a.to_string()),
                 "selected_proceeds_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
+                "selected_expected_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
                 "selected_bounded_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
                 "selected_trade_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade_notional.to_string()),
                 "selected_unhedged_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.unhedged_notional.to_string()),
@@ -1670,7 +1674,7 @@ impl TradingEngine {
             binance_sell_fee_bps: pair.binance_sell_fee_bps,
             expected_cost_token_a: trade.cost_token_a,
             expected_proceeds_token_a: trade.proceeds_token_a,
-            opportunity_threshold_bps: pair.opportunity_threshold_bps,
+            opportunity_threshold_met: trade.meets_threshold,
             network_gas_price_wei,
             native_price_token_a,
             wallet_native_balance_wei,
@@ -1682,6 +1686,11 @@ impl TradingEngine {
         };
         if !economics.native_gas_covered {
             let probe = rejection("gas");
+            search.record(token_b_amount, probe);
+            return Ok(probe);
+        }
+        if !economics.meets_threshold {
+            let probe = rejection("spread_threshold");
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
@@ -1698,8 +1707,8 @@ impl TradingEngine {
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
-        if economics.bounded_profit_token_a < limits.min_bounded_profit {
-            let probe = rejection("bounded_profit_floor");
+        if economics.expected_profit_token_a < limits.min_expected_profit {
+            let probe = rejection("expected_profit_floor");
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
@@ -1871,6 +1880,7 @@ impl TradingEngine {
             pair_config.adaptive_sizing,
             AdaptiveSizingConfig::Adaptive { .. }
         );
+        let adaptive_limits = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)?;
         if adaptive_execution && matches!(admission_liquidity, AdmissionLiquidity::DexFirstTop) {
             self.telemetry.emit(
                 "arbitrage_admission_deferred",
@@ -1888,7 +1898,6 @@ impl TradingEngine {
         let token_b_decimals = pair.token_b_decimals;
         let binance_buy_fee_bps = pair.binance_buy_fee_bps;
         let binance_sell_fee_bps = pair.binance_sell_fee_bps;
-        let opportunity_threshold_bps = pair.opportunity_threshold_bps;
         let baseline_token_a = pair.baseline_token_a();
         let token_b_step = pair.token_b_step();
         let wallet = self
@@ -1980,7 +1989,7 @@ impl TradingEngine {
                 binance_sell_fee_bps,
                 expected_cost_token_a: trade.cost_token_a,
                 expected_proceeds_token_a: trade.proceeds_token_a,
-                opportunity_threshold_bps,
+                opportunity_threshold_met: trade.meets_threshold,
                 network_gas_price_wei,
                 native_price_token_a,
                 wallet_native_balance_wei,
@@ -2031,25 +2040,51 @@ impl TradingEngine {
                 );
                 continue;
             }
-            if economics.bounded_profit_token_a == U256::ZERO {
+            if !economics.meets_threshold {
                 self.emit_admission_risk_rejection(
                     quote,
                     &pair_id,
                     trade_direction,
-                    "non_positive_bounded_profit",
+                    "opportunity_threshold_not_met",
                     Some(economics),
                 );
                 continue;
             }
-            // Rails gates opportunity admission on the gross venue spread.
-            // Keep the fully-burdened economics in telemetry and use them to
-            // rank candidates, but do not turn them into a hidden Rust-only
-            // threshold.
+            if let Some(limits) = adaptive_limits {
+                let trade_notional = trade.cost_token_a.max(trade.proceeds_token_a);
+                let unhedged_notional = economics
+                    .recovery_sell_quote_token_a
+                    .max(economics.recovery_buy_quote_token_a);
+                let rejection_reason = if trade_notional > limits.max_trade_notional {
+                    Some("trade_notional_cap")
+                } else if unhedged_notional > limits.max_unhedged_notional {
+                    Some("unhedged_notional_cap")
+                } else if economics.recovery_loss_token_a > limits.max_recovery_loss {
+                    Some("recovery_loss_cap")
+                } else if economics.expected_profit_token_a < limits.min_expected_profit {
+                    Some("expected_profit_floor")
+                } else {
+                    None
+                };
+                if let Some(reason) = rejection_reason {
+                    self.emit_admission_risk_rejection(
+                        quote,
+                        &pair_id,
+                        trade_direction,
+                        reason,
+                        Some(economics),
+                    );
+                    continue;
+                }
+            }
+            // The configured spread threshold is the profitability gate.
+            // Worst-case gas/recovery remain reservation and risk-cap inputs,
+            // not a requirement that every failure scenario remain profitable.
             candidates.push((trade_direction, trade, economics, liquidity_source));
         }
         let candidate = candidates
             .into_iter()
-            .max_by_key(|(_, _, economics, _)| economics.bounded_profit_token_a);
+            .max_by_key(|(_, _, economics, _)| economics.expected_profit_token_a);
         let Some((direction, trade, economics, liquidity_source)) = candidate else {
             return Ok(needs_depth_fallback);
         };
@@ -2115,6 +2150,7 @@ impl TradingEngine {
                 "paper token-A proceeds",
             )?,
             admission: AdmissionRiskBounds {
+                opportunity_threshold_met: economics.meets_threshold,
                 execution_slippage_bps: trade.execution_slippage_bps,
                 cex_primary_limit_price: match direction {
                     TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
@@ -2306,6 +2342,7 @@ impl TradingEngine {
                 "maximum_fee_per_gas_wei": economics.maximum_fee_per_gas_wei.to_string(),
                 "gas_conversion_price_token_a": native_price_token_a.to_string(),
                 "maximum_gas_cost_token_a_base_units": economics.maximum_gas_cost_token_a.to_string(),
+                "expected_profit_token_a_base_units": economics.expected_profit_token_a.to_string(),
                 "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
                 "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
                 "dex_plan": dex_plan_telemetry_value(&dex_plan),
@@ -2341,6 +2378,7 @@ impl TradingEngine {
                 "maximum_gas_wei": economics.map(|value| value.maximum_gas_wei.to_string()),
                 "maximum_fee_per_gas_wei": economics.map(|value| value.maximum_fee_per_gas_wei.to_string()),
                 "maximum_gas_cost_token_a_base_units": economics.map(|value| value.maximum_gas_cost_token_a.to_string()),
+                "expected_profit_token_a_base_units": economics.map(|value| value.expected_profit_token_a.to_string()),
                 "fully_burdened_cost_token_a_base_units": economics.map(|value| value.fully_burdened_cost_token_a.to_string()),
                 "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
             }),
@@ -2719,14 +2757,14 @@ mod tests {
             InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue,
             ReservationPurpose, ReservationRequest,
         },
-        opportunity::TradeEvaluation,
+        opportunity::{ArbitrageDirection as SizingDirection, TradeEvaluation},
         rebalance::Direction,
     };
 
     use super::{
-        RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
-        exact_execution_envelope_amounts, mark_sequence_matched_update, rebalance_health_state,
-        reservation_precheck,
+        AdaptiveCandidate, RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
+        adaptive_candidate_is_better, exact_execution_envelope_amounts,
+        mark_sequence_matched_update, rebalance_health_state, reservation_precheck,
     };
 
     #[test]
@@ -2832,6 +2870,7 @@ mod tests {
             maximum_gas_wei: U256::from(25),
             maximum_fee_per_gas_wei: 5,
             maximum_gas_cost_token_a: U256::from(2),
+            expected_profit_token_a: U256::from(20),
             fully_burdened_cost_token_a: U256::from(1_077),
             bounded_profit_token_a: U256::from(1),
             native_gas_covered: true,
@@ -2856,6 +2895,58 @@ mod tests {
             ),
             (U256::from(1_075), U256::from(100), U256::from(25))
         );
+    }
+
+    #[test]
+    fn adaptive_optimizer_ranks_expected_spread_profit_not_tail_scenario_profit() {
+        let candidate = adaptive_candidate_for_ranking(100, 0);
+        let current = adaptive_candidate_for_ranking(90, 50);
+
+        assert!(adaptive_candidate_is_better(candidate, current));
+        assert!(!adaptive_candidate_is_better(current, candidate));
+    }
+
+    fn adaptive_candidate_for_ranking(
+        expected_profit: u64,
+        bounded_profit: u64,
+    ) -> AdaptiveCandidate {
+        let trade = TradeEvaluation {
+            pool_index: 0,
+            token_b_amount: U256::from(100),
+            dex_token_a_amount: U256::from(900),
+            cex_token_a_amount: U256::from(1_000),
+            cost_token_a: U256::from(1_000),
+            proceeds_token_a: U256::from(1_000 + expected_profit),
+            execution_slippage_bps: 10,
+            gross_profit_bps_x100: 2_000,
+            profit_bps_x100: 1_000,
+            meets_threshold: true,
+        };
+        AdaptiveCandidate {
+            direction: SizingDirection::BuyTokenBOnDexSellOnCex,
+            trade,
+            economics: AdmissionEconomics {
+                primary_quantity: Decimal::from(100),
+                recovery_limit_price: Decimal::ONE,
+                recovery_quote_token_a: U256::from(1_050),
+                recovery_sell_limit_price: Some(Decimal::ONE),
+                recovery_sell_quote_token_a: U256::from(990),
+                recovery_buy_limit_price: Some(Decimal::ONE),
+                recovery_buy_quote_token_a: U256::from(1_075),
+                recovery_loss_token_a: U256::from(65),
+                maximum_gas_wei: U256::from(25),
+                maximum_fee_per_gas_wei: 5,
+                maximum_gas_cost_token_a: U256::from(2),
+                expected_profit_token_a: U256::from(expected_profit),
+                fully_burdened_cost_token_a: U256::from(1_077),
+                bounded_profit_token_a: U256::from(bounded_profit),
+                native_gas_covered: true,
+                meets_threshold: true,
+            },
+            trade_notional: trade.proceeds_token_a,
+            unhedged_notional: U256::from(1_075),
+            reservation_fits: true,
+        }
     }
 
     #[test]

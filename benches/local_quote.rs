@@ -107,7 +107,7 @@ fn measure_adaptive_admission_batch() {
                         binance_sell_fee_bps: 10,
                         expected_cost_token_a: U256::from(steps * 35_900),
                         expected_proceeds_token_a: U256::from(steps * 36_100),
-                        opportunity_threshold_bps: 20,
+                        opportunity_threshold_met: true,
                         network_gas_price_wei: 1_000_000,
                         native_price_token_a: Decimal::from(3_000),
                         wallet_native_balance_wei: U256::MAX,

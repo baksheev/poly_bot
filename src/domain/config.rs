@@ -221,15 +221,19 @@ pub enum AdaptiveSizingConfig {
         max_trade_notional_token_a_base_units: String,
         max_unhedged_notional_token_a_base_units: String,
         max_recovery_loss_token_a_base_units: String,
-        min_bounded_profit_token_a_base_units: String,
-        min_incremental_bounded_profit_token_a_base_units: String,
+        #[serde(alias = "min_bounded_profit_token_a_base_units")]
+        min_expected_profit_token_a_base_units: String,
+        #[serde(alias = "min_incremental_bounded_profit_token_a_base_units")]
+        min_incremental_expected_profit_token_a_base_units: String,
     },
     Adaptive {
         max_trade_notional_token_a_base_units: String,
         max_unhedged_notional_token_a_base_units: String,
         max_recovery_loss_token_a_base_units: String,
-        min_bounded_profit_token_a_base_units: String,
-        min_incremental_bounded_profit_token_a_base_units: String,
+        #[serde(alias = "min_bounded_profit_token_a_base_units")]
+        min_expected_profit_token_a_base_units: String,
+        #[serde(alias = "min_incremental_bounded_profit_token_a_base_units")]
+        min_incremental_expected_profit_token_a_base_units: String,
     },
 }
 
@@ -253,37 +257,37 @@ impl AdaptiveSizingConfig {
             max_trade_notional,
             max_unhedged_notional,
             max_recovery_loss,
-            min_bounded_profit,
-            min_incremental_bounded_profit,
+            min_expected_profit,
+            min_incremental_expected_profit,
         ) = match self {
             Self::BaselineOnly => return None,
             Self::Shadow {
                 max_trade_notional_token_a_base_units,
                 max_unhedged_notional_token_a_base_units,
                 max_recovery_loss_token_a_base_units,
-                min_bounded_profit_token_a_base_units,
-                min_incremental_bounded_profit_token_a_base_units,
+                min_expected_profit_token_a_base_units,
+                min_incremental_expected_profit_token_a_base_units,
             }
             | Self::Adaptive {
                 max_trade_notional_token_a_base_units,
                 max_unhedged_notional_token_a_base_units,
                 max_recovery_loss_token_a_base_units,
-                min_bounded_profit_token_a_base_units,
-                min_incremental_bounded_profit_token_a_base_units,
+                min_expected_profit_token_a_base_units,
+                min_incremental_expected_profit_token_a_base_units,
             } => (
                 max_trade_notional_token_a_base_units,
                 max_unhedged_notional_token_a_base_units,
                 max_recovery_loss_token_a_base_units,
-                min_bounded_profit_token_a_base_units,
-                min_incremental_bounded_profit_token_a_base_units,
+                min_expected_profit_token_a_base_units,
+                min_incremental_expected_profit_token_a_base_units,
             ),
         };
         Some(AdaptiveSizingLimits {
             max_trade_notional,
             max_unhedged_notional,
             max_recovery_loss,
-            min_bounded_profit,
-            min_incremental_bounded_profit,
+            min_expected_profit,
+            min_incremental_expected_profit,
         })
     }
 
@@ -304,12 +308,12 @@ impl AdaptiveSizingConfig {
             limits.max_recovery_loss,
         )?;
         validate_non_negative_base_units(
-            "adaptive_sizing.min_bounded_profit_token_a_base_units",
-            limits.min_bounded_profit,
+            "adaptive_sizing.min_expected_profit_token_a_base_units",
+            limits.min_expected_profit,
         )?;
         validate_non_negative_base_units(
-            "adaptive_sizing.min_incremental_bounded_profit_token_a_base_units",
-            limits.min_incremental_bounded_profit,
+            "adaptive_sizing.min_incremental_expected_profit_token_a_base_units",
+            limits.min_incremental_expected_profit,
         )?;
         let parse_u256 = |value: &str, name: &str| {
             U256::from_str_radix(value, 10).with_context(|| format!("{name} exceeds uint256"))
@@ -320,10 +324,10 @@ impl AdaptiveSizingConfig {
             "adaptive max unhedged notional",
         )?;
         parse_u256(limits.max_recovery_loss, "adaptive max recovery loss")?;
-        parse_u256(limits.min_bounded_profit, "adaptive min bounded profit")?;
+        parse_u256(limits.min_expected_profit, "adaptive min expected profit")?;
         parse_u256(
-            limits.min_incremental_bounded_profit,
-            "adaptive min incremental bounded profit",
+            limits.min_incremental_expected_profit,
+            "adaptive min incremental expected profit",
         )?;
         let baseline = parse_u256(baseline_token_a, "quote sizing baseline")?;
         ensure!(
@@ -343,8 +347,8 @@ pub struct AdaptiveSizingLimits<'a> {
     pub max_trade_notional: &'a str,
     pub max_unhedged_notional: &'a str,
     pub max_recovery_loss: &'a str,
-    pub min_bounded_profit: &'a str,
-    pub min_incremental_bounded_profit: &'a str,
+    pub min_expected_profit: &'a str,
+    pub min_incremental_expected_profit: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -840,7 +844,9 @@ mod tests {
         include_str!("../../config/strategies/usdc-wld-world-chain.v6.json");
     const SHADOW_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v7.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v8.json");
+    const V8_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v8.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v9.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -954,7 +960,7 @@ mod tests {
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "cbe3d3ab9cc5f3ca29886b8804970250e06acbae3d3d5e9e5c385455d351da93"
+            "dd064e23c3955e4c909800fcbdf6efb36fc887b88df8239837f6f7c23ffe3f98"
         );
     }
 
@@ -977,6 +983,14 @@ mod tests {
                 .balance_safety_multiplier,
             3
         );
+    }
+
+    #[test]
+    fn v8_live_snapshot_remains_readable_with_legacy_profit_floor_names() {
+        let loaded = load(V8_LIVE_CONFIG.as_bytes()).unwrap();
+        let limits = loaded.snapshot().pairs[0].adaptive_sizing.limits().unwrap();
+        assert_eq!(limits.min_expected_profit, "0");
+        assert_eq!(limits.min_incremental_expected_profit, "0");
     }
 
     #[test]
