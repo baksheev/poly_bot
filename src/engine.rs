@@ -61,6 +61,7 @@ pub struct TradingEngine {
     latest_sequence_matched_depth: BTreeMap<String, SpotDepthBook>,
     pending_depth_fallback: BTreeMap<String, u64>,
     gas_price_symbol: String,
+    wallet_gas_symbol: String,
     gas_price_connected: bool,
     gas_price_generation: u64,
     gas_price_book: Option<TopOfBook>,
@@ -341,6 +342,13 @@ impl TradingEngine {
             .find(|pair| pair.market_data_enabled)
             .and_then(|pair| pair.chain.gas_price_binance_symbol.clone())
             .context("enabled pair has no versioned gas-price Binance symbol")?;
+        let wallet_gas_symbol = domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.market_data_enabled)
+            .map(|pair| pair.chain.gas_symbol.clone())
+            .context("enabled pair has no versioned wallet gas symbol")?;
         let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &dex)?;
         for symbol in domain_config.binance_symbols() {
             opportunities.set_binance_fee_bps(
@@ -376,6 +384,7 @@ impl TradingEngine {
                 latest_sequence_matched_depth: BTreeMap::new(),
                 pending_depth_fallback: BTreeMap::new(),
                 gas_price_symbol,
+                wallet_gas_symbol,
                 gas_price_connected: false,
                 gas_price_generation: 0,
                 gas_price_book: None,
@@ -910,13 +919,19 @@ impl TradingEngine {
                 );
             }
             BalanceEvent::Wallet(snapshot) => {
+                let wallet_inventory = snapshot
+                    .token_balances
+                    .iter()
+                    .map(|balance| (balance.symbol.to_string(), balance.base_units))
+                    .chain(std::iter::once((
+                        self.wallet_gas_symbol.clone(),
+                        snapshot.native_balance_wei,
+                    )))
+                    .collect::<Vec<_>>();
                 self.inventory.update_venue(
                     InventoryVenue::Wallet,
                     snapshot.block_number,
-                    snapshot
-                        .token_balances
-                        .iter()
-                        .map(|balance| (balance.symbol.to_string(), balance.base_units)),
+                    wallet_inventory,
                 )?;
                 let token_balances = snapshot
                     .token_balances
@@ -1393,7 +1408,7 @@ impl TradingEngine {
         }
     }
 
-    fn emit_adaptive_sizing_shadow(
+    fn evaluate_adaptive_sizing(
         &self,
         quote: &TopOfBook,
         depth: &SpotDepthBook,
@@ -1401,7 +1416,7 @@ impl TradingEngine {
         network_gas_price_wei: u128,
         native_price_token_a: Decimal,
         wallet_native_balance_wei: U256,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<AdaptiveCandidate>> {
         let started = Instant::now();
         let pair = self.opportunities.pair(evaluation.pair_index)?;
         let pair_config = self
@@ -1412,7 +1427,7 @@ impl TradingEngine {
             .find(|config| config.id == pair.pair_id)
             .context("adaptive sizing pair is absent from domain config")?;
         let Some(limits) = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)? else {
-            return Ok(());
+            return Ok(None);
         };
         let directions = [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell];
         let mut baseline_by_direction: [Option<AdaptiveCandidate>; 2] = [None, None];
@@ -1432,6 +1447,7 @@ impl TradingEngine {
                 symbol: &pair.symbol,
                 direction: adaptive_trade_direction(direction_evaluation.direction),
                 token_b_amount: baseline_trade.token_b_amount,
+                token_b_step_base_units: pair.token_b_step(),
                 token_a_decimals: pair.token_a_decimals,
                 token_b_decimals: pair.token_b_decimals,
                 binance_buy_fee_bps: pair.binance_buy_fee_bps,
@@ -1454,10 +1470,11 @@ impl TradingEngine {
                     unhedged_notional: economics
                         .recovery_sell_quote_token_a
                         .max(economics.recovery_buy_quote_token_a),
-                    reservation_fits: self.adaptive_primary_reservation_fits(
+                    reservation_fits: self.adaptive_exact_reservation_fits(
                         pair,
                         direction_evaluation.direction,
                         baseline_trade,
+                        economics,
                     )?,
                 });
             }
@@ -1529,6 +1546,12 @@ impl TradingEngine {
                     .max_by_key(|candidate| candidate.economics.bounded_profit_token_a)
             });
         let selected_for_telemetry = selected.or(baseline);
+        let execution_candidate = matches!(
+            pair_config.adaptive_sizing,
+            AdaptiveSizingConfig::Adaptive { .. }
+        )
+        .then_some(selected)
+        .flatten();
         let rejection_counts = rejection_counts
             .into_iter()
             .map(|(reason, count)| (reason.to_owned(), Value::from(count)))
@@ -1571,11 +1594,11 @@ impl TradingEngine {
                 "fallback_reason": selected.is_none().then_some(fallback_reason),
                 "rejection_counts": Value::Object(rejection_counts),
                 "calculation_us": calculation_us,
-                "execution_size_changed": false,
+                "execution_size_changed": execution_candidate.is_some(),
                 "admission_liquidity_source": "sequence_matched_full_depth",
             }),
         );
-        Ok(())
+        Ok(execution_candidate)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1640,6 +1663,7 @@ impl TradingEngine {
             symbol: &pair.symbol,
             direction: adaptive_trade_direction(direction),
             token_b_amount,
+            token_b_step_base_units: pair.token_b_step(),
             token_a_decimals: pair.token_a_decimals,
             token_b_decimals: pair.token_b_decimals,
             binance_buy_fee_bps: pair.binance_buy_fee_bps,
@@ -1679,7 +1703,8 @@ impl TradingEngine {
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
-        let reservation_fits = self.adaptive_primary_reservation_fits(pair, direction, trade)?;
+        let reservation_fits =
+            self.adaptive_exact_reservation_fits(pair, direction, trade, economics)?;
         if !reservation_fits {
             let probe = rejection("inventory");
             search.record(token_b_amount, probe);
@@ -1700,21 +1725,26 @@ impl TradingEngine {
         Ok(probe)
     }
 
-    fn adaptive_primary_reservation_fits(
+    fn adaptive_exact_reservation_fits(
         &self,
         pair: &crate::opportunity::PairRuntime,
         direction: ArbitrageDirection,
         trade: TradeEvaluation,
+        economics: AdmissionEconomics,
     ) -> anyhow::Result<bool> {
-        let ((token_a_venue, token_a_amount), (token_b_venue, token_b_amount)) = match direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
-                (InventoryVenue::Wallet, trade.cost_token_a),
-                (InventoryVenue::Binance, trade.token_b_amount),
-            ),
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
-                (InventoryVenue::Binance, trade.cost_token_a),
-                (InventoryVenue::Wallet, trade.token_b_amount),
-            ),
+        let token_a_amount = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => trade.cost_token_a,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
+                trade.cost_token_a.max(economics.recovery_buy_quote_token_a)
+            }
+        };
+        let (token_a_venue, token_b_venue) = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
+                (InventoryVenue::Wallet, InventoryVenue::Binance)
+            }
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
+                (InventoryVenue::Binance, InventoryVenue::Wallet)
+            }
         };
         Ok(self
             .inventory
@@ -1723,7 +1753,11 @@ impl TradingEngine {
             && self
                 .inventory
                 .available_asset(token_b_venue, &pair.token_b_symbol)
-                .is_ok_and(|available| available >= token_b_amount))
+                .is_ok_and(|available| available >= trade.token_b_amount)
+            && self
+                .inventory
+                .available_asset(InventoryVenue::Wallet, &self.wallet_gas_symbol)
+                .is_ok_and(|available| available >= economics.maximum_gas_wei))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1826,6 +1860,30 @@ impl TradingEngine {
         let pair = self.opportunities.pair(evaluation.pair_index)?;
         let pair_id = pair.pair_id.clone();
         let pair_symbol = pair.symbol.clone();
+        let pair_config = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|config| config.id == pair_id)
+            .context("paper opportunity pair is absent from domain config")?;
+        let adaptive_execution = matches!(
+            pair_config.adaptive_sizing,
+            AdaptiveSizingConfig::Adaptive { .. }
+        );
+        if adaptive_execution && matches!(admission_liquidity, AdmissionLiquidity::DexFirstTop) {
+            self.telemetry.emit(
+                "arbitrage_admission_deferred",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": pair_id,
+                    "symbol": quote.symbol.as_ref(),
+                    "update_id": quote.update_id,
+                    "reason": "adaptive_requires_sequence_matched_full_depth",
+                }),
+            );
+            return Ok(true);
+        }
         let token_a_decimals = pair.token_a_decimals;
         let token_b_decimals = pair.token_b_decimals;
         let binance_buy_fee_bps = pair.binance_buy_fee_bps;
@@ -1845,35 +1903,54 @@ impl TradingEngine {
             .native_price_token_a()
             .context("admission has no native-token price")?;
 
-        if let AdmissionLiquidity::FullDepth(depth) = admission_liquidity
-            && let Err(error) = self.emit_adaptive_sizing_shadow(
+        let adaptive_candidate = if let AdmissionLiquidity::FullDepth(depth) = admission_liquidity {
+            match self.evaluate_adaptive_sizing(
                 quote,
                 depth,
                 evaluation,
                 network_gas_price_wei,
                 native_price_token_a,
                 wallet_native_balance_wei,
-            )
-        {
-            self.telemetry.emit(
-                "arbitrage_adaptive_sizing_evaluated",
-                json!({
-                    "engine_id": self.config.engine_id,
-                    "pair_id": pair_id,
-                    "symbol": quote.symbol.as_ref(),
-                    "update_id": quote.update_id,
-                    "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
-                    "selected_sizing_mode": "baseline",
-                    "fallback_reason": "optimizer_error",
-                    "error": format!("{error:#}"),
-                    "execution_size_changed": false,
-                }),
-            );
-        }
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.telemetry.emit(
+                        "arbitrage_adaptive_sizing_evaluated",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "pair_id": pair_id,
+                            "symbol": quote.symbol.as_ref(),
+                            "update_id": quote.update_id,
+                            "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+                            "selected_sizing_mode": "baseline",
+                            "fallback_reason": "optimizer_error",
+                            "error": format!("{error:#}"),
+                            "execution_size_changed": false,
+                        }),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut candidates = Vec::with_capacity(2);
         let mut needs_depth_fallback = false;
-        for direction in [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell] {
+        if let Some(candidate) = adaptive_candidate {
+            candidates.push((
+                adaptive_trade_direction(candidate.direction),
+                candidate.trade,
+                candidate.economics,
+                "sequence_matched_full_depth_adaptive",
+            ));
+        }
+        for direction in adaptive_candidate
+            .is_none()
+            .then_some([evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell])
+            .into_iter()
+            .flatten()
+        {
             // Rails executes the fixed token-A minimum-buy baseline. The
             // larger market-liquidity capacity remains telemetry only and must
             // not silently change the comparison's order size.
@@ -1896,6 +1973,7 @@ impl TradingEngine {
                 symbol: &pair_symbol,
                 direction: trade_direction,
                 token_b_amount: trade.token_b_amount,
+                token_b_step_base_units: token_b_step,
                 token_a_decimals,
                 token_b_decimals,
                 binance_buy_fee_bps,
@@ -2005,16 +2083,9 @@ impl TradingEngine {
             );
             return Ok(false);
         }
-        let pair_config = self
-            .domain_config
-            .snapshot()
-            .pairs
-            .iter()
-            .find(|config| config.id == pair_id)
-            .context("paper opportunity pair is absent from domain config")?;
         let token_a_symbol = pair_config.token_a.symbol.clone();
         let token_b_symbol = pair_config.token_b.symbol.clone();
-        let balance_safety_multiplier = pair_config.strategy.balance_safety_multiplier;
+        let gas_symbol = pair_config.chain.gas_symbol.clone();
         let deadline_unix_seconds = quote
             .received_unix_us
             .checked_div(1_000_000)
@@ -2086,18 +2157,9 @@ impl TradingEngine {
             dex_plan: dex_plan.clone(),
         };
         let plan_id = opportunity.plan_id();
-        let safety_multiplier = U256::from(balance_safety_multiplier);
-        let token_a_claim = trade
-            .cost_token_a
-            .max(economics.recovery_quote_token_a)
-            .max(economics.recovery_sell_quote_token_a)
-            .max(economics.recovery_buy_quote_token_a)
-            .checked_mul(safety_multiplier)
-            .context("paper token-A safety reservation overflow")?;
-        let token_b_claim = trade
-            .token_b_amount
-            .checked_mul(safety_multiplier)
-            .context("paper token-B safety reservation overflow")?;
+        let dex_input_claim = U256::from(dex_plan.amount_in_base_units);
+        let (token_a_claim, token_b_claim, gas_claim) =
+            exact_execution_envelope_amounts(direction, dex_input_claim, trade, economics);
         let claims = match direction {
             TradeDirection::BuyTokenBOnDexSellOnCex => vec![
                 InventoryClaim {
@@ -2108,6 +2170,10 @@ impl TradingEngine {
                     key: InventoryKey::new(InventoryVenue::Binance, token_b_symbol)?,
                     amount: token_b_claim,
                 },
+                InventoryClaim {
+                    key: InventoryKey::new(InventoryVenue::Wallet, gas_symbol)?,
+                    amount: gas_claim,
+                },
             ],
             TradeDirection::BuyTokenBOnCexSellOnDex => vec![
                 InventoryClaim {
@@ -2117,6 +2183,10 @@ impl TradingEngine {
                 InventoryClaim {
                     key: InventoryKey::new(InventoryVenue::Wallet, token_b_symbol)?,
                     amount: token_b_claim,
+                },
+                InventoryClaim {
+                    key: InventoryKey::new(InventoryVenue::Wallet, gas_symbol)?,
+                    amount: gas_claim,
                 },
             ],
         };
@@ -2213,7 +2283,9 @@ impl TradingEngine {
                 "plan_id": &plan_id,
                 "mode": self.config.arbitrage_execution_mode,
                 "admission_liquidity_source": liquidity_source,
-                "balance_safety_multiplier": balance_safety_multiplier,
+                "sizing_mode": if adaptive_candidate.is_some() { "adaptive" } else { "baseline" },
+                "inventory_reservation_policy": "exact_execution_envelope_v1",
+                "inventory_claims": self.inventory_claim_details(&claims),
                 "execution_slippage_bps": trade.execution_slippage_bps,
                 "cex_primary_limit_price": match direction {
                     TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
@@ -2576,6 +2648,27 @@ fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
     i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
 }
 
+fn exact_execution_envelope_amounts(
+    direction: TradeDirection,
+    dex_input: U256,
+    trade: TradeEvaluation,
+    economics: AdmissionEconomics,
+) -> (U256, U256, U256) {
+    let token_a = match direction {
+        TradeDirection::BuyTokenBOnDexSellOnCex => dex_input,
+        TradeDirection::BuyTokenBOnCexSellOnDex => {
+            trade.cost_token_a.max(economics.recovery_buy_quote_token_a)
+        }
+    };
+    let token_b = match direction {
+        // The live executor caps the hedgeable DEX credit at the immutable
+        // planned amount. Favorable output above it stays in the wallet.
+        TradeDirection::BuyTokenBOnDexSellOnCex => trade.token_b_amount,
+        TradeDirection::BuyTokenBOnCexSellOnDex => dex_input,
+    };
+    (token_a, token_b, economics.maximum_gas_wei)
+}
+
 fn dex_plan_telemetry_value(plan: &DexSwapPlan) -> Value {
     json!({
         "route": &plan.route,
@@ -2616,19 +2709,24 @@ mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
     use alloy_primitives::U256;
+    use rust_decimal::Decimal;
 
     use crate::{
+        admission::AdmissionEconomics,
+        arbitrage::ArbitrageDirection as TradeDirection,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
             InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue,
             ReservationPurpose, ReservationRequest,
         },
+        opportunity::TradeEvaluation,
         rebalance::Direction,
     };
 
     use super::{
         RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
-        mark_sequence_matched_update, rebalance_health_state, reservation_precheck,
+        exact_execution_envelope_amounts, mark_sequence_matched_update, rebalance_health_state,
+        reservation_precheck,
     };
 
     #[test]
@@ -2705,6 +2803,58 @@ mod tests {
         assert_eq!(
             payload["amount_out_minimum_base_units"].as_str(),
             Some(max_u128_minus_one.as_str())
+        );
+    }
+
+    #[test]
+    fn exact_execution_envelope_has_no_multiplicative_reservation() {
+        let trade = TradeEvaluation {
+            pool_index: 0,
+            token_b_amount: U256::from(100),
+            dex_token_a_amount: U256::from(900),
+            cex_token_a_amount: U256::from(1_000),
+            cost_token_a: U256::from(1_010),
+            proceeds_token_a: U256::from(1_030),
+            execution_slippage_bps: 10,
+            gross_profit_bps_x100: 2_000,
+            profit_bps_x100: 1_000,
+            meets_threshold: true,
+        };
+        let economics = AdmissionEconomics {
+            primary_quantity: Decimal::from(100),
+            recovery_limit_price: Decimal::ONE,
+            recovery_quote_token_a: U256::from(1_050),
+            recovery_sell_limit_price: Some(Decimal::ONE),
+            recovery_sell_quote_token_a: U256::from(990),
+            recovery_buy_limit_price: Some(Decimal::ONE),
+            recovery_buy_quote_token_a: U256::from(1_075),
+            recovery_loss_token_a: U256::from(65),
+            maximum_gas_wei: U256::from(25),
+            maximum_fee_per_gas_wei: 5,
+            maximum_gas_cost_token_a: U256::from(2),
+            fully_burdened_cost_token_a: U256::from(1_077),
+            bounded_profit_token_a: U256::from(1),
+            native_gas_covered: true,
+            meets_threshold: true,
+        };
+
+        assert_eq!(
+            exact_execution_envelope_amounts(
+                TradeDirection::BuyTokenBOnDexSellOnCex,
+                U256::from(1_020),
+                trade,
+                economics,
+            ),
+            (U256::from(1_020), U256::from(100), U256::from(25))
+        );
+        assert_eq!(
+            exact_execution_envelope_amounts(
+                TradeDirection::BuyTokenBOnCexSellOnDex,
+                U256::from(100),
+                trade,
+                economics,
+            ),
+            (U256::from(1_075), U256::from(100), U256::from(25))
         );
     }
 

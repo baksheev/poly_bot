@@ -24,6 +24,7 @@ pub struct AdmissionInputs<'a> {
     pub symbol: &'a str,
     pub direction: ArbitrageDirection,
     pub token_b_amount: U256,
+    pub token_b_step_base_units: U256,
     pub token_a_decimals: u8,
     pub token_b_decimals: u8,
     pub binance_buy_fee_bps: u16,
@@ -66,13 +67,19 @@ pub fn evaluate_admission(
         "admission depth symbol mismatch"
     );
     let base_quantity = validate_inputs_and_base_quantity(inputs)?;
+    let recovery_buy_quantity = recovery_buy_base_quantity(inputs)?;
     let Some(sell_depth_quote) = depth.quote_market_sell(base_quantity)? else {
         return Ok(None);
     };
-    let Some(buy_depth_quote) = depth.quote_market_buy(base_quantity)? else {
+    let Some(buy_depth_quote) = depth.quote_market_buy(recovery_buy_quantity)? else {
         return Ok(None);
     };
-    finish_admission(Some(sell_depth_quote), Some(buy_depth_quote), inputs)
+    finish_admission(
+        Some(sell_depth_quote),
+        Some(buy_depth_quote),
+        base_quantity,
+        inputs,
+    )
 }
 
 /// Fast admission for the production DEX-first coordinator. The primary IOC
@@ -88,6 +95,7 @@ pub fn evaluate_dex_first_admission(
         "admission quote symbol mismatch"
     );
     let base_quantity = validate_inputs_and_base_quantity(inputs)?;
+    let recovery_buy_quantity = recovery_buy_base_quantity(inputs)?;
     let (sell_quote, buy_quote) = match inputs.direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
             if quote.bid_quantity < base_quantity {
@@ -106,14 +114,14 @@ pub fn evaluate_dex_first_admission(
             )
         }
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            if quote.ask_quantity < base_quantity {
+            if quote.ask_quantity < recovery_buy_quantity {
                 return Ok(None);
             }
             (
                 None,
                 Some(DepthExecutionQuote {
-                    base_quantity,
-                    quote_quantity: base_quantity
+                    base_quantity: recovery_buy_quantity,
+                    quote_quantity: recovery_buy_quantity
                         .checked_mul(quote.ask_price)
                         .context("top-level buy quote overflow")?,
                     worst_price: quote.ask_price,
@@ -122,13 +130,21 @@ pub fn evaluate_dex_first_admission(
             )
         }
     };
-    finish_admission(sell_quote, buy_quote, inputs)
+    finish_admission(sell_quote, buy_quote, base_quantity, inputs)
 }
 
 fn validate_inputs_and_base_quantity(inputs: AdmissionInputs<'_>) -> anyhow::Result<Decimal> {
     ensure!(
         !inputs.token_b_amount.is_zero(),
         "admission token-B amount is zero"
+    );
+    ensure!(
+        !inputs.token_b_step_base_units.is_zero(),
+        "admission token-B step is zero"
+    );
+    ensure!(
+        inputs.token_b_amount % inputs.token_b_step_base_units == U256::ZERO,
+        "admission token-B amount is not step aligned"
     );
     ensure!(
         inputs.network_gas_price_wei > 0,
@@ -157,9 +173,46 @@ fn validate_inputs_and_base_quantity(inputs: AdmissionInputs<'_>) -> anyhow::Res
     .context("token-B amount exceeds Decimal admission range")
 }
 
+fn recovery_buy_base_quantity(inputs: AdmissionInputs<'_>) -> anyhow::Result<Decimal> {
+    ensure!(
+        inputs.binance_buy_fee_bps < 10_000,
+        "Binance BUY fee must be below 100%"
+    );
+    let retention_bps = 10_000_u32
+        .checked_sub(u32::from(inputs.binance_buy_fee_bps))
+        .context("Binance BUY fee retention underflow")?;
+    let numerator = inputs
+        .token_b_amount
+        .checked_mul(U256::from(10_000_u32))
+        .context("recovery BUY gross quantity overflow")?;
+    let denominator = U256::from(retention_bps);
+    let gross = numerator / denominator;
+    let gross = if numerator % denominator == U256::ZERO {
+        gross
+    } else {
+        gross
+            .checked_add(U256::ONE)
+            .context("recovery BUY gross quantity rounding overflow")?
+    };
+    let step = inputs.token_b_step_base_units;
+    let gross = if gross % step == U256::ZERO {
+        gross
+    } else {
+        (gross / step)
+            .checked_add(U256::ONE)
+            .and_then(|steps| steps.checked_mul(step))
+            .context("recovery BUY step rounding overflow")?
+    };
+    validate_inputs_and_base_quantity(AdmissionInputs {
+        token_b_amount: gross,
+        ..inputs
+    })
+}
+
 fn finish_admission(
     sell_depth_quote: Option<DepthExecutionQuote>,
     buy_depth_quote: Option<DepthExecutionQuote>,
+    primary_quantity: Decimal,
     inputs: AdmissionInputs<'_>,
 ) -> anyhow::Result<Option<AdmissionEconomics>> {
     let recovery_sell_quote_token_a = match sell_depth_quote.as_ref() {
@@ -170,10 +223,7 @@ fn finish_admission(
         None => U256::ZERO,
     };
     let recovery_buy_quote_token_a = match buy_depth_quote.as_ref() {
-        Some(quote) => add_bps_ceil(
-            decimal_to_base_units(quote.quote_quantity, inputs.token_a_decimals, true)?,
-            inputs.binance_buy_fee_bps,
-        )?,
+        Some(quote) => decimal_to_base_units(quote.quote_quantity, inputs.token_a_decimals, true)?,
         None => U256::ZERO,
     };
     let (recovery_limit_price, recovery_quote_token_a, sell_loss, buy_loss) = match inputs.direction
@@ -243,20 +293,7 @@ fn finish_admission(
     )?;
 
     Ok(Some(AdmissionEconomics {
-        primary_quantity: match inputs.direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-                sell_depth_quote
-                    .as_ref()
-                    .context("DEX-buy admission has no primary quantity")?
-                    .base_quantity
-            }
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-                buy_depth_quote
-                    .as_ref()
-                    .context("DEX-sell admission has no primary quantity")?
-                    .base_quantity
-            }
-        },
+        primary_quantity,
         recovery_limit_price,
         recovery_quote_token_a,
         recovery_sell_limit_price: sell_depth_quote.map(|quote| quote.worst_price),
@@ -292,22 +329,6 @@ fn decimal_to_base_units(value: Decimal, decimals: u8, round_up: bool) -> anyhow
             .context("admission rounded amount overflow")
     } else {
         Ok(quotient)
-    }
-}
-
-fn add_bps_ceil(value: U256, bps: u16) -> anyhow::Result<U256> {
-    ensure!(bps <= 10_000, "admission fee exceeds 100%");
-    let numerator = value
-        .checked_mul(U256::from(10_000_u64 + u64::from(bps)))
-        .context("admission fee multiplication overflow")?;
-    let denominator = U256::from(10_000_u64);
-    let quotient = numerator / denominator;
-    if numerator % denominator == U256::ZERO {
-        Ok(quotient)
-    } else {
-        quotient
-            .checked_add(U256::ONE)
-            .context("admission fee rounding overflow")
     }
 }
 
@@ -388,6 +409,7 @@ mod tests {
             symbol: "WLDUSDC",
             direction,
             token_b_amount: U256::from(10_u8) * U256::from(10_u64).pow(U256::from(18)),
+            token_b_step_base_units: U256::from(10_u64).pow(U256::from(17)),
             token_a_decimals: 6,
             token_b_decimals: 18,
             binance_buy_fee_bps: 10,
@@ -455,7 +477,7 @@ mod tests {
 
     #[test]
     fn dex_first_buy_admission_uses_only_relevant_ask_top() {
-        let quote = top_of_book(Decimal::ONE, Decimal::from(10));
+        let quote = top_of_book(Decimal::ONE, Decimal::new(101, 1));
         let mut request = inputs(ArbitrageDirection::BuyTokenBOnCexSellOnDex);
         request.expected_proceeds_token_a = U256::from(10_500_000_u64);
         let economics = evaluate_dex_first_admission(&quote, request)
@@ -475,7 +497,7 @@ mod tests {
         assert_eq!(economics.recovery_sell_quote_token_a, U256::ZERO);
         assert_eq!(
             economics.recovery_buy_quote_token_a,
-            U256::from(10_110_100_u64)
+            U256::from(10_201_000_u64)
         );
     }
 
@@ -494,7 +516,7 @@ mod tests {
         );
         assert_eq!(
             economics.recovery_buy_quote_token_a,
-            U256::from(10_160_150_u64)
+            U256::from(10_252_000_u64)
         );
         assert_eq!(
             economics.recovery_limit_price,
@@ -524,21 +546,22 @@ mod tests {
         request.expected_cost_token_a = U256::from(10_000_000_u64);
         request.expected_proceeds_token_a = U256::from(10_500_000_u64);
         let economics = evaluate_admission(&book(), request).unwrap().unwrap();
-        // 5 * 1.01 + 5 * 1.02 = 10.15, then 10 bps buy commission, rounded up.
-        assert_eq!(economics.recovery_quote_token_a, U256::from(10_160_150_u64));
+        // A 10 WLD target with 10 bps base-asset commission grosses up to
+        // 10.1 WLD at the 0.1 step: 5 * 1.01 + 5.1 * 1.02 = 10.252.
+        assert_eq!(economics.recovery_quote_token_a, U256::from(10_252_000_u64));
         assert_eq!(
             economics.recovery_sell_quote_token_a,
             U256::from(9_940_050_u64)
         );
         assert_eq!(
             economics.recovery_buy_quote_token_a,
-            U256::from(10_160_150_u64)
+            U256::from(10_252_000_u64)
         );
         assert_eq!(
             economics.recovery_limit_price,
             Decimal::from_str("1.02").unwrap()
         );
-        assert_eq!(economics.recovery_loss_token_a, U256::from(160_150_u64));
+        assert_eq!(economics.recovery_loss_token_a, U256::from(252_000_u64));
 
         request.token_b_amount = U256::from(16_u8) * U256::from(10_u64).pow(U256::from(18));
         assert!(evaluate_admission(&book(), request).unwrap().is_none());

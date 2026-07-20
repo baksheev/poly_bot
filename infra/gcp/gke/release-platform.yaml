@@ -11,7 +11,7 @@ data:
   BINANCE_REST_BASE_URL: https://api.binance.com
   BINANCE_WS_API_URL: wss://ws-api.binance.com:443/ws-api/v3
   EVM_WALLET_ADDRESS: __EVM_WALLET_ADDRESS__
-  DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v7.json
+  DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v8.json
   MARKET_DATA_MAX_AGE_MS: "5000"
   DEX_EVENT_CHANNEL_CAPACITY: "8192"
   DEX_HEAD_MAX_AGE_MS: "10000"

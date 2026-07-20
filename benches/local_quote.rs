@@ -100,6 +100,7 @@ fn measure_adaptive_admission_batch() {
                         symbol: "WLDUSDC",
                         direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
                         token_b_amount,
+                        token_b_step_base_units: U256::from(100_000_000_000_000_000_u128),
                         token_a_decimals: 6,
                         token_b_decimals: 18,
                         binance_buy_fee_bps: 10,
