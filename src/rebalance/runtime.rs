@@ -1978,6 +1978,7 @@ mod tests {
                     address_topic(wallet),
                 ],
                 data: received.to_be_bytes::<32>().to_vec(),
+                position: None,
             }],
         };
 
@@ -2040,6 +2041,7 @@ mod tests {
                     address_topic(wallet),
                 ],
                 data: received.to_be_bytes::<32>().to_vec(),
+                position: None,
             }],
         };
 

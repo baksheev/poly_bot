@@ -25,6 +25,7 @@ pub fn dex_leg_result(
         token_a_delta_base_units,
         gas_cost_token_a_base_units,
         venue_reference: format!("dex:{:#x}", outcome.transaction_hash),
+        dex_settlement_log: outcome.settlement_log,
     })
 }
 
@@ -67,6 +68,7 @@ pub fn binance_leg_result(
         token_a_delta_base_units,
         gas_cost_token_a_base_units: 0,
         venue_reference: format!("cex:{}", order.order_id),
+        dex_settlement_log: None,
     })
 }
 
@@ -149,7 +151,7 @@ fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{B256, U256};
+    use alloy_primitives::{Address, B256, U256};
     use rust_decimal::Decimal;
 
     use crate::{
@@ -199,8 +201,23 @@ mod tests {
             effective_gas_price: 2,
             token_in_spent: U256::from(1_000_u16),
             token_out_received: U256::from(1_100_u16),
+            settlement_log: Some(crate::chain::logs::ChainLog {
+                address: Address::repeat_byte(2),
+                topics: Vec::new(),
+                data: Vec::new(),
+                block_number: 10,
+                block_hash: B256::repeat_byte(3),
+                transaction_index: 1,
+                log_index: 2,
+                removed: false,
+            }),
         };
-        let buy = dex_leg_result(ArbitrageDirection::BuyTokenBOnDexSellOnCex, outcome, 7).unwrap();
+        let buy = dex_leg_result(
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            outcome.clone(),
+            7,
+        )
+        .unwrap();
         assert_eq!(buy.token_a_delta_base_units, -1_000);
         assert_eq!(buy.token_b_delta_base_units, 1_100);
         assert_eq!(buy.gas_cost_token_a_base_units, 7);

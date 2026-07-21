@@ -170,6 +170,21 @@ impl DexMirror {
     pub fn pool(&self, index: usize) -> anyhow::Result<&HydratedPool> {
         self.pools.get(index).context("DEX pool index is invalid")
     }
+
+    pub fn pool_index(&self, locator: PoolLocator) -> Option<usize> {
+        match locator {
+            PoolLocator::V3(address) => self.v3_indices.get(&address).copied(),
+            PoolLocator::V4(pool_id) => self.v4_indices.get(&pool_id).copied(),
+        }
+    }
+
+    pub fn last_position(&self, locator: PoolLocator) -> Option<LogPosition> {
+        self.last_positions.get(&locator).copied()
+    }
+
+    pub const fn backfilled_through(&self) -> u64 {
+        self.backfilled_through
+    }
 }
 
 #[cfg(test)]

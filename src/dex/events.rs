@@ -109,6 +109,35 @@ pub fn build_log_filters(
     Ok(filters)
 }
 
+pub fn build_pool_log_filter(
+    locator: PoolLocator,
+    event_address: Address,
+) -> anyhow::Result<EthLogFilter> {
+    match locator {
+        PoolLocator::V3(pool) => {
+            ensure!(
+                event_address == pool,
+                "V3 settlement event address differs from its pool"
+            );
+            EthLogFilter::new(
+                vec![pool],
+                vec![Some(vec![
+                    v3_swap_topic(),
+                    v3_mint_topic(),
+                    v3_burn_topic(),
+                ])],
+            )
+        }
+        PoolLocator::V4(pool_id) => EthLogFilter::new(
+            vec![event_address],
+            vec![
+                Some(vec![v4_swap_topic(), v4_modify_liquidity_topic()]),
+                Some(vec![pool_id]),
+            ],
+        ),
+    }
+}
+
 pub fn decode_pool_event(log: &ChainLog) -> anyhow::Result<Option<DecodedPoolEvent>> {
     let Some(signature) = log.topics.first().copied() else {
         return Ok(None);

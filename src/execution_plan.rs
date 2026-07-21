@@ -182,9 +182,12 @@ impl DexSwapPlan {
         self.validate()?;
         let route = match &self.route {
             DexRoutePlan::UniswapV3 {
-                router, fee_pips, ..
+                router,
+                pool_address,
+                fee_pips,
             } => SwapRoute::V3 {
                 router: parse_address("DEX plan V3 router", router)?,
+                pool: parse_address("DEX plan V3 pool", pool_address)?,
                 fee_pips: *fee_pips,
             },
             DexRoutePlan::UniswapV4 {

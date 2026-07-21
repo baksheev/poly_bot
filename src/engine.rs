@@ -23,8 +23,12 @@ use crate::{
         depth::SpotDepthBook,
         user_data::{ExecutionReportEvent, UserDataEvent},
     },
+    chain::logs::{ChainLog, EthLogFilter},
     config::AppConfig,
-    dex::mirror::{DexMirror, LogApplyResult},
+    dex::{
+        events::{PoolUpdate, build_pool_log_filter, decode_pool_event},
+        mirror::{DexMirror, LogApplyResult},
+    },
     domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
     execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
     hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
@@ -268,6 +272,18 @@ struct ArbitrageSettlementBarrier {
     pair_id: String,
     plan_id: String,
     pool_generation: u64,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbitrageSettlementCatchupRequest {
+    pub filter: EthLogFilter,
+    pub from_block: u64,
+    pub through_block: u64,
+    plan_id: String,
+    pool_index: usize,
+    locator: crate::dex::events::PoolLocator,
+    target: ChainLog,
     started_at: Instant,
 }
 
@@ -2758,6 +2774,177 @@ impl TradingEngine {
             .collect()
     }
 
+    pub fn prepare_arbitrage_settlement_catchup(
+        &self,
+        event: &PaperTradeEvent,
+    ) -> anyhow::Result<Option<ArbitrageSettlementCatchupRequest>> {
+        if event.state != PaperTradeEventState::Balanced || !event.dex_filled {
+            return Ok(None);
+        }
+        let Some(target) = event.dex_settlement_log.as_ref() else {
+            return Ok(None);
+        };
+        ensure!(!target.removed, "receipt settlement Swap event is removed");
+        let decoded = decode_pool_event(target)?
+            .context("receipt settlement log is not a recognized pool event")?;
+        ensure!(
+            matches!(decoded.update, PoolUpdate::Swap { .. }),
+            "receipt settlement log is not a Swap event"
+        );
+        let freshness = self
+            .arbitrage_plan_freshness
+            .get(&event.plan_id)
+            .context("settlement proof has no admitted plan freshness")?;
+        let pool_index = self
+            .dex
+            .pool_index(decoded.locator)
+            .context("settlement proof targets an unknown pool")?;
+        ensure!(
+            pool_index == freshness.pool_index,
+            "settlement proof pool differs from the admitted pool"
+        );
+        let target_position = target.position();
+        if target.block_number <= self.dex.backfilled_through()
+            || self
+                .dex
+                .last_position(decoded.locator)
+                .is_some_and(|position| position >= target_position)
+        {
+            return Ok(None);
+        }
+        let from_block = self
+            .dex
+            .last_position(decoded.locator)
+            .map_or_else(
+                || self.dex.backfilled_through().saturating_add(1),
+                |position| position.block_number,
+            )
+            .min(target.block_number);
+        Ok(Some(ArbitrageSettlementCatchupRequest {
+            filter: build_pool_log_filter(decoded.locator, target.address)?,
+            from_block,
+            through_block: target.block_number,
+            plan_id: event.plan_id.clone(),
+            pool_index,
+            locator: decoded.locator,
+            target: target.clone(),
+            started_at: Instant::now(),
+        }))
+    }
+
+    pub fn defer_arbitrage_settlement_catchup(
+        &self,
+        request: &ArbitrageSettlementCatchupRequest,
+        reason: &'static str,
+    ) {
+        self.telemetry.emit(
+            "arbitrage_settlement_catchup_deferred",
+            json!({
+                "engine_id": self.config.engine_id,
+                "plan_id": request.plan_id,
+                "pool_index": request.pool_index,
+                "reason": reason,
+                "target_block": request.target.block_number,
+                "target_transaction_index": request.target.transaction_index,
+                "target_log_index": request.target.log_index,
+                "catchup_age_us": request.started_at.elapsed().as_micros(),
+            }),
+        );
+    }
+
+    pub fn apply_arbitrage_settlement_catchup(
+        &mut self,
+        request: ArbitrageSettlementCatchupRequest,
+        mut logs: Vec<ChainLog>,
+    ) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
+        let Some(barrier) = self.arbitrage_settlement_barriers.get(&request.pool_index) else {
+            return Ok(None);
+        };
+        ensure!(
+            barrier.plan_id == request.plan_id,
+            "settlement catch-up plan differs from the active barrier"
+        );
+        logs.sort_unstable_by_key(ChainLog::position);
+        logs.dedup_by(|right, left| {
+            right.position() == left.position()
+                && right.address == left.address
+                && right.block_hash == left.block_hash
+        });
+        let proof_present = logs.iter().any(|log| {
+            log.position() == request.target.position()
+                && log.block_hash == request.target.block_hash
+                && log.address == request.target.address
+                && log.topics == request.target.topics
+                && log.data == request.target.data
+                && !log.removed
+        });
+        if !proof_present {
+            self.telemetry.emit(
+                "arbitrage_settlement_catchup_deferred",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "plan_id": request.plan_id,
+                    "pool_index": request.pool_index,
+                    "reason": "receipt_swap_not_returned_by_eth_get_logs",
+                    "target_block": request.target.block_number,
+                    "target_transaction_index": request.target.transaction_index,
+                    "target_log_index": request.target.log_index,
+                    "fetched_logs": logs.len(),
+                    "catchup_age_us": request.started_at.elapsed().as_micros(),
+                }),
+            );
+            return Ok(None);
+        }
+        for log in &logs {
+            let decoded = decode_pool_event(log)?
+                .context("settlement catch-up returned an unrecognized pool log")?;
+            ensure!(
+                decoded.locator == request.locator,
+                "settlement catch-up returned a log for another pool"
+            );
+            ensure!(!log.removed, "settlement catch-up returned a removed log");
+        }
+        let mut applied = 0_usize;
+        for log in &logs {
+            if let LogApplyResult::Applied { pool_index, .. } = self.dex.apply_log(log)? {
+                ensure!(
+                    pool_index == request.pool_index,
+                    "settlement catch-up applied another pool"
+                );
+                applied += 1;
+            }
+        }
+        ensure!(
+            self.dex
+                .last_position(request.locator)
+                .is_some_and(|position| position >= request.target.position()),
+            "settlement catch-up did not advance through the receipt Swap"
+        );
+        if applied == 0 {
+            return Ok(None);
+        }
+        let refresh = self
+            .opportunities
+            .request_pool_refresh(request.pool_index, &self.dex)?;
+        self.telemetry.emit(
+            "arbitrage_settlement_catchup_applied",
+            json!({
+                "engine_id": self.config.engine_id,
+                "plan_id": request.plan_id,
+                "pool_index": request.pool_index,
+                "target_block": request.target.block_number,
+                "target_transaction_index": request.target.transaction_index,
+                "target_log_index": request.target.log_index,
+                "applied_logs": applied,
+                "fetched_logs": logs.len(),
+                "prepared_generation": refresh.generation(),
+                "source": "receipt_http_catchup",
+                "catchup_fetch_apply_us": request.started_at.elapsed().as_micros(),
+            }),
+        );
+        Ok(Some(refresh))
+    }
+
     fn reconcile_arbitrage_settlement(&mut self, pool_index: usize, prepared_generation: u64) {
         let Some(barrier) = self.arbitrage_settlement_barriers.get(&pool_index) else {
             return;
@@ -2805,16 +2992,36 @@ impl TradingEngine {
                 if event.dex_filled
                     && let Some(freshness) = self.arbitrage_plan_freshness.remove(&event.plan_id)
                 {
-                    self.arbitrage_settlement_barriers.insert(
-                        freshness.pool_index,
-                        ArbitrageSettlementBarrier {
-                            pair_id: freshness.pair_id,
-                            plan_id: event.plan_id.clone(),
-                            pool_generation: freshness.pool_generation,
-                            started_at: Instant::now(),
-                        },
-                    );
-                    waiting_for_dex_settlement = true;
+                    let prepared_generation = self
+                        .opportunities
+                        .prepared_pool_generation(freshness.pool_index)?;
+                    if !settlement_requires_refresh(freshness.pool_generation, prepared_generation)
+                    {
+                        self.telemetry.emit(
+                            "arbitrage_settlement_reconciled",
+                            json!({
+                                "engine_id": self.config.engine_id,
+                                "pair_id": freshness.pair_id,
+                                "plan_id": event.plan_id,
+                                "pool_index": freshness.pool_index,
+                                "barrier_generation": freshness.pool_generation,
+                                "prepared_generation": prepared_generation,
+                                "settlement_age_ms": 0,
+                                "source": "already_prepared_before_terminal_event",
+                            }),
+                        );
+                    } else {
+                        self.arbitrage_settlement_barriers.insert(
+                            freshness.pool_index,
+                            ArbitrageSettlementBarrier {
+                                pair_id: freshness.pair_id,
+                                plan_id: event.plan_id.clone(),
+                                pool_generation: freshness.pool_generation,
+                                started_at: Instant::now(),
+                            },
+                        );
+                        waiting_for_dex_settlement = true;
+                    }
                 }
             }
             PaperTradeEventState::RejectedUnsubmitted => {
@@ -3106,6 +3313,16 @@ fn requires_depth_for_runtime_phase(arbitrage_execution_mode: &str) -> bool {
     matches!(arbitrage_execution_mode, "paper_concurrent_hedged")
 }
 
+const fn settlement_requires_refresh(
+    admitted_generation: u64,
+    prepared_generation: Option<u64>,
+) -> bool {
+    match prepared_generation {
+        Some(prepared_generation) => prepared_generation <= admitted_generation,
+        None => true,
+    }
+}
+
 fn classify_depth_health(
     observation: DepthObservation,
     depth_available: bool,
@@ -3299,7 +3516,7 @@ mod tests {
         TradingReadiness, adaptive_candidate_is_better, classify_depth_health,
         exact_execution_envelope_amounts, format_bps_x100_u256, mark_sequence_matched_update,
         profit_bps_x100_u256, rebalance_health_state, requires_depth_for_runtime_phase,
-        reservation_precheck,
+        reservation_precheck, settlement_requires_refresh,
     };
 
     fn adaptive_depth_limits() -> AdaptiveSizingRuntimeLimits {
@@ -3320,6 +3537,13 @@ mod tests {
         assert!(!requires_depth_for_runtime_phase("full_live"));
         assert!(!requires_depth_for_runtime_phase("paper_dex_first"));
         assert!(requires_depth_for_runtime_phase("paper_concurrent_hedged"));
+    }
+
+    #[test]
+    fn settlement_waits_only_until_a_new_pool_generation_is_prepared() {
+        assert!(settlement_requires_refresh(41, None));
+        assert!(settlement_requires_refresh(41, Some(41)));
+        assert!(!settlement_requires_refresh(41, Some(42)));
     }
 
     #[test]

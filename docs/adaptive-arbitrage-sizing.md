@@ -842,7 +842,11 @@ The existing mailbox already bounds backlog to one pending opportunity behind
 the active wallet lane. Its mutex-protected replacement transfers ownership
 atomically, and the engine releases the superseded plan's inventory reservation
 and freshness state. A blocked-unknown lane accepts no new work; DEX settlement
-invalidates pending work admitted against the pre-settlement generation.
+invalidates pending work admitted against the pre-settlement generation. The
+normal settlement path now extracts the canonical pool Swap position from the
+successful receipt, catches that pool up through the receipt block with
+`eth_getLogs`, and rebuilds prepared curves immediately. WebSocket delivery
+retains ownership as the fallback when the receipt proof cannot be applied.
 
 Adaptive v1 retains the current newest-wins replacement rule. This isolates the
 sizing experiment from a scheduling-policy change, but it means that a fresher

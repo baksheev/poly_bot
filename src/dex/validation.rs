@@ -33,7 +33,7 @@ pub struct TokenBalances {
     pub wld: U256,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoundTripOutcome {
     pub protocol: UniswapProtocol,
     pub wallet: Address,
@@ -46,7 +46,7 @@ pub struct RoundTripOutcome {
     pub after: TokenBalances,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoverySellOutcome {
     pub protocol: UniswapProtocol,
     pub wallet: Address,
@@ -404,11 +404,12 @@ fn select_route(
             _ => continue,
         };
         let route = match (protocol, candidate.identity) {
-            (UniswapProtocol::V3, PoolIdentity::V3 { fee_pips, .. }) => SwapRoute::V3 {
+            (UniswapProtocol::V3, PoolIdentity::V3 { address, fee_pips }) => SwapRoute::V3 {
                 router: configured_address(
                     "uniswap_v3_router_address",
                     pair.chain.uniswap_v3_router_address.as_deref(),
                 )?,
+                pool: address,
                 fee_pips,
             },
             (UniswapProtocol::V4, PoolIdentity::V4 { pool_id, fee_pips }) => {

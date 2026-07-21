@@ -21,7 +21,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
-use crate::{execution_plan::DexSwapPlan, state::TopOfBook, telemetry::TelemetryHandle};
+use crate::{
+    chain::logs::ChainLog, execution_plan::DexSwapPlan, state::TopOfBook,
+    telemetry::TelemetryHandle,
+};
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -330,6 +333,11 @@ pub struct LegResult {
     /// Gas converted to token A at the terminal accounting snapshot.
     pub gas_cost_token_a_base_units: u128,
     pub venue_reference: String,
+    /// Live-only canonical Swap event extracted from the successful receipt.
+    /// The durable coordinator journal deliberately excludes this acceleration
+    /// hint; restart recovery falls back to normal WebSocket settlement.
+    #[serde(skip)]
+    pub dex_settlement_log: Option<ChainLog>,
 }
 
 impl LegResult {
@@ -341,6 +349,10 @@ impl LegResult {
                 "a failed leg cannot claim venue balance changes"
             );
         }
+        ensure!(
+            self.dex_settlement_log.is_none() || self.status == LegStatus::Filled,
+            "only a filled leg may carry a DEX settlement log"
+        );
         Ok(())
     }
 }
@@ -944,6 +956,7 @@ pub struct PaperTradeEvent {
     pub plan_id: String,
     pub state: PaperTradeEventState,
     pub dex_filled: bool,
+    pub dex_settlement_log: Option<ChainLog>,
 }
 
 pub struct PaperTradeHandle {
@@ -1167,7 +1180,7 @@ impl PaperTradeTask {
                         }
                     },
                 );
-                self.publish_event(plan_id, state, false)?;
+                self.publish_event(plan_id, state, false, None)?;
             }
         }
         let discarded = self.discarded.swap(0, Ordering::Relaxed);
@@ -1248,6 +1261,7 @@ impl PaperTradeTask {
                         plan_id.to_owned(),
                         PaperTradeEventState::Balanced,
                         dex_filled(operation),
+                        None,
                     )?;
                 } else if matches!(
                     operation.stage,
@@ -1257,6 +1271,7 @@ impl PaperTradeTask {
                         plan_id.to_owned(),
                         PaperTradeEventState::BlockedUnknown,
                         dex_filled(operation),
+                        None,
                     )?;
                 }
                 return Ok(());
@@ -1279,12 +1294,14 @@ impl PaperTradeTask {
         plan_id: String,
         state: PaperTradeEventState,
         dex_filled: bool,
+        dex_settlement_log: Option<ChainLog>,
     ) -> anyhow::Result<()> {
         self.event_sender
             .send(PaperTradeEvent {
                 plan_id,
                 state,
                 dex_filled,
+                dex_settlement_log,
             })
             .map_err(|_| anyhow::anyhow!("paper trade event receiver is closed"))
     }
@@ -1336,6 +1353,7 @@ fn simulate_command(
                     token_a_delta_base_units: token_a_delta,
                     gas_cost_token_a_base_units: 0,
                     venue_reference: format!("paper:dex:{}", intent.plan_id),
+                    dex_settlement_log: None,
                 },
             ))
         }
@@ -1390,6 +1408,7 @@ fn simulated_cex_result(
         token_a_delta_base_units: token_a_delta,
         gas_cost_token_a_base_units: 0,
         venue_reference: format!("paper:cex:{role}:{}", intent.plan_id),
+        dex_settlement_log: None,
     })
 }
 
@@ -2237,6 +2256,7 @@ mod tests {
             token_a_delta_base_units: token_a,
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
+            dex_settlement_log: None,
         }
     }
 
@@ -2247,6 +2267,7 @@ mod tests {
             token_a_delta_base_units: 0,
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
+            dex_settlement_log: None,
         }
     }
 
@@ -2869,6 +2890,7 @@ mod tests {
                     token_a_delta_base_units: 0,
                     gas_cost_token_a_base_units: 0,
                     venue_reference: "dex:unknown".to_owned(),
+                    dex_settlement_log: None,
                 },
             )
             .unwrap();
@@ -2895,6 +2917,7 @@ mod tests {
                     token_a_delta_base_units: 0,
                     gas_cost_token_a_base_units: 4,
                     venue_reference: "dex:reconciled-revert".to_owned(),
+                    dex_settlement_log: None,
                 },
             )
             .unwrap();

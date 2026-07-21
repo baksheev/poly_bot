@@ -1152,7 +1152,7 @@ async fn run(
         pair.binance.symbol.clone(),
         binance_assets,
         Duration::from_millis(config.balance_sync_interval_ms),
-        wallet_rpc,
+        wallet_rpc.clone(),
         wallet_owner,
         wallet_chain_id,
         wallet_tokens,
@@ -1358,7 +1358,48 @@ async fn run(
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
+                let catchup = match engine.prepare_arbitrage_settlement_catchup(&event) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::warn!(
+                            plan_id = %event.plan_id,
+                            error = %error,
+                            "receipt settlement proof is invalid; retaining WebSocket barrier"
+                        );
+                        None
+                    }
+                };
                 engine.on_paper_trade_event(event)?;
+                if let Some(request) = catchup {
+                    let from_block = request.from_block;
+                    let through_block = request.through_block;
+                    match wallet_rpc
+                        .get_logs(&request.filter, from_block, through_block)
+                        .await
+                    {
+                        Ok(logs) => {
+                            if let Some(refresh) =
+                                engine.apply_arbitrage_settlement_catchup(request, logs)?
+                            {
+                                prepared_sender
+                                    .try_send(refresh)
+                                    .context("prepared DEX builder queue is full or closed")?;
+                            }
+                        }
+                        Err(error) => {
+                            engine.defer_arbitrage_settlement_catchup(
+                                &request,
+                                "eth_get_logs_failed",
+                            );
+                            tracing::warn!(
+                                from_block,
+                                through_block,
+                                error = %error,
+                                "receipt settlement HTTP catch-up failed; retaining WebSocket barrier"
+                            );
+                        }
+                    }
+                }
             }
             event = dex_receiver.recv() => {
                 let Some(event) = event else {

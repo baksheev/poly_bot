@@ -72,6 +72,37 @@ pub struct ReceiptLog {
     pub address: Address,
     pub topics: Vec<B256>,
     pub data: Vec<u8>,
+    /// Canonical position is present for RPC receipts and absent only in
+    /// synthetic/unit-test receipts.
+    pub position: Option<ReceiptLogPosition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptLogPosition {
+    pub transaction_hash: B256,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub transaction_index: u64,
+    pub log_index: u64,
+    pub removed: bool,
+}
+
+impl ReceiptLog {
+    pub fn chain_log(&self) -> anyhow::Result<ChainLog> {
+        let position = self
+            .position
+            .context("receipt log has no canonical position")?;
+        Ok(ChainLog {
+            address: self.address,
+            topics: self.topics.clone(),
+            data: self.data.clone(),
+            block_number: position.block_number,
+            block_hash: position.block_hash,
+            transaction_index: position.transaction_index,
+            log_index: position.log_index,
+            removed: position.removed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,9 +316,11 @@ impl JsonRpcClient {
         };
         let receipt: WireTransactionReceipt = serde_json::from_value(value)
             .context("eth_getTransactionReceipt returned an invalid receipt")?;
+        let transaction_hash = parse_b256("receipt.transactionHash", &receipt.transaction_hash)?;
+        let block_number = parse_quantity_u64("receipt.blockNumber", &receipt.block_number)?;
         Ok(Some(TransactionReceipt {
-            transaction_hash: parse_b256("receipt.transactionHash", &receipt.transaction_hash)?,
-            block_number: parse_quantity_u64("receipt.blockNumber", &receipt.block_number)?,
+            transaction_hash,
+            block_number,
             status: parse_quantity_u64("receipt.status", &receipt.status)?,
             gas_used: parse_quantity_u64("receipt.gasUsed", &receipt.gas_used)?,
             effective_gas_price: parse_quantity_u128(
@@ -309,6 +342,37 @@ impl JsonRpcClient {
                             .map(|topic| parse_b256("receipt log topic", &topic))
                             .collect::<anyhow::Result<Vec<_>>>()?,
                         data: parse_data_hex("receipt log data", &log.data)?,
+                        position: Some(ReceiptLogPosition {
+                            transaction_hash: {
+                                let log_hash = parse_b256(
+                                    "receipt log transactionHash",
+                                    &log.transaction_hash,
+                                )?;
+                                ensure!(
+                                    log_hash == transaction_hash,
+                                    "receipt log transactionHash differs from its receipt"
+                                );
+                                log_hash
+                            },
+                            block_number: {
+                                let log_block = parse_quantity_u64(
+                                    "receipt log blockNumber",
+                                    &log.block_number,
+                                )?;
+                                ensure!(
+                                    log_block == block_number,
+                                    "receipt log blockNumber differs from its receipt"
+                                );
+                                log_block
+                            },
+                            block_hash: parse_b256("receipt log blockHash", &log.block_hash)?,
+                            transaction_index: parse_quantity_u64(
+                                "receipt log transactionIndex",
+                                &log.transaction_index,
+                            )?,
+                            log_index: parse_quantity_u64("receipt log logIndex", &log.log_index)?,
+                            removed: log.removed,
+                        }),
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?,
@@ -526,10 +590,18 @@ struct WireTransactionReceipt {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WireReceiptLog {
     address: String,
     topics: Vec<String>,
     data: String,
+    transaction_hash: String,
+    block_number: String,
+    block_hash: String,
+    transaction_index: String,
+    log_index: String,
+    #[serde(default)]
+    removed: bool,
 }
 
 #[derive(Debug, Deserialize)]

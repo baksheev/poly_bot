@@ -9,7 +9,11 @@ use anyhow::{Context, bail, ensure};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    chain::rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
+    chain::{
+        logs::ChainLog,
+        rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
+    },
+    dex::events::{PoolLocator, PoolUpdate, decode_pool_event},
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
         EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
@@ -77,6 +81,7 @@ impl UniswapProtocol {
 pub enum SwapRoute {
     V3 {
         router: Address,
+        pool: Address,
         fee_pips: u32,
     },
     V4 {
@@ -148,7 +153,8 @@ impl ExactInputSwapRequest {
             "DEX confirmation timeout is zero"
         );
         match self.route {
-            SwapRoute::V3 { fee_pips, .. } => {
+            SwapRoute::V3 { pool, fee_pips, .. } => {
+                ensure!(pool != Address::ZERO, "Uniswap V3 pool is zero");
                 ensure!(fee_pips > 0 && fee_pips <= 0x00ff_ffff, "invalid V3 fee");
             }
             SwapRoute::V4 { pool_key, .. } => {
@@ -192,7 +198,7 @@ impl ExactInputSwapRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwapExecutionOutcome {
     pub protocol: UniswapProtocol,
     pub transaction_hash: B256,
@@ -201,6 +207,7 @@ pub struct SwapExecutionOutcome {
     pub effective_gas_price: u128,
     pub token_in_spent: U256,
     pub token_out_received: U256,
+    pub settlement_log: Option<ChainLog>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,6 +553,7 @@ impl DexExecutor {
             token_out_received >= request.amount_out_minimum,
             "DEX receipt output-token delta is below the submitted minimum"
         );
+        let settlement_log = settlement_log_for_route(&receipt, request.route)?;
         Ok(SwapExecutionOutcome {
             protocol,
             transaction_hash: receipt.transaction_hash,
@@ -554,6 +562,7 @@ impl DexExecutor {
             effective_gas_price: receipt.effective_gas_price,
             token_in_spent,
             token_out_received,
+            settlement_log,
         })
     }
 
@@ -992,6 +1001,39 @@ impl DexExecutor {
     }
 }
 
+fn settlement_log_for_route(
+    receipt: &TransactionReceipt,
+    route: SwapRoute,
+) -> anyhow::Result<Option<ChainLog>> {
+    let expected = match route {
+        SwapRoute::V3 { pool, .. } => PoolLocator::V3(pool),
+        SwapRoute::V4 { pool_key, .. } => PoolLocator::V4(pool_key.pool_id()),
+    };
+    let mut matched = None;
+    for receipt_log in &receipt.logs {
+        if let Some(position) = receipt_log.position {
+            ensure!(
+                position.transaction_hash == receipt.transaction_hash,
+                "DEX receipt log belongs to another transaction"
+            );
+        }
+        let Ok(log) = receipt_log.chain_log() else {
+            continue;
+        };
+        let Some(event) = decode_pool_event(&log)? else {
+            continue;
+        };
+        if event.locator == expected && matches!(event.update, PoolUpdate::Swap { .. }) {
+            ensure!(
+                matched.is_none(),
+                "DEX receipt contains duplicate route Swap events"
+            );
+            matched = Some(log);
+        }
+    }
+    Ok(matched)
+}
+
 fn wallet_transfer_totals(
     logs: &[ReceiptLog],
     token: Address,
@@ -1266,17 +1308,18 @@ mod tests {
         time::Duration,
     };
 
-    use alloy_primitives::{Address, U256, hex, keccak256};
+    use alloy_primitives::{Address, B256, U256, hex, keccak256};
     use serde_json::{Value, json};
 
     use super::{
         DexExecutionService, DexExecutionServiceError, DexExecutor, ExactInputSwapRequest,
         GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, UniswapProtocol,
-        wallet_transfer_totals,
+        settlement_log_for_route, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
-        chain::rpc::{JsonRpcClient, ReceiptLog},
+        chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
+        dex::events::v3_swap_topic,
         wallet::{EvmWallet, JournalStatus, TransactionJournal, UnknownOutcomeReason},
     };
 
@@ -1321,10 +1364,86 @@ mod tests {
                 address_topic(wallet),
             ],
             data: amount.to_be_bytes::<32>().to_vec(),
+            position: None,
         };
         assert_eq!(
             wallet_transfer_totals(&[log], token, wallet).unwrap(),
             (amount, U256::ZERO)
+        );
+    }
+
+    #[test]
+    fn successful_receipt_proves_the_selected_pool_swap_position() {
+        let pool = Address::repeat_byte(0x44);
+        let mut data = vec![0_u8; 5 * 32];
+        data[95] = 1;
+        data[112..128].copy_from_slice(&1_000_u128.to_be_bytes());
+        let receipt = TransactionReceipt {
+            transaction_hash: alloy_primitives::B256::repeat_byte(0x55),
+            block_number: 123,
+            status: 1,
+            gas_used: 90_000,
+            effective_gas_price: 1_000_000,
+            logs: vec![ReceiptLog {
+                address: pool,
+                topics: vec![v3_swap_topic(), B256::ZERO, B256::ZERO],
+                data,
+                position: Some(ReceiptLogPosition {
+                    transaction_hash: alloy_primitives::B256::repeat_byte(0x55),
+                    block_number: 123,
+                    block_hash: B256::repeat_byte(0x66),
+                    transaction_index: 7,
+                    log_index: 9,
+                    removed: false,
+                }),
+            }],
+        };
+
+        let log = settlement_log_for_route(
+            &receipt,
+            SwapRoute::V3 {
+                router: Address::repeat_byte(0x33),
+                pool,
+                fee_pips: 3_000,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(log.block_number, 123);
+        assert_eq!(log.transaction_index, 7);
+        assert_eq!(log.log_index, 9);
+        assert_eq!(log.address, pool);
+    }
+
+    #[test]
+    fn successful_receipt_without_positional_swap_proof_keeps_the_fallback_available() {
+        let pool = Address::repeat_byte(0x44);
+        let receipt = TransactionReceipt {
+            transaction_hash: B256::repeat_byte(0x55),
+            block_number: 123,
+            status: 1,
+            gas_used: 90_000,
+            effective_gas_price: 1_000_000,
+            logs: vec![ReceiptLog {
+                address: Address::repeat_byte(0x11),
+                topics: vec![keccak256("Transfer(address,address,uint256)")],
+                data: Vec::new(),
+                position: None,
+            }],
+        };
+
+        assert!(
+            settlement_log_for_route(
+                &receipt,
+                SwapRoute::V3 {
+                    router: Address::repeat_byte(0x33),
+                    pool,
+                    fee_pips: 3_000,
+                },
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1466,6 +1585,7 @@ mod tests {
             operation_id,
             SwapRoute::V3 {
                 router: Address::repeat_byte(0x33),
+                pool: Address::repeat_byte(0x44),
                 fee_pips: 3_000,
             },
             Address::repeat_byte(0x11),

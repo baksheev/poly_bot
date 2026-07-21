@@ -448,6 +448,14 @@ impl OpportunityEngine {
             .context("opportunity pool generation index is invalid")
     }
 
+    pub fn prepared_pool_generation(&self, pool_index: usize) -> anyhow::Result<Option<u64>> {
+        let generation = self.pool_generation(pool_index)?;
+        self.prepared_pools
+            .get(pool_index)
+            .context("prepared pool generation index is invalid")
+            .map(|prepared| prepared.as_ref().map(|_| generation))
+    }
+
     pub fn pool_generations(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.pool_generations.iter().copied().enumerate()
     }

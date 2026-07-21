@@ -2,6 +2,11 @@
 
 ## 2026-07-22
 
+- Replace the normal post-arbitrage WebSocket settlement wait with a
+  receipt-proven, pool-scoped HTTP log catch-up. The engine applies canonical
+  events through the fill block, rebuilds prepared curves, and releases the
+  lane only after a newer generation is published; WebSocket delivery remains
+  the fallback for incomplete or temporarily unavailable receipt proof.
 - Removed the Rust-only admission-time and absolute gas-price caps from live
   arbitrage DEX execution. As in Rails, the signer now uses fresh
   `eth_gasPrice` plus the configured priority fee; admission retains its gas

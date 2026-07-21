@@ -125,7 +125,9 @@ Admission also charges a conservative DEX gas budget using a background `eth_gas
 sample and the fresh ETHUSDT ask, verifies the wallet native balance, and
 atomically reserves executable token inventory. Matching Rails, the DEX signer
 uses the fresh RPC gas price plus the configured priority fee without an
-admission-time or absolute fee cap.
+admission-time or absolute fee cap. After a successful fill, the receipt's
+canonical pool `Swap` event drives an immediate ordered HTTP log catch-up and
+prepared-curve rebuild; the WebSocket settlement barrier remains the fallback.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:

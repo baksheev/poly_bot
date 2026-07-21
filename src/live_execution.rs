@@ -491,7 +491,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         }
                     },
                 );
-                self.publish_event(plan_id, state, false)?;
+                self.publish_event(plan_id, state, false, None)?;
             }
         }
         Ok(())
@@ -632,6 +632,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         plan_id.to_owned(),
                         PaperTradeEventState::Balanced,
                         dex_filled(operation),
+                        dex_settlement_log(operation),
                     )?;
                 } else if matches!(
                     operation.stage,
@@ -641,6 +642,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         plan_id.to_owned(),
                         PaperTradeEventState::BlockedUnknown,
                         dex_filled(operation),
+                        None,
                     )?;
                 }
                 return Ok(());
@@ -732,12 +734,14 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         plan_id: String,
         state: PaperTradeEventState,
         dex_filled: bool,
+        dex_settlement_log: Option<crate::chain::logs::ChainLog>,
     ) -> anyhow::Result<()> {
         self.event_sender
             .send(PaperTradeEvent {
                 plan_id,
                 state,
                 dex_filled,
+                dex_settlement_log,
             })
             .map_err(|_| anyhow::anyhow!("live trade event receiver is closed"))
     }
@@ -792,6 +796,13 @@ fn dex_filled(operation: &TradeOperation) -> bool {
     })
 }
 
+fn dex_settlement_log(operation: &TradeOperation) -> Option<crate::chain::logs::ChainLog> {
+    operation
+        .dex_result
+        .as_ref()
+        .and_then(|result| result.dex_settlement_log.clone())
+}
+
 /// Keeps every Binance sell command reachable from a DEX-buy plan inside the
 /// immutable WLD reservation. Favorable DEX output is real wallet inventory,
 /// but it is outside this trade's hedge/recovery graph and is reconciled by the
@@ -826,6 +837,7 @@ fn failed_with_gas(role: LegRole, gas_cost: u128, reference: &str) -> (LegRole, 
             token_a_delta_base_units: 0,
             gas_cost_token_a_base_units: gas_cost,
             venue_reference: reference.to_owned(),
+            dex_settlement_log: None,
         },
     )
 }
@@ -839,6 +851,7 @@ fn unknown(role: LegRole, reference: &str) -> (LegRole, LegResult) {
             token_a_delta_base_units: 0,
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
+            dex_settlement_log: None,
         },
     )
 }
@@ -949,6 +962,7 @@ mod tests {
             token_a_delta_base_units: token_a,
             gas_cost_token_a_base_units: gas,
             venue_reference: reference.to_owned(),
+            dex_settlement_log: None,
         }
     }
 

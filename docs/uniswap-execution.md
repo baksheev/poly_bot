@@ -20,8 +20,8 @@ defaults:
   `max_fee_per_gas = eth_gasPrice + priority_fee`, matching
   `EthWalletService`.
 - `eth_gasPrice` is cached for five seconds inside the execution owner.
-- Gas limit and fee have independent safety caps, and the wallet's native
-  balance must cover the maximum signed cost.
+- Gas limit retains an independent safety cap, and the wallet's native balance
+  must cover the admission-time gas budget.
 
 Gas limits retain Rust safety ceilings. Gas price follows Rails: immediately
 before signing, the executor uses fresh `eth_gasPrice` plus the configured
@@ -64,6 +64,23 @@ submitted minimum, then returns both base-unit deltas with gas used and
 effective gas price. This gives the parent coordinator actual DEX amounts
 without a race against a later balance snapshot; post-trade snapshots remain
 the independent settlement check.
+
+For a successful arbitrage swap, the executor also extracts the selected
+pool's canonical `Swap` event and its `(block, transactionIndex, logIndex)`
+position from the receipt. When the trade becomes terminal, the engine uses a
+pool-scoped HTTP `eth_getLogs` request to catch the mirror up through that
+receipt block immediately. It verifies that the exact receipt event is present,
+applies every preceding Swap/Mint/Burn or Swap/ModifyLiquidity event in
+canonical order, invalidates the old prepared curves, and publishes one new
+pool generation. Pending opportunities from the pre-fill generation are
+discarded; the next candidate passes the normal generation, Binance top, quote
+age, and deadline preflight before dispatch.
+
+WebSocket settlement remains the fail-safe. Missing positional receipt data, a
+temporary HTTP failure, or a receipt event not yet returned by `eth_getLogs`
+leaves the existing settlement barrier active. Later WebSocket delivery is
+deduplicated by canonical log position. A malformed, removed, or conflicting
+canonical event fails closed and requires normal process rehydration.
 
 Transport failures and confirmation timeouts are recorded as
 `outcome_unknown`. The nonce lane then stays blocked until canonical RPC
