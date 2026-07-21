@@ -23,8 +23,9 @@ defaults:
 - Gas limit and fee have independent safety caps, and the wallet's native
   balance must cover the maximum signed cost.
 
-The caps are intentionally Rust-only safety checks. A value outside the cap is
-rejected before nonce reservation and signing.
+Gas limits retain Rust safety ceilings. Gas price follows Rails: immediately
+before signing, the executor uses fresh `eth_gasPrice` plus the configured
+priority fee without an admission-time or absolute fee cap.
 
 ## Single owner and safe outcomes
 
@@ -36,16 +37,16 @@ race each other inside the service.
 Approval and manual validation transactions follow this order:
 
 1. Validate addresses, amounts, pool identity, deadline, and slippage floor.
-2. Simulate with `eth_call`, estimate gas, check the fee cap and ETH balance.
+2. Simulate with `eth_call`, estimate gas, resolve the current fee, and check the ETH balance.
 3. Fsync the intent to the wallet journal.
 4. Sign and fsync the transaction hash.
 5. Broadcast and fsync the broadcast state.
 6. Poll the receipt and fsync either `mined_success` or `mined_reverted`.
 
 Latency-sensitive live arbitrage swaps use immediate submission. Their route,
-amount, slippage floor, fee ceiling, deadline, inventory, and allowance are
+amount, slippage floor, admission gas budget, deadline, inventory, and allowance are
 validated before dispatch, then the executor uses the Rails-compatible quoted
-or fallback gas limit and proceeds directly to fee/balance checks, journaling,
+or fallback gas limit and proceeds directly to fresh fee resolution, journaling,
 signing, and broadcast. It does not call `eth_call` or `eth_estimateGas` between
 dispatch and nonce reservation; an on-chain revert is journaled and charged to
 the parent result. Immediate submission is accepted only after startup has

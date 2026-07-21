@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-22
+
+- Removed the Rust-only admission-time and absolute gas-price caps from live
+  arbitrage DEX execution. As in Rails, the signer now uses fresh
+  `eth_gasPrice` plus the configured priority fee; admission retains its gas
+  sample only for reservation economics and telemetry.
+
 This file records operator-visible changes shipped by `poly_bot`. Source
 revisions and immutable image digests in the GKE deployment history identify
 the exact artifact used by each rollout.

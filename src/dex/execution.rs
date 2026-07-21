@@ -40,7 +40,6 @@ const FAST_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const FAST_RECEIPT_POLL_WINDOW: Duration = Duration::from_secs(1);
 const SLOW_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_GAS_LIMIT: u64 = 5_000_000;
-const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
 const PERMIT2_APPROVAL_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const PERMIT2_MIN_REMAINING_VALIDITY: Duration = Duration::from_secs(60 * 60);
 
@@ -113,8 +112,6 @@ pub struct ExactInputSwapRequest {
     pub quoted_gas: Option<u64>,
     /// Explicit gas added after the Rails v3/v4 multiplier.
     pub additional_gas: u64,
-    /// Admission-time ceiling enforced before nonce reservation.
-    pub maximum_fee_per_gas_wei: u128,
     pub deadline_unix_seconds: u64,
     pub confirmation_timeout: Duration,
     pub submission_policy: SwapSubmissionPolicy,
@@ -145,10 +142,6 @@ impl ExactInputSwapRequest {
         ensure!(
             self.additional_gas <= MAX_GAS_LIMIT,
             "additional DEX gas exceeds safety cap"
-        );
-        ensure!(
-            self.maximum_fee_per_gas_wei > 0 && self.maximum_fee_per_gas_wei <= MAX_FEE_PER_GAS_WEI,
-            "DEX admission fee cap is invalid"
         );
         ensure!(
             !self.confirmation_timeout.is_zero(),
@@ -192,7 +185,6 @@ impl ExactInputSwapRequest {
             amount_out_minimum,
             quoted_gas: None,
             additional_gas: 0,
-            maximum_fee_per_gas_wei: MAX_FEE_PER_GAS_WEI,
             deadline_unix_seconds,
             confirmation_timeout: DEFAULT_SWAP_CONFIRMATION_TIMEOUT,
             submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
@@ -223,7 +215,6 @@ struct GasLimitPolicy {
 struct ExecuteCallPolicy {
     gas: GasLimitPolicy,
     quoted_gas: Option<u64>,
-    admitted_max_fee_per_gas: Option<u128>,
     confirmation_timeout: Duration,
     submission_policy: SwapSubmissionPolicy,
 }
@@ -527,7 +518,6 @@ impl DexExecutor {
                 ExecuteCallPolicy {
                     gas: GasLimitPolicy::for_swap(protocol, request.additional_gas),
                     quoted_gas: request.quoted_gas,
-                    admitted_max_fee_per_gas: Some(request.maximum_fee_per_gas_wei),
                     confirmation_timeout: request.confirmation_timeout,
                     submission_policy: request.submission_policy,
                 },
@@ -672,7 +662,6 @@ impl DexExecutor {
                 ExecuteCallPolicy {
                     gas: GasLimitPolicy::fixed(RAILS_DEFAULT_GAS_LIMIT),
                     quoted_gas: Some(RAILS_DEFAULT_GAS_LIMIT),
-                    admitted_max_fee_per_gas: None,
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
@@ -727,7 +716,6 @@ impl DexExecutor {
                 ExecuteCallPolicy {
                     gas: GasLimitPolicy::fixed(RAILS_PERMIT2_APPROVAL_GAS_LIMIT),
                     quoted_gas: Some(RAILS_PERMIT2_APPROVAL_GAS_LIMIT),
-                    admitted_max_fee_per_gas: None,
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
@@ -811,16 +799,6 @@ impl DexExecutor {
         let max_fee_per_gas = gas_price
             .checked_add(RAILS_PRIORITY_FEE_WEI)
             .context("DEX maximum fee overflow")?;
-        ensure!(
-            max_fee_per_gas > 0 && max_fee_per_gas <= MAX_FEE_PER_GAS_WEI,
-            "DEX maximum fee exceeds safety cap"
-        );
-        if let Some(admitted_max_fee_per_gas) = policy.admitted_max_fee_per_gas {
-            ensure!(
-                max_fee_per_gas <= admitted_max_fee_per_gas,
-                "current DEX fee exceeds the admission-time cap"
-            );
-        }
         let fee_parameters = WalletTransactionParameters {
             chain_id: self.nonce_lane.chain_id(),
             nonce: 0,
@@ -829,9 +807,10 @@ impl DexExecutor {
             max_priority_fee_per_gas: RAILS_PRIORITY_FEE_WEI.min(max_fee_per_gas),
         };
         // Immediate live swaps already passed admission against the in-memory
-        // wallet snapshot and reserve their exact maximum gas envelope. Avoid
-        // repeating eth_getBalance on the latency-sensitive path. Startup
-        // approval writes retain the direct RPC guard.
+        // wallet snapshot. Like Rails, signing uses the fresh RPC gas price
+        // without treating the admission sample as a fee cap. Avoid repeating
+        // eth_getBalance on the latency-sensitive path. Startup approval writes
+        // retain the direct RPC guard.
         if policy.submission_policy == SwapSubmissionPolicy::SimulateAndEstimate {
             let maximum_cost = call.maximum_native_cost(fee_parameters)?;
             ensure!(
@@ -1292,8 +1271,8 @@ mod tests {
 
     use super::{
         DexExecutionService, DexExecutionServiceError, DexExecutor, ExactInputSwapRequest,
-        GasLimitPolicy, MAX_FEE_PER_GAS_WEI, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy,
-        UniswapProtocol, wallet_transfer_totals,
+        GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, UniswapProtocol,
+        wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
@@ -1365,7 +1344,6 @@ mod tests {
             amount_out_minimum: U256::from(1_u8),
             quoted_gas: None,
             additional_gas: 0,
-            maximum_fee_per_gas_wei: MAX_FEE_PER_GAS_WEI,
             deadline_unix_seconds: 1_800_000_000,
             confirmation_timeout: Duration::from_secs(5),
             submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
@@ -1412,6 +1390,33 @@ mod tests {
             }
         ));
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dedicated_worker_signs_above_the_removed_rust_fee_cap() {
+        let (endpoint, server) = spawn_mock_rpc(MockOutcome::RevertHighGas);
+        let path = journal_path("high-gas");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        executor.allowance_mutations_enabled = false;
+        let service = DexExecutionService::spawn(executor, 1).unwrap();
+
+        let error = service
+            .execute(v3_request("rustval-high-gas"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DexExecutionServiceError::Reverted { .. }));
+        drop(service);
+        server.join().unwrap();
         fs::remove_file(path).unwrap();
     }
 
@@ -1486,6 +1491,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MockOutcome {
         Revert,
+        RevertHighGas,
         BroadcastRejected,
     }
 
@@ -1493,7 +1499,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request_count = match outcome {
-            MockOutcome::Revert => 6,
+            MockOutcome::Revert | MockOutcome::RevertHighGas => 6,
             MockOutcome::BroadcastRejected => 5,
         };
         let thread = std::thread::spawn(move || {
@@ -1512,12 +1518,15 @@ mod tests {
                     "eth_estimateGas" => {
                         panic!("immediate swap unexpectedly called eth_estimateGas")
                     }
-                    "eth_gasPrice" => rpc_result(id, json!("0xf4240")),
+                    "eth_gasPrice" => match outcome {
+                        MockOutcome::RevertHighGas => rpc_result(id, json!("0x2e90edd000")),
+                        _ => rpc_result(id, json!("0xf4240")),
+                    },
                     "eth_getBalance" => {
                         panic!("immediate swap unexpectedly called eth_getBalance")
                     }
                     "eth_sendRawTransaction" => match outcome {
-                        MockOutcome::Revert => {
+                        MockOutcome::Revert | MockOutcome::RevertHighGas => {
                             let raw = request["params"][0].as_str().unwrap();
                             let raw = hex::decode(raw.trim_start_matches("0x")).unwrap();
                             let hash = keccak256(raw);

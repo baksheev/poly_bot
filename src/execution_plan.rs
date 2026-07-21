@@ -178,7 +178,6 @@ impl DexSwapPlan {
     pub fn execution_request(
         &self,
         operation_id: impl Into<String>,
-        maximum_fee_per_gas_wei: u128,
     ) -> anyhow::Result<ExactInputSwapRequest> {
         self.validate()?;
         let route = match &self.route {
@@ -216,7 +215,6 @@ impl DexSwapPlan {
             U256::from(self.amount_out_minimum_base_units),
             self.deadline_unix_seconds,
         );
-        request.maximum_fee_per_gas_wei = maximum_fee_per_gas_wei;
         request.confirmation_timeout = Duration::from_secs(5);
         request.submission_policy = SwapSubmissionPolicy::Immediate;
         request.validate()?;
@@ -289,12 +287,9 @@ mod tests {
             deadline_unix_seconds: 1_900_000_000,
         };
 
-        let request = plan
-            .execution_request("rustarb-plan.dex", 2_500_000)
-            .unwrap();
+        let request = plan.execution_request("rustarb-plan.dex").unwrap();
         assert_eq!(request.amount_in, U256::from(10_000_000_u64));
         assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
-        assert_eq!(request.maximum_fee_per_gas_wei, 2_500_000);
         assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
     }
 
@@ -320,12 +315,9 @@ mod tests {
             deadline_unix_seconds: 1_900_000_000,
         };
 
-        let request = plan
-            .execution_request("rustarb-plan-v4.dex", 2_500_000)
-            .unwrap();
+        let request = plan.execution_request("rustarb-plan-v4.dex").unwrap();
         assert_eq!(request.amount_in, U256::from(10_000_000_u64));
         assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
-        assert_eq!(request.maximum_fee_per_gas_wei, 2_500_000);
         assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
         assert!(matches!(
             request.route,

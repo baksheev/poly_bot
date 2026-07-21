@@ -119,9 +119,7 @@ impl ComposedLiveLegExecutor {
                 if unix_seconds().is_none_or(|now| now >= plan.deadline_unix_seconds) {
                     return failed(role, "dex:expired-plan");
                 }
-                let request = match plan
-                    .execution_request(operation_id.clone(), bounds.maximum_fee_per_gas_wei)
-                {
+                let request = match plan.execution_request(operation_id.clone()) {
                     Ok(request) => request,
                     Err(error) => {
                         tracing::error!(operation_id, error = %error, "journaled DEX plan is invalid");

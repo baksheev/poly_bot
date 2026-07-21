@@ -17,7 +17,6 @@ use crate::{
 /// already-admitted trade exceed its gas budget.
 pub const MAX_SWAP_GAS_LIMIT: u64 = 5_000_000;
 pub const RAILS_PRIORITY_FEE_WEI: u128 = 1_500_000;
-pub const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AdmissionInputs<'a> {
@@ -279,10 +278,6 @@ fn finish_admission(
         .network_gas_price_wei
         .checked_add(RAILS_PRIORITY_FEE_WEI)
         .context("admission max fee per gas overflow")?;
-    ensure!(
-        maximum_fee_per_gas <= MAX_FEE_PER_GAS_WEI,
-        "admission max fee per gas exceeds executor cap"
-    );
     let maximum_gas_wei = U256::from(MAX_SWAP_GAS_LIMIT)
         .checked_mul(U256::from(maximum_fee_per_gas))
         .context("admission maximum gas overflow")?;
@@ -645,5 +640,17 @@ mod tests {
         request.wallet_native_balance_wei = U256::from(1_u8);
         let economics = evaluate_admission(&book(), request).unwrap().unwrap();
         assert!(!economics.native_gas_covered);
+    }
+
+    #[test]
+    fn accepts_gas_prices_above_the_removed_rust_fee_cap() {
+        let mut request = inputs(ArbitrageDirection::BuyTokenBOnDexSellOnCex);
+        request.network_gas_price_wei = 200_000_000_000;
+        request.wallet_native_balance_wei = U256::MAX;
+
+        let economics = evaluate_admission(&book(), request).unwrap().unwrap();
+
+        assert_eq!(economics.maximum_fee_per_gas_wei, 200_001_500_000);
+        assert!(economics.native_gas_covered);
     }
 }

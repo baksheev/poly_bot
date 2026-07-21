@@ -380,7 +380,8 @@ An adaptive candidate is eligible only if:
 - its exact gross `TradeEvaluation` still meets the normal opportunity
   threshold;
 - full Binance sell and buy recovery depth exists and venue filters pass;
-- native gas is covered at the admitted maximum fee;
+- native gas is covered at the admission-time gas-price sample; the signer
+  follows Rails and resolves a fresh uncapped fee immediately before signing;
 - `trade_notional`, `unhedged_notional`, and `maximum_recovery_loss` are within
   their config caps;
 - expected spread profit is at least `min_expected_profit` (zero in v9-v11); the

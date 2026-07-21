@@ -121,10 +121,11 @@ Sequence-consistent Spot depth is consulted only as a fallback when that top
 level is too small; concurrent execution retains the two-sided full-depth
 admission bound. Preflight rechecks the relevant top price and quantity, the
 exact DEX generation, and the swap deadline immediately before dispatch.
-Admission also charges a conservative maximum DEX gas cost using a background `eth_gasPrice`
+Admission also charges a conservative DEX gas budget using a background `eth_gasPrice`
 sample and the fresh ETHUSDT ask, verifies the wallet native balance, and
-atomically reserves executable token inventory. The DEX signer enforces the
-admission-time fee cap again before reserving a nonce.
+atomically reserves executable token inventory. Matching Rails, the DEX signer
+uses the fresh RPC gas price plus the configured priority fee without an
+admission-time or absolute fee cap.
 
 Temporary infrastructure identifiers still use the original `poly_bot`
 bootstrap names:
