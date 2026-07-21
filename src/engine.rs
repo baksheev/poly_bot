@@ -3018,7 +3018,17 @@ impl TradingEngine {
             .binance_ready(now, self.config.market_data_max_age_ms);
         let dex_mirror_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms);
         let dex_prepared_ready = self.opportunities.is_ready();
-        let dex_ready = dex_mirror_ready && dex_prepared_ready;
+        // Prepared DEX quote curves are a per-pool execution input, not a
+        // process-wide health signal. A pool can be rebuilding for the latest
+        // on-chain event while the rest of the runtime remains healthy and able
+        // to evaluate other pools or top-of-book-only fast-path candidates.
+        //
+        // Keep the global phase tied to the live DEX mirror/head freshness and
+        // let opportunity evaluation skip pools whose prepared curves are
+        // temporarily unavailable. Otherwise every short CLMM rebuild creates a
+        // misleading Ready->Degraded->Ready flap even though Kubernetes,
+        // balances, user data, gas, and rebalance are all healthy.
+        let dex_ready = dex_mirror_ready;
         let balances_ready = self
             .state
             .balances
@@ -3049,7 +3059,6 @@ impl TradingEngine {
             let blocking_inputs = [
                 (!binance_ready).then_some("binance_top"),
                 (!dex_mirror_ready).then_some("dex_mirror"),
-                (!dex_prepared_ready).then_some("dex_prepared"),
                 (!balances_ready).then_some("balances"),
                 (!user_data_ready).then_some("binance_user_data"),
                 (!gas_price_ready).then_some("gas_price"),

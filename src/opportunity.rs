@@ -669,6 +669,13 @@ fn evaluate_direction_impl(
     let mut best_baseline: Option<TradeEvaluation> = None;
     let mut best_capacity: Option<CapacityEvaluation> = None;
     for &pool_index in &pair.pool_indices {
+        if prepared_pools
+            .get(pool_index)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            continue;
+        }
         let baseline_token_b = if baseline_from_dex_token_a {
             let Some(amount) = quote_token_a_exact_input_baseline(
                 prepared_pools,
@@ -1565,6 +1572,29 @@ mod tests {
                 .is_some()
         );
         assert!(engine.is_ready());
+    }
+
+    #[test]
+    fn rebuilding_prepared_pool_is_skipped_instead_of_failing_evaluation() {
+        let (pair, mirror) = fixture();
+        let initial = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(initial)],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let book = quote("1.10", "100", "1.11", "100");
+        let ready = engine.evaluate(&book).unwrap().unwrap();
+        assert!(ready.dex_buy_cex_sell.baseline.is_some());
+
+        let _refresh = engine.request_pool_refresh(0, &mirror).unwrap();
+        assert!(!engine.is_ready());
+        let rebuilding = engine.evaluate(&book).unwrap().unwrap();
+        assert!(rebuilding.dex_buy_cex_sell.baseline.is_none());
+        assert!(rebuilding.cex_buy_dex_sell.baseline.is_none());
     }
 
     #[test]
