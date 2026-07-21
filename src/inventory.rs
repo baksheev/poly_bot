@@ -161,6 +161,27 @@ impl InventoryReservations {
             .context("reservations exceed observed inventory")
     }
 
+    /// Allocation-free lookup for hot-path read-only admission probes.
+    pub fn available_asset(&self, venue: InventoryVenue, asset: &str) -> anyhow::Result<U256> {
+        let observed = self
+            .observed
+            .iter()
+            .find(|(key, _)| key.venue == venue && key.asset == asset)
+            .map(|(_, amount)| *amount)
+            .with_context(|| format!("no observed inventory for {asset}"))?;
+        let reserved = self
+            .reservations
+            .values()
+            .flat_map(|reservation| reservation.request.claims.iter())
+            .filter(|claim| claim.key.venue == venue && claim.key.asset == asset)
+            .fold(U256::ZERO, |total, claim| {
+                total.saturating_add(claim.amount)
+            });
+        observed
+            .checked_sub(reserved)
+            .context("reservations exceed observed inventory")
+    }
+
     pub fn reservation(&self, operation_id: &str) -> Option<&InventoryReservation> {
         self.reservations.get(operation_id)
     }
@@ -344,6 +365,12 @@ mod tests {
         assert_eq!(
             inventory
                 .available(&InventoryKey::new(InventoryVenue::Wallet, "USDC").unwrap())
+                .unwrap(),
+            U256::from(400)
+        );
+        assert_eq!(
+            inventory
+                .available_asset(InventoryVenue::Wallet, "USDC")
                 .unwrap(),
             U256::from(400)
         );

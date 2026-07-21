@@ -1,46 +1,50 @@
 # Live arbitrage operator runbook
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-20
 
-This runbook applies only to the isolated WLDUSDC Rust identities on
-`arb-bot-rust-shadow-gce` in `asia-southeast1-b`. Rails must continue to own its
-own wallets, Binance account, orders, and nonces. Never run GCE live arbitrage
-while the GKE `arb-bot` deployment has a nonzero replica count: it currently
-owns the Rust rebalance wallet/account. The deployment wrapper refuses this
-overlap.
+This runbook applies only to the isolated WLDUSDC Rust identities owned by the
+single production Pod in the private zonal GKE cluster `arb-bot` in
+`asia-southeast1-b`. Rails continues to own separate wallets, Binance account,
+orders, and nonces. The stopped `arb-bot-rust-shadow-gce` VM is rollback-only
+and must never run while the GKE Deployment has a nonzero replica count.
 
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v6 domain artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC baseline,
+- v10 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback, 200 USDC global cap, 750 ms / delta 8 recent-depth caps, and 40 USDC top-only cap,
   WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
 - the dedicated wallet and Binance subaccount verified at startup;
 - persistent `/var/lib/arb-bot` parent, Binance-order, and wallet/nonce
   journals;
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
-  active rebalance, and fresh Binance/depth/DEX/balance/gas inputs;
-- fixed full-live v6 deployment, single-owner enforcement, and entry-stop
+  active rebalance, and fresh Binance top-of-book/DEX/balance/gas inputs; full
+  depth health is observed separately and does not gate DEX-first readiness;
+- fixed full-live v10 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
   recovery controls.
 
-Run `scripts/quality.sh`, then deploy the digest-pinned production image:
+Run `scripts/quality.sh`, fetch `origin/main`, require a clean fast-forward,
+push the validated commit directly to `main`, approve the `production`
+environment when requested, and deploy only with the `Deploy GKE` workflow. Do
+not open a routine production PR, force-push, or overwrite remote commits. The
+workflow builds the image, resolves its immutable digest, reuses the fixed node,
+and verifies the v10/full-live runtime config. Do not deploy from a workstation
+or use the GCE updater.
 
 ```bash
-scripts/update-gce-worker IMAGE@sha256:DIGEST SOURCE_REVISION
+gh workflow run deploy-gke.yml --ref main
 ```
 
 ## Entry stop and recovery
 
-The recoverable kill switch is the host file
+The recoverable kill switch is the persistent-volume file
 `/var/lib/arb-bot/arbitrage-entry.stop`. Creating it blocks new parent intents
 but deliberately leaves restart reconciliation and residual recovery enabled:
 
-```bash
-./scripts/gcloud-local compute ssh arb-bot-rust-shadow-gce \
-  --zone=asia-southeast1-b \
-  --tunnel-through-iap \
-  --command='sudo touch /var/lib/arb-bot/arbitrage-entry.stop'
-```
+Enable or clear it only through an approved GitHub Actions operational change
+targeting the GKE Pod and its mounted state volume. Never SSH to the rollback
+GCE VM or mutate the production Pod from a workstation; that would operate on
+the wrong owner or bypass the audited delivery boundary.
 
 Do not stop the process merely because an order/transaction is ambiguous. Keep
 the entry stop active, inspect the parent/child state, and prove the venue
@@ -49,14 +53,8 @@ hash. Never edit, truncate, copy over, or delete a journal. An `Unknown` parent
 is not balanced and must not be included in PnL.
 
 A hard service stop is allowed only after confirming there is no unresolved
-parent, order, nonce, transaction, or residual exposure:
-
-```bash
-./scripts/gcloud-local compute ssh arb-bot-rust-shadow-gce \
-  --zone=asia-southeast1-b \
-  --tunnel-through-iap \
-  --command='sudo systemctl stop arb-bot.service'
-```
+parent, order, nonce, transaction, or residual exposure. Scale or stop the GKE
+owner only through a reviewed, approved GitHub Actions recovery change.
 
 Removing the entry-stop file is a new-entry authorization. Do it only after
 venue and journal reconciliation.
@@ -91,6 +89,7 @@ separately.
 ## Rollback
 
 First activate the entry stop. Allow any already journaled recovery to finish,
-then verify venue state and stop GCE. Only after GCE is stopped and has no
-unresolved ownership may another runtime be scaled up. Rollback never reuses a
-Rails identity and never restores from a deleted journal.
+then verify venue state and scale the GKE Deployment to zero through an approved
+GitHub Actions recovery change. Only after GKE is stopped and has no unresolved
+ownership may the rollback VM or another runtime be started. Rollback never
+reuses a Rails identity and never restores from a deleted journal.

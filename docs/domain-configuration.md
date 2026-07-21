@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated v6 live artifact implemented
-Last reviewed: 2026-07-19
+Status: v4 read/paper default and separately gated v10 adaptive-live artifact implemented
+Last reviewed: 2026-07-20
 
 ## Runtime boundary
 
@@ -14,10 +14,10 @@ The default artifact is
 `config/strategies/usdc-wld-world-chain.v4.json`. It starts from the Rails
 production pair `id=3` at the source timestamp stored in the file and records
 one deliberate Rust-clone divergence: both Binance market data and eventual
-execution use Spot. The v6 artifact contains the same pair/economics, uses the
-live Binance price tick, and has the global and pair execution gates enabled.
-Selecting v6 alone cannot trade:
-the production GCE wrapper fixes runtime execution to `full_live`, and
+execution use Spot. The v7 artifact contains the same pair/economics, uses the
+live Binance price tick, enables adaptive sizing in shadow with a 200 USDC cap,
+and has the global and pair execution gates enabled. Selecting v7 alone cannot
+trade: the production GKE deployment fixes runtime execution to `full_live`, and
 signer/order journals, single-owner deployment, and startup health checks are
 independently required. Earlier artifacts remain provenance for prior shadow
 stages.
@@ -25,25 +25,30 @@ stages.
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven
 comparisons, but that credential must not be copied to GCP Secret Manager or
-attached to the GCE VM.
+attached to the production runtime.
 
 ## Captured behavior
 
-The v4-v6 snapshots record:
+The v4-v10 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
 - USDC as token A and WLD as token B, with base-unit decimals;
 - Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
   step/tick size;
-- fixed 20 USDC quote notional;
+- fixed 20 USDC detector/control notional; v10 executes adaptive whole-step
+  sizing from sequence-matched depth, capped recent depth, or a 40 USDC-capped
+  top-only book up to the global 200 USDC cap, while retaining immediate
+  bookTicker admission for a threshold-clearing baseline;
 - token-B quote sizing derived from the latest Binance ask, matching
   `UpdateMinBuyAmountJob` without its database update loop;
 - opportunity capacity expressed as whole Binance token-B steps, starting at
   that derived baseline and bounded by DEX liquidity, the profit threshold,
   and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, quote age, slippage reserve,
-  DEX fee reserve, and balance safety multiplier;
+  DEX fee reserve, and exact execution-envelope inventory reservations; v9-v10
+  makes this 20 bps spread the entry verdict independently of worst-case gas
+  and recovery coverage;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
   process's initial combined inventory;
 - the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.
@@ -65,9 +70,11 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v6 artifact has
-both true and is valid only for the explicitly confirmed GCE live path. The v5
-artifact remains immutable provenance for the previous live release.
+The committed v4 default has both execution gates false. The v10 artifact has
+both true and is valid only for the explicitly confirmed GKE live path. V7 is
+the immutable adaptive-shadow predecessor; v8 is the exact-envelope predecessor;
+v5-v6 remain provenance for earlier live releases and deserialize to
+`baseline_only` because they predate `adaptive_sizing`.
 
 ## Refreshing the source data
 
@@ -92,7 +99,7 @@ tick `0.001`, `profit_token_a`, and the V3/V4 provider set. The older Rails seed
 value of 10 USDC is not authoritative; the versioned artifact follows the live
 production row and records its exact update timestamp.
 
-Binance advertises a WLDUSDC `PRICE_FILTER` tick of `0.0001`. The v6 live
+Binance advertises a WLDUSDC `PRICE_FILTER` tick of `0.0001`. The v7 live
 artifact deliberately uses that venue tick instead of the coarser Rails
 `0.001` value, so IOC protection no longer loses a full millitick to parity
 rounding. Startup still requires the configured tick to be an exact integer

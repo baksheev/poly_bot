@@ -13,30 +13,29 @@ metrics, logging, and storage system Pods must share that node. The application
 is pinned to the active release pool with a node selector.
 
 Steady state contains one application Pod, one node, and one node pool. For a
-release, GitHub Actions explicitly creates a new one-node pool named from the
-tested source SHA. The Deployment uses `Recreate`: the previous process must
-terminate before the replacement can attach the single-writer persistent disk
-and start. After startup recovery and hydration remain Ready for 20 seconds,
-the workflow deletes the previous pool. Two nodes can exist during replacement,
-but never two application processes.
+release, GitHub Actions reuses that already allocated node pool. The Deployment
+uses `Recreate`: the previous process must terminate before the replacement can
+attach the single-writer persistent disk and start. This keeps one application
+process and avoids making every application release depend on new zonal C4
+capacity. Node-pool replacement is a separate, explicitly planned
+infrastructure operation.
 
 The runtime has Guaranteed QoS with equal requests and limits of six exclusive
 CPUs and 10 GiB memory. A C4-8 node exposes about 7.91 CPUs and 12.96 GiB as
 allocatable; required GKE system Pods currently reserve about one CPU and 1.53
 GB, leaving a safe scheduling and runtime margin without moving to C4-16.
 
-If image startup or readiness fails, the previous pool remains intact, the
-Deployment is restored to its previous revision, and the failed release pool
-is deleted. If old-pool cleanup fails after a successful rollout, the healthy
-new revision remains active and a later workflow retry removes orphaned
-`arb-*` pools.
+If image startup or readiness fails, the Deployment is restored to its previous
+revision on the same fixed pool.
 
-The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable rebalance
-journal and provides a second single-writer boundary on C4. Recreate rollout
-plus the journal file lock prevent two processes from owning the same rebalance
-operation. The full executor places its high-level and nonce journals on this
-disk. The current manifest selects `full_live`, mounts the wallet signer, and
-uses separate Binance subaccount and master treasury credentials.
+The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable execution
+journals and provides a second single-writer boundary on C4. Recreate rollout
+plus the journal file locks prevent two processes from owning the same trade or
+rebalance operation. The current manifest selects `full_live` for arbitrage and
+rebalancing, loads the reviewed v10 tiered-depth adaptive-live domain artifact, mounts the wallet
+signer, and uses separate Binance subaccount and master treasury credentials.
+The parent-trade, Binance-order, arbitrage-wallet, rebalance-executor, and
+rebalance-wallet journals all live on this disk.
 
 ## Networking and secrets
 
@@ -59,10 +58,9 @@ the GCE VM, so the Binance API-key allowlist does not change. A static address
 cannot be attached to a VM and Cloud NAT simultaneously: the VM must remain
 stopped and without an external access config while GKE owns the address.
 
-The project-wide and regional C4 quotas must cover the existing eight-vCPU VM
-plus two fixed GKE nodes during a controlled replacement: 24 vCPU during
-coexistence. Steady-state GKE usage is eight vCPU; release-time GKE usage is
-sixteen. Bootstrap and the release helper both explicitly set `--num-nodes=1`.
+The project-wide and regional C4 quotas must cover the fixed eight-vCPU GKE
+node. Application releases do not allocate another C4 VM. Bootstrap and any
+separately reviewed node-replacement procedure explicitly set `--num-nodes=1`.
 
 ## One-time bootstrap
 
@@ -110,17 +108,15 @@ started manually from `main`.
 
 1. checks out the exact CI-tested source SHA;
 2. authenticates with a short-lived GitHub OIDC credential;
-3. builds and pushes a SHA-tagged image;
-4. resolves the immutable Artifact Registry digest;
-5. creates a fixed one-node pool named `arb-<source-sha-prefix>`;
-6. applies the versioned platform resources and targets the new Deployment
-   revision exclusively at that pool;
-7. waits up to 30 minutes for readiness;
-8. deletes every previous release/bootstrap pool only after success;
+3. fails closed unless the GCE live owner is `TERMINATED`;
+4. builds and pushes a SHA-tagged image;
+5. resolves the immutable Artifact Registry digest;
+6. validates and reuses the Deployment's fixed one-node pool;
+7. applies the versioned platform resources and the new Deployment revision;
+8. waits up to 30 minutes for readiness;
 9. idempotently applies the rebalance log metrics, alert policies, and operator
    email channel;
-10. restores the previous Deployment and deletes the new pool on rollout
-    failure.
+10. restores the previous Deployment on the same pool on rollout failure.
 
 Live-capable releases accept deployment downtime: preserving single ownership
 is more important than overlap availability. No Cluster Autoscaler participates
@@ -145,9 +141,11 @@ Kubernetes retains five Deployment revisions.
 6. Run the workflow and verify startup recovery, Binance freshness, DEX heads,
    balances, ClickHouse telemetry, and decision latency using the new GKE
    engine identity.
-7. Confirm that the startup log reports `rebalance_execution_mode=full_live`,
-   the journal has no unexpected active operation, and only the new release
-   node pool remains after workflow cleanup.
+7. Confirm that the startup log reports
+   `arbitrage_execution_mode=full_live`,
+   `rebalance_execution_mode=full_live`, and the reviewed v7 domain snapshot;
+   verify that the journals have no unexpected active operation and only the
+   new release emits telemetry from the fixed node pool.
 8. Confirm that both `poly_bot rebalance` alert policies are enabled and target
    the `baksheev@me.com` notification channel.
 9. Keep the stopped VM, its digest, and configuration as the rollback target

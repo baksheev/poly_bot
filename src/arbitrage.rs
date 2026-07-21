@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -74,6 +74,20 @@ pub struct TradeIntent {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionRiskBounds {
+    /// Persisted proof that the exact candidate crossed the configured gross
+    /// venue-spread threshold before admission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opportunity_threshold_met: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_update_delta: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_matches: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_mismatch_reason: Option<String>,
     pub execution_slippage_bps: u16,
     pub cex_primary_limit_price: Decimal,
     #[serde(default, skip_serializing_if = "is_zero_decimal")]
@@ -100,6 +114,17 @@ pub struct AdmissionRiskBounds {
 
 impl AdmissionRiskBounds {
     fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.depth_source.as_deref().is_none_or(|source| matches!(
+                source,
+                "sequence_matched_full_depth" | "recent_full_depth" | "top_of_book_only"
+            )),
+            "admission depth source is invalid"
+        );
+        ensure!(
+            self.top_matches != Some(true) || self.top_mismatch_reason.is_none(),
+            "matching admission top cannot have a mismatch reason"
+        );
         ensure!(
             self.execution_slippage_bps <= 10_000,
             "execution slippage exceeds 100%"
@@ -162,6 +187,10 @@ const fn is_zero_u128(value: &u128) -> bool {
     *value == 0
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn is_zero_decimal(value: &Decimal) -> bool {
     *value == Decimal::ZERO
 }
@@ -188,6 +217,16 @@ impl TradeIntent {
             .map(|admission| u128_to_i128_saturating(admission.maximum_gas_cost_token_a_base_units))
     }
 
+    fn expected_gas_burdened_cost_token_a_base_units(&self) -> Option<i128> {
+        let admission = self.admission.as_ref()?;
+        Some(
+            self.expected_cost_token_a_base_units
+                .saturating_add(u128_to_i128_saturating(
+                    admission.maximum_gas_cost_token_a_base_units,
+                )),
+        )
+    }
+
     fn expected_fully_burdened_cost_token_a_base_units(&self) -> Option<i128> {
         let admission = self.admission.as_ref()?;
         Some(
@@ -205,6 +244,10 @@ impl TradeIntent {
         self.admission
             .as_ref()
             .map(|admission| u128_to_i128_saturating(admission.bounded_profit_token_a_base_units))
+    }
+
+    fn expected_profit_after_gas_token_a_base_units(&self) -> Option<i128> {
+        self.expected_bounded_profit_token_a_base_units()
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -453,19 +496,23 @@ impl TradeOperation {
         let expected_profit = self.intent.expected_profit_token_a_base_units();
         let expected_recovery_loss = self.intent.expected_recovery_loss_token_a_base_units();
         let expected_gas_cost = self.intent.expected_gas_cost_token_a_base_units();
+        let expected_gas_burdened_cost =
+            self.intent.expected_gas_burdened_cost_token_a_base_units();
         let expected_fully_burdened_cost = self
             .intent
             .expected_fully_burdened_cost_token_a_base_units();
         let expected_bounded_profit = self.intent.expected_bounded_profit_token_a_base_units();
+        let expected_profit_after_gas = self.intent.expected_profit_after_gas_token_a_base_units();
         let expected_profit_bps_x100 = profit_bps_x100(
             expected_profit,
             self.intent.expected_cost_token_a_base_units,
         );
-        let expected_bounded_profit_bps_x100 =
-            expected_fully_burdened_cost.and_then(|expected_cost| {
-                expected_bounded_profit
+        let expected_profit_after_gas_bps_x100 =
+            expected_gas_burdened_cost.and_then(|expected_cost| {
+                expected_profit_after_gas
                     .and_then(|expected_profit| profit_bps_x100(expected_profit, expected_cost))
             });
+        let expected_bounded_profit_bps_x100 = expected_profit_after_gas_bps_x100;
         let (realized_primary_cost, realized_primary_proceeds) = self
             .realized_primary_cost_and_proceeds_token_a_base_units()
             .map_or((None, None), |(cost, proceeds)| {
@@ -504,7 +551,7 @@ impl TradeOperation {
                 .comparable_profit_token_a_base_units
                 .saturating_sub(expected)
         });
-        Ok(json!({
+        let mut payload = json!({
             "engine_id": engine_id,
             "plan_id": self.intent.plan_id,
             "source_revision": self.intent.source_revision,
@@ -543,7 +590,48 @@ impl TradeOperation {
             "dex": self.dex_result.as_ref().map(leg_payload),
             "cex": self.cex_result.as_ref().map(leg_payload),
             "recoveries": self.recovery_results.iter().map(leg_payload).collect::<Vec<_>>(),
-        }))
+        });
+        let object = payload
+            .as_object_mut()
+            .context("arbitrage result telemetry payload is not an object")?;
+        let admission = self.intent.admission.as_ref();
+        object.insert(
+            "recovery_loss_bound_token_a_base_units".to_owned(),
+            json!(optional_i128_string(expected_recovery_loss)),
+        );
+        object.insert(
+            "expected_gas_burdened_cost_token_a_base_units".to_owned(),
+            json!(optional_i128_string(expected_gas_burdened_cost)),
+        );
+        object.insert(
+            "expected_profit_after_gas_token_a_base_units".to_owned(),
+            json!(optional_i128_string(expected_profit_after_gas)),
+        );
+        object.insert(
+            "expected_profit_after_gas_bps_x100".to_owned(),
+            json!(optional_i128_string(expected_profit_after_gas_bps_x100)),
+        );
+        object.insert(
+            "depth_source".to_owned(),
+            json!(admission.and_then(|admission| admission.depth_source.as_deref())),
+        );
+        object.insert(
+            "depth_age_ms".to_owned(),
+            json!(admission.and_then(|admission| admission.depth_age_ms)),
+        );
+        object.insert(
+            "depth_update_delta".to_owned(),
+            json!(admission.and_then(|admission| admission.depth_update_delta)),
+        );
+        object.insert(
+            "top_matches".to_owned(),
+            json!(admission.and_then(|admission| admission.top_matches)),
+        );
+        object.insert(
+            "top_mismatch_reason".to_owned(),
+            json!(admission.and_then(|admission| admission.top_mismatch_reason.as_deref())),
+        );
+        Ok(payload)
     }
 }
 
@@ -680,6 +768,7 @@ pub struct EntryPreflightHandle {
 #[derive(Clone, Debug, Default)]
 struct EntryPreflightState {
     quotes: BTreeMap<String, TopOfBook>,
+    quote_max_age_ms: BTreeMap<String, u64>,
     dex_pool_generations: BTreeMap<usize, u64>,
 }
 
@@ -690,6 +779,13 @@ pub struct EntryPreflightRejection {
 }
 
 impl EntryPreflightHandle {
+    pub fn configure_quote_max_age(&self, symbol: &str, max_age_ms: u64) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        state.quote_max_age_ms.insert(symbol.to_owned(), max_age_ms);
+    }
+
     pub fn update_quote(&self, quote: &TopOfBook) {
         let Ok(mut state) = self.inner.write() else {
             return;
@@ -731,6 +827,18 @@ impl EntryPreflightHandle {
                 detail: format!("no latest quote for {}", opportunity.symbol),
             }));
         };
+        if let Some(max_age_ms) = state.quote_max_age_ms.get(&opportunity.symbol).copied()
+            && quote.received_at.elapsed() > Duration::from_millis(max_age_ms)
+        {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "preflight_quote_age_exceeded",
+                detail: format!(
+                    "latest quote age {} ms exceeds configured {} ms",
+                    quote.received_at.elapsed().as_millis(),
+                    max_age_ms
+                ),
+            }));
+        }
         if quote.update_id < opportunity.update_id {
             return Ok(Some(EntryPreflightRejection {
                 reason: "stale_preflight_quote",
@@ -1304,8 +1412,8 @@ impl PaperTradeCoordinator {
             intent
                 .admission
                 .as_ref()
-                .is_none_or(|admission| admission.bounded_profit_token_a_base_units > 0),
-            "bounded admission profit must be positive"
+                .is_none_or(|admission| admission.opportunity_threshold_met),
+            "opportunity threshold must be met before admission"
         );
         ensure!(
             self.journal.active_operations().is_empty(),
@@ -2097,6 +2205,12 @@ mod tests {
             dex_operation_id: "arb-plan-dex".to_owned(),
             cex_client_order_id: "arbplancex".to_owned(),
             admission: Some(super::AdmissionRiskBounds {
+                opportunity_threshold_met: true,
+                depth_source: None,
+                depth_age_ms: None,
+                depth_update_delta: None,
+                top_matches: None,
+                top_mismatch_reason: None,
                 execution_slippage_bps: 15,
                 cex_primary_limit_price: Decimal::from(1),
                 cex_primary_top_quantity: Decimal::from(100),
@@ -2137,8 +2251,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_bounded_profit_is_valid_for_legacy_decode_but_rejected_on_admit() {
+    fn newly_admitted_trade_does_not_gate_on_expected_profit_after_gas() {
         let mut intent = intent(ExecutionMode::DexFirst);
+        intent.expected_proceeds_token_a_base_units = 1_001;
         intent
             .admission
             .as_mut()
@@ -2147,26 +2262,35 @@ mod tests {
 
         intent.validate().unwrap();
 
-        let path = path("zero-bounded-profit-rejected");
+        let path = path("after-gas-threshold-not-met");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        coordinator.admit(intent).unwrap();
+    }
+
+    #[test]
+    fn newly_admitted_trade_requires_persisted_opportunity_threshold_proof() {
+        let mut intent = intent(ExecutionMode::DexFirst);
+        intent.admission.as_mut().unwrap().opportunity_threshold_met = false;
+
+        let path = path("opportunity-threshold-not-met");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
         let error = coordinator.admit(intent).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("bounded admission profit must be positive"),
+                .contains("opportunity threshold must be met before admission"),
             "{error:#}"
         );
     }
 
     #[test]
-    fn legacy_journal_checksum_survives_missing_primary_top_quantity() {
+    fn legacy_journal_checksum_survives_missing_default_admission_fields() {
         let mut trade_intent = intent(ExecutionMode::DexFirst);
-        trade_intent
-            .admission
-            .as_mut()
-            .unwrap()
-            .cex_primary_top_quantity = Decimal::ZERO;
+        let admission = trade_intent.admission.as_mut().unwrap();
+        admission.cex_primary_top_quantity = Decimal::ZERO;
+        admission.opportunity_threshold_met = false;
         let payload = super::WirePayload {
             version: super::JOURNAL_VERSION,
             sequence: 0,
@@ -2179,6 +2303,14 @@ mod tests {
             !String::from_utf8_lossy(&encoded).contains("cex_primary_top_quantity"),
             "legacy-compatible default must not change the checksum payload"
         );
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains("opportunity_threshold_met"),
+            "legacy-compatible default must not change the checksum payload"
+        );
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains("depth_source"),
+            "missing legacy depth metadata must not change the checksum payload"
+        );
 
         let decoded: super::WireRecord = serde_json::from_slice(&encoded).unwrap();
         decoded.validate_checksum().unwrap();
@@ -2189,7 +2321,13 @@ mod tests {
         let path = path("dex-first");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
-        let intent = intent(ExecutionMode::DexFirst);
+        let mut intent = intent(ExecutionMode::DexFirst);
+        let admission = intent.admission.as_mut().unwrap();
+        admission.depth_source = Some("recent_full_depth".to_owned());
+        admission.depth_age_ms = Some(635);
+        admission.depth_update_delta = Some(5);
+        admission.top_matches = Some(false);
+        admission.top_mismatch_reason = Some("bid_quantity_mismatch".to_owned());
         let plan_id = intent.plan_id.clone();
         coordinator.admit(intent).unwrap();
         assert!(matches!(
@@ -2228,15 +2366,30 @@ mod tests {
         assert_eq!(payload["comparable_profit_token_a_base_units"], "25");
         assert_eq!(payload["expected_cost_token_a_base_units"], "1000");
         assert_eq!(payload["expected_proceeds_token_a_base_units"], "1030");
+        assert_eq!(payload["depth_source"], "recent_full_depth");
+        assert_eq!(payload["depth_age_ms"], 635);
+        assert_eq!(payload["depth_update_delta"], 5);
+        assert_eq!(payload["top_matches"], false);
+        assert_eq!(payload["top_mismatch_reason"], "bid_quantity_mismatch");
         assert_eq!(payload["expected_profit_bps_x100"], "30000");
         assert_eq!(payload["expected_recovery_loss_token_a_base_units"], "10");
+        assert_eq!(payload["recovery_loss_bound_token_a_base_units"], "10");
         assert_eq!(payload["expected_gas_cost_token_a_base_units"], "1");
+        assert_eq!(
+            payload["expected_gas_burdened_cost_token_a_base_units"],
+            "1001"
+        );
         assert_eq!(
             payload["expected_fully_burdened_cost_token_a_base_units"],
             "1011"
         );
+        assert_eq!(
+            payload["expected_profit_after_gas_token_a_base_units"],
+            "19"
+        );
+        assert_eq!(payload["expected_profit_after_gas_bps_x100"], "18981");
         assert_eq!(payload["expected_bounded_profit_token_a_base_units"], "19");
-        assert_eq!(payload["expected_bounded_profit_bps_x100"], "18793");
+        assert_eq!(payload["expected_bounded_profit_bps_x100"], "18981");
         assert_eq!(payload["realized_primary_cost_token_a_base_units"], "1000");
         assert_eq!(
             payload["realized_primary_proceeds_token_a_base_units"],

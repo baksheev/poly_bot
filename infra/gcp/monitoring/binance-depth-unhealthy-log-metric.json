@@ -1,0 +1,10 @@
+{
+  "description": "Counts unhealthy Binance depth heartbeats without changing the full_live DEX-first runtime phase.",
+  "filter": "resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\" AND jsonPayload.fields.message=\"Binance depth health heartbeat\" AND jsonPayload.fields.healthy=false",
+  "metricDescriptor": {
+    "displayName": "poly_bot Binance depth unhealthy",
+    "metricKind": "DELTA",
+    "valueType": "INT64",
+    "unit": "1"
+  }
+}

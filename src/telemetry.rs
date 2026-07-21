@@ -16,6 +16,7 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 use crate::config::AppConfig;
 
 pub const ARBITRAGE_RESULT_KIND: &str = "arbitrage_result";
+pub const ARBITRAGE_EXECUTION_STAGE_KIND: &str = "arbitrage_execution_stage";
 
 #[derive(Clone)]
 pub struct TelemetryHandle {
@@ -45,6 +46,42 @@ impl TelemetryHandle {
             sender,
             dropped_records: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+/// Cheap, non-blocking execution-stage telemetry shared with the dedicated
+/// DEX and Binance worker threads. `operation_id` is the venue id; orchestration
+/// events additionally carry `plan_id` so the two namespaces can be joined.
+#[derive(Clone)]
+pub struct ExecutionLatencyTelemetry {
+    handle: TelemetryHandle,
+    engine_id: String,
+}
+
+impl ExecutionLatencyTelemetry {
+    pub fn new(handle: TelemetryHandle, engine_id: String) -> Self {
+        Self { handle, engine_id }
+    }
+
+    pub fn emit_stage(
+        &self,
+        venue: &'static str,
+        operation_id: &str,
+        stage: &'static str,
+        duration_us: u64,
+        outcome: &'static str,
+    ) {
+        self.handle.emit(
+            ARBITRAGE_EXECUTION_STAGE_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "venue": venue,
+                "operation_id": operation_id,
+                "stage": stage,
+                "duration_us": duration_us,
+                "outcome": outcome,
+            }),
+        );
     }
 }
 

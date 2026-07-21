@@ -21,6 +21,7 @@ env:
   GKE_ZONE: asia-southeast1-b
   GKE_CLUSTER: arb-bot
   GKE_NAMESPACE: arb-bot
+  GCE_INSTANCE: arb-bot-rust-shadow-gce
   ARTIFACT_REPOSITORY: poly-bot
   IMAGE_NAME: poly-bot
   NODE_POOL_PREFIX: arb
@@ -63,6 +64,16 @@ jobs:
             [[ "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]
             test -n "${limit//[0.]/}"
           done
+          domain_config=config/strategies/usdc-wld-world-chain.v10.json
+          test "$(jq -r '.pairs[0].adaptive_sizing.mode' "${domain_config}")" = adaptive
+          test "$(jq -r '.pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units' "${domain_config}")" = 200000000
+          test "$(jq -r '.pairs[0].quote_sizing.token_a_base_units' "${domain_config}")" = 20000000
+          test "$(jq -r '.pairs[0].strategy.opportunity_threshold_bps' "${domain_config}")" = 20
+          test "$(jq -r '.pairs[0].adaptive_sizing.min_expected_profit_token_a_base_units' "${domain_config}")" = 0
+          test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_age_ms' "${domain_config}")" = 750
+          test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_update_delta' "${domain_config}")" = 8
+          test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.top_of_book_max_trade_notional_token_a_base_units' "${domain_config}")" = 40000000
+          test "$(jq -r '.pairs[0].strategy | has("balance_safety_multiplier")' "${domain_config}")" = false
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -85,6 +96,17 @@ jobs:
         uses: google-github-actions/setup-gcloud@v3
         with:
           install_components: alpha
+
+      - name: Verify GCE live owner is stopped
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          status="$(gcloud compute instances describe "${GCE_INSTANCE}" \
+            --zone="${GKE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --format='value(status)')"
+          test "${status}" = "TERMINATED"
 
       - name: Build and push immutable image
         id: image
@@ -117,7 +139,7 @@ jobs:
           namespace: ${{ env.GKE_NAMESPACE }}
           use_dns_based_endpoint: true
 
-      - name: Replace the fixed release node and roll out
+      - name: Roll out on the fixed node
         id: rollout
         env:
           IMAGE: ${{ steps.image.outputs.image }}
@@ -132,6 +154,7 @@ jobs:
           new_pool="${NODE_POOL_PREFIX}-${release_id}"
           had_previous=false
           previous_pool=""
+          previous_runtime_config=""
           rollout_applied=false
           rollout_succeeded=false
 
@@ -140,6 +163,11 @@ jobs:
             previous_pool="$(kubectl get deployment arb-bot \
               --namespace "${GKE_NAMESPACE}" \
               -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+            test -n "${previous_pool}"
+            new_pool="${previous_pool}"
+            previous_runtime_config="$(kubectl get configmap arb-bot-runtime \
+              --namespace "${GKE_NAMESPACE}" \
+              -o yaml)"
           fi
 
           restore_on_failure() {
@@ -157,6 +185,8 @@ jobs:
 
             if [[ "${rollout_applied}" == true ]]; then
               if [[ "${had_previous}" == true ]]; then
+                printf '%s\n' "${previous_runtime_config}" \
+                  | kubectl replace --namespace "${GKE_NAMESPACE}" -f - || true
                 kubectl rollout undo deployment/arb-bot --namespace "${GKE_NAMESPACE}" || true
                 kubectl rollout status deployment/arb-bot \
                   --namespace "${GKE_NAMESPACE}" \
@@ -200,14 +230,12 @@ jobs:
             --zone="${GKE_ZONE}" \
             --format='value(name)')
 
-          if [[ "${new_pool}" != "${previous_pool}" ]]; then
-            GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
-            GKE_CLUSTER="${GKE_CLUSTER}" \
-            GKE_ZONE="${GKE_ZONE}" \
-            GKE_RELEASE_ID="${release_id}" \
-            GCLOUD_BIN=gcloud \
-              scripts/create-gke-node-pool "${new_pool}"
-          fi
+          GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
+          GKE_CLUSTER="${GKE_CLUSTER}" \
+          GKE_ZONE="${GKE_ZONE}" \
+          GKE_RELEASE_ID="${release_id}" \
+          GCLOUD_BIN=gcloud \
+            scripts/create-gke-node-pool "${new_pool}"
 
           sed \
             -e "s|__GCP_PROJECT_ID__|${GCP_PROJECT_ID}|g" \
@@ -250,6 +278,19 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
             -o wide
+          runtime_config="$(kubectl get configmap arb-bot-runtime \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json)"
+          test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
+            = config/strategies/usdc-wld-world-chain.v10.json
+          test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${runtime_config}")" \
+            = full_live
+          test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \
+            = full_live
+          rebalance_mode="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"
+          test "${rebalance_mode}" = full_live
           rollout_succeeded=true
 
           while IFS= read -r pool; do

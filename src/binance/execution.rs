@@ -1,4 +1,8 @@
-use std::{path::PathBuf, thread::JoinHandle, time::Duration};
+use std::{
+    path::PathBuf,
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
@@ -9,6 +13,7 @@ use crate::binance::{
     user_data::MultiplexedBinanceWsApi,
     ws_api::{OrderResult, WsApiError},
 };
+use crate::telemetry::ExecutionLatencyTelemetry;
 
 const RECONCILIATION_ATTEMPTS: usize = 8;
 const RECONCILIATION_DELAY: Duration = Duration::from_millis(250);
@@ -178,17 +183,41 @@ impl std::error::Error for BinanceExecutionServiceError {}
 struct BinanceExecutor {
     client: MultiplexedBinanceWsApi,
     journal: BinanceOrderJournal,
+    latency_telemetry: Option<ExecutionLatencyTelemetry>,
 }
 
 impl BinanceExecutor {
     async fn initialize(
         client: MultiplexedBinanceWsApi,
         journal_path: PathBuf,
+        latency_telemetry: Option<ExecutionLatencyTelemetry>,
     ) -> anyhow::Result<Self> {
         let journal = BinanceOrderJournal::open(journal_path)?;
-        let mut executor = Self { client, journal };
+        let mut executor = Self {
+            client,
+            journal,
+            latency_telemetry,
+        };
         executor.reconcile_startup().await?;
         Ok(executor)
+    }
+
+    fn emit_latency_stage(
+        &self,
+        operation_id: &str,
+        stage: &'static str,
+        started_at: Instant,
+        outcome: &'static str,
+    ) {
+        if let Some(telemetry) = &self.latency_telemetry {
+            telemetry.emit_stage(
+                "binance",
+                operation_id,
+                stage,
+                duration_us(started_at.elapsed()),
+                outcome,
+            );
+        }
     }
 
     async fn reconcile_startup(&mut self) -> anyhow::Result<()> {
@@ -262,7 +291,20 @@ impl BinanceExecutor {
                 _ => anyhow::bail!("journaled Binance order still requires reconciliation"),
             }
         }
-        self.journal.record_intent(request_intent)?;
+        let journal_intent_started = Instant::now();
+        let journal_intent_result = self.journal.record_intent(request_intent);
+        self.emit_latency_stage(
+            &request.operation_id,
+            "intent_journal",
+            journal_intent_started,
+            if journal_intent_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+        );
+        journal_intent_result?;
+        let placement_started = Instant::now();
         let result = match &request.kind {
             BinanceOrderRequestKind::MarketBuy { quote_quantity } => {
                 self.client
@@ -289,6 +331,12 @@ impl BinanceExecutor {
                     .await
             }
         };
+        self.emit_latency_stage(
+            &request.operation_id,
+            "placement_ws_api",
+            placement_started,
+            if result.is_ok() { "success" } else { "failed" },
+        );
 
         match result {
             Ok(order) => {
@@ -312,8 +360,19 @@ impl BinanceExecutor {
                 let order = if terminal_status(&order.status) {
                     order
                 } else {
-                    self.reconcile_known_order(&symbol, &client_order_id)
-                        .await?
+                    let reconciliation_started = Instant::now();
+                    let reconciled = self.reconcile_known_order(&symbol, &client_order_id).await;
+                    self.emit_latency_stage(
+                        &request.operation_id,
+                        "terminal_reconciliation",
+                        reconciliation_started,
+                        if reconciled.is_ok() {
+                            "success"
+                        } else {
+                            "failed"
+                        },
+                    );
+                    reconciled?
                 };
                 tracing::info!(
                     operation_id = request.operation_id,
@@ -531,6 +590,7 @@ fn classify_execution_error(
 
 struct WorkItem {
     request: BinanceOrderRequest,
+    enqueued_at: Instant,
     response: oneshot::Sender<Result<BinanceOrderOutcome, BinanceExecutionServiceError>>,
 }
 
@@ -546,6 +606,24 @@ impl BinanceExecutionService {
         client: MultiplexedBinanceWsApi,
         journal_path: PathBuf,
         capacity: usize,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(client, journal_path, capacity, None).await
+    }
+
+    pub async fn spawn_instrumented(
+        client: MultiplexedBinanceWsApi,
+        journal_path: PathBuf,
+        capacity: usize,
+        latency_telemetry: ExecutionLatencyTelemetry,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(client, journal_path, capacity, Some(latency_telemetry)).await
+    }
+
+    async fn spawn_inner(
+        client: MultiplexedBinanceWsApi,
+        journal_path: PathBuf,
+        capacity: usize,
+        latency_telemetry: Option<ExecutionLatencyTelemetry>,
     ) -> anyhow::Result<Self> {
         ensure!(capacity > 0, "Binance execution channel capacity is zero");
         let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity);
@@ -563,20 +641,30 @@ impl BinanceExecutionService {
                         return;
                     }
                 };
-                let mut executor =
-                    match runtime.block_on(BinanceExecutor::initialize(client, journal_path)) {
-                        Ok(executor) => executor,
-                        Err(error) => {
-                            let _ = startup_sender.send(Err(format!("{error:#}")));
-                            return;
-                        }
-                    };
+                let mut executor = match runtime.block_on(BinanceExecutor::initialize(
+                    client,
+                    journal_path,
+                    latency_telemetry,
+                )) {
+                    Ok(executor) => executor,
+                    Err(error) => {
+                        let _ = startup_sender.send(Err(format!("{error:#}")));
+                        return;
+                    }
+                };
                 if startup_sender.send(Ok(())).is_err() {
                     return;
                 }
                 while let Some(work) = receiver.blocking_recv() {
                     let operation_id = work.request.operation_id.clone();
                     let client_order_id = work.request.client_order_id.clone();
+                    executor.emit_latency_stage(
+                        &operation_id,
+                        "worker_queue",
+                        work.enqueued_at,
+                        "success",
+                    );
+                    let execution_started = Instant::now();
                     let result =
                         runtime
                             .block_on(executor.execute(work.request))
@@ -586,6 +674,12 @@ impl BinanceExecutionService {
                                     format!("{error:#}"),
                                 )
                             });
+                    executor.emit_latency_stage(
+                        &operation_id,
+                        "worker_total",
+                        execution_started,
+                        if result.is_ok() { "success" } else { "failed" },
+                    );
                     if let Err(error) = &result {
                         tracing::error!(
                             operation_id,
@@ -621,7 +715,11 @@ impl BinanceExecutionService {
                 })?;
         let (response, receiver) = oneshot::channel();
         sender
-            .send(WorkItem { request, response })
+            .send(WorkItem {
+                request,
+                enqueued_at: Instant::now(),
+                response,
+            })
             .await
             .map_err(|_| BinanceExecutionServiceError::OutcomeUnknown {
                 reason: "Binance executor thread stopped".to_owned(),
@@ -632,6 +730,10 @@ impl BinanceExecutionService {
                 reason: "Binance executor dropped its response".to_owned(),
             })?
     }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 impl Drop for BinanceExecutionService {

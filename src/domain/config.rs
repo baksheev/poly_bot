@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use alloy_primitives::U256;
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -177,6 +178,8 @@ pub struct PairConfig {
     pub token_b: TokenConfig,
     pub binance: BinanceConfig,
     pub quote_sizing: QuoteSizingConfig,
+    #[serde(default)]
+    pub adaptive_sizing: AdaptiveSizingConfig,
     pub strategy: StrategyConfig,
     #[serde(default)]
     pub rebalance: RebalanceConfig,
@@ -201,11 +204,198 @@ impl PairConfig {
         );
         self.binance.validate(&self.token_a, &self.token_b)?;
         self.quote_sizing.validate()?;
+        self.adaptive_sizing
+            .validate(&self.quote_sizing.token_a_base_units)?;
         self.strategy.validate()?;
         self.rebalance.validate()?;
         self.dex.validate(&self.chain)?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdaptiveSizingConfig {
+    BaselineOnly,
+    Shadow {
+        max_trade_notional_token_a_base_units: String,
+        max_unhedged_notional_token_a_base_units: String,
+        max_recovery_loss_token_a_base_units: String,
+        #[serde(alias = "min_bounded_profit_token_a_base_units")]
+        min_expected_profit_token_a_base_units: String,
+        #[serde(alias = "min_incremental_bounded_profit_token_a_base_units")]
+        min_incremental_expected_profit_token_a_base_units: String,
+        #[serde(default)]
+        depth_policy: AdaptiveDepthPolicy,
+    },
+    Adaptive {
+        max_trade_notional_token_a_base_units: String,
+        max_unhedged_notional_token_a_base_units: String,
+        max_recovery_loss_token_a_base_units: String,
+        #[serde(alias = "min_bounded_profit_token_a_base_units")]
+        min_expected_profit_token_a_base_units: String,
+        #[serde(alias = "min_incremental_bounded_profit_token_a_base_units")]
+        min_incremental_expected_profit_token_a_base_units: String,
+        #[serde(default)]
+        depth_policy: AdaptiveDepthPolicy,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveDepthPolicy {
+    pub recent_full_depth_max_age_ms: u64,
+    pub recent_full_depth_max_update_delta: u64,
+    pub top_of_book_max_trade_notional_token_a_base_units: String,
+}
+
+impl Default for AdaptiveDepthPolicy {
+    fn default() -> Self {
+        Self {
+            recent_full_depth_max_age_ms: 0,
+            recent_full_depth_max_update_delta: 0,
+            top_of_book_max_trade_notional_token_a_base_units: "0".to_owned(),
+        }
+    }
+}
+
+impl Default for AdaptiveSizingConfig {
+    fn default() -> Self {
+        Self::BaselineOnly
+    }
+}
+
+impl AdaptiveSizingConfig {
+    pub const fn mode(&self) -> &'static str {
+        match self {
+            Self::BaselineOnly => "baseline_only",
+            Self::Shadow { .. } => "shadow",
+            Self::Adaptive { .. } => "adaptive",
+        }
+    }
+
+    pub fn limits(&self) -> Option<AdaptiveSizingLimits<'_>> {
+        let (
+            max_trade_notional,
+            max_unhedged_notional,
+            max_recovery_loss,
+            min_expected_profit,
+            min_incremental_expected_profit,
+            depth_policy,
+        ) = match self {
+            Self::BaselineOnly => return None,
+            Self::Shadow {
+                max_trade_notional_token_a_base_units,
+                max_unhedged_notional_token_a_base_units,
+                max_recovery_loss_token_a_base_units,
+                min_expected_profit_token_a_base_units,
+                min_incremental_expected_profit_token_a_base_units,
+                depth_policy,
+            }
+            | Self::Adaptive {
+                max_trade_notional_token_a_base_units,
+                max_unhedged_notional_token_a_base_units,
+                max_recovery_loss_token_a_base_units,
+                min_expected_profit_token_a_base_units,
+                min_incremental_expected_profit_token_a_base_units,
+                depth_policy,
+            } => (
+                max_trade_notional_token_a_base_units,
+                max_unhedged_notional_token_a_base_units,
+                max_recovery_loss_token_a_base_units,
+                min_expected_profit_token_a_base_units,
+                min_incremental_expected_profit_token_a_base_units,
+                depth_policy,
+            ),
+        };
+        Some(AdaptiveSizingLimits {
+            max_trade_notional,
+            max_unhedged_notional,
+            max_recovery_loss,
+            min_expected_profit,
+            min_incremental_expected_profit,
+            depth_policy,
+        })
+    }
+
+    fn validate(&self, baseline_token_a: &str) -> anyhow::Result<()> {
+        let Some(limits) = self.limits() else {
+            return Ok(());
+        };
+        validate_positive_base_units(
+            "adaptive_sizing.max_trade_notional_token_a_base_units",
+            limits.max_trade_notional,
+        )?;
+        validate_positive_base_units(
+            "adaptive_sizing.max_unhedged_notional_token_a_base_units",
+            limits.max_unhedged_notional,
+        )?;
+        validate_non_negative_base_units(
+            "adaptive_sizing.max_recovery_loss_token_a_base_units",
+            limits.max_recovery_loss,
+        )?;
+        validate_non_negative_base_units(
+            "adaptive_sizing.min_expected_profit_token_a_base_units",
+            limits.min_expected_profit,
+        )?;
+        validate_non_negative_base_units(
+            "adaptive_sizing.min_incremental_expected_profit_token_a_base_units",
+            limits.min_incremental_expected_profit,
+        )?;
+        let parse_u256 = |value: &str, name: &str| {
+            U256::from_str_radix(value, 10).with_context(|| format!("{name} exceeds uint256"))
+        };
+        let max_trade = parse_u256(limits.max_trade_notional, "adaptive max trade notional")?;
+        let max_unhedged = parse_u256(
+            limits.max_unhedged_notional,
+            "adaptive max unhedged notional",
+        )?;
+        parse_u256(limits.max_recovery_loss, "adaptive max recovery loss")?;
+        parse_u256(limits.min_expected_profit, "adaptive min expected profit")?;
+        parse_u256(
+            limits.min_incremental_expected_profit,
+            "adaptive min incremental expected profit",
+        )?;
+        ensure!(
+            (limits.depth_policy.recent_full_depth_max_age_ms == 0)
+                == (limits.depth_policy.recent_full_depth_max_update_delta == 0),
+            "adaptive recent full-depth age and update-delta caps must both be zero or both be positive"
+        );
+        let top_of_book_max_trade = parse_u256(
+            &limits
+                .depth_policy
+                .top_of_book_max_trade_notional_token_a_base_units,
+            "adaptive top-of-book max trade notional",
+        )?;
+        let baseline = parse_u256(baseline_token_a, "quote sizing baseline")?;
+        ensure!(
+            max_trade >= baseline,
+            "adaptive max trade notional must be at least the baseline"
+        );
+        ensure!(
+            max_unhedged >= max_trade,
+            "adaptive max unhedged notional must be at least the max trade notional"
+        );
+        ensure!(
+            top_of_book_max_trade.is_zero() || top_of_book_max_trade >= baseline,
+            "adaptive top-of-book max trade notional must be zero or at least the baseline"
+        );
+        ensure!(
+            top_of_book_max_trade <= max_trade,
+            "adaptive top-of-book max trade notional must not exceed the global max trade notional"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveSizingLimits<'a> {
+    pub max_trade_notional: &'a str,
+    pub max_unhedged_notional: &'a str,
+    pub max_recovery_loss: &'a str,
+    pub min_expected_profit: &'a str,
+    pub min_incremental_expected_profit: &'a str,
+    pub depth_policy: &'a AdaptiveDepthPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,7 +594,14 @@ pub struct StrategyConfig {
     pub max_slippage_bps: u16,
     pub slippage_profit_share_bps: u16,
     pub dex_fee_reserve_bps: u16,
+    /// Read-only compatibility for pre-adaptive artifacts. Rust inventory
+    /// reservations use an exact execution envelope and never multiply claims.
+    #[serde(default = "default_legacy_balance_safety_multiplier")]
     pub balance_safety_multiplier: u16,
+}
+
+const fn default_legacy_balance_safety_multiplier() -> u16 {
+    1
 }
 
 impl StrategyConfig {
@@ -657,6 +854,17 @@ fn validate_positive_base_units(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_non_negative_base_units(name: &str, value: &str) -> anyhow::Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 78
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value == "0" || !value.starts_with('0')),
+        "{name} must be a non-negative canonical uint256 decimal string"
+    );
+    Ok(())
+}
+
 fn validate_bps(name: &str, value: u16) -> anyhow::Result<()> {
     ensure!(value <= 10_000, "{name} must be <= 10000");
     Ok(())
@@ -673,10 +881,21 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{ArbitrageStrategy, BinanceProduct, LoadedDomainConfig, TokenBQuoteSizing};
+    use super::{
+        AdaptiveSizingConfig, ArbitrageStrategy, BinanceProduct, LoadedDomainConfig,
+        TokenBQuoteSizing,
+    };
 
     const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v4.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v6.json");
+    const LEGACY_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v6.json");
+    const SHADOW_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v7.json");
+    const V8_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v8.json");
+    const V9_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v9.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -702,8 +921,90 @@ mod tests {
             TokenBQuoteSizing::DeriveFromBinanceAsk
         );
         assert_eq!(pair.strategy.kind, ArbitrageStrategy::ProfitTokenA);
+        assert_eq!(pair.adaptive_sizing, AdaptiveSizingConfig::BaselineOnly);
         assert!(!pair.execution_enabled);
         assert_eq!(loaded.fingerprint_sha256().len(), 64);
+    }
+
+    #[test]
+    fn adaptive_sizing_is_mode_tagged_and_validated() {
+        let shadow = mutate(|value| {
+            value["pairs"][0]["adaptive_sizing"] = serde_json::json!({
+                "mode": "shadow",
+                "max_trade_notional_token_a_base_units": "200000000",
+                "max_unhedged_notional_token_a_base_units": "220000000",
+                "max_recovery_loss_token_a_base_units": "2000000",
+                "min_bounded_profit_token_a_base_units": "0",
+                "min_incremental_bounded_profit_token_a_base_units": "0"
+            });
+        });
+        let loaded = load(&shadow).unwrap();
+        assert_eq!(loaded.snapshot().pairs[0].adaptive_sizing.mode(), "shadow");
+
+        let below_baseline = mutate(|value| {
+            value["pairs"][0]["adaptive_sizing"] = serde_json::json!({
+                "mode": "shadow",
+                "max_trade_notional_token_a_base_units": "19999999",
+                "max_unhedged_notional_token_a_base_units": "220000000",
+                "max_recovery_loss_token_a_base_units": "2000000",
+                "min_bounded_profit_token_a_base_units": "0",
+                "min_incremental_bounded_profit_token_a_base_units": "0"
+            });
+        });
+        assert!(load(&below_baseline).is_err());
+
+        let unknown = mutate(|value| {
+            value["pairs"][0]["adaptive_sizing"] = serde_json::json!({
+                "mode": "elastic"
+            });
+        });
+        assert!(load(&unknown).is_err());
+
+        let active = mutate(|value| {
+            value["pairs"][0]["adaptive_sizing"] = serde_json::json!({
+                "mode": "adaptive",
+                "max_trade_notional_token_a_base_units": "200000000",
+                "max_unhedged_notional_token_a_base_units": "220000000",
+                "max_recovery_loss_token_a_base_units": "2000000",
+                "min_bounded_profit_token_a_base_units": "0",
+                "min_incremental_bounded_profit_token_a_base_units": "0",
+                "depth_policy": {
+                    "recent_full_depth_max_age_ms": 750,
+                    "recent_full_depth_max_update_delta": 8,
+                    "top_of_book_max_trade_notional_token_a_base_units": "40000000"
+                }
+            });
+        });
+        let loaded = load(&active).unwrap();
+        assert_eq!(
+            loaded.snapshot().pairs[0].adaptive_sizing.mode(),
+            "adaptive"
+        );
+        let limits = loaded.snapshot().pairs[0].adaptive_sizing.limits().unwrap();
+        assert_eq!(limits.depth_policy.recent_full_depth_max_age_ms, 750);
+        assert_eq!(limits.depth_policy.recent_full_depth_max_update_delta, 8);
+        assert_eq!(
+            limits
+                .depth_policy
+                .top_of_book_max_trade_notional_token_a_base_units,
+            "40000000"
+        );
+        let mismatched_caps = mutate(|value| {
+            value["pairs"][0]["adaptive_sizing"] = serde_json::json!({
+                "mode": "adaptive",
+                "max_trade_notional_token_a_base_units": "200000000",
+                "max_unhedged_notional_token_a_base_units": "220000000",
+                "max_recovery_loss_token_a_base_units": "2000000",
+                "min_expected_profit_token_a_base_units": "0",
+                "min_incremental_expected_profit_token_a_base_units": "0",
+                "depth_policy": {
+                    "recent_full_depth_max_age_ms": 750,
+                    "recent_full_depth_max_update_delta": 0,
+                    "top_of_book_max_trade_notional_token_a_base_units": "40000000"
+                }
+            });
+        });
+        assert!(load(&mismatched_caps).is_err());
     }
 
     #[test]
@@ -723,12 +1024,75 @@ mod tests {
         assert!(loaded.snapshot().live_trading_enabled);
         assert!(loaded.snapshot().pairs[0].execution_enabled);
         assert_eq!(
+            loaded.snapshot().pairs[0].adaptive_sizing.mode(),
+            "adaptive"
+        );
+        let limits = loaded.snapshot().pairs[0].adaptive_sizing.limits().unwrap();
+        assert_eq!(limits.depth_policy.recent_full_depth_max_age_ms, 750);
+        assert_eq!(limits.depth_policy.recent_full_depth_max_update_delta, 8);
+        assert_eq!(
+            limits
+                .depth_policy
+                .top_of_book_max_trade_notional_token_a_base_units,
+            "40000000"
+        );
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .strategy
+                .balance_safety_multiplier,
+            1
+        );
+        assert_eq!(loaded.snapshot().pairs[0].strategy.max_quote_age_ms, 1_000);
+        assert_eq!(
             loaded.snapshot().pairs[0].binance.tick_size,
             "0.000100000000000"
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "7463a62c0ec714275c86414d9fa4f1fb9a10086f9fdf668c45e9744d41028148"
+            "19ac100b29724f7269a053aca566776168ebe5cdd919a63d50aeb7d962a404fe"
+        );
+    }
+
+    #[test]
+    fn v6_live_snapshot_remains_baseline_only_when_field_is_absent() {
+        let loaded = load(LEGACY_LIVE_CONFIG.as_bytes()).unwrap();
+        assert_eq!(
+            loaded.snapshot().pairs[0].adaptive_sizing,
+            AdaptiveSizingConfig::BaselineOnly
+        );
+    }
+
+    #[test]
+    fn v7_live_snapshot_remains_readable_as_adaptive_shadow() {
+        let loaded = load(SHADOW_LIVE_CONFIG.as_bytes()).unwrap();
+        assert_eq!(loaded.snapshot().pairs[0].adaptive_sizing.mode(), "shadow");
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .strategy
+                .balance_safety_multiplier,
+            3
+        );
+    }
+
+    #[test]
+    fn v8_live_snapshot_remains_readable_with_legacy_profit_floor_names() {
+        let loaded = load(V8_LIVE_CONFIG.as_bytes()).unwrap();
+        let limits = loaded.snapshot().pairs[0].adaptive_sizing.limits().unwrap();
+        assert_eq!(limits.min_expected_profit, "0");
+        assert_eq!(limits.min_incremental_expected_profit, "0");
+    }
+
+    #[test]
+    fn v9_live_snapshot_remains_readable_with_exact_depth_only_defaults() {
+        let loaded = load(V9_LIVE_CONFIG.as_bytes()).unwrap();
+        let limits = loaded.snapshot().pairs[0].adaptive_sizing.limits().unwrap();
+        assert_eq!(limits.depth_policy.recent_full_depth_max_age_ms, 0);
+        assert_eq!(limits.depth_policy.recent_full_depth_max_update_delta, 0);
+        assert_eq!(
+            limits
+                .depth_policy
+                .top_of_book_max_trade_notional_token_a_base_units,
+            "0"
         );
     }
 
