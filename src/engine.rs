@@ -42,6 +42,9 @@ use crate::{
     telemetry::TelemetryHandle,
 };
 
+const EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS: u16 = 5;
+const BPS_X100_SCALE: u64 = 1_000_000;
+
 pub struct TradingEngine {
     config: AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
@@ -2581,6 +2584,14 @@ impl TradingEngine {
             }
         }
         let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
+        let expected_profit_after_gas_bps_x100 = profit_bps_x100_u256(
+            economics.expected_profit_after_gas_token_a,
+            economics.gas_burdened_cost_token_a,
+        )?;
+        let expected_profit_after_gas_bps =
+            format_bps_x100_u256(expected_profit_after_gas_bps_x100)?;
+        let expected_profit_after_gas_threshold_met = expected_profit_after_gas_bps_x100
+            >= U256::from(u64::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS) * 100);
         let mut admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,
@@ -2624,6 +2635,10 @@ impl TradingEngine {
             "expected_profit_token_a_base_units": economics.expected_profit_token_a.to_string(),
             "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
             "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
+            "expected_profit_after_gas_bps_x100": expected_profit_after_gas_bps_x100.to_string(),
+            "expected_profit_after_gas_bps": expected_profit_after_gas_bps,
+            "expected_profit_after_gas_threshold_bps": EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS,
+            "expected_profit_after_gas_threshold_met": expected_profit_after_gas_threshold_met,
             "dex_plan": dex_plan_telemetry_value(&dex_plan),
         });
         let admitted_object = admitted_payload
@@ -2653,6 +2668,19 @@ impl TradingEngine {
         reason: &'static str,
         economics: Option<AdmissionEconomics>,
     ) {
+        let expected_profit_after_gas_bps_x100 = economics.and_then(|value| {
+            profit_bps_x100_u256(
+                value.expected_profit_after_gas_token_a,
+                value.gas_burdened_cost_token_a,
+            )
+            .ok()
+        });
+        let expected_profit_after_gas_bps =
+            expected_profit_after_gas_bps_x100.and_then(|value| format_bps_x100_u256(value).ok());
+        let expected_profit_after_gas_threshold_met =
+            expected_profit_after_gas_bps_x100.map(|value| {
+                value >= U256::from(u64::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS) * 100)
+            });
         self.telemetry.emit(
             "arbitrage_admission_rejected",
             json!({
@@ -2676,6 +2704,10 @@ impl TradingEngine {
                 "expected_profit_token_a_base_units": economics.map(|value| value.expected_profit_token_a.to_string()),
                 "gas_burdened_cost_token_a_base_units": economics.map(|value| value.gas_burdened_cost_token_a.to_string()),
                 "expected_profit_after_gas_token_a_base_units": economics.map(|value| value.expected_profit_after_gas_token_a.to_string()),
+                "expected_profit_after_gas_bps_x100": expected_profit_after_gas_bps_x100.map(|value| value.to_string()),
+                "expected_profit_after_gas_bps": expected_profit_after_gas_bps,
+                "expected_profit_after_gas_threshold_bps": EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS,
+                "expected_profit_after_gas_threshold_met": expected_profit_after_gas_threshold_met,
                 "fully_burdened_cost_token_a_base_units": economics.map(|value| value.fully_burdened_cost_token_a.to_string()),
                 "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
             }),
@@ -3167,6 +3199,21 @@ fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
     i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
 }
 
+fn profit_bps_x100_u256(profit: U256, cost: U256) -> anyhow::Result<U256> {
+    ensure!(!cost.is_zero(), "profit bps cost is zero");
+    profit
+        .checked_mul(U256::from(BPS_X100_SCALE))
+        .map(|scaled| scaled / cost)
+        .context("profit bps scaling overflow")
+}
+
+fn format_bps_x100_u256(value: U256) -> anyhow::Result<String> {
+    let whole = value / U256::from(100_u8);
+    let fractional = value % U256::from(100_u8);
+    let fractional = u8::try_from(fractional).context("profit bps fractional part exceeds u8")?;
+    Ok(format!("{whole}.{fractional:02}"))
+}
+
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -3248,9 +3295,10 @@ mod tests {
 
     use super::{
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
-        RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
-        adaptive_candidate_is_better, classify_depth_health, exact_execution_envelope_amounts,
-        mark_sequence_matched_update, rebalance_health_state, requires_depth_for_runtime_phase,
+        EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, RebalanceSettlementBarrier, ReservationPrecheck,
+        TradingReadiness, adaptive_candidate_is_better, classify_depth_health,
+        exact_execution_envelope_amounts, format_bps_x100_u256, mark_sequence_matched_update,
+        profit_bps_x100_u256, rebalance_health_state, requires_depth_for_runtime_phase,
         reservation_precheck,
     };
 
@@ -3419,6 +3467,17 @@ mod tests {
             payload["amount_out_minimum_base_units"].as_str(),
             Some(max_u128_minus_one.as_str())
         );
+    }
+
+    #[test]
+    fn after_gas_profit_bps_telemetry_uses_fixed_point_math() {
+        let profit = U256::from(12_345_u64);
+        let cost = U256::from(10_000_000_u64);
+        let bps_x100 = profit_bps_x100_u256(profit, cost).unwrap();
+
+        assert_eq!(bps_x100, U256::from(1_234_u64));
+        assert_eq!(format_bps_x100_u256(bps_x100).unwrap(), "12.34");
+        assert!(bps_x100 >= U256::from(u64::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS) * 100));
     }
 
     #[test]
