@@ -846,7 +846,7 @@ impl RebalanceExecutor {
             origin_chain_id,
             transaction_hash,
             minimum_output_amount,
-            destination_balance_before,
+            destination_balance_before: _,
         } = operation.progress
         else {
             return Ok(operation);
@@ -899,16 +899,15 @@ impl RebalanceExecutor {
                     };
                     let token =
                         token_on_chain(&operation.intent.token_symbol, destination_chain_id)?;
-                    let after = rpc
-                        .erc20_balance(token, operation.intent.wallet_owner)
-                        .await?;
-                    let received = after
-                        .checked_sub(destination_balance_before)
-                        .context("Across destination balance decreased")?;
-                    ensure!(
-                        received >= minimum_output_amount,
-                        "Across destination balance delta is below minimum output"
-                    );
+                    let receipt =
+                        wait_receipt(rpc, fill_hash, self.limits.operation_timeout).await?;
+                    let received = validate_across_fill_receipt(
+                        &receipt,
+                        fill_hash,
+                        token,
+                        operation.intent.wallet_owner,
+                        minimum_output_amount,
+                    )?;
                     return self.execution_journal.advance(
                         &operation.intent.operation_id,
                         RebalanceExecutionProgress::AcrossFilled {
@@ -938,12 +937,25 @@ impl RebalanceExecutor {
             operation = self.wait_across_fill(operation).await?;
         }
         let RebalanceExecutionProgress::AcrossFilled {
+            fill_transaction_hash,
             received_base_units,
-            ..
         } = operation.progress
         else {
             return Ok(operation);
         };
+        let receipt = wait_receipt(
+            &self.world,
+            fill_transaction_hash,
+            self.limits.operation_timeout,
+        )
+        .await?;
+        validate_across_fill_receipt(
+            &receipt,
+            fill_transaction_hash,
+            operation.intent.token_contract,
+            operation.intent.wallet_owner,
+            received_base_units,
+        )?;
         let wallet_after = self
             .world
             .erc20_balance(
@@ -951,15 +963,6 @@ impl RebalanceExecutor {
                 operation.intent.wallet_owner,
             )
             .await?;
-        ensure!(
-            wallet_after
-                >= operation
-                    .intent
-                    .wallet_balance_before
-                    .checked_add(received_base_units)
-                    .context("wallet balance target overflow")?,
-            "World Chain balance did not receive Across output"
-        );
         let binance_after = self.binance_balance(&operation).await?;
         self.execution_journal.advance(
             &operation.intent.operation_id,
@@ -1601,11 +1604,40 @@ fn validate_direct_withdrawal_receipt(
     owner: Address,
     expected_delta: U256,
 ) -> anyhow::Result<()> {
+    let received = erc20_credit_from_receipt(receipt, expected_hash, token, owner)?;
+    ensure!(
+        received >= expected_delta,
+        "withdrawal receipt did not transfer the expected token amount to the wallet"
+    );
+    Ok(())
+}
+
+fn validate_across_fill_receipt(
+    receipt: &TransactionReceipt,
+    expected_hash: B256,
+    token: Address,
+    owner: Address,
+    minimum_output: U256,
+) -> anyhow::Result<U256> {
+    let received = erc20_credit_from_receipt(receipt, expected_hash, token, owner)?;
+    ensure!(
+        received >= minimum_output,
+        "Across fill receipt did not transfer the minimum token amount to the wallet"
+    );
+    Ok(received)
+}
+
+fn erc20_credit_from_receipt(
+    receipt: &TransactionReceipt,
+    expected_hash: B256,
+    token: Address,
+    owner: Address,
+) -> anyhow::Result<U256> {
     ensure!(
         receipt.transaction_hash == expected_hash,
-        "withdrawal receipt transaction hash changed"
+        "credit receipt transaction hash changed"
     );
-    ensure!(receipt.status == 1, "withdrawal transaction reverted");
+    ensure!(receipt.status == 1, "credit transaction reverted");
 
     let transfer_topic = keccak256("Transfer(address,address,uint256)");
     let mut received = U256::ZERO;
@@ -1616,24 +1648,20 @@ fn validate_direct_withdrawal_receipt(
     {
         ensure!(
             log.topics.len() == 3,
-            "withdrawal ERC-20 Transfer log has wrong topics"
+            "credit ERC-20 Transfer log has wrong topics"
         );
         ensure!(
             log.data.len() == 32,
-            "withdrawal ERC-20 Transfer log amount is not one word"
+            "credit ERC-20 Transfer log amount is not one word"
         );
         let recipient = Address::from_slice(&log.topics[2].as_slice()[12..]);
         if recipient == owner {
             received = received
                 .checked_add(U256::from_be_slice(&log.data))
-                .context("withdrawal ERC-20 transfer sum overflow")?;
+                .context("credit ERC-20 transfer sum overflow")?;
         }
     }
-    ensure!(
-        received >= expected_delta,
-        "withdrawal receipt did not transfer the expected token amount to the wallet"
-    );
-    Ok(())
+    Ok(received)
 }
 
 fn validate_withdrawal_record(
@@ -1843,7 +1871,7 @@ mod tests {
 
     use super::{
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, validate_approved_world_asset,
+        decimal_to_base_units_floor, validate_across_fill_receipt, validate_approved_world_asset,
         validate_direct_withdrawal_receipt, withdrawal_received_base_units,
         withdrawal_requested_base_units,
     };
@@ -1974,6 +2002,54 @@ mod tests {
                 received,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn across_fill_receipt_proves_credit_when_original_wallet_snapshot_is_stale() {
+        fn address_topic(address: Address) -> B256 {
+            let mut word = [0_u8; 32];
+            word[12..].copy_from_slice(address.as_slice());
+            word.into()
+        }
+
+        // Production incident rebalance-45-2ded2cfb1cf635d1: a concurrent
+        // arbitrage spent 199.443407 USDC after the rebalance intent snapshot
+        // but before the bridge captured its destination balance.
+        let original_wallet_snapshot = U256::from(1_241_799_768_u64);
+        let destination_balance_before = U256::from(1_042_356_361_u64);
+        let received = U256::from(1_260_763_057_u64);
+        let wallet_after = U256::from(2_303_119_418_u64);
+        assert_eq!(wallet_after, destination_balance_before + received);
+        assert!(wallet_after < original_wallet_snapshot + received);
+
+        let fill_hash = B256::repeat_byte(0x44);
+        let token = WORLD_CHAIN_USDC;
+        let wallet = Address::repeat_byte(0x22);
+        let receipt = TransactionReceipt {
+            transaction_hash: fill_hash,
+            block_number: 32_629_600,
+            status: 1,
+            gas_used: 150_000,
+            effective_gas_price: 1,
+            logs: vec![ReceiptLog {
+                address: token,
+                topics: vec![
+                    keccak256("Transfer(address,address,uint256)"),
+                    address_topic(Address::repeat_byte(0x33)),
+                    address_topic(wallet),
+                ],
+                data: received.to_be_bytes::<32>().to_vec(),
+            }],
+        };
+
+        assert_eq!(
+            validate_across_fill_receipt(&receipt, fill_hash, token, wallet, received).unwrap(),
+            received
+        );
+        assert!(
+            validate_across_fill_receipt(&receipt, fill_hash, token, wallet, received + U256::ONE,)
+                .is_err()
         );
     }
 }

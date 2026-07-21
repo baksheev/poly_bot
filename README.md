@@ -262,5 +262,8 @@ See [the local DEX quoting design](docs/low-latency-dex-quoting.md) for the
 hot-path contract, hydration boundary, reorg handling, and latency budget.
 See [the concurrent execution design](docs/concurrent-execution.md) for parallel
 DEX/CEX dispatch, orphan-leg recovery, exposure accounting, and paper rollout.
+See [the adaptive arbitrage sizing design](docs/adaptive-arbitrage-sizing.md) for
+dynamic bounded-notional optimization, shadow rollout, and single-wallet sizing
+controls.
 See [comparable arbitrage results](docs/arbitrage-results.md) for the exact
 Rust/Rails accounting and equal-window comparison contract.
