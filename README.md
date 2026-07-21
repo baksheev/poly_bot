@@ -177,7 +177,7 @@ opportunities through the same latest-wins single-lane mailbox as live
 execution and exercise the durable parent coordinator. Their synthetic
 outcomes are emitted as `paper_arbitrage_result` and are deliberately excluded
 from the live `arbitrage_results` table. The production GKE deployment always
-runs `full_live` with the separately reviewed v7 adaptive-shadow artifact, isolated
+runs `full_live` with the reviewed v11 adaptive-live artifact, isolated
 identities, and persistent parent/Binance/wallet journals. Local paper modes
 remain a test harness; they are not selectable through the production
 deployment path. The v4 default stays execution-disabled.

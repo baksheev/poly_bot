@@ -1,11 +1,11 @@
 # Adaptive arbitrage sizing
 
-Status: v10 tiered-depth adaptive execution implemented for GKE production
-Last reviewed: 2026-07-20
+Status: v11 Rails-age-parity tiered-depth adaptive execution implemented for GKE production
+Last reviewed: 2026-07-21
 
 ## Implementation status
 
-The v10 production artifact enables `mode = adaptive` with a 200 USDC maximum
+The v11 production artifact enables `mode = adaptive` with a 200 USDC maximum
 trade-notional cap and tiered Binance depth. Rust evaluates exact Binance-step
 quantities for every enabled pool against prepared DEX curves using, in order:
 sequence-matched full depth; recent full depth within 750 ms and update delta 8;
@@ -383,7 +383,7 @@ An adaptive candidate is eligible only if:
 - native gas is covered at the admitted maximum fee;
 - `trade_notional`, `unhedged_notional`, and `maximum_recovery_loss` are within
   their config caps;
-- expected spread profit is at least `min_expected_profit` (zero in v9-v10); the
+- expected spread profit is at least `min_expected_profit` (zero in v9-v11); the
   configured 20 bps threshold is the authoritative profitability gate;
 - the exact direction-specific reservation fits currently available inventory;
 - the quote, pool generation, balances, account state, order counters, nonce
@@ -990,11 +990,12 @@ Admission uses two distinct clocks and must report both:
 - `trigger_to_admitted_us` starts when the event that caused reevaluation is
   handled (`binance_book_ticker` or `dex_prepared`).
 
-The production artifact sets `strategy.max_quote_age_ms = 1000`. This is an
+The production artifact sets `strategy.max_quote_age_ms = 30000`, matching the
+Rails `MAX_QUOTE_AGE_SECONDS = 30` gate. This is an
 execution gate, not telemetry: a DEX-triggered reevaluation of an older Binance
 quote is rejected with `reason = quote_age_exceeded`. Runtime readiness can use
-a different market-data health window; it must not implicitly widen the
-admission quote lifetime.
+an independently configured market-data health window; production also sets it
+to 30 seconds so readiness cannot silently narrow the admission window.
 
 The immediate live DEX path performs local request validation and resolves the
 predeclared gas envelope without `eth_call` or `eth_estimateGas`. Its native-gas
@@ -1078,7 +1079,7 @@ Primary code touch points:
 - `src/arbitrage.rs` and `src/live_execution.rs` for immutable plan fields and
   entry-channel behavior;
 - `src/hot_telemetry.rs` and result payloads;
-- `config/strategies/usdc-wld-world-chain.v10.json`;
+- `config/strategies/usdc-wld-world-chain.v11.json`;
 - monitor/comparison scripts and `docs/trading-runbook.md`.
 
 ## Verification and acceptance

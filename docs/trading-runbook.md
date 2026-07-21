@@ -1,6 +1,6 @@
 # Live arbitrage operator runbook
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-07-21
 
 This runbook applies only to the isolated WLDUSDC Rust identities owned by the
 single production Pod in the private zonal GKE cluster `arb-bot` in
@@ -11,8 +11,9 @@ and must never run while the GKE Deployment has a nonzero replica count.
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v10 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback, 200 USDC global cap, 750 ms / delta 8 recent-depth caps, and 40 USDC top-only cap,
-  WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4;
+- v11 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback, 200 USDC global cap, 750 ms / delta 8 recent-depth caps, and 40 USDC top-only cap,
+  WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4,
+  and a Rails-compatible 30-second Binance top-of-book maximum age;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
 - the dedicated wallet and Binance subaccount verified at startup;
 - persistent `/var/lib/arb-bot` parent, Binance-order, and wallet/nonce
@@ -20,7 +21,7 @@ and must never run while the GKE Deployment has a nonzero replica count.
 - no open Binance orders, no locked balance, no unresolved wallet nonce, no
   active rebalance, and fresh Binance top-of-book/DEX/balance/gas inputs; full
   depth health is observed separately and does not gate DEX-first readiness;
-- fixed full-live v10 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
+- fixed full-live v11 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
   recovery controls.
 
 Run `scripts/quality.sh`, fetch `origin/main`, require a clean fast-forward,
@@ -28,7 +29,7 @@ push the validated commit directly to `main`, approve the `production`
 environment when requested, and deploy only with the `Deploy GKE` workflow. Do
 not open a routine production PR, force-push, or overwrite remote commits. The
 workflow builds the image, resolves its immutable digest, reuses the fixed node,
-and verifies the v10/full-live runtime config. Do not deploy from a workstation
+and verifies the v11/full-live runtime config. Do not deploy from a workstation
 or use the GCE updater.
 
 ```bash

@@ -64,11 +64,12 @@ jobs:
             [[ "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]
             test -n "${limit//[0.]/}"
           done
-          domain_config=config/strategies/usdc-wld-world-chain.v10.json
+          domain_config=config/strategies/usdc-wld-world-chain.v11.json
           test "$(jq -r '.pairs[0].adaptive_sizing.mode' "${domain_config}")" = adaptive
           test "$(jq -r '.pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units' "${domain_config}")" = 200000000
           test "$(jq -r '.pairs[0].quote_sizing.token_a_base_units' "${domain_config}")" = 20000000
           test "$(jq -r '.pairs[0].strategy.opportunity_threshold_bps' "${domain_config}")" = 20
+          test "$(jq -r '.pairs[0].strategy.max_quote_age_ms' "${domain_config}")" = 30000
           test "$(jq -r '.pairs[0].adaptive_sizing.min_expected_profit_token_a_base_units' "${domain_config}")" = 0
           test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_age_ms' "${domain_config}")" = 750
           test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_update_delta' "${domain_config}")" = 8
@@ -282,7 +283,9 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
-            = config/strategies/usdc-wld-world-chain.v10.json
+            = config/strategies/usdc-wld-world-chain.v11.json
+          test "$(jq -r '.data.MARKET_DATA_MAX_AGE_MS' <<<"${runtime_config}")" \
+            = 30000
           test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${runtime_config}")" \
             = full_live
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \

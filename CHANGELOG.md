@@ -8,6 +8,9 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Promote the immutable v11 adaptive-live artifact with the Rails-compatible
+  30-second Binance top-of-book age for both admission and runtime readiness.
+  The v10 one-second artifact remains unchanged as rollback provenance.
 - Added a one-minute production rebalance health heartbeat plus Google Cloud
   Monitoring email alerts for explicit planner/executor faults, blocked or
   stuck operations, stuck settlement, and five minutes without a heartbeat.

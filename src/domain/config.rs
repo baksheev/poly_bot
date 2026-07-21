@@ -895,7 +895,9 @@ mod tests {
         include_str!("../../config/strategies/usdc-wld-world-chain.v8.json");
     const V9_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v9.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
+    const V10_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v11.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1042,11 +1044,21 @@ mod tests {
                 .balance_safety_multiplier,
             1
         );
-        assert_eq!(loaded.snapshot().pairs[0].strategy.max_quote_age_ms, 1_000);
+        assert_eq!(loaded.snapshot().pairs[0].strategy.max_quote_age_ms, 30_000);
         assert_eq!(
             loaded.snapshot().pairs[0].binance.tick_size,
             "0.000100000000000"
         );
+        assert_eq!(
+            loaded.fingerprint_sha256(),
+            "eba87e9e10d682c72ca4c3438eefcbbea337c4ff773c1eaa1acf12e0eb0eb69b"
+        );
+    }
+
+    #[test]
+    fn v10_live_snapshot_retains_the_one_second_quote_age() {
+        let loaded = load(V10_LIVE_CONFIG.as_bytes()).unwrap();
+        assert_eq!(loaded.snapshot().pairs[0].strategy.max_quote_age_ms, 1_000);
         assert_eq!(
             loaded.fingerprint_sha256(),
             "19ac100b29724f7269a053aca566776168ebe5cdd919a63d50aeb7d962a404fe"
