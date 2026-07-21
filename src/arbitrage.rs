@@ -21,10 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
-use crate::{
-    admission::EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, execution_plan::DexSwapPlan,
-    state::TopOfBook, telemetry::TelemetryHandle,
-};
+use crate::{execution_plan::DexSwapPlan, state::TopOfBook, telemetry::TelemetryHandle};
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -305,27 +302,6 @@ fn profit_bps_x100(profit: i128, cost: i128) -> Option<i128> {
         return None;
     }
     Some(profit.saturating_mul(1_000_000).saturating_div(cost))
-}
-
-fn meets_expected_profit_after_gas_threshold(
-    proceeds_token_a_base_units: i128,
-    cost_token_a_base_units: i128,
-    gas_cost_token_a_base_units: u128,
-) -> anyhow::Result<bool> {
-    let proceeds = u128::try_from(proceeds_token_a_base_units)
-        .context("expected proceeds cannot be represented as unsigned base units")?;
-    let cost = u128::try_from(cost_token_a_base_units)
-        .context("expected cost cannot be represented as unsigned base units")?;
-    let gas_burdened_cost = cost
-        .checked_add(gas_cost_token_a_base_units)
-        .context("expected after-gas cost overflow")?;
-    let left = proceeds
-        .checked_mul(10_000)
-        .context("expected after-gas proceeds threshold overflow")?;
-    let right = gas_burdened_cost
-        .checked_mul(10_000 + u128::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS))
-        .context("expected after-gas threshold cost overflow")?;
-    Ok(left >= right)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1439,17 +1415,6 @@ impl PaperTradeCoordinator {
                 .is_none_or(|admission| admission.opportunity_threshold_met),
             "opportunity threshold must be met before admission"
         );
-        if let Some(admission) = intent.admission.as_ref() {
-            ensure!(
-                meets_expected_profit_after_gas_threshold(
-                    intent.expected_proceeds_token_a_base_units,
-                    intent.expected_cost_token_a_base_units,
-                    admission.maximum_gas_cost_token_a_base_units,
-                )?,
-                "expected profit after gas must be at least {} bps before admission",
-                EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS
-            );
-        }
         ensure!(
             self.journal.active_operations().is_empty(),
             "another trade is active or has unknown exposure"
@@ -2286,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn newly_admitted_trade_requires_expected_profit_after_gas_threshold() {
+    fn newly_admitted_trade_does_not_gate_on_expected_profit_after_gas() {
         let mut intent = intent(ExecutionMode::DexFirst);
         intent.expected_proceeds_token_a_base_units = 1_001;
         intent
@@ -2300,13 +2265,7 @@ mod tests {
         let path = path("after-gas-threshold-not-met");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
-        let error = coordinator.admit(intent).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("expected profit after gas must be at least 5 bps"),
-            "{error:#}"
-        );
+        coordinator.admit(intent).unwrap();
     }
 
     #[test]

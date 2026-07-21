@@ -323,16 +323,6 @@ fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveC
                                                 < current.trade.pool_index)))))))))
 }
 
-fn admission_threshold_rejection_reason(economics: AdmissionEconomics) -> &'static str {
-    if !economics.opportunity_threshold_met {
-        "opportunity_threshold_not_met"
-    } else if economics.expected_profit_after_gas_token_a.is_zero() {
-        "non_positive_bounded_profit"
-    } else {
-        "expected_profit_after_gas_below_threshold"
-    }
-}
-
 const fn adaptive_direction_order(direction: ArbitrageDirection) -> u8 {
     match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => 0,
@@ -1915,11 +1905,6 @@ impl TradingEngine {
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
-        if !economics.meets_threshold {
-            let probe = rejection(admission_threshold_rejection_reason(economics));
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        }
         let unhedged_notional = economics
             .recovery_sell_quote_token_a
             .max(economics.recovery_buy_quote_token_a);
@@ -2323,16 +2308,6 @@ impl TradingEngine {
                 );
                 continue;
             }
-            if !economics.meets_threshold {
-                self.emit_admission_risk_rejection(
-                    quote,
-                    &pair_id,
-                    trade_direction,
-                    admission_threshold_rejection_reason(economics),
-                    Some(economics),
-                );
-                continue;
-            }
             if let Some(limits) = adaptive_limits {
                 let trade_notional = trade.cost_token_a.max(trade.proceeds_token_a);
                 let unhedged_notional = economics
@@ -2360,9 +2335,9 @@ impl TradingEngine {
                     continue;
                 }
             }
-            // Admission requires the candidate to clear both the configured
-            // gross spread proof and the after-gas bounded-profit threshold.
-            // Recovery loss remains a separate risk bound and telemetry field.
+            // Profitability is decided only by the Rails-compatible gross
+            // spread proof carried by `trade.meets_threshold`. Recovery,
+            // inventory, and gas coverage remain operational safety bounds.
             candidates.push((trade_direction, trade, economics, liquidity_source));
         }
         let candidate = candidates
@@ -2666,14 +2641,6 @@ impl TradingEngine {
             "expected_profit_after_gas_token_a_base_units".to_owned(),
             json!(economics.expected_profit_after_gas_token_a.to_string()),
         );
-        admitted_object.insert(
-            "expected_profit_after_gas_threshold_bps".to_owned(),
-            json!(economics.expected_profit_after_gas_threshold_bps),
-        );
-        admitted_object.insert(
-            "expected_profit_after_gas_threshold_met".to_owned(),
-            json!(economics.expected_profit_after_gas_threshold_met),
-        );
         self.telemetry.emit("arbitrage_admitted", admitted_payload);
         Ok(false)
     }
@@ -2711,8 +2678,6 @@ impl TradingEngine {
                 "expected_profit_after_gas_token_a_base_units": economics.map(|value| value.expected_profit_after_gas_token_a.to_string()),
                 "fully_burdened_cost_token_a_base_units": economics.map(|value| value.fully_burdened_cost_token_a.to_string()),
                 "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
-                "expected_profit_after_gas_threshold_bps": economics.map(|value| value.expected_profit_after_gas_threshold_bps),
-                "expected_profit_after_gas_threshold_met": economics.map(|value| value.expected_profit_after_gas_threshold_met),
             }),
         );
     }
@@ -3488,10 +3453,7 @@ mod tests {
             fully_burdened_cost_token_a: U256::from(1_077),
             bounded_profit_token_a: U256::from(18),
             opportunity_threshold_met: true,
-            expected_profit_after_gas_threshold_bps: 5,
-            expected_profit_after_gas_threshold_met: true,
             native_gas_covered: true,
-            meets_threshold: true,
         };
 
         assert_eq!(
@@ -3560,10 +3522,7 @@ mod tests {
                 fully_burdened_cost_token_a: U256::from(1_077),
                 bounded_profit_token_a: U256::from(bounded_profit),
                 opportunity_threshold_met: true,
-                expected_profit_after_gas_threshold_bps: 5,
-                expected_profit_after_gas_threshold_met: true,
                 native_gas_covered: true,
-                meets_threshold: true,
             },
             trade_notional: trade.proceeds_token_a,
             unhedged_notional: U256::from(1_075),
