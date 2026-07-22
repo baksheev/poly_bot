@@ -682,7 +682,7 @@ pub enum CoordinatorCommand {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PaperOpportunity {
     pub source_revision: String,
     pub pair_id: String,
@@ -736,9 +736,10 @@ impl PaperOpportunity {
             ArbitrageDirection::BuyTokenBOnDexSellOnCex => "ds",
             ArbitrageDirection::BuyTokenBOnCexSellOnDex => "cs",
         };
+        let fingerprint = opportunity_fingerprint(self);
         format!(
-            "paper-{}-{}-{direction}",
-            self.received_unix_us, self.update_id
+            "paper-{}-{}-{fingerprint}-{direction}",
+            self.received_unix_us, self.update_id,
         )
     }
 
@@ -748,12 +749,7 @@ impl PaperOpportunity {
             ArbitrageDirection::BuyTokenBOnCexSellOnDex => "cs",
         };
         let plan_id = self.plan_id();
-        let client_order_id = cex_client_order_id(
-            &self.pair_id,
-            self.received_unix_us,
-            self.update_id,
-            direction,
-        );
+        let client_order_id = cex_client_order_id(&self.pair_id, &plan_id, direction);
         TradeIntent {
             dex_operation_id: format!("{plan_id}-dex"),
             plan_id,
@@ -770,6 +766,18 @@ impl PaperOpportunity {
             dex_plan: Some(self.dex_plan.clone()),
         }
     }
+}
+
+fn opportunity_fingerprint(opportunity: &PaperOpportunity) -> String {
+    let encoded =
+        serde_json::to_vec(opportunity).expect("PaperOpportunity serialization cannot fail");
+    let digest = Sha256::digest(encoded);
+    let mut fingerprint = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    fingerprint
 }
 
 #[derive(Clone, Debug, Default)]
@@ -927,15 +935,8 @@ impl EntryPreflightHandle {
     }
 }
 
-fn cex_client_order_id(
-    pair_id: &str,
-    received_unix_us: u64,
-    update_id: u64,
-    direction: &str,
-) -> String {
-    let digest = Sha256::digest(format!(
-        "{pair_id}:{received_unix_us}:{update_id}:{direction}"
-    ));
+fn cex_client_order_id(pair_id: &str, plan_id: &str, direction: &str) -> String {
+    let digest = Sha256::digest(format!("{pair_id}:{plan_id}:{direction}"));
     let mut fingerprint = String::with_capacity(24);
     for byte in &digest[..12] {
         use std::fmt::Write as _;
@@ -975,7 +976,6 @@ pub enum PaperTradeSubmitResult {
 pub(crate) enum ExecutionLaneState {
     Available,
     Busy,
-    BlockedUnknown,
 }
 
 #[derive(Debug)]
@@ -1047,7 +1047,7 @@ impl PaperTradeHandle {
             self.discarded.fetch_add(1, Ordering::Relaxed);
             return PaperTradeSubmitResult::Unavailable;
         };
-        if !state.receiver_open || state.lane == ExecutionLaneState::BlockedUnknown {
+        if !state.receiver_open {
             self.discarded.fetch_add(1, Ordering::Relaxed);
             return PaperTradeSubmitResult::Unavailable;
         }
@@ -1063,32 +1063,41 @@ impl PaperTradeHandle {
         }
     }
 
-    pub fn finish(&self, state: PaperTradeEventState) -> Option<PaperOpportunity> {
+    pub fn finish(&self, _state: PaperTradeEventState) -> Option<PaperOpportunity> {
         let Ok(mut mailbox) = self.mailbox.state.lock() else {
             return None;
         };
-        let discarded = if state == PaperTradeEventState::BlockedUnknown {
-            mailbox.lane = ExecutionLaneState::BlockedUnknown;
-            mailbox.pending.take()
-        } else {
-            mailbox.lane = ExecutionLaneState::Available;
-            None
+        mailbox.lane = ExecutionLaneState::Available;
+        drop(mailbox);
+        self.mailbox.notify.notify_waiters();
+        None
+    }
+
+    /// Releases the global lane after a fill while invalidating only pending
+    /// work that was quoted from the affected pool generation. Other pools
+    /// remain executable and new work for this pool is guarded by the engine's
+    /// pool-scoped settlement barrier.
+    pub fn finish_for_settlement(
+        &self,
+        pool_index: usize,
+        pool_generation: u64,
+    ) -> Option<PaperOpportunity> {
+        let Ok(mut mailbox) = self.mailbox.state.lock() else {
+            return None;
         };
+        mailbox.lane = ExecutionLaneState::Available;
+        let discarded = mailbox
+            .pending
+            .as_ref()
+            .is_some_and(|opportunity| {
+                opportunity.dex_pool_index == pool_index
+                    && opportunity.dex_pool_generation <= pool_generation
+            })
+            .then(|| mailbox.pending.take())
+            .flatten();
         drop(mailbox);
         self.mailbox.notify.notify_waiters();
         discarded
-    }
-
-    /// Keeps the lane occupied while an external state transition settles.
-    /// Any opportunity admitted against the pre-settlement state is invalid.
-    pub fn hold_for_settlement(&self) -> Option<PaperOpportunity> {
-        let Ok(mut mailbox) = self.mailbox.state.lock() else {
-            return None;
-        };
-        if mailbox.lane != ExecutionLaneState::BlockedUnknown {
-            mailbox.lane = ExecutionLaneState::Busy;
-        }
-        mailbox.pending.take()
     }
 }
 
@@ -1168,17 +1177,13 @@ impl PaperTradeTask {
         self.resume_active()?;
         while let Some(opportunity) = self.receiver.recv().await {
             let plan_id = opportunity.plan_id();
+            let operation_existed_before_attempt = self.coordinator.operation(&plan_id).is_some();
             if let Err(error) = self.execute(opportunity) {
                 tracing::error!(error = %error, "paper arbitrage execution failed closed");
-                let state = self.coordinator.operation(&plan_id).map_or(
-                    PaperTradeEventState::RejectedUnsubmitted,
-                    |operation| {
-                        if operation.dex_dispatched || operation.cex_dispatched {
-                            PaperTradeEventState::BlockedUnknown
-                        } else {
-                            PaperTradeEventState::RejectedUnsubmitted
-                        }
-                    },
+                let state = execution_failure_event_state(
+                    &self.coordinator,
+                    &plan_id,
+                    operation_existed_before_attempt,
                 );
                 self.publish_event(plan_id, state, false, None)?;
             }
@@ -1309,16 +1314,35 @@ impl PaperTradeTask {
 
 pub(crate) fn initial_execution_lane(coordinator: &PaperTradeCoordinator) -> ExecutionLaneState {
     let active = coordinator.active_operations();
-    if active
-        .iter()
-        .any(|operation| operation.stage == TradeStage::UnknownExposure)
-    {
-        ExecutionLaneState::BlockedUnknown
-    } else if active.is_empty() {
-        ExecutionLaneState::Available
-    } else {
+    if active.iter().any(|operation| {
+        matches!(
+            operation.stage,
+            TradeStage::Prepared | TradeStage::Executing | TradeStage::Recovering
+        )
+    }) {
         ExecutionLaneState::Busy
+    } else {
+        ExecutionLaneState::Available
     }
+}
+
+pub(crate) fn execution_failure_event_state(
+    coordinator: &PaperTradeCoordinator,
+    plan_id: &str,
+    operation_existed_before_attempt: bool,
+) -> PaperTradeEventState {
+    if operation_existed_before_attempt {
+        return PaperTradeEventState::RejectedUnsubmitted;
+    }
+    coordinator
+        .operation(plan_id)
+        .map_or(PaperTradeEventState::RejectedUnsubmitted, |operation| {
+            if operation.dex_dispatched || operation.cex_dispatched {
+                PaperTradeEventState::BlockedUnknown
+            } else {
+                PaperTradeEventState::RejectedUnsubmitted
+            }
+        })
 }
 
 fn dex_filled(operation: &TradeOperation) -> bool {
@@ -1435,8 +1459,11 @@ impl PaperTradeCoordinator {
             "opportunity threshold must be met before admission"
         );
         ensure!(
-            self.journal.active_operations().is_empty(),
-            "another trade is active or has unknown exposure"
+            !self.journal.operations.values().any(|operation| matches!(
+                operation.stage,
+                TradeStage::Prepared | TradeStage::Executing | TradeStage::Recovering
+            )),
+            "another trade is currently executing"
         );
         self.journal.record_intent(intent)
     }
@@ -2198,8 +2225,9 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        ArbitrageDirection, CoordinatorCommand, ExecutionMode, LegResult, LegRole, LegStatus,
-        PaperTradeCoordinator, TerminalOutcome, TradeIntent, TradeStage,
+        ArbitrageDirection, CoordinatorCommand, ExecutionLaneState, ExecutionMode, LegResult,
+        LegRole, LegStatus, PaperTradeCoordinator, TerminalOutcome, TradeIntent, TradeStage,
+        initial_execution_lane,
     };
 
     fn path(name: &str) -> std::path::PathBuf {
@@ -2478,6 +2506,10 @@ mod tests {
         assert_eq!(
             operation.blocking_reason.as_deref(),
             Some("dex_first_recovery_direction_flipped")
+        );
+        assert_eq!(
+            initial_execution_lane(&coordinator),
+            ExecutionLaneState::Available
         );
         drop(coordinator);
         fs::remove_file(path).unwrap();
@@ -2872,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outcome_blocks_new_entries_across_restart() {
+    fn unknown_outcome_does_not_block_distinct_entries_across_restart() {
         let path = path("unknown");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
@@ -2899,14 +2931,34 @@ mod tests {
             coordinator.operation(&plan_id).unwrap().stage,
             TradeStage::UnknownExposure
         );
-        assert!(
-            coordinator
-                .admit(intent(ExecutionMode::ConcurrentHedged))
-                .is_err()
+        assert_eq!(
+            initial_execution_lane(&coordinator),
+            ExecutionLaneState::Available
         );
+        let next_intent = intent(ExecutionMode::ConcurrentHedged);
+        let next_plan_id = next_intent.plan_id.clone();
+        coordinator.admit(next_intent).unwrap();
+        assert!(matches!(
+            coordinator.take_commands(&next_plan_id).unwrap().as_slice(),
+            [
+                CoordinatorCommand::DispatchDex { .. },
+                CoordinatorCommand::DispatchCex { .. }
+            ]
+        ));
+        coordinator
+            .record_result(&next_plan_id, LegRole::Dex, filled(100, -1_000, "dex:next"))
+            .unwrap();
+        coordinator
+            .record_result(&next_plan_id, LegRole::Cex, filled(-100, 1_030, "cex:next"))
+            .unwrap();
+        assert!(coordinator.take_commands(&next_plan_id).unwrap().is_empty());
         drop(coordinator);
         let mut recovered = PaperTradeCoordinator::open(&path).unwrap();
         assert_eq!(recovered.active_operations().len(), 1);
+        assert_eq!(
+            recovered.operation(&next_plan_id).unwrap().stage,
+            TradeStage::BalancedProfit
+        );
         recovered
             .reconcile_unknown(
                 &plan_id,
@@ -2927,6 +2979,23 @@ mod tests {
             TradeStage::BalancedLoss
         );
         drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn in_flight_operation_still_serializes_dispatch() {
+        let path = path("in-flight-serialization");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        coordinator.admit(intent(ExecutionMode::DexFirst)).unwrap();
+
+        assert!(
+            coordinator
+                .admit(intent(ExecutionMode::ConcurrentHedged))
+                .is_err()
+        );
+
+        drop(coordinator);
         fs::remove_file(path).unwrap();
     }
 }

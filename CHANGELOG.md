@@ -37,6 +37,16 @@ the exact artifact used by each rollout.
 
 ### Fixed
 
+- Prevent unknown or halted arbitrage operations from dead-ending the global
+  execution lane. Their exact inventory reservations remain held and reduce
+  available balance while independent plans continue; only a plan that is
+  actively dispatching legs serializes the single execution owner. Plan and
+  Binance client-order identities now include the DEX pool generation and a
+  full opportunity fingerprint, so a fresh DEX candidate cannot collide with
+  a completed plan that reused the same Binance update.
+- Scope post-DEX settlement invalidation to pending candidates prepared from
+  the affected pool generation. Receipt catch-up or a later pool update guards
+  that pool, while the global execution lane and unrelated pools remain free.
 - Keep market-data processing and opportunity evaluation ready while a
   rebalance is pending, executing, failed, or waiting for post-operation
   snapshots. Rebalance state now serializes only rebalance operations; stale

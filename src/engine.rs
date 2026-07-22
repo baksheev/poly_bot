@@ -2377,9 +2377,11 @@ impl TradingEngine {
                     "symbol": quote.symbol.as_ref(),
                     "update_id": quote.update_id,
                     "plan_id": format!(
-                        "paper-{}-{}-{}",
+                        "candidate-{}-{}-p{}-g{}-{}",
                         quote.received_unix_us,
                         quote.update_id,
+                        trade.pool_index,
+                        dex_pool_generation,
                         match direction {
                             TradeDirection::BuyTokenBOnDexSellOnCex => "ds",
                             TradeDirection::BuyTokenBOnCexSellOnDex => "cs",
@@ -2968,17 +2970,10 @@ impl TradingEngine {
                 "settlement_age_ms": barrier.started_at.elapsed().as_millis(),
             }),
         );
-        if let Some(handle) = &self.paper_trades {
-            let pending = handle.finish(PaperTradeEventState::Balanced);
-            debug_assert!(
-                pending.is_none(),
-                "settlement lane must not contain work admitted behind its barrier"
-            );
-        }
     }
 
     pub fn on_paper_trade_event(&mut self, event: PaperTradeEvent) -> anyhow::Result<()> {
-        let mut waiting_for_dex_settlement = false;
+        let mut settlement_barrier = None;
         match event.state {
             PaperTradeEventState::Balanced => {
                 if self.inventory.reservation(&event.plan_id).is_some() {
@@ -3020,7 +3015,8 @@ impl TradingEngine {
                                 started_at: Instant::now(),
                             },
                         );
-                        waiting_for_dex_settlement = true;
+                        settlement_barrier =
+                            Some((freshness.pool_index, freshness.pool_generation));
                     }
                 }
             }
@@ -3040,19 +3036,18 @@ impl TradingEngine {
             }
         }
         let pending = self.paper_trades.as_ref().and_then(|handle| {
-            if waiting_for_dex_settlement {
-                handle.hold_for_settlement()
+            if let Some((pool_index, pool_generation)) = settlement_barrier {
+                handle.finish_for_settlement(pool_index, pool_generation)
             } else {
                 handle.finish(event.state)
             }
         });
         if let Some(pending) = pending {
-            let reason = if waiting_for_dex_settlement {
-                "execution_pending_invalidated_by_dex_settlement"
-            } else {
-                "execution_lane_blocked_unknown"
-            };
-            self.release_pending_opportunity(pending, reason, None)?;
+            self.release_pending_opportunity(
+                pending,
+                "execution_pending_invalidated_by_dex_settlement",
+                None,
+            )?;
         }
         self.telemetry.emit(
             "arbitrage_inventory_state",

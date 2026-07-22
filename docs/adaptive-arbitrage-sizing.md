@@ -838,15 +838,24 @@ re-run dynamic sizing against new market data.
 
 ## Interaction with the latest-pending mailbox
 
-The existing mailbox already bounds backlog to one pending opportunity behind
-the active wallet lane. Its mutex-protected replacement transfers ownership
+The existing mailbox bounds backlog to one pending opportunity behind the
+actively executing plan. Its mutex-protected replacement transfers ownership
 atomically, and the engine releases the superseded plan's inventory reservation
-and freshness state. A blocked-unknown lane accepts no new work; DEX settlement
-invalidates pending work admitted against the pre-settlement generation. The
-normal settlement path now extracts the canonical pool Swap position from the
+and freshness state. Unknown or halted parent operations retain their exact
+inventory reservations for reconciliation but do not block the global mailbox
+or admission of an independent plan. Only `Prepared`, `Executing`, or
+`Recovering` work serializes dispatch. DEX settlement invalidates only pending
+work admitted from the affected pool at or before the filled generation. The
+normal settlement path extracts the canonical pool Swap position from the
 successful receipt, catches that pool up through the receipt block with
 `eth_getLogs`, and rebuilds prepared curves immediately. WebSocket delivery
-retains ownership as the fallback when the receipt proof cannot be applied.
+retains ownership as the fallback when the receipt proof cannot be applied;
+other pools and the global lane remain executable meanwhile.
+
+Plan identity includes pool index, pool generation, and a fingerprint of the
+immutable DEX and CEX execution inputs. Binance client-order identity derives
+from that plan identity. A new DEX generation therefore cannot replay a
+terminal coordinator plan merely because Binance top-of-book did not change.
 
 Adaptive v1 retains the current newest-wins replacement rule. This isolates the
 sizing experiment from a scheduling-policy change, but it means that a fresher

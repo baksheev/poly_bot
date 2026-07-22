@@ -15,7 +15,7 @@ use crate::{
         CoordinatorCommand, EntryPreflightHandle, ExecutionMode, LatestOpportunityReceiver,
         LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent,
         PaperTradeEventState, PaperTradeHandle, TradeIntent, TradeOperation, TradeStage,
-        initial_execution_lane,
+        execution_failure_event_state, initial_execution_lane,
     },
     binance::{
         account::SymbolRules,
@@ -448,6 +448,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         while let Some(opportunity) = self.receiver.recv().await {
             let plan_id = opportunity.plan_id();
             let received_unix_us = opportunity.received_unix_us;
+            let operation_existed_before_attempt = self.coordinator.operation(&plan_id).is_some();
             let live_task_started = Instant::now();
             self.emit_live_stage(
                 &plan_id,
@@ -481,15 +482,10 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             );
             if let Err(error) = execution_result {
                 tracing::error!(plan_id, error = %error, "live arbitrage execution failed closed");
-                let state = self.coordinator.operation(&plan_id).map_or(
-                    PaperTradeEventState::RejectedUnsubmitted,
-                    |operation| {
-                        if operation.dex_dispatched || operation.cex_dispatched {
-                            PaperTradeEventState::BlockedUnknown
-                        } else {
-                            PaperTradeEventState::RejectedUnsubmitted
-                        }
-                    },
+                let state = execution_failure_event_state(
+                    &self.coordinator,
+                    &plan_id,
+                    operation_existed_before_attempt,
                 );
                 self.publish_event(plan_id, state, false, None)?;
             }
@@ -875,6 +871,7 @@ mod tests {
             AdmissionRiskBounds, ArbitrageDirection, CoordinatorCommand, EntryPreflightHandle,
             ExecutionMode, LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator,
             PaperTradeEventState, PaperTradeSubmitResult, TerminalOutcome, TradeIntent,
+            execution_failure_event_state,
         },
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
@@ -979,6 +976,52 @@ mod tests {
         handle.update_quote(&quote);
         handle.update_dex_pool_generation(0, 1);
         handle
+    }
+
+    #[test]
+    fn opportunity_identity_changes_with_the_dex_generation() {
+        let first = opportunity();
+        let mut second = first.clone();
+        second.dex_pool_generation += 1;
+
+        assert_ne!(first.plan_id(), second.plan_id());
+        assert_ne!(
+            first.intent(ExecutionMode::DexFirst).cex_client_order_id,
+            second.intent(ExecutionMode::DexFirst).cex_client_order_id
+        );
+    }
+
+    #[test]
+    fn duplicate_of_a_terminal_operation_is_rejected_without_unknown_exposure() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-terminal-duplicate-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let _ = fs::remove_file(&journal);
+        let opportunity = opportunity();
+        let plan_id = opportunity.plan_id();
+        let mut coordinator = PaperTradeCoordinator::open(&journal).unwrap();
+        coordinator
+            .admit(opportunity.intent(ExecutionMode::DexFirst))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                failed(LegRole::Dex, "dex:reverted").1,
+            )
+            .unwrap();
+        assert!(coordinator.take_commands(&plan_id).unwrap().is_empty());
+
+        assert_eq!(
+            execution_failure_event_state(&coordinator, &plan_id, true),
+            PaperTradeEventState::RejectedUnsubmitted
+        );
+
+        drop(coordinator);
+        fs::remove_file(journal).unwrap();
     }
 
     fn preflight_quote(bid: Decimal, ask: Decimal, update_id: u64) -> crate::state::TopOfBook {
@@ -1197,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_outcome_blocks_the_lane_and_discards_pending_work() {
+    async fn unknown_outcome_releases_the_lane_and_preserves_pending_work() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-unknown-mailbox-{}-{}.jsonl",
             std::process::id(),
@@ -1232,11 +1275,13 @@ mod tests {
             handle.try_submit(pending.clone()),
             PaperTradeSubmitResult::Accepted
         ));
-        assert_eq!(
+        assert!(
             handle
                 .finish(PaperTradeEventState::BlockedUnknown)
-                .unwrap()
-                .plan_id(),
+                .is_none()
+        );
+        assert_eq!(
+            task.receiver.recv().await.unwrap().plan_id(),
             pending.plan_id()
         );
 
@@ -1244,9 +1289,14 @@ mod tests {
         next.received_unix_us += 2;
         next.update_id += 2;
         assert!(matches!(
-            handle.try_submit(next),
-            PaperTradeSubmitResult::Unavailable
+            handle.try_submit(next.clone()),
+            PaperTradeSubmitResult::Accepted
         ));
+        assert!(handle.finish(PaperTradeEventState::Balanced).is_none());
+        assert_eq!(
+            task.receiver.recv().await.unwrap().plan_id(),
+            next.plan_id()
+        );
 
         drop(handle);
         drop(task);
@@ -1254,7 +1304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dex_settlement_keeps_the_lane_busy_and_invalidates_pending_work() {
+    async fn dex_settlement_releases_the_lane_and_invalidates_only_the_stale_pool() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-settlement-mailbox-{}-{}.jsonl",
             std::process::id(),
@@ -1289,18 +1339,18 @@ mod tests {
             PaperTradeSubmitResult::Accepted
         ));
         assert_eq!(
-            handle.hold_for_settlement().unwrap().plan_id(),
+            handle.finish_for_settlement(0, 1).unwrap().plan_id(),
             stale.plan_id()
         );
 
         let mut fresh = opportunity();
         fresh.received_unix_us += 2;
         fresh.update_id += 2;
+        fresh.dex_pool_index = 1;
         assert!(matches!(
             handle.try_submit(fresh.clone()),
             PaperTradeSubmitResult::Accepted
         ));
-        assert!(handle.finish(PaperTradeEventState::Balanced).is_none());
         assert_eq!(
             task.receiver.recv().await.unwrap().plan_id(),
             fresh.plan_id()
