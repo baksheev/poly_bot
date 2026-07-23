@@ -76,8 +76,11 @@ a time.
   profitable. An unchanged event-driven Binance top remains current while its
   connection generation has fresh transport activity. Admission, preflight,
   and runtime market-data readiness use the reviewed 30-second maximum
-  transport silence, not the age of the last price change. The deployment
-  workflow must verify these startup fields before it reports success.
+  transport silence from the versioned domain artifact, not the age of the
+  last price change. That artifact is the only strategy-price liveness source;
+  `GAS_PRICE_MAX_TRANSPORT_SILENCE_MS` applies only to the separate gas-price
+  feed. The deployment workflow must verify these startup fields before it
+  reports success.
 - Do not use `.github/workflows/deploy-gce.yml` for routine production delivery.
   It is retained only for an explicitly reviewed rollback after the GKE owner
   is scaled to zero and all active operations are reconciled.

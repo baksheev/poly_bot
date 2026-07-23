@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt::Write,
     fs,
     path::{Path, PathBuf},
@@ -68,6 +68,20 @@ impl LoadedDomainConfig {
             .iter()
             .filter(|pair| pair.market_data_enabled)
             .map(|pair| pair.binance.symbol.clone())
+            .collect()
+    }
+
+    pub fn strategy_price_transport_silence_limits_ms(&self) -> BTreeMap<String, u64> {
+        self.snapshot
+            .pairs
+            .iter()
+            .filter(|pair| pair.market_data_enabled)
+            .map(|pair| {
+                (
+                    pair.binance.symbol.clone(),
+                    pair.strategy.max_transport_silence_ms(),
+                )
+            })
             .collect()
     }
 
@@ -1064,6 +1078,10 @@ mod tests {
                 .strategy
                 .max_transport_silence_ms(),
             30_000
+        );
+        assert_eq!(
+            loaded.strategy_price_transport_silence_limits_ms(),
+            std::collections::BTreeMap::from([("WLDUSDC".to_owned(), 30_000)])
         );
         assert_eq!(
             loaded.snapshot().pairs[0].binance.tick_size,

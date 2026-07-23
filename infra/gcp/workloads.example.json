@@ -16,7 +16,7 @@
         "GCP_REGION": "asia-southeast1",
         "BINANCE_WS_BASE_URL": "wss://stream.binance.com:9443/ws",
         "DOMAIN_CONFIG_PATH": "config/strategies/usdc-wld-world-chain.v4.json",
-        "MARKET_DATA_MAX_AGE_MS": "5000",
+        "GAS_PRICE_MAX_TRANSPORT_SILENCE_MS": "5000",
         "DEX_EVENT_CHANNEL_CAPACITY": "8192",
         "DEX_HEAD_MAX_AGE_MS": "10000",
         "CLICKHOUSE_DATABASE": "arb_bot_prod",

@@ -199,8 +199,12 @@ pub struct AppConfig {
     )]
     pub domain_config_path: PathBuf,
 
-    #[arg(long, env = "MARKET_DATA_MAX_AGE_MS", default_value_t = 5_000)]
-    pub market_data_max_age_ms: u64,
+    #[arg(
+        long,
+        env = "GAS_PRICE_MAX_TRANSPORT_SILENCE_MS",
+        default_value_t = 5_000
+    )]
+    pub gas_price_max_transport_silence_ms: u64,
 
     #[arg(long, env = "DEX_EVENT_CHANNEL_CAPACITY", default_value_t = 8192)]
     pub dex_event_channel_capacity: usize,
@@ -307,8 +311,8 @@ impl AppConfig {
         validate_non_empty("GCP_REGION", &self.gcp_region)?;
 
         ensure!(
-            self.market_data_max_age_ms > 0,
-            "MARKET_DATA_MAX_AGE_MS must be greater than zero"
+            self.gas_price_max_transport_silence_ms > 0,
+            "GAS_PRICE_MAX_TRANSPORT_SILENCE_MS must be greater than zero"
         );
         ensure!(
             self.dex_event_channel_capacity > 0,
@@ -537,7 +541,7 @@ mod tests {
             binance_ws_api_url: "wss://ws-api.binance.com:443/ws-api/v3".into(),
             across_api_base_url: "https://app.across.to/api".into(),
             domain_config_path: "config/strategies/usdc-wld-world-chain.v4.json".into(),
-            market_data_max_age_ms: 5_000,
+            gas_price_max_transport_silence_ms: 5_000,
             dex_event_channel_capacity: 8192,
             dex_head_max_age_ms: 10_000,
             balance_sync_interval_ms: 1_000,

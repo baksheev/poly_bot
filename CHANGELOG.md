@@ -20,6 +20,14 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Make the versioned domain artifact the single
+  `strategy.max_transport_silence_ms` source for strategy-price runtime
+  readiness, admission, and preflight. Rename the independent gas-conversion
+  setting to `GAS_PRICE_MAX_TRANSPORT_SILENCE_MS`.
+- Expire diagnostic Binance exchange-to-socket estimates after 180 seconds
+  without a successful clock observation. Raw timestamps and clock evidence
+  remain visible, while the estimate and uncertainty become null and explicitly
+  invalid without affecting trading.
 - Preserve Binance JSON depth event time and publish a clock-corrected
   exchange-to-socket estimate with synchronization RTT, age, timestamp
   resolution, and explicit uncertainty. The diagnostic remains asynchronous

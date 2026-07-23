@@ -31,7 +31,7 @@ arbitrage execution jobs in the Rails application.
 
 | Rails endpoint or stream | Current purpose | Rust decision |
 |---|---|---|
-| `GET /api/v3/time` | Cache server clock offset for signed requests | Keep. Measure request midpoint and RTT, refresh the diagnostic observation every 60 seconds and immediately after `-1021`, and publish offset age/uncertainty asynchronously. |
+| `GET /api/v3/time` | Cache server clock offset for signed requests | Keep. Measure request midpoint and RTT, refresh the diagnostic observation every 60 seconds and immediately after `-1021`, and publish offset age/uncertainty asynchronously. A diagnostic exchange-to-socket estimate becomes invalid and null after 180 seconds without a successful observation. |
 | Spot/Futures `<symbol>@bookTicker` | Current bid, ask, and best-level quantities | Keep only the Spot stream. It remains the fastest opportunity trigger. |
 | `GET /api/v3/ticker/bookTicker` | REST fallback, batch observations, gas prices | Do not use in the hot path. The Spot WebSocket owns live prices; REST is diagnostic recovery only. |
 | `GET /api/v3/depth` | Not present in Rails | Implemented for the local Spot-book bootstrap and every reconnect. |

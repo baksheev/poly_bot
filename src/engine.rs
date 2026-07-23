@@ -68,6 +68,7 @@ pub struct TradingEngine {
     last_sequence_matched_quote_update: BTreeMap<String, u64>,
     latest_sequence_matched_depth: BTreeMap<String, SpotDepthBook>,
     depth_health_by_symbol: BTreeMap<String, DepthHealthObservation>,
+    strategy_price_transport_silence_limits_ms: BTreeMap<String, u64>,
     gas_price_symbol: String,
     wallet_gas_symbol: String,
     gas_price_connected: bool,
@@ -106,6 +107,7 @@ const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEPTH_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BINANCE_PRICE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BINANCE_JSON_TIME_RESOLUTION_US: u64 = 1_000;
+const BINANCE_CLOCK_SYNC_MAX_AGE_MS: u64 = 180_000;
 const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 const ADAPTIVE_OPTIMIZER_VERSION: &str = "exhaustive_whole_step_v1";
@@ -421,9 +423,11 @@ impl TradingEngine {
         execution: TradingExecutionHandles,
         binance_fee_bps: BinanceFeeBps,
     ) -> anyhow::Result<(Self, HotTelemetryTask)> {
-        let symbols = domain_config
-            .binance_symbols()
-            .into_iter()
+        let strategy_price_transport_silence_limits_ms =
+            domain_config.strategy_price_transport_silence_limits_ms();
+        let symbols = strategy_price_transport_silence_limits_ms
+            .keys()
+            .cloned()
             .map(Arc::<str>::from);
         let gas_price_symbol = domain_config
             .snapshot()
@@ -458,10 +462,17 @@ impl TradingEngine {
             .iter()
             .filter(|pair| pair.execution_enabled)
         {
-            execution.entry_preflight.configure_max_transport_silence(
-                &pair.binance.symbol,
-                pair.strategy.max_transport_silence_ms(),
-            );
+            let max_transport_silence_ms = *strategy_price_transport_silence_limits_ms
+                .get(&pair.binance.symbol)
+                .with_context(|| {
+                    format!(
+                        "execution pair {} has no Binance transport silence limit",
+                        pair.id
+                    )
+                })?;
+            execution
+                .entry_preflight
+                .configure_max_transport_silence(&pair.binance.symbol, max_transport_silence_ms);
         }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
@@ -490,6 +501,7 @@ impl TradingEngine {
                 last_sequence_matched_quote_update: BTreeMap::new(),
                 latest_sequence_matched_depth: BTreeMap::new(),
                 depth_health_by_symbol: BTreeMap::new(),
+                strategy_price_transport_silence_limits_ms,
                 gas_price_symbol,
                 wallet_gas_symbol,
                 gas_price_connected: false,
@@ -883,18 +895,29 @@ impl TradingEngine {
                     observed_at,
                 );
                 let clock_sync = self.binance_clock_sync;
-                let exchange_event_to_socket_estimate_us = clock_sync.and_then(|clock_sync| {
-                    estimate_exchange_event_to_socket_us(
-                        received_unix_us,
-                        exchange_event_ts_ms,
-                        clock_sync.offset_ms,
-                    )
-                });
-                let estimate_uncertainty_us = clock_sync.map(|clock_sync| {
+                let clock_sync_age_ms = clock_sync.map(BinanceClockSync::age_ms);
+                let estimate_valid = clock_sync_estimate_valid(clock_sync_age_ms);
+                let valid_clock_sync = clock_sync.filter(|_| estimate_valid);
+                let exchange_event_to_socket_estimate_us =
+                    valid_clock_sync.and_then(|clock_sync| {
+                        estimate_exchange_event_to_socket_us(
+                            received_unix_us,
+                            exchange_event_ts_ms,
+                            clock_sync.offset_ms,
+                        )
+                    });
+                let estimate_uncertainty_us = valid_clock_sync.map(|clock_sync| {
                     clock_sync
                         .midpoint_uncertainty_us()
                         .saturating_add(BINANCE_JSON_TIME_RESOLUTION_US.saturating_mul(2))
                 });
+                let estimate_invalid_reason = if clock_sync.is_none() {
+                    Some("clock_sync_unavailable")
+                } else if !estimate_valid {
+                    Some("clock_sync_stale")
+                } else {
+                    None
+                };
                 self.telemetry.emit(
                     "binance_depth_applied",
                     json!({
@@ -907,12 +930,15 @@ impl TradingEngine {
                         "received_unix_us": received_unix_us,
                         "exchange_event_to_socket_estimate_us": exchange_event_to_socket_estimate_us,
                         "exchange_event_to_socket_uncertainty_us": estimate_uncertainty_us,
+                        "exchange_event_to_socket_estimate_valid": estimate_valid,
+                        "exchange_event_to_socket_estimate_invalid_reason": estimate_invalid_reason,
                         "exchange_timestamp_resolution_us": BINANCE_JSON_TIME_RESOLUTION_US,
                         "clock_offset_ms": clock_sync.map(|sync| sync.offset_ms),
                         "clock_offset_resolution_us": BINANCE_JSON_TIME_RESOLUTION_US,
                         "clock_sync_rtt_us": clock_sync.map(|sync| sync.round_trip_us),
                         "clock_sync_midpoint_uncertainty_us": clock_sync.map(BinanceClockSync::midpoint_uncertainty_us),
-                        "clock_sync_age_ms": clock_sync.map(BinanceClockSync::age_ms),
+                        "clock_sync_age_ms": clock_sync_age_ms,
+                        "clock_sync_max_age_ms": BINANCE_CLOCK_SYNC_MAX_AGE_MS,
                         "clock_sync_observed_unix_ms": clock_sync.map(|sync| sync.observed_unix_ms),
                         "wire_frame_size_bytes": wire_frame_size_bytes,
                         "parse_apply_time_us": parse_apply_time_us,
@@ -963,6 +989,7 @@ impl TradingEngine {
                 "midpoint_uncertainty_us": clock_sync.midpoint_uncertainty_us(),
                 "observed_unix_ms": clock_sync.observed_unix_ms,
                 "observation_age_ms": clock_sync.age_ms(),
+                "estimate_max_clock_sync_age_ms": BINANCE_CLOCK_SYNC_MAX_AGE_MS,
             }),
         );
     }
@@ -977,6 +1004,7 @@ impl TradingEngine {
                 "error": error,
                 "retained_previous_observation": self.binance_clock_sync.is_some(),
                 "previous_observation_age_ms": self.binance_clock_sync.map(BinanceClockSync::age_ms),
+                "estimate_max_clock_sync_age_ms": BINANCE_CLOCK_SYNC_MAX_AGE_MS,
             }),
         );
     }
@@ -3272,6 +3300,10 @@ impl TradingEngine {
 
         let hot_telemetry_dropped_records = self.hot_telemetry.dropped_records();
         for (symbol, feed) in &self.state.binance_feeds {
+            let max_transport_silence_ms = self
+                .strategy_price_transport_silence_limits_ms
+                .get(symbol.as_ref())
+                .copied();
             let price_age_ms = feed
                 .book
                 .as_ref()
@@ -3280,7 +3312,8 @@ impl TradingEngine {
                 now.saturating_duration_since(last_activity_at).as_millis()
             });
             let transport_fresh = transport_age_ms
-                .is_some_and(|age| age <= u128::from(self.config.market_data_max_age_ms));
+                .zip(max_transport_silence_ms)
+                .is_some_and(|(age, maximum)| age <= u128::from(maximum));
             let healthy = feed.connected && feed.book.is_some() && transport_fresh;
             if healthy {
                 tracing::info!(
@@ -3323,7 +3356,9 @@ impl TradingEngine {
                     "last_update_id": feed.last_update_id,
                     "price_age_ms": price_age_ms,
                     "transport_age_ms": transport_age_ms,
-                    "max_transport_age_ms": self.config.market_data_max_age_ms,
+                    "max_transport_age_ms": max_transport_silence_ms,
+                    "max_transport_silence_ms": max_transport_silence_ms,
+                    "max_transport_silence_source": "domain_artifact",
                     "accepted_updates": feed.accepted_updates,
                     "rejected_updates": feed.rejected_updates,
                     "hot_telemetry_dropped_records": hot_telemetry_dropped_records,
@@ -3449,9 +3484,7 @@ impl TradingEngine {
 
     fn refresh_phase(&mut self, now: Instant) {
         let previous = self.state.phase;
-        let binance_ready = self
-            .state
-            .binance_ready(now, self.config.market_data_max_age_ms);
+        let binance_ready = self.binance_strategy_prices_ready(now);
         let dex_mirror_ready = self.dex.is_fresh(now, self.config.dex_head_max_age_ms);
         let dex_prepared_ready = self.opportunities.is_ready();
         // Prepared DEX quote curves are a per-pool execution input, not a
@@ -3479,7 +3512,7 @@ impl TradingEngine {
             self.gas_price_transport_activity_at
                 .is_some_and(|last_activity_at| {
                     now.saturating_duration_since(last_activity_at).as_millis()
-                        <= u128::from(self.config.market_data_max_age_ms)
+                        <= u128::from(self.config.gas_price_max_transport_silence_ms)
                 });
         let gas_price_ready =
             self.gas_price_connected && self.gas_price_book.is_some() && gas_price_transport_fresh;
@@ -3489,11 +3522,9 @@ impl TradingEngine {
             user_data_ready,
             gas_price_ready,
         };
-        let current = self.state.refresh_phase(
-            now,
-            self.config.market_data_max_age_ms,
-            trading_readiness.ready(),
-        );
+        let current = self
+            .state
+            .refresh_phase_from_inputs(binance_ready, trading_readiness.ready());
         if previous != current {
             let blocking_inputs = [
                 (!binance_ready).then_some("binance_top"),
@@ -3526,6 +3557,16 @@ impl TradingEngine {
                 }),
             );
         }
+    }
+
+    fn binance_strategy_prices_ready(&self, now: Instant) -> bool {
+        !self.strategy_price_transport_silence_limits_ms.is_empty()
+            && self.strategy_price_transport_silence_limits_ms.iter().all(
+                |(symbol, max_transport_silence_ms)| {
+                    self.state
+                        .binance_symbol_price_ready(symbol, now, *max_transport_silence_ms)
+                },
+            )
     }
 
     pub fn phase(&self) -> RuntimePhase {
@@ -3683,6 +3724,10 @@ fn estimate_exchange_event_to_socket_us(
         .and_then(|estimate| i64::try_from(estimate).ok())
 }
 
+fn clock_sync_estimate_valid(clock_sync_age_ms: Option<u64>) -> bool {
+    clock_sync_age_ms.is_some_and(|age_ms| age_ms <= BINANCE_CLOCK_SYNC_MAX_AGE_MS)
+}
+
 fn admission_deadline_unix_seconds(
     price_received_unix_us: u64,
     price_unchanged_for: Duration,
@@ -3776,11 +3821,18 @@ mod tests {
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
         EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, RebalanceSettlementBarrier, ReservationPrecheck,
         TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
-        classify_depth_health, estimate_exchange_event_to_socket_us,
+        classify_depth_health, clock_sync_estimate_valid, estimate_exchange_event_to_socket_us,
         exact_execution_envelope_amounts, format_bps_x100_u256, mark_sequence_matched_update,
         profit_bps_x100_u256, rebalance_health_state, requires_depth_for_runtime_phase,
         reservation_precheck, settlement_requires_refresh,
     };
+
+    #[test]
+    fn exchange_latency_estimate_requires_a_recent_clock_sync() {
+        assert!(!clock_sync_estimate_valid(None));
+        assert!(clock_sync_estimate_valid(Some(180_000)));
+        assert!(!clock_sync_estimate_valid(Some(180_001)));
+    }
 
     #[test]
     fn exchange_event_latency_uses_the_binance_clock_offset() {

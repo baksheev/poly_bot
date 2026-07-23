@@ -50,6 +50,13 @@ The latest accepted top remains current while all of the following are true:
    within `max_transport_silence_ms = 30000`;
 3. the runtime's other independent readiness inputs are healthy.
 
+`strategy.max_transport_silence_ms` in the versioned domain artifact is the
+only source of this boundary for strategy-price runtime readiness, opportunity
+admission, and entry preflight. There is no environment-variable override for
+the strategy price. The gas-conversion feed has a separate
+`GAS_PRICE_MAX_TRANSPORT_SILENCE_MS` runtime setting because it is not a
+strategy-price source.
+
 Price and depth frames advance transport activity. A Binance server Ping is
 answered with Pong and also advances transport activity. The documented
 20-second server Ping cadence keeps a healthy quiet connection inside the
@@ -86,6 +93,7 @@ enriches each
 - `received_unix_us` captured before JSON parsing;
 - `exchange_event_to_socket_estimate_us`;
 - `exchange_event_to_socket_uncertainty_us`;
+- estimate validity, invalid reason, and maximum permitted clock-sync age;
 - clock offset, offset resolution, synchronization RTT, midpoint uncertainty,
   synchronization age, and observation time;
 - wire-frame size and parse-plus-apply duration.
@@ -105,9 +113,21 @@ they expose clock uncertainty.
 
 The runtime refreshes the diagnostic Binance clock observation every 60
 seconds through the process-scoped REST client. A failed refresh emits an
-unhealthy `binance_clock_sync` event and retains the last successful
-observation. This background diagnostic never changes readiness, price state,
-admission, preflight, or execution.
+unhealthy `binance_clock_sync` event and retains the last successful raw
+observation.
+
+An exchange-to-socket estimate is valid only while that successful clock
+observation is at most 180 seconds old. Each depth event records
+`exchange_event_to_socket_estimate_valid`, the 180-second maximum, and an
+explicit invalid reason. When the observation is unavailable or older than the
+maximum:
+
+- raw exchange and local receipt timestamps remain available;
+- clock offset, RTT, and observation age remain available for diagnosis;
+- the estimate and its uncertainty are emitted as `null`.
+
+Clock-sync health and estimate validity are diagnostic only. They never change
+readiness, price state, admission, preflight, or execution.
 
 This metric describes the JSON depth publication path. It is a proxy for
 Binance market-data transport health, not the latency of the strategy
@@ -142,6 +162,7 @@ The minute-level `binance_price_health` event records:
 - connection health and generation;
 - last update ID and current price age;
 - current transport age and the configured 30-second maximum;
+- the domain-artifact source of the strategy-price silence boundary;
 - cumulative accepted and rejected updates;
 - runtime phase;
 - cumulative dropped hot-telemetry records;

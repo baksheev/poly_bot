@@ -53,6 +53,9 @@ The v4-v12 snapshots record:
 - event-driven price content is separate from transport liveness: an unchanged
   top remains current while its connection generation has activity within
   `max_transport_silence_ms = 30000`;
+- that versioned `strategy.max_transport_silence_ms` value is the only
+  strategy-price boundary used by runtime readiness, admission, and preflight;
+  there is no environment override;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
   process's initial combined inventory;
 - the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.

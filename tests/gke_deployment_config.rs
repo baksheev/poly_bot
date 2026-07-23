@@ -7,7 +7,8 @@ fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
         RELEASE_PLATFORM
             .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v12.json")
     );
-    assert!(RELEASE_PLATFORM.contains("MARKET_DATA_MAX_AGE_MS: \"30000\""));
+    assert!(RELEASE_PLATFORM.contains("GAS_PRICE_MAX_TRANSPORT_SILENCE_MS: \"30000\""));
+    assert!(!RELEASE_PLATFORM.contains("MARKET_DATA_MAX_AGE_MS"));
     assert!(RELEASE_PLATFORM.contains("ARBITRAGE_EXECUTION_MODE: full_live"));
     assert!(RELEASE_PLATFORM.contains("REBALANCE_EXECUTION_MODE: full_live"));
     assert!(
@@ -37,7 +38,8 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("max_transport_silence_ms"));
-    assert!(DEPLOY_WORKFLOW.contains("MARKET_DATA_MAX_AGE_MS"));
+    assert!(DEPLOY_WORKFLOW.contains("GAS_PRICE_MAX_TRANSPORT_SILENCE_MS"));
+    assert!(!DEPLOY_WORKFLOW.contains("MARKET_DATA_MAX_AGE_MS"));
     assert!(DEPLOY_WORKFLOW.contains("min_expected_profit_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".adaptive_sizing.mode"));
     assert!(DEPLOY_WORKFLOW.contains("max_trade_notional_token_a_base_units"));

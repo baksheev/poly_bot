@@ -1294,6 +1294,8 @@ async fn run(
         binance_open_orders = binance_account.open_orders.len(),
         binance_order_rate_limits = ?binance_account.order_rate_limits,
         binance_gas_price_symbol = %gas_price_symbol,
+        binance_strategy_max_transport_silence_ms = pair.strategy.max_transport_silence_ms(),
+        binance_gas_price_max_transport_silence_ms = config.gas_price_max_transport_silence_ms,
         binance_wld_balance_present = binance_account.balance("WLD").is_some(),
         binance_usdc_balance_present = binance_account.balance("USDC").is_some(),
         wallet_address = %wallet_owner,
@@ -1310,8 +1312,12 @@ async fn run(
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let shortest_transport_silence_ms = pair
+        .strategy
+        .max_transport_silence_ms()
+        .min(config.gas_price_max_transport_silence_ms);
     let health_interval =
-        Duration::from_millis((config.market_data_max_age_ms / 4).clamp(100, 1_000));
+        Duration::from_millis((shortest_transport_silence_ms / 4).clamp(100, 1_000));
     let mut health_tick = tokio::time::interval(health_interval);
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     health_tick.reset();

@@ -292,11 +292,19 @@ impl RuntimeState {
         max_age_ms: u64,
         external_ready: bool,
     ) -> RuntimePhase {
+        self.refresh_phase_from_inputs(self.binance_ready(now, max_age_ms), external_ready)
+    }
+
+    pub fn refresh_phase_from_inputs(
+        &mut self,
+        binance_ready: bool,
+        external_ready: bool,
+    ) -> RuntimePhase {
         if self.phase == RuntimePhase::Stopping {
             return self.phase;
         }
 
-        let ready = external_ready && self.binance_ready(now, max_age_ms);
+        let ready = external_ready && binance_ready;
 
         self.phase = if ready {
             self.ever_ready = true;

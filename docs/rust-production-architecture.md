@@ -163,7 +163,9 @@ existing JSON depth stream supplies exchange event time `E`; production records
 a clock-corrected depth exchange-to-socket estimate, its clock/timestamp
 uncertainty, frame size, and parse-plus-apply time. This remains asynchronous
 diagnostic telemetry and must not become a strategy, readiness, admission, or
-execution input. Local receipt-to-decision latency remains independently
+execution input. The estimate is valid only for a successful clock observation
+no older than 180 seconds; stale observations preserve raw inputs but produce a
+null estimate. Local receipt-to-decision latency remains independently
 measurable.
 
 The current telemetry and liveness contract is
