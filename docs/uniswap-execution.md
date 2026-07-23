@@ -1,9 +1,9 @@
 # Uniswap V3/V4 execution
 
 The Rust runtime has one typed exact-input execution boundary for buying and
-selling the configured pair through Uniswap V3 and V4. Live arbitrage remains
-disabled by the domain artifact; the manual `uniswap-round-trip` command is a
-separate capped canary.
+selling the configured pair through Uniswap V3 and V4. The v12 production
+artifact enables live arbitrage; the manual `uniswap-round-trip` command is a
+separate historical validation tool and is not a routine production path.
 
 ## Rails gas parity
 
@@ -76,6 +76,13 @@ pool generation. Pending opportunities from the pre-fill generation are
 discarded; the next candidate passes the normal generation, Binance top, quote
 age, and deadline preflight before dispatch.
 
+This HTTP proof remains the current implementation but is priority architecture
+debt: production evidence shows that providers often return the receipt before
+the same event is visible to `eth_getLogs`. The target in
+`rust-production-architecture.md` applies the positional receipt event
+immediately and uses WebSocket delivery for canonical ordering and reorg
+correction.
+
 WebSocket settlement remains the fail-safe. Missing positional receipt data, a
 temporary HTTP failure, or a receipt event not yet returned by `eth_getLogs`
 leaves the existing settlement barrier active. Later WebSocket delivery is
@@ -83,10 +90,11 @@ deduplicated by canonical log position. A malformed, removed, or conflicting
 canonical event fails closed and requires normal process rehydration.
 
 Transport failures and confirmation timeouts are recorded as
-`outcome_unknown`. The nonce lane then stays blocked until canonical RPC
-reconciliation proves the result. A revert is logged with operation ID,
-transaction hash, block, gas used, and effective gas price. Raw signed payloads
-and credentials are never journaled or logged.
+`outcome_unknown`. The unresolved operation keeps its deterministic identity,
+nonce claim, and exact reservation until canonical RPC reconciliation proves
+the result; it must not become a global parent dead end. A revert is logged
+with operation ID, transaction hash, block, gas used, and effective gas price.
+Raw signed payloads and credentials are never journaled or logged.
 
 V3 checks and, if necessary, grants the router ERC-20 allowance. V4 performs
 both required stages: ERC-20 allowance to Permit2 and Permit2 allowance to the
@@ -117,12 +125,11 @@ Use `--protocol v4` for the V4 round trip. The command refuses to run when:
 - the transaction journal is locked by another process;
 - USDC input exceeds 10 USDC or slippage exceeds 50 bps.
 
-The GKE full-live rebalancer currently uses the same dedicated Rust wallet. A
-manual canary must therefore run only after confirming no rebalance is in
-flight and switching that runtime to observer-only mode. The market-data
-service can remain available, but two process-local mutating nonce owners must
-never run concurrently even if both independently observe the same pending
-nonce. Restore `full_live` and verify a fresh healthy heartbeat afterward.
+The GKE full-live process owns the same dedicated Rust wallet. A manual canary
+must never create a second nonce owner beside it. Any future rerun requires a
+reviewed operational workflow that first removes production ownership and
+proves there is no in-flight trade or rebalance; it must not be run ad hoc from
+a workstation.
 
 If a completed buy is followed by a fail-closed interruption before its sell,
 the exact measured WLD delta can be unwound with `uniswap-recovery-sell`. The

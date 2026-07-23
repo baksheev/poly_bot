@@ -1,7 +1,7 @@
 # Comparable arbitrage results
 
-Status: parent paper accounting and runtime integration implemented; live rows pending
-Last reviewed: 2026-07-17
+Status: live parent accounting active in GKE production
+Last reviewed: 2026-07-23
 
 The Rust equivalent of Rails `arbitrage_results` is the ClickHouse
 `arbitrage_results` table. It is populated asynchronously from terminal parent
@@ -144,5 +144,14 @@ WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64({start:String}, 3, '
   AND observed_at_ms <  toUnixTimestamp64Milli(toDateTime64({end:String}, 3, 'UTC'));
 ```
 
-The 100-trade gate requires `balanced >= 100`, every counted result to have a
-matching admission, and `blocked_unknown = 0` at the comparison cutoff.
+An evaluation window is usable after `balanced >= 100` and every counted result
+has a matching admission. Report `blocked_unknown` separately and verify that
+each unknown retained only its own exact reservation and did not stop later
+admissions. Unknown exposure remains economically material, but its mere
+presence is not a global comparison or execution dead end.
+
+The frozen 24-hour production example and the interpretation of its cohorts are
+in [Rust/Rails comparison on 2026-07-23](rust-rails-comparison-2026-07-23.md).
+Architecture changes inferred from comparisons belong in
+[Rust production architecture](rust-production-architecture.md), not in this
+accounting contract.

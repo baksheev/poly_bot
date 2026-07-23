@@ -72,6 +72,7 @@ pub struct TradingEngine {
     gas_price_connected: bool,
     gas_price_generation: u64,
     gas_price_book: Option<TopOfBook>,
+    gas_price_transport_activity_at: Option<Instant>,
     rebalance_inventory_reservation: Option<String>,
     next_inventory_reservation: u64,
     pending_rebalance: Option<RebalanceEvaluation>,
@@ -81,6 +82,7 @@ pub struct TradingEngine {
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
     last_depth_health_log_at: Option<Instant>,
+    last_binance_price_health_log_at: Option<Instant>,
     last_inventory_blocked_alert_at: Option<Instant>,
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
@@ -100,6 +102,7 @@ pub struct BinanceFeeBps {
 
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEPTH_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const BINANCE_PRICE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 const ADAPTIVE_OPTIMIZER_VERSION: &str = "exhaustive_whole_step_v1";
@@ -452,9 +455,10 @@ impl TradingEngine {
             .iter()
             .filter(|pair| pair.execution_enabled)
         {
-            execution
-                .entry_preflight
-                .configure_quote_max_age(&pair.binance.symbol, pair.strategy.max_quote_age_ms);
+            execution.entry_preflight.configure_max_transport_silence(
+                &pair.binance.symbol,
+                pair.strategy.max_transport_silence_ms(),
+            );
         }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
@@ -488,6 +492,7 @@ impl TradingEngine {
                 gas_price_connected: false,
                 gas_price_generation: 0,
                 gas_price_book: None,
+                gas_price_transport_activity_at: None,
                 rebalance_inventory_reservation: None,
                 next_inventory_reservation: 0,
                 pending_rebalance: None,
@@ -497,6 +502,7 @@ impl TradingEngine {
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
                 last_depth_health_log_at: None,
+                last_binance_price_health_log_at: None,
                 last_inventory_blocked_alert_at: None,
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
@@ -784,7 +790,9 @@ impl TradingEngine {
                 generation,
                 observed_at,
             } => {
-                self.state.on_connected(&symbol, generation);
+                self.state.on_connected(&symbol, generation, observed_at);
+                self.entry_preflight
+                    .on_feed_connected(symbol.as_ref(), generation, observed_at);
                 self.last_sequence_matched_quote_update
                     .remove(symbol.as_ref());
                 self.latest_sequence_matched_depth.remove(symbol.as_ref());
@@ -807,6 +815,8 @@ impl TradingEngine {
                 observed_at,
             } => {
                 self.state.on_disconnected(&symbol, generation);
+                self.entry_preflight
+                    .on_feed_disconnected(symbol.as_ref(), generation);
                 self.latest_sequence_matched_depth.remove(symbol.as_ref());
                 self.depth_health_by_symbol.remove(symbol.as_ref());
                 self.telemetry.emit(
@@ -817,6 +827,34 @@ impl TradingEngine {
                         "symbol": symbol.as_ref(),
                         "generation": generation,
                         "reason": reason,
+                        "observed_mono_age_us": observed_at.elapsed().as_micros(),
+                    }),
+                );
+            }
+            MarketEvent::FeedHeartbeat {
+                symbol,
+                generation,
+                observed_at,
+            } => {
+                let accepted =
+                    self.state
+                        .record_transport_activity(symbol.as_ref(), generation, observed_at);
+                if accepted {
+                    self.entry_preflight.record_transport_activity(
+                        symbol.as_ref(),
+                        generation,
+                        observed_at,
+                    );
+                }
+                self.telemetry.emit(
+                    "binance_feed_heartbeat",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "product": "spot",
+                        "feed_role": "strategy_price",
+                        "symbol": symbol.as_ref(),
+                        "generation": generation,
+                        "accepted": accepted,
                         "observed_mono_age_us": observed_at.elapsed().as_micros(),
                     }),
                 );
@@ -880,7 +918,9 @@ impl TradingEngine {
     pub fn on_gas_market_event(&mut self, event: MarketEvent) -> anyhow::Result<()> {
         match event {
             MarketEvent::FeedConnected {
-                symbol, generation, ..
+                symbol,
+                generation,
+                observed_at,
             } => {
                 ensure!(
                     symbol.as_ref() == self.gas_price_symbol,
@@ -890,6 +930,7 @@ impl TradingEngine {
                     self.gas_price_connected = true;
                     self.gas_price_generation = generation;
                     self.gas_price_book = None;
+                    self.gas_price_transport_activity_at = Some(observed_at);
                 }
             }
             MarketEvent::FeedDisconnected {
@@ -902,7 +943,34 @@ impl TradingEngine {
                 if generation == self.gas_price_generation {
                     self.gas_price_connected = false;
                     self.gas_price_book = None;
+                    self.gas_price_transport_activity_at = None;
                 }
+            }
+            MarketEvent::FeedHeartbeat {
+                symbol,
+                generation,
+                observed_at,
+            } => {
+                ensure!(
+                    symbol.as_ref() == self.gas_price_symbol,
+                    "gas heartbeat symbol mismatch"
+                );
+                let accepted = self.gas_price_connected && generation == self.gas_price_generation;
+                if accepted {
+                    self.gas_price_transport_activity_at = Some(observed_at);
+                }
+                self.telemetry.emit(
+                    "binance_feed_heartbeat",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "product": "spot",
+                        "feed_role": "gas_conversion",
+                        "symbol": symbol.as_ref(),
+                        "generation": generation,
+                        "accepted": accepted,
+                        "observed_mono_age_us": observed_at.elapsed().as_micros(),
+                    }),
+                );
             }
             MarketEvent::BinanceTopOfBook(quote) => {
                 ensure!(
@@ -915,7 +983,9 @@ impl TradingEngine {
                         .as_ref()
                         .is_none_or(|current| quote.update_id > current.update_id)
                 {
-                    self.hot_telemetry.emit_binance_book(&quote);
+                    self.gas_price_transport_activity_at = Some(quote.received_at);
+                    self.hot_telemetry
+                        .emit_binance_book(&quote, "gas_conversion", None, "stored");
                     self.gas_price_book = Some(quote);
                 }
             }
@@ -1378,14 +1448,18 @@ impl TradingEngine {
                 // The decision is evaluated only after all readiness inputs are
                 // fresh. The calculation itself performs no RPC, I/O, or locks.
                 self.refresh_phase(Instant::now());
-                if self.state.phase == RuntimePhase::Ready {
+                let decision_outcome = if self.state.phase == RuntimePhase::Ready {
                     if self.uses_dex_first_fast_path() {
-                        self.evaluate_ready_quote(
+                        if self.evaluate_ready_quote(
                             &quote,
                             "binance_book_ticker",
                             Some(AdmissionLiquidity::DexFirstTop),
                             depth,
-                        )?;
+                        )? {
+                            "evaluated"
+                        } else {
+                            "ready_without_pair_evaluation"
+                        }
                     } else if let Some(depth) = depth.filter(|depth| {
                         depth.matches_top(
                             quote.symbol.as_ref(),
@@ -1396,7 +1470,15 @@ impl TradingEngine {
                             quote.ask_quantity,
                         )
                     }) {
-                        self.evaluate_sequence_matched_quote(&quote, "binance_book_ticker", depth)?;
+                        if self.evaluate_sequence_matched_quote(
+                            &quote,
+                            "binance_book_ticker",
+                            depth,
+                        )? {
+                            "evaluated"
+                        } else {
+                            "sequence_matched_update_already_evaluated"
+                        }
                     } else {
                         self.telemetry.emit(
                             "binance_book_depth_mismatch",
@@ -1408,13 +1490,21 @@ impl TradingEngine {
                                 "reason": "sequence_or_top_level_mismatch",
                             }),
                         );
+                        "depth_mismatch"
                     }
-                }
+                } else {
+                    "runtime_not_ready"
+                };
 
                 // Raw market telemetry is deliberately serialized only after
                 // the opportunity decision. It must never delay detection or
                 // eventual order submission.
-                self.hot_telemetry.emit_binance_book(&quote);
+                self.hot_telemetry.emit_binance_book(
+                    &quote,
+                    "strategy_price",
+                    Some(self.state.phase),
+                    decision_outcome,
+                );
             }
             rejected => self.telemetry.emit(
                 "binance_book_ticker_rejected",
@@ -1436,21 +1526,20 @@ impl TradingEngine {
         quote: &TopOfBook,
         trigger: &'static str,
         depth: &SpotDepthBook,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if !mark_sequence_matched_update(
             &mut self.last_sequence_matched_quote_update,
             quote.symbol.as_ref(),
             quote.update_id,
         ) {
-            return Ok(());
+            return Ok(false);
         }
         self.evaluate_ready_quote(
             quote,
             trigger,
             Some(AdmissionLiquidity::FullDepth(depth)),
             Some(depth),
-        )?;
-        Ok(())
+        )
     }
 
     fn matching_cached_depth(&self, quote: &TopOfBook) -> Option<&SpotDepthBook> {
@@ -1474,7 +1563,7 @@ impl TradingEngine {
         trigger: &'static str,
         admission: Option<AdmissionLiquidity<'_>>,
         adaptive_depth: Option<&SpotDepthBook>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let calculation_started = Instant::now();
         if let Some(evaluation) = self.opportunities.evaluate(quote)? {
             self.hot_telemetry.emit_evaluation(
@@ -1494,8 +1583,9 @@ impl TradingEngine {
                     calculation_started,
                 )?;
             }
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn uses_dex_first_fast_path(&self) -> bool {
@@ -2110,8 +2200,13 @@ impl TradingEngine {
             .iter()
             .find(|config| config.id == pair_id)
             .context("paper opportunity pair is absent from domain config")?;
-        let quote_age = quote.received_at.elapsed();
-        if quote_age > Duration::from_millis(pair_config.strategy.max_quote_age_ms) {
+        let price_unchanged_for = quote.received_at.elapsed();
+        let max_transport_silence_ms = pair_config.strategy.max_transport_silence_ms();
+        if !self.state.binance_symbol_price_ready(
+            quote.symbol.as_ref(),
+            Instant::now(),
+            max_transport_silence_ms,
+        ) {
             self.telemetry.emit(
                 "arbitrage_admission_rejected",
                 json!({
@@ -2119,10 +2214,10 @@ impl TradingEngine {
                     "pair_id": pair_id,
                     "symbol": quote.symbol.as_ref(),
                     "update_id": quote.update_id,
-                    "reason": "quote_age_exceeded",
+                    "reason": "binance_transport_unavailable",
                     "evaluation_trigger": evaluation_trigger,
-                    "quote_age_ms": duration_us(quote_age) / 1_000,
-                    "max_quote_age_ms": pair_config.strategy.max_quote_age_ms,
+                    "price_unchanged_for_ms": duration_us(price_unchanged_for) / 1_000,
+                    "max_transport_silence_ms": max_transport_silence_ms,
                     "trigger_to_rejection_us": duration_us(evaluation_started_at.elapsed()),
                 }),
             );
@@ -2400,11 +2495,8 @@ impl TradingEngine {
         let token_a_symbol = pair_config.token_a.symbol.clone();
         let token_b_symbol = pair_config.token_b.symbol.clone();
         let gas_symbol = pair_config.chain.gas_symbol.clone();
-        let deadline_unix_seconds = quote
-            .received_unix_us
-            .checked_div(1_000_000)
-            .and_then(|seconds| seconds.checked_add(DEX_PLAN_TTL_SECONDS))
-            .context("DEX plan deadline overflow")?;
+        let deadline_unix_seconds =
+            admission_deadline_unix_seconds(quote.received_unix_us, quote.received_at.elapsed())?;
         let dex_plan = DexSwapPlan::build(
             pair_config,
             self.dex.pool(trade.pool_index)?,
@@ -2662,6 +2754,10 @@ impl TradingEngine {
         let admitted_object = admitted_payload
             .as_object_mut()
             .context("arbitrage admission telemetry payload is not an object")?;
+        admitted_object.insert(
+            "price_unchanged_for_us".to_owned(),
+            json!(duration_us(quote.received_at.elapsed())),
+        );
         admitted_object.insert(
             "recovery_loss_bound_token_a_base_units".to_owned(),
             json!(economics.recovery_loss_token_a.to_string()),
@@ -3096,8 +3192,83 @@ impl TradingEngine {
     pub fn refresh_health(&mut self) {
         let now = Instant::now();
         self.refresh_phase(now);
+        self.log_binance_price_health(now);
         self.log_depth_health(now);
         self.log_rebalance_health(now);
+    }
+
+    fn log_binance_price_health(&mut self, now: Instant) {
+        if self.last_binance_price_health_log_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < BINANCE_PRICE_HEALTH_LOG_INTERVAL
+        }) {
+            return;
+        }
+
+        let hot_telemetry_dropped_records = self.hot_telemetry.dropped_records();
+        for (symbol, feed) in &self.state.binance_feeds {
+            let price_age_ms = feed
+                .book
+                .as_ref()
+                .map(|book| now.saturating_duration_since(book.received_at).as_millis());
+            let transport_age_ms = feed.last_transport_activity_at.map(|last_activity_at| {
+                now.saturating_duration_since(last_activity_at).as_millis()
+            });
+            let transport_fresh = transport_age_ms
+                .is_some_and(|age| age <= u128::from(self.config.market_data_max_age_ms));
+            let healthy = feed.connected && feed.book.is_some() && transport_fresh;
+            if healthy {
+                tracing::info!(
+                    healthy,
+                    symbol = symbol.as_ref(),
+                    generation = feed.connection_generation,
+                    last_update_id = feed.last_update_id,
+                    price_age_ms,
+                    transport_age_ms,
+                    accepted_updates = feed.accepted_updates,
+                    rejected_updates = feed.rejected_updates,
+                    hot_telemetry_dropped_records,
+                    "Binance strategy price health heartbeat"
+                );
+            } else {
+                tracing::warn!(
+                    healthy,
+                    symbol = symbol.as_ref(),
+                    connected = feed.connected,
+                    generation = feed.connection_generation,
+                    last_update_id = feed.last_update_id,
+                    price_age_ms,
+                    transport_age_ms,
+                    accepted_updates = feed.accepted_updates,
+                    rejected_updates = feed.rejected_updates,
+                    hot_telemetry_dropped_records,
+                    "Binance strategy price health heartbeat"
+                );
+            }
+            self.telemetry.emit(
+                "binance_price_health",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "product": "spot",
+                    "symbol": symbol.as_ref(),
+                    "healthy": healthy,
+                    "connected": feed.connected,
+                    "runtime_phase": self.state.phase,
+                    "generation": feed.connection_generation,
+                    "last_update_id": feed.last_update_id,
+                    "price_age_ms": price_age_ms,
+                    "transport_age_ms": transport_age_ms,
+                    "max_transport_age_ms": self.config.market_data_max_age_ms,
+                    "accepted_updates": feed.accepted_updates,
+                    "rejected_updates": feed.rejected_updates,
+                    "hot_telemetry_dropped_records": hot_telemetry_dropped_records,
+                    "exchange_timestamp_available": feed.book.as_ref().is_some_and(|book| {
+                        book.exchange_event_ts_ms.is_some()
+                            || book.exchange_transaction_ts_ms.is_some()
+                    }),
+                }),
+            );
+        }
+        self.last_binance_price_health_log_at = Some(now);
     }
 
     fn log_depth_health(&mut self, now: Instant) {
@@ -3238,11 +3409,14 @@ impl TradingEngine {
         // market/DEX/balance inputs; an execution coordinator must separately
         // reserve and validate the assets required by its concrete trade.
         let user_data_ready = self.binance_user_data_connected && self.binance_user_data_clean;
-        let gas_price_fresh = self.gas_price_book.as_ref().is_some_and(|book| {
-            now.saturating_duration_since(book.received_at).as_millis()
-                <= u128::from(self.config.market_data_max_age_ms)
-        });
-        let gas_price_ready = self.gas_price_connected && gas_price_fresh;
+        let gas_price_transport_fresh =
+            self.gas_price_transport_activity_at
+                .is_some_and(|last_activity_at| {
+                    now.saturating_duration_since(last_activity_at).as_millis()
+                        <= u128::from(self.config.market_data_max_age_ms)
+                });
+        let gas_price_ready =
+            self.gas_price_connected && self.gas_price_book.is_some() && gas_price_transport_fresh;
         let trading_readiness = TradingReadiness {
             dex_ready,
             balances_ready,
@@ -3280,7 +3454,7 @@ impl TradingEngine {
                     "binance_user_data_clean": self.binance_user_data_clean,
                     "binance_user_data_ready": user_data_ready,
                     "gas_price_connected": self.gas_price_connected,
-                    "gas_price_fresh": gas_price_fresh,
+                    "gas_price_transport_fresh": gas_price_transport_fresh,
                     "gas_price_ready": gas_price_ready,
                     "blocking_inputs": blocking_inputs,
                 }),
@@ -3430,6 +3604,17 @@ fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn admission_deadline_unix_seconds(
+    price_received_unix_us: u64,
+    price_unchanged_for: Duration,
+) -> anyhow::Result<u64> {
+    price_received_unix_us
+        .checked_add(duration_us(price_unchanged_for))
+        .and_then(|admission_unix_us| admission_unix_us.checked_div(1_000_000))
+        .and_then(|seconds| seconds.checked_add(DEX_PLAN_TTL_SECONDS))
+        .context("DEX plan deadline overflow")
+}
+
 fn exact_execution_envelope_amounts(
     direction: TradeDirection,
     dex_input: U256,
@@ -3488,7 +3673,10 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Instant};
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
 
     use alloy_primitives::U256;
     use rust_decimal::Decimal;
@@ -3508,11 +3696,20 @@ mod tests {
     use super::{
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
         EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, RebalanceSettlementBarrier, ReservationPrecheck,
-        TradingReadiness, adaptive_candidate_is_better, classify_depth_health,
-        exact_execution_envelope_amounts, format_bps_x100_u256, mark_sequence_matched_update,
-        profit_bps_x100_u256, rebalance_health_state, requires_depth_for_runtime_phase,
-        reservation_precheck, settlement_requires_refresh,
+        TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
+        classify_depth_health, exact_execution_envelope_amounts, format_bps_x100_u256,
+        mark_sequence_matched_update, profit_bps_x100_u256, rebalance_health_state,
+        requires_depth_for_runtime_phase, reservation_precheck, settlement_requires_refresh,
     };
+
+    #[test]
+    fn dex_deadline_uses_admission_time_when_price_is_unchanged() {
+        assert_eq!(
+            admission_deadline_unix_seconds(1_800_000_000_000_000, Duration::from_secs(45))
+                .unwrap(),
+            1_800_000_075
+        );
+    }
 
     fn adaptive_depth_limits() -> AdaptiveSizingRuntimeLimits {
         AdaptiveSizingRuntimeLimits {

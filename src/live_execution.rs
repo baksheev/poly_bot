@@ -1070,17 +1070,28 @@ mod tests {
     }
 
     #[test]
-    fn entry_preflight_rejects_an_expired_latest_quote() {
+    fn entry_preflight_uses_transport_liveness_not_unchanged_price_age() {
         let handle = EntryPreflightHandle::default();
         let mut quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 8);
         quote.received_at = std::time::Instant::now() - std::time::Duration::from_millis(1_001);
         handle.update_quote(&quote);
-        handle.configure_quote_max_age("WLDUSDC", 1_000);
+        handle.configure_max_transport_silence("WLDUSDC", 1_000);
         handle.update_dex_pool_generation(0, 1);
 
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
+        assert_eq!(rejection.reason, "preflight_transport_silence_exceeded");
 
-        assert_eq!(rejection.reason, "preflight_quote_age_exceeded");
+        handle.record_transport_activity(
+            "WLDUSDC",
+            quote.connection_generation,
+            std::time::Instant::now(),
+        );
+
+        assert!(handle.check(&opportunity()).unwrap().is_none());
+
+        handle.on_feed_disconnected("WLDUSDC", quote.connection_generation);
+        let rejection = handle.check(&opportunity()).unwrap().unwrap();
+        assert_eq!(rejection.reason, "preflight_transport_unavailable");
     }
 
     #[test]

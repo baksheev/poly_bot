@@ -1,7 +1,11 @@
 # Concurrent DEX/CEX execution
 
-Status: proposed; paper implementation required before any live use
-Last reviewed: 2026-07-16
+Status: proposed experiment; DEX-first remains the production control
+Last reviewed: 2026-07-23
+
+This proposal is subordinate to `rust-production-architecture.md`. In
+particular, an unresolved parent may retain its own exposure and reservations
+but must not permanently close the global execution lane.
 
 ## Decision
 
@@ -239,9 +243,11 @@ prepared
 They mean the absolute token-B exposure is zero or below an explicitly accepted
 dust threshold, not merely that both adapters returned success.
 
-`unknown_exposure` immediately blocks all new entries. `halted` additionally
-requires operator acknowledgement after reconciliation or a configured hard
-risk limit has been breached.
+`unknown_exposure` retains that parent's exact reservations and continues venue
+reconciliation. `halted` stops that parent after a configured hard risk limit
+has been breached. Neither state alone is a global runtime phase; later plans
+remain admissible when their own exact inventory and normal readiness gates
+pass.
 
 ## Exposure accounting
 
@@ -295,8 +301,9 @@ rounding, and accepted dust policy.
 
 Do not reverse a filled CEX leg merely because the local DEX deadline expired.
 First reconcile the known transaction hash and nonce, then either accelerate the
-same transaction or confirm a same-nonce cancellation. If neither outcome can be
-proved, enter `unknown_exposure` and block new entries.
+same transaction or confirm a same-nonce cancellation. If neither outcome can
+be proved, enter `unknown_exposure`, retain the exact claim, and continue
+reconciliation without duplicating the mutation.
 
 ### CEX unknown
 
@@ -306,9 +313,10 @@ the position if the initial order filled despite a transport timeout.
 
 ### Both legs unknown
 
-Stop new entries, reconcile both venue identities, and continuously recompute
-the worst possible exposure. Operator notification is immediate. The process
-must not restart into an apparently clean state.
+Retain both exact claims, reconcile both venue identities, and continuously
+recompute the worst possible exposure. Operator notification is immediate.
+Later entries may use only inventory that remains available outside those
+claims. The process must not restart into an apparently clean state.
 
 ## Deadlines and loss limits
 

@@ -14,7 +14,7 @@ use crate::{
         CapacityEvaluation, DirectionEvaluation, PairEvaluation, PairRuntime, TradeEvaluation,
         format_base_units,
     },
-    state::TopOfBook,
+    state::{RuntimePhase, TopOfBook},
     telemetry::TelemetryHandle,
 };
 
@@ -35,7 +35,11 @@ pub struct HotTelemetryTask {
 
 struct HotBookTelemetry {
     quote: TopOfBook,
-    engine_queue_age_us: u128,
+    decision_complete_us: u128,
+    queued_at: std::time::Instant,
+    feed_role: &'static str,
+    runtime_phase: Option<RuntimePhase>,
+    decision_outcome: &'static str,
 }
 
 struct HotEvaluationTelemetry {
@@ -132,17 +136,32 @@ pub fn channel(
 
 impl HotTelemetryHandle {
     #[inline]
-    pub fn emit_binance_book(&self, quote: &TopOfBook) {
+    pub fn emit_binance_book(
+        &self,
+        quote: &TopOfBook,
+        feed_role: &'static str,
+        runtime_phase: Option<RuntimePhase>,
+        decision_outcome: &'static str,
+    ) {
         if self
             .book_sender
             .try_send(HotBookTelemetry {
                 quote: quote.clone(),
-                engine_queue_age_us: quote.received_at.elapsed().as_micros(),
+                decision_complete_us: quote.received_at.elapsed().as_micros(),
+                queued_at: std::time::Instant::now(),
+                feed_role,
+                runtime_phase,
+                decision_outcome,
             })
             .is_err()
         {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[inline]
+    pub fn dropped_records(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -180,7 +199,11 @@ impl HotTelemetryTask {
                 event = self.book_receiver.recv(), if books_open => match event {
                     Some(event) => self.emit_binance_book(
                         &event.quote,
-                        event.engine_queue_age_us,
+                        event.decision_complete_us,
+                        event.queued_at.elapsed().as_micros(),
+                        event.feed_role,
+                        event.runtime_phase,
+                        event.decision_outcome,
                     ),
                     None => books_open = false,
                 },
@@ -207,7 +230,15 @@ impl HotTelemetryTask {
         Ok(())
     }
 
-    fn emit_binance_book(&self, quote: &TopOfBook, engine_queue_age_us: u128) {
+    fn emit_binance_book(
+        &self,
+        quote: &TopOfBook,
+        decision_complete_us: u128,
+        telemetry_queue_delay_us: u128,
+        feed_role: &'static str,
+        runtime_phase: Option<RuntimePhase>,
+        decision_outcome: &'static str,
+    ) {
         self.telemetry.emit(
             "binance_book_ticker",
             json!({
@@ -223,7 +254,16 @@ impl HotTelemetryTask {
                 "exchange_transaction_ts_ms": quote.exchange_transaction_ts_ms,
                 "received_unix_us": quote.received_unix_us,
                 "connection_generation": quote.connection_generation,
-                "engine_queue_age_us": engine_queue_age_us,
+                "wire_frame_size_bytes": quote.wire_frame_size_bytes,
+                "parse_time_us": quote.parse_time_us,
+                "feed_role": feed_role,
+                "runtime_phase": runtime_phase,
+                "decision_outcome": decision_outcome,
+                "exchange_timestamp_available": quote.exchange_event_ts_ms.is_some()
+                    || quote.exchange_transaction_ts_ms.is_some(),
+                "decision_complete_us": decision_complete_us,
+                "engine_queue_age_us": decision_complete_us,
+                "telemetry_queue_delay_us": telemetry_queue_delay_us,
             }),
         );
     }

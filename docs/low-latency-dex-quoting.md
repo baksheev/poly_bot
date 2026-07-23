@@ -1,7 +1,7 @@
 # Low-latency Uniswap quoting
 
-Status: local opportunity calculation and market-liquidity sizing implemented
-Last reviewed: 2026-07-16
+Status: local opportunity calculation and adaptive market-liquidity sizing live
+Last reviewed: 2026-07-23
 
 ## Decision
 
@@ -178,15 +178,12 @@ telemetry rather than executable sizing.
 
 A WSS disconnect, subscription error, block discontinuity, removed log, invalid
 liquidity delta, or parent-hash mismatch immediately makes DEX quoting
-unavailable. The current read-only implementation exits so systemd restarts
-the container, fully hydrates at a new pinned block, and backfills the startup
-gap with `eth_getLogs`. In-process reconnect and exact-range repair are the
-next recovery slice. The service never continues with a plausible but
-unverified pool mirror.
+unavailable. Recovery must restore a canonical pinned snapshot and ordered log
+continuity before new entries resume. The service never continues with a
+plausible but unverified pool mirror.
 
 This intentionally prefers a short fail-closed interval over a plausible but
-incorrect quote. A small block journal may later support cheap rollback, but is
-not required before shadow mode.
+incorrect quote. A small block journal may later support cheaper rollback.
 
 ## Quoter and parity role
 

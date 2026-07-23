@@ -338,6 +338,7 @@ async fn fresh_book(config: &AppConfig, symbol: &str) -> anyhow::Result<TopOfBoo
                 MarketEvent::FeedDisconnected { reason, .. } => {
                     anyhow::bail!("Binance bookTicker disconnected: {reason}")
                 }
+                MarketEvent::FeedHeartbeat { .. } => {}
                 MarketEvent::BinanceDepthApplied { .. } => {}
             }
         }

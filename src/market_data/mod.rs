@@ -18,6 +18,11 @@ pub enum MarketEvent {
         reason: String,
         observed_at: Instant,
     },
+    FeedHeartbeat {
+        symbol: Arc<str>,
+        generation: u64,
+        observed_at: Instant,
+    },
     BinanceTopOfBook(TopOfBook),
     BinanceDepthApplied {
         symbol: Arc<str>,

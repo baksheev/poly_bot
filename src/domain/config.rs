@@ -589,7 +589,12 @@ pub enum TokenBQuoteSizing {
 pub struct StrategyConfig {
     pub kind: ArbitrageStrategy,
     pub opportunity_threshold_bps: u16,
+    /// Retained for deterministic deserialization of historical artifacts.
+    /// Production v12 uses `max_transport_silence_ms`; older artifacts fall
+    /// back to this value so transport readiness remains fail-closed.
     pub max_quote_age_ms: u64,
+    #[serde(default)]
+    pub max_transport_silence_ms: Option<u64>,
     pub min_slippage_bps: u16,
     pub max_slippage_bps: u16,
     pub slippage_profit_share_bps: u16,
@@ -618,6 +623,10 @@ impl StrategyConfig {
             self.max_quote_age_ms > 0,
             "strategy.max_quote_age_ms must be positive"
         );
+        ensure!(
+            self.max_transport_silence_ms() > 0,
+            "strategy.max_transport_silence_ms must be positive"
+        );
         validate_bps("strategy.min_slippage_bps", self.min_slippage_bps)?;
         validate_bps("strategy.max_slippage_bps", self.max_slippage_bps)?;
         ensure!(
@@ -634,6 +643,11 @@ impl StrategyConfig {
             "strategy.balance_safety_multiplier must be positive"
         );
         Ok(())
+    }
+
+    pub fn max_transport_silence_ms(&self) -> u64 {
+        self.max_transport_silence_ms
+            .unwrap_or(self.max_quote_age_ms)
     }
 }
 
@@ -897,7 +911,7 @@ mod tests {
         include_str!("../../config/strategies/usdc-wld-world-chain.v9.json");
     const V10_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v11.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v12.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1046,12 +1060,18 @@ mod tests {
         );
         assert_eq!(loaded.snapshot().pairs[0].strategy.max_quote_age_ms, 30_000);
         assert_eq!(
+            loaded.snapshot().pairs[0]
+                .strategy
+                .max_transport_silence_ms(),
+            30_000
+        );
+        assert_eq!(
             loaded.snapshot().pairs[0].binance.tick_size,
             "0.000100000000000"
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "eba87e9e10d682c72ca4c3438eefcbbea337c4ff773c1eaa1acf12e0eb0eb69b"
+            "87c98bc92b28dc8f168bddbd4009cb1068097e03fef9042c5d942d68541cf596"
         );
     }
 

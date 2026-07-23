@@ -123,6 +123,11 @@ impl BookTickerFeed {
                             if let Err(error) = socket.send(Message::Pong(payload)).await {
                                 return self.disconnect(format!("failed to send Binance pong: {error:#}"));
                             }
+                            return MarketEvent::FeedHeartbeat {
+                                symbol: Arc::clone(&self.symbol),
+                                generation: self.generation,
+                                observed_at: std::time::Instant::now(),
+                            };
                         }
                         Message::Pong(_) => {}
                         Message::Close(frame) => {
@@ -225,16 +230,22 @@ impl BookTickerFeed {
     fn parse_payload(&mut self, payload: &[u8]) -> anyhow::Result<MarketEvent> {
         let received_at = std::time::Instant::now();
         let received_unix_us = unix_timestamp_us();
+        let parse_started = std::time::Instant::now();
         let envelope: WireEventType<'_> =
             serde_json::from_slice(payload).context("invalid Binance stream JSON")?;
         match envelope.event_type {
-            Some("bookTicker") | None => Ok(MarketEvent::BinanceTopOfBook(parse_book_ticker(
-                payload,
-                Arc::clone(&self.symbol),
-                self.generation,
-                received_at,
-                received_unix_us,
-            )?)),
+            Some("bookTicker") | None => {
+                let mut quote = parse_book_ticker(
+                    payload,
+                    Arc::clone(&self.symbol),
+                    self.generation,
+                    received_at,
+                    received_unix_us,
+                )?;
+                quote.wire_frame_size_bytes = payload.len();
+                quote.parse_time_us = parse_started.elapsed().as_micros();
+                Ok(MarketEvent::BinanceTopOfBook(quote))
+            }
             Some("depthUpdate") => {
                 let update = parse_depth_update(payload, &self.symbol)?;
                 let book = self

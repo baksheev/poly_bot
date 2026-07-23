@@ -2,6 +2,9 @@
 
 Last reviewed: 2026-07-17
 
+Status: historical component-canary ledger. Current production decisions and
+global invariants are defined in `docs/rust-production-architecture.md`.
+
 This ledger records the manual canary required before each execution component
 can be enabled in the autonomous runtime. A successful unit or integration test
 does not replace a real operation against the production endpoint.
@@ -79,6 +82,8 @@ evidence. The wallet and Binance hydration evidence intentionally records no
 secret material or raw authenticated request. ERC-20 rebalance validation is
 complete. Standalone DEX V3/V4 execution and fully filled dedicated-account
 Binance LIMIT IOC/MARKET order placement are complete. Partial-fill,
-unknown-outcome, User Data Stream, restart and composed two-leg canaries remain
-pending and keep the full live arbitrage gate closed. The authoritative gate
-is `docs/rails-test-gap-analysis.md`.
+unknown-outcome, User Data Stream, restart, and composed two-leg rows above
+preserve the state of this historical canary ledger; they are not a current
+statement that production is disabled. Current live behavior, accepted risk
+boundaries, and remaining architecture debt are recorded in
+`docs/rust-production-architecture.md`.

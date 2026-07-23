@@ -19,6 +19,8 @@ pub struct TopOfBook {
     pub received_at: Instant,
     pub received_unix_us: u64,
     pub connection_generation: u64,
+    pub wire_frame_size_bytes: usize,
+    pub parse_time_us: u128,
 }
 
 impl TopOfBook {
@@ -63,6 +65,8 @@ impl TopOfBook {
             received_at,
             received_unix_us,
             connection_generation,
+            wire_frame_size_bytes: 0,
+            parse_time_us: 0,
         })
     }
 }
@@ -86,6 +90,7 @@ pub struct BinanceFeedState {
     pub rejected_updates: u64,
     pub depth_update_id: Option<u64>,
     pub depth_received_at: Option<Instant>,
+    pub last_transport_activity_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +183,7 @@ impl RuntimeState {
         }
     }
 
-    pub fn on_connected(&mut self, symbol: &str, generation: u64) {
+    pub fn on_connected(&mut self, symbol: &str, generation: u64, observed_at: Instant) {
         let Some(feed) = self.binance_feeds.get_mut(symbol) else {
             return;
         };
@@ -192,6 +197,7 @@ impl RuntimeState {
         feed.book = None;
         feed.depth_update_id = None;
         feed.depth_received_at = None;
+        feed.last_transport_activity_at = Some(observed_at);
         self.processed_events += 1;
     }
 
@@ -207,7 +213,25 @@ impl RuntimeState {
         feed.book = None;
         feed.depth_update_id = None;
         feed.depth_received_at = None;
+        feed.last_transport_activity_at = None;
         self.processed_events += 1;
+    }
+
+    pub fn record_transport_activity(
+        &mut self,
+        symbol: &str,
+        generation: u64,
+        observed_at: Instant,
+    ) -> bool {
+        let Some(feed) = self.binance_feeds.get_mut(symbol) else {
+            return false;
+        };
+        if !feed.connected || generation != feed.connection_generation {
+            return false;
+        }
+        feed.last_transport_activity_at = Some(observed_at);
+        self.processed_events += 1;
+        true
     }
 
     pub fn apply_quote(&mut self, quote: TopOfBook) -> QuoteApplyResult {
@@ -218,6 +242,7 @@ impl RuntimeState {
             feed.rejected_updates += 1;
             return QuoteApplyResult::StaleGeneration;
         }
+        feed.last_transport_activity_at = Some(quote.received_at);
         if feed
             .last_update_id
             .is_some_and(|last_update_id| quote.update_id <= last_update_id)
@@ -247,6 +272,7 @@ impl RuntimeState {
             feed.rejected_updates += 1;
             return QuoteApplyResult::StaleGeneration;
         }
+        feed.last_transport_activity_at = Some(received_at);
         if feed
             .depth_update_id
             .is_some_and(|last_update_id| update_id <= last_update_id)
@@ -286,17 +312,35 @@ impl RuntimeState {
     pub fn binance_ready(&self, now: Instant, max_age_ms: u64) -> bool {
         !self.binance_feeds.is_empty()
             && self.binance_feeds.values().all(|feed| {
-                feed.connected
-                    && feed.book.as_ref().is_some_and(|book| {
-                        now.saturating_duration_since(book.received_at).as_millis()
-                            <= u128::from(max_age_ms)
-                    })
+                Self::feed_price_ready(feed, now, max_age_ms)
                     && (!self.require_binance_depth
                         || feed.depth_received_at.is_some_and(|received_at| {
                             now.saturating_duration_since(received_at).as_millis()
                                 <= u128::from(max_age_ms)
                         }))
             })
+    }
+
+    pub fn binance_symbol_price_ready(
+        &self,
+        symbol: &str,
+        now: Instant,
+        max_transport_silence_ms: u64,
+    ) -> bool {
+        self.binance_feeds
+            .get(symbol)
+            .is_some_and(|feed| Self::feed_price_ready(feed, now, max_transport_silence_ms))
+    }
+
+    fn feed_price_ready(feed: &BinanceFeedState, now: Instant, max_age_ms: u64) -> bool {
+        feed.connected
+            && feed.book.is_some()
+            && feed
+                .last_transport_activity_at
+                .is_some_and(|last_activity_at| {
+                    now.saturating_duration_since(last_activity_at).as_millis()
+                        <= u128::from(max_age_ms)
+                })
     }
 
     pub fn stop(&mut self) {
@@ -417,11 +461,11 @@ mod tests {
     }
 
     #[test]
-    fn state_requires_connected_fresh_quote_before_ready() {
+    fn state_requires_a_price_and_fresh_transport_before_ready() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
 
-        state.on_connected("WLDUSDC", 1);
+        state.on_connected("WLDUSDC", 1, now);
         assert_eq!(
             state.refresh_phase(now, 5_000, true),
             RuntimePhase::Starting
@@ -431,8 +475,13 @@ mod tests {
             QuoteApplyResult::Accepted
         );
         assert_eq!(state.refresh_phase(now, 5_000, true), RuntimePhase::Ready);
+        assert!(state.record_transport_activity("WLDUSDC", 1, now + Duration::from_secs(4)));
         assert_eq!(
             state.refresh_phase(now + Duration::from_secs(6), 5_000, true),
+            RuntimePhase::Ready
+        );
+        assert_eq!(
+            state.refresh_phase(now + Duration::from_millis(9_001), 5_000, true),
             RuntimePhase::Degraded
         );
     }
@@ -441,7 +490,7 @@ mod tests {
     fn depth_required_state_waits_for_fresh_sequence_consistent_depth() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new_with_depth([Arc::from("WLDUSDC")]);
-        state.on_connected("WLDUSDC", 3);
+        state.on_connected("WLDUSDC", 3, now);
         assert_eq!(
             state.apply_quote(quote(10, 3, now)),
             QuoteApplyResult::Accepted
@@ -469,13 +518,18 @@ mod tests {
     fn reconnect_invalidates_old_generation_and_quote() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
-        state.on_connected("WLDUSDC", 1);
+        state.on_connected("WLDUSDC", 1, now);
         assert_eq!(
             state.apply_quote(quote(10, 1, now)),
             QuoteApplyResult::Accepted
         );
+        assert_eq!(state.refresh_phase(now, 5_000, true), RuntimePhase::Ready);
 
-        state.on_connected("WLDUSDC", 2);
+        state.on_connected("WLDUSDC", 2, now);
+        assert_eq!(
+            state.refresh_phase(now, 5_000, true),
+            RuntimePhase::Degraded
+        );
         assert_eq!(
             state.apply_quote(quote(11, 1, now)),
             QuoteApplyResult::StaleGeneration
@@ -490,7 +544,7 @@ mod tests {
     fn duplicate_or_regressed_update_is_rejected() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
-        state.on_connected("WLDUSDC", 1);
+        state.on_connected("WLDUSDC", 1, now);
         assert_eq!(
             state.apply_quote(quote(10, 1, now)),
             QuoteApplyResult::Accepted
@@ -502,10 +556,10 @@ mod tests {
     }
 
     #[test]
-    fn freshness_boundary_is_inclusive_and_then_degrades() {
+    fn transport_freshness_boundary_is_inclusive_and_then_degrades() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
-        state.on_connected("WLDUSDC", 1);
+        state.on_connected("WLDUSDC", 1, now);
         state.apply_quote(quote(1, 1, now));
 
         assert_eq!(
@@ -522,8 +576,8 @@ mod tests {
     fn every_configured_symbol_must_be_fresh_before_ready() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC"), Arc::from("ETHUSDT")]);
-        state.on_connected("WLDUSDC", 1);
-        state.on_connected("ETHUSDT", 1);
+        state.on_connected("WLDUSDC", 1, now);
+        state.on_connected("ETHUSDT", 1, now);
         state.apply_quote(quote(1, 1, now));
 
         assert_eq!(
@@ -536,13 +590,14 @@ mod tests {
     fn unknown_symbol_and_stale_disconnect_do_not_mutate_live_feed() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
-        state.on_connected("WLDUSDC", 2);
+        state.on_connected("WLDUSDC", 2, now);
         state.apply_quote(quote(1, 2, now));
         let processed = state.processed_events;
 
         let mut unknown = quote(1, 2, now);
         unknown.symbol = Arc::from("UNKNOWN");
         assert_eq!(state.apply_quote(unknown), QuoteApplyResult::UnknownSymbol);
+        assert!(!state.record_transport_activity("WLDUSDC", 1, now + Duration::from_secs(1)));
         state.on_disconnected("WLDUSDC", 1);
 
         assert_eq!(state.processed_events, processed);
@@ -554,7 +609,7 @@ mod tests {
     fn stopping_phase_is_terminal() {
         let now = std::time::Instant::now();
         let mut state = RuntimeState::new([Arc::from("WLDUSDC")]);
-        state.on_connected("WLDUSDC", 1);
+        state.on_connected("WLDUSDC", 1, now);
         state.apply_quote(quote(1, 1, now));
         state.stop();
 

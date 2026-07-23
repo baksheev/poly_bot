@@ -1,11 +1,11 @@
 # Binance bounded execution
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-23
 
 The Rust runtime now has a typed, single-owner Binance Spot order boundary for
-`WLDUSDC`. Autonomous arbitrage entry remains disabled. The manual
-`binance-order-round-trip` command is separately gated and hard-capped at 10
-USDC.
+`WLDUSDC`. Autonomous DEX-first arbitrage is enabled in the isolated GKE
+production runtime. The manual `binance-order-round-trip` command is a
+separately gated historical validation tool hard-capped at 10 USDC.
 
 ## Rails parity and transport
 
@@ -16,17 +16,18 @@ autonomous arbitrage path is stricter:
 - quantities are rounded down to the configured `0.1 WLD` step;
 - BUY protection is rounded up and SELL protection down to the configured
   `0.0001 USDC` live exchange tick;
-- a partial IOC execution is followed by another persisted LIMIT IOC for only
-  the remaining sellable quantity, capped at the admission-time worst depth
-  price;
+- a partial or zero IOC execution is followed by one persisted MARKET recovery
+  for only the exact actionable residual;
 - deterministic client order IDs are queried through `order.status` after an
   ambiguous placement response.
 
-There is no autonomous MARKET fallback. In the separately gated manual canary,
-MARKET BUY uses `quoteOrderQty`, so the exchange-side input is capped directly.
-MARKET SELL uses the exact post-BUY WLD balance delta rounded down to one
-exchange step. A fresh top-of-book must show enough best-level quantity before
-the sell is submitted.
+Autonomous MARKET recovery is permitted only because a bounded DEX-created
+exposure already exists; it may reduce that exposure but must never enlarge or
+reverse it. In the separately gated manual canary, MARKET BUY uses
+`quoteOrderQty`, so the exchange-side input is capped directly. MARKET SELL
+uses the exact post-BUY WLD balance delta rounded down to one exchange step. A
+fresh top-of-book must show enough best-level quantity before the sell is
+submitted.
 
 The implementation follows Binance's documented rule that timeout or an
 unexpected matching-engine response is an unknown execution result, not proof

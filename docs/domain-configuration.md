@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated v11 adaptive-live artifact implemented
-Last reviewed: 2026-07-21
+Status: v4 read/paper default and separately gated v12 adaptive-live artifact implemented
+Last reviewed: 2026-07-23
 
 ## Runtime boundary
 
@@ -29,14 +29,14 @@ attached to the production runtime.
 
 ## Captured behavior
 
-The v4-v11 snapshots record:
+The v4-v12 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
 - USDC as token A and WLD as token B, with base-unit decimals;
 - Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
   step/tick size;
-- fixed 20 USDC detector/control notional; v10-v11 execute adaptive whole-step
+- fixed 20 USDC detector/control notional; v10-v12 execute adaptive whole-step
   sizing from sequence-matched depth, capped recent depth, or a 40 USDC-capped
   top-only book up to the global 200 USDC cap, while retaining immediate
   bookTicker admission for a threshold-clearing baseline;
@@ -45,13 +45,15 @@ The v4-v11 snapshots record:
 - opportunity capacity expressed as whole Binance token-B steps, starting at
   that derived baseline and bounded by DEX liquidity, the profit threshold,
   and observed top-of-book quantity;
-- `profit_token_a`, 20 bps opportunity threshold, quote age, slippage reserve,
-  DEX fee reserve, and exact execution-envelope inventory reservations; v9-v11
+- `profit_token_a`, 20 bps opportunity threshold, market-data liveness,
+  slippage reserve, DEX fee reserve, and exact execution-envelope inventory
+  reservations; v9-v12
   make this 20 bps spread the entry verdict independently of worst-case gas
   and recovery coverage;
-- v11 restores the Rails-compatible 30-second Binance quote-age gate and uses
-  the same 30-second window for runtime market-data readiness; v10 remains the
-  immutable one-second predecessor;
+- v11 is the immutable Rails-compatible quote-age predecessor. V12 separates
+  event-driven price content from transport liveness: an unchanged top remains
+  current while its connection generation has activity within
+  `max_transport_silence_ms = 30000`;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
   process's initial combined inventory;
 - the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.
@@ -73,10 +75,11 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v11 artifact has
+The committed v4 default has both execution gates false. The v12 artifact has
 both true and is valid only for the explicitly confirmed GKE live path. V7 is
 the immutable adaptive-shadow predecessor; v8 is the exact-envelope predecessor;
-v5-v6 remain provenance for earlier live releases and deserialize to
+v11 remains the immutable quote-age predecessor; v5-v6 remain provenance for
+earlier live releases and deserialize to
 `baseline_only` because they predate `adaptive_sizing`.
 
 ## Refreshing the source data

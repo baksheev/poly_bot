@@ -1,11 +1,11 @@
 # Adaptive arbitrage sizing
 
-Status: v11 Rails-age-parity tiered-depth adaptive execution implemented for GKE production
+Status: v12 transport-liveness tiered-depth adaptive execution implemented for GKE production
 Last reviewed: 2026-07-21
 
 ## Implementation status
 
-The v11 production artifact enables `mode = adaptive` with a 200 USDC maximum
+The v12 production artifact enables `mode = adaptive` with a 200 USDC maximum
 trade-notional cap and tiered Binance depth. Rust evaluates exact Binance-step
 quantities for every enabled pool against prepared DEX curves using, in order:
 sequence-matched full depth; recent full depth within 750 ms and update delta 8;
@@ -384,7 +384,7 @@ An adaptive candidate is eligible only if:
   follows Rails and resolves a fresh uncapped fee immediately before signing;
 - `trade_notional`, `unhedged_notional`, and `maximum_recovery_loss` are within
   their config caps;
-- expected spread profit is at least `min_expected_profit` (zero in v9-v11); the
+- expected spread profit is at least `min_expected_profit` (zero in v9-v12); the
   configured 20 bps threshold is the authoritative profitability gate;
 - the exact direction-specific reservation fits currently available inventory;
 - the quote, pool generation, balances, account state, order counters, nonce
@@ -1004,12 +1004,13 @@ Admission uses two distinct clocks and must report both:
 - `trigger_to_admitted_us` starts when the event that caused reevaluation is
   handled (`binance_book_ticker` or `dex_prepared`).
 
-The production artifact sets `strategy.max_quote_age_ms = 30000`, matching the
-Rails `MAX_QUOTE_AGE_SECONDS = 30` gate. This is an
-execution gate, not telemetry: a DEX-triggered reevaluation of an older Binance
-quote is rejected with `reason = quote_age_exceeded`. Runtime readiness can use
-an independently configured market-data health window; production also sets it
-to 30 seconds so readiness cannot silently narrow the admission window.
+The production artifact sets `strategy.max_transport_silence_ms = 30000`.
+`bookTicker` is event-driven, so the last accepted top remains current while
+the same connection generation has a fresh price/depth frame or server
+Ping/client Pong heartbeat. DEX-triggered reevaluation is rejected when
+transport is unavailable or silent beyond that bound, not merely because the
+top has been unchanged for 30 seconds. `max_quote_age_ms` remains in historical
+artifacts for deterministic compatibility and is not the v12 liveness rule.
 
 The immediate live DEX path performs local request validation and resolves the
 predeclared gas envelope without `eth_call` or `eth_estimateGas`. Its native-gas
@@ -1093,7 +1094,7 @@ Primary code touch points:
 - `src/arbitrage.rs` and `src/live_execution.rs` for immutable plan fields and
   entry-channel behavior;
 - `src/hot_telemetry.rs` and result payloads;
-- `config/strategies/usdc-wld-world-chain.v11.json`;
+- `config/strategies/usdc-wld-world-chain.v12.json`;
 - monitor/comparison scripts and `docs/trading-runbook.md`.
 
 ## Verification and acceptance
@@ -1139,6 +1140,7 @@ Required tests before shadow:
 
 Before live adaptive mode, also require deterministic forced partial fill,
 reject, timeout, DEX revert, receipt-unknown, CEX-unknown, restart, rebalance
-overlap, and balance-reconciliation tests for every rollout notional bucket. The
-authoritative live verdict remains `docs/rails-test-gap-analysis.md` and the
-operator procedure remains `docs/trading-runbook.md`.
+overlap, and balance-reconciliation tests for every rollout notional bucket.
+The authoritative production decisions remain
+`docs/rust-production-architecture.md` and the operator procedure remains
+`docs/trading-runbook.md`.

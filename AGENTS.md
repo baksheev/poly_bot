@@ -57,7 +57,7 @@ a time.
   revision, and monitor it through rollout verification. Never force-push or
   discard remote commits; stop and report if `main` cannot be fast-forwarded or
   branch protection rejects the direct push.
-- The production GKE Pod must use the reviewed v11 adaptive-live domain artifact
+- The production GKE Pod must use the reviewed v12 adaptive-live domain artifact
   with both arbitrage and rebalancing in `full_live`. Adaptive sizing may select
   up to the configured 200 USDC cap from sequence-matched full depth or recent
   full depth within the reviewed age/update-delta caps. Top-of-book-only sizing
@@ -68,9 +68,11 @@ a time.
   legacy Rails `3x` multiplier. The configured 20 bps primary spread is the
   profitability gate; worst-case recovery loss and gas remain reservation and
   risk-cap inputs rather than a requirement that failure recovery be
-  profitable. Binance top-of-book admission and runtime market-data readiness
-  use the Rails-compatible 30-second maximum age. The deployment workflow must
-  verify these startup fields before it reports success.
+  profitable. An unchanged event-driven Binance top remains current while its
+  connection generation has fresh transport activity. Admission, preflight,
+  and runtime market-data readiness use the reviewed 30-second maximum
+  transport silence, not the age of the last price change. The deployment
+  workflow must verify these startup fields before it reports success.
 - Do not use `.github/workflows/deploy-gce.yml` for routine production delivery.
   It is retained only for an explicitly reviewed rollback after the GKE owner
   is scaled to zero and all active operations are reconciled.

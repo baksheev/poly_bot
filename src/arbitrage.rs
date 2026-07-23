@@ -788,8 +788,16 @@ pub struct EntryPreflightHandle {
 #[derive(Clone, Debug, Default)]
 struct EntryPreflightState {
     quotes: BTreeMap<String, TopOfBook>,
-    quote_max_age_ms: BTreeMap<String, u64>,
+    max_transport_silence_ms: BTreeMap<String, u64>,
+    transport: BTreeMap<String, PreflightTransportState>,
     dex_pool_generations: BTreeMap<usize, u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PreflightTransportState {
+    connection_generation: u64,
+    connected: bool,
+    last_activity_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,11 +807,63 @@ pub struct EntryPreflightRejection {
 }
 
 impl EntryPreflightHandle {
-    pub fn configure_quote_max_age(&self, symbol: &str, max_age_ms: u64) {
+    pub fn configure_max_transport_silence(&self, symbol: &str, max_age_ms: u64) {
         let Ok(mut state) = self.inner.write() else {
             return;
         };
-        state.quote_max_age_ms.insert(symbol.to_owned(), max_age_ms);
+        state
+            .max_transport_silence_ms
+            .insert(symbol.to_owned(), max_age_ms);
+    }
+
+    pub fn on_feed_connected(
+        &self,
+        symbol: &str,
+        connection_generation: u64,
+        observed_at: std::time::Instant,
+    ) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        let current = state.transport.get(symbol);
+        if current.is_none_or(|current| connection_generation >= current.connection_generation) {
+            state.transport.insert(
+                symbol.to_owned(),
+                PreflightTransportState {
+                    connection_generation,
+                    connected: true,
+                    last_activity_at: observed_at,
+                },
+            );
+        }
+    }
+
+    pub fn on_feed_disconnected(&self, symbol: &str, connection_generation: u64) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        if let Some(current) = state.transport.get_mut(symbol)
+            && current.connection_generation == connection_generation
+        {
+            current.connected = false;
+        }
+    }
+
+    pub fn record_transport_activity(
+        &self,
+        symbol: &str,
+        connection_generation: u64,
+        observed_at: std::time::Instant,
+    ) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        if let Some(current) = state.transport.get_mut(symbol)
+            && current.connected
+            && current.connection_generation == connection_generation
+        {
+            current.last_activity_at = observed_at;
+        }
     }
 
     pub fn update_quote(&self, quote: &TopOfBook) {
@@ -816,6 +876,14 @@ impl EntryPreflightHandle {
                 || (quote.connection_generation == current.connection_generation
                     && quote.update_id >= current.update_id)
         }) {
+            state.transport.insert(
+                quote.symbol.as_ref().to_owned(),
+                PreflightTransportState {
+                    connection_generation: quote.connection_generation,
+                    connected: true,
+                    last_activity_at: quote.received_at,
+                },
+            );
             state
                 .quotes
                 .insert(quote.symbol.as_ref().to_owned(), quote.clone());
@@ -847,14 +915,28 @@ impl EntryPreflightHandle {
                 detail: format!("no latest quote for {}", opportunity.symbol),
             }));
         };
-        if let Some(max_age_ms) = state.quote_max_age_ms.get(&opportunity.symbol).copied()
-            && quote.received_at.elapsed() > Duration::from_millis(max_age_ms)
+        let transport = state.transport.get(&opportunity.symbol);
+        if transport.is_none_or(|transport| {
+            !transport.connected || transport.connection_generation != quote.connection_generation
+        }) {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "preflight_transport_unavailable",
+                detail: format!("no live transport for {}", opportunity.symbol),
+            }));
+        }
+        if let (Some(max_age_ms), Some(transport)) = (
+            state
+                .max_transport_silence_ms
+                .get(&opportunity.symbol)
+                .copied(),
+            transport,
+        ) && transport.last_activity_at.elapsed() > Duration::from_millis(max_age_ms)
         {
             return Ok(Some(EntryPreflightRejection {
-                reason: "preflight_quote_age_exceeded",
+                reason: "preflight_transport_silence_exceeded",
                 detail: format!(
-                    "latest quote age {} ms exceeds configured {} ms",
-                    quote.received_at.elapsed().as_millis(),
+                    "latest transport activity age {} ms exceeds configured {} ms",
+                    transport.last_activity_at.elapsed().as_millis(),
                     max_age_ms
                 ),
             }));

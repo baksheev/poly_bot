@@ -1,10 +1,16 @@
 # Binance runtime parity and low-latency design
 
-Status: rebalance deployed; capped LIMIT/MARKET canary passed; autonomous trade entry disabled
-Last reviewed: 2026-07-17
+Status: autonomous Spot execution and rebalancing enabled in GKE production
+Last reviewed: 2026-07-23
 
 ## Decisions
 
+- The strategy-price path is locked by
+  `docs/rust-production-architecture.md`: persistent Spot `bookTicker` is
+  polled directly by the single state owner and immediately triggers local
+  evaluation. An unchanged top remains current while the same connection
+  generation has a server heartbeat within 30 seconds. This path is observed,
+  not reconsidered.
 - Rust trades Spot, never USD-M Futures.
 - Rust uses a dedicated Binance subaccount and a dedicated EVM execution
   wallet. Rails keeps its current Binance account and wallets.
@@ -35,7 +41,7 @@ arbitrage execution jobs in the Rails application.
 | `GET /api/v3/account/commission` | Not present in Rails | Add at startup per traded symbol so opportunity math uses the real account fee. |
 | `POST /sapi/v3/asset/getUserAsset` | Rails balance snapshots, investment, and rebalance | Do not use for the Rust trading path. `account` plus User Data Stream is lower-weight and directly matches Spot execution state. |
 | `POST /api/v3/order`, `LIMIT IOC` | Primary Rails hedge at the opportunity price | Preserve semantics, but send with WebSocket API `order.place` on a persistent connection. |
-| `POST /api/v3/order`, `MARKET quantity` | Rails hedge fallback and recovery | The autonomous Rust path intentionally tightens this to a persisted, depth-bounded LIMIT IOC for the residual; MARKET remains available only to the separately capped manual canary. |
+| `POST /api/v3/order`, `MARKET quantity` | Rails hedge fallback and recovery | Preserve residual-only recovery. The primary order is LIMIT IOC; an exact remaining quantity may use the bounded autonomous MARKET recovery path with a deterministic child identity. |
 | `POST /api/v3/order`, `MARKET quoteOrderQty` | Periodic investment of excess token-A profit | Preserve only in the later non-critical parity slice; it is not part of arbitrage execution. |
 | `GET /api/v3/order` | Find an order by order ID or deterministic client order ID after an ambiguous create | Preserve as `order.status` over WebSocket API, with REST as an independent recovery fallback. |
 | User Data Stream | Missing in Rails | Implemented through signed WebSocket API subscription. `executionReport`, `outboundAccountPosition`, and `balanceUpdate` feed the single runtime owner; termination, unknown events, or foreign orders fail closed. |
@@ -69,17 +75,19 @@ Rails currently:
 5. If the initial Binance leg fails after DEX success, retries the market hedge
    asynchronously until exposure is closed.
 
-Rust preserves the residual-only recovery quantity but bounds price as well as
-size. Production `dex_first` admission consumes the relevant real-time
+Rust preserves the residual-only recovery quantity. Production `dex_first`
+admission consumes the relevant real-time
 `bookTicker` level and persists that primary execution bound without waiting
 for `depth@100ms`; exact sequence-consistent depth is a fallback when the top
 level is too small. Concurrent execution continues to consume both sides of
-the local depth book. Every primary or recovery order is LIMIT IOC. There is no unbounded
-MARKET fallback in autonomous trading. A single state machine owns each
+the local depth book. The primary order is LIMIT IOC. If it does not fill the
+exact hedge quantity, the coordinator submits only the remaining quantity
+through the capped MARKET recovery path. A single state machine owns each
 attempt. Deterministic rejections become known zero-fill failures. Network
 timeout, 5xx, disconnect, or a missing response means `UNKNOWN`, never
-`FAILED`; the deterministic client ID and durable journal prevent duplicate
-placement.
+`FAILED`; deterministic client IDs and durable journals prevent duplicate
+placement. An unknown child retains only its exact reservation and does not
+close the global execution lane.
 
 ## Faster transport
 
@@ -192,7 +200,7 @@ risk gate fails. See `docs/rebalancing.md`.
 
 ## Readiness gates before order placement
 
-Live Binance order placement remains disabled until all of these are true:
+A new Binance order may be placed only when all of these are true:
 
 - clock synchronization is fresh;
 - account type is `SPOT` and `canTrade=true`;
@@ -203,4 +211,5 @@ Live Binance order placement remains disabled until all of these are true:
 - User Data Stream is subscribed and fresh;
 - open orders and the Rust client-order namespace are reconciled;
 - in-memory free/locked balances match the latest account generation;
-- no order or fill remains in an unknown state.
+- the plan's own reservation and child-order identity are reconciled; unknown
+  work from another plan cannot globally block the lane.

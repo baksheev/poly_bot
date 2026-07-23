@@ -2,10 +2,10 @@ const RELEASE_PLATFORM: &str = include_str!("../infra/gcp/gke/release-platform.y
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
 
 #[test]
-fn gke_manifest_is_the_full_live_v11_adaptive_owner() {
+fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
     assert!(
         RELEASE_PLATFORM
-            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v11.json")
+            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v12.json")
     );
     assert!(RELEASE_PLATFORM.contains("MARKET_DATA_MAX_AGE_MS: \"30000\""));
     assert!(RELEASE_PLATFORM.contains("ARBITRAGE_EXECUTION_MODE: full_live"));
@@ -33,9 +33,10 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
-    assert!(DEPLOY_WORKFLOW.contains("usdc-wld-world-chain.v11.json"));
+    assert!(DEPLOY_WORKFLOW.contains("usdc-wld-world-chain.v12.json"));
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
+    assert!(DEPLOY_WORKFLOW.contains("max_transport_silence_ms"));
     assert!(DEPLOY_WORKFLOW.contains("MARKET_DATA_MAX_AGE_MS"));
     assert!(DEPLOY_WORKFLOW.contains("min_expected_profit_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".adaptive_sizing.mode"));
