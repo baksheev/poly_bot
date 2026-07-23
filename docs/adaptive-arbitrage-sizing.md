@@ -1009,8 +1009,8 @@ The production artifact sets `strategy.max_transport_silence_ms = 30000`.
 the same connection generation has a fresh price/depth frame or server
 Ping/client Pong heartbeat. DEX-triggered reevaluation is rejected when
 transport is unavailable or silent beyond that bound, not merely because the
-top has been unchanged for 30 seconds. `max_quote_age_ms` remains in historical
-artifacts for deterministic compatibility and is not the v12 liveness rule.
+top has been unchanged for 30 seconds. Price-content age is telemetry only and
+is not the production liveness rule.
 
 The immediate live DEX path performs local request validation and resolves the
 predeclared gas envelope without `eth_call` or `eth_estimateGas`. Its native-gas

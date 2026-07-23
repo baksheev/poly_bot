@@ -14,7 +14,7 @@ use arb_bot::{
     balances::{
         BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
     },
-    binance::account::{BinanceAccountClient, BinanceAccountState},
+    binance::account::{BinanceAccountClient, BinanceAccountState, BinanceClockSync},
     binance::capital::{
         CapitalRecoverySnapshot, CapitalRouteState, TravelRuleWithdrawalRecord, WithdrawalRecord,
         select_capital_routes,
@@ -64,6 +64,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 const ARBITRAGE_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_WALLET_JOURNAL_PATH";
 const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
+const BINANCE_CLOCK_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 enum RebalanceExecutorEvent {
     Recovery(Result<RebalanceExecutionOperation, String>),
@@ -847,6 +848,7 @@ async fn run(
     );
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
     let binance_account = binance_account_client.hydrate(&binance_symbols[0]).await?;
+    let binance_clock_sync_client = binance_account_client.clone();
     validate_binance_account(&binance_account)?;
     let binance_buy_fee_bps = binance_account
         .commission
@@ -1198,7 +1200,15 @@ async fn run(
             sell: binance_sell_fee_bps,
         },
     )?;
+    engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
+    let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
+        tokio::sync::mpsc::channel(4);
+    let binance_clock_sync_task = tokio::spawn(run_binance_clock_sync(
+        binance_clock_sync_client,
+        binance_clock_sync_sender,
+    ));
+    let mut binance_clock_sync_running = true;
     let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) = if let Some(mut executor) =
         full_rebalance_executor.take()
     {
@@ -1269,6 +1279,8 @@ async fn run(
         binance_permissions = ?binance_account.account.permissions,
         binance_nonzero_balances = binance_account.account.balances.len(),
         binance_clock_offset_ms = binance_account.clock_offset_ms,
+        binance_clock_sync_rtt_us = binance_account.clock_sync.round_trip_us,
+        binance_clock_sync_midpoint_uncertainty_us = binance_account.clock_sync.midpoint_uncertainty_us(),
         binance_standard_maker_fee = %binance_account.commission.standard_commission.maker,
         binance_standard_taker_fee = %binance_account.commission.standard_commission.taker,
         binance_buy_fee_bps,
@@ -1326,6 +1338,18 @@ async fn run(
             },
             event = user_data_stream.next_event() => {
                 engine.on_user_data_event(event?)?;
+            },
+            observation = binance_clock_sync_receiver.recv(), if binance_clock_sync_running => {
+                match observation {
+                    Some(Ok(clock_sync)) => engine.on_binance_clock_sync(clock_sync),
+                    Some(Err(error)) => engine.on_binance_clock_sync_failure(&error),
+                    None => {
+                        binance_clock_sync_running = false;
+                        engine.on_binance_clock_sync_failure(
+                            "background Binance clock synchronization task stopped",
+                        );
+                    }
+                }
             },
             event = balance_receiver.recv() => {
                 let Some(event) = event else {
@@ -1454,8 +1478,10 @@ async fn run(
     }
     binance_balance_task.abort();
     wallet_balance_task.abort();
+    binance_clock_sync_task.abort();
     let _ = binance_balance_task.await;
     let _ = wallet_balance_task.await;
+    let _ = binance_clock_sync_task.await;
     dex_task.abort();
     let _ = dex_task.await;
     drop(engine);
@@ -1480,6 +1506,25 @@ async fn run(
         "arbitrage shadow service stopped"
     );
     Ok(())
+}
+
+async fn run_binance_clock_sync(
+    mut client: BinanceAccountClient,
+    sender: tokio::sync::mpsc::Sender<Result<BinanceClockSync, String>>,
+) {
+    let start = tokio::time::Instant::now() + BINANCE_CLOCK_SYNC_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, BINANCE_CLOCK_SYNC_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let observation = client
+            .synchronize_clock_observed()
+            .await
+            .map_err(|error| format!("{error:#}"));
+        if sender.send(observation).await.is_err() {
+            return;
+        }
+    }
 }
 
 fn dispatch_rebalance_execution(

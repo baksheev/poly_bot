@@ -20,6 +20,7 @@ use crate::{
     },
     balances::BalanceEvent,
     binance::{
+        account::BinanceClockSync,
         depth::SpotDepthBook,
         user_data::{ExecutionReportEvent, UserDataEvent},
     },
@@ -73,6 +74,7 @@ pub struct TradingEngine {
     gas_price_generation: u64,
     gas_price_book: Option<TopOfBook>,
     gas_price_transport_activity_at: Option<Instant>,
+    binance_clock_sync: Option<BinanceClockSync>,
     rebalance_inventory_reservation: Option<String>,
     next_inventory_reservation: u64,
     pending_rebalance: Option<RebalanceEvaluation>,
@@ -103,6 +105,7 @@ pub struct BinanceFeeBps {
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEPTH_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BINANCE_PRICE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const BINANCE_JSON_TIME_RESOLUTION_US: u64 = 1_000;
 const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 const ADAPTIVE_OPTIMIZER_VERSION: &str = "exhaustive_whole_step_v1";
@@ -493,6 +496,7 @@ impl TradingEngine {
                 gas_price_generation: 0,
                 gas_price_book: None,
                 gas_price_transport_activity_at: None,
+                binance_clock_sync: None,
                 rebalance_inventory_reservation: None,
                 next_inventory_reservation: 0,
                 pending_rebalance: None,
@@ -866,7 +870,11 @@ impl TradingEngine {
                 symbol,
                 generation,
                 last_update_id,
+                exchange_event_ts_ms,
                 observed_at,
+                received_unix_us,
+                wire_frame_size_bytes,
+                parse_apply_time_us,
             } => {
                 let apply_result = self.state.apply_depth(
                     symbol.as_ref(),
@@ -874,6 +882,19 @@ impl TradingEngine {
                     last_update_id,
                     observed_at,
                 );
+                let clock_sync = self.binance_clock_sync;
+                let exchange_event_to_socket_estimate_us = clock_sync.and_then(|clock_sync| {
+                    estimate_exchange_event_to_socket_us(
+                        received_unix_us,
+                        exchange_event_ts_ms,
+                        clock_sync.offset_ms,
+                    )
+                });
+                let estimate_uncertainty_us = clock_sync.map(|clock_sync| {
+                    clock_sync
+                        .midpoint_uncertainty_us()
+                        .saturating_add(BINANCE_JSON_TIME_RESOLUTION_US.saturating_mul(2))
+                });
                 self.telemetry.emit(
                     "binance_depth_applied",
                     json!({
@@ -882,6 +903,19 @@ impl TradingEngine {
                         "symbol": symbol.as_ref(),
                         "generation": generation,
                         "last_update_id": last_update_id,
+                        "exchange_event_ts_ms": exchange_event_ts_ms,
+                        "received_unix_us": received_unix_us,
+                        "exchange_event_to_socket_estimate_us": exchange_event_to_socket_estimate_us,
+                        "exchange_event_to_socket_uncertainty_us": estimate_uncertainty_us,
+                        "exchange_timestamp_resolution_us": BINANCE_JSON_TIME_RESOLUTION_US,
+                        "clock_offset_ms": clock_sync.map(|sync| sync.offset_ms),
+                        "clock_offset_resolution_us": BINANCE_JSON_TIME_RESOLUTION_US,
+                        "clock_sync_rtt_us": clock_sync.map(|sync| sync.round_trip_us),
+                        "clock_sync_midpoint_uncertainty_us": clock_sync.map(BinanceClockSync::midpoint_uncertainty_us),
+                        "clock_sync_age_ms": clock_sync.map(BinanceClockSync::age_ms),
+                        "clock_sync_observed_unix_ms": clock_sync.map(|sync| sync.observed_unix_ms),
+                        "wire_frame_size_bytes": wire_frame_size_bytes,
+                        "parse_apply_time_us": parse_apply_time_us,
                         "observed_mono_age_us": observed_at.elapsed().as_micros(),
                         "apply_result": format!("{apply_result:?}"),
                     }),
@@ -913,6 +947,38 @@ impl TradingEngine {
         }
         self.refresh_phase(Instant::now());
         Ok(())
+    }
+
+    pub fn on_binance_clock_sync(&mut self, clock_sync: BinanceClockSync) {
+        self.binance_clock_sync = Some(clock_sync);
+        self.telemetry.emit(
+            "binance_clock_sync",
+            json!({
+                "engine_id": self.config.engine_id,
+                "product": "spot",
+                "healthy": true,
+                "clock_offset_ms": clock_sync.offset_ms,
+                "clock_offset_resolution_us": BINANCE_JSON_TIME_RESOLUTION_US,
+                "round_trip_us": clock_sync.round_trip_us,
+                "midpoint_uncertainty_us": clock_sync.midpoint_uncertainty_us(),
+                "observed_unix_ms": clock_sync.observed_unix_ms,
+                "observation_age_ms": clock_sync.age_ms(),
+            }),
+        );
+    }
+
+    pub fn on_binance_clock_sync_failure(&self, error: &str) {
+        self.telemetry.emit(
+            "binance_clock_sync",
+            json!({
+                "engine_id": self.config.engine_id,
+                "product": "spot",
+                "healthy": false,
+                "error": error,
+                "retained_previous_observation": self.binance_clock_sync.is_some(),
+                "previous_observation_age_ms": self.binance_clock_sync.map(BinanceClockSync::age_ms),
+            }),
+        );
     }
 
     pub fn on_gas_market_event(&mut self, event: MarketEvent) -> anyhow::Result<()> {
@@ -3604,6 +3670,19 @@ fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn estimate_exchange_event_to_socket_us(
+    received_unix_us: u64,
+    exchange_event_ts_ms: u64,
+    clock_offset_ms: i64,
+) -> Option<i64> {
+    let received_on_binance_clock_us =
+        i128::from(received_unix_us).checked_add(i128::from(clock_offset_ms) * 1_000)?;
+    let exchange_event_us = i128::from(exchange_event_ts_ms).checked_mul(1_000)?;
+    received_on_binance_clock_us
+        .checked_sub(exchange_event_us)
+        .and_then(|estimate| i64::try_from(estimate).ok())
+}
+
 fn admission_deadline_unix_seconds(
     price_received_unix_us: u64,
     price_unchanged_for: Duration,
@@ -3697,10 +3776,23 @@ mod tests {
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
         EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, RebalanceSettlementBarrier, ReservationPrecheck,
         TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
-        classify_depth_health, exact_execution_envelope_amounts, format_bps_x100_u256,
-        mark_sequence_matched_update, profit_bps_x100_u256, rebalance_health_state,
-        requires_depth_for_runtime_phase, reservation_precheck, settlement_requires_refresh,
+        classify_depth_health, estimate_exchange_event_to_socket_us,
+        exact_execution_envelope_amounts, format_bps_x100_u256, mark_sequence_matched_update,
+        profit_bps_x100_u256, rebalance_health_state, requires_depth_for_runtime_phase,
+        reservation_precheck, settlement_requires_refresh,
     };
+
+    #[test]
+    fn exchange_event_latency_uses_the_binance_clock_offset() {
+        assert_eq!(
+            estimate_exchange_event_to_socket_us(1_700_000_000_125_000, 1_700_000_000_123, 1),
+            Some(3_000)
+        );
+        assert_eq!(
+            estimate_exchange_event_to_socket_us(1_700_000_000_123_000, 1_700_000_000_123, -1),
+            Some(-1_000)
+        );
+    }
 
     #[test]
     fn dex_deadline_uses_admission_time_when_price_is_unchanged() {

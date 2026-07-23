@@ -37,6 +37,11 @@ a time.
   scaling live trading.
 - ClickHouse is also in GCP `asia-southeast1`. A future ClickHouse migration or
   outage must never block or delay the in-memory trading loop.
+- The JSON Binance depth stream may provide exchange event time only for
+  diagnostic exchange-to-socket estimates. Record clock offset, synchronization
+  RTT/age, timestamp resolution, and estimate uncertainty asynchronously. This
+  diagnostic must never become a strategy-price, readiness, admission,
+  preflight, or execution input.
 - Use `./scripts/gcloud-local` for every local gcloud command. Its
   repository-local `.gcloud/` configuration keeps this project's account,
   project, and ADC isolated from the global Google Cloud SDK configuration.

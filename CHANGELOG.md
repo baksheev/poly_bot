@@ -20,6 +20,10 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Preserve Binance JSON depth event time and publish a clock-corrected
+  exchange-to-socket estimate with synchronization RTT, age, timestamp
+  resolution, and explicit uncertainty. The diagnostic remains asynchronous
+  and has no effect on strategy, readiness, admission, or execution.
 - Promote the immutable v12 adaptive-live artifact. Binance top-of-book
   admission, runtime readiness, and preflight now treat an unchanged
   event-driven price as current while its connection generation has transport

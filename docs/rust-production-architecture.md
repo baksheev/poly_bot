@@ -156,14 +156,18 @@ observable without delaying the decision:
 - cumulative accepted/rejected update counts, price age, connection health,
   and dropped hot-telemetry records in a periodic health event.
 
-The current Spot `bookTicker` payload does not supply an exchange event or
-transaction timestamp. Therefore exchange-to-socket one-way latency is
-unobservable from this stream and must be reported as unavailable, never
-invented from ClickHouse arrival time. Local receipt-to-decision latency remains
-fully measurable.
+The current JSON Spot `bookTicker` payload does not supply an exchange event or
+transaction timestamp. Direct exchange-to-socket latency is unavailable for
+that frame and must never be invented from ClickHouse arrival time. The
+existing JSON depth stream supplies exchange event time `E`; production records
+a clock-corrected depth exchange-to-socket estimate, its clock/timestamp
+uncertainty, frame size, and parse-plus-apply time. This remains asynchronous
+diagnostic telemetry and must not become a strategy, readiness, admission, or
+execution input. Local receipt-to-decision latency remains independently
+measurable.
 
-The frozen pre-instrumentation baseline is
-[`binance-price-telemetry-2026-07-23.md`](binance-price-telemetry-2026-07-23.md).
+The current telemetry and liveness contract is
+[`binance-price-telemetry.md`](binance-price-telemetry.md).
 
 ### Other market-data decisions
 

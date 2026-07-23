@@ -50,9 +50,8 @@ The v4-v12 snapshots record:
   reservations; v9-v12
   make this 20 bps spread the entry verdict independently of worst-case gas
   and recovery coverage;
-- v11 is the immutable Rails-compatible quote-age predecessor. V12 separates
-  event-driven price content from transport liveness: an unchanged top remains
-  current while its connection generation has activity within
+- event-driven price content is separate from transport liveness: an unchanged
+  top remains current while its connection generation has activity within
   `max_transport_silence_ms = 30000`;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
   process's initial combined inventory;
@@ -76,11 +75,9 @@ Startup rejects:
   data.
 
 The committed v4 default has both execution gates false. The v12 artifact has
-both true and is valid only for the explicitly confirmed GKE live path. V7 is
-the immutable adaptive-shadow predecessor; v8 is the exact-envelope predecessor;
-v11 remains the immutable quote-age predecessor; v5-v6 remain provenance for
-earlier live releases and deserialize to
-`baseline_only` because they predate `adaptive_sizing`.
+both true and is valid only for the explicitly confirmed GKE live path. Older
+artifacts remain immutable release provenance and deserialize according to
+their committed schemas.
 
 ## Refreshing the source data
 

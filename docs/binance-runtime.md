@@ -31,11 +31,11 @@ arbitrage execution jobs in the Rails application.
 
 | Rails endpoint or stream | Current purpose | Rust decision |
 |---|---|---|
-| `GET /api/v3/time` | Cache server clock offset for signed requests | Keep. Measure request midpoint, refresh periodically and immediately after `-1021`. |
+| `GET /api/v3/time` | Cache server clock offset for signed requests | Keep. Measure request midpoint and RTT, refresh the diagnostic observation every 60 seconds and immediately after `-1021`, and publish offset age/uncertainty asynchronously. |
 | Spot/Futures `<symbol>@bookTicker` | Current bid, ask, and best-level quantities | Keep only the Spot stream. It remains the fastest opportunity trigger. |
 | `GET /api/v3/ticker/bookTicker` | REST fallback, batch observations, gas prices | Do not use in the hot path. The Spot WebSocket owns live prices; REST is diagnostic recovery only. |
 | `GET /api/v3/depth` | Not present in Rails | Implemented for the local Spot-book bootstrap and every reconnect. |
-| `<symbol>@depth@100ms` | Not present in Rails | Implemented with buffered bootstrap and strict `U..u` continuity. Depth health is separate telemetry/metric in DEX-first live mode; adaptive sizing uses exact, capped recent, then capped top-only tiers. Never uses Futures depth. |
+| `<symbol>@depth@100ms` | Not present in Rails | Implemented with buffered bootstrap and strict `U..u` continuity. Retain exchange event time `E` for clock-corrected exchange-to-socket diagnostic telemetry. Depth health is separate in DEX-first live mode; adaptive sizing uses exact, capped recent, then capped top-only tiers. Never uses Futures depth. |
 | `GET /api/v3/exchangeInfo` | Discover pairs and obtain filters | Keep at startup and on explicit metadata refresh. Compile filters into per-symbol in-memory values. |
 | `GET /api/v3/account` | Not present in Rails | Add as the trading-account hydration source for permissions and nonzero free/locked balances. |
 | `GET /api/v3/account/commission` | Not present in Rails | Add at startup per traded symbol so opportunity math uses the real account fee. |

@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr, time::Duration};
+use std::{
+    fmt,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail, ensure};
 use hmac::{Hmac, Mac};
@@ -124,7 +128,7 @@ impl BinanceAccountClient {
     }
 
     pub async fn hydrate(&mut self, symbol: &str) -> anyhow::Result<BinanceAccountState> {
-        self.synchronize_clock().await?;
+        let clock_sync = self.synchronize_clock_observed().await?;
         let (account, commission, exchange_information, open_orders, order_rate_limits) = tokio::try_join!(
             self.account_information(),
             self.commission_rates(symbol),
@@ -140,6 +144,7 @@ impl BinanceAccountClient {
         let symbol_rules = exchange_information.symbol_rules(symbol)?;
         Ok(BinanceAccountState {
             clock_offset_ms: self.clock_offset_ms,
+            clock_sync,
             account,
             commission,
             symbol_rules,
@@ -149,6 +154,11 @@ impl BinanceAccountClient {
     }
 
     pub async fn synchronize_clock(&mut self) -> anyhow::Result<()> {
+        self.synchronize_clock_observed().await.map(|_| ())
+    }
+
+    pub async fn synchronize_clock_observed(&mut self) -> anyhow::Result<BinanceClockSync> {
+        let round_trip_started = Instant::now();
         let local_before = unix_timestamp_ms()?;
         let response = self
             .http
@@ -165,7 +175,15 @@ impl BinanceAccountClient {
         let local_after = unix_timestamp_ms()?;
         let local_midpoint = local_before.saturating_add(local_after) / 2;
         self.clock_offset_ms = signed_difference(server_time.server_time, local_midpoint)?;
-        Ok(())
+        Ok(BinanceClockSync {
+            offset_ms: self.clock_offset_ms,
+            round_trip_us: round_trip_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+            observed_at: Instant::now(),
+            observed_unix_ms: local_after,
+        })
     }
 
     pub async fn account_information(&self) -> anyhow::Result<AccountInformation> {
@@ -356,11 +374,33 @@ impl BinanceAccountClient {
 #[derive(Debug)]
 pub struct BinanceAccountState {
     pub clock_offset_ms: i64,
+    pub clock_sync: BinanceClockSync,
     pub account: AccountInformation,
     pub commission: CommissionRates,
     pub symbol_rules: SymbolRules,
     pub open_orders: Vec<OpenOrder>,
     pub order_rate_limits: Vec<OrderRateLimit>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BinanceClockSync {
+    pub offset_ms: i64,
+    pub round_trip_us: u64,
+    pub observed_at: Instant,
+    pub observed_unix_ms: u64,
+}
+
+impl BinanceClockSync {
+    pub fn age_ms(self) -> u64 {
+        self.observed_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    pub fn midpoint_uncertainty_us(self) -> u64 {
+        self.round_trip_us.saturating_add(1) / 2
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -819,12 +859,27 @@ fn apply_clock_offset(timestamp: u64, offset: i64) -> anyhow::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use rust_decimal::Decimal;
 
     use super::{
-        ApiKeyPermissions, BinanceAccountClient, BinanceCredentials, CommissionRates,
-        ExchangeInformation, apply_clock_offset, sign_hex,
+        ApiKeyPermissions, BinanceAccountClient, BinanceClockSync, BinanceCredentials,
+        CommissionRates, ExchangeInformation, apply_clock_offset, sign_hex,
     };
+
+    #[test]
+    fn clock_sync_reports_conservative_midpoint_uncertainty() {
+        let sync = BinanceClockSync {
+            offset_ms: 2,
+            round_trip_us: 5,
+            observed_at: Instant::now(),
+            observed_unix_ms: 1_700_000_000_000,
+        };
+
+        assert_eq!(sync.midpoint_uncertainty_us(), 3);
+        assert!(sync.age_ms() <= 1);
+    }
 
     #[test]
     fn produces_binance_hmac_example_signature() {

@@ -104,8 +104,8 @@ workstation.
   equal-window comparison contract.
 - [24-hour Rust/Rails comparison](docs/rust-rails-comparison-2026-07-23.md) —
   frozen production evidence used for the current priorities.
-- [Binance price telemetry baseline](docs/binance-price-telemetry-2026-07-23.md)
-  — frozen evidence for the locked strategy-price path.
+- [Binance price liveness and telemetry](docs/binance-price-telemetry.md) —
+  current transport-liveness contract and observability requirements.
 - [Concurrent execution](docs/concurrent-execution.md) — separately gated
   experiment; DEX-first remains the production control.
 - [Release changelog](CHANGELOG.md) — implementation history.

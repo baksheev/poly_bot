@@ -20,6 +20,7 @@ pub struct DepthSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthUpdate {
     pub symbol: String,
+    pub event_time_ms: u64,
     pub first_update_id: u64,
     pub final_update_id: u64,
     pub bids: Vec<DepthLevel>,
@@ -231,6 +232,7 @@ pub fn parse_depth_update(payload: &[u8], expected_symbol: &str) -> anyhow::Resu
     );
     Ok(DepthUpdate {
         symbol: wire.symbol.to_owned(),
+        event_time_ms: wire.event_time_ms,
         first_update_id: wire.first_update_id,
         final_update_id: wire.final_update_id,
         bids: parse_levels(wire.bids)?,
@@ -355,6 +357,8 @@ struct WireDepthSnapshot {
 struct WireDepthUpdate<'a> {
     #[serde(rename = "e")]
     event_type: &'a str,
+    #[serde(rename = "E")]
+    event_time_ms: u64,
     #[serde(rename = "s")]
     symbol: &'a str,
     #[serde(rename = "U")]
@@ -475,10 +479,11 @@ mod tests {
     fn applies_overlapping_sequence_and_removes_zero_level() {
         let mut book = snapshot();
         let update = parse_depth_update(
-            br#"{"e":"depthUpdate","s":"WLDUSDC","U":100,"u":102,"b":[["1.00","0"],["0.98","8"]],"a":[["1.01","4"]]}"#,
+            br#"{"e":"depthUpdate","E":1700000000123,"s":"WLDUSDC","U":100,"u":102,"b":[["1.00","0"],["0.98","8"]],"a":[["1.01","4"]]}"#,
             "WLDUSDC",
         )
         .unwrap();
+        assert_eq!(update.event_time_ms, 1_700_000_000_123);
         assert_eq!(book.apply(update).unwrap(), DepthApplyResult::Applied);
         assert_eq!(book.last_update_id(), 102);
         assert_eq!(book.best_bid().unwrap().price, Decimal::new(99, 2));
@@ -505,7 +510,7 @@ mod tests {
     fn rejects_sequence_gap_without_mutating_book() {
         let mut book = snapshot();
         let update = parse_depth_update(
-            br#"{"e":"depthUpdate","s":"WLDUSDC","U":102,"u":103,"b":[],"a":[]}"#,
+            br#"{"e":"depthUpdate","E":1700000000223,"s":"WLDUSDC","U":102,"u":103,"b":[],"a":[]}"#,
             "WLDUSDC",
         )
         .unwrap();

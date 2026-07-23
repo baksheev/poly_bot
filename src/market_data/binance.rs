@@ -248,6 +248,7 @@ impl BookTickerFeed {
             }
             Some("depthUpdate") => {
                 let update = parse_depth_update(payload, &self.symbol)?;
+                let exchange_event_ts_ms = update.event_time_ms;
                 let book = self
                     .depth_book
                     .as_mut()
@@ -261,7 +262,11 @@ impl BookTickerFeed {
                     symbol: Arc::clone(&self.symbol),
                     generation: self.generation,
                     last_update_id: book.last_update_id(),
+                    exchange_event_ts_ms,
                     observed_at: received_at,
+                    received_unix_us,
+                    wire_frame_size_bytes: payload.len(),
+                    parse_apply_time_us: parse_started.elapsed().as_micros(),
                 })
             }
             Some(other) => anyhow::bail!("unexpected Binance stream event {other}"),
