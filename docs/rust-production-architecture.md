@@ -179,7 +179,12 @@ The current telemetry and liveness contract is
 3. DEX quotes come from the local CLMM mirror. RPC Quoter calls are validation
    and replay tools, not hot-path dependencies.
 4. A DEX log updates the mirror in canonical order and creates a new prepared
-   pool generation. Prepared curves are immutable once published.
+   pool generation. The builder proactively prepares only the executable
+   envelope: the configured 200 USDC trade cap is covered by the reviewed
+   220 USDC unhedged-notional bound, from which direction-specific token-B
+   limits are derived using the updated pool. It does not traverse liquidity
+   that no admissible plan can use. Prepared curves are immutable once
+   published; only the latest requested generation may be installed.
 5. New entries require fresh Binance top, DEX mirror/head, balances, Binance
    user data, gas price, and execution ownership. Full-depth health alone does
    not change `RuntimePhase::Ready` in DEX-first production.

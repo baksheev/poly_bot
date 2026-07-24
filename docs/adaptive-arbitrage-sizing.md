@@ -876,9 +876,14 @@ inputs are already known to be stale.
   or telemetry serialization is allowed during candidate construction.
 - Use immutable prepared DEX curves, the sequence-consistent in-memory depth
   book, in-memory balances/reservations, and hydrated fee/gas snapshots.
-- Bound curve/depth breakpoints and exact optimizer evaluations with
-  compile-time limits and reuse fixed-capacity scratch storage; avoid per-probe
-  heap allocation and pool cloning.
+- Build each prepared DEX generation proactively after its pool update, but
+  stop at the configured execution envelope. The 200 USDC trade cap is covered
+  by the 220 USDC unhedged-notional bound; direction-specific token-B limits
+  are derived from the updated pool. Do not traverse unusable full-pool
+  liquidity.
+- Bound depth breakpoints and exact optimizer evaluations with compile-time
+  limits and reuse fixed-capacity scratch storage; avoid per-probe heap
+  allocation and pool cloning.
 - Capture decision latency before JSON construction or ClickHouse enqueue.
 - A missing prepared curve, stale generation, incomplete depth book, arithmetic
   overflow, or representation overflow fails closed.

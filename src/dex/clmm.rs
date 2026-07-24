@@ -348,7 +348,20 @@ impl ClmmPool {
         &self,
         zero_for_one: bool,
     ) -> anyhow::Result<PreparedQuoteCurve> {
-        self.prepare_quote_curve(zero_for_one, PreparedQuoteKind::ExactInput)
+        self.prepare_exact_input_curve_bounded(zero_for_one, (U256::ONE << 255) - U256::ONE)
+    }
+
+    /// Precomputes the exact-input path only through `maximum_amount_in`.
+    pub fn prepare_exact_input_curve_bounded(
+        &self,
+        zero_for_one: bool,
+        maximum_amount_in: U256,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve(
+            zero_for_one,
+            PreparedQuoteKind::ExactInput,
+            maximum_amount_in,
+        )
     }
 
     /// Precomputes the exact-output path for one swap direction.
@@ -356,23 +369,40 @@ impl ClmmPool {
         &self,
         zero_for_one: bool,
     ) -> anyhow::Result<PreparedQuoteCurve> {
-        self.prepare_quote_curve(zero_for_one, PreparedQuoteKind::ExactOutput)
+        self.prepare_exact_output_curve_bounded(zero_for_one, (U256::ONE << 255) - U256::ONE)
+    }
+
+    /// Precomputes the exact-output path only through `maximum_amount_out`.
+    pub fn prepare_exact_output_curve_bounded(
+        &self,
+        zero_for_one: bool,
+        maximum_amount_out: U256,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve(
+            zero_for_one,
+            PreparedQuoteKind::ExactOutput,
+            maximum_amount_out,
+        )
     }
 
     fn prepare_quote_curve(
         &self,
         zero_for_one: bool,
         kind: PreparedQuoteKind,
+        maximum_specified: U256,
     ) -> anyhow::Result<PreparedQuoteCurve> {
+        ensure!(
+            !maximum_specified.is_zero(),
+            "prepared curve maximum must be positive"
+        );
+        ensure!(
+            maximum_specified < (U256::ONE << 255),
+            "prepared curve maximum exceeds int256"
+        );
         let sqrt_price_limit_x96 = if zero_for_one {
             MIN_SQRT_RATIO + U256::ONE
         } else {
             MAX_SQRT_RATIO - U256::ONE
-        };
-        let maximum_specified = (U256::ONE << 255) - U256::ONE;
-        let specified_delta = match kind {
-            PreparedQuoteKind::ExactInput => I256::from_raw(maximum_specified),
-            PreparedQuoteKind::ExactOutput => -I256::from_raw(maximum_specified),
         };
         let mut segments = Vec::new();
         let mut specified_total = U256::ZERO;
@@ -381,7 +411,17 @@ impl ClmmPool {
         let mut tick = self.tick;
         let mut liquidity = self.liquidity;
 
-        while sqrt_price_x96 != sqrt_price_limit_x96 && liquidity != 0 {
+        while specified_total < maximum_specified
+            && sqrt_price_x96 != sqrt_price_limit_x96
+            && liquidity != 0
+        {
+            let specified_remaining = maximum_specified
+                .checked_sub(specified_total)
+                .context("prepared specified amount exceeded its maximum")?;
+            let specified_delta = match kind {
+                PreparedQuoteKind::ExactInput => I256::from_raw(specified_remaining),
+                PreparedQuoteKind::ExactOutput => -I256::from_raw(specified_remaining),
+            };
             let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
                 &self.tick_bitmap,
                 tick,
@@ -628,6 +668,12 @@ impl PreparedQuoteCurve {
             .last()
             .map_or(U256::ZERO, |segment| segment.specified_end)
     }
+
+    pub fn result_capacity(&self) -> U256 {
+        self.segments
+            .last()
+            .map_or(U256::ZERO, |segment| segment.result_end)
+    }
 }
 
 fn updated_boundary(
@@ -787,6 +833,43 @@ mod tests {
                 exact_out
                     .quote(exact_out.specified_capacity() + U256::ONE)
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_prepared_curves_stop_at_the_execution_envelope() {
+        let pool = pool();
+        let maximum = U256::from(20_000_u64);
+
+        for zero_for_one in [true, false] {
+            let exact_in = pool
+                .prepare_exact_input_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let exact_out = pool
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+
+            assert_eq!(exact_in.specified_capacity(), maximum);
+            assert_eq!(exact_out.specified_capacity(), maximum);
+            for amount in [U256::ONE, maximum / U256::from(2_u8), maximum] {
+                assert_eq!(
+                    exact_in.quote(amount).unwrap(),
+                    pool.quote_exact_in_amount_out(zero_for_one, amount)
+                        .unwrap()
+                );
+                assert_eq!(
+                    exact_out.quote(amount).unwrap(),
+                    pool.quote_exact_out_amount_in(zero_for_one, amount)
+                        .unwrap()
+                );
+            }
+            assert!(exact_in.quote(maximum + U256::ONE).is_err());
+            assert!(exact_out.quote(maximum + U256::ONE).is_err());
+            assert_eq!(exact_in.result_capacity(), exact_in.quote(maximum).unwrap());
+            assert_eq!(
+                exact_out.result_capacity(),
+                exact_out.quote(maximum).unwrap()
             );
         }
     }

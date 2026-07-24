@@ -130,6 +130,7 @@ pub struct PairRuntime {
     pub binance_buy_fee_bps: u16,
     pub binance_sell_fee_bps: u16,
     baseline_token_a: U256,
+    prepared_token_a_limit: U256,
     token_b_step: U256,
     token_a: Address,
     token_b: Address,
@@ -149,6 +150,9 @@ pub struct OpportunityEngine {
 struct PreparedPoolQuotes {
     by_direction: [PreparedQuoteCurve; 2],
     token_a_exact_input: PreparedQuoteCurve,
+    token_a_limit: U256,
+    exact_output_token_b_limit: U256,
+    exact_input_token_b_limit: U256,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +162,9 @@ pub struct PreparedPoolRefresh {
     pub exact_output_segments: usize,
     pub exact_input_segments: usize,
     pub token_a_exact_input_segments: usize,
+    pub token_a_limit: U256,
+    pub exact_output_token_b_limit: U256,
+    pub exact_input_token_b_limit: U256,
     pub build_time_us: u128,
     pub total_time_us: u128,
 }
@@ -168,6 +175,7 @@ pub struct PreparedPoolBuildRequest {
     pool: ClmmPool,
     exact_output_zero_for_one: bool,
     exact_input_zero_for_one: bool,
+    token_a_limit: U256,
     requested_at: Instant,
 }
 
@@ -405,6 +413,7 @@ impl OpportunityEngine {
             pool: hydrated.pool.clone(),
             exact_output_zero_for_one: hydrated.token0 == pair.token_a,
             exact_input_zero_for_one: hydrated.token0 == pair.token_b,
+            token_a_limit: pair.prepared_token_a_limit,
             requested_at: Instant::now(),
         })
     }
@@ -427,6 +436,9 @@ impl OpportunityEngine {
             exact_output_segments: result.prepared.by_direction[0].segment_count(),
             exact_input_segments: result.prepared.by_direction[1].segment_count(),
             token_a_exact_input_segments: result.prepared.token_a_exact_input.segment_count(),
+            token_a_limit: result.prepared.token_a_limit,
+            exact_output_token_b_limit: result.prepared.exact_output_token_b_limit,
+            exact_input_token_b_limit: result.prepared.exact_input_token_b_limit,
             build_time_us: result.build_time_us,
             total_time_us: result.requested_at.elapsed().as_micros(),
         };
@@ -481,6 +493,7 @@ impl PreparedPoolBuildRequest {
             &self.pool,
             self.exact_output_zero_for_one,
             self.exact_input_zero_for_one,
+            self.token_a_limit,
             self.generation,
         )?;
         Ok(PreparedPoolBuildResult {
@@ -523,6 +536,7 @@ fn prepare_pool_quotes(
         &hydrated.pool,
         exact_output_zero_for_one,
         exact_input_zero_for_one,
+        pair.prepared_token_a_limit,
         generation,
     )
 }
@@ -531,14 +545,40 @@ fn prepare_pool_quotes_from_pool(
     pool: &ClmmPool,
     exact_output_zero_for_one: bool,
     exact_input_zero_for_one: bool,
+    token_a_limit: U256,
     _generation: u64,
 ) -> anyhow::Result<PreparedPoolQuotes> {
+    let token_a_exact_input =
+        pool.prepare_exact_input_curve_bounded(exact_output_zero_for_one, token_a_limit)?;
+    let exact_output_token_b_limit = token_a_exact_input.result_capacity();
+    ensure!(
+        !exact_output_token_b_limit.is_zero(),
+        "DEX-buy execution envelope has no token-B output"
+    );
+
+    let token_a_exact_output =
+        pool.prepare_exact_output_curve_bounded(exact_input_zero_for_one, token_a_limit)?;
+    let exact_input_token_b_limit = token_a_exact_output.result_capacity();
+    ensure!(
+        !exact_input_token_b_limit.is_zero(),
+        "DEX-sell execution envelope has no token-B input"
+    );
+
     Ok(PreparedPoolQuotes {
         by_direction: [
-            pool.prepare_exact_output_curve(exact_output_zero_for_one)?,
-            pool.prepare_exact_input_curve(exact_input_zero_for_one)?,
+            pool.prepare_exact_output_curve_bounded(
+                exact_output_zero_for_one,
+                exact_output_token_b_limit,
+            )?,
+            pool.prepare_exact_input_curve_bounded(
+                exact_input_zero_for_one,
+                exact_input_token_b_limit,
+            )?,
         ],
-        token_a_exact_input: pool.prepare_exact_input_curve(exact_output_zero_for_one)?,
+        token_a_exact_input,
+        token_a_limit,
+        exact_output_token_b_limit,
+        exact_input_token_b_limit,
     })
 }
 
@@ -562,6 +602,15 @@ impl PairRuntime {
             .context("validated token_b address is invalid")?;
         let baseline_token_a = U256::from_str_radix(&config.quote_sizing.token_a_base_units, 10)
             .context("validated token-A baseline is invalid")?;
+        let prepared_token_a_limit = config
+            .adaptive_sizing
+            .limits()
+            .map(|limits| {
+                U256::from_str_radix(limits.max_unhedged_notional, 10)
+                    .context("validated adaptive exposure cap is invalid")
+            })
+            .transpose()?
+            .unwrap_or_else(|| baseline_token_a.saturating_mul(U256::from(2_u8)));
         let token_b_step = decimal_to_base_units(
             Decimal::from_str(&config.binance.step_size)
                 .context("validated Binance step_size is invalid")?,
@@ -604,6 +653,7 @@ impl PairRuntime {
             binance_buy_fee_bps: 0,
             binance_sell_fee_bps: 0,
             baseline_token_a,
+            prepared_token_a_limit,
             token_b_step,
             token_a,
             token_b,
@@ -1370,6 +1420,7 @@ mod tests {
             binance_buy_fee_bps: 0,
             binance_sell_fee_bps: 0,
             baseline_token_a: U256::from(20_u8) * U256::from(10_u64).pow(U256::from(18_u8)),
+            prepared_token_a_limit: U256::from(220_u16) * U256::from(10_u64).pow(U256::from(18_u8)),
             token_b_step: U256::from(10_u64).pow(U256::from(18_u8)),
             token_a,
             token_b,
@@ -1434,6 +1485,26 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn prepared_pool_curves_are_bounded_by_the_execution_envelope() {
+        let (pair, dex) = fixture();
+        let prepared = super::prepare_pool_quotes(&pair, &dex, 0, 1).unwrap();
+
+        assert_eq!(
+            prepared.token_a_exact_input.specified_capacity(),
+            pair.prepared_token_a_limit
+        );
+        assert_eq!(
+            prepared.by_direction[0].specified_capacity(),
+            prepared.exact_output_token_b_limit
+        );
+        assert_eq!(
+            prepared.by_direction[1].specified_capacity(),
+            prepared.exact_input_token_b_limit
+        );
+        assert_eq!(prepared.token_a_limit, pair.prepared_token_a_limit);
     }
 
     #[test]

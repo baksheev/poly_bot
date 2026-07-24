@@ -118,12 +118,20 @@ Both successful quotes and insufficient-liquidity results are cached.
 
 Each pool has three immutable prepared curves: token-A exact-input for the
 DEX-buy baseline, token-B exact-output for the rounded DEX buy, and token-B
-exact-input for the DEX sell. Curve construction performs the exact Uniswap
-word-boundary traversal once and stores contiguous cumulative segments with
-the original rounding. A quote then performs a binary search and at most one
-`compute_swap_step`; an amount above the directional capacity fails in constant
-time. Capacity-search probes use the curve directly and do not need their own
-cache.
+exact-input for the DEX sell. Curve construction is bounded by
+`exact_execution_envelope_v1`: production admits at most 200 USDC trade
+notional, while the existing 220 USDC unhedged-notional limit supplies the
+conservative token-A build bound. The builder derives both token-B limits from
+the current pool at that bound, preserving pool fees, integer rounding, and
+directional price impact. It never traverses liquidity beyond the amount that
+an admissible plan can use.
+
+Within that envelope, construction performs the exact Uniswap word-boundary
+traversal and stores contiguous cumulative segments with the original
+rounding. A quote then performs a binary search and at most one
+`compute_swap_step`; an amount above the prepared execution envelope fails in
+constant time. Capacity-search probes use the curve directly and do not need
+their own cache.
 
 Any applied `Swap`, `Mint`, `Burn`, or `ModifyLiquidity` event immediately
 marks only the affected pool stale, clears its rings, and transfers a cloned
@@ -131,7 +139,9 @@ versioned pool state to a bounded builder thread. Decisions fail closed while
 any required curve is missing. Only a result matching the latest requested
 generation is published; superseded builds are discarded. Once published, the
 last Binance Spot book is evaluated immediately instead of waiting for another
-exchange tick.
+exchange tick. `dex_pool_prepared` records the token-A and derived token-B
+limits, segment counts, build time, and total publication time under
+`prepared_curve_scope=execution_envelope_v1`.
 
 Uniswap LP fees are already included by the CLMM swap math. As in Rails, half
 of the gross venue-spread basis points is allocated to execution slippage and
