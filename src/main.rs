@@ -1337,8 +1337,9 @@ async fn run(
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
                 };
                 let mut next_event = Some(event);
+                let mut prepared_dex = false;
                 while let Some(event) = next_event {
-                    process_dex_event_inline(
+                    prepared_dex |= process_dex_event_inline(
                         &mut engine,
                         event,
                         &wallet_heads,
@@ -1346,7 +1347,9 @@ async fn run(
                     )?;
                     next_event = dex_receiver.try_recv().ok();
                 }
-                engine.evaluate_after_dex_refreshes()?;
+                if prepared_dex {
+                    engine.evaluate_after_dex_refreshes()?;
+                }
             }
             _ = health_tick.tick() => engine.refresh_health(),
             event = &mut binance_market_event => {
@@ -1451,17 +1454,16 @@ async fn run(
                 let result = result
                     .context("adaptive sizing worker join set stopped unexpectedly")?
                     .context("adaptive sizing worker panicked")?;
-                let mut drained_dex = false;
+                let mut prepared_dex = false;
                 while let Ok(event) = dex_receiver.try_recv() {
-                    process_dex_event_inline(
+                    prepared_dex |= process_dex_event_inline(
                         &mut engine,
                         event,
                         &wallet_heads,
                         &receipt_heads,
                     )?;
-                    drained_dex = true;
                 }
-                if drained_dex {
+                if prepared_dex {
                     engine.evaluate_after_dex_refreshes()?;
                 }
                 engine.on_adaptive_sizing_result(result)?;
@@ -1734,14 +1736,17 @@ fn process_dex_event_inline(
     event: arb_bot::market_data::alchemy::DexStreamEvent,
     wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
     receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let wallet_head = match &event {
         arb_bot::market_data::alchemy::DexStreamEvent::Head { head, .. } => Some(*head),
         arb_bot::market_data::alchemy::DexStreamEvent::Log { .. } => None,
     };
-    if let Some(request) = engine.on_dex_event(event)? {
+    let prepared = if let Some(request) = engine.on_dex_event(event)? {
         build_prepared_pool_inline(engine, request)?;
-    }
+        true
+    } else {
+        false
+    };
     if let Some(head) = wallet_head
         && *wallet_heads.borrow() != head
     {
@@ -1752,7 +1757,7 @@ fn process_dex_event_inline(
     {
         receipt_heads.send_replace(head);
     }
-    Ok(())
+    Ok(prepared)
 }
 
 struct InitializedDex {
