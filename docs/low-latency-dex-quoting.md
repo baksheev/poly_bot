@@ -1,7 +1,7 @@
 # Low-latency Uniswap quoting
 
 Status: local opportunity calculation and adaptive market-liquidity sizing live
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-24
 
 ## Decision
 
@@ -23,9 +23,10 @@ Alchemy HTTP ─> startup hydration / gap repair / sampled parity only
 
 The Binance socket future is polled by the same Tokio task that owns strategy
 state. A parsed Spot frame is applied and evaluated immediately, without an
-intermediate market-data channel or a second task wakeup. DEX I/O, curve
-building, and telemetry remain outside that owner and communicate through
-bounded channels because they are not triggered for every Binance frame.
+intermediate market-data channel or a second task wakeup. DEX I/O and telemetry
+remain outside that owner. The small, execution-envelope-bounded curve rebuild
+runs inline in the owner immediately after applying the DEX event; exhaustive
+adaptive sizing runs on a blocking worker against an immutable snapshot.
 
 Alchemy does not provide a stream of executable Uniswap quotes. The useful
 subscription primitive is `eth_subscribe` over WebSocket for logs and heads.
@@ -103,12 +104,12 @@ baseline:
 2. CEX buy / DEX sell: derive WLD from 20 USDC at the current Binance ask,
    round it down to the Binance step, and compare the Binance cost with the
    reserved exact-input DEX proceeds.
-4. If the baseline clears 20 bps, binary-search whole Binance steps over an
+3. If the baseline clears 20 bps, search whole Binance steps over an
    immutable prepared swap curve until the next step fails the profit
    threshold, exceeds hydrated DEX liquidity, or reaches the observed Binance
    top-of-book quantity. Each probe is a segment lookup plus at most one swap
    step; it never replays the CLMM bitmap walk.
-5. Across qualifying pools, retain the capacity candidate with the greatest
+4. Across qualifying pools, retain the capacity candidate with the greatest
    absolute token-A profit. No RPC, database call, lock, or pool clone occurs.
 
 The repeated baseline DEX quote is held in a fixed ring of eight entries per
@@ -134,19 +135,19 @@ constant time. Capacity-search probes use the curve directly and do not need
 their own cache.
 
 Any applied `Swap`, `Mint`, `Burn`, or `ModifyLiquidity` event immediately
-marks only the affected pool stale, clears its rings, and transfers a cloned
-versioned pool state to a bounded builder thread. Decisions fail closed while
-any required curve is missing. Only a result matching the latest requested
-generation is published; superseded builds are discarded. Once published, the
-last Binance Spot book is evaluated immediately instead of waiting for another
-exchange tick. `dex_pool_prepared` records the token-A and derived token-B
-limits, segment counts, build time, and total publication time under
-`prepared_curve_scope=execution_envelope_v1`. Its monotonic stage timings split
-that total into pre-dispatch owner work, request-channel send and handoff,
-builder work, result-channel send and handoff, and owner publication. Send-call
-durations are diagnostic and may overlap their corresponding handoff because
-the receiver can run concurrently; the handoff fields are the end-to-end
-latency boundaries used for percentile analysis.
+marks only the affected pool stale, clears its rings, and rebuilds that pool's
+bounded curves inline before the owner handles a strategy evaluation. The DEX
+branch is prioritized and drains all already-queued DEX events first, so an
+evaluation never knowingly starts behind an older unprocessed pool update.
+Generation validation remains mandatory when publishing a build and again in
+entry preflight.
+
+`dex_pool_prepared` records the token-A and derived token-B limits, segment
+counts, build time, and total publication time under
+`prepared_curve_scope=execution_envelope_v1` and
+`prepared_build_mode=inline_owner_v1`. The existing stage fields remain for
+continuity; channel send/handoff stages are now approximately zero because no
+builder channel or thread wakeup exists.
 
 Uniswap LP fees are already included by the CLMM swap math. As in Rails, half
 of the gross venue-spread basis points is allocated to execution slippage and
@@ -174,10 +175,22 @@ and swap deadline immediately before dispatch. A maximum DEX gas charge is
 deducted before admission.
 The gas bound uses the executor's five-million-unit ceiling, the background
 World Chain gas-price snapshot, the Rails priority fee, and the fresh ETHUSDT
-ask. Fully burdened economics must still clear 20 bps, and the signer rejects a
-fee above the admitted cap.
+ask. Gas remains an inventory and risk-envelope input; there is no
+admission-time DEX fee cap. The configured 20 bps gross spread remains the
+profitability gate.
 The decision path only transfers typed in-memory records, and captures decision
 latency before JSON construction or ClickHouse channel work.
+
+Adaptive sizing does not run in the single state owner. The owner snapshots the
+prepared curves, matching Binance depth, pool generations, and available
+inventory, then places only the newest pending sizing request onto one bounded
+blocking worker. A completed result is admitted only if the exact Binance book,
+every relevant DEX generation, and the gas/native-price context still match the
+snapshot. Otherwise it is marked superseded and discarded; inventory is
+checked again by the normal atomic reservation, and execution preflight checks
+the selected pool generation and price immediately before fill. This keeps
+exhaustive whole-step search from delaying DEX ingestion without allowing a
+stale snapshot to enter execution.
 
 The capacity is deliberately named `market_liquidity_capacity`, not executable
 size. Both market data and eventual execution use Binance Spot, and hydrated
@@ -268,6 +281,13 @@ five-pool run after moving repeated CEX arithmetic out of the pool loop measured
 the fully warm opportunity calculation at 2/12/19 us p50/p95/p99. These local
 figures remain secondary to the production window recorded in the deployment
 runbook.
+
+The production decision to build bounded curves inline used a 7-hour-12-minute
+GKE window with 1,845 complete builds. Curve construction itself measured
+11/17/24 us p50/p95/p99, while the two builder-thread handoffs measured 168 us
+and 150 us at p95. End-to-end publication measured 49/310/376 us; only two
+builds exceeded 500 us and one exceeded 1 ms. The measured synchronization cost
+was therefore materially larger than the bounded build and was removed.
 
 The subsequent Singapore production window contained 667 Binance-triggered
 evaluations. The complete calculation measured 3/7/13 us p50/p95/p99; its 664

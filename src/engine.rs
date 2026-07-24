@@ -90,6 +90,7 @@ pub struct TradingEngine {
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
     arbitrage_settlement_barriers: BTreeMap<usize, ArbitrageSettlementBarrier>,
+    pending_adaptive_sizing: Vec<AdaptiveSizingJob>,
 }
 
 pub struct TradingExecutionHandles {
@@ -266,6 +267,96 @@ impl AdaptivePoolSearch {
             self.cached_probes.push((amount, probe));
         }
     }
+}
+
+#[derive(Debug)]
+enum OwnedAdmissionLiquidity {
+    DexFirstTop,
+    FullDepth(SpotDepthBook),
+}
+
+impl OwnedAdmissionLiquidity {
+    fn borrowed(&self) -> AdmissionLiquidity<'_> {
+        match self {
+            Self::DexFirstTop => AdmissionLiquidity::DexFirstTop,
+            Self::FullDepth(depth) => AdmissionLiquidity::FullDepth(depth),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingAdaptiveAdmission {
+    quote: TopOfBook,
+    evaluation: PairEvaluation,
+    admission_liquidity: OwnedAdmissionLiquidity,
+    depth: Option<SpotDepthBook>,
+    evaluation_trigger: &'static str,
+    evaluation_started_at: Instant,
+}
+
+#[derive(Clone)]
+struct AdaptiveSizingSnapshot {
+    opportunities: OpportunityEngine,
+    domain_config: Arc<LoadedDomainConfig>,
+    telemetry: TelemetryHandle,
+    engine_id: String,
+    inventory: InventoryReservations,
+    wallet_gas_symbol: String,
+}
+
+pub struct AdaptiveSizingJob {
+    snapshot: AdaptiveSizingSnapshot,
+    pending: PendingAdaptiveAdmission,
+    selection: AdaptiveDepthSelection,
+    limits: AdaptiveSizingRuntimeLimits,
+    admission_context: AdmissionRuntimeContext,
+    pool_generations: Vec<(usize, u64)>,
+    snapshot_time_us: u64,
+    queued_at: Instant,
+}
+
+pub struct AdaptiveSizingTaskResult {
+    pending: PendingAdaptiveAdmission,
+    selection: AdaptiveDepthSelection,
+    limits: AdaptiveSizingRuntimeLimits,
+    admission_context: AdmissionRuntimeContext,
+    pool_generations: Vec<(usize, u64)>,
+    snapshot_time_us: u64,
+    result: anyhow::Result<Option<AdaptiveCandidate>>,
+    queued_at: Instant,
+    started_at: Instant,
+    finished_at: Instant,
+}
+
+impl AdaptiveSizingJob {
+    pub fn run(self) -> AdaptiveSizingTaskResult {
+        let started_at = Instant::now();
+        let result = self.snapshot.evaluate_adaptive_sizing(
+            &self.pending.quote,
+            &self.selection,
+            self.pending.evaluation,
+            self.limits,
+            self.admission_context,
+        );
+        AdaptiveSizingTaskResult {
+            pending: self.pending,
+            selection: self.selection,
+            limits: self.limits,
+            admission_context: self.admission_context,
+            pool_generations: self.pool_generations,
+            snapshot_time_us: self.snapshot_time_us,
+            result,
+            queued_at: self.queued_at,
+            started_at,
+            finished_at: Instant::now(),
+        }
+    }
+}
+
+struct CompletedAdaptiveSizing {
+    selection: AdaptiveDepthSelection,
+    limits: AdaptiveSizingRuntimeLimits,
+    result: anyhow::Result<Option<AdaptiveCandidate>>,
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +614,7 @@ impl TradingEngine {
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
                 arbitrage_settlement_barriers: BTreeMap::new(),
+                pending_adaptive_sizing: Vec::new(),
             },
             hot_telemetry_task,
         ))
@@ -768,6 +860,7 @@ impl TradingEngine {
                 "prepared_exact_input_segments": prepared.exact_input_segments,
                 "prepared_token_a_exact_input_segments": prepared.token_a_exact_input_segments,
                 "prepared_curve_scope": "execution_envelope_v1",
+                "prepared_build_mode": "inline_owner_v1",
                 "prepared_token_a_limit_base_units": prepared.token_a_limit.to_string(),
                 "prepared_exact_output_token_b_limit_base_units": prepared.exact_output_token_b_limit.to_string(),
                 "prepared_exact_input_token_b_limit_base_units": prepared.exact_input_token_b_limit.to_string(),
@@ -785,6 +878,13 @@ impl TradingEngine {
             }),
         );
         self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    /// Evaluates the newest books only after the caller has drained every DEX
+    /// event that was already queued. This prevents an expensive admission
+    /// calculation from delaying publication of a newer pool generation.
+    pub fn evaluate_after_dex_refreshes(&mut self) -> anyhow::Result<()> {
         if self.state.phase == RuntimePhase::Ready {
             let books: Vec<_> = self
                 .state
@@ -805,6 +905,88 @@ impl TradingEngine {
                 self.evaluate_ready_quote(&quote, "dex_prepared", admission, adaptive_depth)?;
             }
         }
+        Ok(())
+    }
+
+    pub fn take_adaptive_sizing_jobs(&mut self) -> Vec<AdaptiveSizingJob> {
+        std::mem::take(&mut self.pending_adaptive_sizing)
+    }
+
+    pub fn on_adaptive_sizing_result(
+        &mut self,
+        task: AdaptiveSizingTaskResult,
+    ) -> anyhow::Result<()> {
+        let quote_is_current = self
+            .state
+            .binance_feeds
+            .get(task.pending.quote.symbol.as_ref())
+            .and_then(|feed| feed.book.as_ref())
+            .is_some_and(|book| book == &task.pending.quote);
+        let pools_are_current = task
+            .pool_generations
+            .iter()
+            .all(|(pool_index, generation)| {
+                self.opportunities
+                    .pool_generation(*pool_index)
+                    .is_ok_and(|current| current == *generation)
+            });
+        let admission_context_is_current = self
+            .state
+            .balances
+            .wallet
+            .as_ref()
+            .zip(self.native_price_token_a())
+            .is_some_and(|(wallet, native_price)| {
+                wallet.gas_price_wei == task.admission_context.network_gas_price_wei
+                    && wallet.native_balance_wei == task.admission_context.wallet_native_balance_wei
+                    && native_price == task.admission_context.native_price_token_a
+            });
+        let stale_reason = if self.state.phase != RuntimePhase::Ready {
+            Some("runtime_not_ready")
+        } else if !quote_is_current {
+            Some("binance_generation_changed")
+        } else if !pools_are_current {
+            Some("dex_generation_changed")
+        } else if !admission_context_is_current {
+            Some("admission_context_changed")
+        } else {
+            None
+        };
+        self.telemetry.emit(
+            "arbitrage_adaptive_sizing_task",
+            json!({
+                "engine_id": self.config.engine_id,
+                "pair_id": self.opportunities.pair(task.pending.evaluation.pair_index)?.pair_id,
+                "symbol": task.pending.quote.symbol.as_ref(),
+                "update_id": task.pending.quote.update_id,
+                "outcome": if stale_reason.is_some() { "superseded" } else { "current" },
+                "stale_reason": stale_reason,
+                "queue_time_us": duration_us(task.started_at.saturating_duration_since(task.queued_at)),
+                "worker_time_us": duration_us(task.finished_at.saturating_duration_since(task.started_at)),
+                "result_handoff_time_us": duration_us(task.finished_at.elapsed()),
+                "snapshot_time_us": task.snapshot_time_us,
+            }),
+        );
+        if stale_reason.is_some() {
+            return Ok(());
+        }
+
+        let pending = task.pending;
+        let admission_liquidity = pending.admission_liquidity.borrowed();
+        let depth = pending.depth.as_ref();
+        self.submit_paper_opportunity_inner(
+            &pending.quote,
+            pending.evaluation,
+            admission_liquidity,
+            depth,
+            pending.evaluation_trigger,
+            pending.evaluation_started_at,
+            Some(CompletedAdaptiveSizing {
+                selection: task.selection,
+                limits: task.limits,
+                result: task.result,
+            }),
+        )?;
         Ok(())
     }
 
@@ -1804,6 +1986,19 @@ impl TradingEngine {
         })
     }
 
+    fn adaptive_sizing_snapshot(&self) -> AdaptiveSizingSnapshot {
+        AdaptiveSizingSnapshot {
+            opportunities: self.opportunities.clone(),
+            domain_config: Arc::clone(&self.domain_config),
+            telemetry: self.telemetry.clone(),
+            engine_id: self.config.engine_id.clone(),
+            inventory: self.inventory.clone(),
+            wallet_gas_symbol: self.wallet_gas_symbol.clone(),
+        }
+    }
+}
+
+impl AdaptiveSizingSnapshot {
     fn evaluate_adaptive_sizing(
         &self,
         quote: &TopOfBook,
@@ -1953,7 +2148,7 @@ impl TradingEngine {
             .collect::<serde_json::Map<_, _>>();
         let calculation_us = started.elapsed().as_micros();
         let mut payload = json!({
-            "engine_id": self.config.engine_id,
+            "engine_id": self.engine_id,
             "pair_id": pair.pair_id,
             "symbol": quote.symbol.as_ref(),
             "update_id": quote.update_id,
@@ -2283,7 +2478,9 @@ impl TradingEngine {
         }
         Ok((Some(winner), search))
     }
+}
 
+impl TradingEngine {
     fn submit_paper_opportunity(
         &mut self,
         quote: &TopOfBook,
@@ -2292,6 +2489,28 @@ impl TradingEngine {
         depth: Option<&SpotDepthBook>,
         evaluation_trigger: &'static str,
         evaluation_started_at: Instant,
+    ) -> anyhow::Result<bool> {
+        self.submit_paper_opportunity_inner(
+            quote,
+            evaluation,
+            admission_liquidity,
+            depth,
+            evaluation_trigger,
+            evaluation_started_at,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_paper_opportunity_inner(
+        &mut self,
+        quote: &TopOfBook,
+        evaluation: PairEvaluation,
+        admission_liquidity: AdmissionLiquidity<'_>,
+        depth: Option<&SpotDepthBook>,
+        evaluation_trigger: &'static str,
+        evaluation_started_at: Instant,
+        completed_adaptive: Option<CompletedAdaptiveSizing>,
     ) -> anyhow::Result<bool> {
         let admission_started = Instant::now();
         let Some(handle) = self.paper_trades.clone() else {
@@ -2330,7 +2549,12 @@ impl TradingEngine {
             );
             return Ok(false);
         }
-        let adaptive_limits = AdaptiveSizingRuntimeLimits::parse(&pair_config.adaptive_sizing)?;
+        let adaptive_limits = completed_adaptive
+            .as_ref()
+            .map(|completed| Some(completed.limits))
+            .unwrap_or(AdaptiveSizingRuntimeLimits::parse(
+                &pair_config.adaptive_sizing,
+            )?);
         if !evaluation
             .dex_buy_cex_sell
             .baseline
@@ -2360,52 +2584,103 @@ impl TradingEngine {
             .native_price_token_a()
             .context("admission has no native-token price")?;
 
-        let adaptive_selection = adaptive_limits
-            .map(|limits| {
-                self.select_adaptive_depth(quote, depth, limits, baseline_token_a, Instant::now())
+        let adaptive_selection = if let Some(completed) = completed_adaptive.as_ref() {
+            Some(AdaptiveDepthSelection {
+                book: completed.selection.book.clone(),
+                health: completed.selection.health,
+                max_trade_notional: completed.selection.max_trade_notional,
             })
-            .transpose()?;
-        let adaptive_candidate = if let (Some(selection), Some(limits)) =
-            (adaptive_selection.as_ref(), adaptive_limits)
+        } else {
+            adaptive_limits
+                .map(|limits| {
+                    self.select_adaptive_depth(
+                        quote,
+                        depth,
+                        limits,
+                        baseline_token_a,
+                        Instant::now(),
+                    )
+                })
+                .transpose()?
+        };
+        if completed_adaptive.is_none()
+            && let (Some(selection), Some(limits)) = (adaptive_selection.as_ref(), adaptive_limits)
         {
-            match self.evaluate_adaptive_sizing(
-                quote,
-                selection,
+            let pool_generations = pair
+                .pool_indices()
+                .iter()
+                .copied()
+                .map(|pool_index| {
+                    self.opportunities
+                        .pool_generation(pool_index)
+                        .map(|generation| (pool_index, generation))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let pending = PendingAdaptiveAdmission {
+                quote: quote.clone(),
                 evaluation,
+                admission_liquidity: match admission_liquidity {
+                    AdmissionLiquidity::DexFirstTop => OwnedAdmissionLiquidity::DexFirstTop,
+                    AdmissionLiquidity::FullDepth(depth) => {
+                        OwnedAdmissionLiquidity::FullDepth(depth.clone())
+                    }
+                },
+                depth: depth.cloned(),
+                evaluation_trigger,
+                evaluation_started_at,
+            };
+            let snapshot_started = Instant::now();
+            let snapshot = self.adaptive_sizing_snapshot();
+            let snapshot_time_us = duration_us(snapshot_started.elapsed());
+            self.pending_adaptive_sizing.push(AdaptiveSizingJob {
+                snapshot,
+                pending,
+                selection: AdaptiveDepthSelection {
+                    book: selection.book.clone(),
+                    health: selection.health,
+                    max_trade_notional: selection.max_trade_notional,
+                },
                 limits,
-                AdmissionRuntimeContext {
+                admission_context: AdmissionRuntimeContext {
                     network_gas_price_wei,
                     native_price_token_a,
                     wallet_native_balance_wei,
                 },
-            ) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    self.telemetry.emit(
-                        "arbitrage_adaptive_sizing_evaluated",
-                        json!({
-                            "engine_id": self.config.engine_id,
-                            "pair_id": pair_id,
-                            "symbol": quote.symbol.as_ref(),
-                            "update_id": quote.update_id,
-                            "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
-                            "selected_sizing_mode": "baseline",
-                            "fallback_reason": "optimizer_error",
-                            "error": format!("{error:#}"),
-                            "execution_size_changed": false,
-                            "depth_source": selection.health.source.as_str(),
-                            "depth_source_reason": selection.health.source_reason,
-                            "depth_age_ms": selection.health.age_ms,
-                            "depth_update_delta": selection.health.update_delta,
-                            "top_matches": selection.health.top_matches,
-                            "top_mismatch_reason": selection.health.top_mismatch_reason,
-                        }),
-                    );
-                    None
-                }
+                pool_generations,
+                snapshot_time_us,
+                queued_at: Instant::now(),
+            });
+            return Ok(false);
+        }
+        let adaptive_candidate = match completed_adaptive.map(|completed| completed.result) {
+            Some(Ok(candidate)) => candidate,
+            Some(Err(error)) => {
+                let selection = adaptive_selection
+                    .as_ref()
+                    .context("completed adaptive sizing has no depth selection")?;
+                self.telemetry.emit(
+                    "arbitrage_adaptive_sizing_evaluated",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "pair_id": pair_id,
+                        "symbol": quote.symbol.as_ref(),
+                        "update_id": quote.update_id,
+                        "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+                        "selected_sizing_mode": "baseline",
+                        "fallback_reason": "optimizer_error",
+                        "error": format!("{error:#}"),
+                        "execution_size_changed": false,
+                        "depth_source": selection.health.source.as_str(),
+                        "depth_source_reason": selection.health.source_reason,
+                        "depth_age_ms": selection.health.age_ms,
+                        "depth_update_delta": selection.health.update_delta,
+                        "top_matches": selection.health.top_matches,
+                        "top_mismatch_reason": selection.health.top_mismatch_reason,
+                    }),
+                );
+                None
             }
-        } else {
-            None
+            None => None,
         };
 
         let observed_depth_health = adaptive_selection

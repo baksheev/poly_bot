@@ -122,7 +122,7 @@ pub struct PairEvaluation {
     pub baseline_cache_misses: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PairRuntime {
     pub pair_id: String,
     pub symbol: String,
@@ -145,6 +145,7 @@ pub struct PairRuntime {
     pool_indices: Vec<usize>,
 }
 
+#[derive(Clone)]
 pub struct OpportunityEngine {
     pairs: Vec<PairRuntime>,
     pair_indices_by_symbol: HashMap<String, usize>,
@@ -154,7 +155,7 @@ pub struct OpportunityEngine {
     baseline_quote_cache: Vec<PoolBaselineQuoteCache>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PreparedPoolQuotes {
     by_direction: [PreparedQuoteCurve; 2],
     token_a_exact_input: PreparedQuoteCurve,
@@ -389,12 +390,12 @@ struct BaselineQuoteCacheEntry {
     outcome: DexQuoteOutcome,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PoolBaselineQuoteCache {
     by_direction: [DirectionBaselineQuoteCache; 2],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DirectionBaselineQuoteCache {
     entries: [Option<BaselineQuoteCacheEntry>; BASELINE_CACHE_ENTRIES_PER_DIRECTION],
     next_replace: usize,

@@ -63,7 +63,7 @@ pub struct InventoryReservation {
 /// Observed balances remain authoritative. Reservations only reduce available
 /// balances; they never create inventory or project an external mutation as a
 /// completed balance change.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InventoryReservations {
     observed: BTreeMap<InventoryKey, U256>,
     venue_generations: BTreeMap<InventoryVenue, u64>,
