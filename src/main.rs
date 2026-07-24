@@ -1411,9 +1411,7 @@ async fn run(
                             if let Some(refresh) =
                                 engine.apply_arbitrage_settlement_catchup(request, logs)?
                             {
-                                prepared_sender
-                                    .try_send(refresh)
-                                    .context("prepared DEX builder queue is full or closed")?;
+                                dispatch_prepared_pool_build(&prepared_sender, refresh)?;
                             }
                         }
                         Err(error) => {
@@ -1440,9 +1438,7 @@ async fn run(
                     arb_bot::market_data::alchemy::DexStreamEvent::Log { .. } => None,
                 };
                 if let Some(request) = engine.on_dex_event(event)? {
-                    prepared_sender
-                        .try_send(request)
-                        .context("prepared DEX builder queue is full or closed")?;
+                    dispatch_prepared_pool_build(&prepared_sender, request)?;
                 }
                 if let Some(head) = wallet_head
                     && *wallet_heads.borrow() != head
@@ -1459,7 +1455,9 @@ async fn run(
                 let Some(result) = result else {
                     bail!("prepared DEX builder stopped unexpectedly");
                 };
-                engine.on_prepared_pool(result?)?;
+                let result = result?;
+                result.mark_owner_received();
+                engine.on_prepared_pool(result)?;
             }
             result = &mut dex_task => {
                 result.context("Alchemy DEX connector task failed")??;
@@ -1707,6 +1705,18 @@ fn log_binance_capital(state: &CapitalRouteState) {
 
 type PreparedBuildResult = anyhow::Result<PreparedPoolBuildResult>;
 
+fn dispatch_prepared_pool_build(
+    sender: &tokio::sync::mpsc::Sender<PreparedPoolBuildRequest>,
+    request: PreparedPoolBuildRequest,
+) -> anyhow::Result<()> {
+    let timing = request.timing_handle();
+    timing.mark_request_dispatch_started();
+    let result = sender.try_send(request);
+    timing.mark_request_dispatch_finished();
+    result.context("prepared DEX builder queue is full or closed")?;
+    Ok(())
+}
+
 fn spawn_prepared_pool_builder(
     capacity: usize,
 ) -> anyhow::Result<(
@@ -1722,7 +1732,16 @@ fn spawn_prepared_pool_builder(
         .name("dex-curve-builder".into())
         .spawn(move || {
             while let Some(request) = request_receiver.blocking_recv() {
-                if result_sender.blocking_send(request.build()).is_err() {
+                let result = request.build();
+                let timing = result.as_ref().ok().map(|result| result.timing_handle());
+                if let Some(timing) = &timing {
+                    timing.mark_result_send_started();
+                }
+                let send_result = result_sender.blocking_send(result);
+                if let Some(timing) = &timing {
+                    timing.mark_result_send_finished();
+                }
+                if send_result.is_err() {
                     break;
                 }
             }

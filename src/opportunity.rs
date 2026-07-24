@@ -1,4 +1,12 @@
-use std::{collections::HashMap, str::FromStr, time::Instant};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, ensure};
@@ -166,6 +174,15 @@ pub struct PreparedPoolRefresh {
     pub exact_output_token_b_limit: U256,
     pub exact_input_token_b_limit: U256,
     pub build_time_us: u128,
+    pub pre_dispatch_time_us: Option<u128>,
+    pub request_send_time_us: Option<u128>,
+    pub request_handoff_time_us: Option<u128>,
+    pub builder_pre_build_time_us: Option<u128>,
+    pub builder_post_build_time_us: Option<u128>,
+    pub result_send_time_us: Option<u128>,
+    pub result_handoff_time_us: Option<u128>,
+    pub owner_publish_time_us: Option<u128>,
+    pub timing_complete: bool,
     pub total_time_us: u128,
 }
 
@@ -176,7 +193,7 @@ pub struct PreparedPoolBuildRequest {
     exact_output_zero_for_one: bool,
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
-    requested_at: Instant,
+    timing: PreparedPoolBuildTimingHandle,
 }
 
 pub struct PreparedPoolBuildResult {
@@ -184,7 +201,180 @@ pub struct PreparedPoolBuildResult {
     generation: u64,
     prepared: PreparedPoolQuotes,
     build_time_us: u128,
-    requested_at: Instant,
+    timing: PreparedPoolBuildTimingHandle,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedPoolBuildTimingHandle {
+    inner: Arc<PreparedPoolBuildTiming>,
+}
+
+#[derive(Debug)]
+struct PreparedPoolBuildTiming {
+    origin: Instant,
+    request_dispatch_started_ns: AtomicU64,
+    request_dispatch_finished_ns: AtomicU64,
+    builder_received_ns: AtomicU64,
+    build_started_ns: AtomicU64,
+    build_finished_ns: AtomicU64,
+    result_send_started_ns: AtomicU64,
+    result_send_finished_ns: AtomicU64,
+    owner_received_ns: AtomicU64,
+    published_ns: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedPoolStageTimings {
+    pre_dispatch_time_us: Option<u128>,
+    request_send_time_us: Option<u128>,
+    request_handoff_time_us: Option<u128>,
+    builder_pre_build_time_us: Option<u128>,
+    builder_post_build_time_us: Option<u128>,
+    result_send_time_us: Option<u128>,
+    result_handoff_time_us: Option<u128>,
+    owner_publish_time_us: Option<u128>,
+    timing_complete: bool,
+    total_time_us: u128,
+}
+
+impl PreparedPoolBuildTimingHandle {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(PreparedPoolBuildTiming {
+                origin: Instant::now(),
+                request_dispatch_started_ns: AtomicU64::new(0),
+                request_dispatch_finished_ns: AtomicU64::new(0),
+                builder_received_ns: AtomicU64::new(0),
+                build_started_ns: AtomicU64::new(0),
+                build_finished_ns: AtomicU64::new(0),
+                result_send_started_ns: AtomicU64::new(0),
+                result_send_finished_ns: AtomicU64::new(0),
+                owner_received_ns: AtomicU64::new(0),
+                published_ns: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub fn mark_request_dispatch_started(&self) {
+        self.mark(&self.inner.request_dispatch_started_ns);
+    }
+
+    pub fn mark_request_dispatch_finished(&self) {
+        self.mark(&self.inner.request_dispatch_finished_ns);
+    }
+
+    fn mark_builder_received(&self) {
+        self.mark(&self.inner.builder_received_ns);
+    }
+
+    fn mark_build_started(&self) {
+        self.mark(&self.inner.build_started_ns);
+    }
+
+    fn mark_build_finished(&self) {
+        self.mark(&self.inner.build_finished_ns);
+    }
+
+    pub fn mark_result_send_started(&self) {
+        self.mark(&self.inner.result_send_started_ns);
+    }
+
+    pub fn mark_result_send_finished(&self) {
+        self.mark(&self.inner.result_send_finished_ns);
+    }
+
+    fn mark_owner_received(&self) {
+        self.mark(&self.inner.owner_received_ns);
+    }
+
+    fn mark_published(&self) {
+        self.mark(&self.inner.published_ns);
+    }
+
+    fn wait_for_result_send_finished(&self) {
+        for _ in 0..256 {
+            if self.inner.result_send_finished_ns.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn mark(&self, destination: &AtomicU64) {
+        let _ = destination.compare_exchange(
+            0,
+            self.now_offset_ns(),
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn now_offset_ns(&self) -> u64 {
+        let elapsed_ns = self
+            .inner
+            .origin
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX - 1)) as u64;
+        elapsed_ns + 1
+    }
+
+    fn snapshot(&self) -> PreparedPoolStageTimings {
+        let request_dispatch_started = load_offset_ns(&self.inner.request_dispatch_started_ns);
+        let request_dispatch_finished = load_offset_ns(&self.inner.request_dispatch_finished_ns);
+        let builder_received = load_offset_ns(&self.inner.builder_received_ns);
+        let build_started = load_offset_ns(&self.inner.build_started_ns);
+        let build_finished = load_offset_ns(&self.inner.build_finished_ns);
+        let result_send_started = load_offset_ns(&self.inner.result_send_started_ns);
+        let result_send_finished = load_offset_ns(&self.inner.result_send_finished_ns);
+        let owner_received = load_offset_ns(&self.inner.owner_received_ns);
+        let published = load_offset_ns(&self.inner.published_ns);
+        let timing_complete = [
+            request_dispatch_started,
+            request_dispatch_finished,
+            builder_received,
+            build_started,
+            build_finished,
+            result_send_started,
+            result_send_finished,
+            owner_received,
+            published,
+        ]
+        .iter()
+        .all(Option::is_some);
+
+        PreparedPoolStageTimings {
+            pre_dispatch_time_us: request_dispatch_started.map(nanos_to_micros),
+            request_send_time_us: elapsed_micros(
+                request_dispatch_started,
+                request_dispatch_finished,
+            ),
+            request_handoff_time_us: elapsed_micros(request_dispatch_started, builder_received),
+            builder_pre_build_time_us: elapsed_micros(builder_received, build_started),
+            builder_post_build_time_us: elapsed_micros(build_finished, result_send_started),
+            result_send_time_us: elapsed_micros(result_send_started, result_send_finished),
+            result_handoff_time_us: elapsed_micros(result_send_started, owner_received),
+            owner_publish_time_us: elapsed_micros(owner_received, published),
+            timing_complete,
+            total_time_us: published
+                .map(nanos_to_micros)
+                .unwrap_or_else(|| self.inner.origin.elapsed().as_micros()),
+        }
+    }
+}
+
+fn load_offset_ns(value: &AtomicU64) -> Option<u64> {
+    value.load(Ordering::Acquire).checked_sub(1)
+}
+
+fn elapsed_micros(start_ns: Option<u64>, end_ns: Option<u64>) -> Option<u128> {
+    start_ns
+        .zip(end_ns)
+        .map(|(start, end)| nanos_to_micros(end.saturating_sub(start)))
+}
+
+fn nanos_to_micros(nanoseconds: u64) -> u128 {
+    u128::from(nanoseconds) / 1_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,7 +604,7 @@ impl OpportunityEngine {
             exact_output_zero_for_one: hydrated.token0 == pair.token_a,
             exact_input_zero_for_one: hydrated.token0 == pair.token_b,
             token_a_limit: pair.prepared_token_a_limit,
-            requested_at: Instant::now(),
+            timing: PreparedPoolBuildTimingHandle::new(),
         })
     }
 
@@ -430,19 +620,39 @@ impl OpportunityEngine {
         if result.generation != expected_generation {
             return Ok(None);
         }
+        let exact_output_segments = result.prepared.by_direction[0].segment_count();
+        let exact_input_segments = result.prepared.by_direction[1].segment_count();
+        let token_a_exact_input_segments = result.prepared.token_a_exact_input.segment_count();
+        let token_a_limit = result.prepared.token_a_limit;
+        let exact_output_token_b_limit = result.prepared.exact_output_token_b_limit;
+        let exact_input_token_b_limit = result.prepared.exact_input_token_b_limit;
+        let build_time_us = result.build_time_us;
+        let timing = result.timing.clone();
+        self.prepared_pools[result.pool_index] = Some(result.prepared);
+        timing.mark_published();
+        timing.wait_for_result_send_finished();
+        let stages = timing.snapshot();
         let refresh = PreparedPoolRefresh {
             pool_index: result.pool_index,
             generation: result.generation,
-            exact_output_segments: result.prepared.by_direction[0].segment_count(),
-            exact_input_segments: result.prepared.by_direction[1].segment_count(),
-            token_a_exact_input_segments: result.prepared.token_a_exact_input.segment_count(),
-            token_a_limit: result.prepared.token_a_limit,
-            exact_output_token_b_limit: result.prepared.exact_output_token_b_limit,
-            exact_input_token_b_limit: result.prepared.exact_input_token_b_limit,
-            build_time_us: result.build_time_us,
-            total_time_us: result.requested_at.elapsed().as_micros(),
+            exact_output_segments,
+            exact_input_segments,
+            token_a_exact_input_segments,
+            token_a_limit,
+            exact_output_token_b_limit,
+            exact_input_token_b_limit,
+            build_time_us,
+            pre_dispatch_time_us: stages.pre_dispatch_time_us,
+            request_send_time_us: stages.request_send_time_us,
+            request_handoff_time_us: stages.request_handoff_time_us,
+            builder_pre_build_time_us: stages.builder_pre_build_time_us,
+            builder_post_build_time_us: stages.builder_post_build_time_us,
+            result_send_time_us: stages.result_send_time_us,
+            result_handoff_time_us: stages.result_handoff_time_us,
+            owner_publish_time_us: stages.owner_publish_time_us,
+            timing_complete: stages.timing_complete,
+            total_time_us: stages.total_time_us,
         };
-        self.prepared_pools[result.pool_index] = Some(result.prepared);
         Ok(Some(refresh))
     }
 
@@ -487,7 +697,13 @@ impl PreparedPoolBuildRequest {
         self.generation
     }
 
+    pub fn timing_handle(&self) -> PreparedPoolBuildTimingHandle {
+        self.timing.clone()
+    }
+
     pub fn build(self) -> anyhow::Result<PreparedPoolBuildResult> {
+        self.timing.mark_builder_received();
+        self.timing.mark_build_started();
         let started = Instant::now();
         let prepared = prepare_pool_quotes_from_pool(
             &self.pool,
@@ -496,13 +712,25 @@ impl PreparedPoolBuildRequest {
             self.token_a_limit,
             self.generation,
         )?;
+        let build_time_us = started.elapsed().as_micros();
+        self.timing.mark_build_finished();
         Ok(PreparedPoolBuildResult {
             pool_index: self.pool_index,
             generation: self.generation,
             prepared,
-            build_time_us: started.elapsed().as_micros(),
-            requested_at: self.requested_at,
+            build_time_us,
+            timing: self.timing,
         })
+    }
+}
+
+impl PreparedPoolBuildResult {
+    pub fn timing_handle(&self) -> PreparedPoolBuildTimingHandle {
+        self.timing.clone()
+    }
+
+    pub fn mark_owner_received(&self) {
+        self.timing.mark_owner_received();
     }
 }
 
@@ -1651,6 +1879,42 @@ mod tests {
                 .is_some()
         );
         assert!(engine.is_ready());
+    }
+
+    #[test]
+    fn prepared_pool_refresh_reports_complete_stage_timing() {
+        let (pair, mirror) = fixture();
+        let initial = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(initial)],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let request = engine.request_pool_refresh(0, &mirror).unwrap();
+        let request_timing = request.timing_handle();
+        request_timing.mark_request_dispatch_started();
+        request_timing.mark_request_dispatch_finished();
+        let result = request.build().unwrap();
+        let result_timing = result.timing_handle();
+        result_timing.mark_result_send_started();
+        result_timing.mark_result_send_finished();
+        result.mark_owner_received();
+
+        let refresh = engine.finish_pool_refresh(result).unwrap().unwrap();
+
+        assert!(refresh.timing_complete);
+        assert!(refresh.pre_dispatch_time_us.is_some());
+        assert!(refresh.request_send_time_us.is_some());
+        assert!(refresh.request_handoff_time_us.is_some());
+        assert!(refresh.builder_pre_build_time_us.is_some());
+        assert!(refresh.builder_post_build_time_us.is_some());
+        assert!(refresh.result_send_time_us.is_some());
+        assert!(refresh.result_handoff_time_us.is_some());
+        assert!(refresh.owner_publish_time_us.is_some());
+        assert!(refresh.total_time_us >= refresh.build_time_us);
     }
 
     #[test]

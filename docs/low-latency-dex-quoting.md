@@ -141,7 +141,12 @@ generation is published; superseded builds are discarded. Once published, the
 last Binance Spot book is evaluated immediately instead of waiting for another
 exchange tick. `dex_pool_prepared` records the token-A and derived token-B
 limits, segment counts, build time, and total publication time under
-`prepared_curve_scope=execution_envelope_v1`.
+`prepared_curve_scope=execution_envelope_v1`. Its monotonic stage timings split
+that total into pre-dispatch owner work, request-channel send and handoff,
+builder work, result-channel send and handoff, and owner publication. Send-call
+durations are diagnostic and may overlap their corresponding handoff because
+the receiver can run concurrently; the handoff fields are the end-to-end
+latency boundaries used for percentile analysis.
 
 Uniswap LP fees are already included by the CLMM swap math. As in Rails, half
 of the gross venue-spread basis points is allocated to execution slippage and
