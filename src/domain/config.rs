@@ -535,6 +535,10 @@ pub struct BinanceConfig {
     /// production config declares BNB explicitly.
     #[serde(default)]
     pub commission_asset: Option<String>,
+    /// Decimal precision used to normalize the commission-asset balance into
+    /// the process-scoped inventory ledger.
+    #[serde(default)]
+    pub commission_asset_decimals: Option<u8>,
     /// Spot symbol whose bid values one commission asset in token-A-equivalent
     /// quote units, matching Rails' BNBUSDT valuation.
     #[serde(default)]
@@ -563,14 +567,21 @@ impl BinanceConfig {
             "Binance symbol must equal base_asset + quote_asset"
         );
         ensure!(
-            self.commission_asset.is_some() == self.commission_price_binance_symbol.is_some(),
-            "binance commission_asset and commission_price_binance_symbol must be configured together"
+            self.commission_asset.is_some() == self.commission_asset_decimals.is_some()
+                && self.commission_asset.is_some()
+                    == self.commission_price_binance_symbol.is_some(),
+            "binance commission_asset, commission_asset_decimals, and commission_price_binance_symbol must be configured together"
         );
-        if let (Some(asset), Some(symbol)) = (
+        if let (Some(asset), Some(decimals), Some(symbol)) = (
             self.commission_asset.as_deref(),
+            self.commission_asset_decimals,
             self.commission_price_binance_symbol.as_deref(),
         ) {
             validate_symbol("binance.commission_asset", asset)?;
+            ensure!(
+                decimals <= 36,
+                "binance.commission_asset_decimals {decimals} is implausible"
+            );
             validate_symbol("binance.commission_price_binance_symbol", symbol)?;
             ensure!(
                 symbol.starts_with(asset),
@@ -1124,6 +1135,10 @@ mod tests {
             Some("BNB")
         );
         assert_eq!(
+            loaded.snapshot().pairs[0].binance.commission_asset_decimals,
+            Some(8)
+        );
+        assert_eq!(
             loaded.snapshot().pairs[0]
                 .binance
                 .commission_price_binance_symbol
@@ -1132,7 +1147,7 @@ mod tests {
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "841be7d0345c229a8295653f7e9c7292016a6dfa39f9f2b16b928503b4e6ea48"
+            "f4f8533c6349d41a2086033582598a14ee6a47918aebb952168d4c425db91d56"
         );
     }
 

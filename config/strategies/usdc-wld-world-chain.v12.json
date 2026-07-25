@@ -66,6 +66,7 @@
         "base_asset": "WLD",
         "quote_asset": "USDC",
         "commission_asset": "BNB",
+        "commission_asset_decimals": 8,
         "commission_price_binance_symbol": "BNBUSDT",
         "market_data_product": "spot",
         "execution_product": "spot",

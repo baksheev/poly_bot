@@ -1696,13 +1696,20 @@ impl TradingEngine {
     }
 
     fn token_decimals(&self, symbol: &str) -> anyhow::Result<u8> {
-        self.domain_config
-            .snapshot()
+        let domain = self.domain_config.snapshot();
+        domain
             .pairs
             .iter()
             .flat_map(|pair| [&pair.token_a, &pair.token_b])
             .find(|token| token.symbol == symbol)
             .map(|token| token.decimals)
+            .or_else(|| {
+                domain.pairs.iter().find_map(|pair| {
+                    (pair.binance.commission_asset.as_deref() == Some(symbol))
+                        .then_some(pair.binance.commission_asset_decimals)
+                        .flatten()
+                })
+            })
             .with_context(|| format!("no configured decimals for inventory asset {symbol}"))
     }
 
