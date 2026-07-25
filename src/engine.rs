@@ -10,9 +10,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use crate::{
-    admission::{
-        AdmissionEconomics, AdmissionInputs, evaluate_admission, evaluate_dex_first_admission,
-    },
+    admission::{AdmissionEconomics, AdmissionInputs, evaluate_execution_admission},
     arbitrage::{
         AdmissionRiskBounds, ArbitrageDirection as TradeDirection, EntryPreflightHandle,
         PaperOpportunity, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
@@ -46,9 +44,6 @@ use crate::{
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::TelemetryHandle,
 };
-
-const EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS: u16 = 5;
-const BPS_X100_SCALE: u64 = 1_000_000;
 
 pub struct TradingEngine {
     config: AppConfig,
@@ -110,8 +105,8 @@ const BINANCE_JSON_TIME_RESOLUTION_US: u64 = 1_000;
 const BINANCE_CLOCK_SYNC_MAX_AGE_MS: u64 = 180_000;
 const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
-const ADAPTIVE_OPTIMIZER_VERSION: &str = "exhaustive_whole_step_v1";
-const MAX_ADAPTIVE_EXACT_EVALUATIONS: u16 = 8_192;
+const ADAPTIVE_OPTIMIZER_VERSION: &str = "maximum_slippage_slot_v2";
+const MAX_ADAPTIVE_EXACT_EVALUATIONS: u16 = 128;
 
 #[derive(Debug)]
 struct RebalanceSettlementBarrier {
@@ -164,30 +159,11 @@ struct DepthHealthObservation {
     top_mismatch_reason: Option<&'static str>,
 }
 
-#[derive(Debug)]
-struct AdaptiveDepthSelection {
-    book: SpotDepthBook,
-    health: DepthHealthObservation,
-    max_trade_notional: U256,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AdmissionRuntimeContext {
-    network_gas_price_wei: u128,
-    native_price_token_a: Decimal,
-    wallet_native_balance_wei: U256,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct AdaptiveSizingRuntimeLimits {
     max_trade_notional: U256,
-    max_unhedged_notional: U256,
-    max_recovery_loss: U256,
-    min_expected_profit: U256,
-    min_incremental_expected_profit: U256,
     recent_full_depth_max_age_ms: u64,
     recent_full_depth_max_update_delta: u64,
-    top_of_book_max_trade_notional: U256,
 }
 
 impl AdaptiveSizingRuntimeLimits {
@@ -201,23 +177,10 @@ impl AdaptiveSizingRuntimeLimits {
         };
         Ok(Some(Self {
             max_trade_notional: parse(limits.max_trade_notional, "trade cap")?,
-            max_unhedged_notional: parse(limits.max_unhedged_notional, "exposure cap")?,
-            max_recovery_loss: parse(limits.max_recovery_loss, "recovery-loss cap")?,
-            min_expected_profit: parse(limits.min_expected_profit, "expected-profit floor")?,
-            min_incremental_expected_profit: parse(
-                limits.min_incremental_expected_profit,
-                "incremental-profit floor",
-            )?,
             recent_full_depth_max_age_ms: limits.depth_policy.recent_full_depth_max_age_ms,
             recent_full_depth_max_update_delta: limits
                 .depth_policy
                 .recent_full_depth_max_update_delta,
-            top_of_book_max_trade_notional: parse(
-                &limits
-                    .depth_policy
-                    .top_of_book_max_trade_notional_token_a_base_units,
-                "top-of-book trade cap",
-            )?,
         }))
     }
 }
@@ -226,10 +189,7 @@ impl AdaptiveSizingRuntimeLimits {
 struct AdaptiveCandidate {
     direction: ArbitrageDirection,
     trade: TradeEvaluation,
-    economics: AdmissionEconomics,
     trade_notional: U256,
-    unhedged_notional: U256,
-    reservation_fits: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -242,19 +202,19 @@ struct AdaptiveProbe {
 struct AdaptivePoolSearch {
     cached_probes: Vec<(U256, AdaptiveProbe)>,
     rejection_counts: BTreeMap<&'static str, u32>,
-    cache_new_probes: bool,
     exact_evaluations: u16,
     limit_exhausted: bool,
+    max_trade_notional: U256,
 }
 
 impl AdaptivePoolSearch {
-    fn new() -> Self {
+    fn new(max_trade_notional: U256) -> Self {
         Self {
             cached_probes: Vec::with_capacity(32),
             rejection_counts: BTreeMap::new(),
-            cache_new_probes: true,
             exact_evaluations: 0,
             limit_exhausted: false,
+            max_trade_notional,
         }
     }
 
@@ -262,9 +222,7 @@ impl AdaptivePoolSearch {
         if let Some(reason) = probe.rejection {
             *self.rejection_counts.entry(reason).or_default() += 1;
         }
-        if self.cache_new_probes {
-            self.cached_probes.push((amount, probe));
-        }
+        self.cached_probes.push((amount, probe));
     }
 }
 
@@ -299,16 +257,12 @@ struct AdaptiveSizingSnapshot {
     domain_config: Arc<LoadedDomainConfig>,
     telemetry: TelemetryHandle,
     engine_id: String,
-    inventory: InventoryReservations,
-    wallet_gas_symbol: String,
 }
 
 pub struct AdaptiveSizingJob {
     snapshot: AdaptiveSizingSnapshot,
     pending: PendingAdaptiveAdmission,
-    selection: AdaptiveDepthSelection,
     limits: AdaptiveSizingRuntimeLimits,
-    admission_context: AdmissionRuntimeContext,
     pool_generations: Vec<(usize, u64)>,
     snapshot_time_us: u64,
     queued_at: Instant,
@@ -316,9 +270,7 @@ pub struct AdaptiveSizingJob {
 
 pub struct AdaptiveSizingTaskResult {
     pending: PendingAdaptiveAdmission,
-    selection: AdaptiveDepthSelection,
     limits: AdaptiveSizingRuntimeLimits,
-    admission_context: AdmissionRuntimeContext,
     pool_generations: Vec<(usize, u64)>,
     snapshot_time_us: u64,
     result: anyhow::Result<Option<AdaptiveCandidate>>,
@@ -332,16 +284,13 @@ impl AdaptiveSizingJob {
         let started_at = Instant::now();
         let result = self.snapshot.evaluate_adaptive_sizing(
             &self.pending.quote,
-            &self.selection,
             self.pending.evaluation,
             self.limits,
-            self.admission_context,
+            self.pending.evaluation_trigger,
         );
         AdaptiveSizingTaskResult {
             pending: self.pending,
-            selection: self.selection,
             limits: self.limits,
-            admission_context: self.admission_context,
             pool_generations: self.pool_generations,
             snapshot_time_us: self.snapshot_time_us,
             result,
@@ -353,7 +302,6 @@ impl AdaptiveSizingJob {
 }
 
 struct CompletedAdaptiveSizing {
-    selection: AdaptiveDepthSelection,
     limits: AdaptiveSizingRuntimeLimits,
     result: anyhow::Result<Option<AdaptiveCandidate>>,
 }
@@ -423,21 +371,25 @@ fn inventory_venue_label(venue: InventoryVenue) -> &'static str {
 }
 
 fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveCandidate) -> bool {
-    candidate.economics.expected_profit_token_a > current.economics.expected_profit_token_a
-        || (candidate.economics.expected_profit_token_a
-            == current.economics.expected_profit_token_a
-            && (candidate.unhedged_notional < current.unhedged_notional
-                || (candidate.unhedged_notional == current.unhedged_notional
-                    && (candidate.trade_notional < current.trade_notional
-                        || (candidate.trade_notional == current.trade_notional
-                            && (candidate.trade.token_b_amount < current.trade.token_b_amount
-                                || (candidate.trade.token_b_amount
-                                    == current.trade.token_b_amount
-                                    && (adaptive_direction_order(candidate.direction)
-                                        < adaptive_direction_order(current.direction)
-                                        || (candidate.direction == current.direction
-                                            && candidate.trade.pool_index
-                                                < current.trade.pool_index)))))))))
+    candidate.trade_notional > current.trade_notional
+        || (candidate.trade_notional == current.trade_notional
+            && (candidate.trade.token_b_amount > current.trade.token_b_amount
+                || (candidate.trade.token_b_amount == current.trade.token_b_amount
+                    && (adaptive_direction_order(candidate.direction)
+                        < adaptive_direction_order(current.direction)
+                        || (candidate.direction == current.direction
+                            && candidate.trade.pool_index < current.trade.pool_index)))))
+}
+
+fn adaptive_trade_notional(direction: ArbitrageDirection, trade: TradeEvaluation) -> U256 {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
+            trade.dex_amount_in.max(trade.proceeds_token_a)
+        }
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
+            trade.cost_token_a.max(trade.proceeds_token_a)
+        }
+    }
 }
 
 const fn adaptive_direction_order(direction: ArbitrageDirection) -> u8 {
@@ -984,19 +936,12 @@ impl TradingEngine {
                     .pool_generation(*pool_index)
                     .is_ok_and(|current| current == *generation)
             });
-        let admission_context_is_current =
-            self.state.balances.wallet.as_ref().is_some_and(|wallet| {
-                wallet.gas_price_wei == task.admission_context.network_gas_price_wei
-                    && wallet.native_balance_wei == task.admission_context.wallet_native_balance_wei
-            });
         let stale_reason = if self.state.phase != RuntimePhase::Ready {
             Some("runtime_not_ready")
         } else if !quote_is_current {
             Some("binance_generation_changed")
         } else if !pools_are_current {
             Some("dex_generation_changed")
-        } else if !admission_context_is_current {
-            Some("admission_context_changed")
         } else {
             None
         };
@@ -1030,7 +975,6 @@ impl TradingEngine {
             pending.evaluation_trigger,
             pending.evaluation_started_at,
             Some(CompletedAdaptiveSizing {
-                selection: task.selection,
                 limits: task.limits,
                 result: task.result,
             }),
@@ -1991,67 +1935,12 @@ impl TradingEngine {
         }
     }
 
-    fn select_adaptive_depth(
-        &self,
-        quote: &TopOfBook,
-        depth: Option<&SpotDepthBook>,
-        limits: AdaptiveSizingRuntimeLimits,
-        baseline_token_a: U256,
-        now: Instant,
-    ) -> anyhow::Result<AdaptiveDepthSelection> {
-        let observation = self.depth_observation(quote, depth, now);
-        let health = classify_depth_health(observation, depth.is_some(), Some(limits));
-        let (book, max_trade_notional) = match health.source {
-            AdaptiveDepthSource::SequenceMatchedFullDepth => (
-                depth.context("sequence-matched depth disappeared")?.clone(),
-                limits.max_trade_notional,
-            ),
-            AdaptiveDepthSource::RecentFullDepth => (
-                depth
-                    .context("recent full depth disappeared")?
-                    .reconciled_with_top(
-                        quote.update_id,
-                        quote.bid_price,
-                        quote.bid_quantity,
-                        quote.ask_price,
-                        quote.ask_quantity,
-                    )?,
-                limits.max_trade_notional,
-            ),
-            AdaptiveDepthSource::TopOfBookOnly => {
-                let configured_cap = if limits.top_of_book_max_trade_notional.is_zero() {
-                    baseline_token_a
-                } else {
-                    limits.top_of_book_max_trade_notional
-                };
-                (
-                    SpotDepthBook::from_top(
-                        quote.symbol.to_string(),
-                        quote.update_id,
-                        quote.bid_price,
-                        quote.bid_quantity,
-                        quote.ask_price,
-                        quote.ask_quantity,
-                    )?,
-                    configured_cap.min(limits.max_trade_notional),
-                )
-            }
-        };
-        Ok(AdaptiveDepthSelection {
-            book,
-            health,
-            max_trade_notional,
-        })
-    }
-
     fn adaptive_sizing_snapshot(&self) -> AdaptiveSizingSnapshot {
         AdaptiveSizingSnapshot {
             opportunities: self.opportunities.clone(),
             domain_config: Arc::clone(&self.domain_config),
             telemetry: self.telemetry.clone(),
             engine_id: self.config.engine_id.clone(),
-            inventory: self.inventory.clone(),
-            wallet_gas_symbol: self.wallet_gas_symbol.clone(),
         }
     }
 }
@@ -2060,10 +1949,9 @@ impl AdaptiveSizingSnapshot {
     fn evaluate_adaptive_sizing(
         &self,
         quote: &TopOfBook,
-        selection: &AdaptiveDepthSelection,
         evaluation: PairEvaluation,
-        mut limits: AdaptiveSizingRuntimeLimits,
-        admission_context: AdmissionRuntimeContext,
+        limits: AdaptiveSizingRuntimeLimits,
+        evaluation_trigger: &'static str,
     ) -> anyhow::Result<Option<AdaptiveCandidate>> {
         let started = Instant::now();
         let pair = self.opportunities.pair(evaluation.pair_index)?;
@@ -2074,8 +1962,6 @@ impl AdaptiveSizingSnapshot {
             .iter()
             .find(|config| config.id == pair.pair_id)
             .context("adaptive sizing pair is absent from domain config")?;
-        limits.max_trade_notional = selection.max_trade_notional;
-        let depth = &selection.book;
         let directions = [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell];
         let mut baseline_by_direction: [Option<AdaptiveCandidate>; 2] = [None, None];
         let mut winner: Option<AdaptiveCandidate> = None;
@@ -2090,55 +1976,23 @@ impl AdaptiveSizingSnapshot {
             else {
                 continue;
             };
-            let baseline_inputs = AdmissionInputs {
-                symbol: &pair.symbol,
-                direction: adaptive_trade_direction(direction_evaluation.direction),
-                token_b_amount: baseline_trade.token_b_amount,
-                token_b_step_base_units: pair.token_b_step(),
-                token_a_decimals: pair.token_a_decimals,
-                token_b_decimals: pair.token_b_decimals,
-                binance_buy_fee_bps: pair.binance_buy_fee_bps,
-                binance_sell_fee_bps: pair.binance_sell_fee_bps,
-                expected_cost_token_a: baseline_trade.cost_token_a,
-                expected_proceeds_token_a: baseline_trade.proceeds_token_a,
-                opportunity_threshold_met: baseline_trade.meets_threshold,
-                network_gas_price_wei: admission_context.network_gas_price_wei,
-                native_price_token_a: admission_context.native_price_token_a,
-                wallet_native_balance_wei: admission_context.wallet_native_balance_wei,
-            };
-            if let Some(economics) = evaluate_admission(depth, baseline_inputs)? {
-                baseline_by_direction[direction_index] = Some(AdaptiveCandidate {
-                    direction: direction_evaluation.direction,
-                    trade: baseline_trade,
-                    economics,
-                    trade_notional: baseline_trade
-                        .cost_token_a
-                        .max(baseline_trade.proceeds_token_a),
-                    unhedged_notional: economics
-                        .recovery_sell_quote_token_a
-                        .max(economics.recovery_buy_quote_token_a),
-                    reservation_fits: self.adaptive_exact_reservation_fits(
-                        pair,
-                        direction_evaluation.direction,
-                        baseline_trade,
-                        economics,
-                    )?,
-                });
-            }
+            baseline_by_direction[direction_index] = Some(AdaptiveCandidate {
+                direction: direction_evaluation.direction,
+                trade: baseline_trade,
+                trade_notional: adaptive_trade_notional(
+                    direction_evaluation.direction,
+                    baseline_trade,
+                ),
+            });
 
             for &pool_index in pair.pool_indices() {
                 let (pool_winner, search) = self.search_adaptive_pool(
                     quote,
-                    depth,
                     evaluation.pair_index,
                     direction_evaluation.direction,
                     pool_index,
                     baseline_trade.token_b_amount,
-                    direction_evaluation.cex_top_token_b_amount,
                     limits,
-                    admission_context.network_gas_price_wei,
-                    admission_context.native_price_token_a,
-                    admission_context.wallet_native_balance_wei,
                 )?;
                 exact_evaluations = exact_evaluations.saturating_add(search.exact_evaluations);
                 limit_exhausted |= search.limit_exhausted;
@@ -2162,21 +2016,11 @@ impl AdaptiveSizingSnapshot {
         let mut fallback_reason = "no_eligible_candidate";
         let mut selected = winner.filter(|candidate| {
             let Some(baseline) = baseline_by_direction[direction_index(candidate.direction)] else {
-                fallback_reason = "baseline_admission_unavailable";
+                fallback_reason = "baseline_unavailable";
                 return false;
             };
             if candidate.trade.token_b_amount <= baseline.trade.token_b_amount {
                 fallback_reason = "not_larger_than_baseline";
-                return false;
-            }
-            let required = baseline
-                .economics
-                .expected_profit_token_a
-                .checked_add(limits.min_incremental_expected_profit);
-            if required
-                .is_none_or(|required| candidate.economics.expected_profit_token_a < required)
-            {
-                fallback_reason = "incremental_profit_floor";
                 return false;
             }
             true
@@ -2191,7 +2035,7 @@ impl AdaptiveSizingSnapshot {
                 baseline_by_direction
                     .into_iter()
                     .flatten()
-                    .max_by_key(|candidate| candidate.economics.expected_profit_token_a)
+                    .max_by_key(|candidate| candidate.trade_notional)
             });
         let selected_for_telemetry = selected.or(baseline);
         let execution_candidate = matches!(
@@ -2212,37 +2056,28 @@ impl AdaptiveSizingSnapshot {
             "update_id": quote.update_id,
             "configured_mode": pair_config.adaptive_sizing.mode(),
             "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
-            "search_mode": "exhaustive_whole_step",
+            "search_mode": "maximum_monotone_whole_step",
             "max_exact_evaluations_per_pool": MAX_ADAPTIVE_EXACT_EVALUATIONS,
             "exact_evaluation_count": exact_evaluations,
             "max_trade_notional_token_a_base_units": limits.max_trade_notional.to_string(),
-            "max_unhedged_notional_token_a_base_units": limits.max_unhedged_notional.to_string(),
-            "max_recovery_loss_token_a_base_units": limits.max_recovery_loss.to_string(),
-            "min_expected_profit_token_a_base_units": limits.min_expected_profit.to_string(),
-            "min_incremental_expected_profit_token_a_base_units": limits.min_incremental_expected_profit.to_string(),
             "baseline_direction": baseline.map(|candidate| candidate.direction.as_str()),
             "baseline_pool_index": baseline.map(|candidate| candidate.trade.pool_index),
             "baseline_token_b_base_units": baseline.map(|candidate| candidate.trade.token_b_amount.to_string()),
             "baseline_cost_token_a_base_units": baseline.map(|candidate| candidate.trade.cost_token_a.to_string()),
             "baseline_proceeds_token_a_base_units": baseline.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
-            "baseline_expected_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
-            "baseline_expected_profit_after_gas_token_a_base_units": baseline.map(|candidate| candidate.economics.expected_profit_after_gas_token_a.to_string()),
-            "baseline_bounded_profit_token_a_base_units": baseline.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
-            "baseline_recovery_loss_bound_token_a_base_units": baseline.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
+            "baseline_gross_profit_bps_x100": baseline.map(|candidate| candidate.trade.gross_profit_bps_x100.to_string()),
+            "evaluation_trigger": evaluation_trigger,
             "selected_sizing_mode": if selected.is_some() { "adaptive" } else { "baseline" },
             "selected_direction": selected_for_telemetry.map(|candidate| candidate.direction.as_str()),
             "selected_pool_index": selected_for_telemetry.map(|candidate| candidate.trade.pool_index),
             "selected_token_b_base_units": selected_for_telemetry.map(|candidate| candidate.trade.token_b_amount.to_string()),
             "selected_cost_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.cost_token_a.to_string()),
             "selected_proceeds_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade.proceeds_token_a.to_string()),
-            "selected_expected_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_token_a.to_string()),
-            "selected_expected_profit_after_gas_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.expected_profit_after_gas_token_a.to_string()),
-            "selected_bounded_profit_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.bounded_profit_token_a.to_string()),
+            "selected_dex_amount_in_base_units": selected_for_telemetry.map(|candidate| candidate.trade.dex_amount_in.to_string()),
+            "selected_dex_amount_out_minimum_base_units": selected_for_telemetry.map(|candidate| candidate.trade.dex_amount_out_minimum.to_string()),
             "selected_trade_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.trade_notional.to_string()),
-            "selected_unhedged_notional_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.unhedged_notional.to_string()),
-            "selected_recovery_loss_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
-            "selected_recovery_loss_bound_token_a_base_units": selected_for_telemetry.map(|candidate| candidate.economics.recovery_loss_token_a.to_string()),
-            "selected_reservation_fits": selected_for_telemetry.map(|candidate| candidate.reservation_fits),
+            "selected_execution_slippage_bps": selected_for_telemetry.map(|candidate| candidate.trade.execution_slippage_bps),
+            "selected_gross_profit_bps_x100": selected_for_telemetry.map(|candidate| candidate.trade.gross_profit_bps_x100.to_string()),
             "fallback_reason": selected.is_none().then_some(fallback_reason),
             "rejection_counts": Value::Object(rejection_counts),
             "calculation_us": calculation_us,
@@ -2261,49 +2096,28 @@ impl AdaptiveSizingSnapshot {
             ),
         );
         object.insert(
-            "admission_liquidity_source".to_owned(),
-            json!(selection.health.source.as_str()),
-        );
-        object.insert(
-            "depth_source".to_owned(),
-            json!(selection.health.source.as_str()),
-        );
-        object.insert(
-            "depth_source_reason".to_owned(),
-            json!(selection.health.source_reason),
-        );
-        object.insert("depth_age_ms".to_owned(), json!(selection.health.age_ms));
-        object.insert(
-            "depth_update_delta".to_owned(),
-            json!(selection.health.update_delta),
-        );
-        object.insert(
-            "top_matches".to_owned(),
-            Value::Bool(selection.health.top_matches),
-        );
-        object.insert(
-            "top_mismatch_reason".to_owned(),
-            json!(selection.health.top_mismatch_reason),
+            "sizing_inputs".to_owned(),
+            json!([
+                "dex_curve",
+                "binance_price",
+                "gross_20_bps",
+                "execution_slippage",
+                "trade_cap"
+            ]),
         );
         self.telemetry
             .emit("arbitrage_adaptive_sizing_evaluated", payload);
         Ok(execution_candidate)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn adaptive_probe(
         &self,
         search: &mut AdaptivePoolSearch,
         quote: &TopOfBook,
-        depth: &SpotDepthBook,
         pair_index: usize,
         direction: ArbitrageDirection,
         pool_index: usize,
         token_b_amount: U256,
-        limits: AdaptiveSizingRuntimeLimits,
-        network_gas_price_wei: u128,
-        native_price_token_a: Decimal,
-        wallet_native_balance_wei: U256,
     ) -> anyhow::Result<AdaptiveProbe> {
         if let Some((_, probe)) = search
             .cached_probes
@@ -2320,7 +2134,6 @@ impl AdaptiveSizingSnapshot {
             });
         }
         search.exact_evaluations += 1;
-        let pair = self.opportunities.pair(pair_index)?;
         let rejection = |reason| AdaptiveProbe {
             candidate: None,
             rejection: Some(reason),
@@ -2342,60 +2155,9 @@ impl AdaptiveSizingSnapshot {
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
-        let trade_notional = trade.cost_token_a.max(trade.proceeds_token_a);
-        if trade_notional > limits.max_trade_notional {
+        let trade_notional = adaptive_trade_notional(direction, trade);
+        if trade_notional > search.max_trade_notional {
             let probe = rejection("trade_cap");
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        }
-        let inputs = AdmissionInputs {
-            symbol: &pair.symbol,
-            direction: adaptive_trade_direction(direction),
-            token_b_amount,
-            token_b_step_base_units: pair.token_b_step(),
-            token_a_decimals: pair.token_a_decimals,
-            token_b_decimals: pair.token_b_decimals,
-            binance_buy_fee_bps: pair.binance_buy_fee_bps,
-            binance_sell_fee_bps: pair.binance_sell_fee_bps,
-            expected_cost_token_a: trade.cost_token_a,
-            expected_proceeds_token_a: trade.proceeds_token_a,
-            opportunity_threshold_met: trade.meets_threshold,
-            network_gas_price_wei,
-            native_price_token_a,
-            wallet_native_balance_wei,
-        };
-        let Some(economics) = evaluate_admission(depth, inputs)? else {
-            let probe = rejection("recovery_depth");
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        };
-        if !economics.native_gas_covered {
-            let probe = rejection("gas");
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        }
-        let unhedged_notional = economics
-            .recovery_sell_quote_token_a
-            .max(economics.recovery_buy_quote_token_a);
-        if unhedged_notional > limits.max_unhedged_notional {
-            let probe = rejection("exposure_cap");
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        }
-        if economics.recovery_loss_token_a > limits.max_recovery_loss {
-            let probe = rejection("recovery_loss_cap");
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        }
-        if economics.expected_profit_token_a < limits.min_expected_profit {
-            let probe = rejection("expected_profit_floor");
-            search.record(token_b_amount, probe);
-            return Ok(probe);
-        }
-        let reservation_fits =
-            self.adaptive_exact_reservation_fits(pair, direction, trade, economics)?;
-        if !reservation_fits {
-            let probe = rejection("inventory");
             search.record(token_b_amount, probe);
             return Ok(probe);
         }
@@ -2403,10 +2165,7 @@ impl AdaptiveSizingSnapshot {
             candidate: Some(AdaptiveCandidate {
                 direction,
                 trade,
-                economics,
                 trade_notional,
-                unhedged_notional,
-                reservation_fits,
             }),
             rejection: None,
         };
@@ -2414,125 +2173,56 @@ impl AdaptiveSizingSnapshot {
         Ok(probe)
     }
 
-    fn adaptive_exact_reservation_fits(
-        &self,
-        pair: &crate::opportunity::PairRuntime,
-        direction: ArbitrageDirection,
-        trade: TradeEvaluation,
-        economics: AdmissionEconomics,
-    ) -> anyhow::Result<bool> {
-        let token_a_amount = match direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => trade.cost_token_a,
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-                trade.cost_token_a.max(economics.recovery_buy_quote_token_a)
-            }
-        };
-        let (token_a_venue, token_b_venue) = match direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-                (InventoryVenue::Wallet, InventoryVenue::Binance)
-            }
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-                (InventoryVenue::Binance, InventoryVenue::Wallet)
-            }
-        };
-        Ok(self
-            .inventory
-            .available_asset(token_a_venue, &pair.token_a_symbol)
-            .is_ok_and(|available| available >= token_a_amount)
-            && self
-                .inventory
-                .available_asset(token_b_venue, &pair.token_b_symbol)
-                .is_ok_and(|available| available >= trade.token_b_amount)
-            && self
-                .inventory
-                .available_asset(InventoryVenue::Wallet, &self.wallet_gas_symbol)
-                .is_ok_and(|available| available >= economics.maximum_gas_wei))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn search_adaptive_pool(
         &self,
         quote: &TopOfBook,
-        depth: &SpotDepthBook,
         pair_index: usize,
         direction: ArbitrageDirection,
         pool_index: usize,
         baseline_amount: U256,
-        cex_top_amount: U256,
         limits: AdaptiveSizingRuntimeLimits,
-        network_gas_price_wei: u128,
-        native_price_token_a: Decimal,
-        wallet_native_balance_wei: U256,
     ) -> anyhow::Result<(Option<AdaptiveCandidate>, AdaptivePoolSearch)> {
         let step = self.opportunities.pair(pair_index)?.token_b_step();
         let low_steps = baseline_amount / step;
-        let high_steps = cex_top_amount / step;
-        let mut search = AdaptivePoolSearch::new();
-        if low_steps == U256::ZERO || high_steps < low_steps {
+        let mut search = AdaptivePoolSearch::new(limits.max_trade_notional);
+        if low_steps == U256::ZERO {
             return Ok((None, search));
         }
         let probe_steps = |steps: U256, search: &mut AdaptivePoolSearch| {
             let amount = steps
                 .checked_mul(step)
                 .context("adaptive candidate amount overflow")?;
-            self.adaptive_probe(
-                search,
-                quote,
-                depth,
-                pair_index,
-                direction,
-                pool_index,
-                amount,
-                limits,
-                network_gas_price_wei,
-                native_price_token_a,
-                wallet_native_balance_wei,
-            )
+            self.adaptive_probe(search, quote, pair_index, direction, pool_index, amount)
         };
         let Some(low_candidate) = probe_steps(low_steps, &mut search)?.candidate else {
             return Ok((None, search));
         };
 
-        // Locate the monotone end of the feasible sizing domain first. The
-        // exhaustive pass below still checks every whole step inside it.
-        let upper_steps = if probe_steps(high_steps, &mut search)?.candidate.is_some() {
-            high_steps
-        } else {
-            let mut low = low_steps;
-            let mut high = high_steps;
-            while high - low > U256::ONE {
-                let mid = low + ((high - low) / U256::from(2_u8));
-                if probe_steps(mid, &mut search)?.candidate.is_some() {
-                    low = mid;
-                } else {
-                    high = mid;
-                }
-            }
-            low
-        };
-
-        let domain_size = upper_steps
-            .checked_sub(low_steps)
-            .and_then(|delta| delta.checked_add(U256::ONE))
-            .context("adaptive sizing domain overflow")?;
-        let remaining_budget =
-            MAX_ADAPTIVE_EXACT_EVALUATIONS.saturating_sub(search.exact_evaluations);
-        if domain_size > U256::from(remaining_budget) {
-            search.limit_exhausted = true;
-            return Ok((None, search));
+        // Feasibility is monotone for one prepared pool curve: increasing the
+        // amount can only consume more DEX liquidity/slippage and notional.
+        // Find an exclusive rejected bound, then return the largest whole step
+        // that still clears the gross spread and execution slippage contract.
+        let mut low = low_steps;
+        let mut high = low_steps
+            .checked_mul(U256::from(2_u8))
+            .context("adaptive upper step overflow")?;
+        while probe_steps(high, &mut search)?.candidate.is_some() {
+            low = high;
+            high = high
+                .checked_mul(U256::from(2_u8))
+                .context("adaptive upper step overflow")?;
         }
-        search.cache_new_probes = false;
-        let mut winner = low_candidate;
-        let mut steps = low_steps;
-        while steps <= upper_steps {
-            if let Some(candidate) = probe_steps(steps, &mut search)?.candidate
-                && adaptive_candidate_is_better(candidate, winner)
-            {
-                winner = candidate;
+        while high - low > U256::ONE {
+            let mid = low + ((high - low) / U256::from(2_u8));
+            if probe_steps(mid, &mut search)?.candidate.is_some() {
+                low = mid;
+            } else {
+                high = mid;
             }
-            steps = steps
-                .checked_add(U256::ONE)
-                .context("adaptive step index overflow")?;
+        }
+        let mut winner = low_candidate;
+        if let Some(candidate) = probe_steps(low, &mut search)?.candidate {
+            winner = candidate;
         }
         Ok((Some(winner), search))
     }
@@ -2624,57 +2314,11 @@ impl TradingEngine {
         {
             return Ok(false);
         }
-        let token_a_decimals = pair.token_a_decimals;
         let token_b_decimals = pair.token_b_decimals;
-        let binance_buy_fee_bps = pair.binance_buy_fee_bps;
-        let binance_sell_fee_bps = pair.binance_sell_fee_bps;
         let baseline_token_a = pair.baseline_token_a();
         let token_b_step = pair.token_b_step();
-        let wallet = self
-            .state
-            .balances
-            .wallet
-            .as_ref()
-            .context("admission has no wallet snapshot")?;
-        let network_gas_price_wei = wallet.gas_price_wei;
-        let wallet_native_balance_wei = wallet.native_balance_wei;
-        let Some(native_price_token_a) = self.native_price_token_a() else {
-            self.telemetry.emit(
-                "arbitrage_admission_rejected",
-                json!({
-                    "engine_id": self.config.engine_id,
-                    "pair_id": pair_id,
-                    "symbol": quote.symbol.as_ref(),
-                    "update_id": quote.update_id,
-                    "reason": "gas_accounting_not_hydrated",
-                    "gas_price_gate_enabled": false,
-                    "trigger_to_rejection_us": duration_us(evaluation_started_at.elapsed()),
-                }),
-            );
-            return Ok(false);
-        };
-
-        let adaptive_selection = if let Some(completed) = completed_adaptive.as_ref() {
-            Some(AdaptiveDepthSelection {
-                book: completed.selection.book.clone(),
-                health: completed.selection.health,
-                max_trade_notional: completed.selection.max_trade_notional,
-            })
-        } else {
-            adaptive_limits
-                .map(|limits| {
-                    self.select_adaptive_depth(
-                        quote,
-                        depth,
-                        limits,
-                        baseline_token_a,
-                        Instant::now(),
-                    )
-                })
-                .transpose()?
-        };
         if completed_adaptive.is_none()
-            && let (Some(selection), Some(limits)) = (adaptive_selection.as_ref(), adaptive_limits)
+            && let Some(limits) = adaptive_limits
         {
             let pool_generations = pair
                 .pool_indices()
@@ -2705,17 +2349,7 @@ impl TradingEngine {
             self.pending_adaptive_sizing.push(AdaptiveSizingJob {
                 snapshot,
                 pending,
-                selection: AdaptiveDepthSelection {
-                    book: selection.book.clone(),
-                    health: selection.health,
-                    max_trade_notional: selection.max_trade_notional,
-                },
                 limits,
-                admission_context: AdmissionRuntimeContext {
-                    network_gas_price_wei,
-                    native_price_token_a,
-                    wallet_native_balance_wei,
-                },
                 pool_generations,
                 snapshot_time_us,
                 queued_at: Instant::now(),
@@ -2725,9 +2359,15 @@ impl TradingEngine {
         let adaptive_candidate = match completed_adaptive.map(|completed| completed.result) {
             Some(Ok(candidate)) => candidate,
             Some(Err(error)) => {
-                let selection = adaptive_selection
-                    .as_ref()
-                    .context("completed adaptive sizing has no depth selection")?;
+                let fallback_baseline = [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell]
+                    .into_iter()
+                    .filter_map(|direction| {
+                        direction
+                            .baseline
+                            .filter(|trade| trade.meets_threshold)
+                            .map(|trade| (direction.direction, trade))
+                    })
+                    .max_by_key(|(direction, trade)| adaptive_trade_notional(*direction, *trade));
                 self.telemetry.emit(
                     "arbitrage_adaptive_sizing_evaluated",
                     json!({
@@ -2736,16 +2376,14 @@ impl TradingEngine {
                         "symbol": quote.symbol.as_ref(),
                         "update_id": quote.update_id,
                         "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
+                        "evaluation_trigger": evaluation_trigger,
+                        "baseline_pool_index": fallback_baseline.map(|(_, trade)| trade.pool_index),
+                        "baseline_token_b_base_units": fallback_baseline.map(|(_, trade)| trade.token_b_amount.to_string()),
+                        "baseline_gross_profit_bps_x100": fallback_baseline.map(|(_, trade)| trade.gross_profit_bps_x100.to_string()),
                         "selected_sizing_mode": "baseline",
                         "fallback_reason": "optimizer_error",
                         "error": format!("{error:#}"),
                         "execution_size_changed": false,
-                        "depth_source": selection.health.source.as_str(),
-                        "depth_source_reason": selection.health.source_reason,
-                        "depth_age_ms": selection.health.age_ms,
-                        "depth_update_delta": selection.health.update_delta,
-                        "top_matches": selection.health.top_matches,
-                        "top_mismatch_reason": selection.health.top_mismatch_reason,
                     }),
                 );
                 None
@@ -2753,39 +2391,17 @@ impl TradingEngine {
             None => None,
         };
 
-        let observed_depth_health = adaptive_selection
-            .as_ref()
-            .map(|selection| selection.health)
-            .unwrap_or_else(|| {
-                classify_depth_health(
-                    self.depth_observation(quote, depth, Instant::now()),
-                    depth.is_some(),
-                    adaptive_limits,
-                )
-            });
-        let execution_depth_health = if adaptive_candidate.is_some() {
-            observed_depth_health
-        } else if matches!(admission_liquidity, AdmissionLiquidity::DexFirstTop) {
-            DepthHealthObservation {
-                source: AdaptiveDepthSource::TopOfBookOnly,
-                source_reason: "baseline_dex_first_fast_path",
-                ..observed_depth_health
-            }
-        } else {
-            observed_depth_health
-        };
+        let execution_depth_health = classify_depth_health(
+            self.depth_observation(quote, depth, Instant::now()),
+            depth.is_some(),
+            adaptive_limits,
+        );
 
         let mut candidates = Vec::with_capacity(2);
-        let mut needs_depth_fallback = false;
         if let Some(candidate) = adaptive_candidate {
             candidates.push((
                 adaptive_trade_direction(candidate.direction),
                 candidate.trade,
-                candidate.economics,
-                adaptive_selection
-                    .as_ref()
-                    .map(|selection| selection.health.source.as_str())
-                    .unwrap_or("top_of_book_only"),
             ));
         }
         for direction in adaptive_candidate
@@ -2812,106 +2428,37 @@ impl TradingEngine {
                     TradeDirection::BuyTokenBOnCexSellOnDex
                 }
             };
-            let inputs = AdmissionInputs {
+            candidates.push((trade_direction, trade));
+        }
+        let candidate = candidates
+            .into_iter()
+            .max_by_key(|(_, trade)| trade.cost_token_a.max(trade.proceeds_token_a));
+        let Some((direction, trade)) = candidate else {
+            return Ok(false);
+        };
+        let wallet = self
+            .state
+            .balances
+            .wallet
+            .as_ref()
+            .context("admission has no wallet snapshot")?;
+        let network_gas_price_wei = wallet.gas_price_wei;
+        let native_price_token_a = self.native_price_token_a().unwrap_or(Decimal::ZERO);
+        let economics = evaluate_execution_admission(
+            quote,
+            AdmissionInputs {
                 symbol: &pair_symbol,
-                direction: trade_direction,
+                direction,
                 token_b_amount: trade.token_b_amount,
                 token_b_step_base_units: token_b_step,
-                token_a_decimals,
                 token_b_decimals,
-                binance_buy_fee_bps,
-                binance_sell_fee_bps,
                 expected_cost_token_a: trade.cost_token_a,
                 expected_proceeds_token_a: trade.proceeds_token_a,
                 opportunity_threshold_met: trade.meets_threshold,
                 network_gas_price_wei,
-                native_price_token_a,
-                wallet_native_balance_wei,
-            };
-            let (economics, liquidity_source) = match admission_liquidity {
-                AdmissionLiquidity::DexFirstTop => {
-                    let Some(economics) = evaluate_dex_first_admission(quote, inputs)? else {
-                        needs_depth_fallback = true;
-                        self.telemetry.emit(
-                            "arbitrage_admission_deferred",
-                            json!({
-                                "engine_id": self.config.engine_id,
-                                "pair_id": pair_id,
-                                "symbol": quote.symbol.as_ref(),
-                                "update_id": quote.update_id,
-                                "direction": match trade_direction {
-                                    TradeDirection::BuyTokenBOnDexSellOnCex => "buy_token_b_on_dex_sell_on_cex",
-                                    TradeDirection::BuyTokenBOnCexSellOnDex => "buy_token_b_on_cex_sell_on_dex",
-                                },
-                                "reason": "insufficient_relevant_top_quantity",
-                            }),
-                        );
-                        continue;
-                    };
-                    (economics, "book_ticker_relevant_top")
-                }
-                AdmissionLiquidity::FullDepth(depth) => {
-                    let Some(economics) = evaluate_admission(depth, inputs)? else {
-                        self.emit_admission_risk_rejection(
-                            quote,
-                            &pair_id,
-                            trade_direction,
-                            "insufficient_recovery_depth",
-                            None,
-                        );
-                        continue;
-                    };
-                    (economics, "sequence_matched_full_depth")
-                }
-            };
-            if !economics.native_gas_covered {
-                self.emit_admission_risk_rejection(
-                    quote,
-                    &pair_id,
-                    trade_direction,
-                    "insufficient_native_gas_reserve",
-                    Some(economics),
-                );
-                continue;
-            }
-            if let Some(limits) = adaptive_limits {
-                let trade_notional = trade.cost_token_a.max(trade.proceeds_token_a);
-                let unhedged_notional = economics
-                    .recovery_sell_quote_token_a
-                    .max(economics.recovery_buy_quote_token_a);
-                let rejection_reason = if trade_notional > limits.max_trade_notional {
-                    Some("trade_notional_cap")
-                } else if unhedged_notional > limits.max_unhedged_notional {
-                    Some("unhedged_notional_cap")
-                } else if economics.recovery_loss_token_a > limits.max_recovery_loss {
-                    Some("recovery_loss_cap")
-                } else if economics.expected_profit_token_a < limits.min_expected_profit {
-                    Some("expected_profit_floor")
-                } else {
-                    None
-                };
-                if let Some(reason) = rejection_reason {
-                    self.emit_admission_risk_rejection(
-                        quote,
-                        &pair_id,
-                        trade_direction,
-                        reason,
-                        Some(economics),
-                    );
-                    continue;
-                }
-            }
-            // Profitability is decided only by the Rails-compatible gross
-            // spread proof carried by `trade.meets_threshold`. Recovery,
-            // inventory, and gas coverage remain operational safety bounds.
-            candidates.push((trade_direction, trade, economics, liquidity_source));
-        }
-        let candidate = candidates
-            .into_iter()
-            .max_by_key(|(_, _, economics, _)| economics.expected_profit_token_a);
-        let Some((direction, trade, economics, liquidity_source)) = candidate else {
-            return Ok(needs_depth_fallback);
-        };
+            },
+        )?;
+        let liquidity_source = "dex_curve_only";
         let dex_pool_generation = self.opportunities.pool_generation(trade.pool_index)?;
         if let Some(barrier) = self.arbitrage_settlement_barriers.get(&trade.pool_index)
             && dex_pool_generation <= barrier.pool_generation
@@ -2987,10 +2534,7 @@ impl TradingEngine {
                     TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
                     TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
                 },
-                cex_primary_top_quantity: match admission_liquidity {
-                    AdmissionLiquidity::DexFirstTop => economics.primary_quantity,
-                    AdmissionLiquidity::FullDepth(_) => Decimal::ZERO,
-                },
+                cex_primary_top_quantity: Decimal::ZERO,
                 cex_recovery_limit_price: economics.recovery_limit_price,
                 cex_recovery_sell_limit_price: economics.recovery_sell_limit_price,
                 cex_recovery_buy_limit_price: economics.recovery_buy_limit_price,
@@ -3006,20 +2550,11 @@ impl TradingEngine {
                     economics.recovery_buy_quote_token_a,
                     "paper recovery buy quote",
                 )?,
-                maximum_recovery_loss_token_a_base_units: u256_to_u128(
-                    economics.recovery_loss_token_a,
-                    "paper maximum recovery loss",
-                )?,
+                maximum_recovery_loss_token_a_base_units: 0,
                 maximum_fee_per_gas_wei: economics.maximum_fee_per_gas_wei,
                 gas_conversion_price_token_a: native_price_token_a,
-                maximum_gas_cost_token_a_base_units: u256_to_u128(
-                    economics.maximum_gas_cost_token_a,
-                    "paper maximum gas cost",
-                )?,
-                bounded_profit_token_a_base_units: u256_to_u128(
-                    economics.bounded_profit_token_a,
-                    "paper bounded profit",
-                )?,
+                maximum_gas_cost_token_a_base_units: 0,
+                bounded_profit_token_a_base_units: 0,
             },
             dex_plan: dex_plan.clone(),
         };
@@ -3147,15 +2682,7 @@ impl TradingEngine {
             }
         }
         let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
-        let expected_profit_after_gas_bps_x100 = profit_bps_x100_u256(
-            economics.expected_profit_after_gas_token_a,
-            economics.gas_burdened_cost_token_a,
-        )?;
-        let expected_profit_after_gas_bps =
-            format_bps_x100_u256(expected_profit_after_gas_bps_x100)?;
-        let expected_profit_after_gas_threshold_met = expected_profit_after_gas_bps_x100
-            >= U256::from(u64::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS) * 100);
-        let mut admitted_payload = json!({
+        let admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,
             "mode": self.config.arbitrage_execution_mode,
@@ -3167,7 +2694,7 @@ impl TradingEngine {
             "depth_update_delta": execution_depth_health.update_delta,
             "top_matches": execution_depth_health.top_matches,
             "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
-            "inventory_reservation_policy": "exact_execution_envelope_v1",
+            "inventory_reservation_policy": "exact_primary_execution_envelope_v2",
             "evaluation_trigger": evaluation_trigger,
             "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
             "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
@@ -3176,109 +2703,20 @@ impl TradingEngine {
             "mailbox_submit_us": mailbox_submit_us,
             "inventory_claims": self.inventory_claim_details(&claims),
             "execution_slippage_bps": trade.execution_slippage_bps,
+            "gross_cost_token_a_base_units": trade.cost_token_a.to_string(),
+            "gross_proceeds_token_a_base_units": trade.proceeds_token_a.to_string(),
+            "gross_profit_bps_x100": trade.gross_profit_bps_x100.to_string(),
             "cex_primary_limit_price": match direction {
                 TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
                 TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price.to_string(),
             },
-            "cex_primary_top_quantity": match admission_liquidity {
-                AdmissionLiquidity::DexFirstTop => Some(economics.primary_quantity.to_string()),
-                AdmissionLiquidity::FullDepth(_) => None,
-            },
-            "recovery_limit_price": economics.recovery_limit_price.to_string(),
-            "recovery_sell_limit_price": economics.recovery_sell_limit_price.map(|price| price.to_string()),
-            "recovery_buy_limit_price": economics.recovery_buy_limit_price.map(|price| price.to_string()),
-            "recovery_quote_token_a_base_units": economics.recovery_quote_token_a.to_string(),
-            "recovery_sell_quote_token_a_base_units": economics.recovery_sell_quote_token_a.to_string(),
-            "recovery_buy_quote_token_a_base_units": economics.recovery_buy_quote_token_a.to_string(),
-            "recovery_loss_token_a_base_units": economics.recovery_loss_token_a.to_string(),
             "maximum_gas_wei": economics.maximum_gas_wei.to_string(),
             "maximum_fee_per_gas_wei": economics.maximum_fee_per_gas_wei.to_string(),
-            "gas_conversion_price_token_a": native_price_token_a.to_string(),
-            "maximum_gas_cost_token_a_base_units": economics.maximum_gas_cost_token_a.to_string(),
-            "expected_profit_token_a_base_units": economics.expected_profit_token_a.to_string(),
-            "fully_burdened_cost_token_a_base_units": economics.fully_burdened_cost_token_a.to_string(),
-            "bounded_profit_token_a_base_units": economics.bounded_profit_token_a.to_string(),
-            "expected_profit_after_gas_bps_x100": expected_profit_after_gas_bps_x100.to_string(),
-            "expected_profit_after_gas_bps": expected_profit_after_gas_bps,
-            "expected_profit_after_gas_threshold_bps": EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS,
-            "expected_profit_after_gas_threshold_met": expected_profit_after_gas_threshold_met,
+            "price_unchanged_for_us": duration_us(quote.received_at.elapsed()),
             "dex_plan": dex_plan_telemetry_value(&dex_plan),
         });
-        let admitted_object = admitted_payload
-            .as_object_mut()
-            .context("arbitrage admission telemetry payload is not an object")?;
-        admitted_object.insert(
-            "price_unchanged_for_us".to_owned(),
-            json!(duration_us(quote.received_at.elapsed())),
-        );
-        admitted_object.insert(
-            "recovery_loss_bound_token_a_base_units".to_owned(),
-            json!(economics.recovery_loss_token_a.to_string()),
-        );
-        admitted_object.insert(
-            "gas_burdened_cost_token_a_base_units".to_owned(),
-            json!(economics.gas_burdened_cost_token_a.to_string()),
-        );
-        admitted_object.insert(
-            "expected_profit_after_gas_token_a_base_units".to_owned(),
-            json!(economics.expected_profit_after_gas_token_a.to_string()),
-        );
         self.telemetry.emit("arbitrage_admitted", admitted_payload);
         Ok(false)
-    }
-
-    fn emit_admission_risk_rejection(
-        &self,
-        quote: &TopOfBook,
-        pair_id: &str,
-        direction: TradeDirection,
-        reason: &'static str,
-        economics: Option<AdmissionEconomics>,
-    ) {
-        let expected_profit_after_gas_bps_x100 = economics.and_then(|value| {
-            profit_bps_x100_u256(
-                value.expected_profit_after_gas_token_a,
-                value.gas_burdened_cost_token_a,
-            )
-            .ok()
-        });
-        let expected_profit_after_gas_bps =
-            expected_profit_after_gas_bps_x100.and_then(|value| format_bps_x100_u256(value).ok());
-        let expected_profit_after_gas_threshold_met =
-            expected_profit_after_gas_bps_x100.map(|value| {
-                value >= U256::from(u64::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS) * 100)
-            });
-        self.telemetry.emit(
-            "arbitrage_admission_rejected",
-            json!({
-                "engine_id": self.config.engine_id,
-                "pair_id": pair_id,
-                "symbol": quote.symbol.as_ref(),
-                "update_id": quote.update_id,
-                "direction": format!("{direction:?}"),
-                "reason": reason,
-                "recovery_limit_price": economics.map(|value| value.recovery_limit_price.to_string()),
-                "recovery_sell_limit_price": economics.and_then(|value| value.recovery_sell_limit_price.map(|price| price.to_string())),
-                "recovery_buy_limit_price": economics.and_then(|value| value.recovery_buy_limit_price.map(|price| price.to_string())),
-                "recovery_quote_token_a_base_units": economics.map(|value| value.recovery_quote_token_a.to_string()),
-                "recovery_sell_quote_token_a_base_units": economics.map(|value| value.recovery_sell_quote_token_a.to_string()),
-                "recovery_buy_quote_token_a_base_units": economics.map(|value| value.recovery_buy_quote_token_a.to_string()),
-                "recovery_loss_token_a_base_units": economics.map(|value| value.recovery_loss_token_a.to_string()),
-                "recovery_loss_bound_token_a_base_units": economics.map(|value| value.recovery_loss_token_a.to_string()),
-                "maximum_gas_wei": economics.map(|value| value.maximum_gas_wei.to_string()),
-                "maximum_fee_per_gas_wei": economics.map(|value| value.maximum_fee_per_gas_wei.to_string()),
-                "maximum_gas_cost_token_a_base_units": economics.map(|value| value.maximum_gas_cost_token_a.to_string()),
-                "expected_profit_token_a_base_units": economics.map(|value| value.expected_profit_token_a.to_string()),
-                "gas_burdened_cost_token_a_base_units": economics.map(|value| value.gas_burdened_cost_token_a.to_string()),
-                "expected_profit_after_gas_token_a_base_units": economics.map(|value| value.expected_profit_after_gas_token_a.to_string()),
-                "expected_profit_after_gas_bps_x100": expected_profit_after_gas_bps_x100.map(|value| value.to_string()),
-                "expected_profit_after_gas_bps": expected_profit_after_gas_bps,
-                "expected_profit_after_gas_threshold_bps": EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS,
-                "expected_profit_after_gas_threshold_met": expected_profit_after_gas_threshold_met,
-                "fully_burdened_cost_token_a_base_units": economics.map(|value| value.fully_burdened_cost_token_a.to_string()),
-                "bounded_profit_token_a_base_units": economics.map(|value| value.bounded_profit_token_a.to_string()),
-            }),
-        );
     }
 
     fn log_trading_inventory_blocked(
@@ -4039,21 +3477,6 @@ fn u256_to_i128(value: U256, name: &str) -> anyhow::Result<i128> {
     i128::try_from(value).map_err(|_| anyhow::anyhow!("{name} exceeds i128"))
 }
 
-fn profit_bps_x100_u256(profit: U256, cost: U256) -> anyhow::Result<U256> {
-    ensure!(!cost.is_zero(), "profit bps cost is zero");
-    profit
-        .checked_mul(U256::from(BPS_X100_SCALE))
-        .map(|scaled| scaled / cost)
-        .context("profit bps scaling overflow")
-}
-
-fn format_bps_x100_u256(value: U256) -> anyhow::Result<String> {
-    let whole = value / U256::from(100_u8);
-    let fractional = value % U256::from(100_u8);
-    let fractional = u8::try_from(fractional).context("profit bps fractional part exceeds u8")?;
-    Ok(format!("{whole}.{fractional:02}"))
-}
-
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -4094,9 +3517,7 @@ fn exact_execution_envelope_amounts(
 ) -> (U256, U256, U256) {
     let token_a = match direction {
         TradeDirection::BuyTokenBOnDexSellOnCex => dex_input,
-        TradeDirection::BuyTokenBOnCexSellOnDex => {
-            trade.cost_token_a.max(economics.recovery_buy_quote_token_a)
-        }
+        TradeDirection::BuyTokenBOnCexSellOnDex => trade.cost_token_a,
     };
     let token_b = match direction {
         // The live executor caps the hedgeable DEX credit at the immutable
@@ -4167,12 +3588,11 @@ mod tests {
 
     use super::{
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
-        EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS, RebalanceSettlementBarrier, ReservationPrecheck,
-        TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
-        classify_depth_health, clock_sync_estimate_valid, estimate_exchange_event_to_socket_us,
-        exact_execution_envelope_amounts, format_bps_x100_u256, mark_sequence_matched_update,
-        profit_bps_x100_u256, rebalance_health_state, requires_depth_for_runtime_phase,
-        reservation_precheck, settlement_requires_refresh,
+        RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
+        adaptive_candidate_is_better, admission_deadline_unix_seconds, classify_depth_health,
+        clock_sync_estimate_valid, estimate_exchange_event_to_socket_us,
+        exact_execution_envelope_amounts, mark_sequence_matched_update, rebalance_health_state,
+        requires_depth_for_runtime_phase, reservation_precheck, settlement_requires_refresh,
     };
 
     #[test]
@@ -4206,13 +3626,8 @@ mod tests {
     fn adaptive_depth_limits() -> AdaptiveSizingRuntimeLimits {
         AdaptiveSizingRuntimeLimits {
             max_trade_notional: U256::from(200_000_000_u64),
-            max_unhedged_notional: U256::from(220_000_000_u64),
-            max_recovery_loss: U256::from(2_000_000_u64),
-            min_expected_profit: U256::ZERO,
-            min_incremental_expected_profit: U256::ZERO,
             recent_full_depth_max_age_ms: 750,
             recent_full_depth_max_update_delta: 8,
-            top_of_book_max_trade_notional: U256::from(40_000_000_u64),
         }
     }
 
@@ -4378,17 +3793,6 @@ mod tests {
     }
 
     #[test]
-    fn after_gas_profit_bps_telemetry_uses_fixed_point_math() {
-        let profit = U256::from(12_345_u64);
-        let cost = U256::from(10_000_000_u64);
-        let bps_x100 = profit_bps_x100_u256(profit, cost).unwrap();
-
-        assert_eq!(bps_x100, U256::from(1_234_u64));
-        assert_eq!(format_bps_x100_u256(bps_x100).unwrap(), "12.34");
-        assert!(bps_x100 >= U256::from(u64::from(EXPECTED_PROFIT_AFTER_GAS_THRESHOLD_BPS) * 100));
-    }
-
-    #[test]
     fn exact_execution_envelope_has_no_multiplicative_reservation() {
         let trade = TradeEvaluation {
             pool_index: 0,
@@ -4397,9 +3801,10 @@ mod tests {
             cex_token_a_amount: U256::from(1_000),
             cost_token_a: U256::from(1_010),
             proceeds_token_a: U256::from(1_030),
+            dex_amount_in: U256::from(1_020),
+            dex_amount_out_minimum: U256::from(100),
             execution_slippage_bps: 10,
             gross_profit_bps_x100: 2_000,
-            profit_bps_x100: 1_000,
             meets_threshold: true,
         };
         let economics = AdmissionEconomics {
@@ -4410,17 +3815,9 @@ mod tests {
             recovery_sell_quote_token_a: U256::from(990),
             recovery_buy_limit_price: Some(Decimal::ONE),
             recovery_buy_quote_token_a: U256::from(1_075),
-            recovery_loss_token_a: U256::from(65),
             maximum_gas_wei: U256::from(25),
             maximum_fee_per_gas_wei: 5,
-            maximum_gas_cost_token_a: U256::from(2),
-            expected_profit_token_a: U256::from(20),
-            gas_burdened_cost_token_a: U256::from(1_012),
-            expected_profit_after_gas_token_a: U256::from(18),
-            fully_burdened_cost_token_a: U256::from(1_077),
-            bounded_profit_token_a: U256::from(18),
             opportunity_threshold_met: true,
-            native_gas_covered: true,
         };
 
         assert_eq!(
@@ -4439,61 +3836,37 @@ mod tests {
                 trade,
                 economics,
             ),
-            (U256::from(1_075), U256::from(100), U256::from(25))
+            (U256::from(1_010), U256::from(100), U256::from(25))
         );
     }
 
     #[test]
-    fn adaptive_optimizer_ranks_expected_spread_profit_not_tail_scenario_profit() {
-        let candidate = adaptive_candidate_for_ranking(100, 0);
-        let current = adaptive_candidate_for_ranking(90, 50);
+    fn adaptive_optimizer_ranks_the_largest_executable_slot() {
+        let candidate = adaptive_candidate_for_ranking(1_100, 110);
+        let current = adaptive_candidate_for_ranking(1_000, 500);
 
         assert!(adaptive_candidate_is_better(candidate, current));
         assert!(!adaptive_candidate_is_better(current, candidate));
     }
 
-    fn adaptive_candidate_for_ranking(
-        expected_profit: u64,
-        bounded_profit: u64,
-    ) -> AdaptiveCandidate {
+    fn adaptive_candidate_for_ranking(notional: u64, token_b_amount: u64) -> AdaptiveCandidate {
         let trade = TradeEvaluation {
             pool_index: 0,
-            token_b_amount: U256::from(100),
+            token_b_amount: U256::from(token_b_amount),
             dex_token_a_amount: U256::from(900),
-            cex_token_a_amount: U256::from(1_000),
-            cost_token_a: U256::from(1_000),
-            proceeds_token_a: U256::from(1_000 + expected_profit),
+            cex_token_a_amount: U256::from(notional),
+            cost_token_a: U256::from(notional),
+            proceeds_token_a: U256::from(notional),
+            dex_amount_in: U256::from(notional),
+            dex_amount_out_minimum: U256::from(token_b_amount),
             execution_slippage_bps: 10,
             gross_profit_bps_x100: 2_000,
-            profit_bps_x100: 1_000,
             meets_threshold: true,
         };
         AdaptiveCandidate {
             direction: SizingDirection::BuyTokenBOnDexSellOnCex,
             trade,
-            economics: AdmissionEconomics {
-                primary_quantity: Decimal::from(100),
-                recovery_limit_price: Decimal::ONE,
-                recovery_quote_token_a: U256::from(1_050),
-                recovery_sell_limit_price: Some(Decimal::ONE),
-                recovery_sell_quote_token_a: U256::from(990),
-                recovery_buy_limit_price: Some(Decimal::ONE),
-                recovery_buy_quote_token_a: U256::from(1_075),
-                recovery_loss_token_a: U256::from(65),
-                maximum_gas_wei: U256::from(25),
-                maximum_fee_per_gas_wei: 5,
-                maximum_gas_cost_token_a: U256::from(2),
-                expected_profit_token_a: U256::from(expected_profit),
-                gas_burdened_cost_token_a: U256::from(1_002),
-                expected_profit_after_gas_token_a: U256::from(bounded_profit),
-                fully_burdened_cost_token_a: U256::from(1_077),
-                bounded_profit_token_a: U256::from(bounded_profit),
-                opportunity_threshold_met: true,
-                native_gas_covered: true,
-            },
-            trade_notional: trade.proceeds_token_a,
-            unhedged_notional: U256::from(1_075),
-            reservation_fits: true,
+            trade_notional: U256::from(notional),
         }
     }
 

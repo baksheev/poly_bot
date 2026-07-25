@@ -49,10 +49,9 @@ comparable_profit_token_a =
 
 A balanced row requires no *actionable* residual: exact zero, or an absolute
 residual smaller than the Binance token-B step. Dust remains visible in
-`token_b_residual_base_units`. A positive residual is marked down at the
-persisted full-depth sell quote net of commission; a negative residual is
-marked up at the persisted full-depth buy quote including commission. The mark
-is prorated by quantity, with assets rounded down and liabilities rounded up.
+`token_b_residual_base_units`. A positive residual is marked at the persisted
+Binance bid and a negative residual at the persisted ask. The mark is prorated
+by quantity, with assets rounded down and liabilities rounded up.
 
 Binance commissions must already be reflected in the CEX balance deltas. DEX
 gas is recorded separately and subtracted exactly once. Recovery loss is broken
@@ -60,6 +59,11 @@ out so a profitable primary spread cannot hide systematically expensive
 compensation. `realized_profit_token_a_base_units` remains the settled cash
 delta; `comparable_profit_token_a_base_units` is the criterion metric because it
 also carries economically real dust.
+
+The expected fields contain only the raw venue economics that cleared the
+20 bps gate. There is deliberately no expected-after-commission,
+expected-after-gas, bounded-profit, or forecast-recovery result model. Those
+costs appear only when they are realized by execution.
 
 This maps to Rails as follows:
 
@@ -74,10 +78,9 @@ This maps to Rails as follows:
 
 Rails calls its field `estimated_profit`, but it is computed from actual venue
 balance changes after execution and marks residual token B at the latest
-Binance bid. Rust uses the admission-time depth quote and, for a token-B
-liability, the buy side plus commission. This is at least as conservative. The
-comparison therefore uses Rust comparable profit, not the opportunity's
-expected profit or its cash-only component.
+Binance bid. Rust uses the admission-time Binance side appropriate to the sign
+of the residual. The comparison therefore uses Rust comparable profit, not the
+opportunity's expected profit or its cash-only component.
 
 ## Equal-window comparison
 

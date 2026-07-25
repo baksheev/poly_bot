@@ -11,8 +11,7 @@ use crate::{
     config::AppConfig,
     dex::mirror::DexMirror,
     opportunity::{
-        CapacityEvaluation, DirectionEvaluation, PairEvaluation, PairRuntime, TradeEvaluation,
-        format_base_units,
+        DirectionEvaluation, PairEvaluation, PairRuntime, TradeEvaluation, format_base_units,
     },
     state::{RuntimePhase, TopOfBook},
     telemetry::TelemetryHandle,
@@ -306,8 +305,8 @@ impl HotTelemetryTask {
                 "slippage_profit_share_bps": pair.slippage_profit_share_bps,
                 "binance_book_product": "spot",
                 "binance_execution_product": "spot",
-                "capacity_model": "prepared_dex_curve_and_observed_spot_top_of_book",
-                "includes_binance_fee": true,
+                "sizing_model": "adaptive_dex_curve_slot",
+                "includes_binance_fee": false,
                 "binance_buy_fee_bps": pair.binance_buy_fee_bps,
                 "binance_sell_fee_bps": pair.binance_sell_fee_bps,
                 "includes_gas": false,
@@ -322,7 +321,7 @@ impl HotTelemetryTask {
         );
 
         for direction in [&evaluation.dex_buy_cex_sell, &evaluation.cex_buy_dex_sell] {
-            if let Some(capacity) = direction.market_liquidity_capacity {
+            if let Some(trade) = direction.baseline.filter(|trade| trade.meets_threshold) {
                 self.telemetry.emit(
                     "arbitrage_opportunity",
                     json!({
@@ -337,20 +336,18 @@ impl HotTelemetryTask {
                         "min_slippage_bps": pair.min_slippage_bps,
                         "max_slippage_bps": pair.max_slippage_bps,
                         "slippage_profit_share_bps": pair.slippage_profit_share_bps,
-                        "capacity_model": "prepared_dex_curve_and_observed_spot_top_of_book",
+                        "sizing_model": "adaptive_dex_curve_slot",
                         "execution_ready": false,
-                        "includes_binance_fee": true,
+                        "includes_binance_fee": false,
                         "binance_buy_fee_bps": pair.binance_buy_fee_bps,
                         "binance_sell_fee_bps": pair.binance_sell_fee_bps,
-                        "execution_gaps": [
-                            "binance_depth_not_applied_to_recovery_bound",
-                            "gas_not_applied",
-                            "inventory_not_applied_to_capacity",
-                        ],
                         "calculation_time_us": calculation_time_us,
                         "decision_latency_us": decision_latency_us,
                         "evaluation_trigger": trigger,
-                        "market_liquidity_capacity": self.capacity_payload(pair, capacity)?,
+                        "baseline_pool_index": trade.pool_index,
+                        "baseline_token_b_base_units": trade.token_b_amount.to_string(),
+                        "baseline_gross_profit_bps_x100": trade.gross_profit_bps_x100,
+                        "baseline": self.trade_payload(pair, trade)?,
                     }),
                 );
             }
@@ -374,21 +371,6 @@ impl HotTelemetryTask {
                 .baseline
                 .map(|trade| self.trade_payload(pair, trade))
                 .transpose()?,
-            "market_liquidity_capacity": direction
-                .market_liquidity_capacity
-                .map(|capacity| self.capacity_payload(pair, capacity))
-                .transpose()?,
-        }))
-    }
-
-    fn capacity_payload(
-        &self,
-        pair: &PairTelemetryContext,
-        capacity: CapacityEvaluation,
-    ) -> anyhow::Result<serde_json::Value> {
-        Ok(json!({
-            "limiter": capacity.limiter.as_str(),
-            "trade": self.trade_payload(pair, capacity.trade)?,
         }))
     }
 
@@ -436,13 +418,13 @@ impl HotTelemetryTask {
             ),
             "cost_token_a_base_units": trade.cost_token_a.to_string(),
             "proceeds_token_a_base_units": trade.proceeds_token_a.to_string(),
+            "dex_amount_in_base_units": trade.dex_amount_in.to_string(),
+            "dex_amount_out_minimum_base_units": trade.dex_amount_out_minimum.to_string(),
             "execution_slippage_bps": trade.execution_slippage_bps,
             "profit_token_a_base_units": trade.signed_profit_token_a(),
             "profit_token_a": profit,
             "gross_profit_bps_x100": trade.gross_profit_bps_x100,
             "gross_profit_bps": format_bps_x100(trade.gross_profit_bps_x100),
-            "profit_bps_x100": trade.profit_bps_x100,
-            "profit_bps": format_bps_x100(trade.profit_bps_x100),
             "meets_threshold": trade.meets_threshold,
         }))
     }

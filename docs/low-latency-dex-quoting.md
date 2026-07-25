@@ -100,17 +100,17 @@ baseline:
 
 1. DEX buy / CEX sell: exact-input quote 20 USDC on each DEX pool, round the
    resulting WLD down to the Binance step, then exact-output quote that rounded
-   WLD amount and compare its reserved DEX cost with Binance bid proceeds.
+   WLD amount and compare its raw DEX cost with Binance bid proceeds.
 2. CEX buy / DEX sell: derive WLD from 20 USDC at the current Binance ask,
    round it down to the Binance step, and compare the Binance cost with the
-   reserved exact-input DEX proceeds.
+   raw exact-input DEX proceeds.
 3. If the baseline clears 20 bps, search whole Binance steps over an
    immutable prepared swap curve until the next step fails the profit
-   threshold, exceeds hydrated DEX liquidity, or reaches the observed Binance
-   top-of-book quantity. Each probe is a segment lookup plus at most one swap
-   step; it never replays the CLMM bitmap walk.
-4. Across qualifying pools, retain the capacity candidate with the greatest
-   absolute token-A profit. No RPC, database call, lock, or pool clone occurs.
+   threshold, exceeds hydrated DEX liquidity, or reaches the 200 USDC execution
+   cap. Each probe is a segment lookup plus at most one swap step; it never
+   replays the CLMM bitmap walk.
+4. Across qualifying pools and directions, retain the largest executable
+   candidate. No RPC, database call, lock, or pool clone occurs.
 
 The repeated baseline DEX quote is held in a fixed ring of eight entries per
 `(pool, direction)`. The token-B amount is part of each entry, so small Binance
@@ -120,12 +120,11 @@ Both successful quotes and insufficient-liquidity results are cached.
 Each pool has three immutable prepared curves: token-A exact-input for the
 DEX-buy baseline, token-B exact-output for the rounded DEX buy, and token-B
 exact-input for the DEX sell. Curve construction is bounded by
-`exact_execution_envelope_v1`: production admits at most 200 USDC trade
-notional, while the existing 220 USDC unhedged-notional limit supplies the
-conservative token-A build bound. The builder derives both token-B limits from
-the current pool at that bound, preserving pool fees, integer rounding, and
-directional price impact. It never traverses liquidity beyond the amount that
-an admissible plan can use.
+the 200 USDC execution cap. The builder derives both token-B limits from the
+current pool at that bound, preserving pool fees, integer rounding, and
+directional price impact. The DEX-buy cap is checked against the final calldata
+input, including Rails-compatible slippage headroom, so the builder never
+traverses liquidity beyond the amount that an admissible plan can use.
 
 Within that envelope, construction performs the exact Uniswap word-boundary
 traversal and stores contiguous cumulative segments with the original
@@ -151,58 +150,50 @@ builder channel or thread wakeup exists.
 
 Uniswap LP fees are already included by the CLMM swap math. As in Rails, half
 of the gross venue-spread basis points is allocated to execution slippage and
-clamped to the configured 5–50 bps range. The configured four-basis-point DEX
-fee reserve is added to that budget. Combined DEX costs round up and proceeds
-round down; account-specific Binance commission is also charged before the
-threshold decision. All amount, threshold, and sizing math is checked integer
-math; `f64` is not used.
+clamped to the configured 5–50 bps range. That slippage never changes the
+20 bps opportunity economics. For DEX-buy, Rust matches Rails by adding the
+slippage plus the configured four-basis-point input headroom, requoting that
+exact input locally, and applying the slippage only to
+`amount_out_minimum`. For DEX-sell, the exact token-B input is unchanged and
+the slippage is applied only to `amount_out_minimum`. Binance commission, gas,
+and recovery forecasts do not change threshold, sizing, ranking, or admission.
+All amount, threshold, and sizing math is checked integer math; `f64` is not
+used.
 
 The service writes one `arbitrage_evaluation` for every calculation and a
 separate `arbitrage_opportunity` for each direction that clears the threshold.
-Each record contains baseline economics, selected pool, signed profit,
-hundredths-of-basis-point edge, capacity, limiter, calculation latency, and
-end-to-end decision latency. `baseline_quote_cache_hits` and
+Each record contains raw baseline economics, selected pool, signed gross
+profit, hundredths-of-basis-point edge, DEX calldata bounds, calculation
+latency, and end-to-end decision latency. `baseline_quote_cache_hits` and
 `baseline_quote_cache_misses` make every recomputation visible in telemetry.
 Raw Binance and evaluation payloads are formatted on a separate bounded task.
+The opportunity event is emitted directly from `baseline.meets_threshold` and
+contains the evaluation trigger, baseline pool, amount, and gross spread. It
+does not contain a theoretical capacity; only the adaptive worker calculates
+an executable size.
 
-Admission then applies execution-only bounds outside the quote calculation.
-For `dex_first`, each `bookTicker` update can admit immediately when the entire
-primary IOC quantity fits the relevant best-price level. The matching
-`depth@100ms` book is only a fallback when that level is too small; concurrent
-execution keeps the two-sided full-depth requirement. The admitted top price
-and quantity are persisted and rechecked alongside the exact DEX generation
-and swap deadline immediately before dispatch. A maximum DEX gas charge is
-deducted before admission.
-The gas bound uses the executor's five-million-unit ceiling, the background
-World Chain gas-price snapshot, the Rails priority fee, and the fresh ETHUSDT
-ask. Gas remains an inventory and risk-envelope input; there is no
-admission-time DEX fee cap. The configured 20 bps gross spread remains the
-profitability gate.
+Admission persists the selected raw economics and exact calldata bounds.
+Binance top quantity and full depth are telemetry only. Immediately before DEX
+dispatch, preflight confirms fresh Binance and DEX inputs and that their current
+prices still clear the same 20 bps gross threshold; a changed DEX generation is
+requoted from the current prepared curve. Gas is reserved only as the native
+amount physically required by the transaction and is accounted from the
+receipt after execution. It is never deducted from expected profit and there
+is no admission-time DEX fee cap.
 The decision path only transfers typed in-memory records, and captures decision
 latency before JSON construction or ClickHouse channel work.
 
 Adaptive sizing does not run in the single state owner. The owner snapshots the
-prepared curves, matching Binance depth, pool generations, and available
-inventory, then places only the newest pending sizing request onto one bounded
-blocking worker. A completed result is admitted only if the exact Binance book,
-every relevant DEX generation, and the gas/native-price context still match the
-snapshot. Otherwise it is marked superseded and discarded; inventory is
-checked again by the normal atomic reservation, and execution preflight
-requotes the exact DEX input and verifies the current 20 bps spread immediately
-before fill whenever a relevant price input changed. Unchanged Binance price
-and DEX generation reuse the admission proof without a duplicate quote. This keeps
-exhaustive whole-step search from delaying DEX ingestion without allowing a
-stale snapshot to enter execution.
-
-The capacity is deliberately named `market_liquidity_capacity`, not executable
-size. Both market data and eventual execution use Binance Spot, and hydrated
-account commission is applied conservatively to the Binance leg. However,
-bookTicker contains only the best price level. That is sufficient for the
-fixed production baseline whenever its relevant-side quantity covers the IOC;
-a REST-bootstrapped, sequence-consistent Spot depth book handles the larger
-fallback case. Gas, executable inventory after reservations, and risk caps are
-hard admission constraints, while larger market-liquidity capacity remains
-telemetry rather than executable sizing.
+prepared curves, Binance price, and pool generations, then places only the
+newest pending sizing request onto one bounded blocking worker. The worker
+finds the largest whole Binance step whose exact DEX quote still clears 20 bps
+and the configured trade-notional cap. It does not read Binance depth,
+inventory, recovery estimates, or gas context. A completed result is admitted
+only if the Binance quote and every relevant DEX generation still match the
+snapshot. Inventory is checked once by the normal atomic primary reservation,
+and execution preflight verifies freshness and the current 20 bps spread.
+This keeps sizing from delaying DEX ingestion without allowing a stale price
+or pool generation to enter execution.
 
 ## Gaps and reorgs
 

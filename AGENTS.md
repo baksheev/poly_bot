@@ -63,21 +63,23 @@ a time.
   discard remote commits; stop and report if `main` cannot be fast-forwarded or
   branch protection rejects the direct push.
 - The production GKE Pod must use the reviewed v12 adaptive-live domain artifact
-  with both arbitrage and rebalancing in `full_live`. Adaptive sizing may select
-  up to the configured 200 USDC cap from sequence-matched full depth or recent
-  full depth within the reviewed age/update-delta caps. Top-of-book-only sizing
-  is separately capped at 40 USDC and must fit the observed top levels. Full
-  depth health is telemetry and a log-based metric; it must not change
-  `RuntimePhase::Ready` in `full_live`/DEX-first mode. Inventory reservations use
-  `exact_execution_envelope_v1`, including native gas, and must never apply the
-  legacy Rails `3x` multiplier. The configured 20 bps primary spread is the
-  profitability gate; worst-case recovery loss and gas remain reservation and
-  risk-cap inputs rather than a requirement that failure recovery be
-  profitable. An unchanged event-driven Binance top remains current while its
-  connection generation has fresh transport activity. Admission, preflight,
-  and runtime market-data readiness use the reviewed 30-second maximum
-  transport silence from the versioned domain artifact, not the age of the
-  last price change. That artifact is the only strategy-price liveness source.
+  with both arbitrage and rebalancing in `full_live`. Adaptive sizing selects
+  the largest Binance-step-aligned exact DEX-curve candidate that clears the
+  configured 20 bps gross spread and the 200 USDC cap. Binance top quantity,
+  full depth, recovery forecasts, expected-profit floors, gas economics, and
+  inventory are not sizing or admission gates. Full-depth health is telemetry
+  and a log-based metric only. Inventory reservations cover the exact primary
+  venue debits and maximum native transaction debit and must never apply the
+  legacy Rails `3x` multiplier or reserve a hypothetical recovery. Actual
+  residual recovery is reactive to realized fills. The 20 bps gate uses raw
+  venue economics. Rails-compatible 5-50 bps dynamic slippage affects only the
+  DEX calldata input/output bounds; Binance commission, gas, and recovery never
+  create a second profitability model. An unchanged event-driven Binance top
+  remains current while its connection generation has fresh transport
+  activity. Admission, preflight, and runtime market-data readiness use the
+  reviewed 30-second maximum transport silence from the versioned domain
+  artifact, not the age of the last price change. That artifact is the only
+  strategy-price liveness source.
   The separate native-token conversion feed is diagnostic/accounting input:
   its connection, quote age, and transport activity must never change
   readiness, admission, preflight, or execution eligibility. The deployment

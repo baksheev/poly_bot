@@ -48,38 +48,23 @@ impl ArbitrageDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapacityLimiter {
-    BinanceTopOfBook,
-    ProfitThreshold,
-    DexLiquidity,
-}
-
-impl CapacityLimiter {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BinanceTopOfBook => "binance_top_of_book",
-            Self::ProfitThreshold => "profit_threshold",
-            Self::DexLiquidity => "dex_liquidity",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TradeEvaluation {
     pub pool_index: usize,
     pub token_b_amount: U256,
     /// Raw CLMM amount before the configured conservative reserve.
     pub dex_token_a_amount: U256,
     pub cex_token_a_amount: U256,
-    /// Cost and proceeds after applying the configured reserve.
+    /// Raw venue economics used by the 20 bps gate and sizing.
     pub cost_token_a: U256,
     pub proceeds_token_a: U256,
+    /// Rails-compatible immutable DEX calldata bounds. These fields never
+    /// participate in the profitability gate or candidate ranking.
+    pub dex_amount_in: U256,
+    pub dex_amount_out_minimum: U256,
     pub execution_slippage_bps: u16,
-    /// Rails-style venue spread before execution reserves and commissions,
-    /// expressed in signed hundredths of one basis point.
+    /// Raw venue spread used by thresholding, sizing, and ranking, expressed
+    /// in signed hundredths of one basis point.
     pub gross_profit_bps_x100: i64,
-    /// Signed hundredths of one basis point.
-    pub profit_bps_x100: i64,
     pub meets_threshold: bool,
 }
 
@@ -98,18 +83,10 @@ impl TradeEvaluation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapacityEvaluation {
-    pub trade: TradeEvaluation,
-    pub limiter: CapacityLimiter,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectionEvaluation {
     pub direction: ArbitrageDirection,
     pub cex_top_token_b_amount: U256,
     pub baseline: Option<TradeEvaluation>,
-    /// Present only when the baseline clears the configured opportunity threshold.
-    pub market_liquidity_capacity: Option<CapacityEvaluation>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -478,7 +455,7 @@ impl OpportunityEngine {
             token_b_amount % pair.token_b_step == U256::ZERO,
             "adaptive candidate is not Binance-step aligned"
         );
-        let Some(mut trade) = evaluate_trade(
+        let Some(trade) = evaluate_trade(
             pair,
             &self.prepared_pools,
             quote,
@@ -489,7 +466,6 @@ impl OpportunityEngine {
         else {
             return Ok(None);
         };
-        finalize_trade_profit(&mut trade)?;
         Ok(Some(trade))
     }
 
@@ -854,8 +830,8 @@ impl PairRuntime {
             .adaptive_sizing
             .limits()
             .map(|limits| {
-                U256::from_str_radix(limits.max_unhedged_notional, 10)
-                    .context("validated adaptive exposure cap is invalid")
+                U256::from_str_radix(limits.max_trade_notional, 10)
+                    .context("validated adaptive trade cap is invalid")
             })
             .transpose()?
             .unwrap_or_else(|| baseline_token_a.saturating_mul(U256::from(2_u8)));
@@ -973,7 +949,6 @@ fn evaluate_direction_impl(
     );
 
     let mut best_baseline: Option<TradeEvaluation> = None;
-    let mut best_capacity: Option<CapacityEvaluation> = None;
     for &pool_index in &pair.pool_indices {
         if prepared_pools
             .get(pool_index)
@@ -995,7 +970,7 @@ fn evaluate_direction_impl(
         } else {
             baseline_token_b
         };
-        if baseline_token_b.is_zero() || cex_top_token_b_amount < baseline_token_b {
+        if baseline_token_b.is_zero() {
             continue;
         }
         let baseline_cex_token_a = cex_token_a_amount(pair, quote, direction, baseline_token_b)?;
@@ -1021,42 +996,19 @@ fn evaluate_direction_impl(
         else {
             continue;
         };
-        finalize_trade_profit(&mut baseline)?;
+        apply_dex_execution_bounds(pair, prepared_pools, direction, pool_index, &mut baseline)?;
         if best_baseline
             .as_ref()
             .is_none_or(|best| trade_is_better(&baseline, best))
         {
             best_baseline = Some(baseline);
         }
-        if !baseline.meets_threshold {
-            continue;
-        }
-
-        let capacity = size_pool(
-            pair,
-            prepared_pools,
-            quote,
-            direction,
-            pool_index,
-            baseline,
-            cex_top_token_b_amount,
-        )?;
-        if best_capacity.as_ref().is_none_or(|best| {
-            capacity.trade.absolute_profit_token_a() > best.trade.absolute_profit_token_a()
-        }) {
-            best_capacity = Some(capacity);
-        }
-    }
-
-    if let Some(capacity) = best_capacity.as_mut() {
-        finalize_trade_profit(&mut capacity.trade)?;
     }
 
     Ok(DirectionEvaluation {
         direction,
         cex_top_token_b_amount,
         baseline: best_baseline,
-        market_liquidity_capacity: best_capacity,
     })
 }
 
@@ -1091,86 +1043,6 @@ impl PoolBaselineQuoteCache {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn size_pool(
-    pair: &PairRuntime,
-    prepared_pools: &[Option<PreparedPoolQuotes>],
-    quote: &TopOfBook,
-    direction: ArbitrageDirection,
-    pool_index: usize,
-    baseline: TradeEvaluation,
-    cex_top_token_b: U256,
-) -> anyhow::Result<CapacityEvaluation> {
-    let baseline_steps = baseline.token_b_amount / pair.token_b_step;
-    let max_steps = cex_top_token_b / pair.token_b_step;
-    ensure!(
-        baseline_steps > U256::ZERO,
-        "baseline has zero Binance steps"
-    );
-    ensure!(max_steps >= baseline_steps, "capacity is below baseline");
-
-    if max_steps == baseline_steps {
-        return Ok(CapacityEvaluation {
-            trade: baseline,
-            limiter: CapacityLimiter::BinanceTopOfBook,
-        });
-    }
-
-    let max_amount = max_steps
-        .checked_mul(pair.token_b_step)
-        .context("maximum token-B amount overflow")?;
-    if let Some(at_max) = evaluate_trade(
-        pair,
-        prepared_pools,
-        quote,
-        direction,
-        pool_index,
-        max_amount,
-    )? && at_max.meets_threshold
-    {
-        return Ok(CapacityEvaluation {
-            trade: at_max,
-            limiter: CapacityLimiter::BinanceTopOfBook,
-        });
-    }
-
-    let mut low = baseline_steps;
-    let mut high = max_steps;
-    let mut best = baseline;
-    while high - low > U256::ONE {
-        let mid = low + ((high - low) / U256::from(2_u8));
-        let amount = mid
-            .checked_mul(pair.token_b_step)
-            .context("sized token-B amount overflow")?;
-        match evaluate_trade(pair, prepared_pools, quote, direction, pool_index, amount)? {
-            Some(candidate) if candidate.meets_threshold => {
-                low = mid;
-                best = candidate;
-            }
-            _ => high = mid,
-        }
-    }
-
-    let next_amount = high
-        .checked_mul(pair.token_b_step)
-        .context("next token-B amount overflow")?;
-    let limiter = match evaluate_trade(
-        pair,
-        prepared_pools,
-        quote,
-        direction,
-        pool_index,
-        next_amount,
-    )? {
-        None => CapacityLimiter::DexLiquidity,
-        Some(_) => CapacityLimiter::ProfitThreshold,
-    };
-    Ok(CapacityEvaluation {
-        trade: best,
-        limiter,
-    })
-}
-
 fn evaluate_trade(
     pair: &PairRuntime,
     prepared_pools: &[Option<PreparedPoolQuotes>],
@@ -1181,14 +1053,53 @@ fn evaluate_trade(
 ) -> anyhow::Result<Option<TradeEvaluation>> {
     let dex_quote = quote_dex(prepared_pools, direction, pool_index, token_b_amount)?;
     let cex_token_a_amount = cex_token_a_amount(pair, quote, direction, token_b_amount)?;
-    evaluate_trade_with_dex_quote(
+    let Some(mut trade) = evaluate_trade_with_dex_quote(
         pair,
         direction,
         pool_index,
         token_b_amount,
         cex_token_a_amount,
         dex_quote,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    apply_dex_execution_bounds(pair, prepared_pools, direction, pool_index, &mut trade)?;
+    Ok(Some(trade))
+}
+
+fn apply_dex_execution_bounds(
+    pair: &PairRuntime,
+    prepared_pools: &[Option<PreparedPoolQuotes>],
+    direction: ArbitrageDirection,
+    pool_index: usize,
+    trade: &mut TradeEvaluation,
+) -> anyhow::Result<()> {
+    match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
+            let prepared = prepared_pools
+                .get(pool_index)
+                .and_then(Option::as_ref)
+                .context("prepared DEX pool is unavailable")?;
+            let expected_output = prepared
+                .token_a_exact_input
+                .quote(trade.dex_amount_in)
+                .context("Rails-compatible DEX-buy input exceeds prepared curve")?;
+            trade.dex_amount_out_minimum =
+                subtract_bps_floor(expected_output, trade.execution_slippage_bps)?;
+        }
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {}
+    }
+    ensure!(
+        !trade.dex_amount_in.is_zero() && !trade.dex_amount_out_minimum.is_zero(),
+        "DEX execution bounds are zero"
+    );
+    ensure!(
+        trade.dex_amount_in <= pair.prepared_token_a_limit
+            || direction == ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+        "DEX-buy input exceeds the prepared execution envelope"
+    );
+    Ok(())
 }
 
 fn quote_dex(
@@ -1239,10 +1150,8 @@ fn evaluate_trade_with_dex_quote(
         return Ok(None);
     };
 
-    // Rails derives the per-order slippage budget from the gross venue spread,
-    // before commissions and execution reserves. Preserve that input exactly,
-    // then apply the account-specific Binance fee and the DEX reserve to the
-    // executable economics below.
+    // Rails derives the per-order slippage budget from the gross venue spread.
+    // Gross venue economics remain the only profitability and sizing input.
     let (gross_cost_token_a, gross_proceeds_token_a) = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => (dex_token_a_amount, cex_token_a_amount),
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => (cex_token_a_amount, dex_token_a_amount),
@@ -1253,33 +1162,20 @@ fn evaluate_trade_with_dex_quote(
             .context("gross opportunity profit bps exceed u16")?;
     let execution_slippage_bps = slippage_bps(pair, gross_profit_bps)?;
 
-    let (cex_adjusted_cost_token_a, cex_adjusted_proceeds_token_a) = match direction {
+    let (dex_amount_in, dex_amount_out_minimum) = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-            let net_cex_proceeds =
-                subtract_bps_floor(cex_token_a_amount, pair.binance_sell_fee_bps)?;
-            (dex_token_a_amount, net_cex_proceeds)
+            let input_headroom_bps = pair
+                .dex_fee_reserve_bps
+                .checked_add(execution_slippage_bps)
+                .context("DEX input headroom bps overflow")?;
+            (
+                add_bps_ceil(dex_token_a_amount, input_headroom_bps)?,
+                token_b_amount,
+            )
         }
-        ArbitrageDirection::BuyTokenBOnCexSellOnDex => {
-            let gross_cex_cost = add_bps_ceil(cex_token_a_amount, pair.binance_buy_fee_bps)?;
-            (gross_cex_cost, dex_token_a_amount)
-        }
-    };
-    let total_dex_reserve_bps = pair
-        .dex_fee_reserve_bps
-        .checked_add(execution_slippage_bps)
-        .context("DEX execution reserve bps overflow")?;
-    ensure!(
-        total_dex_reserve_bps <= 10_000,
-        "DEX execution reserve exceeds 100%"
-    );
-    let (cost_token_a, proceeds_token_a) = match direction {
-        ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
-            add_bps_ceil(dex_token_a_amount, total_dex_reserve_bps)?,
-            cex_adjusted_proceeds_token_a,
-        ),
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
-            cex_adjusted_cost_token_a,
-            subtract_bps_floor(dex_token_a_amount, total_dex_reserve_bps)?,
+            token_b_amount,
+            subtract_bps_floor(dex_token_a_amount, execution_slippage_bps)?,
         ),
     };
 
@@ -1288,11 +1184,12 @@ fn evaluate_trade_with_dex_quote(
         token_b_amount,
         dex_token_a_amount,
         cex_token_a_amount,
-        cost_token_a,
-        proceeds_token_a,
+        cost_token_a: gross_cost_token_a,
+        proceeds_token_a: gross_proceeds_token_a,
+        dex_amount_in,
+        dex_amount_out_minimum,
         execution_slippage_bps,
         gross_profit_bps_x100,
-        profit_bps_x100: 0,
         meets_threshold: meets_threshold(
             gross_proceeds_token_a,
             gross_cost_token_a,
@@ -1315,14 +1212,9 @@ fn slippage_bps(pair: &PairRuntime, profit_bps: u16) -> anyhow::Result<u16> {
 }
 
 fn trade_is_better(candidate: &TradeEvaluation, current: &TradeEvaluation) -> bool {
-    candidate.profit_bps_x100 > current.profit_bps_x100
-        || (candidate.profit_bps_x100 == current.profit_bps_x100
+    candidate.gross_profit_bps_x100 > current.gross_profit_bps_x100
+        || (candidate.gross_profit_bps_x100 == current.gross_profit_bps_x100
             && candidate.token_b_amount > current.token_b_amount)
-}
-
-fn finalize_trade_profit(trade: &mut TradeEvaluation) -> anyhow::Result<()> {
-    trade.profit_bps_x100 = signed_profit_bps_x100(trade.proceeds_token_a, trade.cost_token_a)?;
-    Ok(())
 }
 
 fn cex_token_a_amount(
@@ -1611,11 +1503,10 @@ mod tests {
 
     use super::{
         ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
-        CapacityLimiter, DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache,
-        TradeEvaluation, add_bps_ceil, decimal_to_base_units, evaluate_direction,
-        evaluate_trade_with_dex_quote, finalize_trade_profit, format_base_units, meets_threshold,
-        signed_profit_bps_x100, subtract_bps_floor, token_a_to_token_b_floor, token_b_to_token_a,
-        trade_is_better,
+        DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache, TradeEvaluation,
+        add_bps_ceil, decimal_to_base_units, evaluate_direction, evaluate_trade_with_dex_quote,
+        format_base_units, meets_threshold, signed_profit_bps_x100, subtract_bps_floor,
+        token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
     };
 
     fn hash(number: u64) -> B256 {
@@ -1992,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn account_commission_is_applied_conservatively_in_both_directions() {
+    fn account_commission_does_not_change_opportunity_economics() {
         let (mut pair, _) = fixture();
         pair.binance_sell_fee_bps = 10;
         let dex_buy = evaluate_trade_with_dex_quote(
@@ -2005,7 +1896,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(dex_buy.proceeds_token_a, U256::from(999_u16));
+        assert_eq!(dex_buy.proceeds_token_a, U256::from(1_000_u16));
 
         pair.binance_buy_fee_bps = 10;
         let cex_buy = evaluate_trade_with_dex_quote(
@@ -2018,7 +1909,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(cex_buy.cost_token_a, U256::from(1_001_u16));
+        assert_eq!(cex_buy.cost_token_a, U256::from(1_000_u16));
     }
 
     #[test]
@@ -2040,10 +1931,10 @@ mod tests {
     }
 
     #[test]
-    fn slippage_is_derived_before_binance_commission_like_rails() {
+    fn slippage_only_changes_dex_calldata_bounds() {
         let (mut pair, _) = fixture();
         pair.binance_sell_fee_bps = 20;
-        let mut trade = evaluate_trade_with_dex_quote(
+        let trade = evaluate_trade_with_dex_quote(
             &pair,
             ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             0,
@@ -2056,33 +1947,10 @@ mod tests {
 
         assert_eq!(trade.execution_slippage_bps, 15);
         assert_eq!(trade.gross_profit_bps_x100, 3_000);
-        assert_eq!(trade.proceeds_token_a, U256::from(10_009_u16));
+        assert_eq!(trade.cost_token_a, U256::from(10_000_u16));
+        assert_eq!(trade.proceeds_token_a, U256::from(10_030_u16));
+        assert_eq!(trade.dex_amount_in, U256::from(10_019_u16));
         assert!(trade.meets_threshold);
-        finalize_trade_profit(&mut trade).unwrap();
-        assert!(trade.profit_bps_x100 < i64::from(pair.opportunity_threshold_bps) * 100);
-    }
-
-    #[test]
-    fn sizes_dex_buy_to_the_full_profitable_cex_top() {
-        let (pair, dex) = fixture();
-        let quote = quote("1.02", "100.9", "1.03", "100");
-        let baseline = U256::from(19_u8) * pair.token_b_step;
-        let result = evaluate_direction(
-            &pair,
-            &dex,
-            &quote,
-            baseline,
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
-        )
-        .unwrap();
-
-        let capacity = result.market_liquidity_capacity.unwrap();
-        assert_eq!(capacity.limiter, CapacityLimiter::BinanceTopOfBook);
-        assert_eq!(
-            capacity.trade.token_b_amount,
-            U256::from(100_u8) * pair.token_b_step
-        );
-        assert!(capacity.trade.meets_threshold);
     }
 
     #[test]
@@ -2110,59 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_cex_buy_and_rejects_the_other_direction() {
-        let (pair, dex) = fixture();
-        let quote = quote("0.98", "100", "0.99", "42.7");
-        let baseline = U256::from(20_u8) * pair.token_b_step;
-        let cex_buy = evaluate_direction(
-            &pair,
-            &dex,
-            &quote,
-            baseline,
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
-        )
-        .unwrap();
-        let dex_buy = evaluate_direction(
-            &pair,
-            &dex,
-            &quote,
-            baseline,
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
-        )
-        .unwrap();
-
-        let capacity = cex_buy.market_liquidity_capacity.unwrap();
-        assert_eq!(
-            capacity.trade.token_b_amount,
-            U256::from(42_u8) * pair.token_b_step
-        );
-        assert_eq!(capacity.limiter, CapacityLimiter::BinanceTopOfBook);
-        assert!(dex_buy.market_liquidity_capacity.is_none());
-    }
-
-    #[test]
-    fn sizing_stops_at_the_profit_threshold_before_top_of_book() {
-        let (pair, dex) = fixture_with_liquidity(10_000_000_000_000_000_000_000);
-        let quote = quote("1.02", "1000", "1.03", "1000");
-        let baseline = U256::from(19_u8) * pair.token_b_step;
-        let result = evaluate_direction(
-            &pair,
-            &dex,
-            &quote,
-            baseline,
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
-        )
-        .unwrap();
-
-        let capacity = result.market_liquidity_capacity.unwrap();
-        assert_eq!(capacity.limiter, CapacityLimiter::ProfitThreshold);
-        assert!(capacity.trade.token_b_amount >= baseline);
-        assert!(capacity.trade.token_b_amount < result.cex_top_token_b_amount);
-        assert!(capacity.trade.meets_threshold);
-    }
-
-    #[test]
-    fn top_of_book_below_baseline_has_no_executable_evaluation() {
+    fn top_quantity_is_diagnostic_and_does_not_block_the_baseline() {
         let (pair, dex) = fixture();
         let quote = quote("1.02", "5", "1.03", "5");
         let baseline = U256::from(20_u8) * pair.token_b_step;
@@ -2175,8 +1991,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.baseline.is_none());
-        assert!(result.market_liquidity_capacity.is_none());
+        assert!(result.baseline.is_some());
+        assert_eq!(
+            result.cex_top_token_b_amount,
+            U256::from(5_u8) * pair.token_b_step
+        );
     }
 
     #[test]
@@ -2219,16 +2038,18 @@ mod tests {
 
     #[test]
     fn provider_selection_prefers_direction_specific_economic_result() {
-        let mut candidate = TradeEvaluation {
+        let candidate = TradeEvaluation {
             pool_index: 1,
             token_b_amount: U256::from(10_u8),
             dex_token_a_amount: U256::from(90_u8),
             cex_token_a_amount: U256::from(100_u8),
             cost_token_a: U256::from(90_u8),
             proceeds_token_a: U256::from(110_u8),
+            dex_amount_in: U256::from(90_u8),
+            dex_amount_out_minimum: U256::from(10_u8),
             execution_slippage_bps: 5,
-            gross_profit_bps_x100: 0,
-            profit_bps_x100: 0,
+            gross_profit_bps_x100: signed_profit_bps_x100(U256::from(110_u8), U256::from(90_u8))
+                .unwrap(),
             meets_threshold: true,
         };
         let mut current = TradeEvaluation {
@@ -2237,40 +2058,48 @@ mod tests {
             proceeds_token_a: U256::from(109_u8),
             ..candidate
         };
-        finalize_trade_profit(&mut candidate).unwrap();
-        finalize_trade_profit(&mut current).unwrap();
+        current.gross_profit_bps_x100 =
+            signed_profit_bps_x100(current.proceeds_token_a, current.cost_token_a).unwrap();
 
         assert!(trade_is_better(&candidate, &current));
     }
 
     #[test]
     fn provider_selection_compares_rate_when_dex_buy_baseline_amounts_differ() {
-        let mut low_liquidity = TradeEvaluation {
+        let low_liquidity = TradeEvaluation {
             pool_index: 3,
             token_b_amount: U256::from(500_000_000_000_000_000_u128),
             dex_token_a_amount: U256::from(1_433_245_u64),
             cex_token_a_amount: U256::from(191_750_u64),
             cost_token_a: U256::from(1_434_535_u64),
             proceeds_token_a: U256::from(191_558_u64),
+            dex_amount_in: U256::from(1_434_535_u64),
+            dex_amount_out_minimum: U256::from(500_000_000_000_000_000_u128),
             execution_slippage_bps: 5,
-            gross_profit_bps_x100: 0,
-            profit_bps_x100: 0,
+            gross_profit_bps_x100: signed_profit_bps_x100(
+                U256::from(191_558_u64),
+                U256::from(1_434_535_u64),
+            )
+            .unwrap(),
             meets_threshold: false,
         };
-        let mut healthy_liquidity = TradeEvaluation {
+        let healthy_liquidity = TradeEvaluation {
             pool_index: 0,
             token_b_amount: U256::from(52_100_000_000_000_000_000_u128),
             dex_token_a_amount: U256::from(20_050_000_u64),
             cex_token_a_amount: U256::from(19_995_980_u64),
             cost_token_a: U256::from(20_068_045_u64),
             proceeds_token_a: U256::from(19_975_984_u64),
+            dex_amount_in: U256::from(20_068_045_u64),
+            dex_amount_out_minimum: U256::from(52_100_000_000_000_000_000_u128),
             execution_slippage_bps: 5,
-            gross_profit_bps_x100: 0,
-            profit_bps_x100: 0,
+            gross_profit_bps_x100: signed_profit_bps_x100(
+                U256::from(19_975_984_u64),
+                U256::from(20_068_045_u64),
+            )
+            .unwrap(),
             meets_threshold: false,
         };
-        finalize_trade_profit(&mut low_liquidity).unwrap();
-        finalize_trade_profit(&mut healthy_liquidity).unwrap();
 
         assert!(trade_is_better(&healthy_liquidity, &low_liquidity));
     }

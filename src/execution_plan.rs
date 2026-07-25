@@ -66,16 +66,9 @@ impl DexSwapPlan {
                 || (pool.token0 == token_b && pool.token1 == token_a),
             "selected DEX pool tokens differ from the pair"
         );
-        let (token_in, token_out, amount_in, amount_out_minimum) = match direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-                (token_a, token_b, trade.cost_token_a, trade.token_b_amount)
-            }
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
-                token_b,
-                token_a,
-                trade.token_b_amount,
-                trade.proceeds_token_a,
-            ),
+        let (token_in, token_out) = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => (token_a, token_b),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (token_b, token_a),
         };
         let route = match pool.identity {
             PoolIdentity::V3 { address, fee_pips } => DexRoutePlan::UniswapV3 {
@@ -112,9 +105,9 @@ impl DexSwapPlan {
             route,
             token_in: token_in.to_string(),
             token_out: token_out.to_string(),
-            amount_in_base_units: u128::try_from(amount_in)
+            amount_in_base_units: u128::try_from(trade.dex_amount_in)
                 .context("DEX plan input exceeds u128")?,
-            amount_out_minimum_base_units: u128::try_from(amount_out_minimum)
+            amount_out_minimum_base_units: u128::try_from(trade.dex_amount_out_minimum)
                 .context("DEX plan minimum output exceeds u128")?,
             deadline_unix_seconds,
         };

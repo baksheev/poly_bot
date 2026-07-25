@@ -11,8 +11,9 @@ and must never run while the GKE Deployment has a nonzero replica count.
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v12 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback, 200 USDC global cap, 750 ms / delta 8 recent-depth caps, and 40 USDC top-only cap,
-  WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4,
+- v12 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC
+  detector/fallback, 200 USDC execution cap, WLD step 0.1, live exchange tick
+  0.0001, `profit_token_a`, 20 bps, V3/V4,
   a 30-second maximum Binance transport silence, and a 30-second maximum age
   of the latest received canonical World Chain head;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
@@ -25,8 +26,9 @@ and must never run while the GKE Deployment has a nonzero replica count.
   only free inventory after exact reservations is admissible. User Data,
   native-token conversion-feed health, and full-depth health are observed
   separately and do not gate DEX-first readiness;
-- fixed full-live v12 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
-  recovery controls.
+- fixed full-live v12 adaptive deployment, DEX-curve-only maximum-slot sizing,
+  20 bps spread admission, exact primary reservations, single-owner
+  enforcement, and entry-stop recovery controls.
 
 Run `scripts/quality.sh`, fetch `origin/main`, require a clean fast-forward,
 push the validated commit directly to `main`, approve the `production`

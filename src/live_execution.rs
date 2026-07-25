@@ -128,27 +128,28 @@ impl ComposedLiveLegExecutor {
                 };
                 match self.dex.execute(request).await {
                     Ok(outcome) => {
-                        let gas = match native_gas_to_token_a_base_units(
-                            outcome.gas_used,
-                            outcome.effective_gas_price,
-                            bounds.gas_conversion_price_token_a,
-                            self.quote_decimals,
-                        ) {
-                            Ok(gas) => gas,
-                            Err(error) => {
-                                tracing::error!(operation_id, error = %error, "DEX gas accounting is unknown");
-                                return unknown(role, "dex:accounting-unknown");
+                        let gas = if bounds.gas_conversion_price_token_a.is_zero() {
+                            tracing::warn!(
+                                operation_id,
+                                gas_used = outcome.gas_used,
+                                effective_gas_price = outcome.effective_gas_price,
+                                "DEX gas token-A conversion is unavailable; execution remains valid"
+                            );
+                            0
+                        } else {
+                            match native_gas_to_token_a_base_units(
+                                outcome.gas_used,
+                                outcome.effective_gas_price,
+                                bounds.gas_conversion_price_token_a,
+                                self.quote_decimals,
+                            ) {
+                                Ok(gas) => gas,
+                                Err(error) => {
+                                    tracing::error!(operation_id, error = %error, "DEX gas accounting is unknown");
+                                    return unknown(role, "dex:accounting-unknown");
+                                }
                             }
                         };
-                        if gas > bounds.maximum_gas_cost_token_a_base_units {
-                            tracing::error!(
-                                operation_id,
-                                actual_gas_token_a_base_units = gas,
-                                admitted_gas_token_a_base_units =
-                                    bounds.maximum_gas_cost_token_a_base_units,
-                                "DEX gas exceeded admission bound after execution"
-                            );
-                        }
                         match dex_leg_result(intent.direction, outcome, gas) {
                             Ok(mut result) => {
                                 if let Some(surplus) = cap_dex_credit_to_execution_envelope(
@@ -180,16 +181,26 @@ impl ComposedLiveLegExecutor {
                         effective_gas_price,
                         reason,
                     }) => {
-                        let gas = match native_gas_to_token_a_base_units(
-                            gas_used,
-                            effective_gas_price,
-                            bounds.gas_conversion_price_token_a,
-                            self.quote_decimals,
-                        ) {
-                            Ok(gas) => gas,
-                            Err(error) => {
-                                tracing::error!(operation_id, error = %error, "reverted DEX gas accounting is unknown");
-                                return unknown(role, "dex:revert-accounting-unknown");
+                        let gas = if bounds.gas_conversion_price_token_a.is_zero() {
+                            tracing::warn!(
+                                operation_id,
+                                gas_used,
+                                effective_gas_price,
+                                "reverted DEX gas token-A conversion is unavailable"
+                            );
+                            0
+                        } else {
+                            match native_gas_to_token_a_base_units(
+                                gas_used,
+                                effective_gas_price,
+                                bounds.gas_conversion_price_token_a,
+                                self.quote_decimals,
+                            ) {
+                                Ok(gas) => gas,
+                                Err(error) => {
+                                    tracing::error!(operation_id, error = %error, "reverted DEX gas accounting is unknown");
+                                    return unknown(role, "dex:revert-accounting-unknown");
+                                }
                             }
                         };
                         tracing::warn!(
@@ -934,11 +945,11 @@ mod tests {
                 recovery_quote_token_a_base_units: 1_000,
                 recovery_sell_quote_token_a_base_units: 990,
                 recovery_buy_quote_token_a_base_units: 1_010,
-                maximum_recovery_loss_token_a_base_units: 10,
+                maximum_recovery_loss_token_a_base_units: 0,
                 maximum_fee_per_gas_wei: 2_500_000,
                 gas_conversion_price_token_a: Decimal::from(3_000),
-                maximum_gas_cost_token_a_base_units: 5,
-                bounded_profit_token_a_base_units: 15,
+                maximum_gas_cost_token_a_base_units: 0,
+                bounded_profit_token_a_base_units: 0,
             },
             dex_plan: DexSwapPlan {
                 route: DexRoutePlan::UniswapV3 {
