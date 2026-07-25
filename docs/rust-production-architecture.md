@@ -1,7 +1,7 @@
 # Rust production trading architecture
 
 Status: **authoritative**
-Last reviewed: 2026-07-25
+Last reviewed: 2026-07-26
 Applies to: production arbitrage, recovery, settlement, inventory, rebalancing,
 and delivery
 
@@ -92,11 +92,11 @@ balances/user data/gas ───┘              │
                      DEX receipt/accounting  Binance IOC hedge
                                                    │
                                                    v
-                                            residual recovery
+                                         bounded recovery
                               │                    │
                               └─────────┬──────────┘
                                         v
-                               balanced result/PnL
+                                terminal result/PnL
                                         │
                          ┌──────────────┴──────────────┐
                          v                             v
@@ -221,10 +221,10 @@ to inputs whose absence means that the current venue state is unknown.
 | --- | --- | --- |
 | Binance top | Requires a snapshot and rejects it when its `created_at` is more than 30 seconds old. An unchanged event-driven top can therefore age out. | Requires a price from the current connection generation and transport activity within 30 seconds. Ping/Pong or another valid frame keeps an unchanged top current; the age of the last price change is telemetry only. |
 | DEX state | Requires available DEX quote snapshots for both directions and applies the 30-second snapshot-age limit before opportunity calculation. Execution later requests an executable quote again. | Requires a hydrated local CLMM mirror and a canonical World Chain head observed within 30 seconds. Every accepted head refreshes liveness even when no configured pool changed. Prepared curves are per-pool calculation inputs, not a global readiness gate. |
-| Balance observations | The selected wallet token and native-balance observations use a 10-second maximum age. The legacy Binance balance cache has a 10-minute TTL and no equivalent observation-age check in `DetectArbitrageJob`. | Both the Binance account and World Chain wallet generations must exist and be no older than 10 seconds. Binance REST reconciliation runs every five seconds; canonical heads trigger block-pinned wallet refreshes. Missing or stale generations degrade the runtime. |
-| Balance sufficiency | Applies the legacy `3x` token multiplier and may reject a candidate when the wallet execution lane is busy. | Is not a global readiness decision. Each candidate uses `free - active exact reservations` and reserves only `exact_execution_envelope_v1`, including native gas. Insufficient available balance rejects that candidate only. |
+| Balance observations | The selected wallet token and native-balance observations use a 10-second maximum age. The legacy Binance balance cache has a 10-minute TTL and no equivalent observation-age check in `DetectArbitrageJob`. | Both the Binance account and World Chain ERC-20 wallet generations must exist and be no older than 10 seconds. Binance REST reconciliation runs every five seconds; canonical heads trigger block-pinned wallet token refreshes. Native balance and RPC gas price are not part of that snapshot. Missing or stale token generations degrade the runtime. |
+| Balance sufficiency | Applies the legacy `3x` token multiplier and may reject a candidate when the wallet execution lane is busy. | Is not a global readiness decision. Each candidate uses `free - active exact reservations` and reserves only its exact primary token debits. Native gas is an operator-maintained invariant and is not synchronized or reserved. Insufficient available token balance rejects that candidate only. |
 | Binance User Data and account hygiene | Has no User Data Stream readiness boundary in the arbitrage path. | User Data accelerates balance/order observations but is not a readiness gate. Disconnects, unknown events, foreign or open orders, and nonzero locked balances remain diagnostic. A successful REST account snapshot reconciles state and clears the anomaly flag; only `free` balance is spendable. |
-| Gas-price data | Has no independent gas-price freshness gate for opportunity detection. | Has no gas-price or native-token-conversion readiness gate. The current RPC fee and native balance are used to construct and reserve a transaction, while the 20 bps venue spread remains the profitability gate. |
+| Gas-price data | Has no independent gas-price freshness gate for opportunity detection. | Has no gas-price, native-balance, or native-token-conversion readiness/admission gate. The current RPC fee is obtained only when constructing the EIP-1559 transaction. Realized receipt accounting includes both `gasUsed * effectiveGasPrice` and World Chain `l1Fee`. |
 | Full Binance depth | Does not require a local sequence-consistent depth book. | Depth can support adaptive sizing, but its health does not change DEX-first runtime readiness. The reviewed top-only fallback remains independently capped. |
 | Execution lane | A busy wallet lane can reject the detected attempt. | Lane availability is scheduling, not data readiness. A candidate enters the latest-only mailbox while the lane is busy; a newer candidate supersedes it, and the newest pending candidate is considered as soon as the lane is released. |
 
@@ -256,23 +256,24 @@ candidate's exact reservation remain separate authorization controls.
    buy token B on DEX/sell on CEX, and sell token B on DEX/buy on CEX.
 2. The configured 20 bps gross venue spread remains the Rails-compatible
    opportunity gate.
-3. Binance commission, DEX execution reserve, gas accounting, recovery bounds,
-   inventory, and notional caps must still be calculated and persisted for
-   every admitted plan, but gas-conversion liveness is not checked.
-4. The native gas reservation and worst-case recovery are safety/capital
-   inputs. Neither gas converted to USDC nor recovery profitability is an
-   opportunity threshold: the configured 20 bps gross venue spread is the only
+3. Uniswap pool fees are already included in the exact local CLMM quote.
+   Execution slippage changes only `amount_out_minimum`; it never increases
+   `amount_in`, changes gross economics, or introduces a provider fee reserve.
+4. Native gas funding is an operator-maintained invariant. Native balance and
+   gas price are not balance-sync, admission, or reservation inputs. Neither
+   gas converted to USDC nor recovery profitability is an opportunity
+   threshold: the configured 20 bps gross venue spread is the only
    profitability gate.
-5. Baseline sizing preserves the reviewed Rails-compatible notional. Adaptive
-   sizing may select only an exact Binance-step-aligned amount within the
-   versioned 200 USDC cap, depth age/update-delta limits, and the 40 USDC
-   top-only cap.
-6. Candidate ranking uses executable expected primary economics, not raw spread
-   alone. A change to the profitability gate or ranking objective requires a
-   reviewed config version and an equal-window comparison.
-7. Admission atomically reserves `exact_execution_envelope_v1`: DEX input,
-   Binance hedge inventory, and native gas. The legacy Rails `3x` multiplier is
-   forbidden.
+5. Baseline sizing preserves the reviewed 20 USDC detector. Adaptive sizing
+   may select only the largest exact Binance-step-aligned DEX-curve amount
+   within the versioned 200 USDC cap. Binance top quantity, full depth,
+   recovery forecasts, gas economics, and inventory are not sizing inputs.
+6. Candidate selection maximizes the valid exact-input notional after the
+   baseline direction clears 20 bps. There is no expected-profit ranking or
+   theoretical capacity pass.
+7. Admission atomically reserves only the exact DEX input and Binance primary
+   debit. Native gas, hypothetical recovery, and the legacy Rails `3x`
+   multiplier are forbidden reservation inputs.
 
 ## Scheduling and preflight decisions
 
@@ -331,21 +332,63 @@ this is tracked as priority debt below.
 2. Quantity is rounded conservatively to Binance filters. Commission is part of
    the signed venue delta.
 3. The primary hedge is a deterministic LIMIT IOC.
-4. After the DEX receipt, the coordinator must observe the latest Binance top
-   before placing the IOC. The admission-time price remains an immutable
-   economic reference, not necessarily the only executable price.
-5. Any repricing must stay inside the admitted recovery/exposure envelope. It
-   cannot create a larger unreserved liability.
-6. Partial or zero primary fills are measured from the terminal Binance order.
-   Recovery acts only on the exact actionable residual.
-7. DEX-first recovery may only reduce the existing exposure. A recovery that
-   flips direction halts that parent but does not halt unrelated plans.
-8. MARKET recovery is allowed for the bounded residual because exposure already
-   exists. It uses a deterministic client ID and durable journal.
+4. The admission-time price is the immutable protection boundary. After the
+   DEX receipt, a fresh current in-memory top may improve the IOC price in one
+   direction only:
+   - SELL uses `max(admission bid, current bid)`;
+   - BUY uses `min(admission ask, current ask)`.
+   An absent, stale, or adverse current top keeps the admission price. It never
+   weakens the limit and never blocks closure of an already-created exposure.
+5. The selected price is journaled before CEX dispatch so restart replay uses
+   the identical order intent and deterministic client ID.
+6. Repricing changes price only. It cannot increase the exact hedge quantity
+   or create a larger unreserved liability.
+7. Partial or zero primary fills are measured from the terminal Binance order.
+   The coordinator freezes one MARKET recovery target equal to
+   `primary hedge target - primary executed quantity`.
+8. A proven zero-fill/unsubmitted/rejected child may retry that same immutable
+   target at most three total attempts. Backoff deadlines of 250 ms then 500 ms
+   are persisted before waiting; child IDs are deterministic `r1`–`r3`.
+9. Partial/full fills and Unknown outcomes never advance to another attempt.
+   Recovery results never recalculate a residual target. Exhaustion finishes
+   the parent; any remaining WLD delta is result and inventory telemetry.
+10. Every primary and recovery order emits joinable
+    `arbitrage_binance_order` telemetry keyed by `plan_id` and
+    `client_order_id`:
+    - `primary_price_selection` records admission price, fresh in-memory top,
+      selected price, and whether the price was improved;
+    - `planned` records the exact LIMIT/MARKET request, target and submitted
+      quantity, the in-memory bid/ask immediately before placement, and whether
+      the LIMIT was marketable at that top;
+    - `terminal` records exchange transaction time, status and
+      zero/partial/full class, executed and quote quantities, average execution
+      price, every fill, commissions, and unknown-outcome reconciliation;
+    - `error` records unsubmitted, rejected, or unresolved outcomes.
+    For the MARKET fallback, `planned` additionally records a hypothetical
+    same-side LIMIT at the fresh in-memory bid/ask and whether visible top
+    quantity covered the order. `terminal` records MARKET price advantage
+    versus that limit, whether the average and all reported fills respected the
+    limit, placement-to-terminal duration, the terminal memory top, and an
+    explicitly diagnostic success proxy. The proxy is not evidence of queue
+    position or guaranteed LIMIT execution.
 
-Post-receipt IOC repricing is a target decision. The current implementation
-still places the admission-time price; changing it requires tests and measured
-comparison, but does not require revisiting DEX-first ordering.
+The primary IOC is still attempted when the current market is worse than the
+admission boundary. A partial or zero fill proceeds to bounded MARKET
+fallback; adverse repricing is never used to make the LIMIT more
+aggressive.
+
+MARKET recovery remains the production control until this telemetry has a
+representative sample. A future reviewed experiment may replace the two-step
+LIMIT-then-MARKET path with one order priced from the best fresh in-memory top.
+That decision must compare IOC full/partial/zero-fill rates, the
+`limit_marketable_at_memory_top` cohort, LIMIT-to-MARKET latency, and MARKET
+average execution price versus the placement-time top. Continuous
+`binance_book_ticker` telemetry provides the intervening top evolution. The
+joinable `arbitrage_execution_stage` events provide microsecond worker queue,
+WebSocket placement, and total execution durations. The
+experiment must not be inferred from a single order. It must separately compare
+top-covered and non-top-covered recovery cohorts and unknown-reconciliation
+cohorts.
 
 ## Unknown outcomes and dead-end policy
 
@@ -353,9 +396,17 @@ An unresolved plan must never close the global execution lane permanently.
 
 - `UNKNOWN` holds only that plan's exact reservation and journal identity.
 - Later plans may execute when their own required inventory is available.
-- The same child mutation is never retried under a new identity.
-- Venue reconciliation may replace an unknown child result only with proven
-  terminal data.
+- The same child mutation is never blindly retried under a new identity.
+- Binance reconciliation queries the same deterministic client ID once. A
+  terminal order contributes its actual fills. `-2013 NO_SUCH_ORDER` proves
+  that the child is absent and immediately allows ordinary recovery; a
+  timeout/5xx/transport/protocol failure of the status query remains Unknown
+  and cannot authorize a new mutation.
+- Venue reconciliation may replace an unknown child result only with terminal
+  data or the bounded Binance proof that the order is absent.
+- After restart, an `UnknownExposure` parent reconstructs the exact same CEX
+  command. The Binance journal treats it as a status lookup, never as a new
+  placement, and the parent then resumes from the reconciled result.
 - A known DEX revert with zero token movement is a terminal loss equal to gas,
   not an unknown exposure.
 - `Halted` and `UnknownExposure` are observable parent states, not global
@@ -368,10 +419,17 @@ and runtime-readiness failures remain legitimate global safety gates.
 
 ## Accounting and settlement decisions
 
-1. A balanced result has no actionable token-B residual. Sub-step dust remains
-   visible and receives a conservative token-A mark.
+1. `balanced_profit` and `balanced_loss` are legacy terminal stage names. A
+   terminal result may retain a token-B inventory delta of any size. The signed
+   delta remains visible and receives a conservative token-A mark, but it is
+   accounting only and never triggers another order.
 2. Comparable PnL includes actual DEX/CEX deltas, Binance commissions, recovery,
    and DEX gas exactly once.
+   A BNB-discount commission is retained as an exact negative BNB delta and
+   valued with the fresh accounting-only BNBUSDT bid, matching Rails'
+   USDT/USDC parity convention. The BNB feed cannot enter readiness, admission,
+   sizing, preflight, or recovery. Missing valuation marks PnL incomplete but
+   never changes a known Binance fill into Unknown exposure.
 3. Favorable DEX output outside the immutable hedge envelope remains inventory
    and must be visible in subsequent wallet snapshots and rebalance accounting.
 4. A balanced reservation becomes `PendingSettlement`; it is released only
@@ -438,12 +496,10 @@ The current frozen baseline is
    canonical WebSocket ordering/reorgs. The 24-hour baseline deferred 254 of
    265 filled-plan catch-ups and rejected 2,820 candidate admission attempts
    during settlement.
-2. **Post-receipt hedge decision:** record latest top at receipt and placement,
-   then use bounded current-top IOC repricing inside the admission envelope.
-3. **Execution cohort quality:** explain why only 95 of 317 executed plans had
+2. **Execution cohort quality:** explain why only 95 of 317 executed plans had
    positive expected primary economics although 4,360 of 6,872 admissions did.
    Preserve latest-only semantics; improve selection and stability evidence.
-4. **Unknown root causes:** the eight unknowns did not block later work, but
+3. **Unknown root causes:** the eight unknowns did not block later work, but
    their exact DEX/Binance transport causes and held reservations must be
    reconciled and monitored.
 

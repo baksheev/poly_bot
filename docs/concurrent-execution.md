@@ -1,7 +1,7 @@
 # Concurrent DEX/CEX execution
 
 Status: proposed experiment; DEX-first remains the production control
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-26
 
 This proposal is subordinate to `rust-production-architecture.md`. In
 particular, an unresolved parent may retain its own exposure and reservations
@@ -72,7 +72,7 @@ The coordinator supports both existing opportunity directions:
 | `buy_token_b_on_cex_sell_on_dex` | spend token B, receive token A | buy token B | token B on DEX and token A on Binance |
 
 Inventory is reserved before dispatch and released only after the coordinator
-reaches a balanced terminal state. Two plans must never reserve the same funds,
+reaches a known terminal state. Two plans must never reserve the same funds,
 wallet nonce, or Binance order namespace.
 
 ## Preconditions
@@ -233,15 +233,16 @@ prepared
      -> balanced_profit
      -> recovering_dex_orphan
      -> recovering_cex_orphan
-     -> recovering_residual
+     -> recovering_primary_shortfall
      -> balanced_loss
      -> unknown_exposure
      -> halted
 ```
 
-`balanced_profit` and `balanced_loss` are the only successful terminal states.
-They mean the absolute token-B exposure is zero or below an explicitly accepted
-dust threshold, not merely that both adapters returned success.
+`balanced_profit` and `balanced_loss` are retained terminal stage names for
+journal compatibility. A terminal result may contain a known token-B inventory
+delta; that delta is marked in PnL and monitored, but it does not authorize
+another balancing order.
 
 `unknown_exposure` retains that parent's exact reservations and continues venue
 reconciliation. `halted` stops that parent after a configured hard risk limit
@@ -262,40 +263,36 @@ net_token_b =
 
 Expected quote amounts, requested quantities, acknowledgements, and local book
 depth are not fills. DEX amounts come from the canonical receipt/logs. CEX
-amounts come from execution events and reconciled order status. Every transition
-recomputes `net_token_b`; recovery always targets only this residual.
+amounts come from execution events and reconciled order status. The final
+`net_token_b` is retained as accounting and inventory telemetry. Execution
+creates one immutable recovery target derived from the primary DEX/CEX mismatch.
+Proven zero-execution children may retry within the common three-attempt bounded
+policy; recovery fills never recalculate a new target.
 
 ## Recovery policies
 
 ### DEX terminal failure, CEX filled
 
-1. Compute the exact CEX-filled token-B residual.
-2. Submit the opposite `LIMIT IOC` at the initial fill VWAP, rounded in the
-   conservative direction to Binance tick size.
-3. Reconcile its actual fill.
-4. Submit `MARKET` for the remaining residual.
-5. If the market order remains rejected or unknown after reconciliation, enter
-   `halted`; do not continue opening risk.
-
-The break-even limit is one immediate attempt, not a resting GTC order. Waiting
-for a passive fill leaves the service directionally exposed for an unbounded
-period.
+1. Compute and freeze the primary DEX/CEX token-B mismatch.
+2. Submit MARKET recovery for that quantity.
+3. Retry only proven zero-execution children within the bounded backoff policy.
+4. Record any remaining token-B delta as inventory/PnL telemetry; do not
+   recalculate a residual balance order.
 
 ### CEX terminal failure, DEX confirmed
 
 1. Derive actual token-B exposure from the DEX receipt.
 2. Confirm that the initial CEX order is terminal and account for any partial
    fill.
-3. Submit a CEX `MARKET` order for the remaining residual.
-4. Reconcile actual fills and repeat only for a proven residual, never for the
-   original requested quantity.
-5. Halt if the residual cannot be removed inside the loss or time limit.
+3. Submit bounded CEX MARKET recovery for the immutable primary shortfall.
+4. Reconcile every child and record any remaining token-B delta without a
+   residual-based balance order.
 
 ### Both legs succeed with different quantities
 
-Compute the signed residual and submit one CEX `MARKET` recovery in the required
-direction. This covers CEX partial fills, DEX exact-input output variance, fee
-rounding, and accepted dust policy.
+Compute and freeze the primary DEX/CEX mismatch and use the bounded MARKET
+recovery policy in the required direction. Recovery results do not resize the
+target; a known inventory delta may remain after completion.
 
 ### DEX pending or unknown
 
@@ -662,8 +659,9 @@ drives the coordinator through at least:
 Property tests must prove:
 
 - duplicate events and retries cannot create duplicate economic orders;
-- recovery quantity never exceeds the proven residual;
-- no state marked balanced retains exposure above the dust threshold;
+- every retry uses exactly the immutable proven primary DEX/CEX mismatch;
+- a known terminal state may retain inventory drift, but that drift can never
+  create another order;
 - unknown venue status never becomes a silent success or failure;
 - every risk-limit breach blocks new entries;
 - ClickHouse failure never blocks dispatch or recovery;

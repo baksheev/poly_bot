@@ -531,6 +531,14 @@ pub struct BinanceConfig {
     pub symbol: String,
     pub base_asset: String,
     pub quote_asset: String,
+    /// Optional discounted-fee asset. Historical artifacts omit it; live
+    /// production config declares BNB explicitly.
+    #[serde(default)]
+    pub commission_asset: Option<String>,
+    /// Spot symbol whose bid values one commission asset in token-A-equivalent
+    /// quote units, matching Rails' BNBUSDT valuation.
+    #[serde(default)]
+    pub commission_price_binance_symbol: Option<String>,
     pub market_data_product: BinanceProduct,
     pub execution_product: BinanceProduct,
     pub step_size: String,
@@ -554,6 +562,21 @@ impl BinanceConfig {
             self.symbol == format!("{}{}", self.base_asset, self.quote_asset),
             "Binance symbol must equal base_asset + quote_asset"
         );
+        ensure!(
+            self.commission_asset.is_some() == self.commission_price_binance_symbol.is_some(),
+            "binance commission_asset and commission_price_binance_symbol must be configured together"
+        );
+        if let (Some(asset), Some(symbol)) = (
+            self.commission_asset.as_deref(),
+            self.commission_price_binance_symbol.as_deref(),
+        ) {
+            validate_symbol("binance.commission_asset", asset)?;
+            validate_symbol("binance.commission_price_binance_symbol", symbol)?;
+            ensure!(
+                symbol.starts_with(asset),
+                "Binance commission price symbol must use commission_asset as its base"
+            );
+        }
         ensure!(
             self.market_data_product == BinanceProduct::Spot,
             "opportunity sizing requires Binance Spot market data"
@@ -612,7 +635,11 @@ pub struct StrategyConfig {
     pub min_slippage_bps: u16,
     pub max_slippage_bps: u16,
     pub slippage_profit_share_bps: u16,
-    pub dex_fee_reserve_bps: u16,
+    /// Deserializes historical artifacts that copied the 0x-only four-basis-
+    /// point reserve. Uniswap V3/V4 execution never reads this value, and the
+    /// production v12 artifact omits it.
+    #[serde(default, rename = "dex_fee_reserve_bps")]
+    pub legacy_dex_fee_reserve_bps: Option<u16>,
     /// Read-only compatibility for pre-adaptive artifacts. Rust inventory
     /// reservations use an exact execution envelope and never multiply claims.
     #[serde(default = "default_legacy_balance_safety_multiplier")]
@@ -651,7 +678,9 @@ impl StrategyConfig {
             "strategy.slippage_profit_share_bps",
             self.slippage_profit_share_bps,
         )?;
-        validate_bps("strategy.dex_fee_reserve_bps", self.dex_fee_reserve_bps)?;
+        if let Some(legacy_dex_fee_reserve_bps) = self.legacy_dex_fee_reserve_bps {
+            validate_bps("strategy.dex_fee_reserve_bps", legacy_dex_fee_reserve_bps)?;
+        }
         ensure!(
             self.balance_safety_multiplier > 0,
             "strategy.balance_safety_multiplier must be positive"
@@ -1088,8 +1117,22 @@ mod tests {
             "0.000100000000000"
         );
         assert_eq!(
+            loaded.snapshot().pairs[0]
+                .binance
+                .commission_asset
+                .as_deref(),
+            Some("BNB")
+        );
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .binance
+                .commission_price_binance_symbol
+                .as_deref(),
+            Some("BNBUSDT")
+        );
+        assert_eq!(
             loaded.fingerprint_sha256(),
-            "87c98bc92b28dc8f168bddbd4009cb1068097e03fef9042c5d942d68541cf596"
+            "841be7d0345c229a8295653f7e9c7292016a6dfa39f9f2b16b928503b4e6ea48"
         );
     }
 

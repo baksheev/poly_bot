@@ -17,6 +17,7 @@ use crate::config::AppConfig;
 
 pub const ARBITRAGE_RESULT_KIND: &str = "arbitrage_result";
 pub const ARBITRAGE_EXECUTION_STAGE_KIND: &str = "arbitrage_execution_stage";
+pub const ARBITRAGE_BINANCE_ORDER_KIND: &str = "arbitrage_binance_order";
 
 #[derive(Clone)]
 pub struct TelemetryHandle {
@@ -340,7 +341,7 @@ fn validate_identifier(value: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARBITRAGE_RESULT_KIND, validate_identifier};
+    use super::{ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_RESULT_KIND, validate_identifier};
 
     #[test]
     fn clickhouse_identifier_is_restricted() {
@@ -351,5 +352,6 @@ mod tests {
     #[test]
     fn live_result_kind_matches_the_materialized_view_contract() {
         assert_eq!(ARBITRAGE_RESULT_KIND, "arbitrage_result");
+        assert_eq!(ARBITRAGE_BINANCE_ORDER_KIND, "arbitrage_binance_order");
     }
 }

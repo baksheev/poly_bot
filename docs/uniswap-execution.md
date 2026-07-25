@@ -7,25 +7,55 @@ separate historical validation tool and is not a routine production path.
 
 ## Rails gas parity
 
-The implementation follows the current Rails services rather than generic gas
-defaults:
+Rails receives a gas estimate from the executable Uniswap quote. It uses:
 
-- V3 uses the quoted gas multiplied by `2`.
-- V4 uses the quoted gas multiplied by `4`, with a `250,000` minimum.
-- A caller can add `additional_gas` after that multiplier.
-- If the local Rust quote has no Quoter gas field, the same multiplier is
-  applied to `eth_estimateGas`; the Rails fallback (`800,000` for V3 and
-  `250,000` for V4) remains a floor.
+- V3: quoted gas multiplied by `2`;
+- V4: quoted gas multiplied by `4`, with a `250,000` minimum;
+- `additional_gas`, when explicitly supplied, after that multiplier.
+
+Rust's production local curves do not contain the Quoter gas field, and the
+immediate live path deliberately does not add `eth_estimateGas` latency between
+dispatch and signing. Its static fallback therefore comes from Rails production
+history rather than a generic default. For receipts dated
+2026-05-25 through 2026-07-25:
+
+| Protocol and direction | Executed quote p50 | Executed quote p95 | Actual gas p95 | Actual gas max | Rust live fallback |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| V3 USDC -> WLD | 89,263 | 95,176 | 132,682 | 196,889 | 250,000 |
+| V3 WLD -> USDC | 92,938 | 98,887 | 126,001 | 156,138 | 250,000 |
+| V4 USDC -> WLD | 37,009 | 37,169 | 135,363 | 190,956 | 250,000 |
+| V4 WLD -> USDC | 37,229 | 37,361 | 128,707 | 150,137 | 250,000 |
+
+The unified `250,000` fallback leaves about 27% headroom over the largest
+observed V3 receipt and 31% over the largest V4 receipt. It also preserves the
+Rails V4 minimum. This fallback covered every one of the 83,577 V3 and 30,410
+V4 historical receipts in that window. It is a versioned empirical fallback,
+not a claim that gas use can never grow; new router bytecode or materially
+different routes require remeasurement.
+
+The manual simulation path still combines a fresh `eth_estimateGas` result
+with the same protocol multiplier and historical floor.
+
+Fee construction and accounting remain Rails-compatible:
+
 - EIP-1559 priority fee is `1,500,000 wei` and
   `max_fee_per_gas = eth_gasPrice + priority_fee`, matching
   `EthWalletService`.
 - `eth_gasPrice` is cached for five seconds inside the execution owner.
-- Gas limit retains an independent safety cap, and the wallet's native balance
-  must cover the admission-time gas budget.
+- If `eth_gasPrice` fails, the executor uses the Rails World Chain fallback
+  `100,000 wei`. A fallback is not cached, so the next transaction retries RPC.
+- Receipt cost is `gasUsed * effectiveGasPrice + l1Fee`. The OP Stack
+  `l1Fee` is the L1 data-publication charge; it changes realized cost but
+  cannot prevent or cause an EVM revert.
+- Gas limit retains an independent safety cap. Production admission does not
+  sample or reserve the wallet's native balance; gas funding is an
+  operator-maintained invariant. The separate manual validation command still
+  checks native funding before it mutates the wallet.
 
 Gas limits retain Rust safety ceilings. Gas price follows Rails: immediately
-before signing, the executor uses fresh `eth_gasPrice` plus the configured
-priority fee without an admission-time or absolute fee cap.
+before signing, the executor uses cached-or-fresh `eth_gasPrice`, or the
+`100,000 wei` fallback when that RPC fails, plus the configured priority fee.
+There is no admission-time or absolute fee cap.
 
 ## Single owner and safe outcomes
 
@@ -57,11 +87,14 @@ validation path therefore waits until `latest.number >= receipt.block_number`
 and reads USDC and WLD through one block-pinned batch before accepting a balance
 delta. It never treats an immediately stale balance as transaction failure.
 
-The reusable execution service also parses canonical ERC-20 `Transfer` logs
+The reusable execution service also parses the receipt's OP Stack `l1Fee` and
+canonical ERC-20 `Transfer` logs
 from the successful receipt. It requires the wallet's net input-token delta to
 equal the submitted exact input and the net output-token delta to clear the
 submitted minimum, then returns both base-unit deltas with gas used and
-effective gas price. This gives the parent coordinator actual DEX amounts
+effective gas price. Both the L2 execution fee and `l1Fee` enter realized
+token-A accounting for successful and reverted transactions. This gives the
+parent coordinator actual DEX amounts
 without a race against a later balance snapshot; post-trade snapshots remain
 the independent settlement check.
 

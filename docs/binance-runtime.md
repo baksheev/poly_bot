@@ -1,7 +1,7 @@
 # Binance runtime parity and low-latency design
 
 Status: autonomous Spot execution and rebalancing enabled in GKE production
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-26
 
 ## Decisions
 
@@ -40,8 +40,8 @@ arbitrage execution jobs in the Rails application.
 | `GET /api/v3/account` | Not present in Rails | Add as the trading-account hydration source for permissions and nonzero free/locked balances. |
 | `GET /api/v3/account/commission` | Not present in Rails | Add at startup per traded symbol so opportunity math uses the real account fee. |
 | `POST /sapi/v3/asset/getUserAsset` | Rails balance snapshots, investment, and rebalance | Do not use for the Rust trading path. `account` plus User Data Stream is lower-weight and directly matches Spot execution state. |
-| `POST /api/v3/order`, `LIMIT IOC` | Primary Rails hedge at the opportunity price | Preserve semantics, but send with WebSocket API `order.place` on a persistent connection. |
-| `POST /api/v3/order`, `MARKET quantity` | Rails hedge fallback and recovery | Preserve residual-only recovery. The primary order is LIMIT IOC; an exact remaining quantity may use the bounded autonomous MARKET recovery path with a deterministic child identity. |
+| `POST /api/v3/order`, `LIMIT IOC` | Primary Rails hedge at the opportunity price | Send with WebSocket API `order.place` on a persistent connection. The admission price remains the protection boundary; a fresh post-DEX in-memory top may improve SELL upward or BUY downward, but an adverse top never weakens the limit. |
+| `POST /api/v3/order`, `MARKET quantity` | Rails hedge fallback and recovery | After a partial or zero primary LIMIT IOC, freeze `primary target - primary executed quantity`. Retry only proven zero-fill/unsubmitted/rejected children, with deterministic `r1`–`r3` IDs and persisted 250/500 ms backoff. Partial/full fills and Unknown outcomes never advance attempts. |
 | `POST /api/v3/order`, `MARKET quoteOrderQty` | Periodic investment of excess token-A profit | Preserve only in the later non-critical parity slice; it is not part of arbitrage execution. |
 | `GET /api/v3/order` | Find an order by order ID or deterministic client order ID after an ambiguous create | Preserve as `order.status` over WebSocket API, with REST as an independent recovery fallback. |
 | User Data Stream | Missing in Rails | Implemented through signed WebSocket API subscription. `executionReport`, `outboundAccountPosition`, and `balanceUpdate` feed the single runtime owner as event-driven acceleration and diagnostics. Stream termination, unknown events, foreign orders, and locked balances do not close runtime readiness; the independent REST balance snapshot is the recoverable account-state boundary. |
@@ -72,18 +72,23 @@ Rails currently:
    retry.
 4. If the IOC expires after a partial fill, submits a market order only for
    the remaining quantity using `arb<swap-id>M`.
-5. If the initial Binance leg fails after DEX success, retries the market hedge
-   asynchronously until exposure is closed.
+5. Reconciles ambiguous placement under the same deterministic client ID; a
+   terminal MARKET result does not start a second balancing order.
 
-Rust preserves the residual-only recovery quantity. Production `dex_first`
+Rust preserves the Rails retry shape with a bounded, durable policy. Production `dex_first`
 admission consumes the relevant real-time
 `bookTicker` level and persists that primary execution bound without waiting
 for `depth@100ms`; exact sequence-consistent depth is a fallback when the top
 level is too small. Concurrent execution continues to consume both sides of
 the local depth book. The primary order is LIMIT IOC. If it does not fill the
 exact hedge quantity, the coordinator submits only the remaining quantity
-through the capped MARKET recovery path. A single state machine owns each
-attempt. Deterministic rejections become known zero-fill failures. Network
+through an immutable MARKET recovery target. Proven zero executions can retry
+that same target up to three total attempts; the target is never recomputed from
+prior recovery results. Partial/full fills, Unknown outcomes, or exhaustion
+finish the retry chain. Any remaining WLD delta is accounting/inventory drift
+and never feeds a residual-based MARKET order. A single state machine owns the
+recovery chain.
+Deterministic rejections become known zero-fill failures. Network
 timeout, 5xx, disconnect, or a missing response means `UNKNOWN`, never
 `FAILED`; deterministic client IDs and durable journals prevent duplicate
 placement. An unknown child retains only its exact reservation and does not

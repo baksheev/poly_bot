@@ -393,8 +393,6 @@ mod tests {
                 chain_id: 480,
                 block_number: 1,
                 block_hash: B256::ZERO,
-                native_balance_wei: U256::ONE,
-                gas_price_wei: 1,
                 token_balances: vec![
                     WalletTokenBalance {
                         symbol: Arc::from("USDC"),

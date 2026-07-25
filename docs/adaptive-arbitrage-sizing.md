@@ -1,7 +1,7 @@
 # Adaptive arbitrage sizing
 
 Status: production architecture
-Last reviewed: 2026-07-25
+Last reviewed: 2026-07-26
 
 ## Decision
 
@@ -65,7 +65,7 @@ The candidate is valid when:
 ```text
 DEX exact quote exists
 and gross_profit_bps >= 20
-and execution notional including DEX-buy input headroom <= 200 USDC
+and exact DEX input notional <= 200 USDC
 ```
 
 `TradeEvaluation.cost_token_a` and `proceeds_token_a` are raw venue economics.
@@ -78,11 +78,18 @@ Rails-compatible slippage is derived as:
 slippage_bps = clamp(floor(gross_profit_bps * 0.5), 5, 50)
 ```
 
-For DEX-buy, `dex_amount_in` is the exact-output quote plus slippage and the
-configured 4 bps Rails input headroom. Rust requotes that exact input and sets
-`dex_amount_out_minimum` to the requoted output minus slippage. For DEX-sell,
-the token-B input is unchanged and only the quoted token-A output is reduced by
-slippage. These are calldata validity bounds, not economic deductions.
+V3/V4 pool fees are already included by the local CLMM quote. Both directions
+execute as exact-input swaps: the selected `dex_amount_in` is immutable and is
+never increased by slippage or a provider fee reserve. Rust quotes that exact
+input against the prepared curve and sets `dex_amount_out_minimum` to the
+quoted output reduced by the configured slippage. Slippage is therefore only a
+calldata validity bound, not an economic deduction or an input-size multiplier.
+
+Rails' Uniswap services use the same exact-input router contract and reduce
+only `min_buy_amount`, but the upstream Rails detector still increases DEX-buy
+input by both slippage and the legacy `ZERO_X_FEE_BPS`. That provider-agnostic
+uplift is not copied: it originated in the 0x path, while Uniswap fees are
+already represented in the pool quote.
 
 The optimizer is bounded to 128 exact evaluations. A limit breach falls back
 to the baseline and emits a stable `evaluation_limit` reason.
@@ -96,29 +103,37 @@ native-gas-coverage gates.
 After selection, Rust builds one immutable DEX plan and atomically reserves
 only the primary execution debits:
 
-- DEX-buy / CEX-sell: exact wallet token-A input, planned Binance token-B sell,
-  and the maximum native transaction debit;
+- DEX-buy / CEX-sell: exact wallet token-A input and planned Binance token-B
+  sell;
 - CEX-buy / DEX-sell: planned Binance token-A buy cost, exact wallet token-B
-  input, and the maximum native transaction debit.
+  input.
 
 The reservation uses observed free balance minus active exact reservations.
 Insufficient balance is the only candidate-specific resource rejection.
 There is no Rails `3x` multiplier and no speculative recovery reservation.
 
-The native gas amount is reserved because the transaction physically requires
-native balance. Gas price and native-token conversion never participate in
-sizing or profitability. If the diagnostic conversion price is unavailable,
-token-A gas accounting is recorded as unavailable/zero without blocking the
-trade.
+Native gas funding is an operator-maintained invariant. Native balance and RPC
+gas price are absent from balance synchronization, admission, and inventory
+reservations. The executor obtains the current RPC gas price only when it
+constructs the EIP-1559 transaction. Receipt accounting includes both the L2
+execution charge (`gasUsed * effectiveGasPrice`) and World Chain's `l1Fee`;
+neither is a sizing or admission gate. If the native-token conversion price is
+unavailable, token-A gas accounting is recorded as unavailable/zero without
+blocking the trade.
 
 ## Execution and recovery
 
 The executor does not resize an admitted plan.
 
 DEX-first execution sends the DEX transaction and hedges the actual filled DEX
-delta on Binance. If the primary Binance order leaves a residual, recovery
-uses the actual residual and current MARKET execution. Sizing and admission do
-not attempt to forecast that recovery.
+delta on Binance. If the primary Binance IOC is partial or zero-fill, recovery
+creates one immutable MARKET target equal to the primary hedge target minus the
+primary executed quantity. A proven zero-fill/unsubmitted/rejected child may
+retry that same target up to three total attempts after persisted 250 ms and
+500 ms backoff. Partial/full fills and Unknown outcomes never retry. Recovery
+results are not used to recalculate a new residual target. Any remaining WLD
+delta is retained as inventory and marked in result accounting. Sizing and
+admission do not attempt to forecast recovery.
 
 Freshness and preflight remain separate execution-validity checks:
 

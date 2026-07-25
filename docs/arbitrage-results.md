@@ -1,7 +1,7 @@
 # Comparable arbitrage results
 
 Status: live parent accounting active in GKE production
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-26
 
 The Rust equivalent of Rails `arbitrage_results` is the ClickHouse
 `arbitrage_results` table. It is populated asynchronously from terminal parent
@@ -37,28 +37,51 @@ realized_profit_token_a =
   + signed recovery token-A balance deltas
   - gas converted to token A at the terminal accounting snapshot
 
-token_b_residual =
+final_token_b_inventory_delta =
     signed DEX token-B balance delta
   + signed initial CEX token-B balance delta
   + signed recovery token-B balance deltas
 
 comparable_profit_token_a =
     realized_profit_token_a
-  + conservative token-A mark of any non-actionable token-B residual
+  + conservative token-A mark of the final token-B inventory delta
 ```
 
-A balanced row requires no *actionable* residual: exact zero, or an absolute
-residual smaller than the Binance token-B step. Dust remains visible in
-`token_b_residual_base_units`. A positive residual is marked at the persisted
-Binance bid and a negative residual at the persisted ask. The mark is prorated
-by quantity, with assets rounded down and liabilities rounded up.
+The historical telemetry field remains named
+`token_b_residual_base_units`, but it now means the final signed WLD inventory
+delta after the primary order and its bounded recovery attempts. A terminal
+row may contain a delta of any size. A positive delta is marked at the
+persisted Binance bid and a negative delta at the persisted ask. The mark is
+prorated by quantity, with assets rounded down and liabilities rounded up.
+This value is accounting telemetry only: it never triggers a second automatic
+balance order. Aggregate signed and absolute drift are monitored over time; a
+separate inventory-balancing design is required if they become material.
 
-Binance commissions must already be reflected in the CEX balance deltas. DEX
-gas is recorded separately and subtracted exactly once. Recovery loss is broken
-out so a profitable primary spread cannot hide systematically expensive
+Production pays Binance commissions from the account's BNB balance. Recovery
+therefore never increases MARKET BUY quantity for a hypothetical WLD
+commission; both sides submit the immutable target rounded down to the exchange
+step. The actual discounted BNB fee follows the Rails accounting contract:
+
+- the exact negative BNB balance delta is retained in
+  `third_asset_deltas`;
+- the current in-memory `BNBUSDT` bid is retained in
+  `third_asset_prices_token_a`;
+- USDT and USDC are treated at numeric parity for this accounting conversion,
+  matching `CalculateArbitrageProfitJob`;
+- the converted cost is included in the realized token-A PnL but never changes
+  sizing, admission, hedge quantity, or recovery.
+
+If the accounting-only BNB feed is unavailable, the executed order and its
+residual still reconcile normally. The raw BNB delta remains durable and
+`third_asset_valuation_complete=false` identifies the result that must be
+revalued later; a missing auxiliary quote must not create Unknown exposure.
+
+DEX gas is recorded separately and subtracted exactly once. Recovery loss is
+broken out so a profitable primary spread cannot hide systematically expensive
 compensation. `realized_profit_token_a_base_units` remains the settled cash
-delta; `comparable_profit_token_a_base_units` is the criterion metric because it
-also carries economically real dust.
+delta after realized gas and third-asset fee valuation;
+`comparable_profit_token_a_base_units` is the criterion metric because it also
+carries economically real dust.
 
 The expected fields contain only the raw venue economics that cleared the
 20 bps gate. There is deliberately no expected-after-commission,
@@ -70,8 +93,9 @@ This maps to Rails as follows:
 | Rust | Rails `arbitrage_results` |
 | --- | --- |
 | `comparable_profit_token_a_base_units` | `estimated_profit`, converted to USDC base units |
-| `realized_profit_token_a_base_units` | settled USDC cash component before marking token-B dust |
+| `realized_profit_token_a_base_units` | actual token-A deltas plus valued BNB/ETH costs before marking token-B dust |
 | DEX/CEX signed deltas in `payload_json` | `token_a_balance_change`, `token_b_balance_change` |
+| CEX `third_asset_deltas.BNB` and its price | `bnb_balance_change`, `bnb_price` |
 | DEX gas converted to token A | `eth_balance_change * eth_price` contribution |
 | execution direction | `scenario` |
 | execution mode | no direct Rails field; filter Rust control to `dex_first` |
@@ -117,7 +141,8 @@ The operator-side Rails query must use `arbitrage_results.created_at` in the
 same interval and pair ID `3`. Rails Postgres remains a local export source; it
 is never a Rust runtime dependency or secret.
 
-The goal criterion is evaluated only after at least 100 balanced Rust trades.
+The goal criterion is evaluated only after at least 100 terminal Rust trades
+(stored under the legacy `balanced_profit`/`balanced_loss` outcomes).
 Report total and per-trade comparable USDC, with cash realized and the residual
 mark shown separately. Also report unknown/halted parent intents separately:
 excluding unresolved exposure from PnL does not make it economically harmless.

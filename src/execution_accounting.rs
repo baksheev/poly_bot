@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use alloy_primitives::U256;
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
@@ -7,6 +9,16 @@ use crate::{
     binance::ws_api::OrderResult,
     dex::execution::SwapExecutionOutcome,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommissionAssetValuation<'a> {
+    pub asset: &'a str,
+    /// Token-A-equivalent quote units per commission asset. Production uses
+    /// the fresh BNBUSDT bid, matching Rails' USDT-to-USDC parity treatment.
+    /// `None` preserves the exact BNB delta without blocking hedge recovery;
+    /// telemetry marks the resulting PnL valuation as incomplete.
+    pub price_in_token_a: Option<Decimal>,
+}
 
 pub fn dex_leg_result(
     direction: ArbitrageDirection,
@@ -21,8 +33,11 @@ pub fn dex_leg_result(
     };
     Ok(LegResult {
         status: LegStatus::Filled,
+        executed_token_b_delta_base_units: None,
         token_b_delta_base_units,
         token_a_delta_base_units,
+        third_asset_deltas: BTreeMap::new(),
+        third_asset_prices_token_a: BTreeMap::new(),
         gas_cost_token_a_base_units,
         venue_reference: format!("dex:{:#x}", outcome.transaction_hash),
         dex_settlement_log: outcome.settlement_log,
@@ -35,6 +50,7 @@ pub fn binance_leg_result(
     base_decimals: u8,
     quote_asset: &str,
     quote_decimals: u8,
+    commission_valuation: Option<CommissionAssetValuation<'_>>,
 ) -> anyhow::Result<LegResult> {
     ensure!(
         matches!(order.status.as_str(), "FILLED" | "EXPIRED" | "CANCELED"),
@@ -43,20 +59,50 @@ pub fn binance_leg_result(
     let changes = order
         .balance_changes(base_asset, quote_asset)
         .map_err(anyhow::Error::msg)?;
+    let mut token_a_change = changes.get(quote_asset).copied().unwrap_or(Decimal::ZERO);
+    let mut third_asset_deltas = BTreeMap::new();
+    let mut third_asset_prices_token_a = BTreeMap::new();
     for (asset, change) in &changes {
+        if asset == base_asset || asset == quote_asset || change.is_zero() {
+            continue;
+        }
+        let valuation = commission_valuation
+            .filter(|valuation| valuation.asset == asset)
+            .with_context(|| {
+                format!("Binance commission in {asset} requires token-A conversion")
+            })?;
         ensure!(
-            asset == base_asset || asset == quote_asset || change.is_zero(),
-            "Binance commission in {asset} requires token-A conversion"
+            *change < Decimal::ZERO,
+            "Binance third-asset commission delta must be negative"
         );
+        third_asset_deltas.insert(asset.clone(), *change);
+        if let Some(price) = valuation.price_in_token_a {
+            ensure!(
+                price > Decimal::ZERO,
+                "Binance commission token-A price must be positive"
+            );
+            let value = change
+                .checked_mul(price)
+                .context("Binance commission token-A valuation overflow")?;
+            token_a_change = token_a_change
+                .checked_add(value)
+                .context("Binance token-A delta plus commission overflow")?;
+            third_asset_prices_token_a.insert(asset.clone(), price);
+        }
     }
     let token_b_delta_base_units = decimal_to_signed_base_units(
         changes.get(base_asset).copied().unwrap_or(Decimal::ZERO),
         base_decimals,
     )?;
-    let token_a_delta_base_units = decimal_to_signed_base_units(
-        changes.get(quote_asset).copied().unwrap_or(Decimal::ZERO),
-        quote_decimals,
+    let executed_token_b_delta_base_units = decimal_to_signed_base_units(
+        match order.side.as_str() {
+            "BUY" => order.executed_qty,
+            "SELL" => -order.executed_qty,
+            _ => unreachable!("balance_changes already validated the order side"),
+        },
+        base_decimals,
     )?;
+    let token_a_delta_base_units = decimal_to_signed_base_units(token_a_change, quote_decimals)?;
     let status = if token_b_delta_base_units == 0 && token_a_delta_base_units == 0 {
         LegStatus::Failed
     } else {
@@ -64,8 +110,11 @@ pub fn binance_leg_result(
     };
     Ok(LegResult {
         status,
+        executed_token_b_delta_base_units: Some(executed_token_b_delta_base_units),
         token_b_delta_base_units,
         token_a_delta_base_units,
+        third_asset_deltas,
+        third_asset_prices_token_a,
         gas_cost_token_a_base_units: 0,
         venue_reference: format!("cex:{}", order.order_id),
         dex_settlement_log: None,
@@ -75,6 +124,7 @@ pub fn binance_leg_result(
 pub fn native_gas_to_token_a_base_units(
     gas_used: u64,
     effective_gas_price_wei: u128,
+    l1_fee_wei: u128,
     native_price_token_a: Decimal,
     token_a_decimals: u8,
 ) -> anyhow::Result<u128> {
@@ -89,9 +139,12 @@ pub fn native_gas_to_token_a_base_units(
     );
     let price_mantissa = u128::try_from(native_price_token_a.mantissa())
         .context("native-token price mantissa is negative")?;
-    let numerator = U256::from(gas_used)
+    let native_fee_wei = U256::from(gas_used)
         .checked_mul(U256::from(effective_gas_price_wei))
-        .and_then(|value| value.checked_mul(U256::from(price_mantissa)))
+        .and_then(|value| value.checked_add(U256::from(l1_fee_wei)))
+        .context("total L2 and L1 gas fee overflow")?;
+    let numerator = native_fee_wei
+        .checked_mul(U256::from(price_mantissa))
         .and_then(|value| value.checked_mul(pow10_u256(u32::from(token_a_decimals)).ok()?))
         .context("gas token-A numerator overflow")?;
     let denominator = pow10_u256(18)?
@@ -160,7 +213,10 @@ mod tests {
         dex::execution::{SwapExecutionOutcome, UniswapProtocol},
     };
 
-    use super::{binance_leg_result, dex_leg_result, native_gas_to_token_a_base_units};
+    use super::{
+        CommissionAssetValuation, binance_leg_result, dex_leg_result,
+        native_gas_to_token_a_base_units,
+    };
 
     fn order(side: &str, status: &str, executed: &str, quote: &str) -> OrderResult {
         OrderResult {
@@ -199,6 +255,7 @@ mod tests {
             block_number: 10,
             gas_used: 100,
             effective_gas_price: 2,
+            l1_fee: 3,
             token_in_spent: U256::from(1_000_u16),
             token_out_received: U256::from(1_100_u16),
             settlement_log: Some(crate::chain::logs::ChainLog {
@@ -235,9 +292,14 @@ mod tests {
             18,
             "USDC",
             6,
+            None,
         )
         .unwrap();
         assert_eq!(result.status, LegStatus::Filled);
+        assert_eq!(
+            result.executed_token_b_delta_base_units,
+            Some(-1_200_000_000_000_000_000)
+        );
         assert_eq!(result.token_b_delta_base_units, -1_200_000_000_000_000_000);
         assert_eq!(result.token_a_delta_base_units, 975_000);
     }
@@ -247,7 +309,7 @@ mod tests {
         let mut order = order("SELL", "FILLED", "51.90000000", "20.01264000");
         order.fills = vec![fill("0.38560000", "51.90000000", "0.02001264", "USDC")];
 
-        let result = binance_leg_result(&order, "WLD", 18, "USDC", 6).unwrap();
+        let result = binance_leg_result(&order, "WLD", 18, "USDC", 6, None).unwrap();
 
         assert_eq!(result.status, LegStatus::Filled);
         assert_eq!(result.token_b_delta_base_units, -51_900_000_000_000_000_000);
@@ -256,23 +318,109 @@ mod tests {
 
     #[test]
     fn zero_fill_expired_order_is_failed_without_fake_delta() {
-        let result =
-            binance_leg_result(&order("BUY", "EXPIRED", "0", "0"), "WLD", 18, "USDC", 6).unwrap();
+        let result = binance_leg_result(
+            &order("BUY", "EXPIRED", "0", "0"),
+            "WLD",
+            18,
+            "USDC",
+            6,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.status, LegStatus::Failed);
         assert_eq!(result.token_b_delta_base_units, 0);
         assert_eq!(result.token_a_delta_base_units, 0);
     }
 
     #[test]
+    fn binance_bnb_commission_uses_rails_bid_valuation() {
+        let mut order = order("SELL", "FILLED", "50", "20");
+        order.fills = vec![fill("0.4", "50", "0.0001", "BNB")];
+
+        let result = binance_leg_result(
+            &order,
+            "WLD",
+            18,
+            "USDC",
+            6,
+            Some(CommissionAssetValuation {
+                asset: "BNB",
+                price_in_token_a: Some(Decimal::new(600, 0)),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result.token_a_delta_base_units, 19_940_000);
+        assert_eq!(
+            result.third_asset_deltas.get("BNB"),
+            Some(&Decimal::new(-1, 4))
+        );
+        assert_eq!(
+            result.third_asset_prices_token_a.get("BNB"),
+            Some(&Decimal::new(600, 0))
+        );
+    }
+
+    #[test]
+    fn binance_unknown_commission_asset_still_requires_a_price() {
+        let mut order = order("SELL", "FILLED", "50", "20");
+        order.fills = vec![fill("0.4", "50", "0.0001", "BNB")];
+
+        let error = binance_leg_result(&order, "WLD", 18, "USDC", 6, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("commission in BNB requires token-A conversion")
+        );
+    }
+
+    #[test]
+    fn configured_bnb_commission_without_a_quote_keeps_exact_raw_delta() {
+        let mut order = order("SELL", "FILLED", "50", "20");
+        order.fills = vec![fill("0.4", "50", "0.0001", "BNB")];
+
+        let result = binance_leg_result(
+            &order,
+            "WLD",
+            18,
+            "USDC",
+            6,
+            Some(CommissionAssetValuation {
+                asset: "BNB",
+                price_in_token_a: None,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result.token_a_delta_base_units, 20_000_000);
+        assert_eq!(
+            result.third_asset_deltas.get("BNB"),
+            Some(&Decimal::new(-1, 4))
+        );
+        assert!(result.third_asset_prices_token_a.is_empty());
+    }
+
+    #[test]
     fn converts_native_gas_to_token_a_with_conservative_rounding() {
         assert_eq!(
-            native_gas_to_token_a_base_units(21_000, 1_000_000_000, Decimal::new(3_000, 0), 6,)
+            native_gas_to_token_a_base_units(21_000, 1_000_000_000, 0, Decimal::new(3_000, 0), 6,)
                 .unwrap(),
             63_000
         );
         assert_eq!(
-            native_gas_to_token_a_base_units(1, 1, Decimal::new(1, 0), 6).unwrap(),
+            native_gas_to_token_a_base_units(1, 1, 0, Decimal::new(1, 0), 6).unwrap(),
             1
+        );
+        assert_eq!(
+            native_gas_to_token_a_base_units(
+                21_000,
+                1_000_000_000,
+                1_000_000_000,
+                Decimal::new(3_000, 0),
+                6,
+            )
+            .unwrap(),
+            63_003
         );
     }
 }

@@ -64,6 +64,8 @@ pub struct TransactionReceipt {
     pub status: u64,
     pub gas_used: u64,
     pub effective_gas_price: u128,
+    /// World Chain/OP Stack L1 data-publication fee, denominated in wei.
+    pub l1_fee: u128,
     pub logs: Vec<ReceiptLog>,
 }
 
@@ -327,6 +329,12 @@ impl JsonRpcClient {
                 "receipt.effectiveGasPrice",
                 &receipt.effective_gas_price,
             )?,
+            l1_fee: receipt
+                .l1_fee
+                .as_deref()
+                .map(|value| parse_quantity_u128("receipt.l1Fee", value))
+                .transpose()?
+                .unwrap_or(0),
             logs: receipt
                 .logs
                 .into_iter()
@@ -585,6 +593,8 @@ struct WireTransactionReceipt {
     status: String,
     gas_used: String,
     effective_gas_price: String,
+    #[serde(default)]
+    l1_fee: Option<String>,
     #[serde(default)]
     logs: Vec<WireReceiptLog>,
 }

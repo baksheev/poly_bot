@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use crate::{
-    admission::{AdmissionEconomics, AdmissionInputs, evaluate_execution_admission},
+    admission::{AdmissionInputs, evaluate_execution_admission},
     arbitrage::{
         AdmissionRiskBounds, ArbitrageDirection as TradeDirection, EntryPreflightHandle,
         PaperOpportunity, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
@@ -65,10 +65,10 @@ pub struct TradingEngine {
     depth_health_by_symbol: BTreeMap<String, DepthHealthObservation>,
     strategy_price_transport_silence_limits_ms: BTreeMap<String, u64>,
     gas_price_symbol: String,
-    wallet_gas_symbol: String,
     gas_price_connected: bool,
     gas_price_generation: u64,
     gas_price_book: Option<TopOfBook>,
+    commission_price_symbol: String,
     binance_clock_sync: Option<BinanceClockSync>,
     rebalance_inventory_reservation: Option<String>,
     next_inventory_reservation: u64,
@@ -476,13 +476,21 @@ impl TradingEngine {
             .find(|pair| pair.market_data_enabled)
             .and_then(|pair| pair.chain.gas_price_binance_symbol.clone())
             .context("enabled pair has no versioned gas-price Binance symbol")?;
-        let wallet_gas_symbol = domain_config
+        let commission_pair = domain_config
             .snapshot()
             .pairs
             .iter()
             .find(|pair| pair.market_data_enabled)
-            .map(|pair| pair.chain.gas_symbol.clone())
-            .context("enabled pair has no versioned wallet gas symbol")?;
+            .context("enabled pair is missing")?;
+        let commission_price_symbol = commission_pair
+            .binance
+            .commission_price_binance_symbol
+            .clone()
+            .context("enabled pair has no versioned commission-price Binance symbol")?;
+        execution.entry_preflight.configure_max_transport_silence(
+            &commission_price_symbol,
+            commission_pair.strategy.max_transport_silence_ms(),
+        );
         let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &dex)?;
         for symbol in domain_config.binance_symbols() {
             opportunities.set_binance_fee_bps(
@@ -563,10 +571,10 @@ impl TradingEngine {
                 depth_health_by_symbol: BTreeMap::new(),
                 strategy_price_transport_silence_limits_ms,
                 gas_price_symbol,
-                wallet_gas_symbol,
                 gas_price_connected: false,
                 gas_price_generation: 0,
                 gas_price_book: None,
+                commission_price_symbol,
                 binance_clock_sync: None,
                 rebalance_inventory_reservation: None,
                 next_inventory_reservation: 0,
@@ -1275,6 +1283,78 @@ impl TradingEngine {
         self.gas_price_book.as_ref().map(|book| book.ask_price)
     }
 
+    /// Maintains the diagnostic/accounting-only Binance commission valuation
+    /// feed. It never changes runtime readiness, admission, sizing, or
+    /// preflight; the live executor reads it only after an order has filled.
+    pub fn on_commission_market_event(&mut self, event: MarketEvent) -> anyhow::Result<()> {
+        match event {
+            MarketEvent::FeedConnected {
+                symbol,
+                generation,
+                observed_at,
+            } => {
+                ensure!(
+                    symbol.as_ref() == self.commission_price_symbol,
+                    "commission-price feed symbol mismatch"
+                );
+                self.entry_preflight
+                    .on_feed_connected(symbol.as_ref(), generation, observed_at);
+            }
+            MarketEvent::FeedDisconnected {
+                symbol, generation, ..
+            } => {
+                ensure!(
+                    symbol.as_ref() == self.commission_price_symbol,
+                    "commission-price feed symbol mismatch"
+                );
+                self.entry_preflight
+                    .on_feed_disconnected(symbol.as_ref(), generation);
+            }
+            MarketEvent::FeedHeartbeat {
+                symbol,
+                generation,
+                observed_at,
+            } => {
+                ensure!(
+                    symbol.as_ref() == self.commission_price_symbol,
+                    "commission-price heartbeat symbol mismatch"
+                );
+                self.entry_preflight.record_transport_activity(
+                    symbol.as_ref(),
+                    generation,
+                    observed_at,
+                );
+                self.telemetry.emit(
+                    "binance_feed_heartbeat",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "product": "spot",
+                        "feed_role": "commission_conversion",
+                        "symbol": symbol.as_ref(),
+                        "generation": generation,
+                    }),
+                );
+            }
+            MarketEvent::BinanceTopOfBook(quote) => {
+                ensure!(
+                    quote.symbol.as_ref() == self.commission_price_symbol,
+                    "commission-price quote symbol mismatch"
+                );
+                self.entry_preflight.update_quote(&quote);
+                self.hot_telemetry.emit_binance_book(
+                    &quote,
+                    "commission_conversion",
+                    None,
+                    "stored",
+                );
+            }
+            MarketEvent::BinanceDepthApplied { .. } => {
+                anyhow::bail!("commission-price feed unexpectedly emitted depth")
+            }
+        }
+        Ok(())
+    }
+
     pub fn on_balance_event(&mut self, event: BalanceEvent) -> anyhow::Result<()> {
         let reservations_before = self
             .inventory
@@ -1367,10 +1447,6 @@ impl TradingEngine {
                     .token_balances
                     .iter()
                     .map(|balance| (balance.symbol.to_string(), balance.base_units))
-                    .chain(std::iter::once((
-                        self.wallet_gas_symbol.clone(),
-                        snapshot.native_balance_wei,
-                    )))
                     .collect::<Vec<_>>();
                 self.inventory.update_venue(
                     InventoryVenue::Wallet,
@@ -1396,8 +1472,6 @@ impl TradingEngine {
                         "chain_id": snapshot.chain_id,
                         "block_number": snapshot.block_number,
                         "block_hash": format!("{:#x}", snapshot.block_hash),
-                        "native_balance_wei": snapshot.native_balance_wei.to_string(),
-                        "gas_price_wei": snapshot.gas_price_wei.to_string(),
                         "token_balances": token_balances,
                         "request_duration_us": snapshot.request_duration_us,
                         "rpc_http_requests": snapshot.rpc_stats.http_requests,
@@ -2436,13 +2510,6 @@ impl TradingEngine {
         let Some((direction, trade)) = candidate else {
             return Ok(false);
         };
-        let wallet = self
-            .state
-            .balances
-            .wallet
-            .as_ref()
-            .context("admission has no wallet snapshot")?;
-        let network_gas_price_wei = wallet.gas_price_wei;
         let native_price_token_a = self.native_price_token_a().unwrap_or(Decimal::ZERO);
         let economics = evaluate_execution_admission(
             quote,
@@ -2455,7 +2522,6 @@ impl TradingEngine {
                 expected_cost_token_a: trade.cost_token_a,
                 expected_proceeds_token_a: trade.proceeds_token_a,
                 opportunity_threshold_met: trade.meets_threshold,
-                network_gas_price_wei,
             },
         )?;
         let liquidity_source = "dex_curve_only";
@@ -2493,7 +2559,6 @@ impl TradingEngine {
         }
         let token_a_symbol = pair_config.token_a.symbol.clone();
         let token_b_symbol = pair_config.token_b.symbol.clone();
-        let gas_symbol = pair_config.chain.gas_symbol.clone();
         let deadline_unix_seconds =
             admission_deadline_unix_seconds(quote.received_unix_us, quote.received_at.elapsed())?;
         let dex_plan = DexSwapPlan::build(
@@ -2551,7 +2616,9 @@ impl TradingEngine {
                     "paper recovery buy quote",
                 )?,
                 maximum_recovery_loss_token_a_base_units: 0,
-                maximum_fee_per_gas_wei: economics.maximum_fee_per_gas_wei,
+                // Journal-shape compatibility only. Transaction fees are
+                // selected immediately before signing, outside admission.
+                maximum_fee_per_gas_wei: 0,
                 gas_conversion_price_token_a: native_price_token_a,
                 maximum_gas_cost_token_a_base_units: 0,
                 bounded_profit_token_a_base_units: 0,
@@ -2560,8 +2627,8 @@ impl TradingEngine {
         };
         let plan_id = opportunity.plan_id();
         let dex_input_claim = U256::from(dex_plan.amount_in_base_units);
-        let (token_a_claim, token_b_claim, gas_claim) =
-            exact_execution_envelope_amounts(direction, dex_input_claim, trade, economics);
+        let (token_a_claim, token_b_claim) =
+            exact_execution_envelope_amounts(direction, dex_input_claim, trade);
         let claims = match direction {
             TradeDirection::BuyTokenBOnDexSellOnCex => vec![
                 InventoryClaim {
@@ -2572,10 +2639,6 @@ impl TradingEngine {
                     key: InventoryKey::new(InventoryVenue::Binance, token_b_symbol)?,
                     amount: token_b_claim,
                 },
-                InventoryClaim {
-                    key: InventoryKey::new(InventoryVenue::Wallet, gas_symbol)?,
-                    amount: gas_claim,
-                },
             ],
             TradeDirection::BuyTokenBOnCexSellOnDex => vec![
                 InventoryClaim {
@@ -2585,10 +2648,6 @@ impl TradingEngine {
                 InventoryClaim {
                     key: InventoryKey::new(InventoryVenue::Wallet, token_b_symbol)?,
                     amount: token_b_claim,
-                },
-                InventoryClaim {
-                    key: InventoryKey::new(InventoryVenue::Wallet, gas_symbol)?,
-                    amount: gas_claim,
                 },
             ],
         };
@@ -2694,7 +2753,7 @@ impl TradingEngine {
             "depth_update_delta": execution_depth_health.update_delta,
             "top_matches": execution_depth_health.top_matches,
             "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
-            "inventory_reservation_policy": "exact_primary_execution_envelope_v2",
+            "inventory_reservation_policy": "exact_primary_execution_envelope_v3",
             "evaluation_trigger": evaluation_trigger,
             "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
             "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
@@ -2710,8 +2769,6 @@ impl TradingEngine {
                 TradeDirection::BuyTokenBOnDexSellOnCex => quote.bid_price.to_string(),
                 TradeDirection::BuyTokenBOnCexSellOnDex => quote.ask_price.to_string(),
             },
-            "maximum_gas_wei": economics.maximum_gas_wei.to_string(),
-            "maximum_fee_per_gas_wei": economics.maximum_fee_per_gas_wei.to_string(),
             "price_unchanged_for_us": duration_us(quote.received_at.elapsed()),
             "dex_plan": dex_plan_telemetry_value(&dex_plan),
         });
@@ -3513,8 +3570,7 @@ fn exact_execution_envelope_amounts(
     direction: TradeDirection,
     dex_input: U256,
     trade: TradeEvaluation,
-    economics: AdmissionEconomics,
-) -> (U256, U256, U256) {
+) -> (U256, U256) {
     let token_a = match direction {
         TradeDirection::BuyTokenBOnDexSellOnCex => dex_input,
         TradeDirection::BuyTokenBOnCexSellOnDex => trade.cost_token_a,
@@ -3525,7 +3581,7 @@ fn exact_execution_envelope_amounts(
         TradeDirection::BuyTokenBOnDexSellOnCex => trade.token_b_amount,
         TradeDirection::BuyTokenBOnCexSellOnDex => dex_input,
     };
-    (token_a, token_b, economics.maximum_gas_wei)
+    (token_a, token_b)
 }
 
 fn dex_plan_telemetry_value(plan: &DexSwapPlan) -> Value {
@@ -3570,11 +3626,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use alloy_primitives::U256;
-    use rust_decimal::Decimal;
-
     use crate::{
-        admission::AdmissionEconomics,
         arbitrage::ArbitrageDirection as TradeDirection,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
@@ -3585,6 +3637,7 @@ mod tests {
         rebalance::Direction,
         state::BalanceState,
     };
+    use alloy_primitives::U256;
 
     use super::{
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
@@ -3793,7 +3846,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_execution_envelope_has_no_multiplicative_reservation() {
+    fn exact_execution_envelope_reserves_only_primary_token_debits() {
         let trade = TradeEvaluation {
             pool_index: 0,
             token_b_amount: U256::from(100),
@@ -3807,36 +3860,21 @@ mod tests {
             gross_profit_bps_x100: 2_000,
             meets_threshold: true,
         };
-        let economics = AdmissionEconomics {
-            primary_quantity: Decimal::from(100),
-            recovery_limit_price: Decimal::ONE,
-            recovery_quote_token_a: U256::from(1_050),
-            recovery_sell_limit_price: Some(Decimal::ONE),
-            recovery_sell_quote_token_a: U256::from(990),
-            recovery_buy_limit_price: Some(Decimal::ONE),
-            recovery_buy_quote_token_a: U256::from(1_075),
-            maximum_gas_wei: U256::from(25),
-            maximum_fee_per_gas_wei: 5,
-            opportunity_threshold_met: true,
-        };
-
         assert_eq!(
             exact_execution_envelope_amounts(
                 TradeDirection::BuyTokenBOnDexSellOnCex,
                 U256::from(1_020),
                 trade,
-                economics,
             ),
-            (U256::from(1_020), U256::from(100), U256::from(25))
+            (U256::from(1_020), U256::from(100))
         );
         assert_eq!(
             exact_execution_envelope_amounts(
                 TradeDirection::BuyTokenBOnCexSellOnDex,
                 U256::from(100),
                 trade,
-                economics,
             ),
-            (U256::from(1_010), U256::from(100), U256::from(25))
+            (U256::from(1_010), U256::from(100))
         );
     }
 

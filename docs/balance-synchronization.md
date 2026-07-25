@@ -14,9 +14,10 @@ commissions are not fetched again every interval. A failed request triggers one
 clock resynchronization and retry, then emits a failure event and waits for the
 next interval.
 
-The account endpoint omits zero balances. The synchronizer therefore materializes
-every configured pair asset and treats an omitted asset as exact decimal zero.
-The snapshot records both free and locked amounts.
+The account endpoint omits zero balances. The synchronizer therefore
+materializes every configured pair asset plus the configured Binance fee asset
+(`BNB` in production), and treats an omitted asset as exact decimal zero. The
+snapshot records both free and locked amounts.
 
 ## World Chain wallet
 

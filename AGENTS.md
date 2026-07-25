@@ -68,13 +68,53 @@ a time.
   configured 20 bps gross spread and the 200 USDC cap. Binance top quantity,
   full depth, recovery forecasts, expected-profit floors, gas economics, and
   inventory are not sizing or admission gates. Full-depth health is telemetry
-  and a log-based metric only. Inventory reservations cover the exact primary
-  venue debits and maximum native transaction debit and must never apply the
-  legacy Rails `3x` multiplier or reserve a hypothetical recovery. Actual
-  residual recovery is reactive to realized fills. The 20 bps gate uses raw
+  and a log-based metric only. Inventory reservations cover only the exact
+  primary token debits and must never apply the legacy Rails `3x` multiplier,
+  reserve native gas, or reserve a hypothetical recovery. Native gas funding
+  is an operator-maintained invariant, not a readiness, balance-sync,
+  admission, or reservation input. The executor obtains the current RPC fee
+  only when constructing the transaction and uses the Rails `100,000 wei`
+  World Chain fallback when `eth_gasPrice` fails. Receipt accounting includes
+  both the L2 execution fee and World Chain `l1Fee`; neither is a sizing or
+  admission gate. After a partial or zero primary Binance IOC, the coordinator
+  creates one immutable MARKET recovery target equal to `primary hedge target
+  - primary executed quantity`. A proven zero-fill/unsubmitted/rejected child
+  may retry that same target at most three total attempts, with persisted
+  250 ms then 500 ms backoff and deterministic child IDs. Partial/full fills
+  never start another transaction attempt. An Unknown Binance placement is
+  part of the same recovery state machine but may only query `order.status`
+  once for the same deterministic client ID. A discovered order uses its
+  actual fills; `-2013 NO_SUCH_ORDER` proves absence and immediately allows the
+  normal next recovery step. A timeout/5xx/transport/protocol failure of that
+  status query remains Unknown and must not authorize another order. Remaining WLD drift is PnL and
+  inventory telemetry only. The 20 bps gate uses raw
   venue economics. Rails-compatible 5-50 bps dynamic slippage affects only the
   DEX calldata input/output bounds; Binance commission, gas, and recovery never
-  create a second profitability model. An unchanged event-driven Binance top
+  create a second profitability model. After the DEX receipt, the primary
+  Binance LIMIT IOC keeps the admission price as its immutable protection
+  boundary and may use a fresh in-memory top only to improve execution: SELL
+  uses the higher price and BUY the lower price. An adverse or unavailable top
+  keeps the admission price, followed by bounded MARKET recovery after a
+  partial or zero fill. The selected IOC price must be journaled before
+  dispatch. Primary selection and every LIMIT/MARKET order must emit joinable
+  non-blocking telemetry containing the placement-time in-memory top, exact
+  request, marketability at that top, terminal fill/average price, commissions,
+  and reconciliation outcome. MARKET fallback telemetry must also persist the
+  counterfactual same-side in-memory LIMIT price, visible top coverage, actual
+  MARKET price advantage, fill-price compatibility, placement-to-terminal
+  duration, and terminal top. This counterfactual is diagnostic and must never
+  enter execution. MARKET recovery remains the control until a
+  representative cohort justifies a separately reviewed one-order experiment.
+  Production Binance commissions are paid from the account's BNB balance.
+  MARKET BUY recovery must never be grossed up for a hypothetical base-asset
+  commission; both BUY and SELL submit the immutable recovery target rounded
+  down to the exchange step. Discounted fees are tracked as exact BNB balance
+  deltas and valued for realized PnL with the configured BNBUSDT bid, matching
+  Rails' USDT/USDC parity convention. This auxiliary feed is accounting-only
+  and must never enter readiness, admission, sizing, preflight, or recovery. A
+  missing price makes valuation telemetry incomplete; it must not turn a known
+  fill into an unknown exposure or block bounded recovery.
+  An unchanged event-driven Binance top
   remains current while its connection generation has fresh transport
   activity. Admission, preflight, and runtime market-data readiness use the
   reviewed 30-second maximum transport silence from the versioned domain

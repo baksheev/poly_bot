@@ -13,7 +13,7 @@
       "app/jobs/update_min_buy_amount_job.rb dynamic token-B quote sizing",
       "app/jobs/detect_arbitrage_job.rb strategy constants",
       "app/jobs/rebalance_wallets_job.rb rebalance direction and target formulas",
-      "app/jobs/calculate_arbitrage_profit_job.rb ETHUSDT gas conversion",
+      "app/jobs/calculate_arbitrage_profit_job.rb ETHUSDT gas and BNBUSDT commission conversion",
       "explicit Rust clone decision: Binance market data and execution must both use Spot",
       "explicit Rust clone decision: startup token inventory is the rebalance reference maximum",
       "explicit reviewed Rust gate: execution requires full_live confirmation and positive durable risk caps",
@@ -65,6 +65,8 @@
         "symbol": "WLDUSDC",
         "base_asset": "WLD",
         "quote_asset": "USDC",
+        "commission_asset": "BNB",
+        "commission_price_binance_symbol": "BNBUSDT",
         "market_data_product": "spot",
         "execution_product": "spot",
         "step_size": "0.100000000000000",
@@ -83,8 +85,7 @@
         "max_transport_silence_ms": 30000,
         "min_slippage_bps": 5,
         "max_slippage_bps": 50,
-        "slippage_profit_share_bps": 5000,
-        "dex_fee_reserve_bps": 4
+        "slippage_profit_share_bps": 5000
       },
       "rebalance": {
         "enabled": true,

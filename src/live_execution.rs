@@ -12,19 +12,30 @@ use tokio::sync::mpsc;
 
 use crate::{
     arbitrage::{
-        CoordinatorCommand, EntryPreflightHandle, ExecutionMode, LatestOpportunityReceiver,
-        LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent,
-        PaperTradeEventState, PaperTradeHandle, TradeIntent, TradeOperation, TradeStage,
-        execution_failure_event_state, initial_execution_lane,
+        CoordinatorCommand, EntryPreflightHandle, ExecutionMode, FreshBinanceTopSnapshot,
+        LatestOpportunityReceiver, LegResult, LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS,
+        PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent, PaperTradeEventState,
+        PaperTradeHandle, TradeIntent, TradeOperation, TradeStage, execution_failure_event_state,
+        initial_execution_lane,
     },
     binance::{
         account::SymbolRules,
-        execution::{BinanceExecutionService, BinanceExecutionServiceError},
+        execution::{
+            BinanceExecutionService, BinanceExecutionServiceError, BinanceOrderRequest,
+            BinanceOrderRequestKind,
+        },
         order_plan::{plan_limit_ioc, plan_market_order, recovery_client_order_id},
+        ws_api::OrderResult,
     },
     dex::execution::{DexExecutionService, DexExecutionServiceError},
-    execution_accounting::{binance_leg_result, dex_leg_result, native_gas_to_token_a_base_units},
-    telemetry::{ARBITRAGE_EXECUTION_STAGE_KIND, ARBITRAGE_RESULT_KIND, TelemetryHandle},
+    execution_accounting::{
+        CommissionAssetValuation, binance_leg_result, dex_leg_result,
+        native_gas_to_token_a_base_units,
+    },
+    telemetry::{
+        ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_EXECUTION_STAGE_KIND, ARBITRAGE_RESULT_KIND,
+        TelemetryHandle,
+    },
 };
 
 type LegFuture<'a> = Pin<Box<dyn Future<Output = (LegRole, LegResult)> + Send + 'a>>;
@@ -45,7 +56,27 @@ pub struct ComposedLiveLegExecutor {
     base_decimals: u8,
     quote_asset: String,
     quote_decimals: u8,
-    market_buy_recovery_fee_bps: u16,
+    commission_asset: String,
+    commission_price_symbol: String,
+    market_state: EntryPreflightHandle,
+    telemetry: TelemetryHandle,
+    engine_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct BinanceOrderPlacementObservation {
+    started_at: Instant,
+    memory_top: Option<FreshBinanceTopSnapshot>,
+    recovery_attempt: Option<usize>,
+    recovery_limit_counterfactual: Option<RecoveryLimitCounterfactual>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveryLimitCounterfactual {
+    price: rust_decimal::Decimal,
+    top_quantity: rust_decimal::Decimal,
+    submitted_quantity: rust_decimal::Decimal,
+    top_covers_quantity: bool,
 }
 
 pub struct ComposedLiveLegExecutorConfig {
@@ -54,7 +85,11 @@ pub struct ComposedLiveLegExecutorConfig {
     pub base_decimals: u8,
     pub quote_asset: String,
     pub quote_decimals: u8,
-    pub market_buy_recovery_fee_bps: u16,
+    pub commission_asset: String,
+    pub commission_price_symbol: String,
+    pub market_state: EntryPreflightHandle,
+    pub telemetry: TelemetryHandle,
+    pub engine_id: String,
 }
 
 impl ComposedLiveLegExecutor {
@@ -69,7 +104,11 @@ impl ComposedLiveLegExecutor {
             base_decimals,
             quote_asset,
             quote_decimals,
-            market_buy_recovery_fee_bps,
+            commission_asset,
+            commission_price_symbol,
+            market_state,
+            telemetry,
+            engine_id,
         } = config;
         ensure!(
             rules.symbol == format!("{base_asset}{quote_asset}"),
@@ -85,9 +124,17 @@ impl ComposedLiveLegExecutor {
             "live token decimals invalid"
         );
         ensure!(
-            market_buy_recovery_fee_bps < 10_000,
-            "live Binance market BUY recovery fee is invalid"
+            commission_asset == "BNB",
+            "live Binance commissions must be paid in BNB"
         );
+        ensure!(
+            commission_price_symbol.starts_with(&commission_asset)
+                && commission_price_symbol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+            "live Binance commission price symbol is invalid"
+        );
+        ensure!(!engine_id.is_empty(), "live telemetry engine id is empty");
         Ok(Self {
             dex,
             binance,
@@ -96,7 +143,11 @@ impl ComposedLiveLegExecutor {
             base_decimals,
             quote_asset,
             quote_decimals,
-            market_buy_recovery_fee_bps,
+            commission_asset,
+            commission_price_symbol,
+            market_state,
+            telemetry,
+            engine_id,
         })
     }
 
@@ -133,6 +184,7 @@ impl ComposedLiveLegExecutor {
                                 operation_id,
                                 gas_used = outcome.gas_used,
                                 effective_gas_price = outcome.effective_gas_price,
+                                l1_fee = outcome.l1_fee,
                                 "DEX gas token-A conversion is unavailable; execution remains valid"
                             );
                             0
@@ -140,6 +192,7 @@ impl ComposedLiveLegExecutor {
                             match native_gas_to_token_a_base_units(
                                 outcome.gas_used,
                                 outcome.effective_gas_price,
+                                outcome.l1_fee,
                                 bounds.gas_conversion_price_token_a,
                                 self.quote_decimals,
                             ) {
@@ -179,6 +232,7 @@ impl ComposedLiveLegExecutor {
                         transaction_hash,
                         gas_used,
                         effective_gas_price,
+                        l1_fee,
                         reason,
                     }) => {
                         let gas = if bounds.gas_conversion_price_token_a.is_zero() {
@@ -186,6 +240,7 @@ impl ComposedLiveLegExecutor {
                                 operation_id,
                                 gas_used,
                                 effective_gas_price,
+                                l1_fee,
                                 "reverted DEX gas token-A conversion is unavailable"
                             );
                             0
@@ -193,6 +248,7 @@ impl ComposedLiveLegExecutor {
                             match native_gas_to_token_a_base_units(
                                 gas_used,
                                 effective_gas_price,
+                                l1_fee,
                                 bounds.gas_conversion_price_token_a,
                                 self.quote_decimals,
                             ) {
@@ -208,6 +264,7 @@ impl ComposedLiveLegExecutor {
                             transaction_hash = %transaction_hash,
                             reason,
                             gas_cost_token_a_base_units = gas,
+                            l1_fee,
                             "DEX transaction reverted with a known zero-token outcome"
                         );
                         failed_with_gas(role, gas, &format!("dex:{transaction_hash:#x}:reverted"))
@@ -228,6 +285,7 @@ impl ComposedLiveLegExecutor {
                 limit_price,
             } => {
                 self.execute_cex_limit(
+                    intent,
                     LegRole::Cex,
                     client_order_id.clone(),
                     *target_token_b_delta_base_units,
@@ -248,8 +306,10 @@ impl ComposedLiveLegExecutor {
                         }
                     };
                 self.execute_cex_market(
+                    intent,
                     LegRole::RecoveryCex,
                     client_order_id,
+                    *attempt,
                     *target_token_b_delta_base_units,
                 )
                 .await
@@ -259,6 +319,7 @@ impl ComposedLiveLegExecutor {
 
     async fn execute_cex_limit(
         &self,
+        intent: &TradeIntent,
         role: LegRole,
         client_order_id: String,
         target_token_b_delta_base_units: i128,
@@ -282,21 +343,45 @@ impl ComposedLiveLegExecutor {
                 return failed(role, "cex:invalid-plan");
             }
         };
+        let placement = self.emit_binance_order_plan(
+            intent,
+            role,
+            planned.target_base_units,
+            planned.submitted_base_units,
+            &planned.request,
+            None,
+        );
         match self.binance.execute(planned.request).await {
-            Ok(outcome) => match binance_leg_result(
-                &outcome.order,
-                &self.base_asset,
-                self.base_decimals,
-                &self.quote_asset,
-                self.quote_decimals,
-            ) {
-                Ok(result) => (role, result),
-                Err(error) => {
-                    tracing::error!(client_order_id, error = %error, "Binance fill accounting is unknown");
-                    unknown(role, "cex:accounting-unknown")
+            Ok(outcome) => {
+                let commission_top = self.commission_price_top(&outcome.order);
+                self.emit_binance_order_result(
+                    intent,
+                    role,
+                    &outcome.order,
+                    outcome.reconciled_after_unknown,
+                    commission_top.as_ref(),
+                    &placement,
+                );
+                match binance_leg_result(
+                    &outcome.order,
+                    &self.base_asset,
+                    self.base_decimals,
+                    &self.quote_asset,
+                    self.quote_decimals,
+                    Some(CommissionAssetValuation {
+                        asset: &self.commission_asset,
+                        price_in_token_a: commission_top.as_ref().map(|top| top.bid_price),
+                    }),
+                ) {
+                    Ok(result) => (role, result),
+                    Err(error) => {
+                        tracing::error!(client_order_id, error = %error, "Binance fill accounting is unknown");
+                        unknown(role, "cex:accounting-unknown")
+                    }
                 }
-            },
+            }
             Err(BinanceExecutionServiceError::FailedBeforeSubmission { reason }) => {
+                self.emit_binance_order_error(intent, role, &client_order_id, None, "unsubmitted");
                 tracing::warn!(
                     client_order_id,
                     reason,
@@ -305,6 +390,7 @@ impl ComposedLiveLegExecutor {
                 failed(role, "cex:unsubmitted")
             }
             Err(BinanceExecutionServiceError::Rejected { reason }) => {
+                self.emit_binance_order_error(intent, role, &client_order_id, None, "rejected");
                 tracing::warn!(
                     client_order_id,
                     reason,
@@ -313,6 +399,13 @@ impl ComposedLiveLegExecutor {
                 failed(role, "cex:rejected")
             }
             Err(BinanceExecutionServiceError::OutcomeUnknown { reason }) => {
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    None,
+                    "outcome_unknown",
+                );
                 tracing::error!(
                     client_order_id,
                     reason,
@@ -325,8 +418,10 @@ impl ComposedLiveLegExecutor {
 
     async fn execute_cex_market(
         &self,
+        intent: &TradeIntent,
         role: LegRole,
         client_order_id: String,
+        recovery_attempt: usize,
         target_token_b_delta_base_units: i128,
     ) -> (LegRole, LegResult) {
         let planned = match plan_market_order(
@@ -335,7 +430,6 @@ impl ComposedLiveLegExecutor {
             target_token_b_delta_base_units,
             self.base_decimals,
             &self.rules,
-            self.market_buy_recovery_fee_bps,
         ) {
             Ok(Some(planned)) => planned,
             Ok(None) => return failed(role, "cex:market-sub-step-command"),
@@ -344,21 +438,57 @@ impl ComposedLiveLegExecutor {
                 return failed(role, "cex:invalid-market-plan");
             }
         };
+        let placement = self.emit_binance_order_plan(
+            intent,
+            role,
+            planned.target_base_units,
+            planned.submitted_base_units,
+            &planned.request,
+            Some(recovery_attempt),
+        );
         match self.binance.execute(planned.request).await {
-            Ok(outcome) => match binance_leg_result(
-                &outcome.order,
-                &self.base_asset,
-                self.base_decimals,
-                &self.quote_asset,
-                self.quote_decimals,
-            ) {
-                Ok(result) => (role, result),
-                Err(error) => {
-                    tracing::error!(client_order_id, error = %error, "Binance market fill accounting is unknown");
-                    unknown(role, "cex:market-accounting-unknown")
+            Ok(outcome) => {
+                let commission_top = self.commission_price_top(&outcome.order);
+                self.emit_binance_order_result(
+                    intent,
+                    role,
+                    &outcome.order,
+                    outcome.reconciled_after_unknown,
+                    commission_top.as_ref(),
+                    &placement,
+                );
+                match binance_leg_result(
+                    &outcome.order,
+                    &self.base_asset,
+                    self.base_decimals,
+                    &self.quote_asset,
+                    self.quote_decimals,
+                    Some(CommissionAssetValuation {
+                        asset: &self.commission_asset,
+                        price_in_token_a: commission_top.as_ref().map(|top| top.bid_price),
+                    }),
+                ) {
+                    Ok(mut result) => {
+                        if result.status == LegStatus::Failed {
+                            result.venue_reference =
+                                format!("cex:market-zero-fill:{}", outcome.order.order_id);
+                        }
+                        (role, result)
+                    }
+                    Err(error) => {
+                        tracing::error!(client_order_id, error = %error, "Binance market fill accounting is unknown");
+                        unknown(role, "cex:market-accounting-unknown")
+                    }
                 }
-            },
+            }
             Err(BinanceExecutionServiceError::FailedBeforeSubmission { reason }) => {
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    Some(recovery_attempt),
+                    "unsubmitted",
+                );
                 tracing::warn!(
                     client_order_id,
                     reason,
@@ -367,6 +497,13 @@ impl ComposedLiveLegExecutor {
                 failed(role, "cex:market-unsubmitted")
             }
             Err(BinanceExecutionServiceError::Rejected { reason }) => {
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    Some(recovery_attempt),
+                    "rejected",
+                );
                 tracing::warn!(
                     client_order_id,
                     reason,
@@ -375,6 +512,13 @@ impl ComposedLiveLegExecutor {
                 failed(role, "cex:market-rejected")
             }
             Err(BinanceExecutionServiceError::OutcomeUnknown { reason }) => {
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    Some(recovery_attempt),
+                    "outcome_unknown",
+                );
                 tracing::error!(
                     client_order_id,
                     reason,
@@ -383,6 +527,214 @@ impl ComposedLiveLegExecutor {
                 unknown(role, "cex:market-child-unknown")
             }
         }
+    }
+
+    fn emit_binance_order_plan(
+        &self,
+        intent: &TradeIntent,
+        role: LegRole,
+        target_base_units: i128,
+        submitted_base_units: i128,
+        request: &BinanceOrderRequest,
+        recovery_attempt: Option<usize>,
+    ) -> BinanceOrderPlacementObservation {
+        let started_at = Instant::now();
+        let (side, order_type, quantity, base_quantity, limit_price) = match &request.kind {
+            BinanceOrderRequestKind::LimitIoc {
+                side,
+                quantity,
+                price,
+            } => (
+                side.as_str(),
+                "LIMIT_IOC",
+                quantity.to_string(),
+                Some(*quantity),
+                Some(*price),
+            ),
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity } => {
+                ("BUY", "MARKET", quantity.to_string(), Some(*quantity), None)
+            }
+            BinanceOrderRequestKind::MarketSell { quantity } => (
+                "SELL",
+                "MARKET",
+                quantity.to_string(),
+                Some(*quantity),
+                None,
+            ),
+            BinanceOrderRequestKind::MarketBuy { quote_quantity } => (
+                "BUY",
+                "MARKET_QUOTE",
+                quote_quantity.to_string(),
+                None,
+                None,
+            ),
+        };
+        let top = self.market_state.fresh_binance_top(&self.rules.symbol);
+        let recovery_limit_counterfactual = base_quantity
+            .and_then(|quantity| recovery_limit_counterfactual(role, side, quantity, top.as_ref()));
+        let marketable_at_memory_top = limit_price.and_then(|limit| {
+            top.as_ref().map(|top| match side {
+                "SELL" => top.bid_price >= limit,
+                "BUY" => top.ask_price <= limit,
+                _ => false,
+            })
+        });
+        self.telemetry.emit(
+            ARBITRAGE_BINANCE_ORDER_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "phase": "planned",
+                "plan_id": intent.plan_id,
+                "operation_id": request.operation_id,
+                "client_order_id": request.client_order_id,
+                "role": leg_role_label(role),
+                "recovery_attempt": recovery_attempt,
+                "maximum_recovery_attempts":
+                    recovery_attempt.map(|_| MAX_RECOVERY_ATTEMPTS),
+                "symbol": request.symbol,
+                "side": side,
+                "order_type": order_type,
+                "target_token_b_base_units": target_base_units.to_string(),
+                "submitted_token_b_base_units": submitted_base_units.to_string(),
+                "requested_quantity": quantity,
+                "limit_price": limit_price.map(|price| price.to_string()),
+                "limit_marketable_at_memory_top": marketable_at_memory_top,
+                "memory_top": binance_top_payload(top.clone()),
+                "recovery_limit_counterfactual": recovery_limit_counterfactual.as_ref().map(
+                    recovery_limit_counterfactual_payload
+                ),
+            }),
+        );
+        BinanceOrderPlacementObservation {
+            started_at,
+            memory_top: top,
+            recovery_attempt,
+            recovery_limit_counterfactual,
+        }
+    }
+
+    fn emit_binance_order_result(
+        &self,
+        intent: &TradeIntent,
+        role: LegRole,
+        order: &OrderResult,
+        reconciled_after_unknown: bool,
+        commission_top: Option<&FreshBinanceTopSnapshot>,
+        placement: &BinanceOrderPlacementObservation,
+    ) {
+        let average_execution_price = (!order.executed_qty.is_zero())
+            .then(|| order.cummulative_quote_qty.checked_div(order.executed_qty))
+            .flatten();
+        let fill_class = if order.executed_qty.is_zero() {
+            "zero"
+        } else if !order.orig_qty.is_zero() && order.executed_qty < order.orig_qty {
+            "partial"
+        } else {
+            "full"
+        };
+        let third_asset_commission = order.commission_in(&self.commission_asset);
+        let third_asset_commission_value = commission_top.and_then(|top| {
+            third_asset_commission
+                .checked_mul(top.bid_price)
+                .map(|value| value.to_string())
+        });
+        let terminal_memory_top = self.market_state.fresh_binance_top(&self.rules.symbol);
+        let counterfactual =
+            placement
+                .recovery_limit_counterfactual
+                .as_ref()
+                .map(|counterfactual| {
+                    recovery_limit_terminal_payload(counterfactual, order, average_execution_price)
+                });
+        let mut payload = serde_json::json!({
+            "engine_id": self.engine_id,
+            "phase": "terminal",
+            "plan_id": intent.plan_id,
+            "operation_id": order.client_order_id,
+            "client_order_id": order.client_order_id,
+            "role": leg_role_label(role),
+            "symbol": order.symbol,
+            "side": order.side,
+            "order_type": order.order_type,
+            "time_in_force": order.time_in_force,
+            "order_id": order.order_id,
+            "status": order.status,
+            "fill_class": fill_class,
+            "exchange_transact_time_ms": order.transact_time,
+            "exchange_order_price": order.price.to_string(),
+            "original_quantity": order.orig_qty.to_string(),
+            "executed_quantity": order.executed_qty.to_string(),
+            "cumulative_quote_quantity": order.cummulative_quote_qty.to_string(),
+            "average_execution_price": average_execution_price.map(|price| price.to_string()),
+            "base_commission": order.commission_in(&self.base_asset).to_string(),
+            "quote_commission": order.commission_in(&self.quote_asset).to_string(),
+            "third_asset_commission_asset": self.commission_asset,
+            "third_asset_commission": third_asset_commission.to_string(),
+            "third_asset_commission_price_symbol": self.commission_price_symbol,
+            "third_asset_commission_bid_price": commission_top.map(|top| top.bid_price.to_string()),
+            "third_asset_commission_value_token_a": third_asset_commission_value,
+            "third_asset_commission_price_top": binance_top_payload(commission_top.cloned()),
+            "third_asset_commission_valuation_complete":
+                third_asset_commission.is_zero() || commission_top.is_some(),
+            "reconciled_after_unknown": reconciled_after_unknown,
+            "planned_to_terminal_us": duration_us(placement.started_at.elapsed()),
+            "placement_memory_top": binance_top_payload(placement.memory_top.clone()),
+            "terminal_memory_top": binance_top_payload(terminal_memory_top),
+            "recovery_limit_counterfactual": counterfactual,
+            "fills": order.fills.iter().map(|fill| serde_json::json!({
+                "price": fill.price.to_string(),
+                "quantity": fill.qty.to_string(),
+                "commission": fill.commission.to_string(),
+                "commission_asset": fill.commission_asset,
+                "trade_id": fill.trade_id,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "recovery_attempt".to_owned(),
+                serde_json::json!(placement.recovery_attempt),
+            );
+            object.insert(
+                "maximum_recovery_attempts".to_owned(),
+                serde_json::json!(placement.recovery_attempt.map(|_| MAX_RECOVERY_ATTEMPTS)),
+            );
+        }
+        self.telemetry.emit(ARBITRAGE_BINANCE_ORDER_KIND, payload);
+    }
+
+    fn commission_price_top(&self, order: &OrderResult) -> Option<FreshBinanceTopSnapshot> {
+        (!order.commission_in(&self.commission_asset).is_zero())
+            .then(|| {
+                self.market_state
+                    .fresh_binance_top(&self.commission_price_symbol)
+            })
+            .flatten()
+    }
+
+    fn emit_binance_order_error(
+        &self,
+        intent: &TradeIntent,
+        role: LegRole,
+        client_order_id: &str,
+        recovery_attempt: Option<usize>,
+        outcome: &'static str,
+    ) {
+        self.telemetry.emit(
+            ARBITRAGE_BINANCE_ORDER_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "phase": "error",
+                "plan_id": intent.plan_id,
+                "operation_id": client_order_id,
+                "client_order_id": client_order_id,
+                "role": leg_role_label(role),
+                "recovery_attempt": recovery_attempt,
+                "maximum_recovery_attempts":
+                    recovery_attempt.map(|_| MAX_RECOVERY_ATTEMPTS),
+                "symbol": self.rules.symbol,
+                "outcome": outcome,
+            }),
+        );
     }
 }
 
@@ -410,6 +762,7 @@ pub struct LiveTradeTask<E> {
 pub struct LiveRiskLimits {
     pub entry_stop_file: PathBuf,
     pub entry_preflight: EntryPreflightHandle,
+    pub binance_symbol: String,
 }
 
 impl LiveRiskLimits {
@@ -417,6 +770,14 @@ impl LiveRiskLimits {
         ensure!(
             !self.entry_stop_file.as_os_str().is_empty(),
             "live entry-stop path is empty"
+        );
+        ensure!(
+            !self.binance_symbol.is_empty()
+                && self
+                    .binance_symbol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+            "live Binance symbol is invalid"
         );
         Ok(())
     }
@@ -515,6 +876,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     TradeStage::Prepared
                         | TradeStage::Executing
                         | TradeStage::Recovering
+                        | TradeStage::UnknownExposure
                         | TradeStage::Halted
                 )
             })
@@ -605,6 +967,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
 
     async fn drive(&mut self, plan_id: &str) -> anyhow::Result<()> {
         loop {
+            self.prepare_primary_cex_limit_price(plan_id)?;
             let take_commands_started = Instant::now();
             let commands_result = self.coordinator.take_commands(plan_id);
             self.emit_live_stage(
@@ -621,6 +984,63 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             );
             let commands = commands_result?;
             if commands.is_empty() {
+                if let Some((expected_role, command)) = self
+                    .coordinator
+                    .unknown_binance_reconciliation_command(plan_id)?
+                {
+                    let intent = self
+                        .coordinator
+                        .operation(plan_id)
+                        .context("live trade disappeared before Binance reconciliation")?
+                        .intent
+                        .clone();
+                    let (role, result) = self.execute_leg_timed(&intent, &command).await;
+                    ensure!(
+                        role == expected_role,
+                        "Binance reconciliation returned the wrong leg role"
+                    );
+                    if result.status != LegStatus::Unknown {
+                        self.coordinator.reconcile_unknown(plan_id, role, result)?;
+                        continue;
+                    }
+                }
+                if let Some((attempt, delay)) = self.coordinator.recovery_retry_wait(plan_id)? {
+                    let client_order_id = recovery_client_order_id(
+                        &self
+                            .coordinator
+                            .operation(plan_id)
+                            .context("live trade disappeared before recovery retry")?
+                            .intent
+                            .cex_client_order_id,
+                        attempt,
+                    )?;
+                    self.telemetry.emit(
+                        ARBITRAGE_BINANCE_ORDER_KIND,
+                        serde_json::json!({
+                            "engine_id": self.engine_id,
+                            "phase": "retry_scheduled",
+                            "plan_id": plan_id,
+                            "operation_id": client_order_id,
+                            "client_order_id": client_order_id,
+                            "role": leg_role_label(LegRole::RecoveryCex),
+                            "recovery_attempt": attempt,
+                            "maximum_recovery_attempts": MAX_RECOVERY_ATTEMPTS,
+                            "remaining_backoff_ms":
+                                delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                        }),
+                    );
+                    let backoff_started = Instant::now();
+                    tokio::time::sleep(delay).await;
+                    self.emit_live_stage(
+                        plan_id,
+                        &client_order_id,
+                        "recovery_retry_backoff",
+                        duration_us(backoff_started.elapsed()),
+                        "success",
+                        None,
+                    );
+                    continue;
+                }
                 let operation = self
                     .coordinator
                     .operation(plan_id)
@@ -690,6 +1110,67 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 record_result?;
             }
         }
+    }
+
+    fn prepare_primary_cex_limit_price(&mut self, plan_id: &str) -> anyhow::Result<()> {
+        let Some((direction, admission_price, client_order_id)) =
+            self.coordinator.operation(plan_id).and_then(|operation| {
+                (operation.intent.mode == ExecutionMode::DexFirst
+                    && !operation.cex_dispatched
+                    && operation.cex_execution_limit_price.is_none()
+                    && operation.dex_result.as_ref().is_some_and(|result| {
+                        result.status == LegStatus::Filled && result.token_b_delta_base_units != 0
+                    }))
+                .then(|| {
+                    operation.intent.admission.as_ref().map(|bounds| {
+                        (
+                            operation.intent.direction,
+                            bounds.cex_primary_limit_price,
+                            operation.intent.cex_client_order_id.clone(),
+                        )
+                    })
+                })
+                .flatten()
+            })
+        else {
+            return Ok(());
+        };
+        let (selected_price, memory_top) = self
+            .risk_limits
+            .entry_preflight
+            .favorable_primary_limit_price(
+                &self.risk_limits.binance_symbol,
+                direction,
+                admission_price,
+            );
+        let observed_price = memory_top.as_ref().map(|top| match direction {
+            crate::arbitrage::ArbitrageDirection::BuyTokenBOnDexSellOnCex => top.bid_price,
+            crate::arbitrage::ArbitrageDirection::BuyTokenBOnCexSellOnDex => top.ask_price,
+        });
+        self.coordinator
+            .select_primary_cex_limit_price(plan_id, selected_price)?;
+        self.telemetry.emit(
+            ARBITRAGE_BINANCE_ORDER_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "phase": "primary_price_selection",
+                "plan_id": plan_id,
+                "operation_id": client_order_id,
+                "client_order_id": client_order_id,
+                "role": "cex",
+                "symbol": self.risk_limits.binance_symbol,
+                "direction": match direction {
+                    crate::arbitrage::ArbitrageDirection::BuyTokenBOnDexSellOnCex => "sell",
+                    crate::arbitrage::ArbitrageDirection::BuyTokenBOnCexSellOnDex => "buy",
+                },
+                "admission_limit_price": admission_price.to_string(),
+                "observed_fresh_top_price": observed_price.map(|price| price.to_string()),
+                "selected_limit_price": selected_price.to_string(),
+                "improved": selected_price != admission_price,
+                "memory_top": binance_top_payload(memory_top),
+            }),
+        );
+        Ok(())
     }
 
     async fn execute_leg_timed(
@@ -787,6 +1268,124 @@ fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn binance_top_payload(top: Option<FreshBinanceTopSnapshot>) -> Value {
+    top.map_or(Value::Null, |top| {
+        serde_json::json!({
+            "update_id": top.update_id,
+            "connection_generation": top.connection_generation,
+            "bid_price": top.bid_price.to_string(),
+            "bid_quantity": top.bid_quantity.to_string(),
+            "ask_price": top.ask_price.to_string(),
+            "ask_quantity": top.ask_quantity.to_string(),
+            "price_age_ms": top.price_age_ms,
+            "transport_silence_ms": top.transport_silence_ms,
+        })
+    })
+}
+
+fn recovery_limit_counterfactual(
+    role: LegRole,
+    side: &str,
+    submitted_quantity: rust_decimal::Decimal,
+    top: Option<&FreshBinanceTopSnapshot>,
+) -> Option<RecoveryLimitCounterfactual> {
+    if role != LegRole::RecoveryCex {
+        return None;
+    }
+    let top = top?;
+    let (price, top_quantity) = match side {
+        "SELL" => (top.bid_price, top.bid_quantity),
+        "BUY" => (top.ask_price, top.ask_quantity),
+        _ => return None,
+    };
+    Some(RecoveryLimitCounterfactual {
+        price,
+        top_quantity,
+        submitted_quantity,
+        top_covers_quantity: top_quantity >= submitted_quantity,
+    })
+}
+
+fn recovery_limit_counterfactual_payload(counterfactual: &RecoveryLimitCounterfactual) -> Value {
+    serde_json::json!({
+        "basis": "same_side_memory_top",
+        "price": counterfactual.price.to_string(),
+        "top_quantity": counterfactual.top_quantity.to_string(),
+        "submitted_quantity": counterfactual.submitted_quantity.to_string(),
+        "top_covers_quantity": counterfactual.top_covers_quantity,
+        "marketable_at_snapshot": true,
+    })
+}
+
+fn recovery_limit_terminal_payload(
+    counterfactual: &RecoveryLimitCounterfactual,
+    order: &OrderResult,
+    average_execution_price: Option<rust_decimal::Decimal>,
+) -> Value {
+    let average_price_advantage = average_execution_price
+        .and_then(|average| market_price_advantage(&order.side, average, counterfactual.price));
+    let average_price_advantage_bps = average_price_advantage.and_then(|advantage| {
+        advantage
+            .checked_div(counterfactual.price)
+            .and_then(|ratio| ratio.checked_mul(rust_decimal::Decimal::from(10_000_u32)))
+    });
+    let average_respects_limit = average_execution_price
+        .and_then(|average| price_respects_limit(&order.side, average, counterfactual.price));
+    let all_reported_fills_respect_limit = (!order.fills.is_empty()).then(|| {
+        order.fills.iter().all(|fill| {
+            price_respects_limit(&order.side, fill.price, counterfactual.price).unwrap_or(false)
+        })
+    });
+    let market_filled_submitted_quantity = order.executed_qty >= counterfactual.submitted_quantity;
+    let snapshot_and_market_path_success_proxy = counterfactual.top_covers_quantity
+        && market_filled_submitted_quantity
+        && average_respects_limit == Some(true)
+        && all_reported_fills_respect_limit.unwrap_or(true);
+    serde_json::json!({
+        "basis": "same_side_memory_top",
+        "price": counterfactual.price.to_string(),
+        "top_quantity": counterfactual.top_quantity.to_string(),
+        "submitted_quantity": counterfactual.submitted_quantity.to_string(),
+        "top_covers_quantity": counterfactual.top_covers_quantity,
+        "marketable_at_snapshot": true,
+        "market_filled_submitted_quantity": market_filled_submitted_quantity,
+        "market_average_price_respects_limit": average_respects_limit,
+        "all_reported_market_fills_respect_limit": all_reported_fills_respect_limit,
+        "market_average_price_advantage_token_a":
+            average_price_advantage.map(|value| value.to_string()),
+        "market_average_price_advantage_bps":
+            average_price_advantage_bps.map(|value| value.to_string()),
+        "snapshot_and_market_path_success_proxy": snapshot_and_market_path_success_proxy,
+    })
+}
+
+/// Positive means the MARKET average was better than the hypothetical LIMIT
+/// for the trader; negative means the LIMIT would have protected a better
+/// price if it had filled.
+fn market_price_advantage(
+    side: &str,
+    market_average: rust_decimal::Decimal,
+    limit_price: rust_decimal::Decimal,
+) -> Option<rust_decimal::Decimal> {
+    match side {
+        "SELL" => market_average.checked_sub(limit_price),
+        "BUY" => limit_price.checked_sub(market_average),
+        _ => None,
+    }
+}
+
+fn price_respects_limit(
+    side: &str,
+    execution_price: rust_decimal::Decimal,
+    limit_price: rust_decimal::Decimal,
+) -> Option<bool> {
+    match side {
+        "SELL" => Some(execution_price >= limit_price),
+        "BUY" => Some(execution_price <= limit_price),
+        _ => None,
+    }
+}
+
 fn elapsed_since_unix_us(received_unix_us: u64) -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -840,8 +1439,11 @@ fn failed_with_gas(role: LegRole, gas_cost: u128, reference: &str) -> (LegRole, 
         role,
         LegResult {
             status: LegStatus::Failed,
+            executed_token_b_delta_base_units: None,
             token_b_delta_base_units: 0,
             token_a_delta_base_units: 0,
+            third_asset_deltas: Default::default(),
+            third_asset_prices_token_a: Default::default(),
             gas_cost_token_a_base_units: gas_cost,
             venue_reference: reference.to_owned(),
             dex_settlement_log: None,
@@ -854,8 +1456,11 @@ fn unknown(role: LegRole, reference: &str) -> (LegRole, LegResult) {
         role,
         LegResult {
             status: LegStatus::Unknown,
+            executed_token_b_delta_base_units: None,
             token_b_delta_base_units: 0,
             token_a_delta_base_units: 0,
+            third_asset_deltas: Default::default(),
+            third_asset_prices_token_a: Default::default(),
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
             dex_settlement_log: None,
@@ -881,10 +1486,11 @@ mod tests {
     use crate::{
         arbitrage::{
             AdmissionRiskBounds, ArbitrageDirection, CoordinatorCommand, EntryPreflightHandle,
-            ExecutionMode, LegResult, LegRole, LegStatus, PaperOpportunity, PaperTradeCoordinator,
-            PaperTradeEventState, PaperTradeSubmitResult, TerminalOutcome, TradeIntent,
-            execution_failure_event_state,
+            ExecutionMode, FreshBinanceTopSnapshot, LegResult, LegRole, LegStatus,
+            PaperOpportunity, PaperTradeCoordinator, PaperTradeEventState, PaperTradeSubmitResult,
+            TerminalOutcome, TradeIntent, execution_failure_event_state,
         },
+        binance::ws_api::{OrderFill, OrderResult},
         dex::clmm::ClmmPool,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
@@ -969,8 +1575,11 @@ mod tests {
     fn result(token_b: i128, token_a: i128, gas: u128, reference: &str) -> LegResult {
         LegResult {
             status: LegStatus::Filled,
+            executed_token_b_delta_base_units: Some(token_b),
             token_b_delta_base_units: token_b,
             token_a_delta_base_units: token_a,
+            third_asset_deltas: Default::default(),
+            third_asset_prices_token_a: Default::default(),
             gas_cost_token_a_base_units: gas,
             venue_reference: reference.to_owned(),
             dex_settlement_log: None,
@@ -981,6 +1590,7 @@ mod tests {
         LiveRiskLimits {
             entry_stop_file: stop_file,
             entry_preflight: default_preflight(),
+            binance_symbol: "WLDUSDC".to_owned(),
         }
     }
 
@@ -1022,6 +1632,79 @@ mod tests {
         assert_ne!(
             first.intent(ExecutionMode::DexFirst).cex_client_order_id,
             second.intent(ExecutionMode::DexFirst).cex_client_order_id
+        );
+    }
+
+    #[test]
+    fn recovery_limit_counterfactual_uses_same_side_top_and_scores_market_fill() {
+        let top = FreshBinanceTopSnapshot {
+            update_id: 9,
+            connection_generation: 3,
+            bid_price: Decimal::new(100, 2),
+            bid_quantity: Decimal::from(12),
+            ask_price: Decimal::new(101, 2),
+            ask_quantity: Decimal::from(8),
+            price_age_ms: 4,
+            transport_silence_ms: 6,
+        };
+        let sell = super::recovery_limit_counterfactual(
+            LegRole::RecoveryCex,
+            "SELL",
+            Decimal::from(10),
+            Some(&top),
+        )
+        .unwrap();
+        assert_eq!(sell.price, Decimal::ONE);
+        assert!(sell.top_covers_quantity);
+
+        let order = OrderResult {
+            symbol: "WLDUSDC".to_owned(),
+            order_id: 1,
+            client_order_id: "rustarbrecovery".to_owned(),
+            transact_time: Some(1_800_000_000_000),
+            price: Decimal::ZERO,
+            orig_qty: Decimal::from(10),
+            executed_qty: Decimal::from(10),
+            orig_quote_order_qty: Decimal::ZERO,
+            cummulative_quote_qty: Decimal::new(1002, 2),
+            status: "FILLED".to_owned(),
+            time_in_force: "GTC".to_owned(),
+            order_type: "MARKET".to_owned(),
+            side: "SELL".to_owned(),
+            fills: vec![OrderFill {
+                price: Decimal::new(1002, 3),
+                qty: Decimal::from(10),
+                commission: Decimal::ZERO,
+                commission_asset: "BNB".to_owned(),
+                trade_id: 2,
+            }],
+        };
+        let payload =
+            super::recovery_limit_terminal_payload(&sell, &order, Some(Decimal::new(1002, 3)));
+        assert_eq!(payload["market_average_price_respects_limit"], true);
+        assert_eq!(payload["all_reported_market_fills_respect_limit"], true);
+        assert_eq!(payload["snapshot_and_market_path_success_proxy"], true);
+        assert_eq!(
+            super::market_price_advantage("SELL", Decimal::new(998, 3), Decimal::ONE),
+            Some(Decimal::new(-2, 3))
+        );
+
+        let buy = super::recovery_limit_counterfactual(
+            LegRole::RecoveryCex,
+            "BUY",
+            Decimal::from(10),
+            Some(&top),
+        )
+        .unwrap();
+        assert_eq!(buy.price, Decimal::new(101, 2));
+        assert!(!buy.top_covers_quantity);
+        assert_eq!(
+            super::market_price_advantage("BUY", Decimal::new(1005, 3), buy.price),
+            Some(Decimal::new(5, 3))
+        );
+        assert!(
+            super::recovery_limit_counterfactual(LegRole::Cex, "SELL", Decimal::ONE, Some(&top))
+                .is_none()
         );
     }
 
@@ -1100,6 +1783,58 @@ mod tests {
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
 
         assert_eq!(rejection.reason, "preflight_spread_below_threshold");
+    }
+
+    #[test]
+    fn post_dex_primary_price_only_moves_in_the_favorable_direction() {
+        let handle = default_preflight();
+        handle.update_quote(&preflight_quote(
+            Decimal::new(102, 2),
+            Decimal::new(103, 2),
+            8,
+        ));
+
+        let (sell_price, sell_top) = handle.favorable_primary_limit_price(
+            "WLDUSDC",
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            Decimal::new(101, 2),
+        );
+        assert_eq!(sell_price, Decimal::new(102, 2));
+        assert_eq!(sell_top.unwrap().bid_price, Decimal::new(102, 2));
+
+        let (buy_price, buy_top) = handle.favorable_primary_limit_price(
+            "WLDUSDC",
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+            Decimal::new(104, 2),
+        );
+        assert_eq!(buy_price, Decimal::new(103, 2));
+        assert_eq!(buy_top.unwrap().ask_price, Decimal::new(103, 2));
+
+        handle.update_quote(&preflight_quote(
+            Decimal::new(99, 2),
+            Decimal::new(105, 2),
+            9,
+        ));
+        assert_eq!(
+            handle
+                .favorable_primary_limit_price(
+                    "WLDUSDC",
+                    ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                    Decimal::new(101, 2),
+                )
+                .0,
+            Decimal::new(101, 2)
+        );
+        assert_eq!(
+            handle
+                .favorable_primary_limit_price(
+                    "WLDUSDC",
+                    ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+                    Decimal::new(104, 2),
+                )
+                .0,
+            Decimal::new(104, 2)
+        );
     }
 
     #[test]
@@ -1298,6 +2033,7 @@ mod tests {
         let valid = LiveRiskLimits {
             entry_stop_file: "/tmp/arb-bot-entry.stop".into(),
             entry_preflight: default_preflight(),
+            binance_symbol: "WLDUSDC".to_owned(),
         };
         valid.validate().unwrap();
         let mut invalid = valid;
@@ -1586,6 +2322,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composed_task_waits_and_retries_a_proven_zero_fill_recovery() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-recovery-retry-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let opportunity = opportunity();
+        let plan_id = opportunity.plan_id();
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::from([
+                result(100, -1_000, 5, "dex:filled"),
+                failed(LegRole::Cex, "cex:primary-rejected").1,
+                failed(LegRole::RecoveryCex, "cex:market-unsubmitted").1,
+                result(-100, 990, 0, "cex:recovery-r2"),
+            ])),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+
+        task.execute(opportunity).await.unwrap();
+        let operation = task.coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.recovery_results.len(), 2);
+        assert_eq!(
+            operation
+                .result
+                .as_ref()
+                .unwrap()
+                .token_b_residual_base_units,
+            0
+        );
+        assert!(operation.recovery_retry_not_before_unix_ms.is_none());
+
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
     async fn composed_dex_revert_finishes_without_dispatching_cex() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-dex-revert-{}-{}.jsonl",
@@ -1631,7 +2413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composed_cex_unknown_blocks_without_guessing_a_recovery() {
+    async fn composed_cex_unknown_reconciles_before_market_recovery() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-cex-unknown-{}-{}.jsonl",
             std::process::id(),
@@ -1646,6 +2428,8 @@ mod tests {
             results: Mutex::new(VecDeque::from([
                 result(100, -1_000, 5, "dex:filled-before-unknown"),
                 unknown(LegRole::Cex, "cex:placement-unknown").1,
+                failed(LegRole::Cex, "cex:confirmed-absent").1,
+                result(-100, 990, 0, "cex:market-recovery"),
             ])),
         };
         let (_handle, mut task, mut events) = live_trade_channel(
@@ -1659,14 +2443,19 @@ mod tests {
 
         task.execute(opportunity).await.unwrap();
         let operation = task.coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, crate::arbitrage::TradeStage::BalancedLoss);
+        assert_eq!(operation.recovery_results.len(), 1);
         assert_eq!(
-            operation.stage,
-            crate::arbitrage::TradeStage::UnknownExposure
+            operation
+                .result
+                .as_ref()
+                .unwrap()
+                .token_b_residual_base_units,
+            0
         );
-        assert!(operation.recovery_results.is_empty());
         assert_eq!(
             events.try_recv().unwrap().state,
-            crate::arbitrage::PaperTradeEventState::BlockedUnknown
+            crate::arbitrage::PaperTradeEventState::Balanced
         );
         drop(task);
         fs::remove_file(journal).unwrap();

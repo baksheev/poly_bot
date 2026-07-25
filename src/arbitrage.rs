@@ -28,7 +28,8 @@ use crate::{
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
-const MAX_RECOVERY_ATTEMPTS: usize = 3;
+pub const MAX_RECOVERY_ATTEMPTS: usize = 3;
+const RECOVERY_RETRY_BASE_DELAY_MS: u64 = 250;
 const BPS_DENOMINATOR: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -114,6 +115,9 @@ pub struct AdmissionRiskBounds {
     /// Journal-checksum compatibility only. New plans persist zero and no
     /// decision or result accounting reads this field.
     pub maximum_recovery_loss_token_a_base_units: u128,
+    /// Journal-checksum compatibility only. New plans persist zero because
+    /// transaction fees are selected by the executor immediately before
+    /// signing and never enter admission.
     pub maximum_fee_per_gas_wei: u128,
     pub gas_conversion_price_token_a: Decimal,
     /// Journal-checksum compatibility only. Gas is accounted from the receipt.
@@ -166,10 +170,6 @@ impl AdmissionRiskBounds {
         ensure!(
             self.recovery_quote_token_a_base_units > 0,
             "CEX recovery quote is zero"
-        );
-        ensure!(
-            self.maximum_fee_per_gas_wei > 0,
-            "maximum fee per gas is zero"
         );
         ensure!(
             self.gas_conversion_price_token_a >= Decimal::ZERO,
@@ -292,10 +292,25 @@ pub enum LegStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegResult {
     pub status: LegStatus,
+    /// Signed venue fill quantity before any commission charged in token B.
+    /// Present for Binance legs so the immutable recovery target is based on
+    /// `executedQty`, not on a fee-adjusted balance delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_token_b_delta_base_units: Option<i128>,
     /// Signed venue balance delta: bought token B is positive, sold token B negative.
     pub token_b_delta_base_units: i128,
     /// Signed venue balance delta in token A, excluding gas.
     pub token_a_delta_base_units: i128,
+    /// Exact non-pair asset balance changes caused by this leg. Binance BNB
+    /// commissions are negative and remain auditable independently from their
+    /// token-A valuation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub third_asset_deltas: BTreeMap<String, Decimal>,
+    /// Price in token-A-equivalent units used to value each third-asset delta.
+    /// Missing means execution accounting completed but PnL valuation remains
+    /// reconstructable from the retained raw delta.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub third_asset_prices_token_a: BTreeMap<String, Decimal>,
     /// Gas converted to token A at the terminal accounting snapshot.
     pub gas_cost_token_a_base_units: u128,
     pub venue_reference: String,
@@ -311,10 +326,23 @@ impl LegResult {
         validate_id("venue reference", &self.venue_reference, 128)?;
         if self.status == LegStatus::Failed {
             ensure!(
-                self.token_b_delta_base_units == 0 && self.token_a_delta_base_units == 0,
+                self.token_b_delta_base_units == 0
+                    && self.token_a_delta_base_units == 0
+                    && self.third_asset_deltas.is_empty(),
                 "a failed leg cannot claim venue balance changes"
             );
+            ensure!(
+                self.executed_token_b_delta_base_units
+                    .is_none_or(|executed| executed == 0),
+                "a failed leg cannot claim an executed quantity"
+            );
         }
+        ensure!(
+            self.third_asset_prices_token_a
+                .keys()
+                .all(|asset| self.third_asset_deltas.contains_key(asset)),
+            "third-asset valuation has no matching balance delta"
+        );
         ensure!(
             self.dex_settlement_log.is_none() || self.status == LegStatus::Filled,
             "only a filled leg may carry a DEX settlement log"
@@ -368,10 +396,23 @@ pub struct TradeOperation {
     pub stage: TradeStage,
     pub dex_dispatched: bool,
     pub cex_dispatched: bool,
+    /// The one-way favorable post-DEX IOC price selected and journaled before
+    /// primary CEX dispatch. Absent only before selection or in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cex_execution_limit_price: Option<Decimal>,
     pub dex_result: Option<LegResult>,
     pub cex_result: Option<LegResult>,
     pub recovery_results: Vec<LegResult>,
     pub recovery_inflight: bool,
+    /// Immutable MARKET recovery quantity selected from the primary
+    /// DEX/CEX mismatch. Bounded retries reuse it without recalculating
+    /// residual exposure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_target_token_b_delta_base_units: Option<i128>,
+    /// Durable exponential-backoff deadline for the next proven-zero-fill
+    /// recovery attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_retry_not_before_unix_ms: Option<u64>,
     pub result: Option<ArbitrageResult>,
     pub blocking_reason: Option<String>,
 }
@@ -383,10 +424,13 @@ impl TradeOperation {
             stage: TradeStage::Prepared,
             dex_dispatched: false,
             cex_dispatched: false,
+            cex_execution_limit_price: None,
             dex_result: None,
             cex_result: None,
             recovery_results: Vec::new(),
             recovery_inflight: false,
+            recovery_target_token_b_delta_base_units: None,
+            recovery_retry_not_before_unix_ms: None,
             result: None,
             blocking_reason: None,
         }
@@ -409,6 +453,26 @@ impl TradeOperation {
             0
         } else {
             residual
+        }
+    }
+
+    /// One-shot Rails-compatible fallback quantity derived only from the
+    /// primary DEX and primary Binance terminal deltas. Recovery results never
+    /// feed another order.
+    fn primary_recovery_target_token_b_delta_base_units(&self) -> Option<i128> {
+        let dex = self.dex_result.as_ref()?;
+        let cex = self.cex_result.as_ref()?;
+        let primary_target = dex.token_b_delta_base_units.saturating_neg();
+        let executed = cex
+            .executed_token_b_delta_base_units
+            // Legacy journals did not separate executedQty from balance delta.
+            .unwrap_or(cex.token_b_delta_base_units);
+        let target = primary_target.saturating_sub(executed);
+        let step = self.intent.token_b_step_base_units;
+        if step > 0 && target.unsigned_abs() < step as u128 {
+            Some(0)
+        } else {
+            Some(target)
         }
     }
 
@@ -502,6 +566,16 @@ impl TradeOperation {
         });
         let primary_profit_error =
             realized_primary_profit.map(|realized| realized.saturating_sub(expected_profit));
+        let third_asset_valuation_complete = self
+            .dex_result
+            .iter()
+            .chain(self.cex_result.iter())
+            .chain(self.recovery_results.iter())
+            .all(|leg| {
+                leg.third_asset_deltas
+                    .keys()
+                    .all(|asset| leg.third_asset_prices_token_a.contains_key(asset))
+            });
         let mut payload = json!({
             "engine_id": engine_id,
             "plan_id": self.intent.plan_id,
@@ -528,6 +602,10 @@ impl TradeOperation {
             "token_b_residual_base_units": result.token_b_residual_base_units.to_string(),
             "gas_cost_token_a_base_units": result.gas_cost_token_a_base_units.to_string(),
             "recovery_loss_token_a_base_units": result.recovery_loss_token_a_base_units.to_string(),
+            "recovery_target_token_b_delta_base_units": optional_i128_string(
+                self.recovery_target_token_b_delta_base_units
+            ),
+            "third_asset_valuation_complete": third_asset_valuation_complete,
             "realized_primary_profit_vs_gross_error_token_a_base_units": optional_i128_string(primary_profit_error),
             "dex": self.dex_result.as_ref().map(leg_payload),
             "cex": self.cex_result.as_ref().map(leg_payload),
@@ -571,8 +649,18 @@ fn enum_json<T: Serialize>(value: &T) -> anyhow::Result<String> {
 fn leg_payload(result: &LegResult) -> Value {
     json!({
         "status": enum_json(&result.status).expect("LegStatus serializes as a string"),
+        "executed_token_b_delta_base_units":
+            optional_i128_string(result.executed_token_b_delta_base_units),
         "token_b_delta_base_units": result.token_b_delta_base_units.to_string(),
         "token_a_delta_base_units": result.token_a_delta_base_units.to_string(),
+        "third_asset_deltas": result.third_asset_deltas.iter()
+            .map(|(asset, value)| (asset.clone(), value.to_string()))
+            .collect::<BTreeMap<_, _>>(),
+        "third_asset_prices_token_a": result.third_asset_prices_token_a.iter()
+            .map(|(asset, value)| (asset.clone(), value.to_string()))
+            .collect::<BTreeMap<_, _>>(),
+        "third_asset_valuation_complete": result.third_asset_deltas.keys()
+            .all(|asset| result.third_asset_prices_token_a.contains_key(asset)),
         "gas_cost_token_a_base_units": result.gas_cost_token_a_base_units.to_string(),
         "venue_reference": result.venue_reference,
     })
@@ -730,7 +818,73 @@ pub struct EntryPreflightRejection {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FreshBinanceTopSnapshot {
+    pub update_id: u64,
+    pub connection_generation: u64,
+    pub bid_price: Decimal,
+    pub bid_quantity: Decimal,
+    pub ask_price: Decimal,
+    pub ask_quantity: Decimal,
+    pub price_age_ms: u64,
+    pub transport_silence_ms: u64,
+}
+
 impl EntryPreflightHandle {
+    pub fn fresh_binance_top(&self, symbol: &str) -> Option<FreshBinanceTopSnapshot> {
+        let state = self.inner.read().ok()?;
+        let quote = state.quotes.get(symbol)?;
+        let transport = state.transport.get(symbol)?;
+        let max_transport_silence_ms = state.max_transport_silence_ms.get(symbol).copied()?;
+        let transport_silence = transport.last_activity_at.elapsed();
+        if !transport.connected
+            || transport.connection_generation != quote.connection_generation
+            || transport_silence > Duration::from_millis(max_transport_silence_ms)
+        {
+            return None;
+        }
+        Some(FreshBinanceTopSnapshot {
+            update_id: quote.update_id,
+            connection_generation: quote.connection_generation,
+            bid_price: quote.bid_price,
+            bid_quantity: quote.bid_quantity,
+            ask_price: quote.ask_price,
+            ask_quantity: quote.ask_quantity,
+            price_age_ms: quote
+                .received_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            transport_silence_ms: transport_silence.as_millis().min(u128::from(u64::MAX)) as u64,
+        })
+    }
+
+    /// Improves the primary IOC price only when the current in-memory Binance
+    /// top belongs to a live connection with fresh transport activity.
+    ///
+    /// SELL never goes below the admission bid; BUY never goes above the
+    /// admission ask. Missing or stale state keeps the immutable admission
+    /// price and never blocks the already-created DEX exposure.
+    pub fn favorable_primary_limit_price(
+        &self,
+        symbol: &str,
+        direction: ArbitrageDirection,
+        admission_price: Decimal,
+    ) -> (Decimal, Option<FreshBinanceTopSnapshot>) {
+        let Some(quote) = self.fresh_binance_top(symbol) else {
+            return (admission_price, None);
+        };
+        let observed = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
+        };
+        let selected = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => admission_price.max(observed),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => admission_price.min(observed),
+        };
+        (selected, Some(quote))
+    }
+
     pub fn configure_max_transport_silence(&self, symbol: &str, max_age_ms: u64) {
         let Ok(mut state) = self.inner.write() else {
             return;
@@ -1470,8 +1624,11 @@ fn simulate_command(
                 LegRole::Dex,
                 LegResult {
                     status: LegStatus::Filled,
+                    executed_token_b_delta_base_units: None,
                     token_b_delta_base_units: *expected_token_b_delta_base_units,
                     token_a_delta_base_units: token_a_delta,
+                    third_asset_deltas: BTreeMap::new(),
+                    third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 0,
                     venue_reference: format!("paper:dex:{}", intent.plan_id),
                     dex_settlement_log: None,
@@ -1525,8 +1682,11 @@ fn simulated_cex_result(
     };
     Ok(LegResult {
         status: LegStatus::Filled,
+        executed_token_b_delta_base_units: Some(token_b_delta),
         token_b_delta_base_units: token_b_delta,
         token_a_delta_base_units: token_a_delta,
+        third_asset_deltas: BTreeMap::new(),
+        third_asset_prices_token_a: BTreeMap::new(),
         gas_cost_token_a_base_units: 0,
         venue_reference: format!("paper:cex:{role}:{}", intent.plan_id),
         dex_settlement_log: None,
@@ -1639,15 +1799,20 @@ impl PaperTradeCoordinator {
             return Ok(Some(CoordinatorCommand::DispatchCex {
                 client_order_id: operation.intent.cex_client_order_id.clone(),
                 target_token_b_delta_base_units: target,
-                limit_price: operation
-                    .intent
-                    .admission
-                    .as_ref()
-                    .map(|bounds| bounds.cex_primary_limit_price),
+                limit_price: operation.cex_execution_limit_price.or_else(|| {
+                    operation
+                        .intent
+                        .admission
+                        .as_ref()
+                        .map(|bounds| bounds.cex_primary_limit_price)
+                }),
             }));
         }
         if operation.recovery_inflight {
-            let target = -operation.actionable_token_b_residual_base_units();
+            let target = operation
+                .recovery_target_token_b_delta_base_units
+                // Legacy inflight journals did not persist the command target.
+                .unwrap_or_else(|| -operation.actionable_token_b_residual_base_units());
             let attempt = operation.recovery_results.len() + 1;
             return Ok(Some(CoordinatorCommand::RecoverCex {
                 attempt,
@@ -1655,6 +1820,120 @@ impl PaperTradeCoordinator {
             }));
         }
         Ok(None)
+    }
+
+    pub fn recovery_retry_wait(&self, plan_id: &str) -> anyhow::Result<Option<(usize, Duration)>> {
+        let operation = self.journal.operation(plan_id)?;
+        let Some(not_before) = operation.recovery_retry_not_before_unix_ms else {
+            return Ok(None);
+        };
+        let now = unix_timestamp_ms()?;
+        Ok((not_before > now).then(|| {
+            (
+                operation.recovery_results.len() + 1,
+                Duration::from_millis(not_before - now),
+            )
+        }))
+    }
+
+    /// Reconstructs the exact Binance command whose terminal result is still
+    /// unknown. Replaying this command is reconciliation-only: the Binance
+    /// order journal uses the same deterministic client ID and queries
+    /// `order.status` instead of authorizing a new mutation.
+    pub fn unknown_binance_reconciliation_command(
+        &self,
+        plan_id: &str,
+    ) -> anyhow::Result<Option<(LegRole, CoordinatorCommand)>> {
+        let operation = self.journal.operation(plan_id)?;
+        if operation.stage != TradeStage::UnknownExposure {
+            return Ok(None);
+        }
+        if operation
+            .cex_result
+            .as_ref()
+            .is_some_and(|result| result.status == LegStatus::Unknown)
+        {
+            let target = if operation.intent.mode == ExecutionMode::DexFirst {
+                -operation
+                    .dex_result
+                    .as_ref()
+                    .context("unknown primary CEX result has no DEX result")?
+                    .token_b_delta_base_units
+            } else {
+                -operation
+                    .intent
+                    .direction
+                    .dex_token_b_delta(operation.intent.planned_token_b_base_units)
+            };
+            return Ok(Some((
+                LegRole::Cex,
+                CoordinatorCommand::DispatchCex {
+                    client_order_id: operation.intent.cex_client_order_id.clone(),
+                    target_token_b_delta_base_units: target,
+                    limit_price: operation.cex_execution_limit_price.or_else(|| {
+                        operation
+                            .intent
+                            .admission
+                            .as_ref()
+                            .map(|bounds| bounds.cex_primary_limit_price)
+                    }),
+                },
+            )));
+        }
+        if operation
+            .recovery_results
+            .last()
+            .is_some_and(|result| result.status == LegStatus::Unknown)
+        {
+            let target = operation
+                .recovery_target_token_b_delta_base_units
+                .context("unknown recovery result has no immutable target")?;
+            return Ok(Some((
+                LegRole::RecoveryCex,
+                CoordinatorCommand::RecoverCex {
+                    attempt: operation.recovery_results.len(),
+                    target_token_b_delta_base_units: target,
+                },
+            )));
+        }
+        Ok(None)
+    }
+
+    pub fn select_primary_cex_limit_price(
+        &mut self,
+        plan_id: &str,
+        limit_price: Decimal,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            limit_price > Decimal::ZERO,
+            "selected primary CEX limit price is non-positive"
+        );
+        let mut operation = self.journal.operation(plan_id)?.clone();
+        ensure!(
+            operation.intent.mode == ExecutionMode::DexFirst,
+            "post-DEX CEX price selection requires dex-first execution"
+        );
+        ensure!(
+            !operation.cex_dispatched,
+            "primary CEX leg was already dispatched"
+        );
+        ensure!(
+            operation.dex_result.as_ref().is_some_and(|result| {
+                result.status == LegStatus::Filled && result.token_b_delta_base_units != 0
+            }),
+            "primary CEX price selection requires a filled DEX result"
+        );
+        match operation.cex_execution_limit_price {
+            Some(selected) => ensure!(
+                selected == limit_price,
+                "selected primary CEX limit price changed"
+            ),
+            None => {
+                operation.cex_execution_limit_price = Some(limit_price);
+                self.journal.append(operation)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn take_commands(&mut self, plan_id: &str) -> anyhow::Result<Vec<CoordinatorCommand>> {
@@ -1711,11 +1990,13 @@ impl PaperTradeCoordinator {
                 commands.push(CoordinatorCommand::DispatchCex {
                     client_order_id: operation.intent.cex_client_order_id.clone(),
                     target_token_b_delta_base_units: -dex.token_b_delta_base_units,
-                    limit_price: operation
-                        .intent
-                        .admission
-                        .as_ref()
-                        .map(|bounds| bounds.cex_primary_limit_price),
+                    limit_price: operation.cex_execution_limit_price.or_else(|| {
+                        operation
+                            .intent
+                            .admission
+                            .as_ref()
+                            .map(|bounds| bounds.cex_primary_limit_price)
+                    }),
                 });
                 self.journal.append(operation)?;
                 return Ok(commands);
@@ -1730,12 +2011,42 @@ impl PaperTradeCoordinator {
         let primary_finished = operation.dex_result.is_some()
             && (operation.cex_result.is_some() || !operation.cex_dispatched);
         if primary_finished && !operation.recovery_inflight {
-            let residual = operation.actionable_token_b_residual_base_units();
-            if residual == 0 {
-                finalize_balanced(&mut operation)?;
-                self.journal.append(operation)?;
-            } else if operation.recovery_results.len() < MAX_RECOVERY_ATTEMPTS {
-                let target = -residual;
+            if !operation.recovery_results.is_empty() {
+                let retryable = operation
+                    .recovery_results
+                    .last()
+                    .is_some_and(recovery_failure_is_retryable);
+                if retryable && operation.recovery_results.len() < MAX_RECOVERY_ATTEMPTS {
+                    let not_before = operation
+                        .recovery_retry_not_before_unix_ms
+                        .context("retryable recovery has no persisted backoff deadline")?;
+                    if unix_timestamp_ms()? < not_before {
+                        return Ok(commands);
+                    }
+                    let target = operation
+                        .recovery_target_token_b_delta_base_units
+                        .context("retryable recovery has no immutable target")?;
+                    operation.recovery_inflight = true;
+                    operation.recovery_retry_not_before_unix_ms = None;
+                    commands.push(CoordinatorCommand::RecoverCex {
+                        attempt: operation.recovery_results.len() + 1,
+                        target_token_b_delta_base_units: target,
+                    });
+                    self.journal.append(operation)?;
+                } else {
+                    operation.recovery_retry_not_before_unix_ms = None;
+                    finalize_balanced(&mut operation)?;
+                    self.journal.append(operation)?;
+                }
+            } else {
+                let target = operation
+                    .primary_recovery_target_token_b_delta_base_units()
+                    .unwrap_or(0);
+                if target == 0 {
+                    finalize_balanced(&mut operation)?;
+                    self.journal.append(operation)?;
+                    return Ok(commands);
+                }
                 if operation.intent.mode == ExecutionMode::DexFirst
                     && !dex_first_recovery_direction_is_valid(operation.intent.direction, target)
                 {
@@ -1747,15 +2058,12 @@ impl PaperTradeCoordinator {
                 }
                 operation.stage = TradeStage::Recovering;
                 operation.recovery_inflight = true;
-                let attempt = operation.recovery_results.len() + 1;
+                operation.recovery_target_token_b_delta_base_units = Some(target);
+                operation.recovery_retry_not_before_unix_ms = None;
                 commands.push(CoordinatorCommand::RecoverCex {
-                    attempt,
+                    attempt: 1,
                     target_token_b_delta_base_units: target,
                 });
-                self.journal.append(operation)?;
-            } else {
-                operation.stage = TradeStage::Halted;
-                operation.blocking_reason = Some("recovery_attempts_exhausted".to_owned());
                 self.journal.append(operation)?;
             }
         }
@@ -1792,6 +2100,7 @@ impl PaperTradeCoordinator {
                 ensure!(operation.recovery_inflight, "recovery was not dispatched");
                 operation.recovery_inflight = false;
                 operation.recovery_results.push(result);
+                refresh_recovery_retry_deadline(&mut operation)?;
             }
         }
         self.journal.append(operation)
@@ -1828,6 +2137,7 @@ impl PaperTradeCoordinator {
                     "latest recovery result is not unknown"
                 );
                 *current = result;
+                refresh_recovery_retry_deadline(&mut operation)?;
             }
         }
         operation.stage = if operation.recovery_results.is_empty() {
@@ -1860,11 +2170,44 @@ fn replace_unknown(slot: &mut Option<LegResult>, result: LegResult) -> anyhow::R
     Ok(())
 }
 
-fn finalize_balanced(operation: &mut TradeOperation) -> anyhow::Result<()> {
+fn recovery_failure_is_retryable(result: &LegResult) -> bool {
+    result.status == LegStatus::Failed
+        && (matches!(
+            result.venue_reference.as_str(),
+            "cex:market-unsubmitted" | "cex:market-rejected"
+        ) || result.venue_reference.starts_with("cex:market-zero-fill:"))
+}
+
+fn recovery_retry_delay_ms(completed_attempts: usize) -> anyhow::Result<u64> {
     ensure!(
-        operation.actionable_token_b_residual_base_units() == 0,
-        "cannot finalize a trade with actionable token-B exposure"
+        (1..MAX_RECOVERY_ATTEMPTS).contains(&completed_attempts),
+        "recovery retry attempt is outside the bounded policy"
     );
+    RECOVERY_RETRY_BASE_DELAY_MS
+        .checked_mul(1_u64 << (completed_attempts - 1))
+        .context("recovery retry delay overflow")
+}
+
+fn refresh_recovery_retry_deadline(operation: &mut TradeOperation) -> anyhow::Result<()> {
+    operation.recovery_retry_not_before_unix_ms = if operation
+        .recovery_results
+        .last()
+        .is_some_and(recovery_failure_is_retryable)
+        && operation.recovery_results.len() < MAX_RECOVERY_ATTEMPTS
+    {
+        let delay = recovery_retry_delay_ms(operation.recovery_results.len())?;
+        Some(
+            unix_timestamp_ms()?
+                .checked_add(delay)
+                .context("recovery retry deadline overflow")?,
+        )
+    } else {
+        None
+    };
+    Ok(())
+}
+
+fn finalize_balanced(operation: &mut TradeOperation) -> anyhow::Result<()> {
     let (realized_profit, gas) = operation.realized_profit_token_a_base_units();
     let recovery_token_a = operation
         .recovery_results
@@ -2135,6 +2478,17 @@ fn apply_snapshot(
             "CEX dispatch regressed"
         );
         ensure!(
+            previous.cex_execution_limit_price.is_none()
+                || previous.cex_execution_limit_price == operation.cex_execution_limit_price,
+            "selected primary CEX limit price changed"
+        );
+        ensure!(
+            previous.recovery_target_token_b_delta_base_units.is_none()
+                || previous.recovery_target_token_b_delta_base_units
+                    == operation.recovery_target_token_b_delta_base_units,
+            "selected recovery target changed"
+        );
+        ensure!(
             result_is_unchanged_or_reconciled(&previous.dex_result, &operation.dex_result),
             "DEX result changed without unknown-outcome reconciliation"
         );
@@ -2183,7 +2537,10 @@ fn stage_transition_allowed(previous: &TradeStage, next: &TradeStage) -> bool {
                     TradeStage::UnknownExposure,
                     TradeStage::Executing | TradeStage::Recovering | TradeStage::Halted
                 )
-                | (TradeStage::Halted, TradeStage::Recovering)
+                | (
+                    TradeStage::Halted,
+                    TradeStage::Recovering | TradeStage::BalancedProfit | TradeStage::BalancedLoss
+                )
         )
 }
 
@@ -2224,6 +2581,18 @@ fn validate_operation(operation: &TradeOperation) -> anyhow::Result<()> {
         operation.recovery_results.len() <= MAX_RECOVERY_ATTEMPTS,
         "too many recovery attempts"
     );
+    ensure!(
+        operation.recovery_retry_not_before_unix_ms.is_none()
+            || (operation.stage == TradeStage::Recovering
+                && !operation.recovery_inflight
+                && operation.result.is_none()
+                && operation.recovery_results.len() < MAX_RECOVERY_ATTEMPTS
+                && operation
+                    .recovery_results
+                    .last()
+                    .is_some_and(recovery_failure_is_retryable)),
+        "recovery retry deadline does not match a retryable terminal attempt"
+    );
     for result in operation
         .dex_result
         .iter()
@@ -2240,12 +2609,6 @@ fn validate_operation(operation: &TradeOperation) -> anyhow::Result<()> {
             ),
         "terminal result and stage disagree"
     );
-    if operation.result.is_some() {
-        ensure!(
-            operation.actionable_token_b_residual_base_units() == 0,
-            "terminal result has actionable token-B exposure"
-        );
-    }
     if let Some(reason) = &operation.blocking_reason {
         validate_id("blocking reason", reason, 256)?;
     }
@@ -2317,14 +2680,15 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     use alloy_primitives::U256;
     use rust_decimal::Decimal;
 
     use super::{
         ArbitrageDirection, CoordinatorCommand, ExecutionLaneState, ExecutionMode, LegResult,
-        LegRole, LegStatus, PaperTradeCoordinator, TerminalOutcome, TradeIntent, TradeStage,
+        LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS, PaperTradeCoordinator,
+        RECOVERY_RETRY_BASE_DELAY_MS, TerminalOutcome, TradeIntent, TradeStage,
         initial_execution_lane, meets_spread_threshold, token_b_at_price_in_token_a_base_units,
     };
 
@@ -2410,8 +2774,11 @@ mod tests {
     fn filled(token_b: i128, token_a: i128, reference: &str) -> LegResult {
         LegResult {
             status: LegStatus::Filled,
+            executed_token_b_delta_base_units: Some(token_b),
             token_b_delta_base_units: token_b,
             token_a_delta_base_units: token_a,
+            third_asset_deltas: BTreeMap::new(),
+            third_asset_prices_token_a: BTreeMap::new(),
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
             dex_settlement_log: None,
@@ -2421,8 +2788,11 @@ mod tests {
     fn failed(reference: &str) -> LegResult {
         LegResult {
             status: LegStatus::Failed,
+            executed_token_b_delta_base_units: Some(0),
             token_b_delta_base_units: 0,
             token_a_delta_base_units: 0,
+            third_asset_deltas: BTreeMap::new(),
+            third_asset_prices_token_a: BTreeMap::new(),
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
             dex_settlement_log: None,
@@ -2579,6 +2949,44 @@ mod tests {
             recovered.operation(&plan_id).unwrap().result,
             expected_result
         );
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn selected_post_dex_cex_price_survives_restart_before_order_result() {
+        let path = path("post-dex-cex-price");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, filled(97, -1_000, "dex:0x-price"))
+            .unwrap();
+        coordinator
+            .select_primary_cex_limit_price(&plan_id, Decimal::new(102, 2))
+            .unwrap();
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::DispatchCex {
+                target_token_b_delta_base_units: -97,
+                limit_price: Some(price),
+                ..
+            }] if *price == Decimal::new(102, 2)
+        ));
+        drop(coordinator);
+
+        let recovered = PaperTradeCoordinator::open(&path).unwrap();
+        assert!(matches!(
+            recovered.resume_command(&plan_id).unwrap(),
+            Some(CoordinatorCommand::DispatchCex {
+                target_token_b_delta_base_units: -97,
+                limit_price: Some(price),
+                ..
+            }) if price == Decimal::new(102, 2)
+        ));
         drop(recovered);
         fs::remove_file(path).unwrap();
     }
@@ -2792,7 +3200,39 @@ mod tests {
     }
 
     #[test]
-    fn partial_market_closeout_retries_only_remaining_residual() {
+    fn fallback_uses_primary_executed_quantity_not_fee_adjusted_balance_delta() {
+        let path = path("market-closeout-executed-quantity");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, filled(100, -1_000, "dex:fill"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        let mut primary = filled(-91, 900, "cex:partial-with-wld-fee");
+        primary.executed_token_b_delta_base_units = Some(-90);
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, primary)
+            .unwrap();
+
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex {
+                attempt: 1,
+                target_token_b_delta_base_units: -10,
+                ..
+            }]
+        ));
+
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn partial_market_closeout_is_recorded_without_a_second_balance_order() {
         let path = path("partial-market-closeout");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
@@ -2819,31 +3259,104 @@ mod tests {
                 filled(-40, 396, "cex:partial-market-r1"),
             )
             .unwrap();
+        assert!(coordinator.take_commands(&plan_id).unwrap().is_empty());
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, TradeStage::BalancedLoss);
+        assert_eq!(operation.recovery_results.len(), 1);
+        assert_eq!(operation.token_b_residual_base_units(), 60);
+        assert_eq!(
+            operation
+                .result
+                .as_ref()
+                .unwrap()
+                .token_b_residual_base_units,
+            60
+        );
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn proven_zero_fill_recovery_retries_three_times_with_persisted_backoff() {
+        let path = path("bounded-market-recovery-retries");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, filled(100, -1_000, "dex:fill"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, failed("cex:expired-primary"))
+            .unwrap();
         assert!(matches!(
             coordinator.take_commands(&plan_id).unwrap().as_slice(),
             [CoordinatorCommand::RecoverCex {
-                attempt: 2,
-                target_token_b_delta_base_units: -60,
-                ..
+                attempt: 1,
+                target_token_b_delta_base_units: -100,
             }]
         ));
         coordinator
             .record_result(
                 &plan_id,
                 LegRole::RecoveryCex,
-                filled(-60, 594, "cex:market-closeout-r2"),
+                failed("cex:market-unsubmitted"),
             )
             .unwrap();
-        coordinator.take_commands(&plan_id).unwrap();
+        let (attempt, delay) = coordinator.recovery_retry_wait(&plan_id).unwrap().unwrap();
+        assert_eq!(attempt, 2);
+        assert!(delay <= Duration::from_millis(RECOVERY_RETRY_BASE_DELAY_MS));
+        drop(coordinator);
+
+        std::thread::sleep(delay + Duration::from_millis(2));
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex {
+                attempt: 2,
+                target_token_b_delta_base_units: -100,
+            }]
+        ));
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                failed("cex:market-rejected"),
+            )
+            .unwrap();
+        let (attempt, delay) = coordinator.recovery_retry_wait(&plan_id).unwrap().unwrap();
+        assert_eq!(attempt, 3);
+        assert!(delay <= Duration::from_millis(RECOVERY_RETRY_BASE_DELAY_MS * 2));
+        std::thread::sleep(delay + Duration::from_millis(2));
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex {
+                attempt: 3,
+                target_token_b_delta_base_units: -100,
+            }]
+        ));
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                failed("cex:market-zero-fill:42"),
+            )
+            .unwrap();
+        assert!(coordinator.take_commands(&plan_id).unwrap().is_empty());
         let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.recovery_results.len(), MAX_RECOVERY_ATTEMPTS);
         assert_eq!(operation.stage, TradeStage::BalancedLoss);
-        assert_eq!(operation.token_b_residual_base_units(), 0);
+        assert!(operation.recovery_retry_not_before_unix_ms.is_none());
+
         drop(coordinator);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn legacy_halted_after_two_limits_resumes_market_closeout() {
+    fn journaled_inflight_recovery_resumes_without_starting_another_order() {
         let path = path("legacy-halted-market-closeout");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
@@ -2866,24 +3379,19 @@ mod tests {
         coordinator
             .record_result(&plan_id, LegRole::RecoveryCex, failed("cex:expired-r1"))
             .unwrap();
-        coordinator.take_commands(&plan_id).unwrap();
-        coordinator
-            .record_result(&plan_id, LegRole::RecoveryCex, failed("cex:expired-r2"))
-            .unwrap();
         let mut legacy = coordinator.operation(&plan_id).unwrap().clone();
-        legacy.stage = TradeStage::Halted;
-        legacy.blocking_reason = Some("recovery_attempts_exhausted".to_owned());
+        legacy.stage = TradeStage::Recovering;
+        legacy.recovery_inflight = true;
         coordinator.journal.append(legacy).unwrap();
         drop(coordinator);
 
         let mut recovered = PaperTradeCoordinator::open(&path).unwrap();
         assert!(matches!(
-            recovered.take_commands(&plan_id).unwrap().as_slice(),
-            [CoordinatorCommand::RecoverCex {
-                attempt: 3,
+            recovered.resume_command(&plan_id).unwrap(),
+            Some(CoordinatorCommand::RecoverCex {
+                attempt: 2,
                 target_token_b_delta_base_units: -100,
-                ..
-            }]
+            })
         ));
         recovered
             .record_result(
@@ -2892,10 +3400,18 @@ mod tests {
                 filled(-100, 990, "cex:market-closeout"),
             )
             .unwrap();
-        recovered.take_commands(&plan_id).unwrap();
+        assert!(recovered.take_commands(&plan_id).unwrap().is_empty());
         assert_eq!(
             recovered.operation(&plan_id).unwrap().stage,
             TradeStage::BalancedLoss
+        );
+        assert_eq!(
+            recovered
+                .operation(&plan_id)
+                .unwrap()
+                .recovery_results
+                .len(),
+            2
         );
         drop(recovered);
         fs::remove_file(path).unwrap();
@@ -3018,8 +3534,11 @@ mod tests {
                 LegRole::Dex,
                 LegResult {
                     status: LegStatus::Unknown,
+                    executed_token_b_delta_base_units: None,
                     token_b_delta_base_units: 0,
                     token_a_delta_base_units: 0,
+                    third_asset_deltas: BTreeMap::new(),
+                    third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 0,
                     venue_reference: "dex:unknown".to_owned(),
                     dex_settlement_log: None,
@@ -3065,8 +3584,11 @@ mod tests {
                 LegRole::Dex,
                 LegResult {
                     status: LegStatus::Failed,
+                    executed_token_b_delta_base_units: None,
                     token_b_delta_base_units: 0,
                     token_a_delta_base_units: 0,
+                    third_asset_deltas: BTreeMap::new(),
+                    third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 4,
                     venue_reference: "dex:reconciled-revert".to_owned(),
                     dex_settlement_log: None,

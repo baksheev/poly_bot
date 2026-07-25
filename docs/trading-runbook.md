@@ -1,6 +1,6 @@
 # Live arbitrage operator runbook
 
-Last reviewed: 2026-07-25
+Last reviewed: 2026-07-26
 
 This runbook applies only to the isolated WLDUSDC Rust identities owned by the
 single production Pod in the private zonal GKE cluster `arb-bot` in
@@ -46,7 +46,8 @@ gh workflow run deploy-gke.yml --ref main
 
 The recoverable kill switch is the persistent-volume file
 `/var/lib/arb-bot/arbitrage-entry.stop`. Creating it blocks new parent intents
-but deliberately leaves restart reconciliation and residual recovery enabled:
+but deliberately leaves restart reconciliation and any already-journaled
+bounded MARKET recovery/backoff enabled:
 
 Enable or clear it only through an approved GitHub Actions operational change
 targeting the GKE Pod and its mounted state volume. Never SSH to the rollback
@@ -60,23 +61,27 @@ hash. Never edit, truncate, copy over, or delete a journal. An `Unknown` parent
 is not balanced and must not be included in PnL.
 
 A hard service stop is allowed only after confirming there is no unresolved
-parent, order, nonce, transaction, or residual exposure. Scale or stop the GKE
-owner only through a reviewed, approved GitHub Actions recovery change.
+parent, order, nonce, transaction, or fallback ownership. A recorded WLD
+inventory delta in a terminal result is not unresolved mutation ownership.
+Scale or stop the GKE owner only through a reviewed, approved GitHub Actions
+recovery change.
 
 Removing the entry-stop file is a new-entry authorization. Do it only after
 venue and journal reconciliation.
 
 ## Canary and 100-trade run
 
-For the first composed live canary, enable `full_live`, wait for one balanced
+For the first composed live canary, enable `full_live`, wait for one terminal
 parent result, then immediately activate the entry stop and verify venue
 history, journals, balances, and accounting. The canary must use the same
 strategy parameters as Rails; do not add cost, loss, total-entry, or rate caps
 that Rails does not have.
 
-After the canary is balanced, venue-verified, and economically accounted,
+After the canary is terminal, venue-verified, and economically accounted,
 remove the entry stop and run the same live journal until the watcher observes
-100 balanced results. Do not replace or clear the journal between phases.
+100 terminal results. The persisted stage names remain `balanced_profit` and
+`balanced_loss` for journal compatibility. Do not replace or clear the journal
+between phases.
 
 The 2026-07-17 Rails reference snapshot for the most recent 100 pair-3
 `profit_token_a` results was:
@@ -87,8 +92,9 @@ The 2026-07-17 Rails reference snapshot for the most recent 100 pair-3
 - summed absolute WLD residual: `0`.
 
 The final verdict uses one equal UTC half-open interval and the queries in
-`docs/arbitrage-results.md`. Rust must have at least 100 balanced admitted
-parents and zero actionable residual in the counted results. Report unknown
+`docs/arbitrage-results.md`. Rust must have at least 100 terminal admitted
+parents. Report aggregate signed and absolute WLD inventory drift and its PnL
+mark; drift is an observed result, not a completion gate. Report unknown
 parents separately and verify that each held only its own reservation and did
 not block later independent work. Total and average
 `comparable_profit_token_a_base_units` are compared with Rails for the same

@@ -36,6 +36,8 @@ The v4-v12 snapshots record:
 - USDC as token A and WLD as token B, with base-unit decimals;
 - Binance Spot `WLDUSDC` market data and eventual Spot execution, with exact
   step/tick size;
+- the accounting-only BNB fee asset and Spot `BNBUSDT` valuation symbol; this
+  auxiliary feed is excluded from strategy readiness and execution decisions;
 - fixed 20 USDC detector/control notional; v10-v12 execute adaptive whole-step
   sizing from sequence-matched depth, capped recent depth, or a 40 USDC-capped
   top-only book up to the global 200 USDC cap, while retaining immediate

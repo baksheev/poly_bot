@@ -37,7 +37,7 @@ use arb_bot::{
     },
     domain::config::{DexProvider, LoadedDomainConfig},
     engine::{BinanceFeeBps, TradingEngine},
-    execution_accounting::binance_leg_result,
+    execution_accounting::{CommissionAssetValuation, binance_leg_result},
     live_execution::{
         ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveRiskLimits, live_trade_channel,
     },
@@ -425,6 +425,13 @@ fn arbitrage_reconcile_cex(
         pair.token_b.decimals,
         &pair.binance.quote_asset,
         pair.token_a.decimals,
+        pair.binance
+            .commission_asset
+            .as_deref()
+            .map(|asset| CommissionAssetValuation {
+                asset,
+                price_in_token_a: None,
+            }),
     )?;
     coordinator.reconcile_unknown(plan_id, LegRole::Cex, result.clone())?;
     tracing::info!(
@@ -895,6 +902,17 @@ async fn run(
         .clone()
         .context("domain config has no Binance gas-price symbol")?;
     let mut gas_price_feed = BookTickerFeed::new(&config, gas_price_symbol.clone());
+    let commission_asset = pair
+        .binance
+        .commission_asset
+        .clone()
+        .context("domain config has no Binance commission asset")?;
+    let commission_price_symbol = pair
+        .binance
+        .commission_price_binance_symbol
+        .clone()
+        .context("domain config has no Binance commission-price symbol")?;
+    let mut commission_price_feed = BookTickerFeed::new(&config, commission_price_symbol.clone());
     let rebalance_tracker = if pair.rebalance.enabled {
         let coins = binance_account_client.all_coin_information().await?;
         let mut routes = BTreeMap::new();
@@ -949,6 +967,7 @@ async fn run(
     let binance_assets = vec![
         Arc::<str>::from(pair.binance.quote_asset.as_str()),
         Arc::<str>::from(pair.binance.base_asset.as_str()),
+        Arc::<str>::from(commission_asset.as_str()),
     ];
     let initial_wallet_balances = fetch_wallet_snapshot(
         &wallet_rpc,
@@ -1112,10 +1131,6 @@ async fn run(
             execution_latency_telemetry,
         )
         .await?;
-        let market_buy_recovery_fee_bps = binance_account
-            .commission
-            .conservative_taker_fee_bps("BUY")
-            .context("failed to derive Binance MARKET BUY recovery fee")?;
         let executor = ComposedLiveLegExecutor::new(
             dex_service,
             binance_service,
@@ -1125,7 +1140,11 @@ async fn run(
                 base_decimals: pair.token_b.decimals,
                 quote_asset: pair.binance.quote_asset.clone(),
                 quote_decimals: pair.token_a.decimals,
-                market_buy_recovery_fee_bps,
+                commission_asset: commission_asset.clone(),
+                commission_price_symbol: commission_price_symbol.clone(),
+                market_state: entry_preflight.clone(),
+                telemetry: telemetry.clone(),
+                engine_id: config.engine_id.clone(),
             },
         )?;
         let (handle, task, events) = live_trade_channel(
@@ -1136,6 +1155,7 @@ async fn run(
             LiveRiskLimits {
                 entry_stop_file: config.arbitrage_entry_stop_file.clone(),
                 entry_preflight: entry_preflight.clone(),
+                binance_symbol: pair.binance.symbol.clone(),
             },
         )?;
         Some((handle, tokio::spawn(task.run()), events))
@@ -1292,10 +1312,13 @@ async fn run(
         binance_open_orders = binance_account.open_orders.len(),
         binance_order_rate_limits = ?binance_account.order_rate_limits,
         binance_gas_price_symbol = %gas_price_symbol,
+        binance_commission_asset = %commission_asset,
+        binance_commission_price_symbol = %commission_price_symbol,
         binance_strategy_max_transport_silence_ms = pair.strategy.max_transport_silence_ms(),
         binance_gas_price_gate_enabled = false,
         binance_wld_balance_present = binance_account.balance("WLD").is_some(),
         binance_usdc_balance_present = binance_account.balance("USDC").is_some(),
+        binance_commission_balance_present = binance_account.balance(&commission_asset).is_some(),
         wallet_address = %wallet_owner,
         wallet_chain_id,
         balance_sync_interval_ms = config.balance_sync_interval_ms,
@@ -1322,6 +1345,7 @@ async fn run(
     // bootstrap or reconnect before it can commit the connected socket.
     let mut binance_market_event = Box::pin(binance_feed.next_event());
     let mut gas_market_event = Box::pin(gas_price_feed.next_event());
+    let mut commission_market_event = Box::pin(commission_price_feed.next_event());
 
     loop {
         tokio::select! {
@@ -1356,6 +1380,11 @@ async fn run(
                 drop(gas_market_event);
                 engine.on_gas_market_event(event)?;
                 gas_market_event = Box::pin(gas_price_feed.next_event());
+            },
+            event = &mut commission_market_event => {
+                drop(commission_market_event);
+                engine.on_commission_market_event(event)?;
+                commission_market_event = Box::pin(commission_price_feed.next_event());
             },
             event = user_data_stream.next_event() => {
                 engine.on_user_data_event(event?)?;

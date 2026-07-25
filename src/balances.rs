@@ -65,9 +65,6 @@ pub struct WalletBalanceSnapshot {
     pub chain_id: u64,
     pub block_number: u64,
     pub block_hash: B256,
-    pub native_balance_wei: U256,
-    /// Fresh network gas price sampled with the same canonical wallet snapshot.
-    pub gas_price_wei: u128,
     pub token_balances: Vec<WalletTokenBalance>,
     pub observed_at: Instant,
     pub request_duration_us: u128,
@@ -254,12 +251,10 @@ pub async fn fetch_wallet_snapshot(
             data: erc20_balance_of_call(owner),
         })
         .collect::<Vec<_>>();
-    let (native_balance_wei, encoded_balances, gas_price_wei) = tokio::try_join!(
-        rpc.native_balance_at(owner, block),
-        rpc.eth_call_batch(&calls, block),
-        rpc.gas_price(),
-    )?;
-    ensure!(gas_price_wei > 0, "RPC returned zero gas price");
+    // Trading readiness depends only on the ERC-20 balances consumed by an
+    // admitted plan. Native gas funding is an operational invariant and is
+    // deliberately absent from the balance snapshot and reservation model.
+    let encoded_balances = rpc.eth_call_batch(&calls, block).await?;
     ensure!(
         encoded_balances.len() == tokens.len(),
         "wallet token balance response count mismatch"
@@ -285,8 +280,6 @@ pub async fn fetch_wallet_snapshot(
         chain_id,
         block_number: block.number,
         block_hash: block.hash,
-        native_balance_wei,
-        gas_price_wei,
         token_balances,
         observed_at: Instant::now(),
         request_duration_us: started.elapsed().as_micros(),

@@ -331,6 +331,7 @@ fn validate_transition(
                 next,
                 BinanceOrderProgress::Submitted { .. }
                     | BinanceOrderProgress::Terminal { .. }
+                    | BinanceOrderProgress::Rejected { .. }
                     | BinanceOrderProgress::OutcomeUnknown { .. }
             ),
         "an unknown Binance outcome can only be reconciled from the exchange"
@@ -525,6 +526,39 @@ mod tests {
             .unwrap();
         assert_eq!(journal.active_operations().len(), 1);
         assert!(BinanceOrderJournal::open(&path).is_err());
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_no_such_order_can_reconcile_unknown_as_rejected() {
+        let path = path("unknown-confirmed-absent");
+        let _ = fs::remove_file(&path);
+        let mut journal = BinanceOrderJournal::open(&path).unwrap();
+        journal.record_intent(intent()).unwrap();
+        journal
+            .advance(
+                "rustval123LB",
+                BinanceOrderProgress::OutcomeUnknown {
+                    reason: "response timed out".to_owned(),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                "rustval123LB",
+                BinanceOrderProgress::Rejected {
+                    status: 400,
+                    code: -2013,
+                    reason: "order status confirmed absent".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(journal.active_operations().is_empty());
+        assert!(matches!(
+            journal.operations()["rustval123LB"].progress,
+            BinanceOrderProgress::Rejected { code: -2013, .. }
+        ));
         drop(journal);
         fs::remove_file(path).unwrap();
     }

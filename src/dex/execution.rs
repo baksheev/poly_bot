@@ -33,9 +33,12 @@ pub const PERMIT2_ADDRESS: Address = Address::new([
     0x3a, 0xc7, 0x8b, 0xa3,
 ]);
 
-const RAILS_PRIORITY_FEE_WEI: u128 = crate::admission::RAILS_PRIORITY_FEE_WEI;
-const RAILS_DEFAULT_GAS_LIMIT: u64 = 800_000;
-const RAILS_V4_MIN_SWAP_GAS_LIMIT: u64 = 250_000;
+const RAILS_PRIORITY_FEE_WEI: u128 = 1_500_000;
+const RAILS_FALLBACK_GAS_PRICE_WEI: u128 = 100_000;
+const RAILS_APPROVAL_DEFAULT_GAS_LIMIT: u64 = 800_000;
+// One local-curve fallback for V3 and V4. It leaves roughly 27% headroom over
+// the largest observed Rails V3/V4 receipt from 2026-05-25..2026-07-25.
+const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
 const RAILS_PERMIT2_APPROVAL_GAS_LIMIT: u64 = 120_000;
 const GAS_PRICE_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_SWAP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -205,6 +208,7 @@ pub struct SwapExecutionOutcome {
     pub block_number: u64,
     pub gas_used: u64,
     pub effective_gas_price: u128,
+    pub l1_fee: u128,
     pub token_in_spent: U256,
     pub token_out_received: U256,
     pub settlement_log: Option<ChainLog>,
@@ -232,13 +236,13 @@ impl GasLimitPolicy {
             UniswapProtocol::V3 => Self {
                 multiplier: 2,
                 minimum: 0,
-                default: RAILS_DEFAULT_GAS_LIMIT,
+                default: HISTORICAL_SWAP_GAS_LIMIT,
                 additional,
             },
             UniswapProtocol::V4 => Self {
                 multiplier: 4,
-                minimum: RAILS_V4_MIN_SWAP_GAS_LIMIT,
-                default: RAILS_V4_MIN_SWAP_GAS_LIMIT,
+                minimum: HISTORICAL_SWAP_GAS_LIMIT,
+                default: HISTORICAL_SWAP_GAS_LIMIT,
                 additional,
             },
         }
@@ -262,9 +266,9 @@ impl GasLimitPolicy {
             Some(quoted_gas) => quoted_gas
                 .checked_mul(self.multiplier)
                 .context("Rails-compatible gas multiplier overflow")?,
-            // Local quotes do not carry QuoterV2's gas field. Retain the Rails
-            // default while also applying its protocol multiplier to the RPC
-            // estimate so V4 does not silently fall back to only 250k.
+            // Local quotes do not carry QuoterV2's gas field. Retain the
+            // historical production floor while also applying the Rails
+            // protocol multiplier to a fresh RPC estimate.
             None => self.default.max(multiplied_estimate),
         };
         let estimate_with_extra = estimated_gas
@@ -560,6 +564,7 @@ impl DexExecutor {
             block_number: receipt.block_number,
             gas_used: receipt.gas_used,
             effective_gas_price: receipt.effective_gas_price,
+            l1_fee: receipt.l1_fee,
             token_in_spent,
             token_out_received,
             settlement_log,
@@ -590,6 +595,7 @@ impl DexExecutor {
                     transaction_hash: receipt.transaction_hash,
                     gas_used: receipt.gas_used,
                     effective_gas_price: receipt.effective_gas_price,
+                    l1_fee: receipt.l1_fee,
                     reason,
                 },
                 None => DexExecutionServiceError::OutcomeUnknown { reason },
@@ -669,8 +675,8 @@ impl DexExecutor {
                 "erc20_approval",
                 &approval,
                 ExecuteCallPolicy {
-                    gas: GasLimitPolicy::fixed(RAILS_DEFAULT_GAS_LIMIT),
-                    quoted_gas: Some(RAILS_DEFAULT_GAS_LIMIT),
+                    gas: GasLimitPolicy::fixed(RAILS_APPROVAL_DEFAULT_GAS_LIMIT),
+                    quoted_gas: Some(RAILS_APPROVAL_DEFAULT_GAS_LIMIT),
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
@@ -815,11 +821,11 @@ impl DexExecutor {
             max_fee_per_gas,
             max_priority_fee_per_gas: RAILS_PRIORITY_FEE_WEI.min(max_fee_per_gas),
         };
-        // Immediate live swaps already passed admission against the in-memory
-        // wallet snapshot. Like Rails, signing uses the fresh RPC gas price
-        // without treating the admission sample as a fee cap. Avoid repeating
-        // eth_getBalance on the latency-sensitive path. Startup approval writes
-        // retain the direct RPC guard.
+        // Native gas funding is an operator-maintained invariant for immediate
+        // live swaps. Like Rails, signing uses the fresh RPC gas price without
+        // an admission sample or fee cap, and the latency-sensitive path never
+        // calls eth_getBalance. Startup/manual simulated writes retain their
+        // direct RPC guard.
         if policy.submission_policy == SwapSubmissionPolicy::SimulateAndEstimate {
             let maximum_cost = call.maximum_native_cost(fee_parameters)?;
             ensure!(
@@ -994,10 +1000,28 @@ impl DexExecutor {
         {
             return Ok(gas_price);
         }
-        let gas_price = self.rpc.gas_price().await?;
-        ensure!(gas_price > 0, "RPC returned zero gas price");
-        self.gas_price = Some((Instant::now(), gas_price));
-        Ok(gas_price)
+        match self.rpc.gas_price().await {
+            Ok(gas_price) if gas_price > 0 => {
+                self.gas_price = Some((Instant::now(), gas_price));
+                Ok(gas_price)
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
+                    "eth_gasPrice returned zero; using the Rails fallback"
+                );
+                Ok(RAILS_FALLBACK_GAS_PRICE_WEI)
+            }
+            Err(_) => {
+                // Do not cache the fallback: Rails retries eth_gasPrice on the
+                // next transaction after a failed cache fill.
+                tracing::warn!(
+                    fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
+                    "eth_gasPrice failed; using the Rails fallback"
+                );
+                Ok(RAILS_FALLBACK_GAS_PRICE_WEI)
+            }
+        }
     }
 }
 
@@ -1086,6 +1110,7 @@ pub enum DexExecutionServiceError {
         transaction_hash: B256,
         gas_used: u64,
         effective_gas_price: u128,
+        l1_fee: u128,
         reason: String,
     },
     OutcomeUnknown {
@@ -1330,7 +1355,13 @@ mod tests {
     fn rails_v3_gas_multiplier_and_extra_are_applied() {
         let policy = GasLimitPolicy::for_swap(UniswapProtocol::V3, 25_000);
         assert_eq!(policy.resolve(Some(100_000), 110_000).unwrap(), 225_000);
-        assert_eq!(policy.resolve(None, 110_000).unwrap(), 825_000);
+        assert_eq!(policy.resolve(None, 110_000).unwrap(), 275_000);
+        assert_eq!(
+            GasLimitPolicy::for_swap(UniswapProtocol::V3, 0)
+                .resolve_without_estimate(None)
+                .unwrap(),
+            250_000
+        );
     }
 
     #[test]
@@ -1338,6 +1369,12 @@ mod tests {
         let policy = GasLimitPolicy::for_swap(UniswapProtocol::V4, 10_000);
         assert_eq!(policy.resolve(Some(50_000), 60_000).unwrap(), 260_000);
         assert_eq!(policy.resolve(Some(120_000), 130_000).unwrap(), 490_000);
+        assert_eq!(
+            GasLimitPolicy::for_swap(UniswapProtocol::V4, 0)
+                .resolve_without_estimate(None)
+                .unwrap(),
+            250_000
+        );
         assert!(
             GasLimitPolicy::for_swap(UniswapProtocol::V4, MAX_GAS_LIMIT)
                 .resolve(Some(120_000), 130_000)
@@ -1384,6 +1421,7 @@ mod tests {
             status: 1,
             gas_used: 90_000,
             effective_gas_price: 1_000_000,
+            l1_fee: 0,
             logs: vec![ReceiptLog {
                 address: pool,
                 topics: vec![v3_swap_topic(), B256::ZERO, B256::ZERO],
@@ -1425,6 +1463,7 @@ mod tests {
             status: 1,
             gas_used: 90_000,
             effective_gas_price: 1_000_000,
+            l1_fee: 0,
             logs: vec![ReceiptLog {
                 address: Address::repeat_byte(0x11),
                 topics: vec![keccak256("Transfer(address,address,uint256)")],
@@ -1494,6 +1533,7 @@ mod tests {
             DexExecutionServiceError::Reverted {
                 gas_used: 90_000,
                 effective_gas_price: 1_000_000,
+                l1_fee: 1_000,
                 ..
             }
         ));
@@ -1530,6 +1570,33 @@ mod tests {
 
         let error = service
             .execute(v3_request("rustval-high-gas"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DexExecutionServiceError::Reverted { .. }));
+        drop(service);
+        server.join().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dedicated_worker_uses_rails_fallback_when_gas_price_rpc_fails() {
+        let (endpoint, server) = spawn_mock_rpc(MockOutcome::RevertGasPriceUnavailable);
+        let path = journal_path("gas-price-fallback");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        executor.allowance_mutations_enabled = false;
+        let service = DexExecutionService::spawn(executor, 1).unwrap();
+
+        let error = service
+            .execute(v3_request("rustval-gas-price-fallback"))
             .await
             .unwrap_err();
 
@@ -1612,6 +1679,7 @@ mod tests {
     enum MockOutcome {
         Revert,
         RevertHighGas,
+        RevertGasPriceUnavailable,
         BroadcastRejected,
     }
 
@@ -1619,7 +1687,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request_count = match outcome {
-            MockOutcome::Revert | MockOutcome::RevertHighGas => 6,
+            MockOutcome::Revert
+            | MockOutcome::RevertHighGas
+            | MockOutcome::RevertGasPriceUnavailable => 6,
             MockOutcome::BroadcastRejected => 5,
         };
         let thread = std::thread::spawn(move || {
@@ -1640,13 +1710,23 @@ mod tests {
                     }
                     "eth_gasPrice" => match outcome {
                         MockOutcome::RevertHighGas => rpc_result(id, json!("0x2e90edd000")),
+                        MockOutcome::RevertGasPriceUnavailable => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32000,
+                                "message": "gas price unavailable for test"
+                            }
+                        }),
                         _ => rpc_result(id, json!("0xf4240")),
                     },
                     "eth_getBalance" => {
                         panic!("immediate swap unexpectedly called eth_getBalance")
                     }
                     "eth_sendRawTransaction" => match outcome {
-                        MockOutcome::Revert | MockOutcome::RevertHighGas => {
+                        MockOutcome::Revert
+                        | MockOutcome::RevertHighGas
+                        | MockOutcome::RevertGasPriceUnavailable => {
                             let raw = request["params"][0].as_str().unwrap();
                             let raw = hex::decode(raw.trim_start_matches("0x")).unwrap();
                             let hash = keccak256(raw);
@@ -1671,7 +1751,8 @@ mod tests {
                                 "blockNumber": "0x7b",
                                 "status": "0x0",
                                 "gasUsed": "0x15f90",
-                                "effectiveGasPrice": "0xf4240"
+                                "effectiveGasPrice": "0xf4240",
+                                "l1Fee": "0x3e8"
                             }),
                         )
                     }

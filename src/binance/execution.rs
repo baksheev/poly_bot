@@ -15,8 +15,7 @@ use crate::binance::{
 };
 use crate::telemetry::ExecutionLatencyTelemetry;
 
-const RECONCILIATION_ATTEMPTS: usize = 8;
-const RECONCILIATION_DELAY: Duration = Duration::from_millis(250);
+const RECONCILIATION_ATTEMPTS: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BinanceOrderRequestKind {
@@ -227,18 +226,32 @@ impl BinanceExecutor {
             .into_iter()
             .map(|operation| {
                 (
+                    operation.intent.operation_id.clone(),
                     operation.intent.symbol.clone(),
                     operation.intent.client_order_id.clone(),
+                    matches!(
+                        operation.progress,
+                        BinanceOrderProgress::IntentRecorded
+                            | BinanceOrderProgress::OutcomeUnknown { .. }
+                    ),
                 )
             })
             .collect::<Vec<_>>();
-        for (symbol, client_order_id) in active {
-            let order = self
-                .query_after_reconnect(&symbol, &client_order_id)
+        for (operation_id, symbol, client_order_id, confirm_absent) in active {
+            let Some(order) = self
+                .query_after_reconnect(&operation_id, &symbol, &client_order_id, confirm_absent)
                 .await
                 .with_context(|| {
                     format!("unresolved Binance order {client_order_id}; journal remains blocked")
-                })?;
+                })?
+            else {
+                tracing::warn!(
+                    operation_id,
+                    client_order_id,
+                    "Binance startup reconciliation proved that the journaled order was absent"
+                );
+                continue;
+            };
             self.record_order(&client_order_id, &order)?;
         }
         ensure!(
@@ -273,8 +286,14 @@ impl BinanceExecutor {
                 }
                 BinanceOrderProgress::Terminal { order: None, .. } => {
                     let order = self
-                        .query_after_reconnect(&symbol, &client_order_id)
-                        .await?;
+                        .query_after_reconnect(
+                            &request.operation_id,
+                            &symbol,
+                            &client_order_id,
+                            false,
+                        )
+                        .await?
+                        .context("terminal Binance order disappeared during reconciliation")?;
                     validate_response(&request, &order)?;
                     ensure!(
                         terminal_status(&order.status),
@@ -288,7 +307,41 @@ impl BinanceExecutor {
                 BinanceOrderProgress::Rejected { code, .. } => {
                     anyhow::bail!("journaled Binance order was rejected with code {code}")
                 }
-                _ => anyhow::bail!("journaled Binance order still requires reconciliation"),
+                BinanceOrderProgress::IntentRecorded
+                | BinanceOrderProgress::OutcomeUnknown { .. } => {
+                    let order = self
+                        .query_after_reconnect(
+                            &request.operation_id,
+                            &symbol,
+                            &client_order_id,
+                            true,
+                        )
+                        .await?
+                        .context("journaled Binance order was confirmed absent")?;
+                    validate_response(&request, &order)?;
+                    self.record_order(&client_order_id, &order)?;
+                    return Ok(BinanceOrderOutcome {
+                        order,
+                        reconciled_after_unknown: true,
+                    });
+                }
+                BinanceOrderProgress::Submitted { .. } => {
+                    let order = self
+                        .query_after_reconnect(
+                            &request.operation_id,
+                            &symbol,
+                            &client_order_id,
+                            false,
+                        )
+                        .await?
+                        .context("submitted Binance order disappeared during reconciliation")?;
+                    validate_response(&request, &order)?;
+                    self.record_order(&client_order_id, &order)?;
+                    return Ok(BinanceOrderOutcome {
+                        order,
+                        reconciled_after_unknown: true,
+                    });
+                }
             }
         }
         let journal_intent_started = Instant::now();
@@ -361,7 +414,9 @@ impl BinanceExecutor {
                     order
                 } else {
                     let reconciliation_started = Instant::now();
-                    let reconciled = self.reconcile_known_order(&symbol, &client_order_id).await;
+                    let reconciled = self
+                        .reconcile_known_order(&request.operation_id, &symbol, &client_order_id)
+                        .await;
                     self.emit_latency_stage(
                         &request.operation_id,
                         "terminal_reconciliation",
@@ -410,13 +465,19 @@ impl BinanceExecutor {
                         "Binance reported an ambiguous placement error; reconciling by client order id"
                     );
                     let order = self
-                        .query_after_reconnect(&symbol, &client_order_id)
+                        .query_after_reconnect(
+                            &request.operation_id,
+                            &symbol,
+                            &client_order_id,
+                            true,
+                        )
                         .await
                         .with_context(|| {
                             format!(
                                 "Binance order {client_order_id} remains outcome_unknown; do not retry"
                             )
-                        })?;
+                        })?
+                        .context("ambiguous Binance placement was confirmed absent")?;
                     validate_response(&request, &order)?;
                     self.record_order(&client_order_id, &order)?;
                     ensure!(
@@ -461,13 +522,14 @@ impl BinanceExecutor {
                     "Binance placement outcome is unknown; reconciling by client order id"
                 );
                 let order = self
-                    .query_after_reconnect(&symbol, &client_order_id)
+                    .query_after_reconnect(&request.operation_id, &symbol, &client_order_id, true)
                     .await
                     .with_context(|| {
                         format!(
                             "Binance order {client_order_id} remains outcome_unknown; do not retry"
                         )
-                    })?;
+                    })?
+                    .context("ambiguous Binance placement was confirmed absent")?;
                 validate_response(&request, &order)?;
                 self.record_order(&client_order_id, &order)?;
                 ensure!(
@@ -484,50 +546,140 @@ impl BinanceExecutor {
 
     async fn reconcile_known_order(
         &mut self,
+        operation_id: &str,
         symbol: &str,
         client_order_id: &str,
     ) -> anyhow::Result<OrderResult> {
-        for _ in 0..RECONCILIATION_ATTEMPTS {
-            tokio::time::sleep(RECONCILIATION_DELAY).await;
-            match self.client.query_order(symbol, client_order_id).await {
+        let mut last_error = None;
+        for index in 0..RECONCILIATION_ATTEMPTS {
+            let query_started = Instant::now();
+            let result = self.client.query_order(symbol, client_order_id).await;
+            self.emit_latency_stage(
+                operation_id,
+                "order_status_reconciliation",
+                query_started,
+                if result.is_ok() { "success" } else { "failed" },
+            );
+            match result {
                 Ok(order) => {
+                    last_error = None;
                     self.record_order(client_order_id, &order)?;
                     if terminal_status(&order.status) {
                         return Ok(order);
                     }
                 }
                 Err(error) => {
-                    self.journal.advance(
+                    tracing::warn!(
+                        operation_id,
                         client_order_id,
-                        BinanceOrderProgress::OutcomeUnknown {
-                            reason: bounded_reason(&error.to_string()),
-                        },
-                    )?;
-                    return Err(error.into());
+                        attempt = index + 1,
+                        maximum_attempts = RECONCILIATION_ATTEMPTS,
+                        error = %error,
+                        "Binance terminal status reconciliation attempt failed"
+                    );
+                    last_error = Some(error);
                 }
             }
         }
+        let reason = last_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "terminal status confirmation timed out".to_owned());
         self.journal.advance(
             client_order_id,
             BinanceOrderProgress::OutcomeUnknown {
-                reason: "terminal status confirmation timed out".to_owned(),
+                reason: bounded_reason(&reason),
             },
         )?;
-        anyhow::bail!("Binance order terminal status confirmation timed out")
+        Err(last_error.map(anyhow::Error::from).unwrap_or_else(|| {
+            anyhow::anyhow!("Binance order terminal status confirmation timed out")
+        }))
     }
 
     async fn query_after_reconnect(
         &mut self,
+        operation_id: &str,
         symbol: &str,
         client_order_id: &str,
-    ) -> anyhow::Result<OrderResult> {
+        confirm_absent: bool,
+    ) -> anyhow::Result<Option<OrderResult>> {
         let mut last_error = None;
-        for _ in 0..RECONCILIATION_ATTEMPTS {
-            match self.client.query_order(symbol, client_order_id).await {
-                Ok(order) => return Ok(order),
-                Err(error) => last_error = Some(error),
+        let mut every_response_was_not_found = true;
+        let mut last_not_found = None;
+        for index in 0..RECONCILIATION_ATTEMPTS {
+            let query_started = Instant::now();
+            let result = self.client.query_order(symbol, client_order_id).await;
+            self.emit_latency_stage(
+                operation_id,
+                "order_status_reconciliation",
+                query_started,
+                if result.is_ok() { "success" } else { "failed" },
+            );
+            match result {
+                Ok(order) => {
+                    last_error = None;
+                    every_response_was_not_found = false;
+                    if terminal_status(&order.status) {
+                        return Ok(Some(order));
+                    }
+                }
+                Err(error) => {
+                    if let Some(not_found) = order_not_found_details(&error) {
+                        last_not_found = Some(not_found);
+                    } else {
+                        every_response_was_not_found = false;
+                    }
+                    tracing::warn!(
+                        operation_id,
+                        client_order_id,
+                        attempt = index + 1,
+                        maximum_attempts = RECONCILIATION_ATTEMPTS,
+                        error = %error,
+                        "Binance unknown-outcome reconciliation attempt failed"
+                    );
+                    last_error = Some(error);
+                }
             }
-            tokio::time::sleep(RECONCILIATION_DELAY).await;
+        }
+        if confirm_absent
+            && every_response_was_not_found
+            && let Some((status, code, message)) = last_not_found
+        {
+            self.journal.advance(
+                client_order_id,
+                BinanceOrderProgress::Rejected {
+                    status,
+                    code,
+                    reason: bounded_reason(&format!(
+                        "order.status confirmed absent after {} attempts: {message}",
+                        RECONCILIATION_ATTEMPTS
+                    )),
+                },
+            )?;
+            tracing::warn!(
+                operation_id,
+                client_order_id,
+                attempts = RECONCILIATION_ATTEMPTS,
+                "Binance order was confirmed absent; parent recovery may continue"
+            );
+            return Ok(None);
+        }
+        let reason = last_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "Binance reconciliation returned no terminal result".to_owned());
+        if self
+            .journal
+            .operations()
+            .get(client_order_id)
+            .is_some_and(|operation| !operation.progress.terminal())
+        {
+            self.journal.advance(
+                client_order_id,
+                BinanceOrderProgress::OutcomeUnknown {
+                    reason: bounded_reason(&reason),
+                },
+            )?;
         }
         Err(last_error
             .map(anyhow::Error::from)
@@ -809,6 +961,17 @@ fn rejection_outcome_unknown(status: u16, code: i64) -> bool {
     status >= 500 || matches!(code, -1000 | -1001 | -1006 | -1007)
 }
 
+fn order_not_found_details(error: &WsApiError) -> Option<(u16, i64, String)> {
+    match error {
+        WsApiError::Rejected {
+            status,
+            code: -2013,
+            message,
+        } => Some((*status, -2013, message.clone())),
+        WsApiError::Transport(_) | WsApiError::Rejected { .. } | WsApiError::Protocol(_) => None,
+    }
+}
+
 fn decimal_string(value: Decimal) -> String {
     value.normalize().to_string()
 }
@@ -825,10 +988,12 @@ fn bounded_reason(reason: &str) -> String {
 mod tests {
     use rust_decimal::Decimal;
 
+    use crate::binance::ws_api::WsApiError;
+
     use super::{
         BinanceExecutionServiceError, BinanceOrderProgress, BinanceOrderRequest,
-        BinanceOrderRequestKind, classify_execution_error, rejection_outcome_unknown,
-        terminal_status,
+        BinanceOrderRequestKind, RECONCILIATION_ATTEMPTS, classify_execution_error,
+        order_not_found_details, rejection_outcome_unknown, terminal_status,
     };
 
     #[test]
@@ -866,6 +1031,32 @@ mod tests {
         }
         assert!(rejection_outcome_unknown(500, -1100));
         assert!(!rejection_outcome_unknown(400, -1013));
+    }
+
+    #[test]
+    fn unknown_reconciliation_uses_one_immediate_status_lookup() {
+        assert_eq!(RECONCILIATION_ATTEMPTS, 1);
+    }
+
+    #[test]
+    fn only_no_such_order_can_prove_an_ambiguous_placement_absent() {
+        assert!(
+            order_not_found_details(&WsApiError::Rejected {
+                status: 400,
+                code: -2013,
+                message: "Order does not exist.".to_owned(),
+            })
+            .is_some()
+        );
+        assert!(order_not_found_details(&WsApiError::Transport("timeout".to_owned())).is_none());
+        assert!(
+            order_not_found_details(&WsApiError::Rejected {
+                status: 500,
+                code: -1007,
+                message: "execution status unknown".to_owned(),
+            })
+            .is_none()
+        );
     }
 
     #[test]

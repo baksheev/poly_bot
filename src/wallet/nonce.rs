@@ -788,6 +788,7 @@ mod tests {
                 status: 1,
                 gas_used: 50_000,
                 effective_gas_price: 1_000_000,
+                l1_fee: 0,
                 logs: vec![],
             },
         )
@@ -835,6 +836,7 @@ mod tests {
                 status: 0,
                 gas_used: 21_000,
                 effective_gas_price: 1_000_000,
+                l1_fee: 0,
                 logs: vec![],
             },
         )
@@ -911,6 +913,7 @@ mod tests {
                     status: 1,
                     gas_used: 21_000,
                     effective_gas_price: 1,
+                    l1_fee: 0,
                     logs: vec![],
                 },
             )
@@ -934,6 +937,7 @@ mod tests {
                 status: 1,
                 gas_used: 50_000,
                 effective_gas_price: 1_000_000,
+                l1_fee: 0,
                 logs: vec![],
             }),
             None,

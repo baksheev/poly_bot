@@ -123,8 +123,8 @@ exact-input for the DEX sell. Curve construction is bounded by
 the 200 USDC execution cap. The builder derives both token-B limits from the
 current pool at that bound, preserving pool fees, integer rounding, and
 directional price impact. The DEX-buy cap is checked against the final calldata
-input, including Rails-compatible slippage headroom, so the builder never
-traverses liquidity beyond the amount that an admissible plan can use.
+input, so the builder never traverses liquidity beyond the amount that an
+admissible plan can use.
 
 Within that envelope, construction performs the exact Uniswap word-boundary
 traversal and stores contiguous cumulative segments with the original
@@ -151,12 +151,12 @@ builder channel or thread wakeup exists.
 Uniswap LP fees are already included by the CLMM swap math. As in Rails, half
 of the gross venue-spread basis points is allocated to execution slippage and
 clamped to the configured 5–50 bps range. That slippage never changes the
-20 bps opportunity economics. For DEX-buy, Rust matches Rails by adding the
-slippage plus the configured four-basis-point input headroom, requoting that
-exact input locally, and applying the slippage only to
-`amount_out_minimum`. For DEX-sell, the exact token-B input is unchanged and
-the slippage is applied only to `amount_out_minimum`. Binance commission, gas,
-and recovery forecasts do not change threshold, sizing, ranking, or admission.
+20 bps opportunity economics. Both directions use exact-input calldata: Rust
+keeps the selected input unchanged, requotes that exact input locally, and
+applies slippage only to `amount_out_minimum`. It does not copy the upstream
+Rails detector's legacy 0x four-basis-point reserve or its DEX-buy input
+slippage uplift. Binance commission, gas, and recovery forecasts do not change
+threshold, sizing, ranking, or admission.
 All amount, threshold, and sizing math is checked integer math; `f64` is not
 used.
 

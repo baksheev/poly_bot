@@ -6,12 +6,6 @@ use rust_decimal::Decimal;
 
 use crate::{arbitrage::ArbitrageDirection, opportunity::format_base_units, state::TopOfBook};
 
-/// The executor refuses any swap whose resolved gas limit exceeds this value.
-/// Admission reserves the corresponding native amount but never converts it
-/// into a sizing or profitability gate.
-pub const MAX_SWAP_GAS_LIMIT: u64 = 5_000_000;
-pub const RAILS_PRIORITY_FEE_WEI: u128 = 1_500_000;
-
 #[derive(Clone, Copy, Debug)]
 pub struct AdmissionInputs<'a> {
     pub symbol: &'a str,
@@ -22,7 +16,6 @@ pub struct AdmissionInputs<'a> {
     pub expected_cost_token_a: U256,
     pub expected_proceeds_token_a: U256,
     pub opportunity_threshold_met: bool,
-    pub network_gas_price_wei: u128,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,8 +29,6 @@ pub struct AdmissionEconomics {
     pub recovery_sell_quote_token_a: U256,
     pub recovery_buy_limit_price: Option<Decimal>,
     pub recovery_buy_quote_token_a: U256,
-    pub maximum_gas_wei: U256,
-    pub maximum_fee_per_gas_wei: u128,
     pub opportunity_threshold_met: bool,
 }
 
@@ -53,13 +44,6 @@ pub fn evaluate_execution_admission(
         "admission quote symbol mismatch"
     );
     let primary_quantity = validate_inputs_and_base_quantity(inputs)?;
-    let maximum_fee_per_gas = inputs
-        .network_gas_price_wei
-        .checked_add(RAILS_PRIORITY_FEE_WEI)
-        .context("admission max fee per gas overflow")?;
-    let maximum_gas_wei = U256::from(MAX_SWAP_GAS_LIMIT)
-        .checked_mul(U256::from(maximum_fee_per_gas))
-        .context("admission maximum gas overflow")?;
     let (recovery_limit_price, recovery_quote_token_a) = match inputs.direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
             (quote.bid_price, inputs.expected_proceeds_token_a)
@@ -76,8 +60,6 @@ pub fn evaluate_execution_admission(
         recovery_sell_quote_token_a: U256::ZERO,
         recovery_buy_limit_price: None,
         recovery_buy_quote_token_a: U256::ZERO,
-        maximum_gas_wei,
-        maximum_fee_per_gas_wei: maximum_fee_per_gas,
         opportunity_threshold_met: inputs.opportunity_threshold_met,
     })
 }
@@ -94,10 +76,6 @@ fn validate_inputs_and_base_quantity(inputs: AdmissionInputs<'_>) -> anyhow::Res
     ensure!(
         inputs.token_b_amount % inputs.token_b_step_base_units == U256::ZERO,
         "admission token-B amount is not step aligned"
-    );
-    ensure!(
-        inputs.network_gas_price_wei > 0,
-        "network gas price is zero"
     );
     ensure!(
         inputs.expected_cost_token_a > U256::ZERO && inputs.expected_proceeds_token_a > U256::ZERO,
@@ -126,7 +104,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use crate::{
-        admission::{AdmissionInputs, MAX_SWAP_GAS_LIMIT, evaluate_execution_admission},
+        admission::{AdmissionInputs, evaluate_execution_admission},
         arbitrage::ArbitrageDirection,
         state::TopOfBook,
     };
@@ -158,30 +136,15 @@ mod tests {
             expected_cost_token_a: U256::from(10_000_000_u64),
             expected_proceeds_token_a: U256::from(10_300_000_u64),
             opportunity_threshold_met: true,
-            network_gas_price_wei: 1_000_000,
         }
     }
 
     #[test]
-    fn admission_has_no_depth_recovery_or_gas_conversion_gate() {
+    fn admission_has_no_depth_recovery_or_gas_inputs() {
         let economics = evaluate_execution_admission(&top_of_book(), inputs()).unwrap();
 
         assert_eq!(economics.recovery_sell_quote_token_a, U256::ZERO);
         assert_eq!(economics.recovery_buy_quote_token_a, U256::ZERO);
-        assert!(economics.maximum_gas_wei > U256::ZERO);
-    }
-
-    #[test]
-    fn gas_price_is_uncapped_and_only_sets_the_native_reservation() {
-        let mut request = inputs();
-        request.network_gas_price_wei = 6_000_000_000;
-
-        let economics = evaluate_execution_admission(&top_of_book(), request).unwrap();
-
-        assert_eq!(economics.maximum_fee_per_gas_wei, 6_001_500_000);
-        assert_eq!(
-            economics.maximum_gas_wei,
-            U256::from(MAX_SWAP_GAS_LIMIT) * U256::from(6_001_500_000_u64)
-        );
+        assert!(economics.opportunity_threshold_met);
     }
 }

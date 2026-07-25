@@ -108,7 +108,6 @@ pub struct PairRuntime {
     pub token_a_decimals: u8,
     pub token_b_decimals: u8,
     pub opportunity_threshold_bps: u16,
-    pub dex_fee_reserve_bps: u16,
     pub min_slippage_bps: u16,
     pub max_slippage_bps: u16,
     pub slippage_profit_share_bps: u16,
@@ -870,7 +869,6 @@ impl PairRuntime {
             token_a_decimals: config.token_a.decimals,
             token_b_decimals: config.token_b.decimals,
             opportunity_threshold_bps: config.strategy.opportunity_threshold_bps,
-            dex_fee_reserve_bps: config.strategy.dex_fee_reserve_bps,
             min_slippage_bps: config.strategy.min_slippage_bps,
             max_slippage_bps: config.strategy.max_slippage_bps,
             slippage_profit_share_bps: config.strategy.slippage_profit_share_bps,
@@ -1084,7 +1082,7 @@ fn apply_dex_execution_bounds(
             let expected_output = prepared
                 .token_a_exact_input
                 .quote(trade.dex_amount_in)
-                .context("Rails-compatible DEX-buy input exceeds prepared curve")?;
+                .context("Uniswap exact-input DEX-buy exceeds prepared curve")?;
             trade.dex_amount_out_minimum =
                 subtract_bps_floor(expected_output, trade.execution_slippage_bps)?;
         }
@@ -1163,16 +1161,10 @@ fn evaluate_trade_with_dex_quote(
     let execution_slippage_bps = slippage_bps(pair, gross_profit_bps)?;
 
     let (dex_amount_in, dex_amount_out_minimum) = match direction {
-        ArbitrageDirection::BuyTokenBOnDexSellOnCex => {
-            let input_headroom_bps = pair
-                .dex_fee_reserve_bps
-                .checked_add(execution_slippage_bps)
-                .context("DEX input headroom bps overflow")?;
-            (
-                add_bps_ceil(dex_token_a_amount, input_headroom_bps)?,
-                token_b_amount,
-            )
-        }
+        // V3/V4 execution is exact-input. The local quote already includes
+        // the pool fee, so the selected input is immutable and slippage is
+        // represented only by amount_out_minimum after an exact-input requote.
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => (dex_token_a_amount, token_b_amount),
         ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
             token_b_amount,
             subtract_bps_floor(dex_token_a_amount, execution_slippage_bps)?,
@@ -1373,35 +1365,6 @@ fn round_down_to_step(amount: U256, step: U256) -> U256 {
     (amount / step) * step
 }
 
-fn add_bps_ceil(amount: U256, bps: u16) -> anyhow::Result<U256> {
-    if let Ok(amount) = u128::try_from(amount)
-        && let Some(numerator) = amount.checked_mul(u128::from(BPS_DENOMINATOR + u64::from(bps)))
-    {
-        let denominator = u128::from(BPS_DENOMINATOR);
-        let quotient = numerator / denominator;
-        let rounded = if numerator % denominator == 0 {
-            Some(quotient)
-        } else {
-            quotient.checked_add(1)
-        };
-        if let Some(rounded) = rounded {
-            return Ok(U256::from(rounded));
-        }
-    }
-    let numerator = amount
-        .checked_mul(U256::from(BPS_DENOMINATOR + u64::from(bps)))
-        .context("cost reserve overflow")?;
-    let denominator = U256::from(BPS_DENOMINATOR);
-    let quotient = numerator / denominator;
-    if (numerator % denominator).is_zero() {
-        Ok(quotient)
-    } else {
-        quotient
-            .checked_add(U256::ONE)
-            .context("rounded cost reserve overflow")
-    }
-}
-
 fn subtract_bps_floor(amount: U256, bps: u16) -> anyhow::Result<U256> {
     if let Ok(amount) = u128::try_from(amount)
         && let Some(numerator) = amount.checked_mul(u128::from(BPS_DENOMINATOR - u64::from(bps)))
@@ -1504,7 +1467,7 @@ mod tests {
     use super::{
         ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
         DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache, TradeEvaluation,
-        add_bps_ceil, decimal_to_base_units, evaluate_direction, evaluate_trade_with_dex_quote,
+        decimal_to_base_units, evaluate_direction, evaluate_trade_with_dex_quote,
         format_base_units, meets_threshold, signed_profit_bps_x100, subtract_bps_floor,
         token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
     };
@@ -1552,7 +1515,6 @@ mod tests {
             token_a_decimals: 18,
             token_b_decimals: 18,
             opportunity_threshold_bps: 20,
-            dex_fee_reserve_bps: 4,
             min_slippage_bps: 5,
             max_slippage_bps: 50,
             slippage_profit_share_bps: 5_000,
@@ -1949,14 +1911,15 @@ mod tests {
         assert_eq!(trade.gross_profit_bps_x100, 3_000);
         assert_eq!(trade.cost_token_a, U256::from(10_000_u16));
         assert_eq!(trade.proceeds_token_a, U256::from(10_030_u16));
-        assert_eq!(trade.dex_amount_in, U256::from(10_019_u16));
+        assert_eq!(trade.dex_amount_in, U256::from(10_000_u16));
         assert!(trade.meets_threshold);
     }
 
     #[test]
-    fn dex_buy_baseline_uses_exact_input_dex_quote_like_rails() {
+    fn dex_buy_baseline_uses_uniswap_exact_input_slippage_contract() {
         let (pair, dex) = fixture();
         let prepared = super::prepare_pool_quotes(&pair, &dex, 0, 1).unwrap();
+        let exact_input_curve = prepared.token_a_exact_input.clone();
         let quote = quote("2.10", "100", "2.20", "100");
         let binance_ask_baseline = U256::from(9_u8) * pair.token_b_step;
 
@@ -1971,9 +1934,13 @@ mod tests {
         )
         .unwrap();
 
+        let trade = result.baseline.unwrap();
+        assert_eq!(trade.token_b_amount, U256::from(19_u8) * pair.token_b_step);
+        assert_eq!(trade.dex_amount_in, trade.dex_token_a_amount);
+        let expected_output = exact_input_curve.quote(trade.dex_amount_in).unwrap();
         assert_eq!(
-            result.baseline.unwrap().token_b_amount,
-            U256::from(19_u8) * pair.token_b_step
+            trade.dex_amount_out_minimum,
+            subtract_bps_floor(expected_output, trade.execution_slippage_bps).unwrap()
         );
     }
 
@@ -2006,13 +1973,8 @@ mod tests {
     }
 
     #[test]
-    fn reserve_rounding_is_conservative_in_both_directions() {
-        assert_eq!(add_bps_ceil(U256::from(1_u8), 4).unwrap(), U256::from(2_u8));
+    fn minimum_output_rounding_is_conservative() {
         assert_eq!(subtract_bps_floor(U256::from(1_u8), 4).unwrap(), U256::ZERO);
-        assert_eq!(
-            add_bps_ceil(U256::from(10_000_u64), 4).unwrap(),
-            U256::from(10_004_u64)
-        );
         assert_eq!(
             subtract_bps_floor(U256::from(10_000_u64), 4).unwrap(),
             U256::from(9_996_u64)

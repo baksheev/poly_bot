@@ -360,7 +360,7 @@ impl RuntimeState {
 mod tests {
     use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::{Address, B256};
     use rust_decimal::Decimal;
 
     use crate::{
@@ -407,8 +407,6 @@ mod tests {
             chain_id: 480,
             block_number,
             block_hash: B256::ZERO,
-            native_balance_wei: U256::ZERO,
-            gas_price_wei: 1,
             token_balances: Vec::new(),
             observed_at,
             request_duration_us: 1,
