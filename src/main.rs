@@ -1016,16 +1016,14 @@ async fn run(
         binance_account_client.account_information(),
         binance_account_client.open_orders(&pair.binance.symbol),
     )?;
-    ensure!(
-        reconciled_open_orders.is_empty(),
-        "Binance open order appeared while User Data Stream was starting"
-    );
-    ensure!(
-        reconciled_account
+    tracing::info!(
+        binance_open_orders = reconciled_open_orders.len(),
+        binance_locked_assets = reconciled_account
             .balances
             .iter()
-            .all(|balance| balance.locked.is_zero()),
-        "Binance locked balance appeared while User Data Stream was starting"
+            .filter(|balance| !balance.locked.is_zero())
+            .count(),
+        "Binance account reconciled after User Data subscription; open orders and locked balances remain available as diagnostics"
     );
     let initial_binance_balances = binance_snapshot(
         &reconciled_account,
@@ -1295,13 +1293,14 @@ async fn run(
         binance_order_rate_limits = ?binance_account.order_rate_limits,
         binance_gas_price_symbol = %gas_price_symbol,
         binance_strategy_max_transport_silence_ms = pair.strategy.max_transport_silence_ms(),
-        binance_gas_price_max_transport_silence_ms = config.gas_price_max_transport_silence_ms,
+        binance_gas_price_gate_enabled = false,
         binance_wld_balance_present = binance_account.balance("WLD").is_some(),
         binance_usdc_balance_present = binance_account.balance("USDC").is_some(),
         wallet_address = %wallet_owner,
         wallet_chain_id,
         balance_sync_interval_ms = config.balance_sync_interval_ms,
         balance_max_age_ms = config.balance_max_age_ms,
+        dex_head_max_age_ms = config.dex_head_max_age_ms,
         wallet_sync_trigger = "alchemy_new_heads",
         clickhouse_enabled = config.clickhouse_enabled(),
         arbitrage_execution_mode = %config.arbitrage_execution_mode,
@@ -1312,12 +1311,8 @@ async fn run(
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let shortest_transport_silence_ms = pair
-        .strategy
-        .max_transport_silence_ms()
-        .min(config.gas_price_max_transport_silence_ms);
     let health_interval =
-        Duration::from_millis((shortest_transport_silence_ms / 4).clamp(100, 1_000));
+        Duration::from_millis((pair.strategy.max_transport_silence_ms() / 4).clamp(100, 1_000));
     let mut health_tick = tokio::time::interval(health_interval);
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     health_tick.reset();
@@ -1631,24 +1626,6 @@ fn validate_binance_account(state: &BinanceAccountState) -> anyhow::Result<()> {
     ensure!(
         state.symbol_rules.symbol == state.commission.symbol,
         "Binance symbol rules and commission refer to different symbols"
-    );
-    ensure!(
-        state.open_orders.is_empty(),
-        "Binance account has {} open order(s) for {}; autonomous ownership is unsafe",
-        state.open_orders.len(),
-        state.symbol_rules.symbol
-    );
-    let locked_assets = state
-        .account
-        .balances
-        .iter()
-        .filter(|balance| !balance.locked.is_zero())
-        .map(|balance| balance.asset.as_str())
-        .collect::<Vec<_>>();
-    ensure!(
-        locked_assets.is_empty(),
-        "Binance account has locked balances for {}; autonomous ownership is unsafe",
-        locked_assets.join(",")
     );
     ensure!(
         !state.order_rate_limits.is_empty(),

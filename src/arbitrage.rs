@@ -22,13 +22,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
 use crate::{
-    chain::logs::ChainLog, execution_plan::DexSwapPlan, state::TopOfBook,
-    telemetry::TelemetryHandle,
+    chain::logs::ChainLog, dex::clmm::PreparedQuoteCurve, execution_plan::DexSwapPlan,
+    state::TopOfBook, telemetry::TelemetryHandle,
 };
 
 const JOURNAL_VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_RECOVERY_ATTEMPTS: usize = 3;
+const BPS_DENOMINATOR: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +82,8 @@ pub struct AdmissionRiskBounds {
     /// venue-spread threshold before admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub opportunity_threshold_met: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub opportunity_threshold_bps: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,9 +97,9 @@ pub struct AdmissionRiskBounds {
     pub execution_slippage_bps: u16,
     pub cex_primary_limit_price: Decimal,
     #[serde(default, skip_serializing_if = "is_zero_decimal")]
-    /// Non-zero only when admission was proven entirely from the relevant
-    /// bookTicker level. Full-depth fallback cannot be revalidated from a
-    /// top-of-book snapshot alone.
+    /// Admission-time top quantity retained for sizing diagnostics. Entry
+    /// preflight intentionally does not turn a later quantity change into a
+    /// separate gate; it requotes price economics only.
     pub cex_primary_top_quantity: Decimal,
     pub cex_recovery_limit_price: Decimal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +134,10 @@ impl AdmissionRiskBounds {
         ensure!(
             self.execution_slippage_bps <= 10_000,
             "execution slippage exceeds 100%"
+        );
+        ensure!(
+            self.opportunity_threshold_bps <= 10_000,
+            "opportunity threshold exceeds 100%"
         );
         ensure!(
             self.cex_primary_limit_price > Decimal::ZERO,
@@ -187,6 +194,10 @@ impl AdmissionRiskBounds {
 }
 
 const fn is_zero_u128(value: &u128) -> bool {
+    *value == 0
+}
+
+const fn is_zero_u16(value: &u16) -> bool {
     *value == 0
 }
 
@@ -790,7 +801,9 @@ struct EntryPreflightState {
     quotes: BTreeMap<String, TopOfBook>,
     max_transport_silence_ms: BTreeMap<String, u64>,
     transport: BTreeMap<String, PreflightTransportState>,
-    dex_pool_generations: BTreeMap<usize, u64>,
+    dex_max_head_age_ms: Option<u64>,
+    dex_head_received_at: Option<std::time::Instant>,
+    dex_pools: BTreeMap<usize, PreflightDexPool>,
 }
 
 #[derive(Clone, Debug)]
@@ -798,6 +811,14 @@ struct PreflightTransportState {
     connection_generation: u64,
     connected: bool,
     last_activity_at: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PreflightDexPool {
+    generation: u64,
+    token_a_decimals: u8,
+    token_b_decimals: u8,
+    exact_input_by_direction: [PreparedQuoteCurve; 2],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -814,6 +835,25 @@ impl EntryPreflightHandle {
         state
             .max_transport_silence_ms
             .insert(symbol.to_owned(), max_age_ms);
+    }
+
+    pub fn configure_dex_max_head_age(&self, max_age_ms: u64) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        state.dex_max_head_age_ms = Some(max_age_ms);
+    }
+
+    pub fn update_dex_head(&self, received_at: std::time::Instant) {
+        let Ok(mut state) = self.inner.write() else {
+            return;
+        };
+        if state
+            .dex_head_received_at
+            .is_none_or(|current| received_at >= current)
+        {
+            state.dex_head_received_at = Some(received_at);
+        }
     }
 
     pub fn on_feed_connected(
@@ -890,14 +930,26 @@ impl EntryPreflightHandle {
         }
     }
 
-    pub fn update_dex_pool_generation(&self, pool_index: usize, generation: u64) {
+    pub fn update_dex_pool(
+        &self,
+        pool_index: usize,
+        generation: u64,
+        token_a_decimals: u8,
+        token_b_decimals: u8,
+        exact_input_by_direction: [PreparedQuoteCurve; 2],
+    ) {
         let Ok(mut state) = self.inner.write() else {
             return;
         };
-        let current = state.dex_pool_generations.get(&pool_index).copied();
-        if current.is_none_or(|current| generation >= current) {
-            state.dex_pool_generations.insert(pool_index, generation);
-        }
+        state.dex_pools.insert(
+            pool_index,
+            PreflightDexPool {
+                generation,
+                token_a_decimals,
+                token_b_decimals,
+                exact_input_by_direction,
+            },
+        );
     }
 
     pub fn check(
@@ -911,110 +963,170 @@ impl EntryPreflightHandle {
             .map_err(|_| anyhow::anyhow!("entry preflight state is poisoned"))?;
         let Some(quote) = state.quotes.get(&opportunity.symbol) else {
             return Ok(Some(EntryPreflightRejection {
-                reason: "missing_preflight_quote",
+                reason: "preflight_price_not_fresh",
                 detail: format!("no latest quote for {}", opportunity.symbol),
             }));
         };
         let transport = state.transport.get(&opportunity.symbol);
+        let max_transport_silence_ms = state
+            .max_transport_silence_ms
+            .get(&opportunity.symbol)
+            .copied();
         if transport.is_none_or(|transport| {
-            !transport.connected || transport.connection_generation != quote.connection_generation
+            !transport.connected
+                || transport.connection_generation != quote.connection_generation
+                || max_transport_silence_ms.is_none_or(|max_age_ms| {
+                    transport.last_activity_at.elapsed() > Duration::from_millis(max_age_ms)
+                })
         }) {
             return Ok(Some(EntryPreflightRejection {
-                reason: "preflight_transport_unavailable",
-                detail: format!("no live transport for {}", opportunity.symbol),
+                reason: "preflight_price_not_fresh",
+                detail: format!(
+                    "Binance price for {} has no transport activity inside the configured freshness window",
+                    opportunity.symbol
+                ),
             }));
         }
-        if let (Some(max_age_ms), Some(transport)) = (
+        if state.dex_head_received_at.is_none_or(|received_at| {
             state
-                .max_transport_silence_ms
-                .get(&opportunity.symbol)
-                .copied(),
-            transport,
-        ) && transport.last_activity_at.elapsed() > Duration::from_millis(max_age_ms)
-        {
+                .dex_max_head_age_ms
+                .is_none_or(|max_age_ms| received_at.elapsed() > Duration::from_millis(max_age_ms))
+        }) {
             return Ok(Some(EntryPreflightRejection {
-                reason: "preflight_transport_silence_exceeded",
-                detail: format!(
-                    "latest transport activity age {} ms exceeds configured {} ms",
-                    transport.last_activity_at.elapsed().as_millis(),
-                    max_age_ms
-                ),
+                reason: "preflight_price_not_fresh",
+                detail: "DEX head has no observation inside the configured freshness window"
+                    .to_owned(),
             }));
         }
-        if quote.update_id < opportunity.update_id {
+        let Some(pool) = state.dex_pools.get(&opportunity.dex_pool_index) else {
             return Ok(Some(EntryPreflightRejection {
-                reason: "stale_preflight_quote",
+                reason: "preflight_price_not_fresh",
                 detail: format!(
-                    "latest update_id {} is older than admission update_id {}",
-                    quote.update_id, opportunity.update_id
-                ),
-            }));
-        }
-        let primary = opportunity.admission.cex_primary_limit_price;
-        match opportunity.direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex if quote.bid_price < primary => {
-                return Ok(Some(EntryPreflightRejection {
-                    reason: "cex_price_moved_against_admission",
-                    detail: format!("bid {} is below admission {}", quote.bid_price, primary),
-                }));
-            }
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex if quote.ask_price > primary => {
-                return Ok(Some(EntryPreflightRejection {
-                    reason: "cex_price_moved_against_admission",
-                    detail: format!("ask {} is above admission {}", quote.ask_price, primary),
-                }));
-            }
-            _ => {}
-        }
-        if opportunity.admission.cex_primary_top_quantity > Decimal::ZERO {
-            let available = match opportunity.direction {
-                ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_quantity,
-                ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_quantity,
-            };
-            if available < opportunity.admission.cex_primary_top_quantity {
-                return Ok(Some(EntryPreflightRejection {
-                    reason: "cex_top_quantity_below_admission",
-                    detail: format!(
-                        "latest top quantity {} is below admission {}",
-                        available, opportunity.admission.cex_primary_top_quantity
-                    ),
-                }));
-            }
-        }
-        let Some(current_generation) = state
-            .dex_pool_generations
-            .get(&opportunity.dex_pool_index)
-            .copied()
-        else {
-            return Ok(Some(EntryPreflightRejection {
-                reason: "missing_preflight_dex_generation",
-                detail: format!(
-                    "no latest DEX generation for pool {}",
+                    "no current local DEX pool for index {}",
                     opportunity.dex_pool_index
                 ),
             }));
         };
-        if current_generation != opportunity.dex_pool_generation {
-            return Ok(Some(EntryPreflightRejection {
-                reason: "dex_pool_changed_after_quote",
-                detail: format!(
-                    "current generation {} differs from admission generation {}",
-                    current_generation, opportunity.dex_pool_generation
-                ),
-            }));
+        let relevant_binance_price = match opportunity.direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
+        };
+        if opportunity.admission.opportunity_threshold_met
+            && relevant_binance_price == opportunity.admission.cex_primary_limit_price
+            && pool.generation == opportunity.dex_pool_generation
+        {
+            return Ok(None);
         }
-        let now_unix_seconds = unix_timestamp_ms()? / 1_000;
-        if now_unix_seconds >= opportunity.dex_plan.deadline_unix_seconds {
+        let direction_index = match opportunity.direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => 0,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => 1,
+        };
+        let dex_amount_in = U256::from(opportunity.dex_plan.amount_in_base_units);
+        let dex_amount_out =
+            match pool.exact_input_by_direction[direction_index].quote(dex_amount_in) {
+                Ok(amount) => amount,
+                Err(error) => {
+                    return Ok(Some(EntryPreflightRejection {
+                        reason: "preflight_spread_below_threshold",
+                        detail: format!("current local DEX quote is unavailable: {error}"),
+                    }));
+                }
+            };
+        let threshold_bps = opportunity.admission.opportunity_threshold_bps;
+        let (cost_token_a, proceeds_token_a) = match opportunity.direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
+                dex_amount_in,
+                token_b_at_price_in_token_a_base_units(
+                    dex_amount_out,
+                    quote.bid_price,
+                    pool.token_a_decimals,
+                    pool.token_b_decimals,
+                    false,
+                )?,
+            ),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
+                token_b_at_price_in_token_a_base_units(
+                    dex_amount_in,
+                    quote.ask_price,
+                    pool.token_a_decimals,
+                    pool.token_b_decimals,
+                    true,
+                )?,
+                dex_amount_out,
+            ),
+        };
+        if !meets_spread_threshold(proceeds_token_a, cost_token_a, threshold_bps)? {
             return Ok(Some(EntryPreflightRejection {
-                reason: "dex_plan_expired",
+                reason: "preflight_spread_below_threshold",
                 detail: format!(
-                    "DEX deadline {} is not after current time {}",
-                    opportunity.dex_plan.deadline_unix_seconds, now_unix_seconds
+                    "current proceeds {} and cost {} no longer satisfy {} bps",
+                    proceeds_token_a, cost_token_a, threshold_bps
                 ),
             }));
         }
         Ok(None)
     }
+}
+
+fn token_b_at_price_in_token_a_base_units(
+    token_b_amount: U256,
+    token_a_per_token_b: Decimal,
+    token_a_decimals: u8,
+    token_b_decimals: u8,
+    round_up: bool,
+) -> anyhow::Result<U256> {
+    ensure!(
+        token_a_per_token_b > Decimal::ZERO,
+        "preflight CEX price is non-positive"
+    );
+    let mantissa = u128::try_from(token_a_per_token_b.mantissa())
+        .context("preflight CEX price mantissa is negative")?;
+    let token_a_scale = pow10_u256(token_a_decimals)?;
+    let numerator = token_b_amount
+        .checked_mul(U256::from(mantissa))
+        .and_then(|value| value.checked_mul(token_a_scale))
+        .context("preflight CEX quote numerator overflow")?;
+    let denominator = pow10_u256(token_b_decimals)?
+        .checked_mul(pow10_u256(
+            token_a_per_token_b
+                .scale()
+                .try_into()
+                .context("preflight CEX price scale exceeds u8")?,
+        )?)
+        .context("preflight CEX quote denominator overflow")?;
+    let quotient = numerator / denominator;
+    if round_up && numerator % denominator != U256::ZERO {
+        quotient
+            .checked_add(U256::ONE)
+            .context("preflight CEX quote rounding overflow")
+    } else {
+        Ok(quotient)
+    }
+}
+
+fn pow10_u256(exponent: u8) -> anyhow::Result<U256> {
+    let mut value = U256::ONE;
+    for _ in 0..exponent {
+        value = value
+            .checked_mul(U256::from(10_u8))
+            .context("preflight decimal scale overflow")?;
+    }
+    Ok(value)
+}
+
+fn meets_spread_threshold(
+    proceeds_token_a: U256,
+    cost_token_a: U256,
+    threshold_bps: u16,
+) -> anyhow::Result<bool> {
+    ensure!(cost_token_a > U256::ZERO, "preflight cost is zero");
+    let lhs = proceeds_token_a
+        .checked_mul(U256::from(BPS_DENOMINATOR))
+        .context("preflight threshold proceeds overflow")?;
+    let rhs = cost_token_a
+        .checked_mul(U256::from(BPS_DENOMINATOR + u64::from(threshold_bps)))
+        .context("preflight threshold cost overflow")?;
+    Ok(lhs >= rhs)
 }
 
 fn cex_client_order_id(pair_id: &str, plan_id: &str, direction: &str) -> String {
@@ -2304,12 +2416,13 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use std::fs;
 
+    use alloy_primitives::U256;
     use rust_decimal::Decimal;
 
     use super::{
         ArbitrageDirection, CoordinatorCommand, ExecutionLaneState, ExecutionMode, LegResult,
         LegRole, LegStatus, PaperTradeCoordinator, TerminalOutcome, TradeIntent, TradeStage,
-        initial_execution_lane,
+        initial_execution_lane, meets_spread_threshold, token_b_at_price_in_token_a_base_units,
     };
 
     fn path(name: &str) -> std::path::PathBuf {
@@ -2318,6 +2431,37 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("thread")
         ))
+    }
+
+    #[test]
+    fn preflight_price_conversion_respects_token_decimals_and_rounding_direction() {
+        assert_eq!(
+            token_b_at_price_in_token_a_base_units(
+                U256::from(1_000_000_000_000_000_000_u128),
+                Decimal::new(5, 1),
+                6,
+                18,
+                false,
+            )
+            .unwrap(),
+            U256::from(500_000_u64)
+        );
+        assert_eq!(
+            token_b_at_price_in_token_a_base_units(U256::ONE, Decimal::new(5, 1), 6, 18, false,)
+                .unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            token_b_at_price_in_token_a_base_units(U256::ONE, Decimal::new(5, 1), 6, 18, true,)
+                .unwrap(),
+            U256::ONE
+        );
+    }
+
+    #[test]
+    fn preflight_spread_threshold_is_inclusive_at_twenty_bps() {
+        assert!(meets_spread_threshold(U256::from(1_002_u64), U256::from(1_000_u64), 20).unwrap());
+        assert!(!meets_spread_threshold(U256::from(1_001_u64), U256::from(1_000_u64), 20).unwrap());
     }
 
     fn intent(mode: ExecutionMode) -> TradeIntent {
@@ -2335,6 +2479,7 @@ mod tests {
             cex_client_order_id: "arbplancex".to_owned(),
             admission: Some(super::AdmissionRiskBounds {
                 opportunity_threshold_met: true,
+                opportunity_threshold_bps: 20,
                 depth_source: None,
                 depth_age_ms: None,
                 depth_update_delta: None,

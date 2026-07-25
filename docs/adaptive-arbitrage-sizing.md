@@ -118,8 +118,13 @@ Important implementation facts:
   A newer admission currently supersedes the pending opportunity
   unconditionally; the engine releases the superseded reservation and emits
   `arbitrage_execution_pending_discarded`.
-- Live preflight rejects a queued plan if the Binance price moved against its
-  admitted limit or the DEX pool generation changed.
+- Live market preflight requotes the queued plan's immutable DEX input against
+  the latest local pool, combines it with the latest Binance bid/ask, and
+  rejects only when either price path is outside its 30-second freshness
+  boundary or the recomputed gross spread is below 20 bps. Generation identity
+  and Binance top quantity are not independent preflight gates. If the relevant
+  Binance price and DEX generation are unchanged, preflight reuses the
+  admission proof and skips the duplicate requote.
 - One wallet owns one World Chain nonce lane shared with other wallet writes.
   A larger trade must not weaken nonce or DEX settlement barriers.
 
@@ -151,7 +156,7 @@ conversions.
 - Multi-wallet scheduling or additional nonce lanes.
 - Switching the production default from `dex_first` to `concurrent_hedged`.
 - Removing or relaxing DEX settlement, quote freshness, balance freshness,
-  readiness, signer, live-entry, or recovery gates.
+  signer, live-entry, or recovery gates.
 - Changing latest-pending replacement from newest-wins to an economic policy in
   the same change.
 - Learning probability estimates or optimizing expected value from live data

@@ -285,8 +285,12 @@ jobs:
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
             = config/strategies/usdc-wld-world-chain.v12.json
-          test "$(jq -r '.data.GAS_PRICE_MAX_TRANSPORT_SILENCE_MS' <<<"${runtime_config}")" \
+          test "$(jq -r '.data.DEX_HEAD_MAX_AGE_MS' <<<"${runtime_config}")" \
             = 30000
+          test "$(jq -r '.data.BALANCE_SYNC_INTERVAL_MS' <<<"${runtime_config}")" \
+            = 5000
+          test "$(jq -r '.data.BALANCE_MAX_AGE_MS' <<<"${runtime_config}")" \
+            = 10000
           test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${runtime_config}")" \
             = full_live
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \

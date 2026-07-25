@@ -53,9 +53,8 @@ The latest accepted top remains current while all of the following are true:
 `strategy.max_transport_silence_ms` in the versioned domain artifact is the
 only source of this boundary for strategy-price runtime readiness, opportunity
 admission, and entry preflight. There is no environment-variable override for
-the strategy price. The gas-conversion feed has a separate
-`GAS_PRICE_MAX_TRANSPORT_SILENCE_MS` runtime setting because it is not a
-strategy-price source.
+the strategy price. The separate gas-conversion feed is accounting telemetry:
+its connection state, transport activity, and quote age do not gate trading.
 
 Price and depth frames advance transport activity. A Binance server Ping is
 answered with Pong and also advances transport activity. The documented

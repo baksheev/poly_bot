@@ -1,6 +1,6 @@
 # Live arbitrage operator runbook
 
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-25
 
 This runbook applies only to the isolated WLDUSDC Rust identities owned by the
 single production Pod in the private zonal GKE cluster `arb-bot` in
@@ -13,14 +13,18 @@ and must never run while the GKE Deployment has a nonzero replica count.
 - digest-pinned image built from a clean committed revision;
 - v12 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 20 USDC detector/fallback, 200 USDC global cap, 750 ms / delta 8 recent-depth caps, and 40 USDC top-only cap,
   WLD step 0.1, live exchange tick 0.0001, `profit_token_a`, 20 bps, V3/V4,
-  and a 30-second maximum Binance transport silence;
+  a 30-second maximum Binance transport silence, and a 30-second maximum age
+  of the latest received canonical World Chain head;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
 - the dedicated wallet and Binance subaccount verified at startup;
 - persistent `/var/lib/arb-bot` parent, Binance-order, and wallet/nonce
   journals;
-- no open Binance orders, no locked balance, no unresolved wallet nonce, no
-  active rebalance, and fresh Binance top-of-book/DEX/balance/gas inputs; full
-  depth health is observed separately and does not gate DEX-first readiness;
+- no unresolved wallet nonce, hydrated balance state, and fresh Binance
+  strategy-price/DEX inputs; Binance and wallet balance generations must be no
+  older than 10 seconds. Open Binance orders and locked balances are allowed:
+  only free inventory after exact reservations is admissible. User Data,
+  native-token conversion-feed health, and full-depth health are observed
+  separately and do not gate DEX-first readiness;
 - fixed full-live v12 adaptive deployment, tiered depth, 20 bps spread admission, exact execution-envelope reservations, single-owner enforcement, and entry-stop
   recovery controls.
 

@@ -120,7 +120,11 @@ impl DexMirror {
         Ok(())
     }
 
-    pub fn apply_head(&mut self, head: CanonicalBlock) -> anyhow::Result<bool> {
+    pub fn apply_head(
+        &mut self,
+        head: CanonicalBlock,
+        received_at: Instant,
+    ) -> anyhow::Result<bool> {
         if head.number < self.latest_head.number {
             return Ok(false);
         }
@@ -129,7 +133,7 @@ impl DexMirror {
                 head.hash == self.latest_head.hash,
                 "same-height World Chain head changed; rehydration required"
             );
-            self.latest_head_received_at = Instant::now();
+            self.latest_head_received_at = received_at;
             return Ok(false);
         }
         ensure!(
@@ -141,7 +145,7 @@ impl DexMirror {
             "World Chain parent hash mismatch; rehydration required"
         );
         self.latest_head = head;
-        self.latest_head_received_at = Instant::now();
+        self.latest_head_received_at = received_at;
         Ok(true)
     }
 
@@ -167,6 +171,10 @@ impl DexMirror {
         self.latest_head
     }
 
+    pub const fn latest_head_received_at(&self) -> Instant {
+        self.latest_head_received_at
+    }
+
     pub fn pool(&self, index: usize) -> anyhow::Result<&HydratedPool> {
         self.pools.get(index).context("DEX pool index is invalid")
     }
@@ -189,6 +197,8 @@ impl DexMirror {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use alloy_primitives::{Address, B256, U256, address};
     use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
 
@@ -272,19 +282,35 @@ mod tests {
     fn rejects_head_gaps_and_parent_mismatches() {
         let (mut mirror, _) = test_mirror();
         mirror.finish_backfill(block(11, 10)).unwrap();
-        assert!(mirror.apply_head(block(12, 11)).unwrap());
-        assert!(mirror.apply_head(block(14, 13)).is_err());
+        assert!(mirror.apply_head(block(12, 11), Instant::now()).unwrap());
+        assert!(mirror.apply_head(block(14, 13), Instant::now()).is_err());
 
         let (mut mirror, _) = test_mirror();
         mirror.finish_backfill(block(11, 10)).unwrap();
         assert!(
             mirror
-                .apply_head(CanonicalBlock {
-                    number: 12,
-                    hash: hash(12),
-                    parent_hash: hash(999),
-                })
+                .apply_head(
+                    CanonicalBlock {
+                        number: 12,
+                        hash: hash(12),
+                        parent_hash: hash(999),
+                    },
+                    Instant::now(),
+                )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn head_activity_keeps_the_mirror_fresh_without_a_pool_price_change() {
+        let (mut mirror, _) = test_mirror();
+        mirror.finish_backfill(block(11, 10)).unwrap();
+        let original_tick = mirror.pool(0).unwrap().pool.tick;
+        let received_at = Instant::now();
+
+        assert!(mirror.apply_head(block(12, 11), received_at).unwrap());
+        assert_eq!(mirror.pool(0).unwrap().pool.tick, original_tick);
+        assert!(mirror.is_fresh(received_at + Duration::from_millis(29_999), 30_000));
+        assert!(!mirror.is_fresh(received_at + Duration::from_millis(30_001), 30_000));
     }
 }

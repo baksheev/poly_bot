@@ -199,23 +199,16 @@ pub struct AppConfig {
     )]
     pub domain_config_path: PathBuf,
 
-    #[arg(
-        long,
-        env = "GAS_PRICE_MAX_TRANSPORT_SILENCE_MS",
-        default_value_t = 5_000
-    )]
-    pub gas_price_max_transport_silence_ms: u64,
-
     #[arg(long, env = "DEX_EVENT_CHANNEL_CAPACITY", default_value_t = 8192)]
     pub dex_event_channel_capacity: usize,
 
-    #[arg(long, env = "DEX_HEAD_MAX_AGE_MS", default_value_t = 10_000)]
+    #[arg(long, env = "DEX_HEAD_MAX_AGE_MS", default_value_t = 30_000)]
     pub dex_head_max_age_ms: u64,
 
-    #[arg(long, env = "BALANCE_SYNC_INTERVAL_MS", default_value_t = 1_000)]
+    #[arg(long, env = "BALANCE_SYNC_INTERVAL_MS", default_value_t = 5_000)]
     pub balance_sync_interval_ms: u64,
 
-    #[arg(long, env = "BALANCE_MAX_AGE_MS", default_value_t = 5_000)]
+    #[arg(long, env = "BALANCE_MAX_AGE_MS", default_value_t = 10_000)]
     pub balance_max_age_ms: u64,
 
     #[arg(long, env = "BALANCE_EVENT_CHANNEL_CAPACITY", default_value_t = 16)]
@@ -310,10 +303,6 @@ impl AppConfig {
         validate_non_empty("GCP_PROJECT_ID", &self.gcp_project_id)?;
         validate_non_empty("GCP_REGION", &self.gcp_region)?;
 
-        ensure!(
-            self.gas_price_max_transport_silence_ms > 0,
-            "GAS_PRICE_MAX_TRANSPORT_SILENCE_MS must be greater than zero"
-        );
         ensure!(
             self.dex_event_channel_capacity > 0,
             "DEX_EVENT_CHANNEL_CAPACITY must be greater than zero"
@@ -541,11 +530,10 @@ mod tests {
             binance_ws_api_url: "wss://ws-api.binance.com:443/ws-api/v3".into(),
             across_api_base_url: "https://app.across.to/api".into(),
             domain_config_path: "config/strategies/usdc-wld-world-chain.v4.json".into(),
-            gas_price_max_transport_silence_ms: 5_000,
             dex_event_channel_capacity: 8192,
-            dex_head_max_age_ms: 10_000,
-            balance_sync_interval_ms: 1_000,
-            balance_max_age_ms: 5_000,
+            dex_head_max_age_ms: 30_000,
+            balance_sync_interval_ms: 5_000,
+            balance_max_age_ms: 10_000,
             balance_event_channel_capacity: 16,
             arbitrage_execution_mode: "disabled".into(),
             arbitrage_trade_journal_path: "/tmp/arbitrage-trades.jsonl".into(),

@@ -74,7 +74,6 @@ pub struct TradingEngine {
     gas_price_connected: bool,
     gas_price_generation: u64,
     gas_price_book: Option<TopOfBook>,
-    gas_price_transport_activity_at: Option<Instant>,
     binance_clock_sync: Option<BinanceClockSync>,
     rebalance_inventory_reservation: Option<String>,
     next_inventory_reservation: u64,
@@ -494,13 +493,11 @@ impl RebalanceSettlementBarrier {
 struct TradingReadiness {
     dex_ready: bool,
     balances_ready: bool,
-    user_data_ready: bool,
-    gas_price_ready: bool,
 }
 
 impl TradingReadiness {
     const fn ready(self) -> bool {
-        self.dex_ready && self.balances_ready && self.user_data_ready && self.gas_price_ready
+        self.dex_ready && self.balances_ready
     }
 }
 
@@ -542,10 +539,30 @@ impl TradingEngine {
                 binance_fee_bps.sell,
             )?;
         }
-        for (pool_index, generation) in opportunities.pool_generations() {
-            execution
-                .entry_preflight
-                .update_dex_pool_generation(pool_index, generation);
+        execution
+            .entry_preflight
+            .configure_dex_max_head_age(config.dex_head_max_age_ms);
+        execution
+            .entry_preflight
+            .update_dex_head(dex.latest_head_received_at());
+        for (pool_index, _) in opportunities.pool_generations() {
+            let pool = dex.pool(pool_index)?;
+            let pair = domain_config
+                .snapshot()
+                .pairs
+                .iter()
+                .find(|pair| pair.id == pool.pair_id)
+                .with_context(|| format!("DEX pool {} has no domain pair", pool.pair_id))?;
+            let curves = opportunities
+                .preflight_exact_input_curves(pool_index)?
+                .context("initial prepared DEX pool is unavailable for preflight")?;
+            execution.entry_preflight.update_dex_pool(
+                pool_index,
+                opportunities.pool_generation(pool_index)?,
+                pair.token_a.decimals,
+                pair.token_b.decimals,
+                curves,
+            );
         }
         for pair in domain_config
             .snapshot()
@@ -598,7 +615,6 @@ impl TradingEngine {
                 gas_price_connected: false,
                 gas_price_generation: 0,
                 gas_price_book: None,
-                gas_price_transport_activity_at: None,
                 binance_clock_sync: None,
                 rebalance_inventory_reservation: None,
                 next_inventory_reservation: 0,
@@ -687,6 +703,17 @@ impl TradingEngine {
                     .collect::<Vec<_>>();
                 let mut balances = Vec::new();
                 let mut locked_assets = Vec::new();
+                let observed_balances = position
+                    .balances
+                    .iter()
+                    .map(|balance| {
+                        json!({
+                            "asset": &balance.asset,
+                            "free": balance.free.to_string(),
+                            "locked": balance.locked.to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 for balance in &position.balances {
                     if !balance.locked.is_zero() {
                         locked_assets.push(balance.asset.clone());
@@ -706,7 +733,6 @@ impl TradingEngine {
                     )?;
                     self.reconcile_inventory_settlements(&reservations_before);
                 }
-                self.binance_user_data_clean &= locked_assets.is_empty();
                 self.telemetry.emit(
                     "binance_user_account_position",
                     json!({
@@ -715,6 +741,7 @@ impl TradingEngine {
                         "last_account_update_ms": position.last_account_update_ms,
                         "changed_assets": position.balances.len(),
                         "locked_assets": locked_assets,
+                        "balances": observed_balances,
                     }),
                 );
             }
@@ -767,8 +794,13 @@ impl TradingEngine {
             ),
             UserDataEvent::StreamTerminated { event_time_ms } => {
                 self.binance_user_data_connected = false;
-                self.refresh_phase(Instant::now());
-                anyhow::bail!("Binance User Data Stream terminated at {event_time_ms}");
+                self.telemetry.emit(
+                    "binance_user_data_terminated",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "event_time_ms": event_time_ms,
+                    }),
+                );
             }
             UserDataEvent::Other {
                 event_type,
@@ -821,7 +853,7 @@ impl TradingEngine {
                 }
             }
             DexStreamEvent::Head { head, received_at } => {
-                if self.dex.apply_head(head)? {
+                if self.dex.apply_head(head, received_at)? {
                     self.telemetry.emit(
                         "world_chain_head",
                         json!({
@@ -831,6 +863,8 @@ impl TradingEngine {
                         }),
                     );
                 }
+                self.entry_preflight
+                    .update_dex_head(self.dex.latest_head_received_at());
                 None
             }
         };
@@ -845,8 +879,7 @@ impl TradingEngine {
         let pool = self.dex.pool(prepared.pool_index)?;
         let pool_pair_id = pool.pair_id.clone();
         let pool_identity = format!("{:?}", pool.identity);
-        self.entry_preflight
-            .update_dex_pool_generation(prepared.pool_index, prepared.generation);
+        self.refresh_preflight_dex_pool(prepared.pool_index)?;
         self.reconcile_arbitrage_settlement(prepared.pool_index, prepared.generation);
         self.telemetry.emit(
             "dex_pool_prepared",
@@ -878,6 +911,27 @@ impl TradingEngine {
             }),
         );
         self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    fn refresh_preflight_dex_pool(&self, pool_index: usize) -> anyhow::Result<()> {
+        let pool = self.dex.pool(pool_index)?;
+        let pair = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.id == pool.pair_id)
+            .with_context(|| format!("DEX pool {} has no domain pair", pool.pair_id))?;
+        self.entry_preflight.update_dex_pool(
+            pool_index,
+            self.opportunities.pool_generation(pool_index)?,
+            pair.token_a.decimals,
+            pair.token_b.decimals,
+            self.opportunities
+                .preflight_exact_input_curves(pool_index)?
+                .context("prepared DEX pool is unavailable for preflight")?,
+        );
         Ok(())
     }
 
@@ -930,16 +984,10 @@ impl TradingEngine {
                     .pool_generation(*pool_index)
                     .is_ok_and(|current| current == *generation)
             });
-        let admission_context_is_current = self
-            .state
-            .balances
-            .wallet
-            .as_ref()
-            .zip(self.native_price_token_a())
-            .is_some_and(|(wallet, native_price)| {
+        let admission_context_is_current =
+            self.state.balances.wallet.as_ref().is_some_and(|wallet| {
                 wallet.gas_price_wei == task.admission_context.network_gas_price_wei
                     && wallet.native_balance_wei == task.admission_context.wallet_native_balance_wei
-                    && native_price == task.admission_context.native_price_token_a
             });
         let stale_reason = if self.state.phase != RuntimePhase::Ready {
             Some("runtime_not_ready")
@@ -1209,7 +1257,7 @@ impl TradingEngine {
             MarketEvent::FeedConnected {
                 symbol,
                 generation,
-                observed_at,
+                observed_at: _,
             } => {
                 ensure!(
                     symbol.as_ref() == self.gas_price_symbol,
@@ -1218,8 +1266,6 @@ impl TradingEngine {
                 if generation >= self.gas_price_generation {
                     self.gas_price_connected = true;
                     self.gas_price_generation = generation;
-                    self.gas_price_book = None;
-                    self.gas_price_transport_activity_at = Some(observed_at);
                 }
             }
             MarketEvent::FeedDisconnected {
@@ -1231,8 +1277,6 @@ impl TradingEngine {
                 );
                 if generation == self.gas_price_generation {
                     self.gas_price_connected = false;
-                    self.gas_price_book = None;
-                    self.gas_price_transport_activity_at = None;
                 }
             }
             MarketEvent::FeedHeartbeat {
@@ -1245,9 +1289,6 @@ impl TradingEngine {
                     "gas heartbeat symbol mismatch"
                 );
                 let accepted = self.gas_price_connected && generation == self.gas_price_generation;
-                if accepted {
-                    self.gas_price_transport_activity_at = Some(observed_at);
-                }
                 self.telemetry.emit(
                     "binance_feed_heartbeat",
                     json!({
@@ -1266,13 +1307,13 @@ impl TradingEngine {
                     quote.symbol.as_ref() == self.gas_price_symbol,
                     "gas quote symbol mismatch"
                 );
-                if quote.connection_generation == self.gas_price_generation
-                    && self
-                        .gas_price_book
-                        .as_ref()
-                        .is_none_or(|current| quote.update_id > current.update_id)
+                if self.gas_price_connected
+                    && quote.connection_generation == self.gas_price_generation
+                    && self.gas_price_book.as_ref().is_none_or(|current| {
+                        quote.connection_generation > current.connection_generation
+                            || quote.update_id > current.update_id
+                    })
                 {
-                    self.gas_price_transport_activity_at = Some(quote.received_at);
                     self.hot_telemetry
                         .emit_binance_book(&quote, "gas_conversion", None, "stored");
                     self.gas_price_book = Some(quote);
@@ -1314,11 +1355,29 @@ impl TradingEngine {
                         ))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
+                let inventory_corrections = balances
+                    .iter()
+                    .filter_map(|(asset, rest_amount)| {
+                        let key = InventoryKey::new(InventoryVenue::Binance, asset.clone()).ok()?;
+                        let observed_amount = self.inventory.observed(&key)?;
+                        (observed_amount != *rest_amount).then(|| {
+                            json!({
+                                "asset": asset,
+                                "observed_before_base_units": observed_amount.to_string(),
+                                "rest_base_units": rest_amount.to_string(),
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 self.inventory.update_venue(
                     InventoryVenue::Binance,
                     self.binance_inventory_generation,
                     balances,
                 )?;
+                // REST is the independent full reconciliation boundary. It
+                // clears diagnostic User Data anomalies; neither foreign/open
+                // orders nor locked balances are global trading gates.
+                self.binance_user_data_clean = true;
                 let balances = snapshot
                     .balances
                     .iter()
@@ -1338,6 +1397,8 @@ impl TradingEngine {
                         "account_type": snapshot.account_type,
                         "can_trade": snapshot.can_trade,
                         "balances": balances,
+                        "inventory_correction_count": inventory_corrections.len(),
+                        "inventory_corrections": inventory_corrections,
                         "request_duration_us": snapshot.request_duration_us,
                     }),
                 );
@@ -1347,9 +1408,6 @@ impl TradingEngine {
                 client_order_ids,
                 observed_at,
             } => {
-                if !client_order_ids.is_empty() {
-                    self.binance_user_data_clean = false;
-                }
                 self.telemetry.emit(
                     "binance_open_orders_reconciled",
                     json!({
@@ -2580,9 +2638,21 @@ impl TradingEngine {
             .context("admission has no wallet snapshot")?;
         let network_gas_price_wei = wallet.gas_price_wei;
         let wallet_native_balance_wei = wallet.native_balance_wei;
-        let native_price_token_a = self
-            .native_price_token_a()
-            .context("admission has no native-token price")?;
+        let Some(native_price_token_a) = self.native_price_token_a() else {
+            self.telemetry.emit(
+                "arbitrage_admission_rejected",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": pair_id,
+                    "symbol": quote.symbol.as_ref(),
+                    "update_id": quote.update_id,
+                    "reason": "gas_accounting_not_hydrated",
+                    "gas_price_gate_enabled": false,
+                    "trigger_to_rejection_us": duration_us(evaluation_started_at.elapsed()),
+                }),
+            );
+            return Ok(false);
+        };
 
         let adaptive_selection = if let Some(completed) = completed_adaptive.as_ref() {
             Some(AdaptiveDepthSelection {
@@ -2904,6 +2974,7 @@ impl TradingEngine {
             )?,
             admission: AdmissionRiskBounds {
                 opportunity_threshold_met: economics.opportunity_threshold_met,
+                opportunity_threshold_bps: pair_config.strategy.opportunity_threshold_bps,
                 depth_source: Some(execution_depth_health.source.as_str().to_owned()),
                 depth_age_ms: execution_depth_health.age_ms,
                 depth_update_delta: execution_depth_health.update_delta,
@@ -3790,25 +3861,14 @@ impl TradingEngine {
             .state
             .balances
             .is_fresh(now, self.config.balance_max_age_ms);
-        // Rebalancing is proactive inventory maintenance, not a global trading
-        // lock. Its pending, in-flight, failed, and post-reconciliation states
-        // serialize only rebalance operations. Trading remains gated by fresh
-        // market/DEX/balance inputs; an execution coordinator must separately
-        // reserve and validate the assets required by its concrete trade.
-        let user_data_ready = self.binance_user_data_connected && self.binance_user_data_clean;
-        let gas_price_transport_fresh =
-            self.gas_price_transport_activity_at
-                .is_some_and(|last_activity_at| {
-                    now.saturating_duration_since(last_activity_at).as_millis()
-                        <= u128::from(self.config.gas_price_max_transport_silence_ms)
-                });
-        let gas_price_ready =
-            self.gas_price_connected && self.gas_price_book.is_some() && gas_price_transport_fresh;
+        // User Data is an event-driven acceleration and diagnostic path. REST
+        // balance reconciliation is the recoverable account-state boundary:
+        // its successful snapshots restore health, while missing/stale balance
+        // generations close readiness. Concrete plans still reserve and check
+        // exact available inventory.
         let trading_readiness = TradingReadiness {
             dex_ready,
             balances_ready,
-            user_data_ready,
-            gas_price_ready,
         };
         let current = self
             .state
@@ -3818,8 +3878,6 @@ impl TradingEngine {
                 (!binance_ready).then_some("binance_top"),
                 (!dex_mirror_ready).then_some("dex_mirror"),
                 (!balances_ready).then_some("balances"),
-                (!user_data_ready).then_some("binance_user_data"),
-                (!gas_price_ready).then_some("gas_price"),
             ]
             .into_iter()
             .flatten()
@@ -3835,12 +3893,13 @@ impl TradingEngine {
                     "dex_mirror_ready": dex_mirror_ready,
                     "dex_prepared_ready": dex_prepared_ready,
                     "balances_ready": balances_ready,
+                    "balances_gate_enabled": true,
                     "binance_user_data_connected": self.binance_user_data_connected,
                     "binance_user_data_clean": self.binance_user_data_clean,
-                    "binance_user_data_ready": user_data_ready,
+                    "binance_user_data_gate_enabled": false,
                     "gas_price_connected": self.gas_price_connected,
-                    "gas_price_transport_fresh": gas_price_transport_fresh,
-                    "gas_price_ready": gas_price_ready,
+                    "gas_conversion_available": self.gas_price_book.is_some(),
+                    "gas_price_gate_enabled": false,
                     "blocking_inputs": blocking_inputs,
                 }),
             );
@@ -4103,6 +4162,7 @@ mod tests {
         },
         opportunity::{ArbitrageDirection as SizingDirection, TradeEvaluation},
         rebalance::Direction,
+        state::BalanceState,
     };
 
     use super::{
@@ -4443,43 +4503,60 @@ mod tests {
             TradingReadiness {
                 dex_ready: true,
                 balances_ready: true,
-                user_data_ready: true,
-                gas_price_ready: true,
             }
             .ready()
         );
     }
 
     #[test]
-    fn stale_dex_or_balance_inputs_still_fail_closed() {
+    fn stale_balance_generations_close_global_trading_readiness() {
+        let stale_balances = BalanceState::default();
+        assert!(!stale_balances.is_fresh(Instant::now(), 10_000));
+        assert!(
+            !TradingReadiness {
+                dex_ready: true,
+                balances_ready: false,
+            }
+            .ready()
+        );
+    }
+
+    #[test]
+    fn user_data_health_is_not_a_global_trading_readiness_input() {
+        assert!(
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: true,
+            }
+            .ready()
+        );
+    }
+
+    #[test]
+    fn stale_dex_or_transport_inputs_still_fail_closed() {
         for readiness in [
             TradingReadiness {
                 dex_ready: false,
                 balances_ready: true,
-                user_data_ready: true,
-                gas_price_ready: true,
             },
             TradingReadiness {
                 dex_ready: true,
                 balances_ready: false,
-                user_data_ready: true,
-                gas_price_ready: true,
-            },
-            TradingReadiness {
-                dex_ready: true,
-                balances_ready: true,
-                user_data_ready: false,
-                gas_price_ready: true,
-            },
-            TradingReadiness {
-                dex_ready: true,
-                balances_ready: true,
-                user_data_ready: true,
-                gas_price_ready: false,
             },
         ] {
             assert!(!readiness.ready());
         }
+    }
+
+    #[test]
+    fn gas_price_health_is_not_a_global_trading_readiness_input() {
+        assert!(
+            TradingReadiness {
+                dex_ready: true,
+                balances_ready: true,
+            }
+            .ready()
+        );
     }
 
     #[test]
@@ -4507,8 +4584,6 @@ mod tests {
             TradingReadiness {
                 dex_ready: true,
                 balances_ready: true,
-                user_data_ready: true,
-                gas_price_ready: true,
             }
             .ready()
         );

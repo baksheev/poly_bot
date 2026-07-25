@@ -679,6 +679,25 @@ impl OpportunityEngine {
             .map(|prepared| prepared.as_ref().map(|_| generation))
     }
 
+    pub fn preflight_exact_input_curves(
+        &self,
+        pool_index: usize,
+    ) -> anyhow::Result<Option<[PreparedQuoteCurve; 2]>> {
+        self.prepared_pools
+            .get(pool_index)
+            .context("preflight pool index is invalid")
+            .map(|prepared| {
+                prepared.as_ref().map(|prepared| {
+                    [
+                        prepared.token_a_exact_input.clone(),
+                        prepared.by_direction
+                            [ArbitrageDirection::BuyTokenBOnCexSellOnDex.cache_index()]
+                        .clone(),
+                    ]
+                })
+            })
+    }
+
     pub fn pool_generations(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.pool_generations.iter().copied().enumerate()
     }

@@ -44,8 +44,8 @@ arbitrage execution jobs in the Rails application.
 | `POST /api/v3/order`, `MARKET quantity` | Rails hedge fallback and recovery | Preserve residual-only recovery. The primary order is LIMIT IOC; an exact remaining quantity may use the bounded autonomous MARKET recovery path with a deterministic child identity. |
 | `POST /api/v3/order`, `MARKET quoteOrderQty` | Periodic investment of excess token-A profit | Preserve only in the later non-critical parity slice; it is not part of arbitrage execution. |
 | `GET /api/v3/order` | Find an order by order ID or deterministic client order ID after an ambiguous create | Preserve as `order.status` over WebSocket API, with REST as an independent recovery fallback. |
-| User Data Stream | Missing in Rails | Implemented through signed WebSocket API subscription. `executionReport`, `outboundAccountPosition`, and `balanceUpdate` feed the single runtime owner; termination, unknown events, or foreign orders fail closed. |
-| `GET /api/v3/openOrders` | Missing in Rails | Add at startup/reconnect for reconciliation of the Rust client-order namespace. |
+| User Data Stream | Missing in Rails | Implemented through signed WebSocket API subscription. `executionReport`, `outboundAccountPosition`, and `balanceUpdate` feed the single runtime owner as event-driven acceleration and diagnostics. Stream termination, unknown events, foreign orders, and locked balances do not close runtime readiness; the independent REST balance snapshot is the recoverable account-state boundary. |
+| `GET /api/v3/openOrders` | Missing in Rails | Retain at startup and during periodic reconciliation as order-state telemetry. Open orders are allowed and do not close runtime readiness. |
 | `GET /api/v3/myTrades` | Missing in Rails | Add only for restart recovery when fills cannot be reconstructed from orders and the journal. |
 | `GET /api/v3/rateLimit/order` | Missing in Rails | Add outside the hot path for readiness and rate-limit telemetry. |
 | `GET /sapi/v1/capital/config/getall` | Rails chooses direct vs bridge and refreshes withdrawal limits | Keep in the cold path. Hydrate live network enablement, `busy`, fee, min/max, and integer multiple before every rebalance reservation. Prefer direct `WLD`, fall back to `OPTIMISM` plus Across independently for deposit and withdrawal. |
@@ -107,7 +107,10 @@ restart. Startup subscribes first,
 then independently re-reads account state and `openOrders`, closing the race
 between the original account snapshot and the first stream event. The steady
 state repeats account and `openOrders` REST reconciliation on the configured
-balance interval; any unresolved open order removes readiness. The signed
+five-second balance interval. Open orders and locked balances remain observable
+but do not remove readiness; admission uses only free balance minus exact
+active reservations. A successful REST account snapshot clears diagnostic
+User Data anomalies. The signed
 subscription and wrapper format follow the official Binance
 [`userDataStream.subscribe.signature`](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-api.md#subscribe-to-user-data-stream-through-signature-subscription-user_stream)
 and [User Data Stream event](https://github.com/binance/binance-spot-api-docs/blob/master/user-data-stream.md)
@@ -165,10 +168,11 @@ LIMIT IOC and MARKET evidence from 2026-07-17 is recorded in
 The runtime account bootstrap now also loads `exchangeInfo`, compiles the
 symbol's price, lot, market-lot, notional, and open-order filters, reads current
 order-rate counters, and reconciles `openOrders`. Startup fails closed when the
-symbol is not Spot `TRADING`, required order types are absent, a counter is
-exhausted, or any locked balance/open order means the dedicated account is not
-under exclusive clean ownership. These are startup facts only until User Data
-Stream and periodic independent REST reconciliation are connected.
+symbol is not Spot `TRADING`, required order types are absent, or an order-rate
+counter is exhausted. Open orders and locked balances are reported but allowed;
+their amounts remain excluded from free inventory. These startup facts are
+followed by User Data Stream events and periodic independent REST
+reconciliation.
 
 ## Subaccount and rebalance boundary
 
@@ -207,9 +211,13 @@ A new Binance order may be placed only when all of these are true:
 - WLD and USDC balances are hydrated;
 - actual per-symbol commission is loaded;
 - exchange filters are loaded and every planned price/quantity passes them;
-- local depth is sequence-consistent;
-- User Data Stream is subscribed and fresh;
-- open orders and the Rust client-order namespace are reconciled;
-- in-memory free/locked balances match the latest account generation;
+- the plan is sized either from eligible sequence-consistent/recent full depth
+  or from the separately capped top-only fallback; full-depth health is not an
+  independent readiness gate;
+- the latest complete REST account snapshot is no older than 10 seconds;
+- User Data Stream status, open orders, locked balances, and the Rust
+  client-order namespace remain observable but are not readiness gates;
+- in-memory free balances match the latest account generation, while locked
+  amounts remain unavailable;
 - the plan's own reservation and child-order identity are reconciled; unknown
   work from another plan cannot globally block the lane.

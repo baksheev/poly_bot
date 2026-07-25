@@ -864,6 +864,7 @@ fn unix_seconds() -> Option<u64> {
 mod tests {
     use std::{collections::VecDeque, fs, path::PathBuf, sync::Mutex};
 
+    use alloy_primitives::U256;
     use rust_decimal::Decimal;
 
     use crate::{
@@ -873,6 +874,7 @@ mod tests {
             PaperTradeEventState, PaperTradeSubmitResult, TerminalOutcome, TradeIntent,
             execution_failure_event_state,
         },
+        dex::clmm::ClmmPool,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
             LegFuture, LiveLegExecutor, LiveRiskLimits, cap_dex_credit_to_execution_envelope,
@@ -917,13 +919,14 @@ mod tests {
             proceeds_token_a_base_units: 1_030,
             admission: AdmissionRiskBounds {
                 opportunity_threshold_met: true,
+                opportunity_threshold_bps: 20,
                 depth_source: None,
                 depth_age_ms: None,
                 depth_update_delta: None,
                 top_matches: None,
                 top_mismatch_reason: None,
                 execution_slippage_bps: 15,
-                cex_primary_limit_price: Decimal::ONE,
+                cex_primary_limit_price: Decimal::new(101, 2),
                 cex_primary_top_quantity: Decimal::from(100),
                 cex_recovery_limit_price: Decimal::ONE,
                 cex_recovery_sell_limit_price: Some(Decimal::new(99, 2)),
@@ -972,10 +975,30 @@ mod tests {
 
     fn default_preflight() -> EntryPreflightHandle {
         let handle = EntryPreflightHandle::default();
-        let quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 7);
+        let quote = preflight_quote(Decimal::new(101, 2), Decimal::new(102, 2), 7);
         handle.update_quote(&quote);
-        handle.update_dex_pool_generation(0, 1);
+        configure_fresh_dex(&handle, preflight_pool(U256::ONE << 96, 0));
         handle
+    }
+
+    fn configure_fresh_dex(handle: &EntryPreflightHandle, pool: ClmmPool) {
+        handle.configure_max_transport_silence("WLDUSDC", 30_000);
+        handle.configure_dex_max_head_age(30_000);
+        handle.update_dex_head(std::time::Instant::now());
+        handle.update_dex_pool(0, 1, 0, 0, preflight_curves(&pool));
+    }
+
+    fn preflight_pool(sqrt_price_x96: U256, tick: i32) -> ClmmPool {
+        ClmmPool::new(0, 1, sqrt_price_x96, tick, 1_000_000_000_000_000_000).unwrap()
+    }
+
+    fn preflight_curves(pool: &ClmmPool) -> [crate::dex::clmm::PreparedQuoteCurve; 2] {
+        [
+            pool.prepare_exact_input_curve_bounded(true, U256::from(1_000_000_u64))
+                .unwrap(),
+            pool.prepare_exact_input_curve_bounded(false, U256::from(1_000_000_u64))
+                .unwrap(),
+        ]
     }
 
     #[test]
@@ -1059,27 +1082,34 @@ mod tests {
 
     #[test]
     fn entry_preflight_rejects_price_drift_after_admission() {
-        let handle = EntryPreflightHandle::default();
+        let handle = default_preflight();
         let quote = preflight_quote(Decimal::new(99, 2), Decimal::new(101, 2), 8);
         handle.update_quote(&quote);
-        handle.update_dex_pool_generation(0, 1);
 
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
 
-        assert_eq!(rejection.reason, "cex_price_moved_against_admission");
+        assert_eq!(rejection.reason, "preflight_spread_below_threshold");
     }
 
     #[test]
     fn entry_preflight_uses_transport_liveness_not_unchanged_price_age() {
         let handle = EntryPreflightHandle::default();
-        let mut quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 8);
+        let mut quote = preflight_quote(Decimal::new(101, 2), Decimal::new(102, 2), 8);
         quote.received_at = std::time::Instant::now() - std::time::Duration::from_millis(1_001);
         handle.update_quote(&quote);
         handle.configure_max_transport_silence("WLDUSDC", 1_000);
-        handle.update_dex_pool_generation(0, 1);
+        handle.configure_dex_max_head_age(30_000);
+        handle.update_dex_head(std::time::Instant::now());
+        handle.update_dex_pool(
+            0,
+            1,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
 
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
-        assert_eq!(rejection.reason, "preflight_transport_silence_exceeded");
+        assert_eq!(rejection.reason, "preflight_price_not_fresh");
 
         handle.record_transport_activity(
             "WLDUSDC",
@@ -1091,48 +1121,122 @@ mod tests {
 
         handle.on_feed_disconnected("WLDUSDC", quote.connection_generation);
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
-        assert_eq!(rejection.reason, "preflight_transport_unavailable");
+        assert_eq!(rejection.reason, "preflight_price_not_fresh");
     }
 
     #[test]
-    fn entry_preflight_rejects_dex_generation_drift_after_admission() {
+    fn entry_preflight_requires_a_fresh_dex_head() {
         let handle = EntryPreflightHandle::default();
-        let quote = preflight_quote(Decimal::ONE, Decimal::new(101, 2), 8);
-        handle.update_quote(&quote);
-        handle.update_dex_pool_generation(0, 2);
+        handle.update_quote(&preflight_quote(
+            Decimal::new(101, 2),
+            Decimal::new(102, 2),
+            8,
+        ));
+        handle.configure_max_transport_silence("WLDUSDC", 30_000);
+        handle.configure_dex_max_head_age(1_000);
+        handle.update_dex_head(std::time::Instant::now() - std::time::Duration::from_millis(1_001));
+        handle.update_dex_pool(
+            0,
+            1,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
 
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
 
-        assert_eq!(rejection.reason, "dex_pool_changed_after_quote");
+        assert_eq!(rejection.reason, "preflight_price_not_fresh");
     }
 
     #[test]
-    fn entry_preflight_rejects_relevant_top_quantity_drift() {
-        let handle = EntryPreflightHandle::default();
+    fn entry_preflight_requotes_the_current_dex_pool() {
+        let handle = default_preflight();
+        handle.update_dex_pool(
+            0,
+            2,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 95, -13_864)),
+        );
+
+        let rejection = handle.check(&opportunity()).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "preflight_spread_below_threshold");
+    }
+
+    #[test]
+    fn entry_preflight_requotes_cex_buy_dex_sell_direction() {
+        let handle = default_preflight();
+        handle.update_quote(&preflight_quote(
+            Decimal::new(98, 2),
+            Decimal::new(99, 2),
+            8,
+        ));
+        let mut reverse = opportunity();
+        reverse.direction = ArbitrageDirection::BuyTokenBOnCexSellOnDex;
+        reverse.admission.cex_primary_limit_price = Decimal::new(99, 2);
+        reverse.dex_plan.token_in = "0x4444444444444444444444444444444444444444".to_owned();
+        reverse.dex_plan.token_out = "0x3333333333333333333333333333333333333333".to_owned();
+
+        assert!(handle.check(&reverse).unwrap().is_none());
+
+        handle.update_quote(&preflight_quote(Decimal::ONE, Decimal::new(101, 2), 9));
+        let rejection = handle.check(&reverse).unwrap().unwrap();
+        assert_eq!(rejection.reason, "preflight_spread_below_threshold");
+    }
+
+    #[test]
+    fn entry_preflight_does_not_gate_on_top_quantity() {
+        let handle = default_preflight();
         let quote = preflight_quote_with_quantities(
-            Decimal::ONE,
-            Decimal::from(99),
             Decimal::new(101, 2),
+            Decimal::ONE,
+            Decimal::new(102, 2),
             Decimal::from(100),
             8,
         );
         handle.update_quote(&quote);
-        handle.update_dex_pool_generation(0, 1);
 
-        let rejection = handle.check(&opportunity()).unwrap().unwrap();
-
-        assert_eq!(rejection.reason, "cex_top_quantity_below_admission");
+        assert!(handle.check(&opportunity()).unwrap().is_none());
     }
 
     #[test]
-    fn entry_preflight_rejects_expired_dex_plan() {
+    fn entry_preflight_does_not_compare_admission_update_identity() {
+        let handle = default_preflight();
+        let mut quote = preflight_quote(Decimal::new(101, 2), Decimal::new(102, 2), 1);
+        quote.connection_generation = 2;
+        handle.update_quote(&quote);
+
+        assert!(handle.check(&opportunity()).unwrap().is_none());
+    }
+
+    #[test]
+    fn entry_preflight_skips_duplicate_requote_when_prices_are_unchanged() {
+        let handle = default_preflight();
+        let pool = preflight_pool(U256::ONE << 96, 0);
+        handle.update_dex_pool(
+            0,
+            1,
+            0,
+            0,
+            [
+                pool.prepare_exact_input_curve_bounded(true, U256::ONE)
+                    .unwrap(),
+                pool.prepare_exact_input_curve_bounded(false, U256::ONE)
+                    .unwrap(),
+            ],
+        );
+
+        assert!(handle.check(&opportunity()).unwrap().is_none());
+    }
+
+    #[test]
+    fn entry_preflight_does_not_gate_on_the_transaction_deadline() {
         let handle = default_preflight();
         let mut expired = opportunity();
         expired.dex_plan.deadline_unix_seconds = 1;
 
-        let rejection = handle.check(&expired).unwrap().unwrap();
-
-        assert_eq!(rejection.reason, "dex_plan_expired");
+        assert!(handle.check(&expired).unwrap().is_none());
     }
 
     #[test]

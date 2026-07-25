@@ -108,11 +108,10 @@ umask 077
   printf 'BINANCE_REST_BASE_URL=https://api.binance.com\n'
   printf 'BINANCE_WS_API_URL=wss://ws-api.binance.com:443/ws-api/v3\n'
   printf 'DOMAIN_CONFIG_PATH=%s\n' "${domain_config_path}"
-  printf 'GAS_PRICE_MAX_TRANSPORT_SILENCE_MS=5000\n'
   printf 'DEX_EVENT_CHANNEL_CAPACITY=8192\n'
-  printf 'DEX_HEAD_MAX_AGE_MS=10000\n'
-  printf 'BALANCE_SYNC_INTERVAL_MS=1000\n'
-  printf 'BALANCE_MAX_AGE_MS=5000\n'
+  printf 'DEX_HEAD_MAX_AGE_MS=30000\n'
+  printf 'BALANCE_SYNC_INTERVAL_MS=5000\n'
+  printf 'BALANCE_MAX_AGE_MS=10000\n'
   printf 'BALANCE_EVENT_CHANNEL_CAPACITY=16\n'
   printf 'ARBITRAGE_EXECUTION_MODE=full_live\n'
   printf 'ARBITRAGE_TRADE_JOURNAL_PATH=%s\n' "${arbitrage_trade_journal}"

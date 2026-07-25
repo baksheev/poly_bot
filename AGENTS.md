@@ -77,10 +77,12 @@ a time.
   connection generation has fresh transport activity. Admission, preflight,
   and runtime market-data readiness use the reviewed 30-second maximum
   transport silence from the versioned domain artifact, not the age of the
-  last price change. That artifact is the only strategy-price liveness source;
-  `GAS_PRICE_MAX_TRANSPORT_SILENCE_MS` applies only to the separate gas-price
-  feed. The deployment workflow must verify these startup fields before it
-  reports success.
+  last price change. That artifact is the only strategy-price liveness source.
+  The separate native-token conversion feed is diagnostic/accounting input:
+  its connection, quote age, and transport activity must never change
+  readiness, admission, preflight, or execution eligibility. The deployment
+  workflow must verify the strategy-price startup fields before it reports
+  success.
 - Do not use `.github/workflows/deploy-gce.yml` for routine production delivery.
   It is retained only for an explicitly reviewed rollback after the GKE owner
   is scaled to zero and all active operations are reconciled.

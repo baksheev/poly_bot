@@ -332,6 +332,7 @@ mod tests {
         let snapshot = binance_snapshot(&account, &[Arc::from("USDC"), Arc::from("WLD")], 7);
 
         assert_eq!(snapshot.balances["USDC"].free, Decimal::from(5));
+        assert_eq!(snapshot.balances["USDC"].locked, Decimal::ONE);
         assert_eq!(snapshot.balances["WLD"].free, Decimal::ZERO);
         assert_eq!(snapshot.request_duration_us, 7);
         assert!(snapshot.healthy());

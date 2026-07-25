@@ -72,9 +72,13 @@ pool-scoped HTTP `eth_getLogs` request to catch the mirror up through that
 receipt block immediately. It verifies that the exact receipt event is present,
 applies every preceding Swap/Mint/Burn or Swap/ModifyLiquidity event in
 canonical order, invalidates the old prepared curves, and publishes one new
-pool generation. Pending opportunities from the pre-fill generation are
-discarded; the next candidate passes the normal generation, Binance top, quote
-age, and deadline preflight before dispatch.
+pool generation. Pending opportunities may be superseded by newer candidates.
+Immediately before dispatch, market preflight requotes the immutable DEX input
+against the latest local pool and combines it with the latest Binance bid/ask.
+It requires both price paths to be inside their 30-second freshness boundaries
+and rejects only when the recomputed gross spread is below 20 bps. If the
+relevant Binance price and published DEX generation are unchanged since
+admission, it reuses the admission proof without repeating the quote.
 
 This HTTP proof remains the current implementation but is priority architecture
 debt: production evidence shows that providers often return the receipt before

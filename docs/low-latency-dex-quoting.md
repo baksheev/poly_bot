@@ -187,8 +187,10 @@ inventory, then places only the newest pending sizing request onto one bounded
 blocking worker. A completed result is admitted only if the exact Binance book,
 every relevant DEX generation, and the gas/native-price context still match the
 snapshot. Otherwise it is marked superseded and discarded; inventory is
-checked again by the normal atomic reservation, and execution preflight checks
-the selected pool generation and price immediately before fill. This keeps
+checked again by the normal atomic reservation, and execution preflight
+requotes the exact DEX input and verifies the current 20 bps spread immediately
+before fill whenever a relevant price input changed. Unchanged Binance price
+and DEX generation reuse the admission proof without a duplicate quote. This keeps
 exhaustive whole-step search from delaying DEX ingestion without allowing a
 stale snapshot to enter execution.
 
