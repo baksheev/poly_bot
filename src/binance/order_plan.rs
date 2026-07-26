@@ -98,10 +98,15 @@ pub fn plan_market_order(
     client_order_id: String,
     target_base_units: i128,
     base_decimals: u8,
+    reference_price: Decimal,
     rules: &SymbolRules,
 ) -> anyhow::Result<Option<PlannedMarketOrder>> {
     ensure!(target_base_units != 0, "Binance target delta is zero");
     ensure!(rules.status == "TRADING", "Binance symbol is not trading");
+    ensure!(
+        reference_price > Decimal::ZERO,
+        "Binance MARKET reference price is non-positive"
+    );
     let absolute = target_base_units.unsigned_abs();
     let target_quantity = decimal_from_base_units(absolute, base_decimals)?;
     let step = if rules.market_lot_size.step > Decimal::ZERO {
@@ -126,6 +131,14 @@ pub fn plan_market_order(
     ensure!(
         quantity >= min && quantity <= max,
         "Binance MARKET quantity is outside MARKET_LOT_SIZE"
+    );
+    let notional = quantity
+        .checked_mul(reference_price)
+        .context("Binance MARKET notional overflow")?;
+    ensure!(
+        notional >= rules.min_notional,
+        "Binance MARKET notional {notional} is below the exchange minimum {}",
+        rules.min_notional
     );
     let submitted_absolute = base_units_from_decimal(quantity, base_decimals)?;
     let submitted_absolute =
@@ -364,6 +377,7 @@ mod tests {
             "rustarb-market-buy".to_owned(),
             12_345_678_901_234_567_890,
             18,
+            Decimal::ONE,
             &rules(),
         )
         .unwrap()
@@ -380,6 +394,7 @@ mod tests {
             "rustarb-market-sell".to_owned(),
             -12_345_678_901_234_567_890,
             18,
+            Decimal::ONE,
             &rules(),
         )
         .unwrap()
@@ -398,6 +413,7 @@ mod tests {
             "rustarb-market-buy-bnb-fee".to_owned(),
             53_200_000_000_000_000_000,
             18,
+            Decimal::ONE,
             &rules(),
         )
         .unwrap()
@@ -408,6 +424,53 @@ mod tests {
             buy.request.kind,
             BinanceOrderRequestKind::MarketBuyQuantity { quantity }
                 if quantity == Decimal::new(532, 1)
+        ));
+    }
+
+    #[test]
+    fn market_closeout_rejects_step_aligned_quantity_below_min_notional() {
+        let mut live_rules = rules();
+        live_rules.min_notional = Decimal::from(5);
+
+        let error = plan_market_order(
+            "rustarb-market-small".to_owned(),
+            "rustarb-market-small".to_owned(),
+            6_600_000_000_000_000_000,
+            18,
+            Decimal::new(3427, 4),
+            &live_rules,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("is below the exchange minimum 5")
+        );
+    }
+
+    #[test]
+    fn market_closeout_rounds_to_market_step_before_notional_validation() {
+        let mut live_rules = rules();
+        live_rules.market_lot_size.step = Decimal::new(1, 1);
+        live_rules.min_notional = Decimal::from(5);
+
+        let planned = plan_market_order(
+            "rustarb-market-rounded".to_owned(),
+            "rustarb-market-rounded".to_owned(),
+            15_678_000_000_000_000_000,
+            18,
+            Decimal::new(3427, 4),
+            &live_rules,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(planned.submitted_base_units, 15_600_000_000_000_000_000);
+        assert!(matches!(
+            planned.request.kind,
+            BinanceOrderRequestKind::MarketBuyQuantity { quantity }
+                if quantity == Decimal::new(156, 1)
         ));
     }
 }

@@ -1301,6 +1301,12 @@ async fn run(
         binance_clock_sync_midpoint_uncertainty_us = binance_account.clock_sync.midpoint_uncertainty_us(),
         binance_standard_maker_fee = %binance_account.commission.standard_commission.maker,
         binance_standard_taker_fee = %binance_account.commission.standard_commission.taker,
+        binance_commission_discount_enabled_for_account =
+            binance_account.commission.discount.enabled_for_account,
+        binance_commission_discount_enabled_for_symbol =
+            binance_account.commission.discount.enabled_for_symbol,
+        binance_commission_discount_asset = %binance_account.commission.discount.discount_asset,
+        binance_commission_discount = %binance_account.commission.discount.discount,
         binance_buy_fee_bps,
         binance_sell_fee_bps,
         binance_symbol_status = %binance_account.symbol_rules.status,
@@ -1432,46 +1438,23 @@ async fn run(
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
-                let catchup = match engine.prepare_arbitrage_settlement_catchup(&event) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::warn!(
-                            plan_id = %event.plan_id,
-                            error = %error,
-                            "receipt settlement proof is invalid; retaining WebSocket barrier"
-                        );
-                        None
-                    }
-                };
+                let mut prepared_dex = false;
+                while let Ok(dex_event) = dex_receiver.try_recv() {
+                    prepared_dex |= process_dex_event_inline(
+                        &mut engine,
+                        dex_event,
+                        &wallet_heads,
+                        &receipt_heads,
+                    )?;
+                }
+                let receipt_refresh = engine.apply_arbitrage_receipt_settlement(&event)?;
+                let receipt_applied = receipt_refresh.is_some();
+                if let Some(refresh) = receipt_refresh {
+                    build_prepared_pool_inline(&mut engine, refresh)?;
+                }
                 engine.on_paper_trade_event(event)?;
-                if let Some(request) = catchup {
-                    let from_block = request.from_block;
-                    let through_block = request.through_block;
-                    match wallet_rpc
-                        .get_logs(&request.filter, from_block, through_block)
-                        .await
-                    {
-                        Ok(logs) => {
-                            if let Some(refresh) =
-                                engine.apply_arbitrage_settlement_catchup(request, logs)?
-                            {
-                                build_prepared_pool_inline(&mut engine, refresh)?;
-                                engine.evaluate_after_dex_refreshes()?;
-                            }
-                        }
-                        Err(error) => {
-                            engine.defer_arbitrage_settlement_catchup(
-                                &request,
-                                "eth_get_logs_failed",
-                            );
-                            tracing::warn!(
-                                from_block,
-                                through_block,
-                                error = %error,
-                                "receipt settlement HTTP catch-up failed; retaining WebSocket barrier"
-                            );
-                        }
-                    }
+                if prepared_dex || receipt_applied {
+                    engine.evaluate_after_dex_refreshes()?;
                 }
             }
             result = adaptive_sizing_tasks.join_next(), if !adaptive_sizing_tasks.is_empty() => {
@@ -1690,6 +1673,12 @@ fn log_binance_account(state: &BinanceAccountState) {
         symbol = %state.commission.symbol,
         binance_standard_maker_fee = %state.commission.standard_commission.maker,
         binance_standard_taker_fee = %state.commission.standard_commission.taker,
+        binance_commission_discount_enabled_for_account =
+            state.commission.discount.enabled_for_account,
+        binance_commission_discount_enabled_for_symbol =
+            state.commission.discount.enabled_for_symbol,
+        binance_commission_discount_asset = %state.commission.discount.discount_asset,
+        binance_commission_discount = %state.commission.discount.discount,
         binance_symbol_status = %state.symbol_rules.status,
         binance_base_asset = %state.symbol_rules.base_asset,
         binance_quote_asset = %state.symbol_rules.quote_asset,
@@ -1703,6 +1692,7 @@ fn log_binance_account(state: &BinanceAccountState) {
         binance_order_rate_limits = ?state.order_rate_limits,
         binance_wld_balance_present = state.balance("WLD").is_some(),
         binance_usdc_balance_present = state.balance("USDC").is_some(),
+        binance_bnb_balance_present = state.balance("BNB").is_some(),
         "authenticated Binance Spot account hydrated"
     );
 }

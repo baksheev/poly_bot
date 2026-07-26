@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
+use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -337,8 +338,27 @@ impl ComposedLiveLegExecutor {
             &self.rules,
         ) {
             Ok(Some(planned)) => planned,
-            Ok(None) => return failed(role, "cex:sub-step-command"),
+            Ok(None) => {
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    None,
+                    "filtered_before_submission",
+                    "LIMIT IOC quantity rounded below one Binance step",
+                );
+                return failed(role, "cex:sub-step-command");
+            }
             Err(error) => {
+                let reason = format!("{error:#}");
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    None,
+                    "filtered_before_submission",
+                    &reason,
+                );
                 tracing::error!(client_order_id, error = %error, "bounded Binance IOC plan is invalid");
                 return failed(role, "cex:invalid-plan");
             }
@@ -381,7 +401,14 @@ impl ComposedLiveLegExecutor {
                 }
             }
             Err(BinanceExecutionServiceError::FailedBeforeSubmission { reason }) => {
-                self.emit_binance_order_error(intent, role, &client_order_id, None, "unsubmitted");
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    None,
+                    "unsubmitted",
+                    &reason,
+                );
                 tracing::warn!(
                     client_order_id,
                     reason,
@@ -390,7 +417,14 @@ impl ComposedLiveLegExecutor {
                 failed(role, "cex:unsubmitted")
             }
             Err(BinanceExecutionServiceError::Rejected { reason }) => {
-                self.emit_binance_order_error(intent, role, &client_order_id, None, "rejected");
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    None,
+                    "rejected",
+                    &reason,
+                );
                 tracing::warn!(
                     client_order_id,
                     reason,
@@ -405,6 +439,7 @@ impl ComposedLiveLegExecutor {
                     &client_order_id,
                     None,
                     "outcome_unknown",
+                    &reason,
                 );
                 tracing::error!(
                     client_order_id,
@@ -424,18 +459,59 @@ impl ComposedLiveLegExecutor {
         recovery_attempt: usize,
         target_token_b_delta_base_units: i128,
     ) -> (LegRole, LegResult) {
+        let reference_price =
+            match self.recovery_market_reference_price(intent, target_token_b_delta_base_units) {
+                Ok(reference_price) => reference_price,
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    self.emit_binance_order_error(
+                        intent,
+                        role,
+                        &client_order_id,
+                        Some(recovery_attempt),
+                        "filtered_before_submission",
+                        &reason,
+                    );
+                    tracing::error!(
+                        client_order_id,
+                        error = %error,
+                        "Binance MARKET closeout has no valid filter reference price"
+                    );
+                    return failed(role, "cex:market-filter-rejected");
+                }
+            };
         let planned = match plan_market_order(
             client_order_id.clone(),
             client_order_id.clone(),
             target_token_b_delta_base_units,
             self.base_decimals,
+            reference_price,
             &self.rules,
         ) {
             Ok(Some(planned)) => planned,
-            Ok(None) => return failed(role, "cex:market-sub-step-command"),
+            Ok(None) => {
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    Some(recovery_attempt),
+                    "filtered_before_submission",
+                    "MARKET quantity rounded below one Binance step",
+                );
+                return failed(role, "cex:market-sub-step-command");
+            }
             Err(error) => {
+                let reason = format!("{error:#}");
+                self.emit_binance_order_error(
+                    intent,
+                    role,
+                    &client_order_id,
+                    Some(recovery_attempt),
+                    "filtered_before_submission",
+                    &reason,
+                );
                 tracing::error!(client_order_id, error = %error, "Binance MARKET closeout plan is invalid");
-                return failed(role, "cex:invalid-market-plan");
+                return failed(role, "cex:market-filter-rejected");
             }
         };
         let placement = self.emit_binance_order_plan(
@@ -488,6 +564,7 @@ impl ComposedLiveLegExecutor {
                     &client_order_id,
                     Some(recovery_attempt),
                     "unsubmitted",
+                    &reason,
                 );
                 tracing::warn!(
                     client_order_id,
@@ -503,6 +580,7 @@ impl ComposedLiveLegExecutor {
                     &client_order_id,
                     Some(recovery_attempt),
                     "rejected",
+                    &reason,
                 );
                 tracing::warn!(
                     client_order_id,
@@ -518,6 +596,7 @@ impl ComposedLiveLegExecutor {
                     &client_order_id,
                     Some(recovery_attempt),
                     "outcome_unknown",
+                    &reason,
                 );
                 tracing::error!(
                     client_order_id,
@@ -527,6 +606,37 @@ impl ComposedLiveLegExecutor {
                 unknown(role, "cex:market-child-unknown")
             }
         }
+    }
+
+    fn recovery_market_reference_price(
+        &self,
+        intent: &TradeIntent,
+        target_token_b_delta_base_units: i128,
+    ) -> anyhow::Result<Decimal> {
+        ensure!(
+            target_token_b_delta_base_units != 0,
+            "recovery target is zero"
+        );
+        if let Some(top) = self.market_state.fresh_binance_top(&self.rules.symbol) {
+            return Ok(if target_token_b_delta_base_units > 0 {
+                top.ask_price
+            } else {
+                top.bid_price
+            });
+        }
+        let admission = intent
+            .admission
+            .as_ref()
+            .context("recovery has no admission bounds")?;
+        Ok(if target_token_b_delta_base_units > 0 {
+            admission
+                .cex_recovery_buy_limit_price
+                .unwrap_or(admission.cex_recovery_limit_price)
+        } else {
+            admission
+                .cex_recovery_sell_limit_price
+                .unwrap_or(admission.cex_recovery_limit_price)
+        })
     }
 
     fn emit_binance_order_plan(
@@ -718,6 +828,7 @@ impl ComposedLiveLegExecutor {
         client_order_id: &str,
         recovery_attempt: Option<usize>,
         outcome: &'static str,
+        reason: &str,
     ) {
         self.telemetry.emit(
             ARBITRAGE_BINANCE_ORDER_KIND,
@@ -733,6 +844,7 @@ impl ComposedLiveLegExecutor {
                     recovery_attempt.map(|_| MAX_RECOVERY_ATTEMPTS),
                 "symbol": self.rules.symbol,
                 "outcome": outcome,
+                "error_reason": bounded_telemetry_reason(reason),
             }),
         );
     }
@@ -893,7 +1005,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 let (role, result) = self.execute_leg_timed(&intent, &command).await;
                 self.coordinator.record_result(&plan_id, role, result)?;
             }
-            self.drive(&plan_id).await?;
+            self.drive(&plan_id, true).await?;
         }
         Ok(())
     }
@@ -937,7 +1049,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             None,
         );
         admit_result?;
-        self.drive(&plan_id).await
+        self.drive(&plan_id, false).await
     }
 
     fn authorize_entry(&mut self, opportunity: &PaperOpportunity) -> anyhow::Result<()> {
@@ -965,7 +1077,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         Ok(())
     }
 
-    async fn drive(&mut self, plan_id: &str) -> anyhow::Result<()> {
+    async fn drive(&mut self, plan_id: &str, resumed_after_restart: bool) -> anyhow::Result<()> {
         loop {
             self.prepare_primary_cex_limit_price(plan_id)?;
             let take_commands_started = Instant::now();
@@ -1054,6 +1166,10 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     object.insert("includes_binance_fee".to_owned(), Value::Bool(true));
                     object.insert("includes_gas".to_owned(), Value::Bool(true));
                     object.insert("comparable_to_live".to_owned(), Value::Bool(true));
+                    object.insert(
+                        "resumed_after_restart".to_owned(),
+                        Value::Bool(resumed_after_restart),
+                    );
                     self.telemetry.emit(ARBITRAGE_RESULT_KIND, payload);
                     self.publish_event(
                         plan_id.to_owned(),
@@ -1266,6 +1382,14 @@ const fn leg_status_label(status: LegStatus) -> &'static str {
 
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn bounded_telemetry_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(1_024)
+        .collect()
 }
 
 fn binance_top_payload(top: Option<FreshBinanceTopSnapshot>) -> Value {
@@ -2166,7 +2290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dex_settlement_releases_the_lane_and_invalidates_only_the_stale_pool() {
+    async fn dex_settlement_releases_the_lane_and_keeps_pending_work_for_preflight() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-settlement-mailbox-{}-{}.jsonl",
             std::process::id(),
@@ -2200,22 +2324,10 @@ mod tests {
             handle.try_submit(stale.clone()),
             PaperTradeSubmitResult::Accepted
         ));
-        assert_eq!(
-            handle.finish_for_settlement(0, 1).unwrap().plan_id(),
-            stale.plan_id()
-        );
-
-        let mut fresh = opportunity();
-        fresh.received_unix_us += 2;
-        fresh.update_id += 2;
-        fresh.dex_pool_index = 1;
-        assert!(matches!(
-            handle.try_submit(fresh.clone()),
-            PaperTradeSubmitResult::Accepted
-        ));
+        assert!(handle.finish(PaperTradeEventState::Balanced).is_none());
         assert_eq!(
             task.receiver.recv().await.unwrap().plan_id(),
-            fresh.plan_id()
+            stale.plan_id()
         );
 
         drop(handle);

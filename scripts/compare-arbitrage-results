@@ -43,19 +43,29 @@ psql "${ARB_BOT_DATABASE_URL}" \
   -f "${repo_root}/scripts/sql/rails_arbitrage_comparison.sql"
 
 clickhouse_query="
+WITH admitted AS
+(
+    SELECT DISTINCT JSONExtractString(payload_json, 'plan_id') AS plan_id
+    FROM arb_bot_prod.runtime_telemetry
+    WHERE kind = 'arbitrage_admitted'
+      AND observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+      AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+)
 SELECT
     'rust' AS runtime,
     count() AS completed_trades,
-    countIf(JSONExtractString(payload_json, 'outcome') = 'balanced_profit') AS profitable_trades,
-    sum(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units'))) / 1000000 AS comparable_usdc,
-    if(count() = 0, 0, avg(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units'))) / 1000000) AS avg_comparable_usdc,
-    sum(abs(toInt128OrZero(JSONExtractString(payload_json, 'token_b_residual_base_units')))) / 1000000000000000000 AS absolute_wld_residual
-FROM arb_bot_prod.runtime_telemetry
-WHERE kind = 'arbitrage_result'
-  AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld'
-  AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first'
-  AND observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
-  AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+    countIf(JSONExtractString(result.payload_json, 'outcome') = 'balanced_profit') AS profitable_trades,
+    sum(toInt128OrZero(JSONExtractString(result.payload_json, 'comparable_profit_token_a_base_units'))) / 1000000 AS comparable_usdc,
+    if(count() = 0, 0, avg(toInt128OrZero(JSONExtractString(result.payload_json, 'comparable_profit_token_a_base_units'))) / 1000000) AS avg_comparable_usdc,
+    sum(abs(toInt128OrZero(JSONExtractString(result.payload_json, 'token_b_residual_base_units')))) / 1000000000000000000 AS absolute_wld_residual
+FROM arb_bot_prod.runtime_telemetry AS result
+INNER JOIN admitted
+    ON admitted.plan_id = JSONExtractString(result.payload_json, 'plan_id')
+WHERE result.kind = 'arbitrage_result'
+  AND JSONExtractString(result.payload_json, 'pair_id') = 'world-chain-usdc-wld'
+  AND JSONExtractString(result.payload_json, 'execution_mode') = 'dex_first'
+  AND result.observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+  AND result.observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
 FORMAT TabSeparated
 "
 curl --fail --silent --show-error \
@@ -64,6 +74,14 @@ curl --fail --silent --show-error \
   "${CLICKHOUSE_URL}" | tr '\t' '|'
 
 audit_query="
+WITH admitted_plans AS
+(
+    SELECT DISTINCT JSONExtractString(payload_json, 'plan_id') AS plan_id
+    FROM arb_bot_prod.runtime_telemetry
+    WHERE kind = 'arbitrage_admitted'
+      AND observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+      AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+)
 SELECT
     (
         SELECT uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_admitted')
@@ -76,6 +94,8 @@ SELECT
         FROM arb_bot_prod.runtime_telemetry
         WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
           AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
+          AND JSONExtractString(payload_json, 'plan_id')
+              IN (SELECT plan_id FROM admitted_plans)
     ) AS balanced,
     countIf(blocked_at > 0 AND blocked_at > result_at) AS blocked_unknown
 FROM
@@ -88,6 +108,8 @@ FROM
     WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
       AND observed_at_ms < toUnixTimestamp64Milli(toDateTime64('${end_ch}', 3, 'UTC'))
       AND kind IN ('arbitrage_result', 'arbitrage_inventory_state')
+      AND JSONExtractString(payload_json, 'plan_id')
+          IN (SELECT plan_id FROM admitted_plans)
     GROUP BY plan_id
 )
 WHERE plan_id != ''

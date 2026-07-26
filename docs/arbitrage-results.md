@@ -24,6 +24,12 @@ the same deterministic `plan_id`, so the result population can be audited back
 to admitted opportunities and unresolved reservations without joining on
 timestamps or prices.
 
+`opportunity_received_unix_us` is the stable market-observation timestamp
+persisted with new intents. `resumed_after_restart=true` identifies a terminal
+result first produced while reconciling an older journal operation. Such a
+result is economically real, but it must not be attributed to a new opportunity
+in the restart hour.
+
 ## Accounting contract
 
 All financial values are signed integer base units represented as decimal
@@ -117,7 +123,11 @@ scripts/compare-arbitrage-results 2026-07-17T13:11:53Z 2026-07-17T14:18:10Z
 
 The script validates the timestamp shape, runs the Rails query inside a
 read-only transaction, queries ClickHouse telemetry, and prints both aggregates
-plus admitted/balanced/blocked counts without exposing either credential.
+plus admitted/balanced/blocked counts without exposing either credential. Rust
+results are included only when the same `plan_id` has an
+`arbitrage_admitted` event inside the requested window. This keeps restart
+reconciliation of older journal work out of a new-opportunity comparison
+without suppressing its terminal accounting record.
 
 The underlying Rust query is:
 

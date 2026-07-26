@@ -76,7 +76,15 @@ a time.
   only when constructing the transaction and uses the Rails `100,000 wei`
   World Chain fallback when `eth_gasPrice` fails. Receipt accounting includes
   both the L2 execution fee and World Chain `l1Fee`; neither is a sizing or
-  admission gate. After a partial or zero primary Binance IOC, the coordinator
+  admission gate. After a successful DEX fill, non-blockingly drain already
+  queued DEX WebSocket events, apply the receipt's positional pool `Swap`
+  directly to the local mirror, and rebuild the affected prepared curves before
+  releasing the execution lane. Never wait for a second `eth_getLogs` copy and
+  never create a post-trade pool or global settlement barrier. Pending work
+  from an older pool generation remains eligible for the existing entry
+  preflight, which requotes it against the latest published generation and
+  fresh Binance price before dispatch. After a partial or zero primary Binance
+  IOC, the coordinator
   creates one immutable MARKET recovery target equal to `primary hedge target
   - primary executed quantity`. A proven zero-fill/unsubmitted/rejected child
   may retry that same target at most three total attempts, with persisted

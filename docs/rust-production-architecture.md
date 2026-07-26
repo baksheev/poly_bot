@@ -317,13 +317,18 @@ candidate's exact reservation remain separate authorization controls.
 5. Fresh RPC gas price plus the configured priority fee is used at signing.
    There is no admission-time DEX fee cap.
 6. The receipt's positional pool Swap is sufficient to apply this process's
-   self-impact immediately to the local mirror. WebSocket logs remain the
-   canonical ordering and reorg-correction stream. A second `eth_getLogs` copy
-   must not be required before local self-impact is visible.
-
-The last item is the target architecture. The 2026-07-23 production evidence
-shows that the current HTTP proof path still defers most receipt settlements;
-this is tracked as priority debt below.
+   self-impact immediately to the local mirror. Already-queued DEX WebSocket
+   events are drained without waiting first, then the affected prepared curves
+   are rebuilt before the execution lane is released. A second `eth_getLogs`
+   copy and a post-trade settlement barrier are forbidden.
+7. Pending work is not discarded merely because its admitted pool generation
+   predates the receipt update. Entry preflight requotes it against the latest
+   published generation and rejects it only if the fresh venue prices no longer
+   clear the configured 20 bps gross threshold or the price feeds are outside
+   their 30-second freshness boundaries.
+8. WebSocket logs remain the continuous source of subsequent external pool
+   updates. The receipt event's canonical position deduplicates its later
+   WebSocket copy without delaying owner-loop processing.
 
 ## Binance hedge and recovery decisions
 
@@ -349,6 +354,10 @@ this is tracked as priority debt below.
 8. A proven zero-fill/unsubmitted/rejected child may retry that same immutable
    target at most three total attempts. Backoff deadlines of 250 ms then 500 ms
    are persisted before waiting; child IDs are deterministic `r1`–`r3`.
+   Before the first MARKET attempt, Rust rounds down to the live market step
+   and validates quantity bounds and `MIN_NOTIONAL` at the fresh same-side
+   price. A local filter rejection is non-retryable and leaves the remaining
+   exposure as marked inventory drift.
 9. Partial/full fills and Unknown outcomes never advance to another attempt.
    Recovery results never recalculate a residual target. Exhaustion finishes
    the parent; any remaining WLD delta is result and inventory telemetry.
@@ -363,7 +372,8 @@ this is tracked as priority debt below.
     - `terminal` records exchange transaction time, status and
       zero/partial/full class, executed and quote quantities, average execution
       price, every fill, commissions, and unknown-outcome reconciliation;
-    - `error` records unsubmitted, rejected, or unresolved outcomes.
+    - `error` records unsubmitted, locally filtered, rejected, or unresolved
+      outcomes together with the bounded validation/exchange reason.
     For the MARKET fallback, `planned` additionally records a hypothetical
     same-side LIMIT at the fresh in-memory bid/ask and whether visible top
     quantity covered the order. `terminal` records MARKET price advantage
@@ -477,7 +487,11 @@ Every plan must be traceable by `plan_id` through:
 
 Production comparisons use equal half-open UTC windows. Rails rows must be
 joined to trade status so zero-PnL failed attempts are not mislabeled as
-profitable. Report at minimum:
+profitable. Rust results must have a matching `arbitrage_admitted` event inside
+the same window; journal reconciliation completed after restart is retained as
+accounting telemetry, tagged with `resumed_after_restart`, and attributed by
+its persisted `opportunity_received_unix_us`, not treated as a new admission.
+Report at minimum:
 
 - admitted, mailbox-received, preflight-rejected, balanced, and unknown counts;
 - DEX fill/failure;

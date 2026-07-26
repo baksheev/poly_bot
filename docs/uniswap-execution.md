@@ -100,31 +100,26 @@ the independent settlement check.
 
 For a successful arbitrage swap, the executor also extracts the selected
 pool's canonical `Swap` event and its `(block, transactionIndex, logIndex)`
-position from the receipt. When the trade becomes terminal, the engine uses a
-pool-scoped HTTP `eth_getLogs` request to catch the mirror up through that
-receipt block immediately. It verifies that the exact receipt event is present,
-applies every preceding Swap/Mint/Burn or Swap/ModifyLiquidity event in
-canonical order, invalidates the old prepared curves, and publishes one new
-pool generation. Pending opportunities may be superseded by newer candidates.
-Immediately before dispatch, market preflight requotes the immutable DEX input
-against the latest local pool and combines it with the latest Binance bid/ask.
-It requires both price paths to be inside their 30-second freshness boundaries
-and rejects only when the recomputed gross spread is below 20 bps. If the
-relevant Binance price and published DEX generation are unchanged since
-admission, it reuses the admission proof without repeating the quote.
+position from the receipt. The engine applies that positional event directly
+to the local mirror after non-blockingly draining DEX WebSocket events already
+queued at terminal delivery. It rebuilds the affected prepared curves inline
+and then releases the execution lane. Receipt settlement never calls
+`eth_getLogs` and does not create a pool or global settlement barrier. A later
+WebSocket copy of the same event is discarded by canonical log position.
 
-This HTTP proof remains the current implementation but is priority architecture
-debt: production evidence shows that providers often return the receipt before
-the same event is visible to `eth_getLogs`. The target in
-`rust-production-architecture.md` applies the positional receipt event
-immediately and uses WebSocket delivery for canonical ordering and reorg
-correction.
+Pending opportunities are retained for entry preflight. Immediately before
+dispatch, preflight requotes the immutable DEX input against the latest
+published pool generation and combines it with the latest Binance bid/ask. It
+requires both price paths to be inside their 30-second freshness boundaries and
+rejects when the recomputed gross spread is below 20 bps. If the relevant
+Binance price and published DEX generation are unchanged since admission, it
+reuses the admission proof without repeating the quote.
 
-WebSocket settlement remains the fail-safe. Missing positional receipt data, a
-temporary HTTP failure, or a receipt event not yet returned by `eth_getLogs`
-leaves the existing settlement barrier active. Later WebSocket delivery is
-deduplicated by canonical log position. A malformed, removed, or conflicting
-canonical event fails closed and requires normal process rehydration.
+The receipt Swap is the authoritative immediate self-impact update. The
+process-scoped WebSocket remains the ongoing source of new external pool
+events. Missing or malformed positional receipt settlement is telemetry and
+the normal WebSocket stream remains available; it must not introduce a
+post-trade wait in the owner loop.
 
 Transport failures and confirmation timeouts are recorded as
 `outcome_unknown`. The unresolved operation keeps its deterministic identity,

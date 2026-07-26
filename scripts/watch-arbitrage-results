@@ -53,18 +53,30 @@ clickhouse() {
 
 status_query() {
   cat <<SQL
+WITH admitted_plans AS
+(
+    SELECT DISTINCT JSONExtractString(payload_json, 'plan_id') AS plan_id
+    FROM ${clickhouse_database}.runtime_telemetry
+    WHERE kind = 'arbitrage_admitted'
+      AND observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+)
 SELECT
-    countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') AS completed,
-    countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'outcome') = 'balanced_profit') AS profitable,
-    sumIf(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units')), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') / 1000000 AS comparable_usdc,
+    countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'plan_id') IN (SELECT plan_id FROM admitted_plans)) AS completed,
+    countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'outcome') = 'balanced_profit' AND JSONExtractString(payload_json, 'plan_id') IN (SELECT plan_id FROM admitted_plans)) AS profitable,
+    sumIf(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units')), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'plan_id') IN (SELECT plan_id FROM admitted_plans)) / 1000000 AS comparable_usdc,
     if(
-        countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') = 0,
+        countIf(kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'plan_id') IN (SELECT plan_id FROM admitted_plans)) = 0,
         0,
-        avgIf(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units')), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') / 1000000
+        avgIf(toInt128OrZero(JSONExtractString(payload_json, 'comparable_profit_token_a_base_units')), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'plan_id') IN (SELECT plan_id FROM admitted_plans)) / 1000000
     ) AS avg_comparable_usdc,
-    sumIf(abs(toInt128OrZero(JSONExtractString(payload_json, 'token_b_residual_base_units'))), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first') / 1000000000000000000 AS absolute_wld_residual,
+    sumIf(abs(toInt128OrZero(JSONExtractString(payload_json, 'token_b_residual_base_units'))), kind = 'arbitrage_result' AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld' AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first' AND JSONExtractString(payload_json, 'plan_id') IN (SELECT plan_id FROM admitted_plans)) / 1000000000000000000 AS absolute_wld_residual,
     uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_admitted') AS admitted,
-    uniqExactIf(JSONExtractString(payload_json, 'plan_id'), kind = 'arbitrage_result') AS balanced,
+    uniqExactIf(
+        JSONExtractString(payload_json, 'plan_id'),
+        kind = 'arbitrage_result'
+        AND JSONExtractString(payload_json, 'plan_id')
+            IN (SELECT plan_id FROM admitted_plans)
+    ) AS balanced,
     (
         SELECT count()
         FROM
@@ -76,6 +88,8 @@ SELECT
             FROM ${clickhouse_database}.runtime_telemetry
             WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
               AND kind IN ('arbitrage_result', 'arbitrage_inventory_state')
+              AND JSONExtractString(payload_json, 'plan_id')
+                  IN (SELECT plan_id FROM admitted_plans)
             GROUP BY plan_id
         )
         WHERE plan_id != ''
@@ -91,6 +105,13 @@ SQL
 
 target_end_query() {
   cat <<SQL
+WITH admitted_plans AS
+(
+    SELECT DISTINCT JSONExtractString(payload_json, 'plan_id') AS plan_id
+    FROM ${clickhouse_database}.runtime_telemetry
+    WHERE kind = 'arbitrage_admitted'
+      AND observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'UTC'))
+)
 SELECT formatDateTime(
     toDateTime(intDiv(observed_at_ms, 1000) + 1, 'UTC'),
     '%Y-%m-%dT%H:%M:%SZ',
@@ -101,6 +122,8 @@ WHERE observed_at_ms >= toUnixTimestamp64Milli(toDateTime64('${start_ch}', 3, 'U
   AND kind = 'arbitrage_result'
   AND JSONExtractString(payload_json, 'pair_id') = 'world-chain-usdc-wld'
   AND JSONExtractString(payload_json, 'execution_mode') = 'dex_first'
+  AND JSONExtractString(payload_json, 'plan_id')
+      IN (SELECT plan_id FROM admitted_plans)
 ORDER BY observed_at_ms ASC
 LIMIT 1 OFFSET ${target_offset}
 FORMAT TabSeparated

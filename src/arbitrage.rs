@@ -60,6 +60,10 @@ pub struct TradeIntent {
     pub plan_id: String,
     pub source_revision: String,
     pub pair_id: String,
+    /// Stable market-observation timestamp used to attribute a result even
+    /// when an old journal operation is reconciled after a process restart.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub opportunity_received_unix_us: u64,
     pub mode: ExecutionMode,
     pub direction: ArbitrageDirection,
     pub planned_token_b_base_units: i128,
@@ -198,6 +202,10 @@ const fn is_zero_u128(value: &u128) -> bool {
 }
 
 const fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -581,6 +589,7 @@ impl TradeOperation {
             "plan_id": self.intent.plan_id,
             "source_revision": self.intent.source_revision,
             "pair_id": self.intent.pair_id,
+            "opportunity_received_unix_us": self.intent.opportunity_received_unix_us,
             "execution_mode": enum_json(&self.intent.mode)?,
             "direction": enum_json(&self.intent.direction)?,
             "outcome": enum_json(&result.outcome)?,
@@ -757,6 +766,7 @@ impl PaperOpportunity {
             plan_id,
             source_revision: self.source_revision.clone(),
             pair_id: self.pair_id.clone(),
+            opportunity_received_unix_us: self.received_unix_us,
             mode,
             direction: self.direction,
             planned_token_b_base_units: self.token_b_base_units,
@@ -1322,33 +1332,6 @@ impl PaperTradeHandle {
         drop(mailbox);
         self.mailbox.notify.notify_waiters();
         None
-    }
-
-    /// Releases the global lane after a fill while invalidating only pending
-    /// work that was quoted from the affected pool generation. Other pools
-    /// remain executable and new work for this pool is guarded by the engine's
-    /// pool-scoped settlement barrier.
-    pub fn finish_for_settlement(
-        &self,
-        pool_index: usize,
-        pool_generation: u64,
-    ) -> Option<PaperOpportunity> {
-        let Ok(mut mailbox) = self.mailbox.state.lock() else {
-            return None;
-        };
-        mailbox.lane = ExecutionLaneState::Available;
-        let discarded = mailbox
-            .pending
-            .as_ref()
-            .is_some_and(|opportunity| {
-                opportunity.dex_pool_index == pool_index
-                    && opportunity.dex_pool_generation <= pool_generation
-            })
-            .then(|| mailbox.pending.take())
-            .flatten();
-        drop(mailbox);
-        self.mailbox.notify.notify_waiters();
-        discarded
     }
 }
 
@@ -2736,6 +2719,7 @@ mod tests {
             plan_id: format!("arb-plan-{mode:?}").to_lowercase(),
             source_revision: "abc123".to_owned(),
             pair_id: "world-chain-usdc-wld".to_owned(),
+            opportunity_received_unix_us: 1_800_000_000_000_000,
             mode,
             direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             planned_token_b_base_units: 100,
@@ -2915,6 +2899,10 @@ mod tests {
         let payload = operation
             .result_telemetry_payload("arb-bot-rust-paper")
             .unwrap();
+        assert_eq!(
+            payload["opportunity_received_unix_us"],
+            1_800_000_000_000_000_u64
+        );
         assert_eq!(payload["realized_profit_token_a_base_units"], "25");
         assert_eq!(payload["comparable_profit_token_a_base_units"], "25");
         assert_eq!(payload["expected_cost_token_a_base_units"], "1000");
@@ -3348,6 +3336,44 @@ mod tests {
         assert!(coordinator.take_commands(&plan_id).unwrap().is_empty());
         let operation = coordinator.operation(&plan_id).unwrap();
         assert_eq!(operation.recovery_results.len(), MAX_RECOVERY_ATTEMPTS);
+        assert_eq!(operation.stage, TradeStage::BalancedLoss);
+        assert!(operation.recovery_retry_not_before_unix_ms.is_none());
+
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_market_filter_rejection_is_not_retried() {
+        let path = path("market-filter-rejection");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, filled(100, -1_000, "dex:fill"))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Cex, failed("cex:expired-primary"))
+            .unwrap();
+        assert!(matches!(
+            coordinator.take_commands(&plan_id).unwrap().as_slice(),
+            [CoordinatorCommand::RecoverCex { attempt: 1, .. }]
+        ));
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::RecoveryCex,
+                failed("cex:market-filter-rejected"),
+            )
+            .unwrap();
+
+        assert!(coordinator.take_commands(&plan_id).unwrap().is_empty());
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.recovery_results.len(), 1);
         assert_eq!(operation.stage, TradeStage::BalancedLoss);
         assert!(operation.recovery_retry_not_before_unix_ms.is_none());
 

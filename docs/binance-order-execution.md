@@ -16,6 +16,10 @@ autonomous arbitrage path is stricter:
 - quantities are rounded down to the configured `0.1 WLD` step;
 - BUY protection is rounded up and SELL protection down to the configured
   `0.0001 USDC` live exchange tick;
+- MARKET recovery is rounded down to `MARKET_LOT_SIZE` (falling back to
+  `LOT_SIZE`) and then checked against its quantity bounds and `MIN_NOTIONAL`
+  using the fresh same-side top, with the persisted recovery price as a
+  restart-safe fallback;
 - a partial or zero IOC execution creates one immutable MARKET recovery target
   equal to `primary hedge target - primary executed quantity`;
 - a proven zero-fill, unsubmitted, or deterministically rejected recovery child
@@ -23,6 +27,9 @@ autonomous arbitrage path is stricter:
   250 ms and 500 ms backoff;
 - partial/full recovery fills and unresolved Unknown outcomes never create
   another child;
+- a local exchange-filter rejection is terminal for that immutable target and
+  is not retried, because the same step-aligned below-minimum request cannot
+  become safer through transport backoff;
 - deterministic client order IDs are queried through `order.status` after an
   ambiguous placement response.
 
@@ -45,6 +52,12 @@ gated manual canary, MARKET BUY uses
 uses the exact post-BUY WLD balance delta rounded down to one exchange step. A
 fresh top-of-book must show enough best-level quantity before the sell is
 submitted.
+
+Startup diagnostics record Binance's `enabledForAccount`, `enabledForSymbol`,
+discount asset and discount multiplier alongside BNB balance presence. This
+makes the account's BNB-fee configuration auditable before trading; the
+terminal fill remains the source of truth for the asset Binance actually
+charged.
 
 The implementation follows Binance's documented rule that timeout or an
 unexpected matching-engine response is an unknown execution result, not proof
@@ -78,7 +91,9 @@ selection, the exact submitted order, and its terminal result.
   - whether MARKET filled the submitted quantity;
   - a `snapshot_and_market_path_success_proxy`;
   - placement and terminal memory tops plus `planned_to_terminal_us`;
-- `error`: unsubmitted, rejected, or unresolved placement.
+- `error`: unsubmitted, locally filtered, exchange-rejected, or unresolved
+  placement, including the bounded `error_reason` returned by validation,
+  Binance, or reconciliation.
 
 The same `planned` and `terminal` phases cover every bounded recovery child, so
 each placement-time top can be compared directly with its actual average fill

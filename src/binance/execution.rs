@@ -304,8 +304,14 @@ impl BinanceExecutor {
                         reconciled_after_unknown: true,
                     });
                 }
-                BinanceOrderProgress::Rejected { code, .. } => {
-                    anyhow::bail!("journaled Binance order was rejected with code {code}")
+                BinanceOrderProgress::Rejected {
+                    status,
+                    code,
+                    reason,
+                } => {
+                    anyhow::bail!(
+                        "journaled Binance order was rejected with HTTP status {status}, code {code}: {reason}"
+                    )
                 }
                 BinanceOrderProgress::IntentRecorded
                 | BinanceOrderProgress::OutcomeUnknown { .. } => {
@@ -489,12 +495,13 @@ impl BinanceExecutor {
                         reconciled_after_unknown: true,
                     });
                 }
+                let reason = bounded_reason(&message);
                 self.journal.advance(
                     &client_order_id,
                     BinanceOrderProgress::Rejected {
                         status,
                         code,
-                        reason: bounded_reason(&message),
+                        reason: reason.clone(),
                     },
                 )?;
                 tracing::error!(
@@ -502,10 +509,12 @@ impl BinanceExecutor {
                     client_order_id,
                     status,
                     code,
-                    reason = message,
+                    reason,
                     "Binance order was rejected and journaled"
                 );
-                anyhow::bail!("Binance order rejected with code {code}")
+                anyhow::bail!(
+                    "Binance order rejected with HTTP status {status}, code {code}: {reason}"
+                )
             }
             Err(error) => {
                 let reason = bounded_reason(&error.to_string());
