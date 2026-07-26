@@ -5,4 +5,5 @@ pub mod execution;
 pub mod hydration;
 pub mod mirror;
 pub mod pool_id;
+pub mod revert_diagnostics;
 pub mod validation;

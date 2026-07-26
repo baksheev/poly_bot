@@ -40,7 +40,8 @@ const RAILS_APPROVAL_DEFAULT_GAS_LIMIT: u64 = 800_000;
 // the largest observed Rails V3/V4 receipt from 2026-05-25..2026-07-25.
 const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
 const RAILS_PERMIT2_APPROVAL_GAS_LIMIT: u64 = 120_000;
-const GAS_PRICE_CACHE_TTL: Duration = Duration::from_secs(5);
+const GAS_PRICE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const GAS_PRICE_CACHE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_SWAP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 const APPROVAL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 const FAST_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -230,6 +231,34 @@ struct ExecuteCallPolicy {
     submission_policy: SwapSubmissionPolicy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GasPriceSource {
+    Rpc,
+    RailsFallback,
+}
+
+impl GasPriceSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Rpc => "cached_rpc",
+            Self::RailsFallback => "cached_rails_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GasPriceSample {
+    captured_at: Instant,
+    wei: u128,
+    source: GasPriceSource,
+}
+
+impl GasPriceSample {
+    fn is_fresh(self) -> bool {
+        self.captured_at.elapsed() < GAS_PRICE_CACHE_TTL
+    }
+}
+
 impl GasLimitPolicy {
     const fn for_swap(protocol: UniswapProtocol, additional: u64) -> Self {
         match protocol {
@@ -304,7 +333,7 @@ pub struct DexExecutor {
     wallet: EvmWallet,
     nonce_lane: NonceLane,
     journal: TransactionJournal,
-    gas_price: Option<(Instant, u128)>,
+    gas_price: Option<GasPriceSample>,
     allowance_mutations_enabled: bool,
     last_terminal_receipt: Option<TransactionReceipt>,
     receipt_heads: Option<watch::Receiver<CanonicalBlock>>,
@@ -593,6 +622,7 @@ impl DexExecutor {
             {
                 Some(receipt) => DexExecutionServiceError::Reverted {
                     transaction_hash: receipt.transaction_hash,
+                    block_number: receipt.block_number,
                     gas_used: receipt.gas_used,
                     effective_gas_price: receipt.effective_gas_price,
                     l1_fee: receipt.l1_fee,
@@ -810,7 +840,9 @@ impl DexExecutor {
         let (gas_limit, estimated_gas) = gas_limit_result?;
 
         let gas_price_started = Instant::now();
-        let gas_price = self.current_gas_price().await?;
+        let (gas_price, gas_price_source) = self
+            .gas_price_for_submission(policy.submission_policy)
+            .await;
         let max_fee_per_gas = gas_price
             .checked_add(RAILS_PRIORITY_FEE_WEI)
             .context("DEX maximum fee overflow")?;
@@ -822,10 +854,9 @@ impl DexExecutor {
             max_priority_fee_per_gas: RAILS_PRIORITY_FEE_WEI.min(max_fee_per_gas),
         };
         // Native gas funding is an operator-maintained invariant for immediate
-        // live swaps. Like Rails, signing uses the fresh RPC gas price without
-        // an admission sample or fee cap, and the latency-sensitive path never
-        // calls eth_getBalance. Startup/manual simulated writes retain their
-        // direct RPC guard.
+        // live swaps. The background execution-owner refresher keeps the
+        // two-second gas-price cache out of admission and the latency-sensitive
+        // path. Startup/manual simulated writes retain their direct RPC guard.
         if policy.submission_policy == SwapSubmissionPolicy::SimulateAndEstimate {
             let maximum_cost = call.maximum_native_cost(fee_parameters)?;
             ensure!(
@@ -833,7 +864,12 @@ impl DexExecutor {
                 "wallet native balance cannot cover maximum DEX gas"
             );
         }
-        self.emit_latency_stage(&operation_id, "gas_price_rpc", gas_price_started, "success");
+        self.emit_latency_stage(
+            &operation_id,
+            "gas_price_cache",
+            gas_price_started,
+            gas_price_source,
+        );
 
         let nonce_and_sign_started = Instant::now();
         let mut nonce_guard = acquire_process_nonce_lock(
@@ -994,34 +1030,66 @@ impl DexExecutor {
         Ok(receipt)
     }
 
-    async fn current_gas_price(&mut self) -> anyhow::Result<u128> {
-        if let Some((captured_at, gas_price)) = self.gas_price
-            && captured_at.elapsed() < GAS_PRICE_CACHE_TTL
+    async fn gas_price_for_submission(
+        &mut self,
+        submission_policy: SwapSubmissionPolicy,
+    ) -> (u128, &'static str) {
+        if let Some(sample) = self.gas_price
+            && sample.is_fresh()
         {
-            return Ok(gas_price);
+            return (sample.wei, sample.source.label());
         }
-        match self.rpc.gas_price().await {
+        if submission_policy == SwapSubmissionPolicy::SimulateAndEstimate {
+            self.refresh_gas_price().await;
+            let sample = self
+                .gas_price
+                .expect("gas-price refresh always publishes a sample");
+            return (sample.wei, sample.source.label());
+        }
+        tracing::warn!(
+            fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
+            gas_price_cache_ttl_ms = GAS_PRICE_CACHE_TTL.as_millis(),
+            "background gas-price cache is unavailable or stale; using the Rails fallback"
+        );
+        (RAILS_FALLBACK_GAS_PRICE_WEI, "stale_rails_fallback")
+    }
+
+    async fn refresh_gas_price(&mut self) {
+        let previous_source = self.gas_price.map(|sample| sample.source);
+        let (wei, source) = match self.rpc.gas_price().await {
             Ok(gas_price) if gas_price > 0 => {
-                self.gas_price = Some((Instant::now(), gas_price));
-                Ok(gas_price)
+                if previous_source == Some(GasPriceSource::RailsFallback) {
+                    tracing::info!(
+                        gas_price_wei = gas_price,
+                        "background eth_gasPrice refresh recovered"
+                    );
+                }
+                (gas_price, GasPriceSource::Rpc)
             }
             Ok(_) => {
-                tracing::warn!(
-                    fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
-                    "eth_gasPrice returned zero; using the Rails fallback"
-                );
-                Ok(RAILS_FALLBACK_GAS_PRICE_WEI)
+                if previous_source != Some(GasPriceSource::RailsFallback) {
+                    tracing::warn!(
+                        fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
+                        "background eth_gasPrice refresh returned zero; caching the Rails fallback"
+                    );
+                }
+                (RAILS_FALLBACK_GAS_PRICE_WEI, GasPriceSource::RailsFallback)
             }
             Err(_) => {
-                // Do not cache the fallback: Rails retries eth_gasPrice on the
-                // next transaction after a failed cache fill.
-                tracing::warn!(
-                    fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
-                    "eth_gasPrice failed; using the Rails fallback"
-                );
-                Ok(RAILS_FALLBACK_GAS_PRICE_WEI)
+                if previous_source != Some(GasPriceSource::RailsFallback) {
+                    tracing::warn!(
+                        fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
+                        "background eth_gasPrice refresh failed; caching the Rails fallback"
+                    );
+                }
+                (RAILS_FALLBACK_GAS_PRICE_WEI, GasPriceSource::RailsFallback)
             }
-        }
+        };
+        self.gas_price = Some(GasPriceSample {
+            captured_at: Instant::now(),
+            wei,
+            source,
+        });
     }
 }
 
@@ -1108,6 +1176,7 @@ pub enum DexExecutionServiceError {
     },
     Reverted {
         transaction_hash: B256,
+        block_number: u64,
         gas_used: u64,
         effective_gas_price: u128,
         l1_fee: u128,
@@ -1167,42 +1236,65 @@ impl DexExecutionService {
                         return;
                     }
                 };
-                let mut executor = executor;
-                while let Some(work) = receiver.blocking_recv() {
-                    let operation_id = work.request.operation_id.clone();
-                    let journal_operation_id = format!("{operation_id}.swap");
-                    executor.emit_latency_stage(
-                        &operation_id,
-                        "worker_queue",
-                        work.enqueued_at,
-                        "success",
-                    );
-                    let execution_started = Instant::now();
-                    let result = runtime
-                        .block_on(executor.execute_exact_input(work.request))
-                        .map_err(|error| {
-                            executor.classify_execution_error(
-                                &journal_operation_id,
-                                format!("{error:#}"),
-                            )
-                        });
-                    executor.emit_latency_stage(
-                        &operation_id,
-                        "worker_total",
-                        execution_started,
-                        if result.is_ok() { "success" } else { "failed" },
-                    );
-                    if let Err(error) = &result {
-                        tracing::error!(
-                            operation_id,
-                            error = %error,
-                            "DEX execution request failed; inspect transaction journal before retry"
-                        );
+                runtime.block_on(async move {
+                    let mut executor = executor;
+                    executor.refresh_gas_price().await;
+                    let mut gas_price_refresh =
+                        tokio::time::interval(GAS_PRICE_REFRESH_INTERVAL);
+                    gas_price_refresh
+                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    gas_price_refresh.reset();
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = gas_price_refresh.tick() => {
+                                executor.refresh_gas_price().await;
+                            }
+                            work = receiver.recv() => {
+                                let Some(work) = work else {
+                                    break;
+                                };
+                                let operation_id = work.request.operation_id.clone();
+                                let journal_operation_id = format!("{operation_id}.swap");
+                                executor.emit_latency_stage(
+                                    &operation_id,
+                                    "worker_queue",
+                                    work.enqueued_at,
+                                    "success",
+                                );
+                                let execution_started = Instant::now();
+                                let result = executor
+                                    .execute_exact_input(work.request)
+                                    .await
+                                    .map_err(|error| {
+                                        executor.classify_execution_error(
+                                            &journal_operation_id,
+                                            format!("{error:#}"),
+                                        )
+                                    });
+                                executor.emit_latency_stage(
+                                    &operation_id,
+                                    "worker_total",
+                                    execution_started,
+                                    if result.is_ok() { "success" } else { "failed" },
+                                );
+                                if let Err(error) = &result {
+                                    tracing::error!(
+                                        operation_id,
+                                        error = %error,
+                                        "DEX execution request failed; inspect transaction journal before retry"
+                                    );
+                                }
+                                if work.response.send(result).is_err() {
+                                    tracing::warn!(
+                                        operation_id,
+                                        "DEX execution caller dropped its response"
+                                    );
+                                }
+                            }
+                        }
                     }
-                    if work.response.send(result).is_err() {
-                        tracing::warn!(operation_id, "DEX execution caller dropped its response");
-                    }
-                }
+                });
             })
             .context("failed to spawn DEX executor thread")?;
         Ok(Self {
@@ -1328,7 +1420,10 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         thread::JoinHandle,
         time::Duration,
     };
@@ -1511,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedicated_worker_journals_an_onchain_revert() {
-        let (endpoint, server) = spawn_mock_rpc(MockOutcome::Revert);
+        let (endpoint, server, _) = spawn_mock_rpc(MockOutcome::Revert);
         let path = journal_path("revert");
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
         let mut executor = DexExecutor::hydrate(
@@ -1554,7 +1649,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedicated_worker_signs_above_the_removed_rust_fee_cap() {
-        let (endpoint, server) = spawn_mock_rpc(MockOutcome::RevertHighGas);
+        let (endpoint, server, _) = spawn_mock_rpc(MockOutcome::RevertHighGas);
         let path = journal_path("high-gas");
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
         let mut executor = DexExecutor::hydrate(
@@ -1581,7 +1676,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedicated_worker_uses_rails_fallback_when_gas_price_rpc_fails() {
-        let (endpoint, server) = spawn_mock_rpc(MockOutcome::RevertGasPriceUnavailable);
+        let (endpoint, server, _) = spawn_mock_rpc(MockOutcome::RevertGasPriceUnavailable);
         let path = journal_path("gas-price-fallback");
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
         let mut executor = DexExecutor::hydrate(
@@ -1607,8 +1702,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_worker_reuses_the_background_gas_price_sample() {
+        let (endpoint, server, gas_price_requests) = spawn_mock_rpc(MockOutcome::TwoReverts);
+        let path = journal_path("background-gas-price");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        executor.allowance_mutations_enabled = false;
+        let service = DexExecutionService::spawn(executor, 1).unwrap();
+
+        assert!(
+            matches!(
+                service
+                    .execute(v3_request("rustval-background-gas-price-1"))
+                    .await,
+                Err(DexExecutionServiceError::Reverted { .. })
+            ),
+            "first transaction should use the primed background sample"
+        );
+        assert!(
+            matches!(
+                service
+                    .execute(v3_request("rustval-background-gas-price-2"))
+                    .await,
+                Err(DexExecutionServiceError::Reverted { .. })
+            ),
+            "second transaction should reuse the same fresh sample"
+        );
+
+        drop(service);
+        server.join().unwrap();
+        assert_eq!(gas_price_requests.load(Ordering::Relaxed), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn dedicated_worker_journals_an_unknown_broadcast_outcome() {
-        let (endpoint, server) = spawn_mock_rpc(MockOutcome::BroadcastRejected);
+        let (endpoint, server, _) = spawn_mock_rpc(MockOutcome::BroadcastRejected);
         let path = journal_path("broadcast-rejected");
         let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
         let mut executor = DexExecutor::hydrate(
@@ -1678,20 +1814,24 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MockOutcome {
         Revert,
+        TwoReverts,
         RevertHighGas,
         RevertGasPriceUnavailable,
         BroadcastRejected,
     }
 
-    fn spawn_mock_rpc(outcome: MockOutcome) -> (String, JoinHandle<()>) {
+    fn spawn_mock_rpc(outcome: MockOutcome) -> (String, JoinHandle<()>, Arc<AtomicU64>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request_count = match outcome {
             MockOutcome::Revert
             | MockOutcome::RevertHighGas
             | MockOutcome::RevertGasPriceUnavailable => 6,
+            MockOutcome::TwoReverts => 8,
             MockOutcome::BroadcastRejected => 5,
         };
+        let gas_price_requests = Arc::new(AtomicU64::new(0));
+        let server_gas_price_requests = Arc::clone(&gas_price_requests);
         let thread = std::thread::spawn(move || {
             let mut transaction_hash = None;
             for _ in 0..request_count {
@@ -1708,23 +1848,27 @@ mod tests {
                     "eth_estimateGas" => {
                         panic!("immediate swap unexpectedly called eth_estimateGas")
                     }
-                    "eth_gasPrice" => match outcome {
-                        MockOutcome::RevertHighGas => rpc_result(id, json!("0x2e90edd000")),
-                        MockOutcome::RevertGasPriceUnavailable => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": -32000,
-                                "message": "gas price unavailable for test"
-                            }
-                        }),
-                        _ => rpc_result(id, json!("0xf4240")),
-                    },
+                    "eth_gasPrice" => {
+                        server_gas_price_requests.fetch_add(1, Ordering::Relaxed);
+                        match outcome {
+                            MockOutcome::RevertHighGas => rpc_result(id, json!("0x2e90edd000")),
+                            MockOutcome::RevertGasPriceUnavailable => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": "gas price unavailable for test"
+                                }
+                            }),
+                            _ => rpc_result(id, json!("0xf4240")),
+                        }
+                    }
                     "eth_getBalance" => {
                         panic!("immediate swap unexpectedly called eth_getBalance")
                     }
                     "eth_sendRawTransaction" => match outcome {
                         MockOutcome::Revert
+                        | MockOutcome::TwoReverts
                         | MockOutcome::RevertHighGas
                         | MockOutcome::RevertGasPriceUnavailable => {
                             let raw = request["params"][0].as_str().unwrap();
@@ -1761,7 +1905,7 @@ mod tests {
                 write_response(&mut stream, &response);
             }
         });
-        (format!("http://{address}"), thread)
+        (format!("http://{address}"), thread, gas_price_requests)
     }
 
     fn rpc_result(id: Value, result: Value) -> Value {

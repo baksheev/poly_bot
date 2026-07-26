@@ -28,14 +28,17 @@ use crate::{
         order_plan::{plan_limit_ioc, plan_market_order, recovery_client_order_id},
         ws_api::OrderResult,
     },
-    dex::execution::{DexExecutionService, DexExecutionServiceError},
+    dex::{
+        execution::{DexExecutionService, DexExecutionServiceError, SwapRoute},
+        revert_diagnostics::{DexRevertDiagnosticHandle, DexRevertDiagnosticRequest},
+    },
     execution_accounting::{
         CommissionAssetValuation, binance_leg_result, dex_leg_result,
         native_gas_to_token_a_base_units,
     },
     telemetry::{
-        ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_EXECUTION_STAGE_KIND, ARBITRAGE_RESULT_KIND,
-        TelemetryHandle,
+        ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_DEX_REVERT_KIND, ARBITRAGE_EXECUTION_STAGE_KIND,
+        ARBITRAGE_RESULT_KIND, TelemetryHandle,
     },
 };
 
@@ -60,6 +63,7 @@ pub struct ComposedLiveLegExecutor {
     commission_asset: String,
     commission_price_symbol: String,
     market_state: EntryPreflightHandle,
+    dex_revert_diagnostics: DexRevertDiagnosticHandle,
     telemetry: TelemetryHandle,
     engine_id: String,
 }
@@ -80,6 +84,15 @@ struct RecoveryLimitCounterfactual {
     top_covers_quantity: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DexRevertContext {
+    protocol: String,
+    pool_reference: String,
+    amount_in_base_units: String,
+    amount_out_minimum_base_units: String,
+    deadline_unix_seconds: u64,
+}
+
 pub struct ComposedLiveLegExecutorConfig {
     pub rules: SymbolRules,
     pub base_asset: String,
@@ -89,6 +102,7 @@ pub struct ComposedLiveLegExecutorConfig {
     pub commission_asset: String,
     pub commission_price_symbol: String,
     pub market_state: EntryPreflightHandle,
+    pub dex_revert_diagnostics: DexRevertDiagnosticHandle,
     pub telemetry: TelemetryHandle,
     pub engine_id: String,
 }
@@ -108,6 +122,7 @@ impl ComposedLiveLegExecutor {
             commission_asset,
             commission_price_symbol,
             market_state,
+            dex_revert_diagnostics,
             telemetry,
             engine_id,
         } = config;
@@ -147,6 +162,7 @@ impl ComposedLiveLegExecutor {
             commission_asset,
             commission_price_symbol,
             market_state,
+            dex_revert_diagnostics,
             telemetry,
             engine_id,
         })
@@ -178,6 +194,7 @@ impl ComposedLiveLegExecutor {
                         return failed(role, "dex:invalid-plan");
                     }
                 };
+                let revert_context = DexRevertContext::from_request(&request);
                 match self.dex.execute(request).await {
                     Ok(outcome) => {
                         let gas = if bounds.gas_conversion_price_token_a.is_zero() {
@@ -231,11 +248,62 @@ impl ComposedLiveLegExecutor {
                     }
                     Err(DexExecutionServiceError::Reverted {
                         transaction_hash,
+                        block_number,
                         gas_used,
                         effective_gas_price,
                         l1_fee,
                         reason,
                     }) => {
+                        let diagnostic_submit =
+                            self.dex_revert_diagnostics
+                                .try_submit(DexRevertDiagnosticRequest {
+                                    plan_id: intent.plan_id.clone(),
+                                    operation_id: operation_id.clone(),
+                                    pair_id: intent.pair_id.clone(),
+                                    source_revision: intent.source_revision.clone(),
+                                    direction: arbitrage_direction_label(intent.direction)
+                                        .to_owned(),
+                                    protocol: revert_context.protocol.clone(),
+                                    pool_reference: revert_context.pool_reference.clone(),
+                                    transaction_hash,
+                                    block_number,
+                                    gas_used,
+                                    effective_gas_price,
+                                    l1_fee,
+                                    amount_in_base_units: revert_context
+                                        .amount_in_base_units
+                                        .clone(),
+                                    amount_out_minimum_base_units: revert_context
+                                        .amount_out_minimum_base_units
+                                        .clone(),
+                                    deadline_unix_seconds: revert_context.deadline_unix_seconds,
+                                    execution_reason: reason.clone(),
+                                });
+                        self.telemetry.emit(
+                            ARBITRAGE_DEX_REVERT_KIND,
+                            serde_json::json!({
+                                "engine_id": self.engine_id,
+                                "phase": "receipt",
+                                "diagnostic_status": diagnostic_submit.label(),
+                                "plan_id": intent.plan_id,
+                                "operation_id": operation_id,
+                                "pair_id": intent.pair_id,
+                                "source_revision": intent.source_revision,
+                                "direction": arbitrage_direction_label(intent.direction),
+                                "protocol": revert_context.protocol,
+                                "pool_reference": revert_context.pool_reference,
+                                "transaction_hash": format!("{transaction_hash:#x}"),
+                                "block_number": block_number,
+                                "gas_used": gas_used,
+                                "effective_gas_price": effective_gas_price.to_string(),
+                                "l1_fee": l1_fee.to_string(),
+                                "amount_in_base_units": revert_context.amount_in_base_units,
+                                "amount_out_minimum_base_units":
+                                    revert_context.amount_out_minimum_base_units,
+                                "deadline_unix_seconds": revert_context.deadline_unix_seconds,
+                                "execution_reason": bounded_telemetry_reason(&reason),
+                            }),
+                        );
                         let gas = if bounds.gas_conversion_price_token_a.is_zero() {
                             tracing::warn!(
                                 operation_id,
@@ -850,6 +918,22 @@ impl ComposedLiveLegExecutor {
     }
 }
 
+impl DexRevertContext {
+    fn from_request(request: &crate::dex::execution::ExactInputSwapRequest) -> Self {
+        let pool_reference = match request.route {
+            SwapRoute::V3 { pool, .. } => format!("{pool:#x}"),
+            SwapRoute::V4 { pool_key, .. } => format!("{:#x}", pool_key.pool_id()),
+        };
+        Self {
+            protocol: request.route.protocol().label().to_owned(),
+            pool_reference,
+            amount_in_base_units: request.amount_in.to_string(),
+            amount_out_minimum_base_units: request.amount_out_minimum.to_string(),
+            deadline_unix_seconds: request.deadline_unix_seconds,
+        }
+    }
+}
+
 impl LiveLegExecutor for ComposedLiveLegExecutor {
     fn execute<'a>(
         &'a self,
@@ -1361,6 +1445,15 @@ fn command_operation_id(intent: &TradeIntent, command: &CoordinatorCommand) -> S
             recovery_client_order_id(&intent.cex_client_order_id, *attempt)
                 .unwrap_or_else(|_| format!("{}-recovery-{attempt}", intent.plan_id))
         }
+    }
+}
+
+const fn arbitrage_direction_label(
+    direction: crate::arbitrage::ArbitrageDirection,
+) -> &'static str {
+    match direction {
+        crate::arbitrage::ArbitrageDirection::BuyTokenBOnDexSellOnCex => "dex_buy_cex_sell",
+        crate::arbitrage::ArbitrageDirection::BuyTokenBOnCexSellOnDex => "cex_buy_dex_sell",
     }
 }
 

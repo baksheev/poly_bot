@@ -18,6 +18,7 @@ use crate::config::AppConfig;
 pub const ARBITRAGE_RESULT_KIND: &str = "arbitrage_result";
 pub const ARBITRAGE_EXECUTION_STAGE_KIND: &str = "arbitrage_execution_stage";
 pub const ARBITRAGE_BINANCE_ORDER_KIND: &str = "arbitrage_binance_order";
+pub const ARBITRAGE_DEX_REVERT_KIND: &str = "arbitrage_dex_revert";
 
 #[derive(Clone)]
 pub struct TelemetryHandle {

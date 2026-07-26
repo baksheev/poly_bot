@@ -33,6 +33,7 @@ use arb_bot::{
         execution::{AllowanceRequirement, DexExecutionService, DexExecutor, UniswapProtocol},
         hydration::DexHydrator,
         mirror::{DexMirror, LogApplyResult},
+        revert_diagnostics::dex_revert_diagnostic_channel,
         validation::{execute_recovery_sell, execute_round_trip},
     },
     domain::config::{DexProvider, LoadedDomainConfig},
@@ -65,6 +66,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 const ARBITRAGE_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_WALLET_JOURNAL_PATH";
 const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
 const BINANCE_CLOCK_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+const DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY: usize = 32;
 
 enum RebalanceExecutorEvent {
     Recovery(Result<RebalanceExecutionOperation, String>),
@@ -1131,6 +1133,12 @@ async fn run(
             execution_latency_telemetry,
         )
         .await?;
+        let (dex_revert_diagnostics, dex_revert_diagnostic_task) = dex_revert_diagnostic_channel(
+            wallet_rpc.clone(),
+            telemetry.clone(),
+            config.engine_id.clone(),
+            DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
+        );
         let executor = ComposedLiveLegExecutor::new(
             dex_service,
             binance_service,
@@ -1143,6 +1151,7 @@ async fn run(
                 commission_asset: commission_asset.clone(),
                 commission_price_symbol: commission_price_symbol.clone(),
                 market_state: entry_preflight.clone(),
+                dex_revert_diagnostics,
                 telemetry: telemetry.clone(),
                 engine_id: config.engine_id.clone(),
             },
@@ -1158,7 +1167,12 @@ async fn run(
                 binance_symbol: pair.binance.symbol.clone(),
             },
         )?;
-        Some((handle, tokio::spawn(task.run()), events))
+        Some((
+            handle,
+            tokio::spawn(task.run()),
+            events,
+            tokio::spawn(dex_revert_diagnostic_task.run()),
+        ))
     } else {
         None
     };
@@ -1187,22 +1201,26 @@ async fn run(
         "full_live" => None,
         _ => unreachable!("AppConfig validation rejects unknown arbitrage modes"),
     };
-    let (paper_trades, mut paper_trade_task, mut paper_trade_events) =
-        if let Some(runtime) = live_trade_runtime {
-            let (handle, task, events) = runtime;
-            (Some(handle), Some(task), events)
-        } else if let Some(mode) = paper_mode {
-            let (handle, task, events) = paper_trade_channel(
-                &config.arbitrage_trade_journal_path,
-                mode,
-                telemetry.clone(),
-                config.engine_id.clone(),
-            )?;
-            (Some(handle), Some(tokio::spawn(task.run())), events)
-        } else {
-            let (_event_sender, events) = tokio::sync::mpsc::unbounded_channel();
-            (None, None, events)
-        };
+    let (
+        paper_trades,
+        mut paper_trade_task,
+        mut paper_trade_events,
+        mut dex_revert_diagnostic_task,
+    ) = if let Some(runtime) = live_trade_runtime {
+        let (handle, task, events, diagnostic_task) = runtime;
+        (Some(handle), Some(task), events, Some(diagnostic_task))
+    } else if let Some(mode) = paper_mode {
+        let (handle, task, events) = paper_trade_channel(
+            &config.arbitrage_trade_journal_path,
+            mode,
+            telemetry.clone(),
+            config.engine_id.clone(),
+        )?;
+        (Some(handle), Some(tokio::spawn(task.run())), events, None)
+    } else {
+        let (_event_sender, events) = tokio::sync::mpsc::unbounded_channel();
+        (None, None, events, None)
+    };
     let (mut engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
@@ -1517,6 +1535,9 @@ async fn run(
     drop(engine);
     if let Some(task) = paper_trade_task.take() {
         task.await??;
+    }
+    if let Some(task) = dex_revert_diagnostic_task.take() {
+        task.await?;
     }
     hot_telemetry_task.await??;
     writer_task.await??;

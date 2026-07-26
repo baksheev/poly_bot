@@ -41,9 +41,12 @@ Fee construction and accounting remain Rails-compatible:
 - EIP-1559 priority fee is `1,500,000 wei` and
   `max_fee_per_gas = eth_gasPrice + priority_fee`, matching
   `EthWalletService`.
-- `eth_gasPrice` is cached for five seconds inside the execution owner.
-- If `eth_gasPrice` fails, the executor uses the Rails World Chain fallback
-  `100,000 wei`. A fallback is not cached, so the next transaction retries RPC.
+- The dedicated execution owner refreshes `eth_gasPrice` every second and
+  caches the resulting sample for two seconds. Live transaction construction
+  performs only a cache lookup; it never waits for this RPC.
+- A zero or failed refresh publishes the Rails World Chain fallback
+  `100,000 wei` into the same two-second cache. The next one-second background
+  tick retries RPC without delaying execution.
 - Receipt cost is `gasUsed * effectiveGasPrice + l1Fee`. The OP Stack
   `l1Fee` is the L1 data-publication charge; it changes realized cost but
   cannot prevent or cause an EVM revert.
@@ -52,10 +55,10 @@ Fee construction and accounting remain Rails-compatible:
   operator-maintained invariant. The separate manual validation command still
   checks native funding before it mutates the wallet.
 
-Gas limits retain Rust safety ceilings. Gas price follows Rails: immediately
-before signing, the executor uses cached-or-fresh `eth_gasPrice`, or the
-`100,000 wei` fallback when that RPC fails, plus the configured priority fee.
-There is no admission-time or absolute fee cap.
+Gas limits retain Rust safety ceilings. Immediately before signing, the live
+executor uses the at-most-two-second cached RPC or fallback sample plus the
+configured priority fee. Startup/manual mutation may refresh synchronously if
+the cache is unavailable. There is no admission-time or absolute fee cap.
 
 ## Single owner and safe outcomes
 
@@ -125,8 +128,22 @@ Transport failures and confirmation timeouts are recorded as
 `outcome_unknown`. The unresolved operation keeps its deterministic identity,
 nonce claim, and exact reservation until canonical RPC reconciliation proves
 the result; it must not become a global parent dead end. A revert is logged
-with operation ID, transaction hash, block, gas used, and effective gas price.
-Raw signed payloads and credentials are never journaled or logged.
+immediately as `arbitrage_dex_revert` with `phase=receipt`, `plan_id`,
+operation ID, protocol, pool, transaction hash, block, calldata amount bounds,
+deadline, gas used, effective gas price, and `l1Fee`. This receipt event releases
+the execution lane without waiting for diagnosis.
+
+A separate bounded background worker then calls `debug_traceTransaction` with
+a five-second diagnostic timeout. If the provider does not expose tracing, it
+falls back to a historical `eth_call` of the mined transaction. A second
+`arbitrage_dex_revert` event with `phase=diagnostic` records the diagnostic
+source and status, decoded `Error(string)`, decoded `Panic(uint256)`, or the
+four-byte custom-error selector. It also records whether gas usage exhausted
+the submitted limit when the transaction lookup exposes that limit. Trace
+failure, timeout, or queue saturation is telemetry incompleteness only: it
+cannot change the known revert, hold the lane, or enter trading decisions. Raw
+signed payloads, full calldata, credentials, and unbounded provider responses
+are never journaled or logged.
 
 V3 checks and, if necessary, grants the router ERC-20 allowance. V4 performs
 both required stages: ERC-20 allowance to Permit2 and Permit2 allowance to the

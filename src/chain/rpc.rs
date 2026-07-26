@@ -117,6 +117,18 @@ pub struct RpcTransaction {
     pub value: U256,
     pub input: Vec<u8>,
     pub block_number: Option<u64>,
+    pub gas_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionRevertDiagnostic {
+    pub source: String,
+    pub classification: String,
+    pub reason: Option<String>,
+    pub selector: Option<String>,
+    pub gas_limit: Option<u64>,
+    pub gas_used_equals_limit: Option<bool>,
+    pub trace_error: Option<String>,
 }
 
 impl EthCall {
@@ -402,6 +414,169 @@ impl JsonRpcClient {
         Ok(Some(transaction))
     }
 
+    /// Diagnoses a known mined revert without entering the execution path.
+    ///
+    /// The caller is responsible for running this method from a bounded
+    /// background worker. A call trace is preferred because it observes the
+    /// exact transaction execution. Historical `eth_call` is only a fallback
+    /// for providers that do not expose `debug_traceTransaction`.
+    pub async fn diagnose_transaction_revert(
+        &self,
+        transaction_hash: B256,
+        block_number: u64,
+        gas_used: u64,
+    ) -> anyhow::Result<TransactionRevertDiagnostic> {
+        let trace_response = self
+            .rpc_response(
+                "debug_traceTransaction",
+                json!([
+                    format!("{transaction_hash:#x}"),
+                    {
+                        "tracer": "callTracer",
+                        "timeout": "3s",
+                        "tracerConfig": {
+                            "onlyTopCall": false,
+                            "withLog": false
+                        }
+                    }
+                ]),
+            )
+            .await;
+        let mut trace_error = None;
+        let mut trace_diagnostic = match trace_response {
+            Ok(response) => {
+                if let Some(error) = response.error {
+                    trace_error = Some(sanitize_rpc_message(&error.message));
+                    None
+                } else {
+                    response
+                        .result
+                        .as_ref()
+                        .map(diagnostic_from_trace)
+                        .transpose()?
+                }
+            }
+            Err(error) => {
+                trace_error = Some(sanitize_rpc_message(&format!("{error:#}")));
+                None
+            }
+        };
+        if let Some(diagnostic) = trace_diagnostic.as_mut() {
+            diagnostic.trace_error = trace_error.clone();
+            if diagnostic.reason.is_some()
+                || diagnostic.selector.is_some()
+                || !matches!(
+                    diagnostic.classification.as_str(),
+                    "execution_reverted" | "empty_revert_data"
+                )
+            {
+                return Ok(diagnostic.clone());
+            }
+        }
+
+        let transaction = match self.transaction_by_hash(transaction_hash).await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let replay_error = sanitize_rpc_message(&format!("{error:#}"));
+                if let Some(mut diagnostic) = trace_diagnostic {
+                    diagnostic.trace_error =
+                        Some(join_diagnostic_errors(trace_error, replay_error));
+                    return Ok(diagnostic);
+                }
+                return Ok(TransactionRevertDiagnostic {
+                    source: "diagnostic_unavailable".to_owned(),
+                    classification: "rpc_error".to_owned(),
+                    reason: None,
+                    selector: None,
+                    gas_limit: None,
+                    gas_used_equals_limit: None,
+                    trace_error: Some(join_diagnostic_errors(trace_error, replay_error)),
+                });
+            }
+        };
+        let gas_limit = transaction
+            .as_ref()
+            .and_then(|transaction| transaction.gas_limit);
+        let gas_used_equals_limit = gas_limit.map(|gas_limit| gas_used >= gas_limit);
+        let Some(transaction) = transaction else {
+            return Ok(trace_diagnostic.unwrap_or(TransactionRevertDiagnostic {
+                source: "diagnostic_unavailable".to_owned(),
+                classification: "transaction_unavailable".to_owned(),
+                reason: None,
+                selector: None,
+                gas_limit,
+                gas_used_equals_limit,
+                trace_error,
+            }));
+        };
+        let Some(to) = transaction.to else {
+            return Ok(trace_diagnostic.unwrap_or(TransactionRevertDiagnostic {
+                source: "diagnostic_unavailable".to_owned(),
+                classification: "contract_creation_unsupported".to_owned(),
+                reason: None,
+                selector: None,
+                gas_limit,
+                gas_used_equals_limit,
+                trace_error,
+            }));
+        };
+        let call = TransactionCall {
+            from: transaction.from,
+            to,
+            data: transaction.input,
+            value: transaction.value,
+        };
+        let replay_response = self
+            .rpc_response(
+                "eth_call",
+                json!([call.json(), format!("0x{block_number:x}")]),
+            )
+            .await;
+        let mut diagnostic = match replay_response {
+            Ok(response) => match response.error {
+                Some(error) => diagnostic_from_rpc_error(&error)?,
+                None => TransactionRevertDiagnostic {
+                    source: "historical_eth_call".to_owned(),
+                    classification: "replay_succeeded".to_owned(),
+                    reason: Some(
+                        "historical replay no longer reproduces the mined revert".to_owned(),
+                    ),
+                    selector: None,
+                    gas_limit,
+                    gas_used_equals_limit,
+                    trace_error: trace_error.clone(),
+                },
+            },
+            Err(error) => {
+                if let Some(mut diagnostic) = trace_diagnostic {
+                    diagnostic.gas_limit = gas_limit;
+                    diagnostic.gas_used_equals_limit = gas_used_equals_limit;
+                    diagnostic.trace_error = Some(join_diagnostic_errors(
+                        trace_error.clone(),
+                        sanitize_rpc_message(&format!("{error:#}")),
+                    ));
+                    return Ok(diagnostic);
+                }
+                TransactionRevertDiagnostic {
+                    source: "diagnostic_unavailable".to_owned(),
+                    classification: "rpc_error".to_owned(),
+                    reason: None,
+                    selector: None,
+                    gas_limit,
+                    gas_used_equals_limit,
+                    trace_error: Some(join_diagnostic_errors(
+                        trace_error.clone(),
+                        sanitize_rpc_message(&format!("{error:#}")),
+                    )),
+                }
+            }
+        };
+        diagnostic.gas_limit = gas_limit;
+        diagnostic.gas_used_equals_limit = gas_used_equals_limit;
+        diagnostic.trace_error = trace_error;
+        Ok(diagnostic)
+    }
+
     pub async fn erc20_balance(&self, token: Address, owner: Address) -> anyhow::Result<U256> {
         let block = self.latest_block().await?;
         let mut data = Vec::with_capacity(36);
@@ -505,34 +680,11 @@ impl JsonRpcClient {
     }
 
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let response = self
-            .send_json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
-            .await?;
-        let decoded: RpcResponse =
-            serde_json::from_value(response).context("invalid JSON-RPC response")?;
-        ensure!(decoded.id == id, "JSON-RPC response id mismatch");
-        decode_rpc_result(decoded)
+        decode_rpc_result(self.rpc_response(method, params).await?)
     }
 
     async fn request_optional(&self, method: &str, params: Value) -> anyhow::Result<Option<Value>> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let response = self
-            .send_json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
-            .await?;
-        let decoded: RpcResponse =
-            serde_json::from_value(response).context("invalid JSON-RPC response")?;
-        ensure!(decoded.id == id, "JSON-RPC response id mismatch");
+        let decoded = self.rpc_response(method, params).await?;
         if let Some(error) = decoded.error {
             return Err(anyhow!(
                 "JSON-RPC error {}: {}",
@@ -541,6 +693,22 @@ impl JsonRpcClient {
             ));
         }
         Ok(decoded.result)
+    }
+
+    async fn rpc_response(&self, method: &str, params: Value) -> anyhow::Result<RpcResponse> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let response = self
+            .send_json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .await?;
+        let decoded: RpcResponse =
+            serde_json::from_value(response).context("invalid JSON-RPC response")?;
+        ensure!(decoded.id == id, "JSON-RPC response id mismatch");
+        Ok(decoded)
     }
 
     async fn send_json(&self, body: Value) -> anyhow::Result<Value> {
@@ -625,6 +793,8 @@ struct WireRpcTransaction {
     value: String,
     input: String,
     block_number: Option<String>,
+    #[serde(default)]
+    gas: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -640,6 +810,8 @@ struct RpcResponse {
 struct RpcError {
     code: i64,
     message: String,
+    #[serde(default)]
+    data: Option<Value>,
 }
 
 fn decode_rpc_result(response: RpcResponse) -> anyhow::Result<Value> {
@@ -682,7 +854,267 @@ fn decode_rpc_transaction(value: Value) -> anyhow::Result<RpcTransaction> {
             .block_number
             .map(|number| parse_quantity_u64("transaction.blockNumber", &number))
             .transpose()?,
+        gas_limit: transaction
+            .gas
+            .map(|gas| parse_quantity_u64("transaction.gas", &gas))
+            .transpose()?,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedRevert {
+    classification: String,
+    reason: Option<String>,
+    selector: Option<String>,
+}
+
+fn diagnostic_from_trace(value: &Value) -> anyhow::Result<TransactionRevertDiagnostic> {
+    let failure = deepest_trace_failure(value).unwrap_or(value);
+    let trace_reason = failure
+        .get("revertReason")
+        .and_then(Value::as_str)
+        .map(sanitize_rpc_message);
+    let trace_error = failure
+        .get("error")
+        .and_then(Value::as_str)
+        .map(sanitize_rpc_message);
+    let revert_data = ["output", "returnValue"]
+        .into_iter()
+        .find_map(|field| failure.get(field).and_then(Value::as_str))
+        .and_then(|encoded| parse_revert_hex(encoded).ok());
+    let decoded = revert_data
+        .as_deref()
+        .map(decode_revert_data)
+        .transpose()?
+        .unwrap_or_else(|| classification_from_message(trace_error.as_deref()));
+    Ok(TransactionRevertDiagnostic {
+        source: "debug_trace_transaction".to_owned(),
+        classification: decoded.classification,
+        reason: decoded.reason.or(trace_reason).or_else(|| {
+            trace_error.filter(|error| !error.eq_ignore_ascii_case("execution reverted"))
+        }),
+        selector: decoded.selector,
+        gas_limit: None,
+        gas_used_equals_limit: None,
+        trace_error: None,
+    })
+}
+
+fn diagnostic_from_rpc_error(error: &RpcError) -> anyhow::Result<TransactionRevertDiagnostic> {
+    let message = sanitize_rpc_message(&error.message);
+    let revert_data = error
+        .data
+        .as_ref()
+        .and_then(find_revert_hex)
+        .and_then(|encoded| parse_revert_hex(encoded).ok());
+    let decoded = revert_data
+        .as_deref()
+        .map(decode_revert_data)
+        .transpose()?
+        .unwrap_or_else(|| classification_from_message(Some(&message)));
+    Ok(TransactionRevertDiagnostic {
+        source: "historical_eth_call".to_owned(),
+        classification: decoded.classification,
+        reason: decoded
+            .reason
+            .or_else(|| execution_revert_message_reason(&message)),
+        selector: decoded.selector,
+        gas_limit: None,
+        gas_used_equals_limit: None,
+        trace_error: None,
+    })
+}
+
+fn deepest_trace_failure(value: &Value) -> Option<&Value> {
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .find(|value| trace_contains_failure(value))
+            .and_then(deepest_trace_failure);
+    }
+    if let Some(wrapped) = value.get("value")
+        && trace_contains_failure(wrapped)
+    {
+        return deepest_trace_failure(wrapped);
+    }
+    if let Some(calls) = value.get("calls").and_then(Value::as_array) {
+        for call in calls {
+            if trace_contains_failure(call)
+                && let Some(failure) = deepest_trace_failure(call)
+            {
+                return Some(failure);
+            }
+        }
+    }
+    (value.get("error").is_some()
+        || value.get("revertReason").is_some()
+        || value.get("failed").and_then(Value::as_bool) == Some(true))
+    .then_some(value)
+}
+
+fn trace_contains_failure(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|values| values.iter().any(trace_contains_failure))
+        || value.get("error").is_some()
+        || value.get("revertReason").is_some()
+        || value.get("failed").and_then(Value::as_bool) == Some(true)
+        || value.get("value").is_some_and(trace_contains_failure)
+        || value
+            .get("calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| calls.iter().any(trace_contains_failure))
+}
+
+fn find_revert_hex(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(encoded)
+            if encoded.starts_with("0x") && encoded.len() >= 2 && encoded.len() % 2 == 0 =>
+        {
+            Some(encoded)
+        }
+        Value::Array(values) => values.iter().find_map(find_revert_hex),
+        Value::Object(values) => ["data", "result", "output", "return", "originalError"]
+            .into_iter()
+            .filter_map(|key| values.get(key))
+            .find_map(find_revert_hex)
+            .or_else(|| values.values().find_map(find_revert_hex)),
+        _ => None,
+    }
+}
+
+fn parse_revert_hex(encoded: &str) -> anyhow::Result<Vec<u8>> {
+    parse_data_hex("revert data", encoded)
+}
+
+fn decode_revert_data(data: &[u8]) -> anyhow::Result<DecodedRevert> {
+    if data.is_empty() {
+        return Ok(DecodedRevert {
+            classification: "empty_revert_data".to_owned(),
+            reason: None,
+            selector: None,
+        });
+    }
+    if data.len() < 4 {
+        return Ok(DecodedRevert {
+            classification: "malformed_revert_data".to_owned(),
+            reason: None,
+            selector: None,
+        });
+    }
+    let selector = format!("0x{}", hex::encode(&data[..4]));
+    if data[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        let offset = abi_word_usize(data.get(4..36).context("Error(string) offset is absent")?)?;
+        let length_offset = 4_usize
+            .checked_add(offset)
+            .context("Error(string) offset overflow")?;
+        let content_offset = length_offset
+            .checked_add(32)
+            .context("Error(string) content offset overflow")?;
+        let length = abi_word_usize(
+            data.get(length_offset..content_offset)
+                .context("Error(string) length is absent")?,
+        )?;
+        let content_end = content_offset
+            .checked_add(length)
+            .context("Error(string) length overflow")?;
+        let content = data
+            .get(content_offset..content_end)
+            .context("Error(string) content is truncated")?;
+        let reason = String::from_utf8_lossy(content);
+        return Ok(DecodedRevert {
+            classification: "error_string".to_owned(),
+            reason: Some(sanitize_rpc_message(&reason)),
+            selector: Some(selector),
+        });
+    }
+    if data[..4] == [0x4e, 0x48, 0x7b, 0x71] {
+        let code = abi_word_u64(data.get(4..36).context("Panic(uint256) code is absent")?)?;
+        return Ok(DecodedRevert {
+            classification: "solidity_panic".to_owned(),
+            reason: Some(format!(
+                "Solidity panic 0x{code:x}: {}",
+                solidity_panic_reason(code)
+            )),
+            selector: Some(selector),
+        });
+    }
+    Ok(DecodedRevert {
+        classification: "custom_error".to_owned(),
+        reason: None,
+        selector: Some(selector),
+    })
+}
+
+fn abi_word_usize(word: &[u8]) -> anyhow::Result<usize> {
+    ensure!(word.len() == 32, "ABI word is not 32 bytes");
+    ensure!(
+        word[..24].iter().all(|byte| *byte == 0),
+        "ABI word exceeds u64"
+    );
+    let mut encoded = [0_u8; 8];
+    encoded.copy_from_slice(&word[24..]);
+    usize::try_from(u64::from_be_bytes(encoded)).context("ABI word exceeds usize")
+}
+
+fn abi_word_u64(word: &[u8]) -> anyhow::Result<u64> {
+    ensure!(word.len() == 32, "ABI word is not 32 bytes");
+    ensure!(
+        word[..24].iter().all(|byte| *byte == 0),
+        "ABI word exceeds u64"
+    );
+    let mut encoded = [0_u8; 8];
+    encoded.copy_from_slice(&word[24..]);
+    Ok(u64::from_be_bytes(encoded))
+}
+
+fn classification_from_message(message: Option<&str>) -> DecodedRevert {
+    let message = message.unwrap_or_default();
+    let lowercase = message.to_ascii_lowercase();
+    let classification = if lowercase.contains("out of gas") {
+        "out_of_gas"
+    } else if lowercase.contains("invalid opcode") {
+        "invalid_opcode"
+    } else if lowercase.contains("execution reverted") || lowercase.contains("revert") {
+        "execution_reverted"
+    } else {
+        "trace_error"
+    };
+    DecodedRevert {
+        classification: classification.to_owned(),
+        reason: None,
+        selector: None,
+    }
+}
+
+fn execution_revert_message_reason(message: &str) -> Option<String> {
+    let (_, reason) = message.split_once(':')?;
+    let reason = sanitize_rpc_message(reason.trim());
+    (!reason.is_empty()).then_some(reason)
+}
+
+const fn solidity_panic_reason(code: u64) -> &'static str {
+    match code {
+        0x01 => "assertion failed",
+        0x11 => "arithmetic underflow or overflow",
+        0x12 => "division or modulo by zero",
+        0x21 => "invalid enum conversion",
+        0x22 => "invalid storage byte array",
+        0x31 => "pop on an empty array",
+        0x32 => "array or bytes index out of bounds",
+        0x41 => "memory allocation overflow",
+        0x51 => "call to an uninitialized internal function",
+        _ => "unknown panic code",
+    }
+}
+
+fn join_diagnostic_errors(trace_error: Option<String>, replay_error: String) -> String {
+    match trace_error {
+        Some(trace_error) => {
+            sanitize_rpc_message(&format!("trace: {trace_error}; replay: {replay_error}"))
+        }
+        None => replay_error,
+    }
 }
 
 fn parse_data_hex(name: &str, value: &str) -> anyhow::Result<Vec<u8>> {
@@ -787,7 +1219,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        JsonRpcClient, decode_rpc_transaction, parse_data_hex, parse_quantity_u64,
+        JsonRpcClient, RpcError, decode_revert_data, decode_rpc_transaction,
+        diagnostic_from_rpc_error, diagnostic_from_trace, parse_data_hex, parse_quantity_u64,
         parse_quantity_u256, sanitize_rpc_message,
     };
 
@@ -833,7 +1266,8 @@ mod tests {
             "to": format!("{:#x}", Address::repeat_byte(0x33)),
             "value": "0x100",
             "input": "0x00ff",
-            "blockNumber": null
+            "blockNumber": null,
+            "gas": "0x3d090"
         }))
         .unwrap();
 
@@ -845,6 +1279,7 @@ mod tests {
         assert_eq!(transaction.value, U256::from(256));
         assert_eq!(transaction.input, [0, 255]);
         assert_eq!(transaction.block_number, None);
+        assert_eq!(transaction.gas_limit, Some(250_000));
     }
 
     #[test]
@@ -856,5 +1291,77 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn decodes_standard_error_panic_and_custom_revert_data() {
+        let mut error = vec![0x08, 0xc3, 0x79, 0xa0];
+        error.extend_from_slice(&abi_word(32));
+        error.extend_from_slice(&abi_word(3));
+        error.extend_from_slice(b"STF");
+        error.extend_from_slice(&[0_u8; 29]);
+        let decoded = decode_revert_data(&error).unwrap();
+        assert_eq!(decoded.classification, "error_string");
+        assert_eq!(decoded.reason.as_deref(), Some("STF"));
+        assert_eq!(decoded.selector.as_deref(), Some("0x08c379a0"));
+
+        let mut panic = vec![0x4e, 0x48, 0x7b, 0x71];
+        panic.extend_from_slice(&abi_word(0x11));
+        let decoded = decode_revert_data(&panic).unwrap();
+        assert_eq!(decoded.classification, "solidity_panic");
+        assert!(
+            decoded
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("arithmetic underflow or overflow")
+        );
+
+        let decoded = decode_revert_data(&[0xde, 0xad, 0xbe, 0xef, 0, 1]).unwrap();
+        assert_eq!(decoded.classification, "custom_error");
+        assert_eq!(decoded.selector.as_deref(), Some("0xdeadbeef"));
+    }
+
+    #[test]
+    fn extracts_nested_trace_and_rpc_error_reasons() {
+        let trace = diagnostic_from_trace(&json!([{
+            "name": "transaction trace",
+            "value": {
+                "type": "CALL",
+                "error": "execution reverted",
+                "calls": [
+                    {
+                        "type": "STATICCALL",
+                        "output": "0xdeadbeef"
+                    },
+                    {
+                        "type": "CALL",
+                        "error": "execution reverted",
+                        "revertReason": "Too little received",
+                        "output": "0x"
+                    }
+                ]
+            }
+        }]))
+        .unwrap();
+        assert_eq!(trace.source, "debug_trace_transaction");
+        assert_eq!(trace.classification, "empty_revert_data");
+        assert_eq!(trace.reason.as_deref(), Some("Too little received"));
+
+        let error = RpcError {
+            code: 3,
+            message: "execution reverted: STF".to_owned(),
+            data: Some(json!({"originalError": {"data": "0x"}})),
+        };
+        let replay = diagnostic_from_rpc_error(&error).unwrap();
+        assert_eq!(replay.source, "historical_eth_call");
+        assert_eq!(replay.classification, "empty_revert_data");
+        assert_eq!(replay.reason.as_deref(), Some("STF"));
+    }
+
+    fn abi_word(value: u64) -> [u8; 32] {
+        let mut word = [0_u8; 32];
+        word[24..].copy_from_slice(&value.to_be_bytes());
+        word
     }
 }

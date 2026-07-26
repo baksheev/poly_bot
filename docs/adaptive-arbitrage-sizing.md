@@ -114,12 +114,13 @@ There is no Rails `3x` multiplier and no speculative recovery reservation.
 
 Native gas funding is an operator-maintained invariant. Native balance and RPC
 gas price are absent from balance synchronization, admission, and inventory
-reservations. The executor obtains the current RPC gas price only when it
-constructs the EIP-1559 transaction. Receipt accounting includes both the L2
-execution charge (`gasUsed * effectiveGasPrice`) and World Chain's `l1Fee`;
-neither is a sizing or admission gate. If the native-token conversion price is
-unavailable, token-A gas accounting is recorded as unavailable/zero without
-blocking the trade.
+reservations. The dedicated execution owner refreshes RPC gas price every
+second and transaction construction reads its at-most-two-second cached RPC or
+Rails-fallback sample. Receipt accounting includes both the L2 execution charge
+(`gasUsed * effectiveGasPrice`) and World Chain's `l1Fee`; neither is a sizing
+or admission gate. If the native-token conversion price is unavailable,
+token-A gas accounting is recorded as unavailable/zero without blocking the
+trade.
 
 ## Execution and recovery
 

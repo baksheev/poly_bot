@@ -747,6 +747,7 @@ mod tests {
             value: call.value(),
             input: call.calldata().to_vec(),
             block_number: None,
+            gas_limit: None,
         }
     }
 

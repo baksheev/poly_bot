@@ -314,8 +314,10 @@ candidate's exact reservation remain separate authorization controls.
    Ambiguous broadcast or receipt outcomes are `UNKNOWN`, never a known failure.
 4. Actual execution amounts come only from the canonical receipt's token
    transfers. The receipt status decides success or revert.
-5. Fresh RPC gas price plus the configured priority fee is used at signing.
-   There is no admission-time DEX fee cap.
+5. The dedicated execution owner refreshes RPC gas price every second. Signing
+   uses the at-most-two-second cached RPC or Rails-fallback sample plus the
+   configured priority fee. There is no admission-time DEX fee cap and no gas
+   RPC in the live execution hot path.
 6. The receipt's positional pool Swap is sufficient to apply this process's
    self-impact immediately to the local mirror. Already-queued DEX WebSocket
    events are drained without waiting first, then the affected prepared curves
@@ -481,6 +483,9 @@ Every plan must be traceable by `plan_id` through:
 - pending supersession or preflight rejection;
 - parent and child execution stages;
 - DEX/CEX/recovery results;
+- two-phase DEX revert evidence: immediate receipt facts and an asynchronous
+  trace/replay diagnosis joined by `plan_id`, `operation_id`, and transaction
+  hash;
 - inventory state;
 - DEX and balance settlement;
 - terminal comparable PnL.
@@ -506,10 +511,10 @@ The current frozen baseline is
 
 ## Priority architectural debt
 
-1. **Receipt self-impact:** apply the receipt Swap directly, then reconcile
-   canonical WebSocket ordering/reorgs. The 24-hour baseline deferred 254 of
-   265 filled-plan catch-ups and rejected 2,820 candidate admission attempts
-   during settlement.
+1. **DEX revert cohort:** accumulate decoded trace/replay classifications by
+   protocol, pool, direction, amount bounds, and revision before changing
+   slippage or calldata policy. Missing diagnostics are counted explicitly and
+   never treated as a different execution outcome.
 2. **Execution cohort quality:** explain why only 95 of 317 executed plans had
    positive expected primary economics although 4,360 of 6,872 admissions did.
    Preserve latest-only semantics; improve selection and stability evidence.
