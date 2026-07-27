@@ -5,7 +5,7 @@ use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
         AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
-        WORLD_CHAIN_USDC, validate_quote,
+        WORLD_CHAIN_USDC, is_retryable_quote_error, validate_quote,
     },
     arbitrage::{
         EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator, TradeStage,
@@ -67,6 +67,8 @@ const ARBITRAGE_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_WALLET_JOURNAL_PATH";
 const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
 const BINANCE_CLOCK_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY: usize = 32;
+const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 enum RebalanceExecutorEvent {
     Recovery(Result<RebalanceExecutionOperation, String>),
@@ -1245,52 +1247,42 @@ async fn run(
         binance_clock_sync_sender,
     ));
     let mut binance_clock_sync_running = true;
-    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) = if let Some(mut executor) =
-        full_rebalance_executor.take()
-    {
-        let recover_on_start = rebalance_recovery_operation.is_some();
-        let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
-        let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            if recover_on_start {
-                let result = executor
-                    .recover_active()
-                    .await
-                    .and_then(|operation| {
-                        operation.context("active rebalance operation disappeared before recovery")
-                    })
-                    .map_err(|error| format!("{error:#}"));
-                if result_sender
-                    .send(RebalanceExecutorEvent::Recovery(result))
-                    .await
-                    .is_err()
-                {
-                    return Ok::<(), anyhow::Error>(());
+    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) =
+        if let Some(mut executor) = full_rebalance_executor.take() {
+            let recover_on_start = rebalance_recovery_operation.is_some();
+            let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
+            let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(async move {
+                if recover_on_start {
+                    let result = recover_rebalance_with_quote_retries(&mut executor).await;
+                    if result_sender
+                        .send(RebalanceExecutorEvent::Recovery(result))
+                        .await
+                        .is_err()
+                    {
+                        return Ok::<(), anyhow::Error>(());
+                    }
                 }
-            }
-            while let Some(request) = request_receiver.recv().await {
-                let result = executor
-                    .execute(request)
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                if result_sender
-                    .send(RebalanceExecutorEvent::Execution(result))
-                    .await
-                    .is_err()
-                {
-                    return Ok::<(), anyhow::Error>(());
+                while let Some(request) = request_receiver.recv().await {
+                    let result = execute_rebalance_with_quote_retries(&mut executor, request).await;
+                    if result_sender
+                        .send(RebalanceExecutorEvent::Execution(result))
+                        .await
+                        .is_err()
+                    {
+                        return Ok::<(), anyhow::Error>(());
+                    }
                 }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        (Some(request_sender), result_receiver, Some(task))
-    } else {
-        let (_request_sender, _request_receiver) =
-            tokio::sync::mpsc::channel::<RebalanceExecutionRequest>(1);
-        let (_result_sender, result_receiver) =
-            tokio::sync::mpsc::channel::<RebalanceExecutorEvent>(1);
-        (None, result_receiver, None)
-    };
+                Ok::<(), anyhow::Error>(())
+            });
+            (Some(request_sender), result_receiver, Some(task))
+        } else {
+            let (_request_sender, _request_receiver) =
+                tokio::sync::mpsc::channel::<RebalanceExecutionRequest>(1);
+            let (_result_sender, result_receiver) =
+                tokio::sync::mpsc::channel::<RebalanceExecutorEvent>(1);
+            (None, result_receiver, None)
+        };
     if let Some(operation) = rebalance_recovery_operation.as_ref() {
         engine.on_rebalance_recovery_started(operation)?;
     }
@@ -1570,6 +1562,72 @@ async fn run_binance_clock_sync(
             return;
         }
     }
+}
+
+async fn execute_rebalance_with_quote_retries(
+    executor: &mut RebalanceExecutor,
+    request: RebalanceExecutionRequest,
+) -> Result<RebalanceExecutionOperation, String> {
+    let result = executor.execute(request).await;
+    complete_rebalance_with_quote_retries(executor, result).await
+}
+
+async fn recover_rebalance_with_quote_retries(
+    executor: &mut RebalanceExecutor,
+) -> Result<RebalanceExecutionOperation, String> {
+    let result = executor.recover_active().await.and_then(|operation| {
+        operation.context("active rebalance operation disappeared before recovery")
+    });
+    complete_rebalance_with_quote_retries(executor, result).await
+}
+
+async fn complete_rebalance_with_quote_retries(
+    executor: &mut RebalanceExecutor,
+    mut result: anyhow::Result<RebalanceExecutionOperation>,
+) -> Result<RebalanceExecutionOperation, String> {
+    let mut retry_attempt = 0_u32;
+    loop {
+        match result {
+            Ok(operation) => return Ok(operation),
+            Err(error) if is_retryable_quote_error(&error) => {
+                retry_attempt = retry_attempt.saturating_add(1);
+                let operation = match executor.active_operation() {
+                    Ok(Some(operation)) => operation,
+                    Ok(None) => {
+                        return Err(format!(
+                            "{error:#}; retryable Across quote failure left no active rebalance operation"
+                        ));
+                    }
+                    Err(journal_error) => {
+                        return Err(format!(
+                            "{error:#}; failed to inspect active rebalance operation: {journal_error:#}"
+                        ));
+                    }
+                };
+                let delay = rebalance_quote_retry_delay(retry_attempt);
+                tracing::warn!(
+                    operation_id = %operation.intent.operation_id,
+                    retry_attempt,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %format!("{error:#}"),
+                    "rebalance Across quote retry scheduled"
+                );
+                tokio::time::sleep(delay).await;
+                result = executor.recover_active().await.and_then(|operation| {
+                    operation
+                        .context("active rebalance operation disappeared before Across quote retry")
+                });
+            }
+            Err(error) => return Err(format!("{error:#}")),
+        }
+    }
+}
+
+fn rebalance_quote_retry_delay(retry_attempt: u32) -> Duration {
+    let exponent = retry_attempt.saturating_sub(1).min(4);
+    REBALANCE_QUOTE_RETRY_INITIAL_DELAY
+        .saturating_mul(1_u32 << exponent)
+        .min(REBALANCE_QUOTE_RETRY_MAX_DELAY)
 }
 
 fn dispatch_rebalance_execution(
@@ -1878,4 +1936,21 @@ fn init_tracing() {
         .json()
         .with_current_span(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::rebalance_quote_retry_delay;
+
+    #[test]
+    fn rebalance_quote_retry_backoff_is_bounded() {
+        assert_eq!(rebalance_quote_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(rebalance_quote_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(rebalance_quote_retry_delay(3), Duration::from_secs(20));
+        assert_eq!(rebalance_quote_retry_delay(4), Duration::from_secs(40));
+        assert_eq!(rebalance_quote_retry_delay(5), Duration::from_secs(60));
+        assert_eq!(rebalance_quote_retry_delay(100), Duration::from_secs(60));
+    }
 }

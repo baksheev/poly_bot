@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Duration};
+use std::{fmt, str::FromStr, time::Duration};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, ensure};
@@ -23,6 +23,91 @@ const MAX_QUOTE_EXPIRY_SECONDS: u64 = 7_200;
 const ACROSS_DEPOSIT_V3_SELECTOR: [u8; 4] = [0xad, 0x54, 0x25, 0xc6];
 const CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR: [u8; 4] = [0x8e, 0x02, 0x50, 0xee];
 const MAX_CCTP_TRAILING_INTEGRATOR_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcrossOperation {
+    Quote,
+    DepositStatus,
+}
+
+impl AcrossOperation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Quote => "quote",
+            Self::DepositStatus => "deposit status",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcrossTransportPhase {
+    Request,
+    Response,
+}
+
+#[derive(Debug)]
+struct AcrossTransportError {
+    operation: AcrossOperation,
+    phase: AcrossTransportPhase,
+    message: String,
+}
+
+impl fmt::Display for AcrossTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.phase {
+            AcrossTransportPhase::Request => write!(
+                formatter,
+                "Across {} request failed: {}",
+                self.operation.label(),
+                self.message
+            ),
+            AcrossTransportPhase::Response => write!(
+                formatter,
+                "failed to read Across {} response: {}",
+                self.operation.label(),
+                self.message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AcrossTransportError {}
+
+#[derive(Debug)]
+struct AcrossHttpStatusError {
+    operation: AcrossOperation,
+    status: StatusCode,
+}
+
+impl fmt::Display for AcrossHttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Across {} failed closed with HTTP {}",
+            self.operation.label(),
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for AcrossHttpStatusError {}
+
+pub fn is_retryable_quote_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<AcrossTransportError>()
+            .is_some_and(|error| error.operation == AcrossOperation::Quote)
+            || cause
+                .downcast_ref::<AcrossHttpStatusError>()
+                .is_some_and(|error| {
+                    error.operation == AcrossOperation::Quote
+                        && (error.status == StatusCode::REQUEST_TIMEOUT
+                            || error.status == StatusCode::TOO_EARLY
+                            || error.status == StatusCode::TOO_MANY_REQUESTS
+                            || error.status.is_server_error())
+                })
+    })
+}
 
 pub struct AcrossClient {
     http: Client,
@@ -61,10 +146,12 @@ impl AcrossClient {
             ])
             .send()
             .await
-            .map_err(|error| {
-                anyhow::anyhow!("Across quote request failed: {}", error.without_url())
+            .map_err(|error| AcrossTransportError {
+                operation: AcrossOperation::Quote,
+                phase: AcrossTransportPhase::Request,
+                message: error.without_url().to_string(),
             })?;
-        decode_response(response, "quote").await
+        decode_response(response, AcrossOperation::Quote).await
     }
 
     pub async fn deposit_status(
@@ -78,40 +165,44 @@ impl AcrossClient {
             .query(&[("depositTxnRef", deposit_txn_ref)])
             .send()
             .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "Across deposit status request failed: {}",
-                    error.without_url()
-                )
+            .map_err(|error| AcrossTransportError {
+                operation: AcrossOperation::DepositStatus,
+                phase: AcrossTransportPhase::Request,
+                message: error.without_url().to_string(),
             })?;
-        decode_response(response, "deposit status").await
+        decode_response(response, AcrossOperation::DepositStatus).await
     }
 }
 
 async fn decode_response<T: DeserializeOwned>(
     response: Response,
-    operation: &str,
+    operation: AcrossOperation,
 ) -> anyhow::Result<T> {
     let status = response.status();
     let content_length = response.content_length().unwrap_or(0);
     ensure!(
         content_length <= MAX_RESPONSE_BYTES as u64,
-        "Across {operation} response exceeds the size limit"
+        "Across {} response exceeds the size limit",
+        operation.label()
     );
     let body = response
         .bytes()
         .await
-        .with_context(|| format!("failed to read Across {operation} response"))?;
+        .map_err(|error| AcrossTransportError {
+            operation,
+            phase: AcrossTransportPhase::Response,
+            message: error.without_url().to_string(),
+        })?;
     ensure!(
         body.len() <= MAX_RESPONSE_BYTES,
-        "Across {operation} response exceeds the size limit"
+        "Across {} response exceeds the size limit",
+        operation.label()
     );
-    ensure!(
-        status == StatusCode::OK,
-        "Across {operation} failed closed with HTTP {status}"
-    );
+    if status != StatusCode::OK {
+        return Err(AcrossHttpStatusError { operation, status }.into());
+    }
     serde_json::from_slice(&body)
-        .with_context(|| format!("invalid Across {operation} response JSON"))
+        .with_context(|| format!("invalid Across {} response JSON", operation.label()))
 }
 
 #[derive(Clone, Debug)]
@@ -794,15 +885,17 @@ fn unix_timestamp_seconds() -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, U256, address};
+    use reqwest::StatusCode;
     use serde::Deserialize;
     use serde_json::json;
 
     use super::{
         AcrossAllowanceCheck, AcrossBalanceCheck, AcrossChecks, AcrossDepositStatus, AcrossFee,
-        AcrossFees, AcrossQuote, AcrossQuoteRequest, AcrossToken, AcrossTransaction,
+        AcrossFees, AcrossHttpStatusError, AcrossOperation, AcrossQuote, AcrossQuoteRequest,
+        AcrossToken, AcrossTransaction, AcrossTransportError, AcrossTransportPhase,
         OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WLD, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
-        WORLD_CHAIN_WLD, decode_calldata, transaction_integer, u256_word_is_at_least_u128,
-        validate_deposit_status, validate_quote,
+        WORLD_CHAIN_WLD, decode_calldata, is_retryable_quote_error, transaction_integer,
+        u256_word_is_at_least_u128, validate_deposit_status, validate_quote,
     };
 
     const DEPOSITOR: Address = address!("0x1111111111111111111111111111111111111111");
@@ -879,6 +972,50 @@ mod tests {
             address: format!("{address:#x}"),
             chain_id,
         }
+    }
+
+    #[test]
+    fn retries_only_transient_quote_failures() {
+        let transport = anyhow::Error::new(AcrossTransportError {
+            operation: AcrossOperation::Quote,
+            phase: AcrossTransportPhase::Request,
+            message: "error sending request".to_owned(),
+        });
+        assert!(is_retryable_quote_error(&transport));
+        assert_eq!(
+            transport.to_string(),
+            "Across quote request failed: error sending request"
+        );
+
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let error = anyhow::Error::new(AcrossHttpStatusError {
+                operation: AcrossOperation::Quote,
+                status,
+            });
+            assert!(is_retryable_quote_error(&error), "{status}");
+        }
+
+        let invalid_request = anyhow::Error::new(AcrossHttpStatusError {
+            operation: AcrossOperation::Quote,
+            status: StatusCode::BAD_REQUEST,
+        });
+        assert!(!is_retryable_quote_error(&invalid_request));
+
+        let deposit_status = anyhow::Error::new(AcrossTransportError {
+            operation: AcrossOperation::DepositStatus,
+            phase: AcrossTransportPhase::Response,
+            message: "connection reset".to_owned(),
+        });
+        assert!(!is_retryable_quote_error(&deposit_status));
+
+        let validation = anyhow::anyhow!("Across quote input amount mismatch");
+        assert!(!is_retryable_quote_error(&validation));
     }
 
     fn approval_calldata(spender: Address) -> String {

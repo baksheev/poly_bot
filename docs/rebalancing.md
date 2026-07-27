@@ -351,6 +351,16 @@ The engine emits bounded asynchronous ClickHouse records for:
 The durable journal, Binance history, and chain receipts authorize recovery.
 ClickHouse is used to audit what the in-memory owner observed and decided.
 
+The dedicated executor retries a journaled operation when an Across quote fails
+before validated calldata is available because of a transport failure, HTTP
+408, HTTP 429, or HTTP 5xx. It re-enters the normal durable recovery path after
+5, 10, 20, 40, and then at most 60 seconds between attempts. The retry keeps
+the same operation and inventory reservation; it never creates a second
+transfer or bypasses quote/calldata validation. Invalid requests, malformed or
+unsafe quotes, journal inconsistencies, and other unclassified failures remain
+fail-closed. A prolonged quote outage eventually makes the normal in-flight
+timeout heartbeat unhealthy while the executor continues retrying.
+
 Production also emits a structured `rebalance health heartbeat` to Cloud
 Logging once per minute. This is deliberately outside the market-data and
 decision hot path. The heartbeat reports whether rebalance is blocked, how long
