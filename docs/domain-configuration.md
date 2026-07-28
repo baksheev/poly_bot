@@ -28,9 +28,11 @@ The independent
 Arbitrum Uniswap V3 0.01% and V4 2.88% pools. Its dedicated `collect-prices`
 runtime has execution and rebalancing disabled, does not receive a signer or
 Binance trading credentials, and emits book, DEX evaluation, and public
-wallet-balance telemetry. Binance balance telemetry is optional and requires a
-separately provisioned read-only API key whose trading, withdrawal, and
-transfer permissions are all disabled.
+wallet-balance telemetry. Each accepted Binance update also emits one
+`dex_pool_quote` per direction for every hydrated V3/V4 pool, so a provider is
+retained even when it is not the best arbitrage route. Binance balance
+telemetry is optional and requires a separately provisioned read-only API key
+whose trading, withdrawal, and transfer permissions are all disabled.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven

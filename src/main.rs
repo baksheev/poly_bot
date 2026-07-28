@@ -31,7 +31,7 @@ use arb_bot::{
     dex::{
         events::build_log_filters,
         execution::{AllowanceRequirement, DexExecutionService, DexExecutor, UniswapProtocol},
-        hydration::DexHydrator,
+        hydration::{DexHydrator, PoolIdentity},
         mirror::{DexMirror, LogApplyResult},
         revert_diagnostics::dex_revert_diagnostic_channel,
         validation::{execute_recovery_sell, execute_round_trip},
@@ -48,13 +48,15 @@ use arb_bot::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
     },
-    opportunity::{OpportunityEngine, PreparedPoolBuildRequest},
+    opportunity::{ArbitrageDirection, OpportunityEngine, PreparedPoolBuildRequest},
     rebalance::{
         RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
         RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
-    telemetry::{ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryWriter},
+    telemetry::{
+        ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryHandle, TelemetryWriter,
+    },
     wallet::{
         EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV,
         hydrate_chain_wallet,
@@ -881,6 +883,7 @@ async fn collect_prices(
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
     let writer_task = tokio::spawn(writer.run());
     let balance_telemetry = telemetry.clone();
+    let pool_quote_telemetry = telemetry.clone();
     let (hot_telemetry, hot_telemetry_task) =
         hot_telemetry::channel(&config, opportunities.pairs(), &mirror, telemetry)?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry_task.run());
@@ -995,7 +998,12 @@ async fn collect_prices(
                 {
                     emit_price_collector_evaluation(
                         &mut opportunities,
-                        &hot_telemetry,
+                        CollectorPriceTelemetry {
+                            hot: &hot_telemetry,
+                            pool_quote: &pool_quote_telemetry,
+                            engine_id: &config.engine_id,
+                        },
+                        &mirror,
                         quote,
                         mirror.latest_head().number,
                         "dex",
@@ -1049,7 +1057,12 @@ async fn collect_prices(
                         if accepted {
                             emit_price_collector_evaluation(
                                 &mut opportunities,
-                                &hot_telemetry,
+                                CollectorPriceTelemetry {
+                                    hot: &hot_telemetry,
+                                    pool_quote: &pool_quote_telemetry,
+                                    engine_id: &config.engine_id,
+                                },
+                                &mirror,
                                 &quote,
                                 mirror.latest_head().number,
                                 "binance",
@@ -1092,6 +1105,7 @@ async fn collect_prices(
         task.abort();
         let _ = task.await;
     }
+    drop(pool_quote_telemetry);
     drop(hot_telemetry);
     hot_telemetry_task.await??;
     writer_task.await??;
@@ -1139,6 +1153,13 @@ struct CollectorBalanceContext {
     engine_id: String,
     pair_id: String,
     interval: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct CollectorPriceTelemetry<'a> {
+    hot: &'a arb_bot::hot_telemetry::HotTelemetryHandle,
+    pool_quote: &'a TelemetryHandle,
+    engine_id: &'a str,
 }
 
 async fn run_collector_wallet_balance_sync(
@@ -1253,14 +1274,71 @@ fn process_price_collector_dex_event(
 
 fn emit_price_collector_evaluation(
     opportunities: &mut OpportunityEngine,
-    telemetry: &arb_bot::hot_telemetry::HotTelemetryHandle,
+    telemetry: CollectorPriceTelemetry<'_>,
+    mirror: &DexMirror,
     quote: &TopOfBook,
     chain_block: u64,
     trigger: &'static str,
 ) -> anyhow::Result<()> {
     let started_at = std::time::Instant::now();
     if let Some(evaluation) = opportunities.evaluate(quote)? {
-        telemetry.emit_evaluation(
+        let pair = opportunities.pair(evaluation.pair_index)?;
+        let pair_id = pair.pair_id.clone();
+        let chain_id = pair.chain_id;
+        let symbol = pair.symbol.clone();
+        let pool_indices = pair.pool_indices().to_vec();
+        for pool_index in pool_indices {
+            let pool = mirror.pool(pool_index)?;
+            let (provider, pool_identity, fee_pips) = match pool.identity {
+                PoolIdentity::V3 { address, fee_pips } => {
+                    ("uniswap_v3", address.to_string(), fee_pips)
+                }
+                PoolIdentity::V4 { pool_id, fee_pips } => {
+                    ("uniswap_v4", pool_id.to_string(), fee_pips)
+                }
+            };
+            for direction in [
+                ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+            ] {
+                let trade = opportunities.evaluate_exact_candidate(
+                    evaluation.pair_index,
+                    quote,
+                    direction,
+                    pool_index,
+                    evaluation.baseline_token_b_amount,
+                )?;
+                telemetry.pool_quote.emit(
+                    "dex_pool_quote",
+                    serde_json::json!({
+                        "engine_id": telemetry.engine_id,
+                        "pair_id": &pair_id,
+                        "chain_id": chain_id,
+                        "chain_block": chain_block,
+                        "symbol": &symbol,
+                        "update_id": quote.update_id,
+                        "provider": provider,
+                        "pool_index": pool_index,
+                        "pool_identity": pool_identity,
+                        "pool_fee_pips": fee_pips,
+                        "pool_tick_spacing": pool.pool.tick_spacing,
+                        "pool_tick": pool.pool.tick,
+                        "pool_sqrt_price_x96": pool.pool.sqrt_price_x96.to_string(),
+                        "pool_liquidity": pool.pool.liquidity.to_string(),
+                        "direction": direction.as_str(),
+                        "quote_mode": match direction {
+                            ArbitrageDirection::BuyTokenBOnDexSellOnCex => "exact_output_token_b",
+                            ArbitrageDirection::BuyTokenBOnCexSellOnDex => "exact_input_token_b",
+                        },
+                        "token_b_base_units": evaluation.baseline_token_b_amount.to_string(),
+                        "dex_token_a_base_units": trade.map(|trade| trade.dex_token_a_amount.to_string()),
+                        "available": trade.is_some(),
+                        "evaluation_trigger": trigger,
+                    }),
+                );
+            }
+        }
+        telemetry.hot.emit_evaluation(
             quote,
             evaluation,
             chain_block,
