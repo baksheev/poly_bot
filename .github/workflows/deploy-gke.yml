@@ -76,7 +76,7 @@ jobs:
           test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_update_delta' "${domain_config}")" = 8
           test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.top_of_book_max_trade_notional_token_a_base_units' "${domain_config}")" = 40000000
           test "$(jq -r '.pairs[0].strategy | has("balance_safety_multiplier")' "${domain_config}")" = false
-          esp_domain_config=config/strategies/usdc-esp-arbitrum.v1.json
+          esp_domain_config=config/strategies/usdc-esp-arbitrum.v2.json
           test "$(jq -r '.live_trading_enabled' "${esp_domain_config}")" = false
           test "$(jq -r '.source.rails_pair_candidate_id' "${esp_domain_config}")" = 3144
           test "$(jq -r '.pairs | length' "${esp_domain_config}")" = 1
@@ -89,13 +89,13 @@ jobs:
           test "$(jq -r '.pairs[0].chain | has("uniswap_v3_router_address")' "${esp_domain_config}")" = false
           test "$(jq -r '.pairs[0].chain | has("uniswap_v4_router_address")' "${esp_domain_config}")" = false
           test "$(jq -c '.pairs[0].dex.allowed_providers' "${esp_domain_config}")" \
-            = '["uniswap_v3","uniswap_v4"]'
+            = '["uniswap_v3"]'
           test "$(jq -c '.pairs[0].dex.uniswap_v3.fee_tiers' "${esp_domain_config}")" \
             = '[100]'
-          test "$(jq -r '.pairs[0].dex.uniswap_v4.pools[0].fee_tier' "${esp_domain_config}")" \
-            = 28800
-          test "$(jq -r '.pairs[0].dex.uniswap_v4.pools[0].tick_spacing' "${esp_domain_config}")" \
-            = 576
+          test "$(jq -r '.pairs[0].dex | has("uniswap_v4")' "${esp_domain_config}")" = false
+          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_quoter_address")' "${esp_domain_config}")" = false
+          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_pool_manager_address")' "${esp_domain_config}")" = false
+          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_state_view_address")' "${esp_domain_config}")" = false
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -319,7 +319,7 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${esp_runtime_config}")" \
-            = config/strategies/usdc-esp-arbitrum.v1.json
+            = config/strategies/usdc-esp-arbitrum.v2.json
           test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${esp_runtime_config}")" \
             = disabled
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${esp_runtime_config}")" \

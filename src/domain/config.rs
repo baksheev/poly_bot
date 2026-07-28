@@ -983,7 +983,7 @@ mod tests {
         include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
     const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v12.json");
     const ESP_SHADOW_CONFIG: &str =
-        include_str!("../../config/strategies/usdc-esp-arbitrum.v1.json");
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v2.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1027,15 +1027,13 @@ mod tests {
         assert!(!pair.rebalance.enabled);
         assert!(!loaded.snapshot().live_trading_enabled);
         assert!(pair.chain.uniswap_v3_router_address.is_none());
+        assert!(pair.chain.uniswap_v4_quoter_address.is_none());
         assert!(pair.chain.uniswap_v4_router_address.is_none());
-        assert_eq!(
-            pair.dex.allowed_providers,
-            [DexProvider::UniswapV3, DexProvider::UniswapV4]
-        );
+        assert!(pair.chain.uniswap_v4_pool_manager_address.is_none());
+        assert!(pair.chain.uniswap_v4_state_view_address.is_none());
+        assert_eq!(pair.dex.allowed_providers, [DexProvider::UniswapV3]);
         assert_eq!(pair.dex.uniswap_v3.as_ref().unwrap().fee_tiers, [100]);
-        let v4 = &pair.dex.uniswap_v4.as_ref().unwrap().pools[0];
-        assert_eq!(v4.fee_tier, 28_800);
-        assert_eq!(v4.tick_spacing, 576);
+        assert!(pair.dex.uniswap_v4.is_none());
     }
 
     #[test]

@@ -23,14 +23,16 @@ independently required. Earlier artifacts remain provenance for prior shadow
 stages.
 
 The independent
-`config/strategies/usdc-esp-arbitrum.v1.json` artifact captures Rails
+`config/strategies/usdc-esp-arbitrum.v2.json` artifact captures Rails
 `PairCandidate id=3144` and enables public Spot `ESPUSDC` plus the hydrated
-Arbitrum Uniswap V3 0.01% and V4 2.88% pools. Its dedicated `collect-prices`
+Arbitrum Uniswap V3 0.01% pool. Production observation of v1 showed that the
+V4 2.88% pool stayed on one tick, could not quote ESP exact output, and
+returned a one-way executable quote far below V3 and Binance, so v2 excludes
+V4. Its dedicated `collect-prices`
 runtime has execution and rebalancing disabled, does not receive a signer or
 Binance trading credentials, and emits book, DEX evaluation, and public
 wallet-balance telemetry. Each accepted Binance update also emits one
-`dex_pool_quote` per direction for every hydrated V3/V4 pool, so a provider is
-retained even when it is not the best arbitrage route. Binance balance
+`dex_pool_quote` per direction for the hydrated V3 pool. Binance balance
 telemetry is optional and requires a separately provisioned read-only API key
 whose trading, withdrawal, and transfer permissions are all disabled.
 

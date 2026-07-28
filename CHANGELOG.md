@@ -20,6 +20,10 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Remove the unusable ESP/USDC Arbitrum V4 2.88% pool from the production
+  price shadow after it remained on one tick, could not quote one direction,
+  and returned a one-way executable quote far below V3 and Binance. The new
+  immutable v2 artifact collects only the viable V3 0.01% pool.
 - Make the versioned domain artifact the single
   `strategy.max_transport_silence_ms` source for strategy-price runtime
   readiness, admission, and preflight. Rename the independent gas-conversion

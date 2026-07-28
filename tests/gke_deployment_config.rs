@@ -62,7 +62,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
 fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(
         RELEASE_PLATFORM
-            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-esp-arbitrum.v1.json")
+            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-esp-arbitrum.v2.json")
     );
     assert!(RELEASE_PLATFORM.contains("name: arb-bot-esp-market-data"));
     assert!(RELEASE_PLATFORM.contains("RUNTIME_READY_FILE: /tmp/arb-bot-esp-ready"));
@@ -71,7 +71,7 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOYMENT.contains("secretProviderClass: arb-bot-esp-market-data"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
-    assert!(DEPLOY_WORKFLOW.contains("usdc-esp-arbitrum.v1.json"));
+    assert!(DEPLOY_WORKFLOW.contains("usdc-esp-arbitrum.v2.json"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
 }

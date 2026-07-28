@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "snapshot_id": "arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices",
+  "source": {
+    "repository": "baksheev/arb_bot",
+    "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
+    "rails_pair_candidate_id": 3144,
+    "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
+    "captured_at_utc": "2026-07-28T09:48:35Z",
+    "evidence": [
+      "production PostgreSQL read-only PairCandidate export for ESPUSDC",
+      "Binance public Spot exchangeInfo for ESPUSDC",
+      "Uniswap official Arbitrum V3 deployment registry",
+      "production shadow observation: the V4 2.88% pool stayed on one tick, could not quote ESP exact output, and returned a one-way executable quote far below the V3 and Binance market",
+      "explicit operator decision: retain only the viable V3 0.01% pool",
+      "explicit Rust shadow decision: public market data only, with execution and rebalancing disabled"
+    ]
+  },
+  "live_trading_enabled": false,
+  "pairs": [
+    {
+      "id": "arbitrum-usdc-esp",
+      "market_data_enabled": true,
+      "execution_enabled": false,
+      "chain": {
+        "name": "Arbitrum One",
+        "chain_id": 42161,
+        "rpc_url_env": "ARBITRUM_RPC_URL",
+        "ws_url_env": "ARBITRUM_WS_URL",
+        "binance_network_name": "ARBITRUM",
+        "gas_symbol": "ETH",
+        "gas_decimals": 18,
+        "gas_price_binance_symbol": "ETHUSDT",
+        "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+        "uniswap_v3_factory_address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+      },
+      "token_a": {
+        "symbol": "USDC",
+        "contract": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "decimals": 6
+      },
+      "token_b": {
+        "symbol": "ESP",
+        "contract": "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
+        "decimals": 18
+      },
+      "binance": {
+        "symbol": "ESPUSDC",
+        "base_asset": "ESP",
+        "quote_asset": "USDC",
+        "market_data_product": "spot",
+        "execution_product": "spot",
+        "step_size": "1.000000000000000",
+        "tick_size": "0.000010000000000"
+      },
+      "quote_sizing": {
+        "token_a_base_units": "20000000",
+        "token_b": {
+          "mode": "derive_from_binance_ask"
+        }
+      },
+      "strategy": {
+        "kind": "profit_token_a",
+        "opportunity_threshold_bps": 20,
+        "max_quote_age_ms": 30000,
+        "max_transport_silence_ms": 30000,
+        "min_slippage_bps": 5,
+        "max_slippage_bps": 50,
+        "slippage_profit_share_bps": 5000
+      },
+      "rebalance": {
+        "enabled": false,
+        "start_threshold_bps": 2500
+      },
+      "dex": {
+        "allowed_providers": [
+          "uniswap_v3"
+        ],
+        "uniswap_v3": {
+          "fee_tiers": [
+            100
+          ]
+        }
+      }
+    }
+  ]
+}
