@@ -184,7 +184,7 @@ pub fn recovery_client_order_id(primary: &str, attempt: usize) -> anyhow::Result
     Ok(format!("{primary}{suffix}"))
 }
 
-fn decimal_from_base_units(value: u128, decimals: u8) -> anyhow::Result<Decimal> {
+pub(crate) fn decimal_from_base_units(value: u128, decimals: u8) -> anyhow::Result<Decimal> {
     let scale = 10_u128
         .checked_pow(u32::from(decimals))
         .context("Binance base decimal scale overflow")?;

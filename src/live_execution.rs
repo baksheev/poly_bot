@@ -25,7 +25,9 @@ use crate::{
             BinanceExecutionService, BinanceExecutionServiceError, BinanceOrderRequest,
             BinanceOrderRequestKind,
         },
-        order_plan::{plan_limit_ioc, plan_market_order, recovery_client_order_id},
+        order_plan::{
+            decimal_from_base_units, plan_limit_ioc, plan_market_order, recovery_client_order_id,
+        },
         ws_api::OrderResult,
     },
     dex::{
@@ -959,6 +961,7 @@ pub struct LiveRiskLimits {
     pub entry_stop_file: PathBuf,
     pub entry_preflight: EntryPreflightHandle,
     pub binance_symbol: String,
+    pub binance_base_decimals: u8,
 }
 
 impl LiveRiskLimits {
@@ -974,6 +977,10 @@ impl LiveRiskLimits {
                     .bytes()
                     .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
             "live Binance symbol is invalid"
+        );
+        ensure!(
+            self.binance_base_decimals <= 28,
+            "live Binance base decimals exceed Decimal precision"
         );
         Ok(())
     }
@@ -1313,42 +1320,44 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
     }
 
     fn prepare_primary_cex_limit_price(&mut self, plan_id: &str) -> anyhow::Result<()> {
-        let Some((direction, admission_price, client_order_id)) =
+        let Some((direction, admission_price, client_order_id, target_base_units)) =
             self.coordinator.operation(plan_id).and_then(|operation| {
-                (operation.intent.mode == ExecutionMode::DexFirst
-                    && !operation.cex_dispatched
-                    && operation.cex_execution_limit_price.is_none()
-                    && operation.dex_result.as_ref().is_some_and(|result| {
-                        result.status == LegStatus::Filled && result.token_b_delta_base_units != 0
-                    }))
-                .then(|| {
-                    operation.intent.admission.as_ref().map(|bounds| {
-                        (
-                            operation.intent.direction,
-                            bounds.cex_primary_limit_price,
-                            operation.intent.cex_client_order_id.clone(),
-                        )
-                    })
-                })
-                .flatten()
+                if operation.intent.mode != ExecutionMode::DexFirst
+                    || operation.cex_dispatched
+                    || operation.cex_execution_limit_price.is_some()
+                {
+                    return None;
+                }
+                let dex_result = operation.dex_result.as_ref()?;
+                if dex_result.status != LegStatus::Filled
+                    || dex_result.token_b_delta_base_units == 0
+                {
+                    return None;
+                }
+                let bounds = operation.intent.admission.as_ref()?;
+                Some((
+                    operation.intent.direction,
+                    bounds.cex_primary_limit_price,
+                    operation.intent.cex_client_order_id.clone(),
+                    dex_result.token_b_delta_base_units.unsigned_abs(),
+                ))
             })
         else {
             return Ok(());
         };
-        let (selected_price, memory_top) = self
+        let target_quantity =
+            decimal_from_base_units(target_base_units, self.risk_limits.binance_base_decimals)?;
+        let selection = self
             .risk_limits
             .entry_preflight
             .favorable_primary_limit_price(
                 &self.risk_limits.binance_symbol,
                 direction,
                 admission_price,
+                target_quantity,
             );
-        let observed_price = memory_top.as_ref().map(|top| match direction {
-            crate::arbitrage::ArbitrageDirection::BuyTokenBOnDexSellOnCex => top.bid_price,
-            crate::arbitrage::ArbitrageDirection::BuyTokenBOnCexSellOnDex => top.ask_price,
-        });
         self.coordinator
-            .select_primary_cex_limit_price(plan_id, selected_price)?;
+            .select_primary_cex_limit_price(plan_id, selection.selected_price)?;
         self.telemetry.emit(
             ARBITRAGE_BINANCE_ORDER_KIND,
             serde_json::json!({
@@ -1364,10 +1373,15 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     crate::arbitrage::ArbitrageDirection::BuyTokenBOnCexSellOnDex => "buy",
                 },
                 "admission_limit_price": admission_price.to_string(),
-                "observed_fresh_top_price": observed_price.map(|price| price.to_string()),
-                "selected_limit_price": selected_price.to_string(),
-                "improved": selected_price != admission_price,
-                "memory_top": binance_top_payload(memory_top),
+                "observed_fresh_top_price": selection.observed_price.map(|price| price.to_string()),
+                "observed_fresh_top_quantity": selection.observed_quantity.map(|quantity| quantity.to_string()),
+                "target_quantity": selection.target_quantity.to_string(),
+                "top_covers_target": selection.top_covers_target,
+                "price_improvement_available": selection.price_improvement_available,
+                "selection_reason": selection.reason,
+                "selected_limit_price": selection.selected_price.to_string(),
+                "improved": selection.selected_price != admission_price,
+                "memory_top": binance_top_payload(selection.memory_top),
             }),
         );
         Ok(())
@@ -1808,6 +1822,7 @@ mod tests {
             entry_stop_file: stop_file,
             entry_preflight: default_preflight(),
             binance_symbol: "WLDUSDC".to_owned(),
+            binance_base_decimals: 18,
         }
     }
 
@@ -2011,21 +2026,32 @@ mod tests {
             8,
         ));
 
-        let (sell_price, sell_top) = handle.favorable_primary_limit_price(
+        let sell = handle.favorable_primary_limit_price(
             "WLDUSDC",
             ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             Decimal::new(101, 2),
+            Decimal::from(100),
         );
-        assert_eq!(sell_price, Decimal::new(102, 2));
-        assert_eq!(sell_top.unwrap().bid_price, Decimal::new(102, 2));
+        assert_eq!(sell.selected_price, Decimal::new(102, 2));
+        assert_eq!(
+            sell.memory_top.as_ref().unwrap().bid_price,
+            Decimal::new(102, 2)
+        );
+        assert_eq!(sell.top_covers_target, Some(true));
+        assert_eq!(sell.reason, "fresh_top_price_improved_with_full_coverage");
 
-        let (buy_price, buy_top) = handle.favorable_primary_limit_price(
+        let buy = handle.favorable_primary_limit_price(
             "WLDUSDC",
             ArbitrageDirection::BuyTokenBOnCexSellOnDex,
             Decimal::new(104, 2),
+            Decimal::from(100),
         );
-        assert_eq!(buy_price, Decimal::new(103, 2));
-        assert_eq!(buy_top.unwrap().ask_price, Decimal::new(103, 2));
+        assert_eq!(buy.selected_price, Decimal::new(103, 2));
+        assert_eq!(
+            buy.memory_top.as_ref().unwrap().ask_price,
+            Decimal::new(103, 2)
+        );
+        assert_eq!(buy.top_covers_target, Some(true));
 
         handle.update_quote(&preflight_quote(
             Decimal::new(99, 2),
@@ -2038,8 +2064,9 @@ mod tests {
                     "WLDUSDC",
                     ArbitrageDirection::BuyTokenBOnDexSellOnCex,
                     Decimal::new(101, 2),
+                    Decimal::from(100),
                 )
-                .0,
+                .selected_price,
             Decimal::new(101, 2)
         );
         assert_eq!(
@@ -2048,10 +2075,45 @@ mod tests {
                     "WLDUSDC",
                     ArbitrageDirection::BuyTokenBOnCexSellOnDex,
                     Decimal::new(104, 2),
+                    Decimal::from(100),
                 )
-                .0,
+                .selected_price,
             Decimal::new(104, 2)
         );
+    }
+
+    #[test]
+    fn post_dex_primary_price_keeps_admission_boundary_when_favorable_top_is_thin() {
+        let handle = default_preflight();
+        handle.update_quote(&preflight_quote_with_quantities(
+            Decimal::new(102, 2),
+            Decimal::from(99),
+            Decimal::new(103, 2),
+            Decimal::from(99),
+            8,
+        ));
+
+        let sell = handle.favorable_primary_limit_price(
+            "WLDUSDC",
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            Decimal::new(101, 2),
+            Decimal::from(100),
+        );
+        assert_eq!(sell.selected_price, Decimal::new(101, 2));
+        assert!(sell.price_improvement_available);
+        assert_eq!(sell.top_covers_target, Some(false));
+        assert_eq!(sell.reason, "fresh_top_quantity_below_target");
+
+        let buy = handle.favorable_primary_limit_price(
+            "WLDUSDC",
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+            Decimal::new(104, 2),
+            Decimal::from(100),
+        );
+        assert_eq!(buy.selected_price, Decimal::new(104, 2));
+        assert!(buy.price_improvement_available);
+        assert_eq!(buy.top_covers_target, Some(false));
+        assert_eq!(buy.reason, "fresh_top_quantity_below_target");
     }
 
     #[test]
@@ -2251,6 +2313,7 @@ mod tests {
             entry_stop_file: "/tmp/arb-bot-entry.stop".into(),
             entry_preflight: default_preflight(),
             binance_symbol: "WLDUSDC".to_owned(),
+            binance_base_decimals: 18,
         };
         valid.validate().unwrap();
         let mut invalid = valid;

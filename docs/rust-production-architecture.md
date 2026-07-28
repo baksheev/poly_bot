@@ -341,11 +341,14 @@ candidate's exact reservation remain separate authorization controls.
 3. The primary hedge is a deterministic LIMIT IOC.
 4. The admission-time price is the immutable protection boundary. After the
    DEX receipt, a fresh current in-memory top may improve the IOC price in one
-   direction only:
-   - SELL uses `max(admission bid, current bid)`;
-   - BUY uses `min(admission ask, current ask)`.
-   An absent, stale, or adverse current top keeps the admission price. It never
-   weakens the limit and never blocks closure of an already-created exposure.
+   direction only when its same-side quantity covers the complete hedge target:
+   - a covered SELL uses `max(admission bid, current bid)`;
+   - a covered BUY uses `min(admission ask, current ask)`.
+   An absent, stale, adverse, or insufficient current top keeps the admission
+   price. Top quantity changes only this post-DEX price choice; it remains
+   excluded from sizing, readiness, admission, and entry preflight. The
+   selection never weakens the limit or blocks closure of an already-created
+   exposure.
 5. The selected price is journaled before CEX dispatch so restart replay uses
    the identical order intent and deterministic client ID.
 6. Repricing changes price only. It cannot increase the exact hedge quantity
@@ -367,7 +370,8 @@ candidate's exact reservation remain separate authorization controls.
     `arbitrage_binance_order` telemetry keyed by `plan_id` and
     `client_order_id`:
     - `primary_price_selection` records admission price, fresh in-memory top,
-      selected price, and whether the price was improved;
+      exact target and observed same-side quantities, coverage, selected price,
+      selection reason, and whether the price was improved;
     - `planned` records the exact LIMIT/MARKET request, target and submitted
       quantity, the in-memory bid/ask immediately before placement, and whether
       the LIMIT was marketable at that top;

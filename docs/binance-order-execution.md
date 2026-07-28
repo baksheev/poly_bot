@@ -1,6 +1,6 @@
 # Binance bounded execution
 
-Last reviewed: 2026-07-26
+Last reviewed: 2026-07-28
 
 The Rust runtime now has a typed, single-owner Binance Spot order boundary for
 `WLDUSDC`. Autonomous DEX-first arbitrage is enabled in the isolated GKE
@@ -72,7 +72,9 @@ hedge chain. `plan_id` joins the DEX parent and `client_order_id` joins price
 selection, the exact submitted order, and its terminal result.
 
 - `primary_price_selection`: admission limit, fresh in-memory top, selected
-  one-way-improved limit, and `improved`;
+  one-way-improved limit, exact target quantity, observed same-side quantity,
+  whether that top covers the complete target, the selection reason, and
+  `improved`. A favorable but insufficient top keeps the admission limit;
 - `planned`: side/type, exact target and submitted quantities, limit price,
   full placement-time bid/ask snapshot with transport silence, and
   `limit_marketable_at_memory_top`. For the recovery MARKET child it also

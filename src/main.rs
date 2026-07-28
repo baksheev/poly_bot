@@ -1167,6 +1167,7 @@ async fn run(
                 entry_stop_file: config.arbitrage_entry_stop_file.clone(),
                 entry_preflight: entry_preflight.clone(),
                 binance_symbol: pair.binance.symbol.clone(),
+                binance_base_decimals: pair.token_b.decimals,
             },
         )?;
         Some((

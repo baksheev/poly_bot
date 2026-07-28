@@ -107,14 +107,18 @@ a time.
   DEX calldata input/output bounds; Binance commission, gas, and recovery never
   create a second profitability model. After the DEX receipt, the primary
   Binance LIMIT IOC keeps the admission price as its immutable protection
-  boundary and may use a fresh in-memory top only to improve execution: SELL
-  uses the higher price and BUY the lower price. An adverse or unavailable top
+  boundary and may use a fresh in-memory top only when its same-side quantity
+  covers the complete hedge target: a covered SELL uses the higher price and a
+  covered BUY the lower price. An adverse, unavailable, or insufficient top
   keeps the admission price, followed by bounded MARKET recovery after a
-  partial or zero fill. The selected IOC price must be journaled before
-  dispatch. Primary selection and every LIMIT/MARKET order must emit joinable
-  non-blocking telemetry containing the placement-time in-memory top, exact
-  request, marketability at that top, terminal fill/average price, commissions,
-  and reconciliation outcome. MARKET fallback telemetry must also persist the
+  partial or zero fill. Top quantity changes only this post-DEX price choice;
+  it remains excluded from sizing, readiness, admission, and entry preflight.
+  The selected IOC price must be journaled before dispatch. Primary selection
+  and every LIMIT/MARKET order must emit joinable non-blocking telemetry
+  containing the target quantity, observed same-side quantity, coverage
+  decision, placement-time in-memory top, exact request, marketability at that
+  top, terminal fill/average price, commissions, and reconciliation outcome.
+  MARKET fallback telemetry must also persist the
   counterfactual same-side in-memory LIMIT price, visible top coverage, actual
   MARKET price advantage, fill-price compatibility, placement-to-terminal
   duration, and terminal top. This counterfactual is diagnostic and must never

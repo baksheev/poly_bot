@@ -840,6 +840,18 @@ pub struct FreshBinanceTopSnapshot {
     pub transport_silence_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrimaryLimitPriceSelection {
+    pub selected_price: Decimal,
+    pub memory_top: Option<FreshBinanceTopSnapshot>,
+    pub observed_price: Option<Decimal>,
+    pub observed_quantity: Option<Decimal>,
+    pub target_quantity: Decimal,
+    pub top_covers_target: Option<bool>,
+    pub price_improvement_available: bool,
+    pub reason: &'static str,
+}
+
 impl EntryPreflightHandle {
     pub fn fresh_binance_top(&self, symbol: &str) -> Option<FreshBinanceTopSnapshot> {
         let state = self.inner.read().ok()?;
@@ -870,29 +882,63 @@ impl EntryPreflightHandle {
     }
 
     /// Improves the primary IOC price only when the current in-memory Binance
-    /// top belongs to a live connection with fresh transport activity.
+    /// top belongs to a live connection with fresh transport activity and its
+    /// same-side quantity covers the complete post-DEX hedge target.
     ///
     /// SELL never goes below the admission bid; BUY never goes above the
-    /// admission ask. Missing or stale state keeps the immutable admission
-    /// price and never blocks the already-created DEX exposure.
+    /// admission ask. Missing, stale, adverse, or thin state keeps the
+    /// immutable admission price and never blocks the already-created DEX
+    /// exposure.
     pub fn favorable_primary_limit_price(
         &self,
         symbol: &str,
         direction: ArbitrageDirection,
         admission_price: Decimal,
-    ) -> (Decimal, Option<FreshBinanceTopSnapshot>) {
+        target_quantity: Decimal,
+    ) -> PrimaryLimitPriceSelection {
         let Some(quote) = self.fresh_binance_top(symbol) else {
-            return (admission_price, None);
+            return PrimaryLimitPriceSelection {
+                selected_price: admission_price,
+                memory_top: None,
+                observed_price: None,
+                observed_quantity: None,
+                target_quantity,
+                top_covers_target: None,
+                price_improvement_available: false,
+                reason: "fresh_top_unavailable",
+            };
         };
-        let observed = match direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
+        let (observed_price, observed_quantity) = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => (quote.bid_price, quote.bid_quantity),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => (quote.ask_price, quote.ask_quantity),
         };
-        let selected = match direction {
-            ArbitrageDirection::BuyTokenBOnDexSellOnCex => admission_price.max(observed),
-            ArbitrageDirection::BuyTokenBOnCexSellOnDex => admission_price.min(observed),
+        let favorable_price = match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => admission_price.max(observed_price),
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => admission_price.min(observed_price),
         };
-        (selected, Some(quote))
+        let price_improvement_available = favorable_price != admission_price;
+        let top_covers_target =
+            target_quantity > Decimal::ZERO && observed_quantity >= target_quantity;
+        let (selected_price, reason) = if !price_improvement_available {
+            (admission_price, "fresh_top_price_not_favorable")
+        } else if top_covers_target {
+            (
+                favorable_price,
+                "fresh_top_price_improved_with_full_coverage",
+            )
+        } else {
+            (admission_price, "fresh_top_quantity_below_target")
+        };
+        PrimaryLimitPriceSelection {
+            selected_price,
+            memory_top: Some(quote),
+            observed_price: Some(observed_price),
+            observed_quantity: Some(observed_quantity),
+            target_quantity,
+            top_covers_target: Some(top_covers_target),
+            price_improvement_available,
+            reason,
+        }
     }
 
     pub fn configure_max_transport_silence(&self, symbol: &str, max_age_ms: u64) {
