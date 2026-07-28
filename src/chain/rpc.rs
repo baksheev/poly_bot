@@ -621,7 +621,20 @@ impl JsonRpcClient {
             let body = Value::Array(requests);
             let mut attempt = 0;
             let mut by_id = loop {
-                let values = self.send_json(body.clone()).await?;
+                let values = match self.send_json(body.clone()).await {
+                    Ok(values) => values,
+                    Err(error) if attempt < MAX_RATE_LIMIT_RETRIES => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            error = %error,
+                            "read-only eth_call batch retry scheduled"
+                        );
+                        tokio::time::sleep(retry_delay(attempt)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let responses = values
                     .as_array()
                     .context("JSON-RPC batch response is not an array")?;

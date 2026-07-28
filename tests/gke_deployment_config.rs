@@ -1,4 +1,5 @@
 const RELEASE_PLATFORM: &str = include_str!("../infra/gcp/gke/release-platform.yaml");
+const DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
 
 #[test]
@@ -55,4 +56,22 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("has(\"balance_safety_multiplier\")"));
     assert!(DEPLOY_WORKFLOW.contains("previous_runtime_config"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
+}
+
+#[test]
+fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
+    assert!(
+        RELEASE_PLATFORM
+            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-esp-arbitrum.v1.json")
+    );
+    assert!(RELEASE_PLATFORM.contains("name: arb-bot-esp-market-data"));
+    assert!(RELEASE_PLATFORM.contains("RUNTIME_READY_FILE: /tmp/arb-bot-esp-ready"));
+    assert!(DEPLOYMENT.contains("name: esp-market-data"));
+    assert!(DEPLOYMENT.contains("exec arb_bot collect-prices"));
+    assert!(DEPLOYMENT.contains("secretProviderClass: arb-bot-esp-market-data"));
+    assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
+    assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
+    assert!(DEPLOY_WORKFLOW.contains("usdc-esp-arbitrum.v1.json"));
+    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
+    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
 }

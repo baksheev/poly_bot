@@ -148,8 +148,14 @@ impl DomainSnapshot {
 pub struct SnapshotSource {
     pub repository: String,
     pub revision: String,
-    pub rails_pair_id: u64,
-    pub rails_pair_updated_at_utc: String,
+    #[serde(default)]
+    pub rails_pair_id: Option<u64>,
+    #[serde(default)]
+    pub rails_pair_updated_at_utc: Option<String>,
+    #[serde(default)]
+    pub rails_pair_candidate_id: Option<u64>,
+    #[serde(default)]
+    pub rails_pair_candidate_updated_at_utc: Option<String>,
     pub captured_at_utc: String,
     pub evidence: Vec<String>,
 }
@@ -161,14 +167,24 @@ impl SnapshotSource {
             self.revision.len() == 40 && self.revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "source.revision must be a 40-character Git commit"
         );
-        ensure!(
-            self.rails_pair_id > 0,
-            "source.rails_pair_id must be positive"
-        );
-        validate_non_empty(
-            "source.rails_pair_updated_at_utc",
-            &self.rails_pair_updated_at_utc,
-        )?;
+        match (
+            self.rails_pair_id,
+            self.rails_pair_updated_at_utc.as_deref(),
+            self.rails_pair_candidate_id,
+            self.rails_pair_candidate_updated_at_utc.as_deref(),
+        ) {
+            (Some(id), Some(updated_at), None, None) => {
+                ensure!(id > 0, "source.rails_pair_id must be positive");
+                validate_non_empty("source.rails_pair_updated_at_utc", updated_at)?;
+            }
+            (None, None, Some(id), Some(updated_at)) => {
+                ensure!(id > 0, "source.rails_pair_candidate_id must be positive");
+                validate_non_empty("source.rails_pair_candidate_updated_at_utc", updated_at)?;
+            }
+            _ => anyhow::bail!(
+                "source must identify exactly one Rails pair or pair candidate with its updated_at timestamp"
+            ),
+        }
         validate_non_empty("source.captured_at_utc", &self.captured_at_utc)?;
         ensure!(
             !self.evidence.is_empty(),
@@ -950,7 +966,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AdaptiveSizingConfig, ArbitrageStrategy, BinanceProduct, LoadedDomainConfig,
+        AdaptiveSizingConfig, ArbitrageStrategy, BinanceProduct, DexProvider, LoadedDomainConfig,
         TokenBQuoteSizing,
     };
 
@@ -966,6 +982,8 @@ mod tests {
     const V10_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
     const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v12.json");
+    const ESP_SHADOW_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v1.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -994,6 +1012,30 @@ mod tests {
         assert_eq!(pair.adaptive_sizing, AdaptiveSizingConfig::BaselineOnly);
         assert!(!pair.execution_enabled);
         assert_eq!(loaded.fingerprint_sha256().len(), 64);
+    }
+
+    #[test]
+    fn committed_esp_shadow_snapshot_is_public_market_data_only() {
+        let loaded = load(ESP_SHADOW_CONFIG.as_bytes()).unwrap();
+        let pair = &loaded.snapshot().pairs[0];
+
+        assert_eq!(loaded.binance_symbols(), ["ESPUSDC"]);
+        assert_eq!(loaded.snapshot().source.rails_pair_candidate_id, Some(3144));
+        assert_eq!(pair.chain.chain_id, 42_161);
+        assert!(pair.market_data_enabled);
+        assert!(!pair.execution_enabled);
+        assert!(!pair.rebalance.enabled);
+        assert!(!loaded.snapshot().live_trading_enabled);
+        assert!(pair.chain.uniswap_v3_router_address.is_none());
+        assert!(pair.chain.uniswap_v4_router_address.is_none());
+        assert_eq!(
+            pair.dex.allowed_providers,
+            [DexProvider::UniswapV3, DexProvider::UniswapV4]
+        );
+        assert_eq!(pair.dex.uniswap_v3.as_ref().unwrap().fee_tiers, [100]);
+        let v4 = &pair.dex.uniswap_v4.as_ref().unwrap().pools[0];
+        assert_eq!(v4.fee_tier, 28_800);
+        assert_eq!(v4.tick_spacing, 576);
     }
 
     #[test]

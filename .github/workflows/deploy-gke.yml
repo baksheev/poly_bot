@@ -76,6 +76,26 @@ jobs:
           test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_update_delta' "${domain_config}")" = 8
           test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.top_of_book_max_trade_notional_token_a_base_units' "${domain_config}")" = 40000000
           test "$(jq -r '.pairs[0].strategy | has("balance_safety_multiplier")' "${domain_config}")" = false
+          esp_domain_config=config/strategies/usdc-esp-arbitrum.v1.json
+          test "$(jq -r '.live_trading_enabled' "${esp_domain_config}")" = false
+          test "$(jq -r '.source.rails_pair_candidate_id' "${esp_domain_config}")" = 3144
+          test "$(jq -r '.pairs | length' "${esp_domain_config}")" = 1
+          test "$(jq -r '.pairs[0].id' "${esp_domain_config}")" = arbitrum-usdc-esp
+          test "$(jq -r '.pairs[0].chain.chain_id' "${esp_domain_config}")" = 42161
+          test "$(jq -r '.pairs[0].binance.symbol' "${esp_domain_config}")" = ESPUSDC
+          test "$(jq -r '.pairs[0].market_data_enabled' "${esp_domain_config}")" = true
+          test "$(jq -r '.pairs[0].execution_enabled' "${esp_domain_config}")" = false
+          test "$(jq -r '.pairs[0].rebalance.enabled' "${esp_domain_config}")" = false
+          test "$(jq -r '.pairs[0].chain | has("uniswap_v3_router_address")' "${esp_domain_config}")" = false
+          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_router_address")' "${esp_domain_config}")" = false
+          test "$(jq -c '.pairs[0].dex.allowed_providers' "${esp_domain_config}")" \
+            = '["uniswap_v3","uniswap_v4"]'
+          test "$(jq -c '.pairs[0].dex.uniswap_v3.fee_tiers' "${esp_domain_config}")" \
+            = '[100]'
+          test "$(jq -r '.pairs[0].dex.uniswap_v4.pools[0].fee_tier' "${esp_domain_config}")" \
+            = 28800
+          test "$(jq -r '.pairs[0].dex.uniswap_v4.pools[0].tick_spacing' "${esp_domain_config}")" \
+            = 576
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -295,6 +315,26 @@ jobs:
             = full_live
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \
             = full_live
+          esp_runtime_config="$(kubectl get configmap arb-bot-esp-market-data \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json)"
+          test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${esp_runtime_config}")" \
+            = config/strategies/usdc-esp-arbitrum.v1.json
+          test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${esp_runtime_config}")" \
+            = disabled
+          test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${esp_runtime_config}")" \
+            = disabled
+          test "$(jq -r '.data.RUNTIME_READY_FILE' <<<"${esp_runtime_config}")" \
+            = /tmp/arb-bot-esp-ready
+          deployment_json="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json)"
+          test "$(jq -r '.spec.template.spec.containers | map(.name) | sort | join(",")' \
+            <<<"${deployment_json}")" = arb-bot,esp-market-data
+          test "$(jq -r '.spec.template.spec.containers[] | select(.name == "esp-market-data") | .args[0] | contains("collect-prices")' \
+            <<<"${deployment_json}")" = true
+          test "$(jq -r '.spec.template.spec.volumes[] | select(.name == "esp-market-data-secrets") | .csi.volumeAttributes.secretProviderClass' \
+            <<<"${deployment_json}")" = arb-bot-esp-market-data
           rebalance_mode="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"

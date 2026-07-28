@@ -17,6 +17,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the read-only market-data shadow service.
     Run,
+    /// Collect public Binance and DEX prices without trading or signing credentials.
+    CollectPrices,
     /// Create ClickHouse telemetry tables.
     Migrate,
     /// Validate configuration without connecting to external systems.

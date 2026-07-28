@@ -111,6 +111,16 @@ impl BinanceAccountClient {
         )
     }
 
+    pub fn from_read_only_env(config: &AppConfig) -> anyhow::Result<Self> {
+        Self::new(
+            &config.binance_rest_base_url,
+            BinanceCredentials::from_env_names(
+                "BINANCE_READ_ONLY_API_KEY",
+                "BINANCE_READ_ONLY_SECRET_KEY",
+            )?,
+        )
+    }
+
     fn new(base_url: &str, credentials: BinanceCredentials) -> anyhow::Result<Self> {
         let http = Client::builder()
             .connect_timeout(REQUEST_TIMEOUT)

@@ -102,6 +102,7 @@ pub struct PairEvaluation {
 #[derive(Debug, Clone)]
 pub struct PairRuntime {
     pub pair_id: String,
+    pub chain_id: u64,
     pub symbol: String,
     pub token_a_symbol: String,
     pub token_b_symbol: String,
@@ -863,6 +864,7 @@ impl PairRuntime {
 
         Ok(Self {
             pair_id: config.id.clone(),
+            chain_id: config.chain.chain_id,
             symbol: config.binance.symbol.clone(),
             token_a_symbol: config.token_a.symbol.clone(),
             token_b_symbol: config.token_b.symbol.clone(),
@@ -1509,6 +1511,7 @@ mod tests {
         .unwrap();
         let runtime = PairRuntime {
             pair_id: "test-pair".into(),
+            chain_id: 480,
             symbol: "BA".into(),
             token_a_symbol: "A".into(),
             token_b_symbol: "B".into(),

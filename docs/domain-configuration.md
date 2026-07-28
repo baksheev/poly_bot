@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated v12 adaptive-live artifact implemented
-Last reviewed: 2026-07-23
+Status: v4 read/paper default, separately gated v12 adaptive-live artifact, and ESP/USDC Arbitrum price shadow implemented
+Last reviewed: 2026-07-28
 
 ## Runtime boundary
 
@@ -21,6 +21,16 @@ trade: the production GKE deployment fixes runtime execution to `full_live`, and
 signer/order journals, single-owner deployment, and startup health checks are
 independently required. Earlier artifacts remain provenance for prior shadow
 stages.
+
+The independent
+`config/strategies/usdc-esp-arbitrum.v1.json` artifact captures Rails
+`PairCandidate id=3144` and enables public Spot `ESPUSDC` plus the hydrated
+Arbitrum Uniswap V3 0.01% and V4 2.88% pools. Its dedicated `collect-prices`
+runtime has execution and rebalancing disabled, does not receive a signer or
+Binance trading credentials, and emits book, DEX evaluation, and public
+wallet-balance telemetry. Binance balance telemetry is optional and requires a
+separately provisioned read-only API key whose trading, withdrawal, and
+transfer permissions are all disabled.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven

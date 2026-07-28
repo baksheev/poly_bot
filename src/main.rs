@@ -39,18 +39,21 @@ use arb_bot::{
     domain::config::{DexProvider, LoadedDomainConfig},
     engine::{BinanceFeeBps, TradingEngine},
     execution_accounting::{CommissionAssetValuation, binance_leg_result},
+    hot_telemetry,
     live_execution::{
         ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveRiskLimits, live_trade_channel,
     },
     market_data::{
+        MarketEvent,
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
     },
-    opportunity::PreparedPoolBuildRequest,
+    opportunity::{OpportunityEngine, PreparedPoolBuildRequest},
     rebalance::{
         RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
         RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
     },
+    state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::{ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryWriter},
     wallet::{
         EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV,
@@ -87,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Run => {
             let domain_config = Arc::new(LoadedDomainConfig::load(&cli.config.domain_config_path)?);
             run(cli.config, domain_config).await
+        }
+        Command::CollectPrices => {
+            let domain_config = Arc::new(LoadedDomainConfig::load(&cli.config.domain_config_path)?);
+            collect_prices(cli.config, domain_config).await
         }
         Command::Migrate => TelemetryWriter::new(&cli.config).migrate().await,
         Command::Check => {
@@ -832,6 +839,435 @@ async fn hydrate(domain_config: &LoadedDomainConfig) -> anyhow::Result<()> {
         rpc = ?rpc.stats(),
         "DEX hydration completed"
     );
+    Ok(())
+}
+
+async fn collect_prices(
+    config: config::AppConfig,
+    domain_config: Arc<LoadedDomainConfig>,
+) -> anyhow::Result<()> {
+    ensure!(
+        !domain_config.snapshot().live_trading_enabled
+            && domain_config
+                .snapshot()
+                .pairs
+                .iter()
+                .all(|pair| !pair.execution_enabled && !pair.rebalance.enabled),
+        "collect-prices requires execution and rebalancing to be disabled in the domain artifact"
+    );
+    ensure!(
+        config.arbitrage_execution_mode == "disabled"
+            && config.rebalance_execution_mode == "disabled",
+        "collect-prices requires ARBITRAGE_EXECUTION_MODE=disabled and REBALANCE_EXECUTION_MODE=disabled"
+    );
+    let symbols = domain_config.binance_symbols();
+    ensure!(
+        symbols.len() == 1,
+        "collect-prices currently requires exactly one enabled Binance symbol"
+    );
+    let pair = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.market_data_enabled)
+        .context("collect-prices requires one enabled pair")?;
+
+    let InitializedDex {
+        mut mirror,
+        stream,
+        rpc: wallet_rpc,
+    } = initialize_dex(&config, domain_config.as_ref()).await?;
+    let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &mirror)?;
+    let (telemetry, writer) = TelemetryWriter::new(&config).channel();
+    let writer_task = tokio::spawn(writer.run());
+    let balance_telemetry = telemetry.clone();
+    let (hot_telemetry, hot_telemetry_task) =
+        hot_telemetry::channel(&config, opportunities.pairs(), &mirror, telemetry)?;
+    let hot_telemetry_task = tokio::spawn(hot_telemetry_task.run());
+
+    let AlchemyDexStream {
+        receiver: mut dex_receiver,
+        task: mut dex_task,
+    } = stream;
+    let symbol = symbols[0].clone();
+    let mut binance_feed = BookTickerFeed::new(&config, symbol.clone());
+    let mut runtime_state = RuntimeState::new([Arc::<str>::from(symbol.as_str())]);
+    let mut latest_quote: Option<TopOfBook> = None;
+    let wallet_owner = config
+        .evm_wallet_address
+        .trim()
+        .parse::<Address>()
+        .context("collect-prices requires a valid EVM_WALLET_ADDRESS for balance sync")?;
+    let wallet_tokens = vec![
+        TokenBalanceRequest {
+            symbol: pair.token_a.symbol.clone(),
+            contract: pair
+                .token_a
+                .contract
+                .parse()
+                .context("configured token_a address is invalid")?,
+        },
+        TokenBalanceRequest {
+            symbol: pair.token_b.symbol.clone(),
+            contract: pair
+                .token_b
+                .contract
+                .parse()
+                .context("configured token_b address is invalid")?,
+        },
+    ];
+    let (balance_heads, balance_head_receiver) = tokio::sync::watch::channel(mirror.latest_head());
+    let balance_context = CollectorBalanceContext {
+        telemetry: balance_telemetry,
+        engine_id: config.engine_id.clone(),
+        pair_id: pair.id.clone(),
+        interval: Duration::from_millis(config.balance_sync_interval_ms),
+    };
+    let wallet_balance_task = tokio::spawn(run_collector_wallet_balance_sync(
+        wallet_rpc,
+        wallet_owner,
+        pair.chain.chain_id,
+        wallet_tokens,
+        balance_head_receiver,
+        balance_context.clone(),
+    ));
+    let binance_balance_task = collector_read_only_binance_client(&config)
+        .await?
+        .map(|client| {
+            tokio::spawn(run_collector_binance_balance_sync(
+                client,
+                [pair.token_a.symbol.clone(), pair.token_b.symbol.clone()],
+                balance_context,
+            ))
+        });
+    let binance_balance_sync_enabled = binance_balance_task.is_some();
+    let ready_path = runtime_ready_marker_path()?;
+    let mut ready_marked = false;
+    sync_runtime_ready_marker(ready_path.as_deref(), &mut ready_marked, false)?;
+
+    tracing::info!(
+        service = %config.service_name,
+        engine_id = %config.engine_id,
+        pair_id = %pair.id,
+        chain_id = pair.chain.chain_id,
+        symbol = %symbol,
+        domain_snapshot_id = %domain_config.snapshot().snapshot_id,
+        domain_config_sha256 = %domain_config.fingerprint_sha256(),
+        pools = mirror.pool_count(),
+        unavailable_pools = mirror.unavailable_count(),
+        clickhouse_enabled = config.clickhouse_enabled(),
+        binance_market_data_authenticated = false,
+        binance_balance_sync_enabled,
+        wallet_balance_sync_enabled = true,
+        execution_enabled = false,
+        rebalance_enabled = false,
+        "public price collector started"
+    );
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut health_tick = tokio::time::interval(Duration::from_secs(1));
+    health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut binance_event = Box::pin(binance_feed.next_event());
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            event = dex_receiver.recv() => {
+                let Some(event) = event else {
+                    bail!("Arbitrum DEX stream stopped; process restart will rehydrate state");
+                };
+                let new_head = match &event {
+                    arb_bot::market_data::alchemy::DexStreamEvent::Head { head, .. } => Some(*head),
+                    arb_bot::market_data::alchemy::DexStreamEvent::Log { .. } => None,
+                };
+                let changed = process_price_collector_dex_event(
+                    &mut mirror,
+                    &mut opportunities,
+                    event,
+                )?;
+                if let Some(head) = new_head {
+                    balance_heads.send_replace(head);
+                }
+                if changed
+                    && let Some(quote) = latest_quote.as_ref()
+                {
+                    emit_price_collector_evaluation(
+                        &mut opportunities,
+                        &hot_telemetry,
+                        quote,
+                        mirror.latest_head().number,
+                        "dex",
+                    )?;
+                }
+            }
+            event = &mut binance_event => {
+                drop(binance_event);
+                match event {
+                    MarketEvent::FeedConnected {
+                        symbol,
+                        generation,
+                        observed_at,
+                    } => runtime_state.on_connected(&symbol, generation, observed_at),
+                    MarketEvent::FeedDisconnected {
+                        symbol,
+                        generation,
+                        ..
+                    } => {
+                        runtime_state.on_disconnected(&symbol, generation);
+                        latest_quote = None;
+                    }
+                    MarketEvent::FeedHeartbeat {
+                        symbol,
+                        generation,
+                        observed_at,
+                    } => {
+                        runtime_state.record_transport_activity(
+                            &symbol,
+                            generation,
+                            observed_at,
+                        );
+                    }
+                    MarketEvent::BinanceTopOfBook(quote) => {
+                        let accepted =
+                            runtime_state.apply_quote(quote.clone()) == QuoteApplyResult::Accepted;
+                        let phase = runtime_state.refresh_phase(
+                            std::time::Instant::now(),
+                            pair.strategy.max_transport_silence_ms(),
+                            mirror.is_fresh(
+                                std::time::Instant::now(),
+                                config.dex_head_max_age_ms,
+                            ),
+                        );
+                        hot_telemetry.emit_binance_book(
+                            &quote,
+                            "strategy",
+                            Some(phase),
+                            if accepted { "evaluated" } else { "rejected" },
+                        );
+                        if accepted {
+                            emit_price_collector_evaluation(
+                                &mut opportunities,
+                                &hot_telemetry,
+                                &quote,
+                                mirror.latest_head().number,
+                                "binance",
+                            )?;
+                            latest_quote = Some(quote);
+                        }
+                    }
+                    MarketEvent::BinanceDepthApplied { .. } => {
+                        bail!("public price collector unexpectedly received Binance depth");
+                    }
+                }
+                binance_event = Box::pin(binance_feed.next_event());
+            }
+            _ = health_tick.tick() => {}
+            result = &mut dex_task => {
+                result.context("Arbitrum DEX connector task failed")??;
+                bail!("Arbitrum DEX connector stopped; process restart will rehydrate state");
+            }
+        }
+
+        let phase = runtime_state.refresh_phase(
+            std::time::Instant::now(),
+            pair.strategy.max_transport_silence_ms(),
+            mirror.is_fresh(std::time::Instant::now(), config.dex_head_max_age_ms),
+        );
+        sync_runtime_ready_marker(
+            ready_path.as_deref(),
+            &mut ready_marked,
+            phase == RuntimePhase::Ready,
+        )?;
+    }
+
+    runtime_state.stop();
+    sync_runtime_ready_marker(ready_path.as_deref(), &mut ready_marked, false)?;
+    dex_task.abort();
+    let _ = dex_task.await;
+    wallet_balance_task.abort();
+    let _ = wallet_balance_task.await;
+    if let Some(task) = binance_balance_task {
+        task.abort();
+        let _ = task.await;
+    }
+    drop(hot_telemetry);
+    hot_telemetry_task.await??;
+    writer_task.await??;
+    tracing::info!(
+        pair_id = %pair.id,
+        symbol = %symbol,
+        "public price collector stopped"
+    );
+    Ok(())
+}
+
+async fn collector_read_only_binance_client(
+    config: &config::AppConfig,
+) -> anyhow::Result<Option<BinanceAccountClient>> {
+    let api_key_present = std::env::var_os("BINANCE_READ_ONLY_API_KEY").is_some();
+    let secret_key_present = std::env::var_os("BINANCE_READ_ONLY_SECRET_KEY").is_some();
+    ensure!(
+        api_key_present == secret_key_present,
+        "BINANCE_READ_ONLY_API_KEY and BINANCE_READ_ONLY_SECRET_KEY must be configured together"
+    );
+    if !api_key_present {
+        tracing::warn!(
+            "read-only Binance credentials are absent; Binance balance sync is disabled"
+        );
+        return Ok(None);
+    }
+
+    let mut client = BinanceAccountClient::from_read_only_env(config)?;
+    client.synchronize_clock().await?;
+    let permissions = client.api_key_permissions().await?;
+    ensure!(
+        permissions.enable_reading
+            && !permissions.enable_spot_and_margin_trading
+            && !permissions.enable_withdrawals
+            && !permissions.enable_internal_transfer
+            && !permissions.permits_universal_transfer,
+        "ESP shadow requires a read-only Binance key with every trading, withdrawal, and transfer permission disabled"
+    );
+    Ok(Some(client))
+}
+
+#[derive(Clone)]
+struct CollectorBalanceContext {
+    telemetry: arb_bot::telemetry::TelemetryHandle,
+    engine_id: String,
+    pair_id: String,
+    interval: Duration,
+}
+
+async fn run_collector_wallet_balance_sync(
+    rpc: JsonRpcClient,
+    owner: Address,
+    chain_id: u64,
+    tokens: Vec<TokenBalanceRequest>,
+    mut heads: tokio::sync::watch::Receiver<CanonicalBlock>,
+    context: CollectorBalanceContext,
+) -> anyhow::Result<()> {
+    let mut tick = tokio::time::interval(context.interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let head = *heads.borrow_and_update();
+        match fetch_wallet_snapshot(&rpc, owner, chain_id, &tokens, head).await {
+            Ok(snapshot) => context.telemetry.emit(
+                "balance_snapshot",
+                serde_json::json!({
+                    "engine_id": context.engine_id,
+                    "pair_id": context.pair_id,
+                    "source": "wallet",
+                    "owner": snapshot.owner.to_string(),
+                    "chain_id": snapshot.chain_id,
+                    "chain_block": snapshot.block_number,
+                    "chain_block_hash": snapshot.block_hash.to_string(),
+                    "request_duration_us": snapshot.request_duration_us,
+                    "tokens": snapshot.token_balances.iter().map(|balance| {
+                        serde_json::json!({
+                            "symbol": balance.symbol.as_ref(),
+                            "contract": balance.contract.to_string(),
+                            "base_units": balance.base_units.to_string(),
+                        })
+                    }).collect::<Vec<_>>(),
+                }),
+            ),
+            Err(error) => tracing::warn!(
+                pair_id = %context.pair_id,
+                chain_id,
+                error = %format!("{error:#}"),
+                "ESP wallet balance sync failed"
+            ),
+        }
+        heads.changed().await.ok();
+    }
+}
+
+async fn run_collector_binance_balance_sync(
+    mut client: BinanceAccountClient,
+    assets: [String; 2],
+    context: CollectorBalanceContext,
+) -> anyhow::Result<()> {
+    let mut tick = tokio::time::interval(context.interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let started_at = std::time::Instant::now();
+        let account = match client.account_information().await {
+            Ok(account) => account,
+            Err(first_error) => {
+                client.synchronize_clock().await.with_context(|| {
+                    format!(
+                        "Binance balance request failed: {first_error:#}; clock resynchronization also failed"
+                    )
+                })?;
+                client.account_information().await?
+            }
+        };
+        context.telemetry.emit(
+            "balance_snapshot",
+            serde_json::json!({
+                "engine_id": context.engine_id,
+                "pair_id": context.pair_id,
+                "source": "binance",
+                "account_type": account.account_type,
+                "api_key_read_only": true,
+                "account_update_time_ms": account.update_time,
+                "request_duration_us": started_at.elapsed().as_micros(),
+                "assets": assets.iter().map(|asset| {
+                    let balance = account.balances.iter().find(|balance| balance.asset == *asset);
+                    serde_json::json!({
+                        "symbol": asset,
+                        "free": balance.map_or(Decimal::ZERO, |balance| balance.free).to_string(),
+                        "locked": balance.map_or(Decimal::ZERO, |balance| balance.locked).to_string(),
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+        );
+    }
+}
+
+fn process_price_collector_dex_event(
+    mirror: &mut DexMirror,
+    opportunities: &mut OpportunityEngine,
+    event: arb_bot::market_data::alchemy::DexStreamEvent,
+) -> anyhow::Result<bool> {
+    match event {
+        arb_bot::market_data::alchemy::DexStreamEvent::Log { log, .. } => {
+            let LogApplyResult::Applied { pool_index, .. } = mirror.apply_log(&log)? else {
+                return Ok(false);
+            };
+            let request = opportunities.request_pool_refresh(pool_index, mirror)?;
+            let result = request.build()?;
+            Ok(opportunities.finish_pool_refresh(result)?.is_some())
+        }
+        arb_bot::market_data::alchemy::DexStreamEvent::Head { head, received_at } => {
+            mirror.apply_head(head, received_at)?;
+            Ok(false)
+        }
+    }
+}
+
+fn emit_price_collector_evaluation(
+    opportunities: &mut OpportunityEngine,
+    telemetry: &arb_bot::hot_telemetry::HotTelemetryHandle,
+    quote: &TopOfBook,
+    chain_block: u64,
+    trigger: &'static str,
+) -> anyhow::Result<()> {
+    let started_at = std::time::Instant::now();
+    if let Some(evaluation) = opportunities.evaluate(quote)? {
+        telemetry.emit_evaluation(
+            quote,
+            evaluation,
+            chain_block,
+            started_at.elapsed().as_micros(),
+            trigger,
+        );
+    }
     Ok(())
 }
 
@@ -1669,6 +2105,19 @@ fn dispatch_rebalance_execution(
 }
 
 fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
+    let Some(path) = runtime_ready_marker_path()? else {
+        return Ok(None);
+    };
+    std::fs::write(&path, b"ready\n").with_context(|| {
+        format!(
+            "failed to write runtime readiness marker {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(path))
+}
+
+fn runtime_ready_marker_path() -> anyhow::Result<Option<PathBuf>> {
     let Some(path) = std::env::var_os("RUNTIME_READY_FILE") else {
         return Ok(None);
     };
@@ -1677,13 +2126,43 @@ fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
         !path.as_os_str().is_empty(),
         "RUNTIME_READY_FILE must not be empty"
     );
-    std::fs::write(&path, b"ready\n").with_context(|| {
-        format!(
-            "failed to write runtime readiness marker {}",
-            path.display()
-        )
-    })?;
     Ok(Some(path))
+}
+
+fn sync_runtime_ready_marker(
+    path: Option<&std::path::Path>,
+    marked: &mut bool,
+    ready: bool,
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if ready {
+        if !*marked {
+            std::fs::write(path, b"ready\n").with_context(|| {
+                format!(
+                    "failed to write runtime readiness marker {}",
+                    path.display()
+                )
+            })?;
+            *marked = true;
+        }
+    } else if *marked || path.exists() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove runtime readiness marker {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+        *marked = false;
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

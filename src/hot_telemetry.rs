@@ -58,6 +58,7 @@ struct HotTelemetryContext {
 
 struct PairTelemetryContext {
     pair_id: String,
+    chain_id: u64,
     symbol: String,
     token_a_symbol: String,
     token_b_symbol: String,
@@ -94,6 +95,7 @@ pub fn channel(
         .iter()
         .map(|pair| PairTelemetryContext {
             pair_id: pair.pair_id.clone(),
+            chain_id: pair.chain_id,
             symbol: pair.symbol.clone(),
             token_a_symbol: pair.token_a_symbol.clone(),
             token_b_symbol: pair.token_b_symbol.clone(),
@@ -166,7 +168,7 @@ impl HotTelemetryHandle {
         &self,
         quote: &TopOfBook,
         evaluation: PairEvaluation,
-        world_chain_block: u64,
+        chain_block: u64,
         calculation_time_us: u128,
         trigger: &'static str,
     ) {
@@ -175,7 +177,7 @@ impl HotTelemetryHandle {
             .try_send(HotEvaluationTelemetry {
                 quote: quote.clone(),
                 evaluation,
-                world_chain_block,
+                world_chain_block: chain_block,
                 calculation_time_us,
                 decision_latency_us: quote.received_at.elapsed().as_micros(),
                 trigger,
@@ -288,6 +290,8 @@ impl HotTelemetryTask {
             json!({
                 "engine_id": self.context.engine_id,
                 "pair_id": pair.pair_id,
+                "chain_id": pair.chain_id,
+                "chain_block": world_chain_block,
                 "symbol": pair.symbol,
                 "update_id": quote.update_id,
                 "world_chain_block": world_chain_block,
@@ -324,6 +328,8 @@ impl HotTelemetryTask {
                     json!({
                         "engine_id": self.context.engine_id,
                         "pair_id": pair.pair_id,
+                        "chain_id": pair.chain_id,
+                        "chain_block": world_chain_block,
                         "symbol": pair.symbol,
                         "update_id": quote.update_id,
                         "world_chain_block": world_chain_block,
