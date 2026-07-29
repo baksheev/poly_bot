@@ -263,6 +263,26 @@ impl ClmmPool {
         zero_for_one: bool,
         amount_out: U256,
     ) -> anyhow::Result<U256> {
+        self.quote_exact_out_amount_in_impl(zero_for_one, amount_out, true)
+    }
+
+    /// Computes the input capacity reached while walking toward a bounded
+    /// exact-output amount. Unlike a quote, exhaustion returns the reachable
+    /// input capacity, matching a bounded prepared curve's result capacity.
+    pub(crate) fn exact_output_result_capacity_bounded(
+        &self,
+        zero_for_one: bool,
+        maximum_amount_out: U256,
+    ) -> anyhow::Result<U256> {
+        self.quote_exact_out_amount_in_impl(zero_for_one, maximum_amount_out, false)
+    }
+
+    fn quote_exact_out_amount_in_impl(
+        &self,
+        zero_for_one: bool,
+        amount_out: U256,
+        require_full_output: bool,
+    ) -> anyhow::Result<U256> {
         ensure!(!amount_out.is_zero(), "amount out must be positive");
         ensure!(amount_out < (U256::ONE << 255), "amount out exceeds int256");
 
@@ -273,11 +293,15 @@ impl ClmmPool {
         };
         let mut amount_remaining = amount_out;
         let mut amount_in = U256::ZERO;
+        let mut prepared_result_capacity = U256::ZERO;
         let mut sqrt_price_x96 = self.sqrt_price_x96;
         let mut tick = self.tick;
         let mut liquidity = self.liquidity;
 
-        while !amount_remaining.is_zero() && sqrt_price_x96 != sqrt_price_limit_x96 {
+        while !amount_remaining.is_zero()
+            && sqrt_price_x96 != sqrt_price_limit_x96
+            && liquidity != 0
+        {
             let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
                 &self.tick_bitmap,
                 tick,
@@ -309,6 +333,9 @@ impl ClmmPool {
                 .checked_add(step_in)
                 .and_then(|value| value.checked_add(fee_amount))
                 .context("swap input overflow")?;
+            if !step_out.is_zero() {
+                prepared_result_capacity = amount_in;
+            }
             sqrt_price_x96 = sqrt_after;
 
             if sqrt_after == sqrt_price_next_x96 {
@@ -338,10 +365,14 @@ impl ClmmPool {
             }
         }
 
-        if !amount_remaining.is_zero() {
+        if require_full_output && !amount_remaining.is_zero() {
             return Err(InsufficientLiquidity.into());
         }
-        Ok(amount_in)
+        Ok(if require_full_output {
+            amount_in
+        } else {
+            prepared_result_capacity
+        })
     }
 
     /// Precomputes the exact-input path for one swap direction.
@@ -362,6 +393,22 @@ impl ClmmPool {
             zero_for_one,
             PreparedQuoteKind::ExactInput,
             maximum_amount_in,
+        )
+    }
+
+    /// Rebuilds an exact-input curve while retaining the previous curve's
+    /// segment allocation. The previous contents are never observed.
+    pub(crate) fn prepare_exact_input_curve_bounded_reusing(
+        &self,
+        zero_for_one: bool,
+        maximum_amount_in: U256,
+        previous: PreparedQuoteCurve,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve_reusing(
+            zero_for_one,
+            PreparedQuoteKind::ExactInput,
+            maximum_amount_in,
+            Some(previous),
         )
     }
 
@@ -386,11 +433,37 @@ impl ClmmPool {
         )
     }
 
+    /// Rebuilds an exact-output curve while retaining the previous curve's
+    /// segment allocation. The previous contents are never observed.
+    pub(crate) fn prepare_exact_output_curve_bounded_reusing(
+        &self,
+        zero_for_one: bool,
+        maximum_amount_out: U256,
+        previous: PreparedQuoteCurve,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve_reusing(
+            zero_for_one,
+            PreparedQuoteKind::ExactOutput,
+            maximum_amount_out,
+            Some(previous),
+        )
+    }
+
     fn prepare_quote_curve(
         &self,
         zero_for_one: bool,
         kind: PreparedQuoteKind,
         maximum_specified: U256,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        self.prepare_quote_curve_reusing(zero_for_one, kind, maximum_specified, None)
+    }
+
+    fn prepare_quote_curve_reusing(
+        &self,
+        zero_for_one: bool,
+        kind: PreparedQuoteKind,
+        maximum_specified: U256,
+        previous: Option<PreparedQuoteCurve>,
     ) -> anyhow::Result<PreparedQuoteCurve> {
         ensure!(
             !maximum_specified.is_zero(),
@@ -407,8 +480,15 @@ impl ClmmPool {
         };
         // Sparse V3 tails can cross more than one hundred empty bitmap words
         // inside the reviewed execution envelope. A bounded initial reserve
-        // avoids allocator/copy tails during owner-side curve publication.
-        let mut segments = Vec::with_capacity(PREPARED_CURVE_INITIAL_SEGMENT_CAPACITY);
+        // avoids allocator/copy tails during initial hydration. Refreshes
+        // retain that allocation across pool generations.
+        let mut segments = if let Some(previous) = previous {
+            let mut segments = previous.segments;
+            segments.clear();
+            segments
+        } else {
+            Vec::with_capacity(PREPARED_CURVE_INITIAL_SEGMENT_CAPACITY)
+        };
         let mut specified_total = U256::ZERO;
         let mut result_total = U256::ZERO;
         let mut sqrt_price_x96 = self.sqrt_price_x96;
@@ -920,6 +1000,102 @@ mod tests {
                 exact_out.result_capacity(),
                 exact_out.quote(maximum).unwrap()
             );
+            assert_eq!(
+                exact_out.result_capacity(),
+                pool.exact_output_result_capacity_bounded(zero_for_one, maximum)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_exact_output_capacity_preserves_exhausted_liquidity_behavior() {
+        let pool = pool();
+        let maximum = (U256::ONE << 255) - U256::ONE;
+
+        for zero_for_one in [true, false] {
+            let prepared = pool
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            assert!(prepared.specified_capacity() < maximum);
+            assert_eq!(
+                pool.exact_output_result_capacity_bounded(zero_for_one, maximum)
+                    .unwrap(),
+                prepared.result_capacity()
+            );
+            assert!(
+                pool.quote_exact_out_amount_in(zero_for_one, maximum)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_prepared_curve_rebuilds_retain_segment_allocations() {
+        let mut pool = ClmmPool::new(
+            3_000,
+            60,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        pool.set_tick(-120, 1_000_000_000, 1_000_000_000).unwrap();
+        pool.set_tick(120, 1_000_000_000, -1_000_000_000).unwrap();
+        let maximum = U256::from(20_000_u64);
+
+        for zero_for_one in [true, false] {
+            let previous_exact_input = pool
+                .prepare_exact_input_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let exact_input_capacity = previous_exact_input.segments.capacity();
+            let previous_exact_output = pool
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let exact_output_capacity = previous_exact_output.segments.capacity();
+            let next_tick = if zero_for_one { -1 } else { 1 };
+            pool.apply_swap_head(
+                get_sqrt_ratio_at_tick(next_tick).unwrap(),
+                next_tick,
+                1_000_000_000,
+            )
+            .unwrap();
+
+            let rebuilt_exact_input = pool
+                .prepare_exact_input_curve_bounded_reusing(
+                    zero_for_one,
+                    maximum,
+                    previous_exact_input,
+                )
+                .unwrap();
+            assert_eq!(
+                rebuilt_exact_input.segments.capacity(),
+                exact_input_capacity
+            );
+            let rebuilt_exact_output = pool
+                .prepare_exact_output_curve_bounded_reusing(
+                    zero_for_one,
+                    maximum,
+                    previous_exact_output,
+                )
+                .unwrap();
+            assert_eq!(
+                rebuilt_exact_output.segments.capacity(),
+                exact_output_capacity
+            );
+
+            for amount in [U256::ONE, maximum / U256::from(2_u8), maximum] {
+                assert_eq!(
+                    rebuilt_exact_input.quote(amount).unwrap(),
+                    pool.quote_exact_in_amount_out(zero_for_one, amount)
+                        .unwrap()
+                );
+                assert_eq!(
+                    rebuilt_exact_output.quote(amount).unwrap(),
+                    pool.quote_exact_out_amount_in(zero_for_one, amount)
+                        .unwrap()
+                );
+            }
         }
     }
 

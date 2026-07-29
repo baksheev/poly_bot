@@ -172,6 +172,7 @@ pub struct PreparedPoolBuildRequest {
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
     estimated_build_segments: usize,
+    previous_prepared: Option<PreparedPoolQuotes>,
     timing: PreparedPoolBuildTimingHandle,
 }
 
@@ -575,14 +576,15 @@ impl OpportunityEngine {
             .copied()
             .context("opportunity pool generation index is invalid")?
             .saturating_add(1);
-        let estimated_build_segments = self
+        let previous_prepared = self
             .prepared_pools
-            .get(pool_index)
+            .get_mut(pool_index)
             .context("prepared pool estimate index is invalid")?
+            .take();
+        let estimated_build_segments = previous_prepared
             .as_ref()
             .map_or(usize::MAX, PreparedPoolQuotes::total_segments);
         self.pool_generations[pool_index] = generation;
-        self.prepared_pools[pool_index] = None;
         self.invalidate_pool(pool_index)?;
         let pair = &self.pairs[pair_index];
         let hydrated = dex.pool(pool_index)?;
@@ -594,6 +596,7 @@ impl OpportunityEngine {
             exact_input_zero_for_one: hydrated.token0 == pair.token_b,
             token_a_limit: pair.prepared_token_a_limit,
             estimated_build_segments,
+            previous_prepared,
             timing: PreparedPoolBuildTimingHandle::new(),
         })
     }
@@ -720,6 +723,7 @@ impl PreparedPoolBuildRequest {
             self.exact_input_zero_for_one,
             self.token_a_limit,
             self.generation,
+            self.previous_prepared,
         )?;
         let build_time_us = started.elapsed().as_micros();
         self.timing.mark_build_finished();
@@ -744,6 +748,9 @@ impl PreparedPoolBuildBatch {
             .find(|queued| queued.pool_index == request.pool_index)
         {
             request.estimated_build_segments = queued.estimated_build_segments;
+            if request.previous_prepared.is_none() {
+                request.previous_prepared = queued.previous_prepared.take();
+            }
             *queued = request;
         } else {
             self.requests.push(request);
@@ -820,6 +827,7 @@ fn prepare_pool_quotes(
         exact_input_zero_for_one,
         pair.prepared_token_a_limit,
         generation,
+        None,
     )
 }
 
@@ -829,34 +837,63 @@ fn prepare_pool_quotes_from_pool(
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
     _generation: u64,
+    previous: Option<PreparedPoolQuotes>,
 ) -> anyhow::Result<PreparedPoolQuotes> {
-    let token_a_exact_input =
-        pool.prepare_exact_input_curve_bounded(exact_output_zero_for_one, token_a_limit)?;
+    let (previous_exact_output, previous_exact_input, previous_token_a_exact_input) = previous
+        .map_or((None, None, None), |previous| {
+            let [exact_output, exact_input] = previous.by_direction;
+            (
+                Some(exact_output),
+                Some(exact_input),
+                Some(previous.token_a_exact_input),
+            )
+        });
+    let token_a_exact_input = if let Some(previous) = previous_token_a_exact_input {
+        pool.prepare_exact_input_curve_bounded_reusing(
+            exact_output_zero_for_one,
+            token_a_limit,
+            previous,
+        )?
+    } else {
+        pool.prepare_exact_input_curve_bounded(exact_output_zero_for_one, token_a_limit)?
+    };
     let exact_output_token_b_limit = token_a_exact_input.result_capacity();
     ensure!(
         !exact_output_token_b_limit.is_zero(),
         "DEX-buy execution envelope has no token-B output"
     );
 
-    let token_a_exact_output =
-        pool.prepare_exact_output_curve_bounded(exact_input_zero_for_one, token_a_limit)?;
-    let exact_input_token_b_limit = token_a_exact_output.result_capacity();
+    let exact_input_token_b_limit =
+        pool.exact_output_result_capacity_bounded(exact_input_zero_for_one, token_a_limit)?;
     ensure!(
         !exact_input_token_b_limit.is_zero(),
         "DEX-sell execution envelope has no token-B input"
     );
 
+    let exact_output = if let Some(previous) = previous_exact_output {
+        pool.prepare_exact_output_curve_bounded_reusing(
+            exact_output_zero_for_one,
+            exact_output_token_b_limit,
+            previous,
+        )?
+    } else {
+        pool.prepare_exact_output_curve_bounded(
+            exact_output_zero_for_one,
+            exact_output_token_b_limit,
+        )?
+    };
+    let exact_input = if let Some(previous) = previous_exact_input {
+        pool.prepare_exact_input_curve_bounded_reusing(
+            exact_input_zero_for_one,
+            exact_input_token_b_limit,
+            previous,
+        )?
+    } else {
+        pool.prepare_exact_input_curve_bounded(exact_input_zero_for_one, exact_input_token_b_limit)?
+    };
+
     Ok(PreparedPoolQuotes {
-        by_direction: [
-            pool.prepare_exact_output_curve_bounded(
-                exact_output_zero_for_one,
-                exact_output_token_b_limit,
-            )?,
-            pool.prepare_exact_input_curve_bounded(
-                exact_input_zero_for_one,
-                exact_input_token_b_limit,
-            )?,
-        ],
+        by_direction: [exact_output, exact_input],
         token_a_exact_input,
         token_a_limit,
         exact_output_token_b_limit,
@@ -1832,7 +1869,9 @@ mod tests {
         let expected_generation = current.generation();
         let expected_estimate = superseded.estimated_build_segments;
         assert_ne!(expected_estimate, usize::MAX);
+        assert!(superseded.previous_prepared.is_some());
         assert_eq!(current.estimated_build_segments, usize::MAX);
+        assert!(current.previous_prepared.is_none());
         let mut batch = PreparedPoolBuildBatch::default();
 
         batch.queue(superseded);
@@ -1842,6 +1881,7 @@ mod tests {
         let queued = batch.drain().next().unwrap();
         assert_eq!(queued.generation(), expected_generation);
         assert_eq!(queued.estimated_build_segments, expected_estimate);
+        assert!(queued.previous_prepared.is_some());
         assert!(batch.is_empty());
     }
 

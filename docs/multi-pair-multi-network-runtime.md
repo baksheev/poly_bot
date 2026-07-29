@@ -1029,6 +1029,17 @@ tick calculation, while sparse empty-word traversal avoids recalculating the
 same deterministic boundary prices after every swap. Exact quote parity and
 rounding remain regression-tested at every segment boundary.
 
+Subsequent generations retain the three published curve-vector allocations
+instead of freeing and reallocating them for every Swap. Coalescing transfers
+those buffers from the superseded request to the newest request for the same
+pool. The reverse-direction token-A exact-output envelope limit is calculated
+with the same allocation-free bounded traversal used as the curve oracle rather
+than materializing a fourth temporary curve whose segments were immediately
+discarded. Reachable-capacity behavior remains unchanged if liquidity ends
+inside the configured envelope. The three published curves and every boundary quote remain
+byte-for-byte equivalent to the iterative CLMM math; this changes allocation
+work only, not sizing, admission, slippage, or execution semantics.
+
 `m0_cohort.sql` is the authoritative cohort gate in
 `scripts/report-m0-performance`: WLD percentile claims remain `collecting`
 until the selected half-open window contains at least 100,000 strategy frames,
