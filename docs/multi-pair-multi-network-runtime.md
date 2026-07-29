@@ -1473,6 +1473,29 @@ replacement overload, and non-mutating sink proofs are reported by
 `scripts/report-m4-hot-path-runtime START_UTC END_UTC`, followed by the
 unchanged WLD M0 regression report.
 
+Production acceptance used revision
+`03d474926f948bfe4f9207e313b092b8279228ac` (CI `30479065217`, Deploy GKE
+`30479474198`) and image
+`sha256:f0dad2465f8bb910dae10a22a9ceb7765ce6b0ce2b930ad2684d903e39844695`.
+The sole Pod `arb-bot-77d458f8cc-9q2ck` started at
+`2026-07-29T18:27:23Z`, became ready with both containers and zero restarts,
+and proved an empty pre-ready backlog after applying four World Chain and
+eight Arbitrum startup DEX events. GCE remained `TERMINATED`.
+
+The final revision's `[18:27:23Z,18:36:22Z)` cohort contained 735 ESP
+exhaustive sizing jobs (p99/max 34/42 microseconds; queue p99/max 81/282
+microseconds), 764 direct ESP baselines (p99/max 15/27 microseconds), and
+3,390 WLD baselines (p99/max 18/34 microseconds), with no calculation-budget
+breach or hot telemetry drop. The immediately preceding production revision
+had identical hot-path code and contributed 1,334 additional ESP sizing jobs;
+the final change only reclassified fully known terminal DEX reverts from error
+to warning. WLD JSON parse, depth, and socket-to-decision p99 were 6, 12, and
+34 microseconds. World Chain fee-500 DEX receive p99/max was 43/43
+microseconds and prepared publication p99/max was 140/140 microseconds, below
+the frozen 175/200-microsecond hard limits. CPU max was 0.0242 core; cgroup
+memory current/peak was 84.9/88.5 MB. CPU throttling, memory pressure/OOM,
+container restarts, production errors, and hot-path drops were all zero.
+
 ### M5 — Portfolio owner and shared capital allocation
 
 Deliver:
@@ -1507,6 +1530,28 @@ Rollback:
 
 - retain the combined market-data runtime but use the v12 inventory/rebalance
   adapter for the only live pair.
+
+The compiled graph now emits one `CompiledPortfolioRuntimePlan`. Every venue
+asset is assigned to exactly one account- or chain/wallet-scoped
+`InventoryLocation` and must have a reviewed economic-asset mapping and exact
+decimals. The atomic owner keys observations and pre-aggregated reservations by
+`(inventory_location, venue_asset_id)`; it therefore cannot alias World Chain
+USDC with Arbitrum USDC or count account-scoped Binance USDC once per strategy.
+Trade and rebalance claims share this owner and settlement generations are
+recorded for explicit locations rather than the ambiguous `Binance/Wallet`
+pair.
+
+The account-wide `CapitalAllocator` validates every observed and reserved
+asset, in-flight transfer, proposal credit, and fee against the economic
+mapping. `disabled` returns no proposal; production `shadow` may produce only
+conserved proposals with `external_mutation_authorized=false`. World Chain
+continues to execute the frozen tracker through
+`V12RebalanceParityAdapter`; snapshot replay compares adapter and control
+decisions exactly. Arbitrum startup wallet inventory enters the same portfolio
+owner but its execution owner and allocator remain structurally non-mutating.
+Scheduler, portfolio snapshot, reservation snapshot, allocator validation, and
+unchanged WLD hot tails are reported by
+`scripts/report-m5-portfolio-runtime START_UTC END_UTC`.
 
 ### M6 — Durable trade sagas and per-network EVM owners
 

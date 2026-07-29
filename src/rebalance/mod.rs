@@ -12,4 +12,6 @@ pub use planner::{
     RebalancePolicy, Route, RouteCandidate, WithdrawalRules, plan_rebalance,
 };
 pub use runtime::{RebalanceExecutor, RebalanceRuntimeLimits};
-pub use tracker::{RebalanceEvaluation, RebalanceTracker, route_candidates_from_capital};
+pub use tracker::{
+    RebalanceEvaluation, RebalanceTracker, V12RebalanceParityAdapter, route_candidates_from_capital,
+};

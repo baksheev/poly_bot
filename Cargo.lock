@@ -507,6 +507,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hmac",
+ "proptest",
  "reqwest",
  "rust_decimal",
  "serde",

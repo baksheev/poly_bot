@@ -29,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uniswap_v3_math = "0.6.2"
 
+[dev-dependencies]
+proptest = "1.11"
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

@@ -20,6 +20,12 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Add the M5 account-wide portfolio owner. Inventory is now keyed by exact
+  account or chain/wallet location plus reviewed venue asset ID, trade and
+  rebalance claims share pre-aggregated atomic reservations, settlement
+  barriers name their locations, and World/Arbitrum assets cannot collide.
+  The conservation-checked allocator runs non-mutating in shadow while the
+  live World Chain rebalance remains behind the exact v12 parity adapter.
 - Classify a journaled DEX `status=0` receipt and a proven pre-submission
   rejection as expected terminal warnings while retaining `ERROR` for unknown
   DEX outcomes, accounting failures, and confirmation failures. Receipt

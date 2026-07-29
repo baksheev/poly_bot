@@ -34,7 +34,7 @@ use crate::{
         channel as hot_telemetry_channel,
     },
     inventory::{
-        InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue, ReservationPurpose,
+        InventoryClaim, InventoryKey, InventoryLocation, InventoryReservations, ReservationPurpose,
         ReservationRequest,
     },
     market_data::{MarketEvent, alchemy::DexStreamEvent},
@@ -42,7 +42,13 @@ use crate::{
         ArbitrageDirection, OpportunityEngine, PairEvaluation, PreparedPoolBuildRequest,
         PreparedPoolBuildResult, TradeEvaluation,
     },
-    rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
+    portfolio::{
+        CapitalAllocatorShadowHandle, CapitalAllocatorShadowTask, PortfolioCatalog,
+        capital_allocator_shadow_channel,
+    },
+    rebalance::{
+        Direction, RebalanceEvaluation, RebalanceExecutionOperation, V12RebalanceParityAdapter,
+    },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{StrategyEvaluation, StrategyEvaluator, measure_strategy_evaluation},
     telemetry::{
@@ -90,11 +96,13 @@ pub struct TradingEngine {
     state: RuntimeState,
     dex: DexMirror,
     opportunities: OpportunityEngine,
-    rebalance: RebalanceTracker,
+    rebalance: V12RebalanceParityAdapter,
     telemetry: TelemetryHandle,
     hot_telemetry: HotTelemetryHandle,
     paper_trades: Option<PaperTradeHandle>,
     inventory: InventoryReservations,
+    portfolio_catalog: Arc<PortfolioCatalog>,
+    capital_allocator: CapitalAllocatorShadowHandle,
     binance_asset_decimals: BTreeMap<String, u8>,
     binance_inventory_generation: u64,
     binance_user_data_connected: bool,
@@ -131,6 +139,7 @@ pub struct TradingExecutionHandles {
     pub paper_trades: Option<PaperTradeHandle>,
     pub entry_preflight: EntryPreflightHandle,
     pub binance_asset_decimals: BTreeMap<String, u8>,
+    pub portfolio_catalog: Arc<PortfolioCatalog>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +166,7 @@ struct RebalanceSettlementBarrier {
     direction: Direction,
     binance_after: Instant,
     wallet_after: Instant,
+    settlement_locations: [InventoryLocation; 2],
     started_at: Instant,
 }
 
@@ -404,13 +414,6 @@ fn rebalance_health_state(
     }
 }
 
-fn inventory_venue_label(venue: InventoryVenue) -> &'static str {
-    match venue {
-        InventoryVenue::Binance => "binance",
-        InventoryVenue::Wallet => "wallet",
-    }
-}
-
 fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveCandidate) -> bool {
     candidate.trade_notional > current.trade_notional
         || (candidate.trade_notional == current.trade_notional
@@ -500,10 +503,10 @@ impl TradingEngine {
         domain_config: Arc<LoadedDomainConfig>,
         dex: DexMirror,
         telemetry: TelemetryHandle,
-        rebalance: RebalanceTracker,
+        rebalance: V12RebalanceParityAdapter,
         execution: TradingExecutionHandles,
         binance_fee_bps: BinanceFeeBps,
-    ) -> anyhow::Result<(Self, HotTelemetryTask)> {
+    ) -> anyhow::Result<(Self, HotTelemetryTask, CapitalAllocatorShadowTask)> {
         let strategy_price_transport_silence_limits_ms =
             domain_config.strategy_price_transport_silence_limits_ms();
         let symbols = strategy_price_transport_silence_limits_ms
@@ -585,6 +588,12 @@ impl TradingEngine {
         }
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
+        let portfolio_catalog = execution.portfolio_catalog;
+        let (capital_allocator, capital_allocator_task) = capital_allocator_shadow_channel(
+            portfolio_catalog.as_ref(),
+            telemetry.clone(),
+            config.engine_id.clone(),
+        );
         let require_binance_depth =
             requires_depth_for_runtime_phase(config.arbitrage_execution_mode.as_str());
         Ok((
@@ -603,6 +612,8 @@ impl TradingEngine {
                 hot_telemetry,
                 paper_trades: execution.paper_trades,
                 inventory: InventoryReservations::default(),
+                capital_allocator,
+                portfolio_catalog,
                 binance_asset_decimals: execution.binance_asset_decimals,
                 binance_inventory_generation: 0,
                 binance_user_data_connected: false,
@@ -635,6 +646,7 @@ impl TradingEngine {
                 pending_adaptive_sizing: Vec::new(),
             },
             hot_telemetry_task,
+            capital_allocator_task,
         ))
     }
 
@@ -721,15 +733,17 @@ impl TradingEngine {
                         locked_assets.push(balance.asset.clone());
                     }
                     if let Ok(decimals) = self.token_decimals(&balance.asset) {
+                        let key = self
+                            .portfolio_key(&self.binance_inventory_location()?, &balance.asset)?;
                         balances.push((
-                            balance.asset.clone(),
+                            key.venue_asset_id,
                             decimal_to_base_units_floor(balance.free, decimals)?,
                         ));
                     }
                 }
                 if !balances.is_empty() {
-                    self.inventory.update_venue_assets(
-                        InventoryVenue::Binance,
+                    self.inventory.update_location_assets(
+                        self.binance_inventory_location()?,
                         self.binance_inventory_generation,
                         balances,
                     )?;
@@ -1423,7 +1437,9 @@ impl TradingEngine {
                 let inventory_corrections = balances
                     .iter()
                     .filter_map(|(asset, rest_amount)| {
-                        let key = InventoryKey::new(InventoryVenue::Binance, asset.clone()).ok()?;
+                        let key = self
+                            .portfolio_key(&self.binance_inventory_location().ok()?, asset)
+                            .ok()?;
                         let observed_amount = self.inventory.observed(&key)?;
                         (observed_amount != *rest_amount).then(|| {
                             json!({
@@ -1434,10 +1450,18 @@ impl TradingEngine {
                         })
                     })
                     .collect::<Vec<_>>();
-                self.inventory.update_venue(
-                    InventoryVenue::Binance,
+                let binance_location = self.binance_inventory_location()?;
+                let inventory_balances = balances
+                    .iter()
+                    .map(|(symbol, amount)| {
+                        self.portfolio_key(&binance_location, symbol)
+                            .map(|key| (key.venue_asset_id, *amount))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                self.inventory.update_location(
+                    binance_location,
                     self.binance_inventory_generation,
-                    balances,
+                    inventory_balances,
                 )?;
                 // REST is the independent full reconciliation boundary. It
                 // clears diagnostic User Data anomalies; neither foreign/open
@@ -1494,10 +1518,16 @@ impl TradingEngine {
                 let wallet_inventory = snapshot
                     .token_balances
                     .iter()
-                    .map(|balance| (balance.symbol.to_string(), balance.base_units))
-                    .collect::<Vec<_>>();
-                self.inventory.update_venue(
-                    InventoryVenue::Wallet,
+                    .map(|balance| {
+                        self.portfolio_key(
+                            &self.wallet_inventory_location(snapshot.chain_id)?,
+                            balance.symbol.as_ref(),
+                        )
+                        .map(|key| (key.venue_asset_id, balance.base_units))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                self.inventory.update_location(
+                    self.wallet_inventory_location(snapshot.chain_id)?,
                     snapshot.block_number,
                     wallet_inventory,
                 )?;
@@ -1566,6 +1596,7 @@ impl TradingEngine {
             }
         }
         self.reconcile_inventory_settlements(&reservations_before);
+        self.evaluate_capital_allocator_shadow();
         self.evaluate_rebalance();
         self.refresh_phase(Instant::now());
         Ok(())
@@ -1584,9 +1615,20 @@ impl TradingEngine {
             .action
             .as_ref()
             .context("rebalance execution has no action")?;
-        let venue = match action.direction {
-            Direction::BinanceToWallet => InventoryVenue::Binance,
-            Direction::WalletToBinance => InventoryVenue::Wallet,
+        let pair_chain_id = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.execution_enabled)
+            .context("rebalance requires one executable pair")?
+            .chain
+            .chain_id;
+        let binance_location = self.binance_inventory_location()?;
+        let wallet_location = self.wallet_inventory_location(pair_chain_id)?;
+        let source_location = match action.direction {
+            Direction::BinanceToWallet => binance_location.clone(),
+            Direction::WalletToBinance => wallet_location.clone(),
         };
         let reservation_id = format!("rebalance-reservation-{}", self.next_inventory_reservation);
         self.next_inventory_reservation = self
@@ -1597,12 +1639,10 @@ impl TradingEngine {
             operation_id: reservation_id.clone(),
             purpose: ReservationPurpose::Rebalance,
             claims: vec![InventoryClaim {
-                key: InventoryKey::new(venue, evaluation.token_symbol.clone())?,
+                key: self.portfolio_key(&source_location, &evaluation.token_symbol)?,
                 amount: action.amount,
             }],
-            settlement_venues: [InventoryVenue::Binance, InventoryVenue::Wallet]
-                .into_iter()
-                .collect(),
+            settlement_locations: [binance_location, wallet_location].into_iter().collect(),
         })?;
         self.rebalance_inventory_reservation = Some(reservation_id.clone());
         self.telemetry.emit(
@@ -1611,12 +1651,48 @@ impl TradingEngine {
                 "engine_id": self.config.engine_id,
                 "operation_id": reservation_id,
                 "purpose": "rebalance",
-                "venue": format!("{venue:?}"),
+                "inventory_location": source_location.stable_id(),
+                "inventory_location_kind": source_location.kind_label(),
                 "asset": evaluation.token_symbol,
                 "amount_base_units": action.amount.to_string(),
             }),
         );
         Ok(Some(evaluation))
+    }
+
+    pub fn on_portfolio_wallet_snapshot(
+        &mut self,
+        snapshot: &crate::balances::WalletBalanceSnapshot,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            snapshot.batch_complete,
+            "partial wallet batch cannot enter the portfolio owner"
+        );
+        let location = self.wallet_inventory_location(snapshot.chain_id)?;
+        let balances = snapshot
+            .token_balances
+            .iter()
+            .map(|balance| {
+                self.portfolio_key(&location, balance.symbol.as_ref())
+                    .map(|key| (key.venue_asset_id, balance.base_units))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.inventory
+            .update_location(location.clone(), snapshot.block_number, balances)?;
+        self.telemetry.emit(
+            "portfolio_wallet_snapshot",
+            json!({
+                "engine_id": self.config.engine_id,
+                "network_id": network_id(snapshot.chain_id),
+                "inventory_location_id": location.stable_id(),
+                "inventory_location_kind": location.kind_label(),
+                "venue_asset_count": snapshot.token_balances.len(),
+                "batch_complete": snapshot.batch_complete,
+                "external_mutation_authorized": snapshot.chain_id == 480,
+            }),
+        );
+        self.evaluate_capital_allocator_shadow();
+        Ok(())
     }
 
     pub fn on_rebalance_recovery_started(
@@ -1651,12 +1727,17 @@ impl TradingEngine {
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),
                 ) {
+                    let settlement_locations = [
+                        self.binance_inventory_location()?,
+                        self.wallet_inventory_location(wallet.chain_id)?,
+                    ];
                     self.rebalance_settlement = Some(RebalanceSettlementBarrier {
                         operation_id: operation.intent.operation_id.clone(),
                         token_symbol: operation.intent.token_symbol.clone(),
                         direction: operation.intent.direction,
                         binance_after: binance.observed_at,
                         wallet_after: wallet.observed_at,
+                        settlement_locations,
                         started_at: Instant::now(),
                     });
                 }
@@ -1714,12 +1795,17 @@ impl TradingEngine {
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),
                 ) {
+                    let settlement_locations = [
+                        self.binance_inventory_location()?,
+                        self.wallet_inventory_location(wallet.chain_id)?,
+                    ];
                     self.rebalance_settlement = Some(RebalanceSettlementBarrier {
                         operation_id: operation.intent.operation_id.clone(),
                         token_symbol: operation.intent.token_symbol.clone(),
                         direction: operation.intent.direction,
                         binance_after: binance.observed_at,
                         wallet_after: wallet.observed_at,
+                        settlement_locations,
                         started_at: Instant::now(),
                     });
                 }
@@ -1776,6 +1862,22 @@ impl TradingEngine {
                 })
             })
             .with_context(|| format!("no configured decimals for inventory asset {symbol}"))
+    }
+
+    fn binance_inventory_location(&self) -> anyhow::Result<InventoryLocation> {
+        InventoryLocation::binance(PRIMARY_BINANCE_ACCOUNT_ID)
+    }
+
+    fn wallet_inventory_location(&self, chain_id: u64) -> anyhow::Result<InventoryLocation> {
+        InventoryLocation::evm_wallet(network_id(chain_id), wallet_location_id(chain_id))
+    }
+
+    fn portfolio_key(
+        &self,
+        location: &InventoryLocation,
+        symbol: &str,
+    ) -> anyhow::Result<InventoryKey> {
+        self.portfolio_catalog.key(location, symbol)
     }
 
     fn reconcile_inventory_settlements(&mut self, reservations_before: &[String]) {
@@ -1839,6 +1941,11 @@ impl TradingEngine {
                     "operation_id": barrier.operation_id,
                     "token": barrier.token_symbol,
                     "direction": format!("{:?}", barrier.direction),
+                    "settlement_locations": barrier
+                        .settlement_locations
+                        .iter()
+                        .map(InventoryLocation::stable_id)
+                        .collect::<Vec<_>>(),
                 }),
             );
         }
@@ -1916,6 +2023,10 @@ impl TradingEngine {
                 );
             }
         }
+    }
+
+    fn evaluate_capital_allocator_shadow(&self) {
+        self.capital_allocator.submit(&self.inventory);
     }
 
     fn on_binance_quote(
@@ -2728,24 +2839,26 @@ impl TradingEngine {
         let dex_input_claim = U256::from(dex_plan.amount_in_base_units);
         let (token_a_claim, token_b_claim) =
             exact_execution_envelope_amounts(direction, dex_input_claim, trade);
+        let binance_location = self.binance_inventory_location()?;
+        let wallet_location = self.wallet_inventory_location(pair_chain_id)?;
         let claims = match direction {
             TradeDirection::BuyTokenBOnDexSellOnCex => vec![
                 InventoryClaim {
-                    key: InventoryKey::new(InventoryVenue::Wallet, token_a_symbol)?,
+                    key: self.portfolio_key(&wallet_location, &token_a_symbol)?,
                     amount: token_a_claim,
                 },
                 InventoryClaim {
-                    key: InventoryKey::new(InventoryVenue::Binance, token_b_symbol)?,
+                    key: self.portfolio_key(&binance_location, &token_b_symbol)?,
                     amount: token_b_claim,
                 },
             ],
             TradeDirection::BuyTokenBOnCexSellOnDex => vec![
                 InventoryClaim {
-                    key: InventoryKey::new(InventoryVenue::Binance, token_a_symbol)?,
+                    key: self.portfolio_key(&binance_location, &token_a_symbol)?,
                     amount: token_a_claim,
                 },
                 InventoryClaim {
-                    key: InventoryKey::new(InventoryVenue::Wallet, token_b_symbol)?,
+                    key: self.portfolio_key(&wallet_location, &token_b_symbol)?,
                     amount: token_b_claim,
                 },
             ],
@@ -2754,9 +2867,7 @@ impl TradingEngine {
             operation_id: plan_id.clone(),
             purpose: ReservationPurpose::TradePrimary,
             claims: claims.clone(),
-            settlement_venues: [InventoryVenue::Binance, InventoryVenue::Wallet]
-                .into_iter()
-                .collect(),
+            settlement_locations: [binance_location, wallet_location].into_iter().collect(),
         };
         let reservation_started = Instant::now();
         match reservation_precheck(&self.inventory, &request) {
@@ -2920,8 +3031,13 @@ impl TradingEngine {
                 let reserved = self.inventory.reserved(&claim.key);
                 let available = self.inventory.available(&claim.key).ok();
                 json!({
-                    "venue": inventory_venue_label(claim.key.venue),
-                    "asset": claim.key.asset.as_str(),
+                    "inventory_location_kind": claim.key.location.kind_label(),
+                    "inventory_location_id": claim.key.location.stable_id(),
+                    "venue_asset_id": claim.key.venue_asset_id.as_str(),
+                    "economic_asset_id": self
+                        .portfolio_catalog
+                        .economic_asset_id(&claim.key)
+                        .ok(),
                     "required_base_units": claim.amount.to_string(),
                     "observed_base_units": observed.map(|amount| amount.to_string()),
                     "reserved_base_units": reserved.to_string(),
@@ -3654,7 +3770,7 @@ mod tests {
         arbitrage::ArbitrageDirection as TradeDirection,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
-            InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue,
+            InventoryClaim, InventoryKey, InventoryLocation, InventoryReservations,
             ReservationPurpose, ReservationRequest,
         },
         opportunity::{ArbitrageDirection as SizingDirection, TradeEvaluation},
@@ -3798,21 +3914,19 @@ mod tests {
     #[test]
     fn active_identical_reservation_is_a_duplicate_not_an_inventory_shortage() {
         let mut inventory = InventoryReservations::default();
+        let location = InventoryLocation::binance("binance-spot:primary").unwrap();
+        let asset = "binance-spot:primary:asset:USDC";
         inventory
-            .update_venue(
-                InventoryVenue::Binance,
-                1,
-                [("USDC".to_owned(), U256::from(1_000))],
-            )
+            .update_location(location.clone(), 1, [(asset.to_owned(), U256::from(1_000))])
             .unwrap();
         let request = ReservationRequest {
             operation_id: "paper-plan-1".to_owned(),
             purpose: ReservationPurpose::TradePrimary,
             claims: vec![InventoryClaim {
-                key: InventoryKey::new(InventoryVenue::Binance, "USDC").unwrap(),
+                key: InventoryKey::new(location.clone(), asset).unwrap(),
                 amount: U256::from(100),
             }],
-            settlement_venues: [InventoryVenue::Binance].into_iter().collect(),
+            settlement_locations: [location].into_iter().collect(),
         };
 
         assert_eq!(
@@ -3997,6 +4111,10 @@ mod tests {
             direction: Direction::WalletToBinance,
             binance_after: now,
             wallet_after: now,
+            settlement_locations: [
+                InventoryLocation::binance("binance-spot:primary").unwrap(),
+                InventoryLocation::evm_wallet("eip155:480", "eip155:480:wallet:primary").unwrap(),
+            ],
             started_at: now,
         };
 

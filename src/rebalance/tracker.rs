@@ -42,6 +42,40 @@ pub struct RebalanceTracker {
     balanced: bool,
 }
 
+/// Explicit compatibility boundary for the only live M5 rebalance strategy.
+/// It delegates byte-for-byte to the frozen v12 tracker until allocator replay
+/// has proved a separately reviewed replacement.
+#[derive(Debug)]
+pub struct V12RebalanceParityAdapter {
+    inner: RebalanceTracker,
+}
+
+impl V12RebalanceParityAdapter {
+    pub fn new(inner: RebalanceTracker) -> Self {
+        Self { inner }
+    }
+
+    pub fn balanced(&self) -> bool {
+        self.inner.balanced()
+    }
+
+    pub fn evaluate(
+        &mut self,
+        binance: &BinanceBalanceSnapshot,
+        wallet: &WalletBalanceSnapshot,
+    ) -> anyhow::Result<Vec<RebalanceEvaluation>> {
+        self.inner.evaluate(binance, wallet)
+    }
+
+    pub fn mark_unbalanced(&mut self) {
+        self.inner.mark_unbalanced();
+    }
+
+    pub fn pending_action(&self) -> Option<RebalanceEvaluation> {
+        self.inner.pending_action()
+    }
+}
+
 impl RebalanceTracker {
     pub fn disabled() -> Self {
         Self {
@@ -306,7 +340,7 @@ mod tests {
         rebalance::{Direction, Route, RouteCandidate, WithdrawalRules},
     };
 
-    use super::{RebalanceTracker, route_candidates_from_capital};
+    use super::{RebalanceTracker, V12RebalanceParityAdapter, route_candidates_from_capital};
 
     fn direct_route() -> RouteCandidate {
         RouteCandidate {
@@ -482,6 +516,21 @@ mod tests {
             U256::from(3_000_000_000_u64)
         );
         assert!(!tracker.balanced());
+    }
+
+    #[test]
+    fn production_snapshot_replay_is_identical_through_v12_parity_adapter() {
+        let mut control = tracker();
+        let mut adapter = V12RebalanceParityAdapter::new(tracker());
+        for (binance_usdc, wallet_usdc) in [(5_000, 5_000), (2_000, 8_000), (5_000, 5_000)] {
+            let (binance, wallet) = snapshots(binance_usdc, wallet_usdc);
+            assert_eq!(
+                adapter.evaluate(&binance, &wallet).unwrap(),
+                control.evaluate(&binance, &wallet).unwrap()
+            );
+            assert_eq!(adapter.pending_action(), control.pending_action());
+            assert_eq!(adapter.balanced(), control.balanced());
+        }
     }
 
     #[test]

@@ -47,7 +47,7 @@ use arb_bot::{
         compiled::{
             CompatibilityRole, CompiledBinanceRuntimePlan, CompiledGraphSummary,
             CompiledHotPathRuntimePlan, CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan,
-            compile_manifest_to_path, load_compatibility_domain,
+            CompiledPortfolioRuntimePlan, compile_manifest_to_path, load_compatibility_domain,
         },
         config::{DexProvider, LoadedDomainConfig},
     },
@@ -66,9 +66,11 @@ use arb_bot::{
     opportunity::{
         ArbitrageDirection, OpportunityEngine, PreparedPoolBuildBatch, PreparedPoolBuildRequest,
     },
+    portfolio::PortfolioCatalog,
     rebalance::{
         RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
-        RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
+        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
+        route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -159,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
             let binance_runtime = selection.binance_runtime.map(Arc::new);
             let network_runtime = selection.network_runtime;
             let hot_path_runtime = selection.hot_path_runtime;
+            let portfolio_runtime = selection.portfolio_runtime;
             let domain_config = Arc::new(selection.config);
             let bootstrap = BootstrapTiming {
                 process_started_at,
@@ -171,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                 binance_runtime,
                 network_runtime,
                 hot_path_runtime,
+                portfolio_runtime,
                 bootstrap,
             )
             .await
@@ -1024,8 +1028,13 @@ async fn collect_prices(
         },
     ];
     if let Some(registry) = network_registry.as_ref() {
-        hydrate_network_wallet_registries(registry, wallet_owner, &telemetry, &config.engine_id)
-            .await?;
+        let _ = hydrate_network_wallet_registries(
+            registry,
+            wallet_owner,
+            &telemetry,
+            &config.engine_id,
+        )
+        .await?;
     }
     let (balance_heads, balance_head_receiver) = tokio::sync::watch::channel(mirror.latest_head());
     let balance_context = CollectorBalanceContext {
@@ -1516,6 +1525,7 @@ async fn run(
     compiled_binance_runtime: Option<Arc<CompiledBinanceRuntimePlan>>,
     compiled_network_runtime: Option<CompiledNetworkRuntimePlan>,
     compiled_hot_path_runtime: Option<CompiledHotPathRuntimePlan>,
+    compiled_portfolio_runtime: Option<CompiledPortfolioRuntimePlan>,
     bootstrap: BootstrapTiming,
 ) -> anyhow::Result<()> {
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
@@ -1758,6 +1768,13 @@ async fn run(
     } else {
         RebalanceTracker::disabled()
     };
+    let portfolio_runtime = compiled_portfolio_runtime
+        .context("run requires the compiled M5 portfolio runtime plan")?;
+    let portfolio_catalog = Arc::new(PortfolioCatalog::from_compiled(&portfolio_runtime)?);
+    ensure!(
+        portfolio_catalog.live_rebalance_adapter() == "world_chain_v12_parity",
+        "live WLD rebalance is not behind the reviewed v12 parity adapter"
+    );
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -1790,10 +1807,12 @@ async fn run(
                 .context("configured token_b address is invalid")?,
         },
     ];
-    if let Some(registry) = network_registry.as_ref() {
+    let portfolio_wallet_snapshots = if let Some(registry) = network_registry.as_ref() {
         hydrate_network_wallet_registries(registry, wallet_owner, &telemetry, &config.engine_id)
-            .await?;
-    }
+            .await?
+    } else {
+        Vec::new()
+    };
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -2110,12 +2129,12 @@ async fn run(
         let (_event_sender, events) = tokio::sync::mpsc::unbounded_channel();
         (None, None, events, None)
     };
-    let (primary_engine, hot_telemetry) = TradingEngine::new(
+    let (primary_engine, hot_telemetry, portfolio_allocator) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
         mirror,
         telemetry.clone(),
-        rebalance_tracker,
+        V12RebalanceParityAdapter::new(rebalance_tracker),
         arb_bot::engine::TradingExecutionHandles {
             paper_trades,
             entry_preflight,
@@ -2123,6 +2142,7 @@ async fn run(
                 .as_ref()
                 .map(|runtime| runtime.asset_decimals.clone())
                 .unwrap_or_default(),
+            portfolio_catalog: Arc::clone(&portfolio_catalog),
         },
         BinanceFeeBps {
             buy: binance_buy_fee_bps,
@@ -2179,6 +2199,7 @@ async fn run(
     } = shadow_stream;
     engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
+    let portfolio_allocator_task = tokio::spawn(portfolio_allocator.run());
     let shadow_hot_telemetry_task = tokio::spawn(shadow_hot_telemetry_writer.run());
     let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
         tokio::sync::mpsc::channel(4);
@@ -2228,6 +2249,11 @@ async fn run(
     }
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
     engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances))?;
+    for snapshot in &portfolio_wallet_snapshots {
+        if snapshot.chain_id != wallet_chain_id {
+            engine.on_portfolio_wallet_snapshot(snapshot)?;
+        }
+    }
     engine.on_user_data_connected(user_data_subscription_id);
     dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
     engine.start();
@@ -2316,6 +2342,13 @@ async fn run(
         hot_path_sizing_policy = "one_running_one_latest_pending_per_strategy",
         hot_path_shadow_strategy_id = %shadow_plan.strategy_id.as_str(),
         hot_path_shadow_external_mutation_authorized = false,
+        portfolio_inventory_key = "inventory_location+venue_asset_id",
+        portfolio_location_count = portfolio_catalog.location_count(),
+        portfolio_venue_asset_count = portfolio_catalog.asset_count(),
+        portfolio_economic_asset_count = portfolio_catalog.economic_asset_count(),
+        portfolio_allocator_mode = ?portfolio_catalog.allocator_mode(),
+        portfolio_external_mutation_authorized = false,
+        live_rebalance_adapter = portfolio_catalog.live_rebalance_adapter(),
         arbitrum_execution_enabled = network_registry
             .as_ref()
             .and_then(|registry| registry.get_by_chain_id(42_161).ok())
@@ -2746,6 +2779,7 @@ async fn run(
     }
     hot_telemetry_task.await??;
     shadow_hot_telemetry_task.await??;
+    portfolio_allocator_task.await?;
     writer_task.await??;
     if let Some(path) = runtime_ready_file
         && let Err(error) = std::fs::remove_file(&path)
@@ -3249,7 +3283,7 @@ async fn hydrate_network_wallet_registries(
     owner: Address,
     telemetry: &TelemetryHandle,
     engine_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<WalletBalanceSnapshot>> {
     let snapshots = try_join_all(registry.runtimes().map(|runtime| async move {
         let tokens = runtime
             .plan()
@@ -3286,10 +3320,12 @@ async fn hydrate_network_wallet_registries(
         Ok::<_, anyhow::Error>((runtime, snapshot))
     }))
     .await?;
+    let mut hydrated = Vec::with_capacity(snapshots.len());
     for (runtime, snapshot) in snapshots {
         emit_network_wallet_hydrated(telemetry, engine_id, runtime, &snapshot);
+        hydrated.push(snapshot);
     }
-    Ok(())
+    Ok(hydrated)
 }
 
 fn emit_network_wallet_hydrated(

@@ -536,6 +536,7 @@ pub struct CompatibilitySelection {
     pub binance_runtime: Option<CompiledBinanceRuntimePlan>,
     pub network_runtime: Option<CompiledNetworkRuntimePlan>,
     pub hot_path_runtime: Option<CompiledHotPathRuntimePlan>,
+    pub portfolio_runtime: Option<CompiledPortfolioRuntimePlan>,
 }
 
 /// Immutable account-scoped Binance topology consumed by the M2 runtime.
@@ -562,6 +563,42 @@ pub struct CompiledBinanceStreamShard {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompiledNetworkRuntimePlan {
     pub networks: Vec<CompiledNetworkPlan>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CompiledCapitalAllocatorMode {
+    Disabled,
+    Shadow,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CompiledInventoryLocation {
+    BinanceAccount {
+        account_id: BinanceAccountId,
+    },
+    EvmWallet {
+        network_id: NetworkId,
+        chain_id: u64,
+        wallet_location_id: WalletLocationId,
+    },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledPortfolioAsset {
+    pub location: CompiledInventoryLocation,
+    pub venue_asset_id: VenueAssetId,
+    pub economic_asset_id: EconomicAssetId,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
+/// Process-scoped M5 account and wallet ownership plan. Every venue asset has
+/// exactly one reviewed economic mapping and one exact inventory location.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledPortfolioRuntimePlan {
+    pub assets: Vec<CompiledPortfolioAsset>,
+    pub allocator_mode: CompiledCapitalAllocatorMode,
+    pub live_rebalance_adapter: String,
 }
 
 /// Process-scoped M4 routing plan. It is compiled from the same authoritative
@@ -1120,6 +1157,7 @@ impl CompiledDomainGraph {
             binance_runtime: Some(self.binance_runtime_plan()?),
             network_runtime: Some(self.network_runtime_plan(role)?),
             hot_path_runtime: Some(self.hot_path_runtime_plan(path)?),
+            portfolio_runtime: Some(self.portfolio_runtime_plan(role)?),
             graph_summary: Some(CompiledGraphSummary {
                 bundle_id: self.bundle.bundle_id.clone(),
                 projection_id: projection.id.clone(),
@@ -1508,6 +1546,102 @@ impl CompiledDomainGraph {
         );
         Ok(CompiledHotPathRuntimePlan { strategies })
     }
+
+    fn portfolio_runtime_plan(
+        &self,
+        role: CompatibilityRole,
+    ) -> anyhow::Result<CompiledPortfolioRuntimePlan> {
+        let mappings = self
+            .bundle
+            .asset_mappings
+            .iter()
+            .map(|mapping| {
+                (
+                    mapping.venue_asset_id.clone(),
+                    mapping.economic_asset_id.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let wallet_locations = self
+            .bundle
+            .wallet_locations
+            .iter()
+            .map(|location| (location.network_id.clone(), location))
+            .collect::<BTreeMap<_, _>>();
+        let networks = self
+            .bundle
+            .networks
+            .iter()
+            .map(|network| (network.id.clone(), network))
+            .collect::<BTreeMap<_, _>>();
+        let binance_decimals = self.binance_runtime_plan()?.asset_decimals;
+        let mut assets = Vec::with_capacity(self.bundle.venue_assets.len());
+        for venue_asset in &self.bundle.venue_assets {
+            let economic_asset_id = mappings
+                .get(&venue_asset.id)
+                .with_context(|| {
+                    format!(
+                        "portfolio venue asset {} has no reviewed economic mapping",
+                        venue_asset.id.as_str()
+                    )
+                })?
+                .clone();
+            let location = match venue_asset.kind {
+                VenueAssetKind::BinanceSpot => CompiledInventoryLocation::BinanceAccount {
+                    account_id: venue_asset
+                        .account_id
+                        .clone()
+                        .context("Binance venue asset has no account")?,
+                },
+                VenueAssetKind::Erc20 | VenueAssetKind::Native => {
+                    let network_id = venue_asset
+                        .network_id
+                        .clone()
+                        .context("wallet venue asset has no network")?;
+                    let network = networks
+                        .get(&network_id)
+                        .context("wallet venue asset references unknown network")?;
+                    let wallet_location = wallet_locations
+                        .get(&network_id)
+                        .context("wallet venue asset has no wallet location")?;
+                    CompiledInventoryLocation::EvmWallet {
+                        network_id,
+                        chain_id: network.chain_id,
+                        wallet_location_id: wallet_location.id.clone(),
+                    }
+                }
+            };
+            let decimals = venue_asset
+                .decimals
+                .or_else(|| binance_decimals.get(&venue_asset.symbol).copied())
+                .with_context(|| {
+                    format!(
+                        "portfolio venue asset {} has no exact decimals",
+                        venue_asset.id.as_str()
+                    )
+                })?;
+            assets.push(CompiledPortfolioAsset {
+                location,
+                venue_asset_id: venue_asset.id.clone(),
+                economic_asset_id,
+                symbol: venue_asset.symbol.clone(),
+                decimals,
+            });
+        }
+        assets.sort_by(|left, right| left.venue_asset_id.cmp(&right.venue_asset_id));
+        ensure!(
+            assets.len() == self.bundle.asset_mappings.len(),
+            "portfolio plan does not cover every reviewed asset mapping"
+        );
+        Ok(CompiledPortfolioRuntimePlan {
+            assets,
+            allocator_mode: match role {
+                CompatibilityRole::LiveRuntime => CompiledCapitalAllocatorMode::Shadow,
+                CompatibilityRole::PublicPriceCollector => CompiledCapitalAllocatorMode::Disabled,
+            },
+            live_rebalance_adapter: "world_chain_v12_parity".to_owned(),
+        })
+    }
 }
 
 pub fn load_compatibility_domain(
@@ -1549,6 +1683,7 @@ pub fn load_compatibility_domain(
             binance_runtime: None,
             network_runtime: None,
             hot_path_runtime: None,
+            portfolio_runtime: None,
         })
     }
 }
@@ -2301,8 +2436,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        CompatibilityRole, CompiledDomainBundle, CompiledDomainGraph, CompiledNetworkGasPolicy,
-        DomainCompilerManifest, PoolLifecycle, compile_domain,
+        CompatibilityRole, CompiledCapitalAllocatorMode, CompiledDomainBundle, CompiledDomainGraph,
+        CompiledInventoryLocation, CompiledNetworkGasPolicy, DomainCompilerManifest, PoolLifecycle,
+        compile_domain,
     };
     use crate::domain::config::LoadedDomainConfig;
 
@@ -2524,6 +2660,30 @@ mod tests {
             live.config.fingerprint_sha256(),
             original_live.fingerprint_sha256()
         );
+        let portfolio = live.portfolio_runtime.unwrap();
+        assert_eq!(
+            portfolio.allocator_mode,
+            CompiledCapitalAllocatorMode::Shadow
+        );
+        assert_eq!(portfolio.live_rebalance_adapter, "world_chain_v12_parity");
+        assert_eq!(portfolio.assets.len(), 10);
+        assert!(portfolio.assets.iter().any(|asset| {
+            asset.symbol == "USDC"
+                && matches!(
+                    &asset.location,
+                    CompiledInventoryLocation::EvmWallet { chain_id: 480, .. }
+                )
+        }));
+        assert!(portfolio.assets.iter().any(|asset| {
+            asset.symbol == "USDC"
+                && matches!(
+                    &asset.location,
+                    CompiledInventoryLocation::EvmWallet {
+                        chain_id: 42_161,
+                        ..
+                    }
+                )
+        }));
     }
 
     #[test]

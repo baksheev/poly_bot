@@ -86,6 +86,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("hot_path_dependency_index"));
     assert!(MAIN.contains("hot_path_sizing_policy"));
     assert!(MAIN.contains("hot_path_shadow_external_mutation_authorized"));
+    assert!(MAIN.contains("portfolio_inventory_key"));
+    assert!(MAIN.contains("portfolio_location_count"));
+    assert!(MAIN.contains("portfolio_allocator_mode"));
+    assert!(MAIN.contains("portfolio_external_mutation_authorized"));
+    assert!(MAIN.contains("live_rebalance_adapter"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
         .expect("startup DEX backlog drain is wired");

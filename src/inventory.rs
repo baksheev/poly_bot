@@ -3,23 +3,72 @@ use std::collections::{BTreeMap, BTreeSet};
 use alloy_primitives::U256;
 use anyhow::{Context, ensure};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum InventoryVenue {
-    Binance,
-    Wallet,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InventoryLocation {
+    BinanceAccount {
+        account_id: String,
+    },
+    EvmWallet {
+        network_id: String,
+        wallet_location_id: String,
+    },
+}
+
+impl InventoryLocation {
+    pub fn binance(account_id: impl Into<String>) -> anyhow::Result<Self> {
+        let account_id = account_id.into();
+        validate_id("Binance inventory account", &account_id, 96)?;
+        Ok(Self::BinanceAccount { account_id })
+    }
+
+    pub fn evm_wallet(
+        network_id: impl Into<String>,
+        wallet_location_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let network_id = network_id.into();
+        let wallet_location_id = wallet_location_id.into();
+        validate_id("inventory network", &network_id, 96)?;
+        validate_id("wallet inventory location", &wallet_location_id, 120)?;
+        Ok(Self::EvmWallet {
+            network_id,
+            wallet_location_id,
+        })
+    }
+
+    pub const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::BinanceAccount { .. } => "binance_account",
+            Self::EvmWallet { .. } => "evm_wallet",
+        }
+    }
+
+    pub fn stable_id(&self) -> &str {
+        match self {
+            Self::BinanceAccount { account_id } => account_id,
+            Self::EvmWallet {
+                wallet_location_id, ..
+            } => wallet_location_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct InventoryKey {
-    pub venue: InventoryVenue,
-    pub asset: String,
+    pub location: InventoryLocation,
+    pub venue_asset_id: String,
 }
 
 impl InventoryKey {
-    pub fn new(venue: InventoryVenue, asset: impl Into<String>) -> anyhow::Result<Self> {
-        let asset = asset.into();
-        validate_id("inventory asset", &asset, 24)?;
-        Ok(Self { venue, asset })
+    pub fn new(
+        location: InventoryLocation,
+        venue_asset_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let venue_asset_id = venue_asset_id.into();
+        validate_id("venue asset id", &venue_asset_id, 160)?;
+        Ok(Self {
+            location,
+            venue_asset_id,
+        })
     }
 }
 
@@ -41,14 +90,14 @@ pub struct ReservationRequest {
     pub operation_id: String,
     pub purpose: ReservationPurpose,
     pub claims: Vec<InventoryClaim>,
-    pub settlement_venues: BTreeSet<InventoryVenue>,
+    pub settlement_locations: BTreeSet<InventoryLocation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReservationState {
     Active,
     PendingSettlement {
-        venue_generations: BTreeMap<InventoryVenue, u64>,
+        location_generations: BTreeMap<InventoryLocation, u64>,
     },
 }
 
@@ -58,82 +107,85 @@ pub struct InventoryReservation {
     pub state: ReservationState,
 }
 
-/// Single-owner accounting for process-scoped venue inventory.
+/// Single atomic owner for every strategy and rebalance inventory claim.
 ///
-/// Observed balances remain authoritative. Reservations only reduce available
-/// balances; they never create inventory or project an external mutation as a
-/// completed balance change.
+/// A key is the exact `(inventory_location, venue_asset_id)` pair. Observed
+/// balances remain authoritative; reservations only reduce availability and
+/// are pre-aggregated so admission never scans all in-flight operations.
 #[derive(Clone, Debug, Default)]
 pub struct InventoryReservations {
     observed: BTreeMap<InventoryKey, U256>,
-    venue_generations: BTreeMap<InventoryVenue, u64>,
+    location_generations: BTreeMap<InventoryLocation, u64>,
     reservations: BTreeMap<String, InventoryReservation>,
+    reserved_totals: BTreeMap<InventoryKey, U256>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InventoryPortfolioSnapshot {
+    pub observed: BTreeMap<InventoryKey, U256>,
+    pub reserved_totals: BTreeMap<InventoryKey, U256>,
 }
 
 impl InventoryReservations {
-    /// Atomically replaces all observed assets for one venue. Regressed
-    /// generations are rejected without mutating state.
-    pub fn update_venue(
+    pub fn update_location(
         &mut self,
-        venue: InventoryVenue,
+        location: InventoryLocation,
         generation: u64,
         balances: impl IntoIterator<Item = (String, U256)>,
     ) -> anyhow::Result<bool> {
         ensure!(generation > 0, "inventory generation must be positive");
         if self
-            .venue_generations
-            .get(&venue)
+            .location_generations
+            .get(&location)
             .is_some_and(|current| generation <= *current)
         {
             return Ok(false);
         }
         let mut replacement = BTreeMap::new();
-        for (asset, amount) in balances {
-            let key = InventoryKey::new(venue, asset)?;
+        for (venue_asset_id, amount) in balances {
+            let key = InventoryKey::new(location.clone(), venue_asset_id)?;
             ensure!(
                 replacement.insert(key, amount).is_none(),
-                "duplicate asset in inventory snapshot"
+                "duplicate venue asset in inventory snapshot"
             );
         }
         ensure!(
             !replacement.is_empty(),
-            "inventory snapshot must contain at least one asset"
+            "inventory snapshot must contain at least one venue asset"
         );
-        self.observed.retain(|key, _| key.venue != venue);
+        self.observed.retain(|key, _| key.location != location);
         self.observed.extend(replacement);
-        self.venue_generations.insert(venue, generation);
+        self.location_generations.insert(location, generation);
         self.release_reconciled();
         Ok(true)
     }
 
-    /// Applies a primary-stream partial update after a complete venue snapshot
-    /// has established the initial asset set.
-    pub fn update_venue_assets(
+    pub fn update_location_assets(
         &mut self,
-        venue: InventoryVenue,
+        location: InventoryLocation,
         generation: u64,
         balances: impl IntoIterator<Item = (String, U256)>,
     ) -> anyhow::Result<bool> {
         ensure!(generation > 0, "inventory generation must be positive");
         let current_generation = self
-            .venue_generations
-            .get(&venue)
+            .location_generations
+            .get(&location)
             .copied()
-            .context("partial inventory update requires a complete venue snapshot")?;
+            .context("partial inventory update requires a complete location snapshot")?;
         if generation <= current_generation {
             return Ok(false);
         }
         let mut updates = BTreeMap::new();
-        for (asset, amount) in balances {
-            let key = InventoryKey::new(venue, asset)?;
+        for (venue_asset_id, amount) in balances {
+            let key = InventoryKey::new(location.clone(), venue_asset_id)?;
             ensure!(
                 updates.insert(key, amount).is_none(),
-                "duplicate asset in partial inventory update"
+                "duplicate venue asset in partial inventory update"
             );
         }
         ensure!(!updates.is_empty(), "partial inventory update is empty");
         self.observed.extend(updates);
-        self.venue_generations.insert(venue, generation);
+        self.location_generations.insert(location, generation);
         self.release_reconciled();
         Ok(true)
     }
@@ -142,43 +194,35 @@ impl InventoryReservations {
         self.observed.get(key).copied()
     }
 
+    pub fn observed_balances(&self) -> &BTreeMap<InventoryKey, U256> {
+        &self.observed
+    }
+
     pub fn reserved(&self, key: &InventoryKey) -> U256 {
-        self.reservations
-            .values()
-            .flat_map(|reservation| reservation.request.claims.iter())
-            .filter(|claim| &claim.key == key)
-            .fold(U256::ZERO, |total, claim| {
-                total.saturating_add(claim.amount)
-            })
+        self.reserved_totals.get(key).copied().unwrap_or(U256::ZERO)
+    }
+
+    pub fn reserved_totals(&self) -> &BTreeMap<InventoryKey, U256> {
+        &self.reserved_totals
+    }
+
+    pub fn portfolio_snapshot(&self) -> InventoryPortfolioSnapshot {
+        InventoryPortfolioSnapshot {
+            observed: self.observed.clone(),
+            reserved_totals: self.reserved_totals.clone(),
+        }
     }
 
     pub fn available(&self, key: &InventoryKey) -> anyhow::Result<U256> {
-        let observed = self
-            .observed(key)
-            .with_context(|| format!("no observed inventory for {}", key.asset))?;
+        let observed = self.observed(key).with_context(|| {
+            format!(
+                "no observed inventory for {} at {}",
+                key.venue_asset_id,
+                key.location.stable_id()
+            )
+        })?;
         observed
             .checked_sub(self.reserved(key))
-            .context("reservations exceed observed inventory")
-    }
-
-    /// Allocation-free lookup for hot-path read-only admission probes.
-    pub fn available_asset(&self, venue: InventoryVenue, asset: &str) -> anyhow::Result<U256> {
-        let observed = self
-            .observed
-            .iter()
-            .find(|(key, _)| key.venue == venue && key.asset == asset)
-            .map(|(_, amount)| *amount)
-            .with_context(|| format!("no observed inventory for {asset}"))?;
-        let reserved = self
-            .reservations
-            .values()
-            .flat_map(|reservation| reservation.request.claims.iter())
-            .filter(|claim| claim.key.venue == venue && claim.key.asset == asset)
-            .fold(U256::ZERO, |total, claim| {
-                total.saturating_add(claim.amount)
-            });
-        observed
-            .checked_sub(reserved)
             .context("reservations exceed observed inventory")
     }
 
@@ -194,17 +238,26 @@ impl InventoryReservations {
         );
         for claim in &request.claims {
             ensure!(
-                self.venue_generations.contains_key(&claim.key.venue),
-                "inventory venue has no observed generation"
+                self.location_generations.contains_key(&claim.key.location),
+                "inventory location has no observed generation"
             );
             let available = self.available(&claim.key)?;
             ensure!(
                 claim.amount <= available,
                 "insufficient available {} inventory: requested {}, available {}",
-                claim.key.asset,
+                claim.key.venue_asset_id,
                 claim.amount,
                 available
             );
+        }
+        for claim in &request.claims {
+            let reserved = self
+                .reserved_totals
+                .entry(claim.key.clone())
+                .or_insert(U256::ZERO);
+            *reserved = reserved
+                .checked_add(claim.amount)
+                .context("inventory reserved total overflow")?;
         }
         self.reservations.insert(
             request.operation_id.clone(),
@@ -216,7 +269,6 @@ impl InventoryReservations {
         Ok(())
     }
 
-    /// Releases an intent only when no external mutation was submitted.
     pub fn release_unsubmitted(&mut self, operation_id: &str) -> anyhow::Result<()> {
         let reservation = self
             .reservations
@@ -226,12 +278,10 @@ impl InventoryReservations {
             reservation.state == ReservationState::Active,
             "only an active reservation can be released as unsubmitted"
         );
-        self.reservations.remove(operation_id);
+        self.remove_reservation(operation_id);
         Ok(())
     }
 
-    /// Keeps inventory unavailable until every claimed venue publishes a
-    /// strictly newer snapshot after a proven balanced terminal outcome.
     pub fn mark_pending_settlement(&mut self, operation_id: &str) -> anyhow::Result<()> {
         let reservation = self
             .reservations
@@ -242,39 +292,67 @@ impl InventoryReservations {
             "inventory reservation is not active"
         );
         let mut generations = BTreeMap::new();
-        for venue in &reservation.request.settlement_venues {
+        for location in &reservation.request.settlement_locations {
             let generation = self
-                .venue_generations
-                .get(venue)
+                .location_generations
+                .get(location)
                 .copied()
-                .context("settlement inventory venue has no generation")?;
-            generations.insert(*venue, generation);
+                .context("settlement inventory location has no generation")?;
+            generations.insert(location.clone(), generation);
         }
         reservation.state = ReservationState::PendingSettlement {
-            venue_generations: generations,
+            location_generations: generations,
         };
         Ok(())
     }
 
-    /// Unknown or failed external outcomes deliberately have no release API.
-    /// They remain Active until the parent coordinator proves a balanced
-    /// outcome and calls `mark_pending_settlement`.
     pub fn active_operation_ids(&self) -> Vec<&str> {
         self.reservations.keys().map(String::as_str).collect()
     }
 
-    fn release_reconciled(&mut self) {
-        self.reservations.retain(|_, reservation| {
-            let ReservationState::PendingSettlement { venue_generations } = &reservation.state
-            else {
-                return true;
+    fn remove_reservation(&mut self, operation_id: &str) {
+        let Some(reservation) = self.reservations.remove(operation_id) else {
+            return;
+        };
+        for claim in reservation.request.claims {
+            let remove = if let Some(reserved) = self.reserved_totals.get_mut(&claim.key) {
+                *reserved = reserved
+                    .checked_sub(claim.amount)
+                    .expect("reserved total covers every admitted claim");
+                reserved.is_zero()
+            } else {
+                false
             };
-            !venue_generations.iter().all(|(venue, barrier)| {
-                self.venue_generations
-                    .get(venue)
-                    .is_some_and(|current| current > barrier)
+            if remove {
+                self.reserved_totals.remove(&claim.key);
+            }
+        }
+    }
+
+    fn release_reconciled(&mut self) {
+        let reconciled = self
+            .reservations
+            .iter()
+            .filter_map(|(operation_id, reservation)| {
+                let ReservationState::PendingSettlement {
+                    location_generations,
+                } = &reservation.state
+                else {
+                    return None;
+                };
+                location_generations
+                    .iter()
+                    .all(|(location, barrier)| {
+                        self.location_generations
+                            .get(location)
+                            .is_some_and(|current| current > barrier)
+                    })
+                    .then(|| operation_id.clone())
             })
-        });
+            .collect::<Vec<_>>();
+        for operation_id in reconciled {
+            self.remove_reservation(&operation_id);
+        }
     }
 }
 
@@ -282,20 +360,20 @@ fn validate_request(request: &ReservationRequest) -> anyhow::Result<()> {
     validate_id("reservation operation id", &request.operation_id, 120)?;
     ensure!(!request.claims.is_empty(), "reservation has no claims");
     ensure!(
-        !request.settlement_venues.is_empty(),
-        "reservation has no settlement venues"
+        !request.settlement_locations.is_empty(),
+        "reservation has no settlement locations"
     );
     let mut keys = BTreeSet::new();
     for claim in &request.claims {
-        validate_id("inventory asset", &claim.key.asset, 24)?;
+        validate_id("venue asset id", &claim.key.venue_asset_id, 160)?;
         ensure!(!claim.amount.is_zero(), "inventory claim amount is zero");
         ensure!(
             keys.insert(claim.key.clone()),
             "reservation has duplicate inventory claims"
         );
         ensure!(
-            request.settlement_venues.contains(&claim.key.venue),
-            "claim venue is absent from settlement venues"
+            request.settlement_locations.contains(&claim.key.location),
+            "claim location is absent from settlement locations"
         );
     }
     Ok(())
@@ -307,10 +385,9 @@ fn validate_id(name: &str, value: &str, maximum: usize) -> anyhow::Result<()> {
         "{name} has invalid length"
     );
     ensure!(
-        value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric()
-                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')),
+        value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        }),
         "{name} contains unsupported characters"
     );
     Ok(())
@@ -321,203 +398,186 @@ mod tests {
     use alloy_primitives::U256;
 
     use super::{
-        InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue, ReservationPurpose,
+        InventoryClaim, InventoryKey, InventoryLocation, InventoryReservations, ReservationPurpose,
         ReservationRequest,
     };
 
-    fn claim(venue: InventoryVenue, asset: &str, amount: u64) -> InventoryClaim {
+    fn binance() -> InventoryLocation {
+        InventoryLocation::binance("binance-spot:primary").unwrap()
+    }
+
+    fn wallet(chain_id: u64) -> InventoryLocation {
+        InventoryLocation::evm_wallet(
+            format!("eip155:{chain_id}"),
+            format!("eip155:{chain_id}:wallet:primary"),
+        )
+        .unwrap()
+    }
+
+    fn key(location: InventoryLocation, venue_asset_id: &str) -> InventoryKey {
+        InventoryKey::new(location, venue_asset_id).unwrap()
+    }
+
+    fn claim(location: InventoryLocation, venue_asset_id: &str, amount: u64) -> InventoryClaim {
         InventoryClaim {
-            key: InventoryKey::new(venue, asset).unwrap(),
+            key: key(location, venue_asset_id),
             amount: U256::from(amount),
         }
     }
 
     #[test]
-    fn reservations_are_atomic_across_venues_and_prevent_overspend() {
+    fn two_pairs_cannot_double_spend_account_scoped_binance_usdc() {
+        let location = binance();
+        let usdc = "binance-spot:primary:asset:USDC";
         let mut inventory = InventoryReservations::default();
         inventory
-            .update_venue(
-                InventoryVenue::Wallet,
-                10,
-                [("USDC".to_owned(), U256::from(1_000))],
-            )
-            .unwrap();
-        inventory
-            .update_venue(
-                InventoryVenue::Binance,
-                20,
-                [("WLD".to_owned(), U256::from(2_000))],
-            )
+            .update_location(location.clone(), 1, [(usdc.to_owned(), U256::from(1_000))])
             .unwrap();
         inventory
             .reserve(ReservationRequest {
-                operation_id: "trade-1".to_owned(),
+                operation_id: "wld-trade".to_owned(),
                 purpose: ReservationPurpose::TradePrimary,
-                claims: vec![
-                    claim(InventoryVenue::Wallet, "USDC", 600),
-                    claim(InventoryVenue::Binance, "WLD", 1_200),
-                ],
-                settlement_venues: [InventoryVenue::Wallet, InventoryVenue::Binance]
-                    .into_iter()
-                    .collect(),
+                claims: vec![claim(location.clone(), usdc, 700)],
+                settlement_locations: [location.clone()].into_iter().collect(),
             })
             .unwrap();
-        assert_eq!(
-            inventory
-                .available(&InventoryKey::new(InventoryVenue::Wallet, "USDC").unwrap())
-                .unwrap(),
-            U256::from(400)
-        );
-        assert_eq!(
-            inventory
-                .available_asset(InventoryVenue::Wallet, "USDC")
-                .unwrap(),
-            U256::from(400)
-        );
         assert!(
             inventory
                 .reserve(ReservationRequest {
-                    operation_id: "trade-2".to_owned(),
+                    operation_id: "esp-trade".to_owned(),
                     purpose: ReservationPurpose::TradePrimary,
-                    claims: vec![claim(InventoryVenue::Wallet, "USDC", 401)],
-                    settlement_venues: [InventoryVenue::Wallet].into_iter().collect(),
+                    claims: vec![claim(location.clone(), usdc, 301)],
+                    settlement_locations: [location].into_iter().collect(),
                 })
                 .is_err()
         );
-        assert!(inventory.reservation("trade-2").is_none());
     }
 
     #[test]
-    fn balanced_operation_waits_for_source_and_destination_to_advance() {
+    fn world_and_arbitrum_usdc_never_collide() {
+        let world = wallet(480);
+        let arbitrum = wallet(42_161);
+        let world_usdc = "eip155:480:erc20:0x79a02482a880bce3f13e09da970dc34db4cd24d1";
+        let arbitrum_usdc = "eip155:42161:erc20:0xaf88d065e77c8cc2239327c5edb3a432268e5831";
         let mut inventory = InventoryReservations::default();
         inventory
-            .update_venue(
-                InventoryVenue::Wallet,
+            .update_location(
+                world.clone(),
                 10,
-                [("USDC".to_owned(), U256::from(1_000))],
+                [(world_usdc.to_owned(), U256::from(100))],
             )
             .unwrap();
         inventory
-            .update_venue(
-                InventoryVenue::Binance,
+            .update_location(
+                arbitrum.clone(),
                 20,
-                [("WLD".to_owned(), U256::from(2_000))],
+                [(arbitrum_usdc.to_owned(), U256::from(200))],
             )
             .unwrap();
-        inventory
-            .reserve(ReservationRequest {
-                operation_id: "trade-1".to_owned(),
-                purpose: ReservationPurpose::TradePrimary,
-                claims: vec![claim(InventoryVenue::Wallet, "USDC", 600)],
-                settlement_venues: [InventoryVenue::Wallet, InventoryVenue::Binance]
-                    .into_iter()
-                    .collect(),
-            })
-            .unwrap();
-        inventory.mark_pending_settlement("trade-1").unwrap();
-        inventory
-            .update_venue(
-                InventoryVenue::Wallet,
-                11,
-                [("USDC".to_owned(), U256::from(400))],
-            )
-            .unwrap();
-        assert!(inventory.reservation("trade-1").is_some());
-        inventory
-            .update_venue(
-                InventoryVenue::Binance,
-                21,
-                [("WLD".to_owned(), U256::from(800))],
-            )
-            .unwrap();
-        assert!(inventory.reservation("trade-1").is_none());
-    }
-
-    #[test]
-    fn unknown_outcome_has_no_accidental_release_path() {
-        let mut inventory = InventoryReservations::default();
-        inventory
-            .update_venue(
-                InventoryVenue::Binance,
-                1,
-                [("USDC".to_owned(), U256::from(1_000))],
-            )
-            .unwrap();
-        inventory
-            .reserve(ReservationRequest {
-                operation_id: "unknown-1".to_owned(),
-                purpose: ReservationPurpose::TradeRecovery,
-                claims: vec![claim(InventoryVenue::Binance, "USDC", 500)],
-                settlement_venues: [InventoryVenue::Binance].into_iter().collect(),
-            })
-            .unwrap();
-        inventory
-            .update_venue(
-                InventoryVenue::Binance,
-                2,
-                [("USDC".to_owned(), U256::from(500))],
-            )
-            .unwrap();
-        assert!(inventory.reservation("unknown-1").is_some());
         assert_eq!(
-            inventory
-                .available(&InventoryKey::new(InventoryVenue::Binance, "USDC").unwrap())
-                .unwrap(),
-            U256::ZERO
+            inventory.available(&key(world, world_usdc)).unwrap(),
+            U256::from(100)
+        );
+        assert_eq!(
+            inventory.available(&key(arbitrum, arbitrum_usdc)).unwrap(),
+            U256::from(200)
         );
     }
 
     #[test]
-    fn regressed_snapshot_cannot_release_or_rewrite_inventory() {
+    fn trade_and_rebalance_contend_through_one_atomic_owner() {
+        let location = binance();
+        let usdc = "binance-spot:primary:asset:USDC";
         let mut inventory = InventoryReservations::default();
         inventory
-            .update_venue(
-                InventoryVenue::Wallet,
-                10,
-                [("WLD".to_owned(), U256::from(100))],
-            )
+            .update_location(location.clone(), 1, [(usdc.to_owned(), U256::from(1_000))])
+            .unwrap();
+        inventory
+            .reserve(ReservationRequest {
+                operation_id: "trade".to_owned(),
+                purpose: ReservationPurpose::TradePrimary,
+                claims: vec![claim(location.clone(), usdc, 800)],
+                settlement_locations: [location.clone()].into_iter().collect(),
+            })
             .unwrap();
         assert!(
-            !inventory
-                .update_venue(
-                    InventoryVenue::Wallet,
-                    9,
-                    [("WLD".to_owned(), U256::from(999))],
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            inventory.observed(&InventoryKey::new(InventoryVenue::Wallet, "WLD").unwrap()),
-            Some(U256::from(100))
+            inventory
+                .reserve(ReservationRequest {
+                    operation_id: "rebalance".to_owned(),
+                    purpose: ReservationPurpose::Rebalance,
+                    claims: vec![claim(location.clone(), usdc, 201)],
+                    settlement_locations: [location].into_iter().collect(),
+                })
+                .is_err()
         );
     }
 
     #[test]
-    fn primary_stream_partial_update_preserves_unmentioned_assets() {
+    fn pending_settlement_requires_every_exact_location_to_advance() {
+        let account = binance();
+        let world = wallet(480);
+        let account_usdc = "binance-spot:primary:asset:USDC";
+        let world_usdc = "eip155:480:erc20:0x79a02482a880bce3f13e09da970dc34db4cd24d1";
         let mut inventory = InventoryReservations::default();
         inventory
-            .update_venue(
-                InventoryVenue::Binance,
+            .update_location(
+                account.clone(),
+                1,
+                [(account_usdc.to_owned(), U256::from(1_000))],
+            )
+            .unwrap();
+        inventory
+            .update_location(
+                world.clone(),
+                10,
+                [(world_usdc.to_owned(), U256::from(1_000))],
+            )
+            .unwrap();
+        inventory
+            .reserve(ReservationRequest {
+                operation_id: "trade".to_owned(),
+                purpose: ReservationPurpose::TradePrimary,
+                claims: vec![claim(account.clone(), account_usdc, 100)],
+                settlement_locations: [account.clone(), world.clone()].into_iter().collect(),
+            })
+            .unwrap();
+        inventory.mark_pending_settlement("trade").unwrap();
+        inventory
+            .update_location(account, 2, [(account_usdc.to_owned(), U256::from(900))])
+            .unwrap();
+        assert!(inventory.reservation("trade").is_some());
+        inventory
+            .update_location(world, 11, [(world_usdc.to_owned(), U256::from(1_100))])
+            .unwrap();
+        assert!(inventory.reservation("trade").is_none());
+        assert!(inventory.reserved_totals().is_empty());
+    }
+
+    #[test]
+    fn partial_update_preserves_other_venue_assets() {
+        let location = binance();
+        let usdc = "binance-spot:primary:asset:USDC";
+        let wld = "binance-spot:primary:asset:WLD";
+        let mut inventory = InventoryReservations::default();
+        inventory
+            .update_location(
+                location.clone(),
                 1,
                 [
-                    ("USDC".to_owned(), U256::from(1_000)),
-                    ("WLD".to_owned(), U256::from(2_000)),
+                    (usdc.to_owned(), U256::from(1_000)),
+                    (wld.to_owned(), U256::from(2_000)),
                 ],
             )
             .unwrap();
         inventory
-            .update_venue_assets(
-                InventoryVenue::Binance,
-                2,
-                [("WLD".to_owned(), U256::from(1_900))],
-            )
+            .update_location_assets(location.clone(), 2, [(wld.to_owned(), U256::from(1_900))])
             .unwrap();
         assert_eq!(
-            inventory.observed(&InventoryKey::new(InventoryVenue::Binance, "USDC").unwrap()),
+            inventory.observed(&key(location.clone(), usdc)),
             Some(U256::from(1_000))
         );
         assert_eq!(
-            inventory.observed(&InventoryKey::new(InventoryVenue::Binance, "WLD").unwrap()),
+            inventory.observed(&key(location, wld)),
             Some(U256::from(1_900))
         );
     }
