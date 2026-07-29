@@ -1000,6 +1000,18 @@ between a parsed strategy-price frame and completed baseline evaluation. The
 fixed-size hot records continue to be formatted only by the background
 telemetry task.
 
+The same boundary applies to canonical DEX ingestion. `dex_pool_event`,
+`world_chain_head`, and `dex_pool_prepared` cross the decision-owner boundary
+as bounded fixed-size records. Pool/pair lookup, compatibility-ID formatting,
+base-unit string conversion, JSON construction, and serialization run only on
+the background hot-telemetry task. This prevents telemetry for one pool log
+from increasing the receive-to-owner age of later logs in the same burst.
+
+`m0_cohort.sql` is the authoritative cohort gate in
+`scripts/report-m0-performance`: WLD percentile claims remain `collecting`
+until the selected half-open window contains at least 100,000 strategy frames,
+1,000 adaptive-sizing evaluations, and zero hot-telemetry drops.
+
 ### Current single-pair assumption register
 
 Every known production bootstrap restriction has an explicit migration owner:

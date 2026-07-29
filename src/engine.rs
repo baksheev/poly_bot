@@ -43,7 +43,7 @@ use crate::{
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     telemetry::{
         PRIMARY_BINANCE_ACCOUNT_ID, PRIMARY_EVM_WALLET_ID, TelemetryHandle, execution_lane_id,
-        instrument_id, network_id, pool_id, strategy_id, wallet_location_id,
+        instrument_id, network_id, strategy_id, wallet_location_id,
     },
 };
 
@@ -773,32 +773,14 @@ impl TradingEngine {
                     let request = self
                         .opportunities
                         .request_pool_refresh(pool_index, &self.dex)?;
-                    let pool = self.dex.pool(pool_index)?;
-                    let pair = self
-                        .domain_config
-                        .snapshot()
-                        .pairs
-                        .iter()
-                        .find(|pair| pair.id == pool.pair_id)
-                        .context("DEX telemetry pool pair is missing")?;
-                    let identity = format!("{:?}", pool.identity);
-                    self.telemetry.emit(
-                        "dex_pool_event",
-                        json!({
-                            "engine_id": self.config.engine_id,
-                            "pair_id": pool.pair_id,
-                            "strategy_id": strategy_id(&pool.pair_id),
-                            "network_id": network_id(pair.chain.chain_id),
-                            "pool_id": pool_id(pair.chain.chain_id, &identity),
-                            "identity": identity,
-                            "kind": kind,
-                            "block_number": log.block_number,
-                            "transaction_index": log.transaction_index,
-                            "log_index": log.log_index,
-                            "engine_queue_age_us": received_at.elapsed().as_micros(),
-                            "prepared_generation": request.generation(),
-                            "prepared_state": "building",
-                        }),
+                    self.hot_telemetry.emit_dex_pool_event(
+                        pool_index,
+                        kind,
+                        log.block_number,
+                        log.transaction_index,
+                        log.log_index,
+                        received_at.elapsed().as_micros(),
+                        request.generation(),
                     );
                     Some(request)
                 } else {
@@ -807,23 +789,8 @@ impl TradingEngine {
             }
             DexStreamEvent::Head { head, received_at } => {
                 if self.dex.apply_head(head, received_at)? {
-                    let chain_id = self
-                        .domain_config
-                        .snapshot()
-                        .pairs
-                        .iter()
-                        .find(|pair| pair.market_data_enabled)
-                        .map(|pair| pair.chain.chain_id);
-                    self.telemetry.emit(
-                        "world_chain_head",
-                        json!({
-                            "engine_id": self.config.engine_id,
-                            "network_id": chain_id.map(network_id),
-                            "chain_id": chain_id,
-                            "block_number": head.number,
-                            "engine_queue_age_us": received_at.elapsed().as_micros(),
-                        }),
-                    );
+                    self.hot_telemetry
+                        .emit_dex_head(head.number, received_at.elapsed().as_micros());
                 }
                 self.entry_preflight
                     .update_dex_head(self.dex.latest_head_received_at());
@@ -838,51 +805,8 @@ impl TradingEngine {
         let Some(prepared) = self.opportunities.finish_pool_refresh(result)? else {
             return Ok(());
         };
-        let pool = self.dex.pool(prepared.pool_index)?;
-        let pool_pair_id = pool.pair_id.clone();
-        let pool_identity = format!("{:?}", pool.identity);
-        let chain_id = self
-            .domain_config
-            .snapshot()
-            .pairs
-            .iter()
-            .find(|pair| pair.id == pool_pair_id)
-            .context("prepared pool telemetry pair is missing")?
-            .chain
-            .chain_id;
         self.refresh_preflight_dex_pool(prepared.pool_index)?;
-        self.telemetry.emit(
-            "dex_pool_prepared",
-            json!({
-                "engine_id": self.config.engine_id,
-                "pair_id": pool_pair_id,
-                "strategy_id": strategy_id(&pool_pair_id),
-                "network_id": network_id(chain_id),
-                "pool_id": pool_id(chain_id, &pool_identity),
-                "identity": pool_identity,
-                "pool_index": prepared.pool_index,
-                "prepared_generation": prepared.generation,
-                "prepared_exact_output_segments": prepared.exact_output_segments,
-                "prepared_exact_input_segments": prepared.exact_input_segments,
-                "prepared_token_a_exact_input_segments": prepared.token_a_exact_input_segments,
-                "prepared_curve_scope": "execution_envelope_v1",
-                "prepared_build_mode": "inline_owner_v1",
-                "prepared_token_a_limit_base_units": prepared.token_a_limit.to_string(),
-                "prepared_exact_output_token_b_limit_base_units": prepared.exact_output_token_b_limit.to_string(),
-                "prepared_exact_input_token_b_limit_base_units": prepared.exact_input_token_b_limit.to_string(),
-                "build_time_us": prepared.build_time_us,
-                "pre_dispatch_time_us": prepared.pre_dispatch_time_us,
-                "request_send_time_us": prepared.request_send_time_us,
-                "request_handoff_time_us": prepared.request_handoff_time_us,
-                "builder_pre_build_time_us": prepared.builder_pre_build_time_us,
-                "builder_post_build_time_us": prepared.builder_post_build_time_us,
-                "result_send_time_us": prepared.result_send_time_us,
-                "result_handoff_time_us": prepared.result_handoff_time_us,
-                "owner_publish_time_us": prepared.owner_publish_time_us,
-                "stage_timing_complete": prepared.timing_complete,
-                "total_time_us": prepared.total_time_us,
-            }),
-        );
+        self.hot_telemetry.emit_dex_pool_prepared(prepared);
         self.refresh_phase(Instant::now());
         Ok(())
     }

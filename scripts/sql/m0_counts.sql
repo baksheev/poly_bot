@@ -18,6 +18,7 @@ WHERE observed_at_ms >= start_ms
       'binance_book_ticker',
       'arbitrage_evaluation',
       'arbitrage_opportunity',
+      'arbitrage_adaptive_sizing_evaluated',
       'arbitrage_admitted',
       'arbitrage_execution_pending_discarded',
       'arbitrage_entry_preflight_rejected',

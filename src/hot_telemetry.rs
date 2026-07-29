@@ -11,7 +11,8 @@ use crate::{
     config::AppConfig,
     dex::mirror::DexMirror,
     opportunity::{
-        DirectionEvaluation, PairEvaluation, PairRuntime, TradeEvaluation, format_base_units,
+        DirectionEvaluation, PairEvaluation, PairRuntime, PreparedPoolRefresh, TradeEvaluation,
+        format_base_units,
     },
     state::{RuntimePhase, TopOfBook},
     telemetry::{
@@ -24,12 +25,16 @@ use crate::{
 pub struct HotTelemetryHandle {
     book_sender: mpsc::Sender<HotBookTelemetry>,
     evaluation_sender: mpsc::Sender<HotEvaluationTelemetry>,
+    dex_event_sender: mpsc::Sender<HotDexEventTelemetry>,
+    prepared_pool_sender: mpsc::Sender<PreparedPoolRefresh>,
     dropped: Arc<AtomicU64>,
 }
 
 pub struct HotTelemetryTask {
     book_receiver: mpsc::Receiver<HotBookTelemetry>,
     evaluation_receiver: mpsc::Receiver<HotEvaluationTelemetry>,
+    dex_event_receiver: mpsc::Receiver<HotDexEventTelemetry>,
+    prepared_pool_receiver: mpsc::Receiver<PreparedPoolRefresh>,
     dropped: Arc<AtomicU64>,
     telemetry: TelemetryHandle,
     context: HotTelemetryContext,
@@ -53,10 +58,27 @@ struct HotEvaluationTelemetry {
     trigger: &'static str,
 }
 
+enum HotDexEventTelemetry {
+    PoolEvent {
+        pool_index: usize,
+        kind: &'static str,
+        block_number: u64,
+        transaction_index: u64,
+        log_index: u64,
+        engine_queue_age_us: u128,
+        prepared_generation: u64,
+    },
+    Head {
+        block_number: u64,
+        engine_queue_age_us: u128,
+    },
+}
+
 struct HotTelemetryContext {
     engine_id: String,
     pairs: Vec<PairTelemetryContext>,
     pools: Vec<PoolTelemetryContext>,
+    head_chain_id: Option<u64>,
 }
 
 struct PairTelemetryContext {
@@ -79,6 +101,9 @@ struct PairTelemetryContext {
 }
 
 struct PoolTelemetryContext {
+    pair_id: String,
+    strategy_id: String,
+    network_id: String,
     identity: String,
     pool_id: String,
     fee_pips: u32,
@@ -99,11 +124,15 @@ pub fn channel(
             .context("hot telemetry pool pair is invalid")?;
         let identity = format!("{:?}", pool.identity);
         pools.push(PoolTelemetryContext {
+            pair_id: pair.pair_id.clone(),
+            strategy_id: strategy_id(&pair.pair_id),
+            network_id: network_id(pair.chain_id),
             pool_id: pool_id(pair.chain_id, &identity),
             identity,
             fee_pips: pool.pool.fee_pips,
         });
     }
+    let head_chain_id = pairs.first().map(|pair| pair.chain_id);
     let pairs = pairs
         .iter()
         .map(|pair| PairTelemetryContext {
@@ -129,19 +158,27 @@ pub fn channel(
         engine_id: config.engine_id.clone(),
         pairs,
         pools,
+        head_chain_id,
     };
     let (book_sender, book_receiver) = mpsc::channel(config.telemetry_channel_capacity);
     let (evaluation_sender, evaluation_receiver) = mpsc::channel(config.telemetry_channel_capacity);
+    let (dex_event_sender, dex_event_receiver) = mpsc::channel(config.telemetry_channel_capacity);
+    let (prepared_pool_sender, prepared_pool_receiver) =
+        mpsc::channel(config.telemetry_channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     Ok((
         HotTelemetryHandle {
             book_sender,
             evaluation_sender,
+            dex_event_sender,
+            prepared_pool_sender,
             dropped: Arc::clone(&dropped),
         },
         HotTelemetryTask {
             book_receiver,
             evaluation_receiver,
+            dex_event_receiver,
+            prepared_pool_receiver,
             dropped,
             telemetry,
             context,
@@ -203,13 +240,65 @@ impl HotTelemetryHandle {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn emit_dex_pool_event(
+        &self,
+        pool_index: usize,
+        kind: &'static str,
+        block_number: u64,
+        transaction_index: u64,
+        log_index: u64,
+        engine_queue_age_us: u128,
+        prepared_generation: u64,
+    ) {
+        if self
+            .dex_event_sender
+            .try_send(HotDexEventTelemetry::PoolEvent {
+                pool_index,
+                kind,
+                block_number,
+                transaction_index,
+                log_index,
+                engine_queue_age_us,
+                prepared_generation,
+            })
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn emit_dex_head(&self, block_number: u64, engine_queue_age_us: u128) {
+        if self
+            .dex_event_sender
+            .try_send(HotDexEventTelemetry::Head {
+                block_number,
+                engine_queue_age_us,
+            })
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn emit_dex_pool_prepared(&self, prepared: PreparedPoolRefresh) {
+        if self.prepared_pool_sender.try_send(prepared).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl HotTelemetryTask {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let mut books_open = true;
         let mut evaluations_open = true;
-        while books_open || evaluations_open {
+        let mut dex_events_open = true;
+        let mut prepared_pools_open = true;
+        while books_open || evaluations_open || dex_events_open || prepared_pools_open {
             tokio::select! {
                 event = self.book_receiver.recv(), if books_open => match event {
                     Some(event) => self.emit_binance_book(
@@ -233,6 +322,14 @@ impl HotTelemetryTask {
                     )?,
                     None => evaluations_open = false,
                 },
+                event = self.dex_event_receiver.recv(), if dex_events_open => match event {
+                    Some(event) => self.emit_dex_event(event)?,
+                    None => dex_events_open = false,
+                },
+                event = self.prepared_pool_receiver.recv(), if prepared_pools_open => match event {
+                    Some(prepared) => self.emit_prepared_pool(prepared)?,
+                    None => prepared_pools_open = false,
+                },
             }
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
@@ -242,6 +339,101 @@ impl HotTelemetryTask {
                 "hot telemetry records dropped outside decision path"
             );
         }
+        Ok(())
+    }
+
+    fn emit_dex_event(&self, event: HotDexEventTelemetry) -> anyhow::Result<()> {
+        match event {
+            HotDexEventTelemetry::PoolEvent {
+                pool_index,
+                kind,
+                block_number,
+                transaction_index,
+                log_index,
+                engine_queue_age_us,
+                prepared_generation,
+            } => {
+                let pool = self
+                    .context
+                    .pools
+                    .get(pool_index)
+                    .context("hot DEX telemetry pool index is invalid")?;
+                self.telemetry.emit(
+                    "dex_pool_event",
+                    json!({
+                        "engine_id": self.context.engine_id,
+                        "pair_id": pool.pair_id,
+                        "strategy_id": pool.strategy_id,
+                        "network_id": pool.network_id,
+                        "pool_id": pool.pool_id,
+                        "identity": pool.identity,
+                        "kind": kind,
+                        "block_number": block_number,
+                        "transaction_index": transaction_index,
+                        "log_index": log_index,
+                        "engine_queue_age_us": engine_queue_age_us,
+                        "prepared_generation": prepared_generation,
+                        "prepared_state": "building",
+                    }),
+                );
+            }
+            HotDexEventTelemetry::Head {
+                block_number,
+                engine_queue_age_us,
+            } => {
+                self.telemetry.emit(
+                    "world_chain_head",
+                    json!({
+                        "engine_id": self.context.engine_id,
+                        "network_id": self.context.head_chain_id.map(network_id),
+                        "chain_id": self.context.head_chain_id,
+                        "block_number": block_number,
+                        "engine_queue_age_us": engine_queue_age_us,
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_prepared_pool(&self, prepared: PreparedPoolRefresh) -> anyhow::Result<()> {
+        let pool = self
+            .context
+            .pools
+            .get(prepared.pool_index)
+            .context("hot prepared-pool telemetry index is invalid")?;
+        self.telemetry.emit(
+            "dex_pool_prepared",
+            json!({
+                "engine_id": self.context.engine_id,
+                "pair_id": pool.pair_id,
+                "strategy_id": pool.strategy_id,
+                "network_id": pool.network_id,
+                "pool_id": pool.pool_id,
+                "identity": pool.identity,
+                "pool_index": prepared.pool_index,
+                "prepared_generation": prepared.generation,
+                "prepared_exact_output_segments": prepared.exact_output_segments,
+                "prepared_exact_input_segments": prepared.exact_input_segments,
+                "prepared_token_a_exact_input_segments": prepared.token_a_exact_input_segments,
+                "prepared_curve_scope": "execution_envelope_v1",
+                "prepared_build_mode": "inline_owner_v1",
+                "prepared_token_a_limit_base_units": prepared.token_a_limit.to_string(),
+                "prepared_exact_output_token_b_limit_base_units": prepared.exact_output_token_b_limit.to_string(),
+                "prepared_exact_input_token_b_limit_base_units": prepared.exact_input_token_b_limit.to_string(),
+                "build_time_us": prepared.build_time_us,
+                "pre_dispatch_time_us": prepared.pre_dispatch_time_us,
+                "request_send_time_us": prepared.request_send_time_us,
+                "request_handoff_time_us": prepared.request_handoff_time_us,
+                "builder_pre_build_time_us": prepared.builder_pre_build_time_us,
+                "builder_post_build_time_us": prepared.builder_post_build_time_us,
+                "result_send_time_us": prepared.result_send_time_us,
+                "result_handoff_time_us": prepared.result_handoff_time_us,
+                "owner_publish_time_us": prepared.owner_publish_time_us,
+                "stage_timing_complete": prepared.timing_complete,
+                "total_time_us": prepared.total_time_us,
+            }),
+        );
         Ok(())
     }
 
@@ -466,4 +658,18 @@ fn format_bps_x100(value: i64) -> String {
     let magnitude = value.unsigned_abs();
     let sign = if negative { "-" } else { "" };
     format!("{sign}{}.{:02}", magnitude / 100, magnitude % 100)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HotDexEventTelemetry;
+    use crate::opportunity::PreparedPoolRefresh;
+
+    #[test]
+    fn dex_hot_records_are_fixed_size_and_own_no_heap_allocation() {
+        assert!(!std::mem::needs_drop::<HotDexEventTelemetry>());
+        assert!(std::mem::size_of::<HotDexEventTelemetry>() <= 128);
+        assert!(!std::mem::needs_drop::<PreparedPoolRefresh>());
+        assert!(std::mem::size_of::<PreparedPoolRefresh>() <= 512);
+    }
 }
