@@ -32,7 +32,6 @@ data:
   TELEMETRY_BATCH_SIZE: "200"
   TELEMETRY_FLUSH_INTERVAL_MS: "100"
   RUNTIME_READY_FILE: /tmp/arb-bot-ready
-  RUNTIME_STARTUP_CONTRACT_FILE: /tmp/arb-bot-startup-contract.json
   RUST_LOG: arb_bot=info
 ---
 apiVersion: v1

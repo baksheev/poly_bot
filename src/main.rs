@@ -2355,21 +2355,6 @@ async fn run(
         rebalance_execution_mode = %config.rebalance_execution_mode,
         "arbitrage shadow service started with authenticated Binance account state"
     );
-    write_runtime_startup_contract(serde_json::json!({
-        "network_runtime_count": network_runtime_ids.len(),
-        "arbitrum_execution_enabled": network_registry
-            .as_ref()
-            .and_then(|registry| registry.get_by_chain_id(42_161).ok())
-            .is_some_and(|runtime| runtime.execution().mutation_enabled()),
-        "binance_strategy_max_transport_silence_ms":
-            pair.strategy.max_transport_silence_ms(),
-        "hot_path_strategy_count": hot_path_strategy_ids.len(),
-        "hot_path_direct_binance_poll": true,
-        "hot_path_dependency_index": "compiled_exact_symbol_pool",
-        "hot_path_sizing_policy": "one_running_one_latest_pending_per_strategy",
-        "hot_path_shadow_strategy_id": shadow_plan.strategy_id.as_str(),
-        "hot_path_shadow_external_mutation_authorized": false,
-    }))?;
     let runtime_ready_file = mark_runtime_ready()?;
 
     let shutdown = shutdown_signal();
@@ -2883,25 +2868,6 @@ fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
         )
     })?;
     Ok(Some(path))
-}
-
-fn write_runtime_startup_contract(contract: serde_json::Value) -> anyhow::Result<()> {
-    let Some(path) = std::env::var_os("RUNTIME_STARTUP_CONTRACT_FILE") else {
-        return Ok(());
-    };
-    let path = PathBuf::from(path);
-    ensure!(
-        !path.as_os_str().is_empty(),
-        "RUNTIME_STARTUP_CONTRACT_FILE must not be empty"
-    );
-    let encoded =
-        serde_json::to_vec(&contract).context("failed to encode runtime startup contract")?;
-    std::fs::write(&path, encoded).with_context(|| {
-        format!(
-            "failed to write runtime startup contract {}",
-            path.display()
-        )
-    })
 }
 
 fn runtime_ready_marker_path() -> anyhow::Result<Option<PathBuf>> {
