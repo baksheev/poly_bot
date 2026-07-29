@@ -42,6 +42,38 @@ pub fn v3_exact_input(
     Ok(encoded)
 }
 
+pub fn v3_quote_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    fee: u32,
+) -> anyhow::Result<Vec<u8>> {
+    validate_currency_pair(token_in, token_out)?;
+    ensure!(!amount_in.is_zero(), "Uniswap V3 quote input is zero");
+    ensure!(
+        fee > 0 && fee <= 0x00ff_ffff,
+        "Uniswap V3 quote fee does not fit uint24"
+    );
+
+    // QuoterV2.quoteExactInputSingle((address,address,uint256,uint24,uint160)).
+    let mut encoded =
+        selector("quoteExactInputSingle((address,address,uint256,uint24,uint160))").to_vec();
+    push_address_word(&mut encoded, token_in);
+    push_address_word(&mut encoded, token_out);
+    push_u256_word(&mut encoded, amount_in);
+    push_u256_word(&mut encoded, U256::from(fee));
+    push_u256_word(&mut encoded, U256::ZERO);
+    Ok(encoded)
+}
+
+pub fn decode_v3_quote_exact_input_single(encoded: &[u8]) -> anyhow::Result<U256> {
+    ensure!(
+        encoded.len() >= 4 * WORD_BYTES,
+        "Uniswap V3 QuoterV2 result is truncated"
+    );
+    Ok(U256::from_be_slice(&encoded[..WORD_BYTES]))
+}
+
 pub fn v4_exact_input_single(
     pool_key: V4PoolKey,
     zero_for_one: bool,
@@ -301,7 +333,10 @@ mod tests {
 
     use alloy_primitives::{Address, U256, hex, keccak256};
 
-    use super::{decode_permit2_allowance, permit2_approve, v3_exact_input, v4_exact_input_single};
+    use super::{
+        decode_permit2_allowance, decode_v3_quote_exact_input_single, permit2_approve,
+        v3_exact_input, v3_quote_exact_input_single, v4_exact_input_single,
+    };
     use crate::dex::pool_id::V4PoolKey;
 
     fn address(value: &str) -> Address {
@@ -329,6 +364,27 @@ mod tests {
             &[0x00, 0x27, 0x10]
         );
         assert_eq!(&calldata[4 + 6 * 32 + 23..4 + 6 * 32 + 43], usdc.as_slice());
+    }
+
+    #[test]
+    fn arbitrum_v3_quoter_v2_calldata_is_exact_and_decodes_amount_out() {
+        let usdc = address("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let esp = address("0x3b8db18e69d6686ad9371a423afe3dd1065c94f1");
+        let calldata =
+            v3_quote_exact_input_single(usdc, esp, U256::from(10_000_000_u64), 100).unwrap();
+        assert_eq!(&calldata[..4], &[0xc6, 0xa5, 0x02, 0x6a]);
+        assert_eq!(calldata.len(), 4 + 5 * 32);
+        assert_eq!(
+            format!("{:#x}", keccak256(&calldata)),
+            "0xfc58465ddd636b3bad7ec219ebf7b0c2243c14493d09d6f72cc7f79411a07e73"
+        );
+
+        let mut response = vec![0_u8; 4 * 32];
+        response[..32].copy_from_slice(&U256::from(123_u64).to_be_bytes::<32>());
+        assert_eq!(
+            decode_v3_quote_exact_input_single(&response).unwrap(),
+            U256::from(123_u64)
+        );
     }
 
     #[test]

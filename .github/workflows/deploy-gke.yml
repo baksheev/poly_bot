@@ -80,7 +80,7 @@ jobs:
           test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
             = arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness
           test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
-            = arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices
+            = arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary
           wld='.sources[] | select(.snapshot.live_trading_enabled == true) | .snapshot'
           test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.mode" "${domain_config}")" = adaptive
           test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
@@ -103,7 +103,16 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].market_data_enabled" "${domain_config}")" = true
           test "$(jq -r "${esp} | .pairs[0].execution_enabled" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].rebalance.enabled" "${domain_config}")" = false
-          test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v3_router_address\")" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].live_canary.approval_gate" "${domain_config}")" \
+            = explicit_production_approval_required
+          test "$(jq -r "${esp} | .pairs[0].live_canary.max_trade_notional_token_a_base_units" "${domain_config}")" = 10000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.max_parent_trades" "${domain_config}")" = 2
+          test "$(jq -r "${esp} | .pairs[0].live_canary.max_concurrent_trades" "${domain_config}")" = 1
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_mutations_enabled" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
+            = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
+          test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \
+            = 0x61fFE014bA17989E743c5F6cB21bF9697530B21e
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_router_address\")" "${domain_config}")" = false
           test "$(jq -c "${esp} | .pairs[0].dex.allowed_providers" "${domain_config}")" \
             = '["uniswap_v3"]'

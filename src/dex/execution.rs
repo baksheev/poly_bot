@@ -14,6 +14,7 @@ use crate::{
         rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
     },
     dex::events::{PoolLocator, PoolUpdate, decode_pool_event},
+    domain::compiled::CompiledNetworkGasPolicy,
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
         EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
@@ -334,6 +335,7 @@ pub struct DexExecutor {
     nonce_lane: NonceLane,
     journal: TransactionJournal,
     gas_price: Option<GasPriceSample>,
+    gas_policy: CompiledNetworkGasPolicy,
     allowance_mutations_enabled: bool,
     last_terminal_receipt: Option<TransactionReceipt>,
     receipt_heads: Option<watch::Receiver<CanonicalBlock>>,
@@ -358,6 +360,34 @@ impl DexExecutor {
         chain_id: u64,
         journal_path: PathBuf,
     ) -> anyhow::Result<Self> {
+        Self::hydrate_with_gas_policy(
+            rpc,
+            wallet,
+            chain_id,
+            journal_path,
+            CompiledNetworkGasPolicy::WorldChainV12 {
+                fallback_gas_price_wei: RAILS_FALLBACK_GAS_PRICE_WEI,
+                includes_l1_fee: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn hydrate_with_gas_policy(
+        rpc: JsonRpcClient,
+        wallet: EvmWallet,
+        chain_id: u64,
+        journal_path: PathBuf,
+        gas_policy: CompiledNetworkGasPolicy,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            matches!(
+                (&gas_policy, chain_id),
+                (CompiledNetworkGasPolicy::WorldChainV12 { .. }, 480)
+                    | (CompiledNetworkGasPolicy::ArbitrumOne { .. }, 42_161)
+            ),
+            "DEX executor chain has no reviewed mutation fee policy"
+        );
         ensure!(
             rpc.chain_id().await? == chain_id,
             "DEX RPC chain id mismatch"
@@ -397,6 +427,7 @@ impl DexExecutor {
             nonce_lane,
             journal,
             gas_price: None,
+            gas_policy,
             allowance_mutations_enabled: true,
             last_terminal_receipt: None,
             receipt_heads: None,
@@ -600,13 +631,14 @@ impl DexExecutor {
             "DEX receipt output-token delta is below the submitted minimum"
         );
         let settlement_log = settlement_log_for_route(&receipt, request.route)?;
+        let l1_fee = self.accounted_l1_fee(receipt.l1_fee);
         Ok(SwapExecutionOutcome {
             protocol,
             transaction_hash: receipt.transaction_hash,
             block_number: receipt.block_number,
             gas_used: receipt.gas_used,
             effective_gas_price: receipt.effective_gas_price,
-            l1_fee: receipt.l1_fee,
+            l1_fee,
             token_in_spent,
             token_out_received,
             settlement_log,
@@ -638,7 +670,7 @@ impl DexExecutor {
                     block_number: receipt.block_number,
                     gas_used: receipt.gas_used,
                     effective_gas_price: receipt.effective_gas_price,
-                    l1_fee: receipt.l1_fee,
+                    l1_fee: self.accounted_l1_fee(receipt.l1_fee),
                     reason,
                 },
                 None => DexExecutionServiceError::OutcomeUnknown { reason },
@@ -711,7 +743,7 @@ impl DexExecutor {
             "pre-locked ERC-20 allowance is insufficient"
         );
 
-        let approval = WalletCall::erc20_approval(token, spender, U256::MAX)?;
+        let approval = WalletCall::erc20_approval(token, spender, self.allowance_grant(required))?;
         let receipt = self
             .execute_call(
                 operation_id.to_owned(),
@@ -858,16 +890,14 @@ impl DexExecutor {
         let gas_price_started = Instant::now();
         let (gas_price, gas_price_source) = self
             .gas_price_for_submission(policy.submission_policy)
-            .await;
-        let max_fee_per_gas = gas_price
-            .checked_add(RAILS_PRIORITY_FEE_WEI)
-            .context("DEX maximum fee overflow")?;
+            .await?;
+        let (max_fee_per_gas, max_priority_fee_per_gas) = self.transaction_fees(gas_price)?;
         let fee_parameters = WalletTransactionParameters {
             chain_id: self.nonce_lane.chain_id(),
             nonce: 0,
             gas_limit,
             max_fee_per_gas,
-            max_priority_fee_per_gas: RAILS_PRIORITY_FEE_WEI.min(max_fee_per_gas),
+            max_priority_fee_per_gas,
         };
         // Native gas funding is an operator-maintained invariant for immediate
         // live swaps. The background execution-owner refresher keeps the
@@ -988,7 +1018,7 @@ impl DexExecutor {
             quoted_gas = policy.quoted_gas,
             additional_gas = policy.gas.additional,
             max_fee_per_gas,
-            max_priority_fee_per_gas = RAILS_PRIORITY_FEE_WEI,
+            max_priority_fee_per_gas,
             "DEX transaction broadcast and journaled"
         );
 
@@ -1054,33 +1084,71 @@ impl DexExecutor {
         Ok(receipt)
     }
 
+    fn allowance_grant(&self, required: U256) -> U256 {
+        allowance_grant_for_policy(&self.gas_policy, required)
+    }
+
+    fn accounted_l1_fee(&self, receipt_l1_fee: u128) -> u128 {
+        match self.gas_policy {
+            CompiledNetworkGasPolicy::WorldChainV12 {
+                includes_l1_fee: true,
+                ..
+            } => receipt_l1_fee,
+            CompiledNetworkGasPolicy::ArbitrumOne {
+                includes_l1_fee: false,
+                ..
+            }
+            | CompiledNetworkGasPolicy::ReadOnly => 0,
+            _ => receipt_l1_fee,
+        }
+    }
+
+    fn transaction_fees(&self, gas_price: u128) -> anyhow::Result<(u128, u128)> {
+        transaction_fees_for_policy(&self.gas_policy, gas_price)
+    }
+
     async fn gas_price_for_submission(
         &mut self,
         submission_policy: SwapSubmissionPolicy,
-    ) -> (u128, &'static str) {
+    ) -> anyhow::Result<(u128, &'static str)> {
         if let Some(sample) = self.gas_price
             && sample.is_fresh()
         {
-            return (sample.wei, sample.source.label());
+            return Ok((sample.wei, sample.source.label()));
         }
         if submission_policy == SwapSubmissionPolicy::SimulateAndEstimate {
-            self.refresh_gas_price().await;
+            self.refresh_gas_price().await?;
             let sample = self
                 .gas_price
                 .expect("gas-price refresh always publishes a sample");
-            return (sample.wei, sample.source.label());
+            return Ok((sample.wei, sample.source.label()));
         }
-        tracing::warn!(
-            fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
-            gas_price_cache_ttl_ms = GAS_PRICE_CACHE_TTL.as_millis(),
-            "background gas-price cache is unavailable or stale; using the Rails fallback"
-        );
-        (RAILS_FALLBACK_GAS_PRICE_WEI, "stale_rails_fallback")
+        match self.gas_policy {
+            CompiledNetworkGasPolicy::WorldChainV12 {
+                fallback_gas_price_wei,
+                ..
+            } => {
+                tracing::warn!(
+                    fallback_gas_price_wei,
+                    gas_price_cache_ttl_ms = GAS_PRICE_CACHE_TTL.as_millis(),
+                    "background gas-price cache is unavailable or stale; using the Rails fallback"
+                );
+                Ok((fallback_gas_price_wei, "stale_rails_fallback"))
+            }
+            CompiledNetworkGasPolicy::ArbitrumOne {
+                requires_fresh_rpc_gas_price: true,
+                ..
+            } => anyhow::bail!(
+                "fresh Arbitrum eth_gasPrice sample is unavailable; transaction fails closed"
+            ),
+            _ => anyhow::bail!("network has no executable gas-price policy"),
+        }
     }
 
-    async fn refresh_gas_price(&mut self) {
+    async fn refresh_gas_price(&mut self) -> anyhow::Result<()> {
         let previous_source = self.gas_price.map(|sample| sample.source);
-        let (wei, source) = match self.rpc.gas_price().await {
+        let rpc_sample = self.rpc.gas_price().await;
+        let (wei, source) = match rpc_sample {
             Ok(gas_price) if gas_price > 0 => {
                 if previous_source == Some(GasPriceSource::RailsFallback) {
                     tracing::info!(
@@ -1090,7 +1158,12 @@ impl DexExecutor {
                 }
                 (gas_price, GasPriceSource::Rpc)
             }
-            Ok(_) => {
+            Ok(_)
+                if matches!(
+                    self.gas_policy,
+                    CompiledNetworkGasPolicy::WorldChainV12 { .. }
+                ) =>
+            {
                 if previous_source != Some(GasPriceSource::RailsFallback) {
                     tracing::warn!(
                         fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
@@ -1099,7 +1172,12 @@ impl DexExecutor {
                 }
                 (RAILS_FALLBACK_GAS_PRICE_WEI, GasPriceSource::RailsFallback)
             }
-            Err(_) => {
+            Err(_)
+                if matches!(
+                    self.gas_policy,
+                    CompiledNetworkGasPolicy::WorldChainV12 { .. }
+                ) =>
+            {
                 if previous_source != Some(GasPriceSource::RailsFallback) {
                     tracing::warn!(
                         fallback_gas_price_wei = RAILS_FALLBACK_GAS_PRICE_WEI,
@@ -1108,12 +1186,54 @@ impl DexExecutor {
                 }
                 (RAILS_FALLBACK_GAS_PRICE_WEI, GasPriceSource::RailsFallback)
             }
+            Ok(_) => anyhow::bail!("Arbitrum eth_gasPrice returned zero; no fallback is permitted"),
+            Err(error) => {
+                return Err(error)
+                    .context("Arbitrum eth_gasPrice refresh failed; no fallback is permitted");
+            }
         };
         self.gas_price = Some(GasPriceSample {
             captured_at: Instant::now(),
             wei,
             source,
         });
+        Ok(())
+    }
+}
+
+fn allowance_grant_for_policy(policy: &CompiledNetworkGasPolicy, required: U256) -> U256 {
+    match policy {
+        CompiledNetworkGasPolicy::WorldChainV12 { .. } => U256::MAX,
+        CompiledNetworkGasPolicy::ArbitrumOne { .. } => required,
+        CompiledNetworkGasPolicy::ReadOnly => U256::ZERO,
+    }
+}
+
+fn transaction_fees_for_policy(
+    policy: &CompiledNetworkGasPolicy,
+    gas_price: u128,
+) -> anyhow::Result<(u128, u128)> {
+    ensure!(gas_price > 0, "DEX gas price is zero");
+    match policy {
+        CompiledNetworkGasPolicy::WorldChainV12 { .. } => {
+            let maximum = gas_price
+                .checked_add(RAILS_PRIORITY_FEE_WEI)
+                .context("DEX maximum fee overflow")?;
+            Ok((maximum, RAILS_PRIORITY_FEE_WEI.min(maximum)))
+        }
+        CompiledNetworkGasPolicy::ArbitrumOne {
+            max_priority_fee_per_gas_wei,
+            ..
+        } => {
+            ensure!(
+                *max_priority_fee_per_gas_wei == 0,
+                "reviewed Arbitrum sequencer policy does not permit a priority tip"
+            );
+            Ok((gas_price, 0))
+        }
+        CompiledNetworkGasPolicy::ReadOnly => {
+            anyhow::bail!("read-only network cannot construct transaction fees")
+        }
     }
 }
 
@@ -1263,7 +1383,12 @@ impl DexExecutionService {
                 };
                 runtime.block_on(async move {
                     let mut executor = executor;
-                    executor.refresh_gas_price().await;
+                    if executor.refresh_gas_price().await.is_err() {
+                        tracing::warn!(
+                            chain_id,
+                            "initial DEX gas-price refresh failed; executable policy remains fail-closed"
+                        );
+                    }
                     let mut gas_price_refresh =
                         tokio::time::interval(GAS_PRICE_REFRESH_INTERVAL);
                     gas_price_refresh
@@ -1273,7 +1398,12 @@ impl DexExecutionService {
                         tokio::select! {
                             biased;
                             _ = gas_price_refresh.tick() => {
-                                executor.refresh_gas_price().await;
+                                if executor.refresh_gas_price().await.is_err() {
+                                    tracing::warn!(
+                                        chain_id,
+                                        "background DEX gas-price refresh failed; executable policy remains fail-closed"
+                                    );
+                                }
                             }
                             work = receiver.recv() => {
                                 let Some(work) = work else {
@@ -1494,12 +1624,14 @@ mod tests {
     use super::{
         DexExecutionService, DexExecutionServiceError, DexExecutor, ExactInputSwapRequest,
         GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, UniswapProtocol,
-        settlement_log_for_route, wallet_transfer_totals,
+        allowance_grant_for_policy, settlement_log_for_route, transaction_fees_for_policy,
+        wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
         chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
         dex::events::v3_swap_topic,
+        domain::compiled::CompiledNetworkGasPolicy,
         wallet::{EvmWallet, JournalStatus, TransactionJournal, UnknownOutcomeReason},
     };
 
@@ -1516,6 +1648,34 @@ mod tests {
                 .resolve_without_estimate(None)
                 .unwrap(),
             250_000
+        );
+    }
+
+    #[test]
+    fn arbitrum_fee_and_allowance_policy_has_no_world_chain_fallback_or_tip() {
+        let policy = CompiledNetworkGasPolicy::ArbitrumOne {
+            requires_fresh_rpc_gas_price: true,
+            max_priority_fee_per_gas_wei: 0,
+            includes_l1_fee: false,
+        };
+        assert_eq!(
+            transaction_fees_for_policy(&policy, 12_345).unwrap(),
+            (12_345, 0)
+        );
+        assert_eq!(
+            allowance_grant_for_policy(&policy, U256::from(10_000_000_u64)),
+            U256::from(10_000_000_u64)
+        );
+        assert!(transaction_fees_for_policy(&policy, 0).is_err());
+
+        let world = CompiledNetworkGasPolicy::WorldChainV12 {
+            fallback_gas_price_wei: 100_000,
+            includes_l1_fee: true,
+        };
+        assert_eq!(allowance_grant_for_policy(&world, U256::ONE), U256::MAX);
+        assert_ne!(
+            transaction_fees_for_policy(&world, 12_345).unwrap(),
+            (12_345, 0)
         );
     }
 

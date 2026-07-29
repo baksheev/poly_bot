@@ -4,7 +4,7 @@
   "compiler_version": "m1-v1",
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v12.json",
-    "config/strategies/usdc-esp-arbitrum.v2.json"
+    "config/strategies/usdc-esp-arbitrum.v3.json"
   ],
   "accounts": [
     {

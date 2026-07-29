@@ -249,7 +249,7 @@ pub(crate) fn decimal_from_base_units(value: u128, decimals: u8) -> anyhow::Resu
         .context("Binance base quantity exceeds Decimal range")
 }
 
-fn base_units_from_decimal(value: Decimal, decimals: u8) -> anyhow::Result<u128> {
+pub(crate) fn base_units_from_decimal(value: Decimal, decimals: u8) -> anyhow::Result<u128> {
     ensure!(value >= Decimal::ZERO, "Binance quantity is negative");
     let mantissa = u128::try_from(value.mantissa()).context("Binance quantity is negative")?;
     let target_scale = u32::from(decimals);

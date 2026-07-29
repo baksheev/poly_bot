@@ -656,6 +656,11 @@ pub enum CompiledNetworkGasPolicy {
         fallback_gas_price_wei: u128,
         includes_l1_fee: bool,
     },
+    ArbitrumOne {
+        requires_fresh_rpc_gas_price: bool,
+        max_priority_fee_per_gas_wei: u128,
+        includes_l1_fee: bool,
+    },
     ReadOnly,
 }
 
@@ -1418,12 +1423,18 @@ impl CompiledDomainGraph {
             );
 
             let execution_enabled = executable_networks.contains(&network.id);
-            let gas_policy = match (network.chain_id, execution_enabled) {
-                (480, true) => CompiledNetworkGasPolicy::WorldChainV12 {
+            let canary_readiness = pairs.iter().any(|pair| pair.live_canary.is_some());
+            let gas_policy = match (network.chain_id, execution_enabled, canary_readiness) {
+                (480, true, _) => CompiledNetworkGasPolicy::WorldChainV12 {
                     fallback_gas_price_wei: 100_000,
                     includes_l1_fee: true,
                 },
-                (_, false) => CompiledNetworkGasPolicy::ReadOnly,
+                (42_161, false, true) => CompiledNetworkGasPolicy::ArbitrumOne {
+                    requires_fresh_rpc_gas_price: true,
+                    max_priority_fee_per_gas_wei: 0,
+                    includes_l1_fee: false,
+                },
+                (_, false, false) => CompiledNetworkGasPolicy::ReadOnly,
                 _ => anyhow::bail!(
                     "network {} has no reviewed live gas policy",
                     network.id.as_str()
@@ -2615,7 +2626,14 @@ mod tests {
             .find(|network| network.chain_id == 42_161)
             .unwrap();
         assert!(!arbitrum.execution_enabled);
-        assert_eq!(arbitrum.gas_policy, CompiledNetworkGasPolicy::ReadOnly);
+        assert_eq!(
+            arbitrum.gas_policy,
+            CompiledNetworkGasPolicy::ArbitrumOne {
+                requires_fresh_rpc_gas_price: true,
+                max_priority_fee_per_gas_wei: 0,
+                includes_l1_fee: false,
+            }
+        );
         assert_eq!(
             collector
                 .network_runtime

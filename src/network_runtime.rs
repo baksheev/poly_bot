@@ -418,6 +418,7 @@ impl EvmExecutionOwnerBoundary for EvmExecutionOwner {
             matches!(
                 self.gas_policy,
                 CompiledNetworkGasPolicy::WorldChainV12 { .. }
+                    | CompiledNetworkGasPolicy::ArbitrumOne { .. }
             ),
             "EVM execution owner has no reviewed live gas policy"
         );
@@ -541,6 +542,8 @@ impl NetworkRuntimeRegistry {
                         "execution_enabled": network.execution_enabled,
                         "gas_policy": match &network.gas_policy {
                             CompiledNetworkGasPolicy::WorldChainV12 { .. } => "world_chain_v12",
+                            CompiledNetworkGasPolicy::ArbitrumOne { .. } =>
+                                "arbitrum_one_fail_closed",
                             CompiledNetworkGasPolicy::ReadOnly => "read_only",
                         },
                         "provider_capability_profile": reads.provider().id.as_str(),
@@ -627,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_owner_routes_by_chain_and_lane_and_keeps_arbitrum_read_only() {
+    fn execution_owner_routes_by_chain_and_lane_and_keeps_arbitrum_mutation_disabled() {
         let world_lane = ExecutionLaneId::new("lane-world-live").unwrap();
         let world = EvmExecutionOwner {
             chain_id: 480,
@@ -650,7 +653,11 @@ mod tests {
             chain_id: 42_161,
             execution_lane_id: ExecutionLaneId::new("lane-arbitrum-read-only").unwrap(),
             mutation_enabled: false,
-            gas_policy: CompiledNetworkGasPolicy::ReadOnly,
+            gas_policy: CompiledNetworkGasPolicy::ArbitrumOne {
+                requires_fresh_rpc_gas_price: true,
+                max_priority_fee_per_gas_wei: 0,
+                includes_l1_fee: false,
+            },
         };
         let command = EvmExecutionCommand {
             operation_id: "operation-2".to_owned(),
@@ -659,5 +666,17 @@ mod tests {
             kind: EvmExecutionCommandKind::Swap,
         };
         assert!(arbitrum.authorize(&command).is_err());
+
+        let reviewed_future_owner = EvmExecutionOwner {
+            chain_id: 42_161,
+            execution_lane_id: command.execution_lane_id.clone(),
+            mutation_enabled: true,
+            gas_policy: CompiledNetworkGasPolicy::ArbitrumOne {
+                requires_fresh_rpc_gas_price: true,
+                max_priority_fee_per_gas_wei: 0,
+                includes_l1_fee: false,
+            },
+        };
+        assert!(reviewed_future_owner.authorize(&command).is_ok());
     }
 }

@@ -1,7 +1,7 @@
 # Rust production trading architecture
 
 Status: **authoritative**
-Last reviewed: 2026-07-26
+Last reviewed: 2026-07-30
 Applies to: production arbitrage, recovery, settlement, inventory, rebalancing,
 and delivery
 
@@ -314,10 +314,14 @@ candidate's exact reservation remain separate authorization controls.
    Ambiguous broadcast or receipt outcomes are `UNKNOWN`, never a known failure.
 4. Actual execution amounts come only from the canonical receipt's token
    transfers. The receipt status decides success or revert.
-5. The dedicated execution owner refreshes RPC gas price every second. Signing
-   uses the at-most-two-second cached RPC or Rails-fallback sample plus the
-   configured priority fee. There is no admission-time DEX fee cap and no gas
-   RPC in the live execution hot path.
+5. Each dedicated execution owner refreshes its chain-specific RPC gas price
+   every second. World Chain signing preserves the reviewed at-most-two-second
+   cached RPC or 100,000-wei Rails-fallback sample plus its configured priority
+   fee. Arbitrum signing, once separately approved, requires a fresh
+   at-most-two-second `eth_gasPrice` sample, uses zero priority tip, and fails
+   closed when that sample is absent, zero, or stale; World Chain fallback
+   constants are forbidden on Arbitrum. There is no admission-time DEX fee cap
+   and no gas RPC in the live execution hot path.
 6. The receipt's positional pool Swap is sufficient to apply this process's
    self-impact immediately to the local mirror. Already-queued DEX WebSocket
    events are drained without waiting first, then the affected prepared curves
@@ -331,6 +335,17 @@ candidate's exact reservation remain separate authorization controls.
 8. WebSocket logs remain the continuous source of subsequent external pool
    updates. The receipt event's canonical position deduplicates its later
    WebSocket copy without delaying owner-loop processing.
+9. World Chain receipt accounting adds its explicit `l1Fee` to
+   `gasUsed * effectiveGasPrice`. Arbitrum's poster component is already
+   represented by its effective gas accounting and must not receive a second
+   World-specific `l1Fee` addition.
+
+The checked-in ESP/USDC Arbitrum readiness artifact does not authorize a
+mutation. It fixes the reviewed SwapRouter02/token identities, exact bounded
+allowance policy, per-trade/cumulative/loss/time limits, and an
+`explicit_production_approval_required` gate while both trade and rebalance
+execution remain disabled. Selecting a later live ESP artifact is an explicit
+M9 production decision, not an implication of M8 readiness.
 
 ## Binance hedge and recovery decisions
 

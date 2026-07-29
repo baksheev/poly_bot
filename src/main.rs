@@ -57,6 +57,9 @@ use arb_bot::{
     live_execution::{
         ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveRiskLimits, live_trade_channel,
     },
+    m8_readiness::{
+        inspect_chain_readiness, validate_binance_readiness, validate_rebalance_readiness,
+    },
     market_data::{
         MarketEvent,
         alchemy::{AlchemyDexStream, DexStreamEvent, connect_dex_stream},
@@ -1560,9 +1563,13 @@ async fn run(
             !arbitrum.execution().mutation_enabled()
                 && matches!(
                     arbitrum.execution().gas_policy(),
-                    CompiledNetworkGasPolicy::ReadOnly
+                    CompiledNetworkGasPolicy::ArbitrumOne {
+                        requires_fresh_rpc_gas_price: true,
+                        max_priority_fee_per_gas_wei: 0,
+                        includes_l1_fee: false,
+                    }
                 ),
-            "Arbitrum network runtime must remain read-only in M3"
+            "Arbitrum M8 readiness policy must remain fail-closed and mutation-disabled"
         );
     }
     let shadow_strategy_plan = hot_path_dependencies.as_ref().and_then(|dependencies| {
@@ -1714,6 +1721,55 @@ async fn run(
     let shared_binance_account = binance_account_client
         .hydrate_symbols_after_subscription(binance_symbols.clone(), startup_binance_clock_sync)
         .await?;
+    let m8_pair = shadow_strategy_plan
+        .as_ref()
+        .and_then(|strategy| strategy.domain_config.snapshot().pairs.first())
+        .context("compiled M8 shadow strategy has no readiness pair")?
+        .clone();
+    match shared_binance_account
+        .symbol(&m8_pair.binance.symbol)
+        .context("shared Binance account omitted the M8 readiness symbol")
+        .and_then(|state| validate_binance_readiness(&m8_pair, state))
+    {
+        Ok(readiness) => telemetry.emit(
+            "m8_live_readiness",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "stage": "binance_order_matrix",
+                "pair_id": m8_pair.id,
+                "network_id": "eip155:42161",
+                "symbol": readiness.symbol,
+                "buy_fee_bps": readiness.buy_fee_bps,
+                "sell_fee_bps": readiness.sell_fee_bps,
+                "validation_price": readiness.validation_price.to_string(),
+                "validation_quantity": readiness.validation_quantity.to_string(),
+                "request_fingerprints": readiness.request_fingerprints,
+                "request_count": 4,
+                "filters_ready": readiness.filters_ready,
+                "external_mutation_authorized": readiness.external_mutation_authorized,
+                "ready": true,
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                pair_id = m8_pair.id,
+                error = %error,
+                "M8 Binance readiness validation is incomplete; WLD execution is unchanged"
+            );
+            telemetry.emit(
+                "m8_live_readiness",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "stage": "binance_order_matrix",
+                    "pair_id": m8_pair.id,
+                    "network_id": "eip155:42161",
+                    "symbol": m8_pair.binance.symbol,
+                    "external_mutation_authorized": false,
+                    "ready": false,
+                }),
+            );
+        }
+    }
     let binance_account_generation = shared_binance_account.generation;
     let binance_account_snapshot_duration_us = shared_binance_account.account_snapshot_duration_us;
     let hydrated_binance_symbols: Vec<_> = shared_binance_account.symbols.keys().cloned().collect();
@@ -1801,6 +1857,41 @@ async fn run(
     let mut commission_price_feed = BookTickerFeed::new(&config, commission_price_symbol.clone());
     let rebalance_tracker = if pair.rebalance.enabled {
         let coins = binance_account_client.all_coin_information().await?;
+        match validate_rebalance_readiness(&m8_pair, &coins) {
+            Ok(readiness) => telemetry.emit(
+                "m8_live_readiness",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "stage": "arbitrum_rebalance_routes",
+                    "pair_id": m8_pair.id,
+                    "network_id": "eip155:42161",
+                    "binance_network": readiness.network,
+                    "asset_count": readiness.asset_count,
+                    "direct_route_count": readiness.direct_route_count,
+                    "deposit_enabled_assets": readiness.deposit_enabled_assets,
+                    "withdrawal_enabled_assets": readiness.withdrawal_enabled_assets,
+                    "external_mutation_authorized": readiness.external_mutation_authorized,
+                    "ready": readiness.ready,
+                }),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "M8 Arbitrum rebalance readiness is incomplete; mutations remain disabled"
+                );
+                telemetry.emit(
+                    "m8_live_readiness",
+                    serde_json::json!({
+                        "engine_id": config.engine_id,
+                        "stage": "arbitrum_rebalance_routes",
+                        "pair_id": m8_pair.id,
+                        "network_id": "eip155:42161",
+                        "external_mutation_authorized": false,
+                        "ready": false,
+                    }),
+                );
+            }
+        }
         let mut routes = BTreeMap::new();
         for token in [&pair.token_a, &pair.token_b] {
             let capital = select_capital_routes(
@@ -1863,6 +1954,52 @@ async fn run(
     } else {
         Vec::new()
     };
+    if let Some(registry) = network_registry.as_ref() {
+        let runtime = registry.get_by_chain_id(42_161)?;
+        let snapshot = portfolio_wallet_snapshots
+            .iter()
+            .find(|snapshot| snapshot.chain_id == 42_161)
+            .context("M8 Arbitrum wallet snapshot is missing")?;
+        match inspect_chain_readiness(&m8_pair, runtime, snapshot).await {
+            Ok(readiness) => telemetry.emit(
+                "m8_live_readiness",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "stage": "arbitrum_chain",
+                    "pair_id": m8_pair.id,
+                    "network_id": "eip155:42161",
+                    "chain_id": readiness.chain_id,
+                    "block_number": readiness.block_number,
+                    "exact_token_contracts": readiness.exact_token_contracts,
+                    "token_code_present": readiness.token_code_present,
+                    "router_code_present": readiness.router_code_present,
+                    "native_gas_funded": readiness.native_gas_funded,
+                    "fresh_rpc_gas_price": readiness.fresh_rpc_gas_price,
+                    "allowance_policy": readiness.allowance_policy,
+                    "receipt_l1_fee_mode": readiness.receipt_l1_fee_mode,
+                    "external_mutation_authorized": readiness.external_mutation_authorized,
+                    "ready": readiness.ready,
+                }),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "M8 Arbitrum chain readiness is incomplete; mutations remain disabled"
+                );
+                telemetry.emit(
+                    "m8_live_readiness",
+                    serde_json::json!({
+                        "engine_id": config.engine_id,
+                        "stage": "arbitrum_chain",
+                        "pair_id": m8_pair.id,
+                        "network_id": "eip155:42161",
+                        "external_mutation_authorized": false,
+                        "ready": false,
+                    }),
+                );
+            }
+        }
+    }
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -2326,6 +2463,36 @@ async fn run(
         shadow_external_mutation_authorized = false,
         root_supervisor_policy = "dependency_scoped_v1",
         "M7 combined production shadow configured"
+    );
+    let m8_canary = m8_pair
+        .live_canary
+        .as_ref()
+        .context("M8 readiness pair has no bounded canary policy")?;
+    tracing::info!(
+        pair_id = m8_pair.id,
+        strategy_id = %shadow_plan.strategy_id.as_str(),
+        network_id = %shadow_plan.network_id.as_str(),
+        chain_id = m8_pair.chain.chain_id,
+        router = %m8_pair
+            .chain
+            .uniswap_v3_router_address
+            .as_deref()
+            .context("M8 readiness router is missing")?,
+        approval_gate = "explicit_production_approval_required",
+        max_trade_notional_token_a_base_units =
+            %m8_canary.max_trade_notional_token_a_base_units,
+        max_total_notional_token_a_base_units =
+            %m8_canary.max_total_notional_token_a_base_units,
+        max_parent_trades = m8_canary.max_parent_trades,
+        max_concurrent_trades = m8_canary.max_concurrent_trades,
+        rollout_duration_seconds = m8_canary.rollout_duration_seconds,
+        gas_policy = "fresh_eth_gas_price_fail_closed_no_world_fallback",
+        allowance_policy = "bounded_exact_canary_cap_then_locked",
+        receipt_accounting = "effective_gas_price_includes_arbitrum_l1_component",
+        execution_enabled = false,
+        rebalance_enabled = false,
+        external_mutation_authorized = false,
+        "M8 Arbitrum live readiness configured"
     );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,

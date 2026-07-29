@@ -223,6 +223,8 @@ pub struct PairConfig {
     pub id: String,
     pub market_data_enabled: bool,
     pub execution_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_canary: Option<LiveCanaryConfig>,
     pub chain: ChainConfig,
     pub token_a: TokenConfig,
     pub token_b: TokenConfig,
@@ -244,6 +246,9 @@ impl PairConfig {
             "pair {} cannot enable execution without market data",
             self.id
         );
+        if let Some(canary) = &self.live_canary {
+            canary.validate(self)?;
+        }
         self.chain.validate()?;
         self.token_a.validate("token_a", self.chain.chain_id)?;
         self.token_b.validate("token_b", self.chain.chain_id)?;
@@ -261,6 +266,111 @@ impl PairConfig {
         self.dex.validate(&self.chain)?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryConfig {
+    pub approval_gate: LiveCanaryApprovalGate,
+    pub max_trade_notional_token_a_base_units: String,
+    pub max_total_notional_token_a_base_units: String,
+    pub max_unhedged_notional_token_a_base_units: String,
+    pub max_realized_loss_token_a_base_units: String,
+    pub minimum_native_gas_wei: String,
+    pub max_parent_trades: u16,
+    pub max_concurrent_trades: u16,
+    pub rollout_duration_seconds: u64,
+    pub rebalance_mutations_enabled: bool,
+}
+
+impl LiveCanaryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        ensure!(
+            pair.id == "arbitrum-usdc-esp"
+                && pair.chain.chain_id == 42_161
+                && pair.binance.symbol == "ESPUSDC"
+                && pair.token_a.symbol == "USDC"
+                && pair
+                    .token_a
+                    .contract
+                    .eq_ignore_ascii_case("0xaf88d065e77c8cc2239327c5edb3a432268e5831")
+                && pair.token_b.symbol == "ESP"
+                && pair
+                    .token_b
+                    .contract
+                    .eq_ignore_ascii_case("0x3b8db18e69d6686ad9371a423afe3dd1065c94f1")
+                && pair
+                    .chain
+                    .uniswap_v3_router_address
+                    .as_deref()
+                    .is_some_and(|address| address
+                        .eq_ignore_ascii_case("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")),
+            "live canary is restricted to the reviewed ESPUSDC Arbitrum contracts and SwapRouter02"
+        );
+        ensure!(
+            self.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired,
+            "pair {} live canary is missing the explicit production approval gate",
+            pair.id
+        );
+        ensure!(
+            !pair.execution_enabled,
+            "pair {} readiness artifact cannot enable execution before explicit approval",
+            pair.id
+        );
+        ensure!(
+            !self.rebalance_mutations_enabled && !pair.rebalance.enabled,
+            "pair {} readiness artifact cannot enable rebalance mutations",
+            pair.id
+        );
+        let maximum_trade = parse_base_units_u256(
+            &self.max_trade_notional_token_a_base_units,
+            "live_canary.max_trade_notional_token_a_base_units",
+        )?;
+        let maximum_total = parse_base_units_u256(
+            &self.max_total_notional_token_a_base_units,
+            "live_canary.max_total_notional_token_a_base_units",
+        )?;
+        let maximum_unhedged = parse_base_units_u256(
+            &self.max_unhedged_notional_token_a_base_units,
+            "live_canary.max_unhedged_notional_token_a_base_units",
+        )?;
+        let maximum_loss = parse_base_units_u256(
+            &self.max_realized_loss_token_a_base_units,
+            "live_canary.max_realized_loss_token_a_base_units",
+        )?;
+        let minimum_native_gas = parse_base_units_u256(
+            &self.minimum_native_gas_wei,
+            "live_canary.minimum_native_gas_wei",
+        )?;
+        ensure!(
+            !maximum_trade.is_zero()
+                && maximum_trade <= maximum_total
+                && maximum_unhedged <= maximum_trade
+                && maximum_loss <= maximum_total
+                && !minimum_native_gas.is_zero(),
+            "pair {} live canary monetary limits are inconsistent",
+            pair.id
+        );
+        ensure!(
+            self.max_parent_trades > 0
+                && self.max_parent_trades <= 10
+                && self.max_concurrent_trades == 1,
+            "pair {} live canary trade limits are outside the reviewed bounds",
+            pair.id
+        );
+        ensure!(
+            (60..=3_600).contains(&self.rollout_duration_seconds),
+            "pair {} live canary duration is outside 60..=3600 seconds",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveCanaryApprovalGate {
+    ExplicitProductionApprovalRequired,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -979,6 +1089,10 @@ fn validate_positive_base_units(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_base_units_u256(value: &str, name: &str) -> anyhow::Result<U256> {
+    U256::from_str_radix(value, 10).with_context(|| format!("{name} exceeds uint256"))
+}
+
 fn validate_non_negative_base_units(name: &str, value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
@@ -1007,8 +1121,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AdaptiveSizingConfig, ArbitrageStrategy, BinanceProduct, DexProvider, LoadedDomainConfig,
-        TokenBQuoteSizing,
+        AdaptiveSizingConfig, ArbitrageStrategy, BinanceProduct, DexProvider,
+        LiveCanaryApprovalGate, LoadedDomainConfig, TokenBQuoteSizing,
     };
 
     const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v4.json");
@@ -1025,6 +1139,8 @@ mod tests {
     const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v12.json");
     const ESP_SHADOW_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v2.json");
+    const ESP_READINESS_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v3.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1075,6 +1191,44 @@ mod tests {
         assert_eq!(pair.dex.allowed_providers, [DexProvider::UniswapV3]);
         assert_eq!(pair.dex.uniswap_v3.as_ref().unwrap().fee_tiers, [100]);
         assert!(pair.dex.uniswap_v4.is_none());
+    }
+
+    #[test]
+    fn committed_esp_readiness_snapshot_is_bounded_and_cannot_mutate() {
+        let loaded = load(ESP_READINESS_CONFIG.as_bytes()).unwrap();
+        let pair = &loaded.snapshot().pairs[0];
+        let canary = pair.live_canary.as_ref().unwrap();
+
+        assert_eq!(pair.chain.chain_id, 42_161);
+        assert_eq!(
+            pair.chain.uniswap_v3_router_address.as_deref(),
+            Some("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
+        );
+        assert_eq!(
+            canary.approval_gate,
+            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+        );
+        assert_eq!(canary.max_parent_trades, 2);
+        assert_eq!(canary.max_concurrent_trades, 1);
+        assert!(!canary.rebalance_mutations_enabled);
+        assert!(!pair.execution_enabled);
+        assert!(!pair.rebalance.enabled);
+        assert!(!loaded.snapshot().live_trading_enabled);
+    }
+
+    #[test]
+    fn esp_readiness_artifact_rejects_execution_before_approval() {
+        let mut value: Value = serde_json::from_str(ESP_READINESS_CONFIG).unwrap();
+        value["pairs"][0]["execution_enabled"] = Value::Bool(true);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_READINESS_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["max_concurrent_trades"] = Value::from(2);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_READINESS_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(true);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 
     #[test]

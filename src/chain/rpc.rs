@@ -275,6 +275,24 @@ impl JsonRpcClient {
         parse_quantity_value_u256("eth_getBalance", value)
     }
 
+    pub async fn contract_code_at(
+        &self,
+        address: Address,
+        block: CanonicalBlock,
+    ) -> anyhow::Result<Vec<u8>> {
+        ensure!(address != Address::ZERO, "eth_getCode address is zero");
+        let value = self
+            .request(
+                "eth_getCode",
+                json!([format!("{address:#x}"), block.eip1898()]),
+            )
+            .await?;
+        let encoded = value
+            .as_str()
+            .context("eth_getCode result is not a hex string")?;
+        parse_data_hex("eth_getCode result", encoded)
+    }
+
     pub async fn pending_nonce(&self, address: Address) -> anyhow::Result<u64> {
         self.nonce(address, "pending").await
     }

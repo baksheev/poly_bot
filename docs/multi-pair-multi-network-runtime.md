@@ -1731,6 +1731,25 @@ supervisor action. `scripts/report-m7-combined-shadow START_UTC END_UTC`
 reports those faults, exact background WLD comparisons, ESP planning/mutation
 proofs, and then chains the unchanged M6 through M0 gates.
 
+The authoritative corrective M7 revision
+`cfa316b26d5b996cf4411671908c0e8efe438c70` ran in Pod
+`arb-bot-7cc7d7888f-g5dtg` from `2026-07-29T21:04:44Z`. In the first
+8m16s, the exact main engine produced 1,692/1,692 matching WLD decision
+projections, zero mismatches, zero dependency-scoped faults, and zero shadow
+mutation-capability records. WLD socket-to-decision p99/max was 24/40
+microseconds; the World Chain fee-500 prepared-curve total p99/max was
+174/174 microseconds, within the frozen relative and hard M0 bounds. The
+preceding runtime-identical revision produced 30 ESP candidate, reservation,
+and rebalance proposals; the corrective revision changed only the report's
+engine filter, while its shorter market window contained no qualifying ESP
+candidate.
+
+The same exact-Pod window had no production `ERROR`, no container restart,
+0 cgroup throttles, 51.8 MB peak cgroup memory, no memory high/max/OOM event,
+and 0.0148 CPU-core maximum. Both containers remained Ready and the GCE
+rollback target remained `TERMINATED`. This closes M7 without changing the WLD
+execution path.
+
 ### M8 — ESP/USDC Arbitrum live readiness
 
 Deliver:
@@ -1766,6 +1785,44 @@ Exit criteria:
 Rollback:
 
 - disable the ESP pair execution gate; retain read-only collection.
+
+M8 introduces `usdc-esp-arbitrum.v3.json` as a non-mutating readiness
+artifact. It pins official Arbitrum One SwapRouter02
+`0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45`, native USDC, ESP, the viable
+V3 0.01% pool, a 10-USDC per-parent cap, 20-USDC cumulative cap, one concurrent
+parent, two parents, a 15-minute window, and a 1-USDC realized-loss stop. Its
+gate is `explicit_production_approval_required`; `execution_enabled`,
+rebalance, and external mutation authorization remain false.
+
+The process-scoped Arbitrum execution policy is prepared but cannot authorize
+the current owner. It requires a fresh two-second `eth_gasPrice` sample, sets
+the sequencer priority tip to zero, has no World Chain fallback, grants only
+the exact bounded V3 allowance during a future approved startup phase, and
+then locks allowance writes. Arbitrum receipt accounting uses
+`gasUsed * effectiveGasPrice` without adding the World Chain-only `l1Fee`.
+The existing nonce journal, known-revert diagnostics, unknown-broadcast
+recovery, positional receipt settlement, and exact transfer accounting remain
+shared typed components.
+
+The live read-only M8 startup proof checks authenticated ESPUSDC filters and
+commissions and constructs deterministic BUY/SELL LIMIT IOC plus BUY/SELL
+MARKET recovery requests without submitting them. A block-pinned wallet proof
+checks the exact token contracts, token/router bytecode, native gas floor, and
+nonzero RPC fee. Binance capital metadata is independently projected into
+direct Arbitrum rebalance routes for USDC and ESP without exposing an executor.
+`scripts/report-m8-live-readiness START_UTC END_UTC` requires all three proofs,
+four valid order shapes, two direct routes, the fail-closed gas policy, and
+zero mutation capability before chaining M7 through M0.
+
+The explicit archival-RPC parity test passed in both directions at Arbitrum
+block `489077578`,
+`0xe5ba358e8a603b04b7a5d07d7ad6106aa678b3709ad7ebbdf061bc500dce060a`:
+the local V3 curve exactly matched QuoterV2 using EIP-1898 block pinning. The
+checked calldata has the QuoterV2 tuple selector and a stable digest, while the
+swap plan uses the matching SwapRouter02 `exactInput` ABI. Deterministic
+fixtures also cover bounded allowances, transaction fees, restart journal
+reconciliation, known DEX revert, unknown broadcast, Binance rejection,
+partial IOC, unknown placement, and the three-attempt MARKET recovery bound.
 
 ### M9 — Bounded ESP/USDC live canary
 
