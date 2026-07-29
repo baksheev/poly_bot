@@ -5,6 +5,11 @@ WITH
     (
         SELECT
             JSONExtractString(payload_json, 'engine_id') AS engine_id,
+            JSONExtractString(payload_json, 'pair_id') AS pair_id,
+            JSONExtractString(payload_json, 'strategy_id') AS strategy_id,
+            JSONExtractString(payload_json, 'binance_account_id') AS binance_account_id,
+            JSONExtractString(payload_json, 'instrument_id') AS instrument_id,
+            JSONExtractString(payload_json, 'network_id') AS network_id,
             arrayJoin([
                 if(kind = 'arbitrage_adaptive_sizing_task',
                     tuple('sizing_snapshot', JSONExtractUInt(payload_json, 'snapshot_time_us')),
@@ -48,6 +53,11 @@ WITH
     )
 SELECT
     engine_id,
+    pair_id,
+    strategy_id,
+    binance_account_id,
+    instrument_id,
+    network_id,
     tupleElement(sample, 1) AS stage,
     count() AS n,
     quantileExact(0.50)(tupleElement(sample, 2)) AS p50_us,
@@ -56,6 +66,13 @@ SELECT
     max(tupleElement(sample, 2)) AS max_us
 FROM samples
 WHERE stage != ''
-GROUP BY engine_id, stage
-ORDER BY engine_id, stage
+GROUP BY
+    engine_id,
+    pair_id,
+    strategy_id,
+    binance_account_id,
+    instrument_id,
+    network_id,
+    stage
+ORDER BY engine_id, pair_id, strategy_id, stage
 FORMAT TabSeparatedWithNames

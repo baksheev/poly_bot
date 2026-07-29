@@ -1015,6 +1015,11 @@ strategy, network, stable pool ID, and canonical pool identity. It also reports
 complete stage-timing counts and maximum prepared segment counts, so a sparse
 fee tier cannot be hidden inside a faster aggregate pool distribution.
 
+Adaptive sizing task, optimizer, and admission rows carry the M0 compatibility
+IDs for their pair, strategy, Binance account, instrument, and network.
+`m0_admission_execution.sql` groups on those dimensions, so M1 cannot hide one
+strategy's queue or worker tail inside another strategy on the same engine.
+
 The owner applies an already-queued canonical DEX burst before doing any curve
 work. Build requests are coalesced by pool generation and keep only the newest
 mirror snapshot for each pool. Independent pools are then built by ascending

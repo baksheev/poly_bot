@@ -149,6 +149,8 @@ Freshness and preflight remain separate execution-validity checks:
 
 `arbitrage_adaptive_sizing_evaluated` records:
 
+- the stable pair, strategy, Binance account, instrument, and network
+  compatibility IDs used by the M0 per-strategy report;
 - optimizer version `maximum_slippage_slot_v2`;
 - configured and selected sizing modes;
 - exact evaluation count and calculation latency;
@@ -165,10 +167,11 @@ Freshness and preflight remain separate execution-validity checks:
 pool, amount, and gross spread. There is no theoretical-capacity payload;
 adaptive sizing is the only owner of executable-size calculation.
 
-`arbitrage_adaptive_sizing_task` separately records queue, worker, result
-handoff, and snapshot timings. A result is superseded only by a newer Binance
-quote, a newer prepared DEX generation, or runtime freshness loss. Balance,
-gas, and depth changes do not invalidate an in-progress sizing result.
+`arbitrage_adaptive_sizing_task` carries the same stable identity projection
+and separately records queue, worker, result handoff, and snapshot timings. A
+result is superseded only by a newer Binance quote, a newer prepared DEX
+generation, or runtime freshness loss. Balance, gas, and depth changes do not
+invalidate an in-progress sizing result.
 
 ## Active control
 

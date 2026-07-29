@@ -45,3 +45,27 @@ fn m0_report_includes_pool_scoped_dex_latency_table() {
     assert!(query.contains("quantileExact(0.95)"));
     assert!(query.contains("quantileExact(0.99)"));
 }
+
+#[test]
+fn m0_admission_report_is_strategy_and_account_scoped() {
+    let query =
+        fs::read_to_string(repository_root().join("scripts/sql/m0_admission_execution.sql"))
+            .expect("M0 admission query must be readable");
+
+    for identity in [
+        "'pair_id'",
+        "'strategy_id'",
+        "'binance_account_id'",
+        "'instrument_id'",
+        "'network_id'",
+    ] {
+        assert!(
+            query.contains(identity),
+            "admission query must extract {identity}"
+        );
+    }
+    assert!(query.contains("GROUP BY"));
+    assert!(query.contains("binance_account_id,"));
+    assert!(query.contains("instrument_id,"));
+    assert!(query.contains("network_id,"));
+}

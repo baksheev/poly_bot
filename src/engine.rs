@@ -867,6 +867,9 @@ impl TradingEngine {
         &mut self,
         task: AdaptiveSizingTaskResult,
     ) -> anyhow::Result<()> {
+        let pair = self
+            .opportunities
+            .pair(task.pending.evaluation.pair_index)?;
         let quote_is_current = self
             .state
             .binance_feeds
@@ -894,7 +897,11 @@ impl TradingEngine {
             "arbitrage_adaptive_sizing_task",
             json!({
                 "engine_id": self.config.engine_id,
-                "pair_id": self.opportunities.pair(task.pending.evaluation.pair_index)?.pair_id,
+                "pair_id": pair.pair_id,
+                "strategy_id": strategy_id(&pair.pair_id),
+                "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                "instrument_id": instrument_id(&pair.symbol),
+                "network_id": network_id(pair.chain_id),
                 "symbol": task.pending.quote.symbol.as_ref(),
                 "update_id": task.pending.quote.update_id,
                 "outcome": if stale_reason.is_some() { "superseded" } else { "current" },
@@ -2130,6 +2137,10 @@ impl AdaptiveSizingSnapshot {
         let mut payload = json!({
             "engine_id": self.engine_id,
             "pair_id": pair.pair_id,
+            "strategy_id": strategy_id(&pair.pair_id),
+            "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+            "instrument_id": instrument_id(&pair.symbol),
+            "network_id": network_id(pair.chain_id),
             "symbol": quote.symbol.as_ref(),
             "update_id": quote.update_id,
             "configured_mode": pair_config.adaptive_sizing.mode(),
@@ -2345,6 +2356,7 @@ impl TradingEngine {
         let pair = self.opportunities.pair(evaluation.pair_index)?;
         let pair_id = pair.pair_id.clone();
         let pair_symbol = pair.symbol.clone();
+        let pair_chain_id = pair.chain_id;
         let pair_config = self
             .domain_config
             .snapshot()
@@ -2451,6 +2463,10 @@ impl TradingEngine {
                     json!({
                         "engine_id": self.config.engine_id,
                         "pair_id": pair_id,
+                        "strategy_id": strategy_id(&pair_id),
+                        "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                        "instrument_id": instrument_id(&pair_symbol),
+                        "network_id": network_id(pair_chain_id),
                         "symbol": quote.symbol.as_ref(),
                         "update_id": quote.update_id,
                         "optimizer_version": ADAPTIVE_OPTIMIZER_VERSION,
@@ -2533,7 +2549,6 @@ impl TradingEngine {
         let dex_pool_generation = self.opportunities.pool_generation(trade.pool_index)?;
         let token_a_symbol = pair_config.token_a.symbol.clone();
         let token_b_symbol = pair_config.token_b.symbol.clone();
-        let pair_chain_id = pair_config.chain.chain_id;
         let deadline_unix_seconds =
             admission_deadline_unix_seconds(quote.received_unix_us, quote.received_at.elapsed())?;
         let dex_plan = DexSwapPlan::build(
