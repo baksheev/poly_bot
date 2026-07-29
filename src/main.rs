@@ -41,7 +41,13 @@ use arb_bot::{
         revert_diagnostics::dex_revert_diagnostic_channel,
         validation::{execute_recovery_sell, execute_round_trip},
     },
-    domain::config::{DexProvider, LoadedDomainConfig},
+    domain::{
+        compiled::{
+            CompatibilityRole, CompiledGraphSummary, compile_manifest_to_path,
+            load_compatibility_domain,
+        },
+        config::{DexProvider, LoadedDomainConfig},
+    },
     engine::{BinanceFeeBps, TradingEngine},
     execution_accounting::{CommissionAssetValuation, binance_leg_result},
     hot_telemetry,
@@ -87,6 +93,31 @@ enum RebalanceExecutorEvent {
     Execution(Result<RebalanceExecutionOperation, String>),
 }
 
+fn log_compiled_graph(summary: Option<&CompiledGraphSummary>) {
+    let Some(summary) = summary else {
+        return;
+    };
+    tracing::info!(
+        bundle_id = %summary.bundle_id,
+        compatibility_projection_id = %summary.projection_id,
+        domain_config_sha256 = %summary.fingerprint_sha256,
+        account_count = summary.accounts,
+        instrument_count = summary.instruments,
+        network_count = summary.networks,
+        wallet_count = summary.wallets,
+        venue_asset_count = summary.venue_assets,
+        economic_asset_count = summary.economic_assets,
+        pool_count = summary.pools,
+        strategy_count = summary.strategies,
+        compiled_domain_bundle_bytes = summary.bundle_bytes,
+        compiled_domain_load_validation_us = summary.load_validation_us,
+        compiled_domain_rss_before_bytes = ?summary.rss_before_bytes,
+        compiled_domain_rss_after_bytes = ?summary.rss_after_bytes,
+        compiled_domain_rss_delta_bytes = ?summary.rss_delta_bytes,
+        "compiled domain graph validated before network startup"
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let process_started_at = Instant::now();
@@ -97,9 +128,25 @@ async fn main() -> anyhow::Result<()> {
     cli.config.validate()?;
 
     match cli.command {
+        Command::CompileDomain { manifest, output } => {
+            let fingerprint = compile_manifest_to_path(&manifest, &output)?;
+            tracing::info!(
+                manifest_path = %manifest.display(),
+                output_path = %output.display(),
+                domain_config_sha256 = %fingerprint,
+                "compiled canonical multi-pair domain bundle"
+            );
+            Ok(())
+        }
         Command::Run => {
             let domain_validation_started_at = Instant::now();
-            let domain_config = Arc::new(LoadedDomainConfig::load(&cli.config.domain_config_path)?);
+            let selection = load_compatibility_domain(
+                &cli.config.domain_config_path,
+                CompatibilityRole::LiveRuntime,
+                true,
+            )?;
+            log_compiled_graph(selection.graph_summary.as_ref());
+            let domain_config = Arc::new(selection.config);
             let bootstrap = BootstrapTiming {
                 process_started_at,
                 domain_validation_complete_at: Instant::now(),
@@ -108,12 +155,24 @@ async fn main() -> anyhow::Result<()> {
             run(cli.config, domain_config, bootstrap).await
         }
         Command::CollectPrices => {
-            let domain_config = Arc::new(LoadedDomainConfig::load(&cli.config.domain_config_path)?);
+            let selection = load_compatibility_domain(
+                &cli.config.domain_config_path,
+                CompatibilityRole::PublicPriceCollector,
+                true,
+            )?;
+            log_compiled_graph(selection.graph_summary.as_ref());
+            let domain_config = Arc::new(selection.config);
             collect_prices(cli.config, domain_config).await
         }
         Command::Migrate => TelemetryWriter::new(&cli.config).migrate().await,
         Command::Check => {
-            let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
+            let selection = load_compatibility_domain(
+                &cli.config.domain_config_path,
+                CompatibilityRole::LiveRuntime,
+                false,
+            )?;
+            log_compiled_graph(selection.graph_summary.as_ref());
+            let domain_config = selection.config;
             tracing::info!(
                 service = %cli.config.service_name,
                 engine_id = %cli.config.engine_id,

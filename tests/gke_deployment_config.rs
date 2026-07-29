@@ -6,7 +6,13 @@ const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml"
 fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
     assert!(
         RELEASE_PLATFORM
-            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-wld-world-chain.v12.json")
+            .contains("DOMAIN_CONFIG_PATH: config/domain/compiled-multi-pair-production.v1.json")
+    );
+    assert_eq!(
+        RELEASE_PLATFORM
+            .matches("DOMAIN_CONFIG_PATH: config/domain/compiled-multi-pair-production.v1.json")
+            .count(),
+        2
     );
     assert!(!RELEASE_PLATFORM.contains("GAS_PRICE_MAX_TRANSPORT_SILENCE_MS"));
     assert!(RELEASE_PLATFORM.contains("DEX_HEAD_MAX_AGE_MS: \"30000\""));
@@ -38,7 +44,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
-    assert!(DEPLOY_WORKFLOW.contains("usdc-wld-world-chain.v12.json"));
+    assert!(DEPLOY_WORKFLOW.contains("compiled-multi-pair-production.v1.json"));
+    assert!(DEPLOY_WORKFLOW.contains(".bundle_kind"));
+    assert!(DEPLOY_WORKFLOW.contains(".capabilities"));
+    assert!(DEPLOY_WORKFLOW.contains("live_runtime"));
+    assert!(DEPLOY_WORKFLOW.contains("public_price_collector"));
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("max_transport_silence_ms"));
@@ -53,7 +63,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_update_delta"));
     assert!(DEPLOY_WORKFLOW.contains("top_of_book_max_trade_notional_token_a_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("has(\"balance_safety_multiplier\")"));
+    assert!(DEPLOY_WORKFLOW.contains("balance_safety_multiplier"));
     assert!(DEPLOY_WORKFLOW.contains("previous_runtime_config"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
 }
@@ -62,7 +72,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
 fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(
         RELEASE_PLATFORM
-            .contains("DOMAIN_CONFIG_PATH: config/strategies/usdc-esp-arbitrum.v2.json")
+            .contains("DOMAIN_CONFIG_PATH: config/domain/compiled-multi-pair-production.v1.json")
     );
     assert!(RELEASE_PLATFORM.contains("name: arb-bot-esp-market-data"));
     assert!(RELEASE_PLATFORM.contains("RUNTIME_READY_FILE: /tmp/arb-bot-esp-ready"));
@@ -71,7 +81,7 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOYMENT.contains("secretProviderClass: arb-bot-esp-market-data"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
-    assert!(DEPLOY_WORKFLOW.contains("usdc-esp-arbitrum.v2.json"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
 }

@@ -15,6 +15,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Compile versioned pair artifacts into one canonical multi-pair domain bundle.
+    CompileDomain {
+        #[arg(
+            long,
+            default_value = "config/domain/multi-pair-production.v1.sources.json"
+        )]
+        manifest: PathBuf,
+        #[arg(
+            long,
+            default_value = "config/domain/compiled-multi-pair-production.v1.json"
+        )]
+        output: PathBuf,
+    },
     /// Run the read-only market-data shadow service.
     Run,
     /// Collect public Binance and DEX prices without trading or signing credentials.

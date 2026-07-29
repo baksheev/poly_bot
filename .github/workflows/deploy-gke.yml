@@ -64,38 +64,51 @@ jobs:
             [[ "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]
             test -n "${limit//[0.]/}"
           done
-          domain_config=config/strategies/usdc-wld-world-chain.v12.json
-          test "$(jq -r '.pairs[0].adaptive_sizing.mode' "${domain_config}")" = adaptive
-          test "$(jq -r '.pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units' "${domain_config}")" = 200000000
-          test "$(jq -r '.pairs[0].quote_sizing.token_a_base_units' "${domain_config}")" = 20000000
-          test "$(jq -r '.pairs[0].strategy.opportunity_threshold_bps' "${domain_config}")" = 20
-          test "$(jq -r '.pairs[0].strategy.max_quote_age_ms' "${domain_config}")" = 30000
-          test "$(jq -r '.pairs[0].strategy.max_transport_silence_ms' "${domain_config}")" = 30000
-          test "$(jq -r '.pairs[0].adaptive_sizing.min_expected_profit_token_a_base_units' "${domain_config}")" = 0
-          test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_age_ms' "${domain_config}")" = 750
-          test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_update_delta' "${domain_config}")" = 8
-          test "$(jq -r '.pairs[0].adaptive_sizing.depth_policy.top_of_book_max_trade_notional_token_a_base_units' "${domain_config}")" = 40000000
-          test "$(jq -r '.pairs[0].strategy | has("balance_safety_multiplier")' "${domain_config}")" = false
-          esp_domain_config=config/strategies/usdc-esp-arbitrum.v2.json
-          test "$(jq -r '.live_trading_enabled' "${esp_domain_config}")" = false
-          test "$(jq -r '.source.rails_pair_candidate_id' "${esp_domain_config}")" = 3144
-          test "$(jq -r '.pairs | length' "${esp_domain_config}")" = 1
-          test "$(jq -r '.pairs[0].id' "${esp_domain_config}")" = arbitrum-usdc-esp
-          test "$(jq -r '.pairs[0].chain.chain_id' "${esp_domain_config}")" = 42161
-          test "$(jq -r '.pairs[0].binance.symbol' "${esp_domain_config}")" = ESPUSDC
-          test "$(jq -r '.pairs[0].market_data_enabled' "${esp_domain_config}")" = true
-          test "$(jq -r '.pairs[0].execution_enabled' "${esp_domain_config}")" = false
-          test "$(jq -r '.pairs[0].rebalance.enabled' "${esp_domain_config}")" = false
-          test "$(jq -r '.pairs[0].chain | has("uniswap_v3_router_address")' "${esp_domain_config}")" = false
-          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_router_address")' "${esp_domain_config}")" = false
-          test "$(jq -c '.pairs[0].dex.allowed_providers' "${esp_domain_config}")" \
+          domain_config=config/domain/compiled-multi-pair-production.v1.json
+          test "$(jq -r '.bundle_kind' "${domain_config}")" = compiled_multi_pair_domain
+          test "$(jq -r '.bundle_id' "${domain_config}")" = arb-bot-production-multi-pair-v1
+          test "$(jq -c '.instruments | map(.symbol)' "${domain_config}")" \
+            = '["ESPUSDC","WLDUSDC"]'
+          test "$(jq -c '.networks | map(.id)' "${domain_config}")" \
+            = '["eip155:42161","eip155:480"]'
+          test "$(jq -c '.capabilities' "${domain_config}")" = \
+            '[{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":false,"rebalance":false},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
+          test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
+            = arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness
+          test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
+            = arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices
+          wld='.sources[] | select(.snapshot.live_trading_enabled == true) | .snapshot'
+          test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.mode" "${domain_config}")" = adaptive
+          test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
+          test "$(jq -r "${wld} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 20000000
+          test "$(jq -r "${wld} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
+          test "$(jq -r "${wld} | .pairs[0].strategy.max_quote_age_ms" "${domain_config}")" = 30000
+          test "$(jq -r "${wld} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
+          test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.min_expected_profit_token_a_base_units" "${domain_config}")" = 0
+          test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_age_ms" "${domain_config}")" = 750
+          test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.depth_policy.recent_full_depth_max_update_delta" "${domain_config}")" = 8
+          test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.depth_policy.top_of_book_max_trade_notional_token_a_base_units" "${domain_config}")" = 40000000
+          test "$(jq -r "${wld} | .pairs[0].strategy | has(\"balance_safety_multiplier\")" "${domain_config}")" = false
+          esp='.sources[] | select(.snapshot.live_trading_enabled == false) | .snapshot'
+          test "$(jq -r "${esp} | .live_trading_enabled" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .source.rails_pair_candidate_id" "${domain_config}")" = 3144
+          test "$(jq -r "${esp} | .pairs | length" "${domain_config}")" = 1
+          test "$(jq -r "${esp} | .pairs[0].id" "${domain_config}")" = arbitrum-usdc-esp
+          test "$(jq -r "${esp} | .pairs[0].chain.chain_id" "${domain_config}")" = 42161
+          test "$(jq -r "${esp} | .pairs[0].binance.symbol" "${domain_config}")" = ESPUSDC
+          test "$(jq -r "${esp} | .pairs[0].market_data_enabled" "${domain_config}")" = true
+          test "$(jq -r "${esp} | .pairs[0].execution_enabled" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].rebalance.enabled" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v3_router_address\")" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_router_address\")" "${domain_config}")" = false
+          test "$(jq -c "${esp} | .pairs[0].dex.allowed_providers" "${domain_config}")" \
             = '["uniswap_v3"]'
-          test "$(jq -c '.pairs[0].dex.uniswap_v3.fee_tiers' "${esp_domain_config}")" \
+          test "$(jq -c "${esp} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" \
             = '[100]'
-          test "$(jq -r '.pairs[0].dex | has("uniswap_v4")' "${esp_domain_config}")" = false
-          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_quoter_address")' "${esp_domain_config}")" = false
-          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_pool_manager_address")' "${esp_domain_config}")" = false
-          test "$(jq -r '.pairs[0].chain | has("uniswap_v4_state_view_address")' "${esp_domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].dex | has(\"uniswap_v4\")" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_quoter_address\")" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -304,7 +317,7 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${runtime_config}")" \
-            = config/strategies/usdc-wld-world-chain.v12.json
+            = config/domain/compiled-multi-pair-production.v1.json
           test "$(jq -r '.data.DEX_HEAD_MAX_AGE_MS' <<<"${runtime_config}")" \
             = 30000
           test "$(jq -r '.data.BALANCE_SYNC_INTERVAL_MS' <<<"${runtime_config}")" \
@@ -319,7 +332,7 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
           test "$(jq -r '.data.DOMAIN_CONFIG_PATH' <<<"${esp_runtime_config}")" \
-            = config/strategies/usdc-esp-arbitrum.v2.json
+            = config/domain/compiled-multi-pair-production.v1.json
           test "$(jq -r '.data.ARBITRAGE_EXECUTION_MODE' <<<"${esp_runtime_config}")" \
             = disabled
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${esp_runtime_config}")" \

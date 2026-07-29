@@ -8,7 +8,7 @@ use std::{
 use alloy_primitives::U256;
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -28,7 +28,7 @@ impl LoadedDomainConfig {
         Self::from_bytes(path, &bytes)
     }
 
-    fn from_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> anyhow::Result<Self> {
+    pub(crate) fn from_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let snapshot: DomainSnapshot = serde_json::from_slice(bytes)
             .with_context(|| format!("failed to parse domain config {}", path.display()))?;
@@ -43,6 +43,22 @@ impl LoadedDomainConfig {
                 .expect("writing a SHA-256 digest to String cannot fail");
         }
 
+        Ok(Self {
+            path: path.to_owned(),
+            fingerprint_sha256,
+            snapshot,
+        })
+    }
+
+    pub(crate) fn from_projected_snapshot(
+        path: impl AsRef<Path>,
+        fingerprint_sha256: String,
+        snapshot: DomainSnapshot,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        snapshot
+            .validate()
+            .with_context(|| format!("invalid projected domain config {}", path.display()))?;
         Ok(Self {
             path: path.to_owned(),
             fingerprint_sha256,
@@ -94,7 +110,7 @@ impl LoadedDomainConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DomainSnapshot {
     pub schema_version: u32,
@@ -141,9 +157,13 @@ impl DomainSnapshot {
         );
         Ok(())
     }
+
+    pub(crate) fn validate_for_compiler(&self) -> anyhow::Result<()> {
+        self.validate()
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSource {
     pub repository: String,
@@ -197,7 +217,7 @@ impl SnapshotSource {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
     pub id: String,
@@ -243,7 +263,7 @@ impl PairConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdaptiveSizingConfig {
     BaselineOnly,
@@ -271,7 +291,7 @@ pub enum AdaptiveSizingConfig {
     },
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdaptiveDepthPolicy {
     pub recent_full_depth_max_age_ms: u64,
@@ -428,7 +448,7 @@ pub struct AdaptiveSizingLimits<'a> {
     pub depth_policy: &'a AdaptiveDepthPolicy,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RebalanceConfig {
     pub enabled: bool,
@@ -454,7 +474,7 @@ impl RebalanceConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub name: String,
@@ -520,7 +540,7 @@ impl ChainConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenConfig {
     pub symbol: String,
@@ -541,7 +561,7 @@ impl TokenConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinanceConfig {
     pub symbol: String,
@@ -618,14 +638,14 @@ impl BinanceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BinanceProduct {
     Spot,
     UsdMFutures,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteSizingConfig {
     pub token_a_base_units: String,
@@ -642,13 +662,13 @@ impl QuoteSizingConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenBQuoteSizing {
     DeriveFromBinanceAsk,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StrategyConfig {
     pub kind: ArbitrageStrategy,
@@ -721,14 +741,14 @@ impl StrategyConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArbitrageStrategy {
     Legacy,
     ProfitTokenA,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DexConfig {
     pub allowed_providers: Vec<DexProvider>,
@@ -787,7 +807,7 @@ impl DexConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DexProvider {
     ZeroX,
@@ -795,7 +815,7 @@ pub enum DexProvider {
     UniswapV4,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniswapV3Config {
     pub fee_tiers: Vec<u32>,
@@ -822,7 +842,7 @@ impl UniswapV3Config {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniswapV4Config {
     pub pools: Vec<UniswapV4PoolConfig>,
@@ -838,7 +858,7 @@ impl UniswapV4Config {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniswapV4PoolConfig {
     pub fee_tier: u32,

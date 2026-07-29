@@ -32,8 +32,10 @@ The zonal `dynamic-rwo` Hyperdisk Balanced volume stores the durable execution
 journals and provides a second single-writer boundary on C4. Recreate rollout
 plus the journal file locks prevent two processes from owning the same trade or
 rebalance operation. The current manifest selects `full_live` for arbitrage and
-rebalancing, loads the reviewed v12 adaptive-live domain artifact, mounts the
-wallet signer, and uses separate Binance subaccount and master treasury credentials.
+rebalancing, loads the compiled multi-pair bundle through the strict WLD/USDC
+v12 live compatibility projection, mounts the wallet signer, and uses separate
+Binance subaccount and master treasury credentials. The ESP sidecar reads the
+same bundle through its non-mutating v2 collector projection.
 The parent-trade, Binance-order, arbitrage-wallet, rebalance-executor, and
 rebalance-wallet journals all live on this disk.
 

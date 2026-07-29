@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "bundle_id": "arb-bot-production-multi-pair-v1",
+  "compiler_version": "m1-v1",
+  "source_paths": [
+    "config/strategies/usdc-wld-world-chain.v12.json",
+    "config/strategies/usdc-esp-arbitrum.v2.json"
+  ],
+  "accounts": [
+    {
+      "id": "binance-spot:primary",
+      "product": "spot",
+      "order_api_key_env": "BINANCE_API_KEY",
+      "order_secret_key_env": "BINANCE_SECRET_KEY",
+      "treasury_api_key_env": "BINANCE_TREASURY_API_KEY",
+      "treasury_secret_key_env": "BINANCE_TREASURY_SECRET_KEY",
+      "subaccount_email_env": "BINANCE_SUBACCOUNT_EMAIL"
+    }
+  ],
+  "wallets": [
+    {
+      "id": "evm-wallet:primary",
+      "address_env": "EVM_WALLET_ADDRESS",
+      "private_key_env": "EVM_WALLET_PRIVATE_KEY"
+    }
+  ],
+  "v3_pools": [
+    {
+      "pair_id": "arbitrum-usdc-esp",
+      "fee_pips": 100,
+      "address": "0x15eb51a325cbce6c1cc8202a6f8a76224c5b7540",
+      "lifecycle": "validated"
+    },
+    {
+      "pair_id": "world-chain-usdc-wld",
+      "fee_pips": 500,
+      "address": "0x02371da6173cf95623da4189e68912233cc7107c",
+      "lifecycle": "execution_eligible"
+    },
+    {
+      "pair_id": "world-chain-usdc-wld",
+      "fee_pips": 3000,
+      "address": "0xc19bc89ac024426f5a23c5bb8bc91d8017c90684",
+      "lifecycle": "execution_eligible"
+    }
+  ],
+  "reviewed_live_strategies": [
+    "strategy:world-chain-usdc-wld"
+  ],
+  "stream_shard_symbol_capacity": 20,
+  "required_environment": [
+    {
+      "projection_id": "compat-live-runtime",
+      "names": [
+        "ALCHEMY_OPTIMISM_RPC_URL",
+        "ALCHEMY_WORLDCHAIN_RPC_URL",
+        "ALCHEMY_WORLDCHAIN_WS_URL",
+        "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH",
+        "ARBITRAGE_TRADE_JOURNAL_PATH",
+        "ARBITRAGE_WALLET_JOURNAL_PATH",
+        "BINANCE_API_KEY",
+        "BINANCE_SECRET_KEY",
+        "BINANCE_SUBACCOUNT_EMAIL",
+        "BINANCE_TREASURY_API_KEY",
+        "BINANCE_TREASURY_SECRET_KEY",
+        "EVM_WALLET_ADDRESS",
+        "EVM_WALLET_JOURNAL_PATH",
+        "EVM_WALLET_PRIVATE_KEY",
+        "REBALANCE_EXECUTOR_JOURNAL_PATH"
+      ]
+    },
+    {
+      "projection_id": "compat-public-price-collector",
+      "names": [
+        "ARBITRUM_RPC_URL",
+        "ARBITRUM_WS_URL",
+        "EVM_WALLET_ADDRESS"
+      ]
+    }
+  ],
+  "journals": [
+    {
+      "owner_id": "owner:trade-coordinator",
+      "path_env": "ARBITRAGE_TRADE_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:binance-order-execution",
+      "path_env": "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",
+      "path_env": "ARBITRAGE_WALLET_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",
+      "path_env": "EVM_WALLET_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:rebalance-saga",
+      "path_env": "REBALANCE_EXECUTOR_JOURNAL_PATH"
+    }
+  ]
+}

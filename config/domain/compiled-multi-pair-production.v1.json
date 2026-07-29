@@ -1,0 +1,760 @@
+{
+  "bundle_kind": "compiled_multi_pair_domain",
+  "schema_version": 1,
+  "bundle_id": "arb-bot-production-multi-pair-v1",
+  "compiler_version": "m1-v1",
+  "sources": [
+    {
+      "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+      "source_fingerprint_sha256": "f4f8533c6349d41a2086033582598a14ee6a47918aebb952168d4c425db91d56",
+      "snapshot": {
+        "schema_version": 1,
+        "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+        "source": {
+          "repository": "baksheev/arb_bot",
+          "revision": "e381dff246e806b86ca9cf3de4a5c805204cb86c",
+          "rails_pair_id": 3,
+          "rails_pair_updated_at_utc": "2026-07-21T18:35:54.337674Z",
+          "rails_pair_candidate_id": null,
+          "rails_pair_candidate_updated_at_utc": null,
+          "captured_at_utc": "2026-07-23T10:00:09Z",
+          "evidence": [
+            "production PostgreSQL whitelist SELECT from arb_bot_production",
+            "docs/multi-wallet-infrastructure.md current USDC-WLD configuration",
+            "app/jobs/update_min_buy_amount_job.rb dynamic token-B quote sizing",
+            "app/jobs/detect_arbitrage_job.rb strategy constants",
+            "app/jobs/rebalance_wallets_job.rb rebalance direction and target formulas",
+            "app/jobs/calculate_arbitrage_profit_job.rb ETHUSDT gas and BNBUSDT commission conversion",
+            "explicit Rust clone decision: Binance market data and execution must both use Spot",
+            "explicit Rust clone decision: startup token inventory is the rebalance reference maximum",
+            "explicit reviewed Rust gate: execution requires full_live confirmation and positive durable risk caps",
+            "explicit Rust execution decision: use the live WLDUSDC PRICE_FILTER tick instead of the coarser Rails tick",
+            "explicit reviewed Rust decision: adaptive sizing uses sequence-matched, capped recent full depth, then capped top-of-book tiers",
+            "production 30-minute observation: bookTicker-to-depth P80 age 635 ms and update delta 5; reviewed caps are 750 ms and 8",
+            "explicit reviewed Rust decision: top-of-book-only adaptive sizing is capped at 40 USDC and must fit the observed top level",
+            "explicit reviewed Rust decision: full_live DEX-first runtime readiness is independent of full-depth freshness",
+            "explicit reviewed Rust decision: exact execution-envelope inventory claims replace the legacy Rails 3x multiplier",
+            "explicit reviewed Rust decision: the configured 20 bps primary spread is the profitability gate; worst-case gas and recovery remain reservation and risk-cap inputs",
+            "explicit operator decision: an event-driven Binance top remains current while the same connection generation has a fresh server heartbeat; the 30-second maximum applies to transport silence, not unchanged price age"
+          ]
+        },
+        "live_trading_enabled": true,
+        "pairs": [
+          {
+            "id": "world-chain-usdc-wld",
+            "market_data_enabled": true,
+            "execution_enabled": true,
+            "chain": {
+              "name": "World Chain",
+              "chain_id": 480,
+              "rpc_url_env": "ALCHEMY_WORLDCHAIN_RPC_URL",
+              "ws_url_env": "ALCHEMY_WORLDCHAIN_WS_URL",
+              "binance_network_name": "WLD",
+              "gas_symbol": "ETH",
+              "gas_decimals": 18,
+              "gas_price_binance_symbol": "ETHUSDT",
+              "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+              "uniswap_v3_factory_address": "0x7a5028BDa40e7B173C278C5342087826455ea25a",
+              "uniswap_v3_quoter_address": "0x10158D43e6cc414deE1Bd1eB0EfC6a5cBCfF244c",
+              "uniswap_v3_router_address": "0x091AD9e2e6e5eD44c1c66dB50e49A601F9f36cF6",
+              "uniswap_v4_quoter_address": "0x55d235b3ff2daf7c3ede0defc9521f1d6fe6c5c0",
+              "uniswap_v4_router_address": "0x8ac7bee993bb44dab564ea4bc9ea67bf9eb5e743",
+              "uniswap_v4_pool_manager_address": "0xb1860d529182ac3bc1f51fa2abd56662b7d13f33",
+              "uniswap_v4_state_view_address": "0x51d394718bc09297262e368c1a481217fdeb71eb"
+            },
+            "token_a": {
+              "symbol": "USDC",
+              "contract": "0x79a02482a880bce3f13e09da970dc34db4cd24d1",
+              "decimals": 6
+            },
+            "token_b": {
+              "symbol": "WLD",
+              "contract": "0x2cfc85d8e48f8eab294be644d9e25c3030863003",
+              "decimals": 18
+            },
+            "binance": {
+              "symbol": "WLDUSDC",
+              "base_asset": "WLD",
+              "quote_asset": "USDC",
+              "commission_asset": "BNB",
+              "commission_asset_decimals": 8,
+              "commission_price_binance_symbol": "BNBUSDT",
+              "market_data_product": "spot",
+              "execution_product": "spot",
+              "step_size": "0.100000000000000",
+              "tick_size": "0.000100000000000"
+            },
+            "quote_sizing": {
+              "token_a_base_units": "20000000",
+              "token_b": {
+                "mode": "derive_from_binance_ask"
+              }
+            },
+            "adaptive_sizing": {
+              "mode": "adaptive",
+              "max_trade_notional_token_a_base_units": "200000000",
+              "max_unhedged_notional_token_a_base_units": "220000000",
+              "max_recovery_loss_token_a_base_units": "2000000",
+              "min_expected_profit_token_a_base_units": "0",
+              "min_incremental_expected_profit_token_a_base_units": "0",
+              "depth_policy": {
+                "recent_full_depth_max_age_ms": 750,
+                "recent_full_depth_max_update_delta": 8,
+                "top_of_book_max_trade_notional_token_a_base_units": "40000000"
+              }
+            },
+            "strategy": {
+              "kind": "profit_token_a",
+              "opportunity_threshold_bps": 20,
+              "max_quote_age_ms": 30000,
+              "max_transport_silence_ms": 30000,
+              "min_slippage_bps": 5,
+              "max_slippage_bps": 50,
+              "slippage_profit_share_bps": 5000,
+              "dex_fee_reserve_bps": null,
+              "balance_safety_multiplier": 1
+            },
+            "rebalance": {
+              "enabled": true,
+              "start_threshold_bps": 2500
+            },
+            "dex": {
+              "allowed_providers": [
+                "uniswap_v3",
+                "uniswap_v4"
+              ],
+              "uniswap_v3": {
+                "fee_tiers": [
+                  500,
+                  3000
+                ]
+              },
+              "uniswap_v4": {
+                "pools": [
+                  {
+                    "fee_tier": 500,
+                    "tick_spacing": 10,
+                    "hooks": "0x0000000000000000000000000000000000000000"
+                  },
+                  {
+                    "fee_tier": 3000,
+                    "tick_spacing": 60,
+                    "hooks": "0x0000000000000000000000000000000000000000"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "snapshot_id": "arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices",
+      "source_fingerprint_sha256": "90d17cb48df256ced773a41d2ccc1677e777b678e66e118bb744d996790e96d7",
+      "snapshot": {
+        "schema_version": 1,
+        "snapshot_id": "arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices",
+        "source": {
+          "repository": "baksheev/arb_bot",
+          "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
+          "rails_pair_id": null,
+          "rails_pair_updated_at_utc": null,
+          "rails_pair_candidate_id": 3144,
+          "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
+          "captured_at_utc": "2026-07-28T09:48:35Z",
+          "evidence": [
+            "production PostgreSQL read-only PairCandidate export for ESPUSDC",
+            "Binance public Spot exchangeInfo for ESPUSDC",
+            "Uniswap official Arbitrum V3 deployment registry",
+            "production shadow observation: the V4 2.88% pool stayed on one tick, could not quote ESP exact output, and returned a one-way executable quote far below the V3 and Binance market",
+            "explicit operator decision: retain only the viable V3 0.01% pool",
+            "explicit Rust shadow decision: public market data only, with execution and rebalancing disabled"
+          ]
+        },
+        "live_trading_enabled": false,
+        "pairs": [
+          {
+            "id": "arbitrum-usdc-esp",
+            "market_data_enabled": true,
+            "execution_enabled": false,
+            "chain": {
+              "name": "Arbitrum One",
+              "chain_id": 42161,
+              "rpc_url_env": "ARBITRUM_RPC_URL",
+              "ws_url_env": "ARBITRUM_WS_URL",
+              "binance_network_name": "ARBITRUM",
+              "gas_symbol": "ETH",
+              "gas_decimals": 18,
+              "gas_price_binance_symbol": "ETHUSDT",
+              "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+              "uniswap_v3_factory_address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+              "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+              "uniswap_v3_router_address": null,
+              "uniswap_v4_quoter_address": null,
+              "uniswap_v4_router_address": null,
+              "uniswap_v4_pool_manager_address": null,
+              "uniswap_v4_state_view_address": null
+            },
+            "token_a": {
+              "symbol": "USDC",
+              "contract": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+              "decimals": 6
+            },
+            "token_b": {
+              "symbol": "ESP",
+              "contract": "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
+              "decimals": 18
+            },
+            "binance": {
+              "symbol": "ESPUSDC",
+              "base_asset": "ESP",
+              "quote_asset": "USDC",
+              "commission_asset": null,
+              "commission_asset_decimals": null,
+              "commission_price_binance_symbol": null,
+              "market_data_product": "spot",
+              "execution_product": "spot",
+              "step_size": "1.000000000000000",
+              "tick_size": "0.000010000000000"
+            },
+            "quote_sizing": {
+              "token_a_base_units": "20000000",
+              "token_b": {
+                "mode": "derive_from_binance_ask"
+              }
+            },
+            "adaptive_sizing": {
+              "mode": "baseline_only"
+            },
+            "strategy": {
+              "kind": "profit_token_a",
+              "opportunity_threshold_bps": 20,
+              "max_quote_age_ms": 30000,
+              "max_transport_silence_ms": 30000,
+              "min_slippage_bps": 5,
+              "max_slippage_bps": 50,
+              "slippage_profit_share_bps": 5000,
+              "dex_fee_reserve_bps": null,
+              "balance_safety_multiplier": 1
+            },
+            "rebalance": {
+              "enabled": false,
+              "start_threshold_bps": 2500
+            },
+            "dex": {
+              "allowed_providers": [
+                "uniswap_v3"
+              ],
+              "uniswap_v3": {
+                "fee_tiers": [
+                  100
+                ]
+              },
+              "uniswap_v4": null
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "accounts": [
+    {
+      "id": "binance-spot:primary",
+      "product": "spot",
+      "order_api_key_env": "BINANCE_API_KEY",
+      "order_secret_key_env": "BINANCE_SECRET_KEY",
+      "treasury_api_key_env": "BINANCE_TREASURY_API_KEY",
+      "treasury_secret_key_env": "BINANCE_TREASURY_SECRET_KEY",
+      "subaccount_email_env": "BINANCE_SUBACCOUNT_EMAIL"
+    }
+  ],
+  "instruments": [
+    {
+      "id": "binance-spot:primary:ESPUSDC",
+      "account_id": "binance-spot:primary",
+      "symbol": "ESPUSDC",
+      "base_asset": "binance-spot:primary:asset:ESP",
+      "quote_asset": "binance-spot:primary:asset:USDC"
+    },
+    {
+      "id": "binance-spot:primary:WLDUSDC",
+      "account_id": "binance-spot:primary",
+      "symbol": "WLDUSDC",
+      "base_asset": "binance-spot:primary:asset:WLD",
+      "quote_asset": "binance-spot:primary:asset:USDC"
+    }
+  ],
+  "networks": [
+    {
+      "id": "eip155:42161",
+      "chain_id": 42161,
+      "name": "Arbitrum One",
+      "rpc_url_env": "ARBITRUM_RPC_URL",
+      "ws_url_env": "ARBITRUM_WS_URL"
+    },
+    {
+      "id": "eip155:480",
+      "chain_id": 480,
+      "name": "World Chain",
+      "rpc_url_env": "ALCHEMY_WORLDCHAIN_RPC_URL",
+      "ws_url_env": "ALCHEMY_WORLDCHAIN_WS_URL"
+    }
+  ],
+  "wallets": [
+    {
+      "id": "evm-wallet:primary",
+      "address_env": "EVM_WALLET_ADDRESS",
+      "private_key_env": "EVM_WALLET_PRIVATE_KEY"
+    }
+  ],
+  "wallet_locations": [
+    {
+      "id": "eip155:42161:evm-wallet:primary",
+      "network_id": "eip155:42161",
+      "wallet_id": "evm-wallet:primary",
+      "execution_lane_id": "eip155:42161:evm-wallet:primary"
+    },
+    {
+      "id": "eip155:480:evm-wallet:primary",
+      "network_id": "eip155:480",
+      "wallet_id": "evm-wallet:primary",
+      "execution_lane_id": "eip155:480:evm-wallet:primary"
+    }
+  ],
+  "venue_assets": [
+    {
+      "id": "binance-spot:primary:asset:BNB",
+      "kind": "binance_spot",
+      "symbol": "BNB",
+      "account_id": "binance-spot:primary",
+      "network_id": null,
+      "contract": null,
+      "decimals": null
+    },
+    {
+      "id": "binance-spot:primary:asset:ESP",
+      "kind": "binance_spot",
+      "symbol": "ESP",
+      "account_id": "binance-spot:primary",
+      "network_id": null,
+      "contract": null,
+      "decimals": null
+    },
+    {
+      "id": "binance-spot:primary:asset:USDC",
+      "kind": "binance_spot",
+      "symbol": "USDC",
+      "account_id": "binance-spot:primary",
+      "network_id": null,
+      "contract": null,
+      "decimals": null
+    },
+    {
+      "id": "binance-spot:primary:asset:WLD",
+      "kind": "binance_spot",
+      "symbol": "WLD",
+      "account_id": "binance-spot:primary",
+      "network_id": null,
+      "contract": null,
+      "decimals": null
+    },
+    {
+      "id": "eip155:42161:erc20:0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
+      "kind": "erc20",
+      "symbol": "ESP",
+      "account_id": null,
+      "network_id": "eip155:42161",
+      "contract": "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
+      "decimals": 18
+    },
+    {
+      "id": "eip155:42161:erc20:0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "kind": "erc20",
+      "symbol": "USDC",
+      "account_id": null,
+      "network_id": "eip155:42161",
+      "contract": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "decimals": 6
+    },
+    {
+      "id": "eip155:42161:native:ETH",
+      "kind": "native",
+      "symbol": "ETH",
+      "account_id": null,
+      "network_id": "eip155:42161",
+      "contract": null,
+      "decimals": 18
+    },
+    {
+      "id": "eip155:480:erc20:0x2cfc85d8e48f8eab294be644d9e25c3030863003",
+      "kind": "erc20",
+      "symbol": "WLD",
+      "account_id": null,
+      "network_id": "eip155:480",
+      "contract": "0x2cfc85d8e48f8eab294be644d9e25c3030863003",
+      "decimals": 18
+    },
+    {
+      "id": "eip155:480:erc20:0x79a02482a880bce3f13e09da970dc34db4cd24d1",
+      "kind": "erc20",
+      "symbol": "USDC",
+      "account_id": null,
+      "network_id": "eip155:480",
+      "contract": "0x79a02482a880bce3f13e09da970dc34db4cd24d1",
+      "decimals": 6
+    },
+    {
+      "id": "eip155:480:native:ETH",
+      "kind": "native",
+      "symbol": "ETH",
+      "account_id": null,
+      "network_id": "eip155:480",
+      "contract": null,
+      "decimals": 18
+    }
+  ],
+  "economic_assets": [
+    {
+      "id": "economic:BNB",
+      "symbol": "BNB"
+    },
+    {
+      "id": "economic:ESP",
+      "symbol": "ESP"
+    },
+    {
+      "id": "economic:ETH",
+      "symbol": "ETH"
+    },
+    {
+      "id": "economic:USDC",
+      "symbol": "USDC"
+    },
+    {
+      "id": "economic:WLD",
+      "symbol": "WLD"
+    }
+  ],
+  "asset_mappings": [
+    {
+      "venue_asset_id": "binance-spot:primary:asset:BNB",
+      "economic_asset_id": "economic:BNB"
+    },
+    {
+      "venue_asset_id": "binance-spot:primary:asset:ESP",
+      "economic_asset_id": "economic:ESP"
+    },
+    {
+      "venue_asset_id": "binance-spot:primary:asset:USDC",
+      "economic_asset_id": "economic:USDC"
+    },
+    {
+      "venue_asset_id": "binance-spot:primary:asset:WLD",
+      "economic_asset_id": "economic:WLD"
+    },
+    {
+      "venue_asset_id": "eip155:42161:erc20:0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
+      "economic_asset_id": "economic:ESP"
+    },
+    {
+      "venue_asset_id": "eip155:42161:erc20:0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "economic_asset_id": "economic:USDC"
+    },
+    {
+      "venue_asset_id": "eip155:42161:native:ETH",
+      "economic_asset_id": "economic:ETH"
+    },
+    {
+      "venue_asset_id": "eip155:480:erc20:0x2cfc85d8e48f8eab294be644d9e25c3030863003",
+      "economic_asset_id": "economic:WLD"
+    },
+    {
+      "venue_asset_id": "eip155:480:erc20:0x79a02482a880bce3f13e09da970dc34db4cd24d1",
+      "economic_asset_id": "economic:USDC"
+    },
+    {
+      "venue_asset_id": "eip155:480:native:ETH",
+      "economic_asset_id": "economic:ETH"
+    }
+  ],
+  "pools": [
+    {
+      "id": "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
+      "pair_id": "arbitrum-usdc-esp",
+      "network_id": "eip155:42161",
+      "protocol": "uniswap_v3",
+      "canonical_identity": "V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
+      "fee_pips": 100,
+      "tick_spacing": null,
+      "hooks": null,
+      "lifecycle": "validated"
+    },
+    {
+      "id": "eip155:480:pool:V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
+      "pair_id": "world-chain-usdc-wld",
+      "network_id": "eip155:480",
+      "protocol": "uniswap_v3",
+      "canonical_identity": "V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
+      "fee_pips": 500,
+      "tick_spacing": null,
+      "hooks": null,
+      "lifecycle": "execution_eligible"
+    },
+    {
+      "id": "eip155:480:pool:V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
+      "pair_id": "world-chain-usdc-wld",
+      "network_id": "eip155:480",
+      "protocol": "uniswap_v3",
+      "canonical_identity": "V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
+      "fee_pips": 3000,
+      "tick_spacing": null,
+      "hooks": null,
+      "lifecycle": "execution_eligible"
+    },
+    {
+      "id": "eip155:480:pool:V4 { pool_id: 0x4ca0af0122d384225dc0be3702e42cfc81d22d442fd595ddd0edfc5d1c2b23cf, fee_pips: 3000 }",
+      "pair_id": "world-chain-usdc-wld",
+      "network_id": "eip155:480",
+      "protocol": "uniswap_v4",
+      "canonical_identity": "V4 { pool_id: 0x4ca0af0122d384225dc0be3702e42cfc81d22d442fd595ddd0edfc5d1c2b23cf, fee_pips: 3000 }",
+      "fee_pips": 3000,
+      "tick_spacing": 60,
+      "hooks": "0x0000000000000000000000000000000000000000",
+      "lifecycle": "execution_eligible"
+    },
+    {
+      "id": "eip155:480:pool:V4 { pool_id: 0xbf415332fad64886704ccbaeff2cc16e505ea746a042dba9af9be9dd23da91ff, fee_pips: 500 }",
+      "pair_id": "world-chain-usdc-wld",
+      "network_id": "eip155:480",
+      "protocol": "uniswap_v4",
+      "canonical_identity": "V4 { pool_id: 0xbf415332fad64886704ccbaeff2cc16e505ea746a042dba9af9be9dd23da91ff, fee_pips: 500 }",
+      "fee_pips": 500,
+      "tick_spacing": 10,
+      "hooks": "0x0000000000000000000000000000000000000000",
+      "lifecycle": "execution_eligible"
+    }
+  ],
+  "strategies": [
+    {
+      "id": "strategy:arbitrum-usdc-esp",
+      "pair_id": "arbitrum-usdc-esp",
+      "source_snapshot_id": "arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices",
+      "account_id": "binance-spot:primary",
+      "instrument_id": "binance-spot:primary:ESPUSDC",
+      "network_id": "eip155:42161",
+      "wallet_location_id": "eip155:42161:evm-wallet:primary"
+    },
+    {
+      "id": "strategy:world-chain-usdc-wld",
+      "pair_id": "world-chain-usdc-wld",
+      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+      "account_id": "binance-spot:primary",
+      "instrument_id": "binance-spot:primary:WLDUSDC",
+      "network_id": "eip155:480",
+      "wallet_location_id": "eip155:480:evm-wallet:primary"
+    }
+  ],
+  "dependencies": [
+    {
+      "strategy_id": "strategy:arbitrum-usdc-esp",
+      "instrument_id": "binance-spot:primary:ESPUSDC",
+      "pool_ids": [
+        "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }"
+      ]
+    },
+    {
+      "strategy_id": "strategy:world-chain-usdc-wld",
+      "instrument_id": "binance-spot:primary:WLDUSDC",
+      "pool_ids": [
+        "eip155:480:pool:V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
+        "eip155:480:pool:V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
+        "eip155:480:pool:V4 { pool_id: 0x4ca0af0122d384225dc0be3702e42cfc81d22d442fd595ddd0edfc5d1c2b23cf, fee_pips: 3000 }",
+        "eip155:480:pool:V4 { pool_id: 0xbf415332fad64886704ccbaeff2cc16e505ea746a042dba9af9be9dd23da91ff, fee_pips: 500 }"
+      ]
+    }
+  ],
+  "stream_shards": [
+    {
+      "id": "stream:binance-spot:primary:0",
+      "account_id": "binance-spot:primary",
+      "instrument_ids": [
+        "binance-spot:primary:ESPUSDC",
+        "binance-spot:primary:WLDUSDC"
+      ]
+    }
+  ],
+  "owners": [
+    {
+      "owner_id": "owner:binance-account-state",
+      "kind": "binance_account_state",
+      "owned_ids": [
+        "binance-spot:primary"
+      ]
+    },
+    {
+      "owner_id": "owner:binance-capital-saga",
+      "kind": "binance_capital_saga",
+      "owned_ids": [
+        "binance-spot:primary"
+      ]
+    },
+    {
+      "owner_id": "owner:binance-order-execution",
+      "kind": "binance_order_execution",
+      "owned_ids": [
+        "binance-spot:primary"
+      ]
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:42161:evm-wallet:primary",
+      "kind": "evm_execution",
+      "owned_ids": [
+        "eip155:42161:evm-wallet:primary"
+      ]
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",
+      "kind": "evm_execution",
+      "owned_ids": [
+        "eip155:480:evm-wallet:primary"
+      ]
+    },
+    {
+      "owner_id": "owner:hot-path-decision",
+      "kind": "hot_path_decision",
+      "owned_ids": [
+        "strategy:arbitrum-usdc-esp",
+        "strategy:world-chain-usdc-wld"
+      ]
+    },
+    {
+      "owner_id": "owner:network:eip155:42161",
+      "kind": "network_runtime",
+      "owned_ids": [
+        "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }"
+      ]
+    },
+    {
+      "owner_id": "owner:network:eip155:480",
+      "kind": "network_runtime",
+      "owned_ids": [
+        "eip155:480:pool:V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
+        "eip155:480:pool:V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
+        "eip155:480:pool:V4 { pool_id: 0x4ca0af0122d384225dc0be3702e42cfc81d22d442fd595ddd0edfc5d1c2b23cf, fee_pips: 3000 }",
+        "eip155:480:pool:V4 { pool_id: 0xbf415332fad64886704ccbaeff2cc16e505ea746a042dba9af9be9dd23da91ff, fee_pips: 500 }"
+      ]
+    },
+    {
+      "owner_id": "owner:portfolio",
+      "kind": "portfolio",
+      "owned_ids": [
+        "economic:BNB",
+        "economic:ESP",
+        "economic:ETH",
+        "economic:USDC",
+        "economic:WLD"
+      ]
+    },
+    {
+      "owner_id": "owner:rebalance-saga",
+      "kind": "rebalance_saga",
+      "owned_ids": [
+        "strategy:world-chain-usdc-wld"
+      ]
+    },
+    {
+      "owner_id": "owner:trade-coordinator",
+      "kind": "trade_coordinator",
+      "owned_ids": [
+        "strategy:arbitrum-usdc-esp",
+        "strategy:world-chain-usdc-wld"
+      ]
+    }
+  ],
+  "journals": [
+    {
+      "owner_id": "owner:binance-order-execution",
+      "path_env": "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",
+      "path_env": "ARBITRAGE_WALLET_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",
+      "path_env": "EVM_WALLET_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:rebalance-saga",
+      "path_env": "REBALANCE_EXECUTOR_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:trade-coordinator",
+      "path_env": "ARBITRAGE_TRADE_JOURNAL_PATH"
+    }
+  ],
+  "capabilities": [
+    {
+      "strategy_id": "strategy:arbitrum-usdc-esp",
+      "observe": true,
+      "plan": true,
+      "execute": false,
+      "rebalance": false
+    },
+    {
+      "strategy_id": "strategy:world-chain-usdc-wld",
+      "observe": true,
+      "plan": true,
+      "execute": true,
+      "rebalance": true
+    }
+  ],
+  "compatibility_projections": [
+    {
+      "id": "compat-live-runtime",
+      "role": "live_runtime",
+      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+      "pair_ids": [
+        "world-chain-usdc-wld"
+      ]
+    },
+    {
+      "id": "compat-public-price-collector",
+      "role": "public_price_collector",
+      "source_snapshot_id": "arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices",
+      "pair_ids": [
+        "arbitrum-usdc-esp"
+      ]
+    }
+  ],
+  "required_environment": [
+    {
+      "projection_id": "compat-live-runtime",
+      "names": [
+        "ALCHEMY_OPTIMISM_RPC_URL",
+        "ALCHEMY_WORLDCHAIN_RPC_URL",
+        "ALCHEMY_WORLDCHAIN_WS_URL",
+        "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH",
+        "ARBITRAGE_TRADE_JOURNAL_PATH",
+        "ARBITRAGE_WALLET_JOURNAL_PATH",
+        "BINANCE_API_KEY",
+        "BINANCE_SECRET_KEY",
+        "BINANCE_SUBACCOUNT_EMAIL",
+        "BINANCE_TREASURY_API_KEY",
+        "BINANCE_TREASURY_SECRET_KEY",
+        "EVM_WALLET_ADDRESS",
+        "EVM_WALLET_JOURNAL_PATH",
+        "EVM_WALLET_PRIVATE_KEY",
+        "REBALANCE_EXECUTOR_JOURNAL_PATH"
+      ]
+    },
+    {
+      "projection_id": "compat-public-price-collector",
+      "names": [
+        "ARBITRUM_RPC_URL",
+        "ARBITRUM_WS_URL",
+        "EVM_WALLET_ADDRESS"
+      ]
+    }
+  ]
+}

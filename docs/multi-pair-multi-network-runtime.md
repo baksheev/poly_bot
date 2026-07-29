@@ -1174,6 +1174,17 @@ Rollback:
 
 - code-only rollback; no artifact or secret change.
 
+#### M0 transition record
+
+On 2026-07-29 the operator explicitly accepted the available post-fix M0
+production cohort as sufficient to begin M1. The accepted half-open cohort had
+10,437 WLDUSDC frames, 166 adaptive tasks, zero hot-telemetry drops, no CPU
+throttling, and no memory high/max/OOM event. It is a reviewed exception to the
+100,000-frame/1,000-task exit sample requirement, not a claim that the formal
+M0 percentile gate reached `ready`. The observed WLD hot-path values remain the
+comparison baseline for the M1 rollout; the formal sample thresholds continue
+to apply to future percentile claims unless another exception is reviewed.
+
 ### M1 — Compiled multi-pair domain graph
 
 Deliver:
@@ -1200,6 +1211,20 @@ Exit criteria:
 Rollback:
 
 - select the unchanged WLD/USDC v12 artifact.
+
+Implementation uses
+`config/domain/multi-pair-production.v1.sources.json` as the versioned compiler
+manifest and
+`config/domain/compiled-multi-pair-production.v1.json` as the generated
+canonical bundle. `run` selects `compat-live-runtime`; `collect-prices` selects
+`compat-public-price-collector`. The compiler requires the reviewed live
+strategy set to equal the execution-enabled strategies in the immutable source
+artifacts, so merely selecting the bundle cannot grant ESP execution or
+rebalance capability. Bundle validation emits load duration, bundle size, and
+Linux RSS before/after values before any network connection.
+`scripts/report-m1-domain START_UTC END_UTC` reproduces those startup rows for
+both compatibility projections from Cloud Logging; the normal M0 hot-path and
+GKE resource reports remain the latency and memory comparison sources.
 
 ### M2 — Shared Binance account runtime
 

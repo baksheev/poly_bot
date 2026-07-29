@@ -12,8 +12,10 @@ settlement, reservations, rebalancing, or deployment.
 
 - One application Pod runs on the fixed `c4-highcpu-8` node in the private
   zonal GKE Standard cluster `arb-bot` in `asia-southeast1-b`.
-- The production runtime uses the reviewed v12 adaptive-live domain artifact
-  with arbitrage and rebalancing in `full_live`.
+- Both runtime containers load one compiled multi-pair bundle. Its strict live
+  compatibility projection preserves the reviewed WLD/USDC v12 adaptive-live
+  artifact with arbitrage and rebalancing in `full_live`; its collector
+  projection preserves non-mutating ESP/USDC v2 behavior.
 - The stopped `arb-bot-rust-shadow-gce` VM is a rollback target only. It must
   never run while the GKE Deployment has a nonzero replica count.
 - Rails runs independently with separate mutable state. Rust never reads Rails
