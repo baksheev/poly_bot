@@ -20,6 +20,40 @@ pub struct PlannedMarketOrder {
     pub submitted_base_units: i128,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarketResidualDustReason {
+    BelowMarketStep,
+    BelowMinimumQuantity,
+    BelowMinimumNotional,
+}
+
+impl MarketResidualDustReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowMarketStep => "below_market_step",
+            Self::BelowMinimumQuantity => "below_minimum_quantity",
+            Self::BelowMinimumNotional => "below_minimum_notional",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketResidualDust {
+    pub reason: MarketResidualDustReason,
+    pub target_quantity: Decimal,
+    pub submitted_quantity: Decimal,
+    pub reference_price: Decimal,
+    pub notional: Decimal,
+    pub minimum_quantity: Decimal,
+    pub minimum_notional: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarketOrderPlan {
+    Submit(PlannedMarketOrder),
+    ResidualDust(MarketResidualDust),
+}
+
 /// Builds the same bounded LIMIT IOC shape for the primary hedge and every
 /// recovery. A target below one exchange step returns `None` and is dust.
 pub fn plan_limit_ioc(
@@ -93,7 +127,9 @@ pub fn plan_limit_ioc(
 /// Builds the final CEX closeout used after a bounded LIMIT IOC leaves a
 /// proven residual. Production pays commissions from its BNB balance, so BUY
 /// and SELL both submit only the target quantity rounded down to one market
-/// step. Commission accounting must not enlarge the recovery exposure.
+/// step. Commission accounting must not enlarge the recovery exposure. A
+/// target below the live quantity or notional filters is returned as terminal
+/// inventory dust rather than an invalid order.
 pub fn plan_market_order(
     operation_id: String,
     client_order_id: String,
@@ -101,7 +137,7 @@ pub fn plan_market_order(
     base_decimals: u8,
     reference_price: Decimal,
     rules: &SymbolRules,
-) -> anyhow::Result<Option<PlannedMarketOrder>> {
+) -> anyhow::Result<MarketOrderPlan> {
     ensure!(target_base_units != 0, "Binance target delta is zero");
     ensure!(rules.status == "TRADING", "Binance symbol is not trading");
     ensure!(
@@ -116,9 +152,6 @@ pub fn plan_market_order(
         rules.lot_size.step
     };
     let quantity = round_down(target_quantity, step)?;
-    if quantity.is_zero() {
-        return Ok(None);
-    }
     let min = if rules.market_lot_size.min > Decimal::ZERO {
         rules.market_lot_size.min
     } else {
@@ -129,18 +162,33 @@ pub fn plan_market_order(
     } else {
         rules.lot_size.max
     };
-    ensure!(
-        quantity >= min && quantity <= max,
-        "Binance MARKET quantity is outside MARKET_LOT_SIZE"
-    );
     let notional = quantity
         .checked_mul(reference_price)
         .context("Binance MARKET notional overflow")?;
+    let dust = |reason| {
+        MarketOrderPlan::ResidualDust(MarketResidualDust {
+            reason,
+            target_quantity,
+            submitted_quantity: quantity,
+            reference_price,
+            notional,
+            minimum_quantity: min,
+            minimum_notional: rules.min_notional,
+        })
+    };
+    if quantity.is_zero() {
+        return Ok(dust(MarketResidualDustReason::BelowMarketStep));
+    }
+    if quantity < min {
+        return Ok(dust(MarketResidualDustReason::BelowMinimumQuantity));
+    }
     ensure!(
-        notional >= rules.min_notional,
-        "Binance MARKET notional {notional} is below the exchange minimum {}",
-        rules.min_notional
+        quantity <= max,
+        "Binance MARKET quantity exceeds MARKET_LOT_SIZE"
     );
+    if notional < rules.min_notional {
+        return Ok(dust(MarketResidualDustReason::BelowMinimumNotional));
+    }
     let submitted_absolute = base_units_from_decimal(quantity, base_decimals)?;
     let submitted_absolute =
         i128::try_from(submitted_absolute).context("Binance submitted quantity exceeds i128")?;
@@ -162,7 +210,7 @@ pub fn plan_market_order(
         latency_origin: None,
     };
     request.validate()?;
-    Ok(Some(PlannedMarketOrder {
+    Ok(MarketOrderPlan::Submit(PlannedMarketOrder {
         request,
         target_base_units,
         submitted_base_units,
@@ -248,7 +296,10 @@ mod tests {
     use crate::binance::{
         account::{DecimalFilter, SymbolRules},
         execution::BinanceOrderRequestKind,
-        order_plan::{plan_limit_ioc, plan_market_order, recovery_client_order_id},
+        order_plan::{
+            MarketOrderPlan, MarketResidualDustReason, PlannedMarketOrder, plan_limit_ioc,
+            plan_market_order, recovery_client_order_id,
+        },
     };
 
     fn rules() -> SymbolRules {
@@ -275,6 +326,15 @@ mod tests {
             min_notional: Decimal::ONE,
             max_num_orders: 200,
             max_num_algo_orders: 5,
+        }
+    }
+
+    fn submitted(plan: MarketOrderPlan) -> PlannedMarketOrder {
+        match plan {
+            MarketOrderPlan::Submit(planned) => planned,
+            MarketOrderPlan::ResidualDust(dust) => {
+                panic!("expected submitted MARKET order, got {dust:?}")
+            }
         }
     }
 
@@ -366,6 +426,18 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        let MarketOrderPlan::ResidualDust(dust) = plan_market_order(
+            "rustarb-market-dust".to_owned(),
+            "rustarb-market-dust".to_owned(),
+            99_000_000_000_000_000,
+            18,
+            Decimal::ONE,
+            &rules(),
+        )
+        .unwrap() else {
+            panic!("sub-step MARKET residual must remain inventory dust");
+        };
+        assert_eq!(dust.reason, MarketResidualDustReason::BelowMarketStep);
         assert_eq!(
             recovery_client_order_id("rustarb123", 2).unwrap(),
             "rustarb123r2"
@@ -374,16 +446,17 @@ mod tests {
 
     #[test]
     fn market_closeout_uses_exact_base_quantity_for_buy_and_sell() {
-        let buy = plan_market_order(
-            "rustarb-market-buy".to_owned(),
-            "rustarb-market-buy".to_owned(),
-            12_345_678_901_234_567_890,
-            18,
-            Decimal::ONE,
-            &rules(),
-        )
-        .unwrap()
-        .unwrap();
+        let buy = submitted(
+            plan_market_order(
+                "rustarb-market-buy".to_owned(),
+                "rustarb-market-buy".to_owned(),
+                12_345_678_901_234_567_890,
+                18,
+                Decimal::ONE,
+                &rules(),
+            )
+            .unwrap(),
+        );
         assert_eq!(buy.submitted_base_units, 12_300_000_000_000_000_000);
         assert!(matches!(
             buy.request.kind,
@@ -391,16 +464,17 @@ mod tests {
                 if quantity == Decimal::new(123, 1)
         ));
 
-        let sell = plan_market_order(
-            "rustarb-market-sell".to_owned(),
-            "rustarb-market-sell".to_owned(),
-            -12_345_678_901_234_567_890,
-            18,
-            Decimal::ONE,
-            &rules(),
-        )
-        .unwrap()
-        .unwrap();
+        let sell = submitted(
+            plan_market_order(
+                "rustarb-market-sell".to_owned(),
+                "rustarb-market-sell".to_owned(),
+                -12_345_678_901_234_567_890,
+                18,
+                Decimal::ONE,
+                &rules(),
+            )
+            .unwrap(),
+        );
         assert_eq!(sell.submitted_base_units, -12_300_000_000_000_000_000);
         assert!(matches!(
             sell.request.kind,
@@ -410,16 +484,17 @@ mod tests {
 
     #[test]
     fn market_buy_closeout_does_not_gross_up_for_bnb_commission() {
-        let buy = plan_market_order(
-            "rustarb-market-buy-bnb-fee".to_owned(),
-            "rustarb-market-buy-bnb-fee".to_owned(),
-            53_200_000_000_000_000_000,
-            18,
-            Decimal::ONE,
-            &rules(),
-        )
-        .unwrap()
-        .unwrap();
+        let buy = submitted(
+            plan_market_order(
+                "rustarb-market-buy-bnb-fee".to_owned(),
+                "rustarb-market-buy-bnb-fee".to_owned(),
+                53_200_000_000_000_000_000,
+                18,
+                Decimal::ONE,
+                &rules(),
+            )
+            .unwrap(),
+        );
         assert_eq!(buy.target_base_units, 53_200_000_000_000_000_000);
         assert_eq!(buy.submitted_base_units, 53_200_000_000_000_000_000);
         assert!(matches!(
@@ -430,11 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn market_closeout_rejects_step_aligned_quantity_below_min_notional() {
+    fn market_closeout_classifies_below_min_notional_as_residual_dust() {
         let mut live_rules = rules();
         live_rules.min_notional = Decimal::from(5);
 
-        let error = plan_market_order(
+        let plan = plan_market_order(
             "rustarb-market-small".to_owned(),
             "rustarb-market-small".to_owned(),
             6_600_000_000_000_000_000,
@@ -442,13 +517,16 @@ mod tests {
             Decimal::new(3427, 4),
             &live_rules,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("is below the exchange minimum 5")
-        );
+        let MarketOrderPlan::ResidualDust(dust) = plan else {
+            panic!("below-minimum residual must not create a MARKET order");
+        };
+        assert_eq!(dust.reason, MarketResidualDustReason::BelowMinimumNotional);
+        assert_eq!(dust.target_quantity, Decimal::new(66, 1));
+        assert_eq!(dust.submitted_quantity, Decimal::new(66, 1));
+        assert_eq!(dust.notional, Decimal::new(226182, 5));
+        assert_eq!(dust.minimum_notional, Decimal::from(5));
     }
 
     #[test]
@@ -457,16 +535,17 @@ mod tests {
         live_rules.market_lot_size.step = Decimal::new(1, 1);
         live_rules.min_notional = Decimal::from(5);
 
-        let planned = plan_market_order(
-            "rustarb-market-rounded".to_owned(),
-            "rustarb-market-rounded".to_owned(),
-            15_678_000_000_000_000_000,
-            18,
-            Decimal::new(3427, 4),
-            &live_rules,
-        )
-        .unwrap()
-        .unwrap();
+        let planned = submitted(
+            plan_market_order(
+                "rustarb-market-rounded".to_owned(),
+                "rustarb-market-rounded".to_owned(),
+                15_678_000_000_000_000_000,
+                18,
+                Decimal::new(3427, 4),
+                &live_rules,
+            )
+            .unwrap(),
+        );
 
         assert_eq!(planned.submitted_base_units, 15_600_000_000_000_000_000);
         assert!(matches!(

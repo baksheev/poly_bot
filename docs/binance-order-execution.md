@@ -30,6 +30,10 @@ autonomous arbitrage path is stricter:
 - a local exchange-filter rejection is terminal for that immutable target and
   is not retried, because the same step-aligned below-minimum request cannot
   become safer through transport backoff;
+- a target that rounds below the market step, minimum quantity, or
+  `MIN_NOTIONAL` is classified as `residual_inventory_drift`, emitted through
+  the `skipped` telemetry phase at INFO severity, and retained in result/PnL
+  accounting; it is an expected non-mutation, not an execution error;
 - deterministic client order IDs are queried through `order.status` after an
   ambiguous placement response.
 
@@ -96,6 +100,9 @@ selection, the exact submitted order, and its terminal result.
 - `error`: unsubmitted, locally filtered, exchange-rejected, or unresolved
   placement, including the bounded `error_reason` returned by validation,
   Binance, or reconciliation.
+- `skipped`: the immutable residual, rounded quantity, reference price,
+  notional, live minimums, and exact dust reason when no Binance-compliant
+  MARKET child can be submitted without enlarging the target.
 
 The same `planned` and `terminal` phases cover every bounded recovery child, so
 each placement-time top can be compared directly with its actual average fill

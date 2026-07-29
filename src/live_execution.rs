@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeMap,
+    error::Error,
+    fmt,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -27,7 +29,8 @@ use crate::{
             BinanceOrderRequestKind,
         },
         order_plan::{
-            decimal_from_base_units, plan_limit_ioc, plan_market_order, recovery_client_order_id,
+            MarketOrderPlan, MarketResidualDust, decimal_from_base_units, plan_limit_ioc,
+            plan_market_order, recovery_client_order_id,
         },
         ws_api::OrderResult,
     },
@@ -96,6 +99,20 @@ struct DexRevertContext {
     amount_out_minimum_base_units: String,
     deadline_unix_seconds: u64,
 }
+
+#[derive(Debug)]
+struct ExpectedEntryPreflightRejection {
+    reason: &'static str,
+    detail: String,
+}
+
+impl fmt::Display for ExpectedEntryPreflightRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.reason, self.detail)
+    }
+}
+
+impl Error for ExpectedEntryPreflightRejection {}
 
 pub struct ComposedLiveLegExecutorConfig {
     pub rules: SymbolRules,
@@ -579,17 +596,29 @@ impl ComposedLiveLegExecutor {
             reference_price,
             &self.rules,
         ) {
-            Ok(Some(planned)) => planned,
-            Ok(None) => {
-                self.emit_binance_order_error(
+            Ok(MarketOrderPlan::Submit(planned)) => planned,
+            Ok(MarketOrderPlan::ResidualDust(dust)) => {
+                self.emit_binance_residual_dust(
                     intent,
                     role,
                     &client_order_id,
-                    Some(recovery_attempt),
-                    "filtered_before_submission",
-                    "MARKET quantity rounded below one Binance step",
+                    recovery_attempt,
+                    target_token_b_delta_base_units,
+                    &dust,
                 );
-                return failed(role, "cex:market-sub-step-command");
+                tracing::info!(
+                    client_order_id,
+                    recovery_attempt,
+                    target_token_b_delta_base_units,
+                    dust_reason = dust.reason.as_str(),
+                    target_quantity = %dust.target_quantity,
+                    submitted_quantity = %dust.submitted_quantity,
+                    reference_price = %dust.reference_price,
+                    notional = %dust.notional,
+                    minimum_notional = %dust.minimum_notional,
+                    "Binance MARKET residual is below executable filters and remains inventory drift"
+                );
+                return failed(role, "cex:market-residual-dust");
             }
             Err(error) => {
                 let reason = format!("{error:#}");
@@ -939,6 +968,40 @@ impl ComposedLiveLegExecutor {
             }),
         );
     }
+
+    fn emit_binance_residual_dust(
+        &self,
+        intent: &TradeIntent,
+        role: LegRole,
+        client_order_id: &str,
+        recovery_attempt: usize,
+        target_token_b_delta_base_units: i128,
+        dust: &MarketResidualDust,
+    ) {
+        self.telemetry.emit(
+            ARBITRAGE_BINANCE_ORDER_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "phase": "skipped",
+                "plan_id": intent.plan_id,
+                "operation_id": client_order_id,
+                "client_order_id": client_order_id,
+                "role": leg_role_label(role),
+                "recovery_attempt": recovery_attempt,
+                "maximum_recovery_attempts": MAX_RECOVERY_ATTEMPTS,
+                "symbol": self.rules.symbol,
+                "outcome": "residual_inventory_drift",
+                "dust_reason": dust.reason.as_str(),
+                "target_token_b_base_units": target_token_b_delta_base_units.to_string(),
+                "target_quantity": dust.target_quantity.to_string(),
+                "submitted_quantity": dust.submitted_quantity.to_string(),
+                "reference_price": dust.reference_price.to_string(),
+                "notional": dust.notional.to_string(),
+                "minimum_quantity": dust.minimum_quantity.to_string(),
+                "minimum_notional": dust.minimum_notional.to_string(),
+            }),
+        );
+    }
 }
 
 impl DexRevertContext {
@@ -1089,7 +1152,20 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 None,
             );
             if let Err(error) = execution_result {
-                tracing::error!(plan_id, error = %error, "live arbitrage execution failed closed");
+                if let Some(rejection) = error.downcast_ref::<ExpectedEntryPreflightRejection>() {
+                    tracing::info!(
+                        plan_id,
+                        reason = rejection.reason,
+                        detail = rejection.detail,
+                        "live arbitrage entry rejected by preflight"
+                    );
+                } else {
+                    tracing::error!(
+                        plan_id,
+                        error = %error,
+                        "live arbitrage execution failed closed"
+                    );
+                }
                 let state = execution_failure_event_state(
                     &self.coordinator,
                     &plan_id,
@@ -1217,7 +1293,11 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     "detail": rejection.detail,
                 }),
             );
-            anyhow::bail!("live entry preflight rejected: {}", rejection.reason);
+            return Err(ExpectedEntryPreflightRejection {
+                reason: rejection.reason,
+                detail: rejection.detail,
+            }
+            .into());
         }
         Ok(())
     }
