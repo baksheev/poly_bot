@@ -174,6 +174,11 @@ pub struct PreparedPoolBuildRequest {
     timing: PreparedPoolBuildTimingHandle,
 }
 
+#[derive(Default)]
+pub struct PreparedPoolBuildBatch {
+    requests: Vec<PreparedPoolBuildRequest>,
+}
+
 pub struct PreparedPoolBuildResult {
     pool_index: usize,
     generation: u64,
@@ -717,6 +722,35 @@ impl PreparedPoolBuildRequest {
             build_time_us,
             timing: self.timing,
         })
+    }
+}
+
+impl PreparedPoolBuildBatch {
+    /// Keeps only the newest request for each pool while preserving the order
+    /// in which distinct pools first appeared in the canonical DEX drain.
+    pub fn queue(&mut self, request: PreparedPoolBuildRequest) {
+        if let Some(queued) = self
+            .requests
+            .iter_mut()
+            .find(|queued| queued.pool_index == request.pool_index)
+        {
+            *queued = request;
+        } else {
+            self.requests.push(request);
+        }
+    }
+
+    pub fn drain(&mut self) -> impl Iterator<Item = PreparedPoolBuildRequest> + '_ {
+        self.requests.drain(..)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.requests.len()
     }
 }
 
@@ -1468,10 +1502,10 @@ mod tests {
 
     use super::{
         ArbitrageDirection, BASELINE_CACHE_ENTRIES_PER_DIRECTION, BaselineCacheUsage,
-        DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache, TradeEvaluation,
-        decimal_to_base_units, evaluate_direction, evaluate_trade_with_dex_quote,
-        format_base_units, meets_threshold, signed_profit_bps_x100, subtract_bps_floor,
-        token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
+        DexQuoteOutcome, OpportunityEngine, PairRuntime, PoolBaselineQuoteCache,
+        PreparedPoolBuildBatch, TradeEvaluation, decimal_to_base_units, evaluate_direction,
+        evaluate_trade_with_dex_quote, format_base_units, meets_threshold, signed_profit_bps_x100,
+        subtract_bps_floor, token_a_to_token_b_floor, token_b_to_token_a, trade_is_better,
     };
 
     fn hash(number: u64) -> B256 {
@@ -1755,6 +1789,32 @@ mod tests {
                 .is_some()
         );
         assert!(engine.is_ready());
+    }
+
+    #[test]
+    fn prepared_pool_batch_keeps_only_the_latest_generation_per_pool() {
+        let (pair, mirror) = fixture();
+        let initial = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(initial)],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let superseded = engine.request_pool_refresh(0, &mirror).unwrap();
+        let current = engine.request_pool_refresh(0, &mirror).unwrap();
+        let expected_generation = current.generation();
+        let mut batch = PreparedPoolBuildBatch::default();
+
+        batch.queue(superseded);
+        batch.queue(current);
+
+        assert_eq!(batch.len(), 1);
+        let queued = batch.drain().next().unwrap();
+        assert_eq!(queued.generation(), expected_generation);
+        assert!(batch.is_empty());
     }
 
     #[test]

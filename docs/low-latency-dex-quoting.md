@@ -138,12 +138,14 @@ exponentiation from sparse rebuilds without coalescing word boundaries or
 changing per-boundary fee rounding.
 
 Any applied `Swap`, `Mint`, `Burn`, or `ModifyLiquidity` event immediately
-marks only the affected pool stale, clears its rings, and rebuilds that pool's
-bounded curves inline before the owner handles a strategy evaluation. The DEX
-branch is prioritized and drains all already-queued DEX events first, so an
-evaluation never knowingly starts behind an older unprocessed pool update.
-Generation validation remains mandatory when publishing a build and again in
-entry preflight.
+marks only the affected pool stale and clears its rings. The prioritized DEX
+branch first applies every already-queued canonical event, retaining only the
+newest build request for each affected pool, and then rebuilds those pools
+inline before the owner handles a strategy evaluation. Consequently an
+intermediate generation that no evaluation could observe does not make the
+next queued log wait behind a redundant sparse-curve build. Generation
+validation remains mandatory when publishing a build and again in entry
+preflight.
 
 `dex_pool_prepared` records the token-A and derived token-B limits, segment
 counts, build time, and total publication time under

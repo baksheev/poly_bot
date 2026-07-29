@@ -53,7 +53,9 @@ use arb_bot::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
     },
-    opportunity::{ArbitrageDirection, OpportunityEngine, PreparedPoolBuildRequest},
+    opportunity::{
+        ArbitrageDirection, OpportunityEngine, PreparedPoolBuildBatch, PreparedPoolBuildRequest,
+    },
     rebalance::{
         RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
         RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
@@ -1858,6 +1860,7 @@ async fn run(
     let mut longest_non_price_handler = "none";
     let mut adaptive_sizing_tasks = tokio::task::JoinSet::new();
     let mut latest_adaptive_sizing_job = None;
+    let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
 
     tracing::info!(
         service = %config.service_name,
@@ -1938,18 +1941,23 @@ async fn run(
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
                 };
                 let mut next_event = Some(event);
-                let mut prepared_dex = false;
                 let mut drained_events = 0_usize;
                 while let Some(event) = next_event {
                     drained_events += 1;
-                    prepared_dex |= process_dex_event_inline(
+                    if let Some(request) = process_dex_event_inline(
                         &mut engine,
                         event,
                         &wallet_heads,
                         &receipt_heads,
-                    )?;
+                    )? {
+                        pending_prepared_pool_builds.queue(request);
+                    }
                     next_event = dex_receiver.try_recv().ok();
                 }
+                let prepared_dex = build_prepared_pools_inline(
+                    &mut engine,
+                    &mut pending_prepared_pool_builds,
+                )?;
                 if prepared_dex {
                     engine.evaluate_after_dex_refreshes()?;
                 }
@@ -2077,20 +2085,25 @@ async fn run(
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
-                let mut prepared_dex = false;
                 while let Ok(dex_event) = dex_receiver.try_recv() {
-                    prepared_dex |= process_dex_event_inline(
+                    if let Some(request) = process_dex_event_inline(
                         &mut engine,
                         dex_event,
                         &wallet_heads,
                         &receipt_heads,
-                    )?;
+                    )? {
+                        pending_prepared_pool_builds.queue(request);
+                    }
                 }
                 let receipt_refresh = engine.apply_arbitrage_receipt_settlement(&event)?;
                 let receipt_applied = receipt_refresh.is_some();
                 if let Some(refresh) = receipt_refresh {
-                    build_prepared_pool_inline(&mut engine, refresh)?;
+                    pending_prepared_pool_builds.queue(refresh);
                 }
+                let prepared_dex = build_prepared_pools_inline(
+                    &mut engine,
+                    &mut pending_prepared_pool_builds,
+                )?;
                 engine.on_paper_trade_event(event)?;
                 if prepared_dex || receipt_applied {
                     engine.evaluate_after_dex_refreshes()?;
@@ -2107,15 +2120,20 @@ async fn run(
                 let result = result
                     .context("adaptive sizing worker join set stopped unexpectedly")?
                     .context("adaptive sizing worker panicked")?;
-                let mut prepared_dex = false;
                 while let Ok(event) = dex_receiver.try_recv() {
-                    prepared_dex |= process_dex_event_inline(
+                    if let Some(request) = process_dex_event_inline(
                         &mut engine,
                         event,
                         &wallet_heads,
                         &receipt_heads,
-                    )?;
+                    )? {
+                        pending_prepared_pool_builds.queue(request);
+                    }
                 }
+                let prepared_dex = build_prepared_pools_inline(
+                    &mut engine,
+                    &mut pending_prepared_pool_builds,
+                )?;
                 if prepared_dex {
                     engine.evaluate_after_dex_refreshes()?;
                 }
@@ -2495,22 +2513,28 @@ fn build_prepared_pool_inline(
     engine.on_prepared_pool(result)
 }
 
+fn build_prepared_pools_inline(
+    engine: &mut TradingEngine,
+    pending: &mut PreparedPoolBuildBatch,
+) -> anyhow::Result<bool> {
+    let prepared = !pending.is_empty();
+    for request in pending.drain() {
+        build_prepared_pool_inline(engine, request)?;
+    }
+    Ok(prepared)
+}
+
 fn process_dex_event_inline(
     engine: &mut TradingEngine,
     event: arb_bot::market_data::alchemy::DexStreamEvent,
     wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
     receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
     let wallet_head = match &event {
         arb_bot::market_data::alchemy::DexStreamEvent::Head { head, .. } => Some(*head),
         arb_bot::market_data::alchemy::DexStreamEvent::Log { .. } => None,
     };
-    let prepared = if let Some(request) = engine.on_dex_event(event)? {
-        build_prepared_pool_inline(engine, request)?;
-        true
-    } else {
-        false
-    };
+    let prepared = engine.on_dex_event(event)?;
     if let Some(head) = wallet_head
         && *wallet_heads.borrow() != head
     {
