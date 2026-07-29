@@ -1,0 +1,44 @@
+{
+  "description": "Dependency-scoped supervisor faults from the active poly_bot GKE runtime.",
+  "filter": "resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\" AND jsonPayload.fields.message=\"runtime dependency fault\"",
+  "labelExtractors": {
+    "binance_account_id": "EXTRACT(jsonPayload.fields.binance_account_id)",
+    "network_id": "EXTRACT(jsonPayload.fields.network_id)",
+    "strategy_id": "EXTRACT(jsonPayload.fields.strategy_id)",
+    "execution_lane_id": "EXTRACT(jsonPayload.fields.execution_lane_id)",
+    "supervisor_action": "EXTRACT(jsonPayload.fields.supervisor_action)"
+  },
+  "metricDescriptor": {
+    "displayName": "poly_bot runtime dependency fault",
+    "metricKind": "DELTA",
+    "valueType": "INT64",
+    "unit": "1",
+    "labels": [
+      {
+        "key": "binance_account_id",
+        "valueType": "STRING",
+        "description": "Process-scoped Binance account owner."
+      },
+      {
+        "key": "network_id",
+        "valueType": "STRING",
+        "description": "Dependency network scope."
+      },
+      {
+        "key": "strategy_id",
+        "valueType": "STRING",
+        "description": "Affected strategy scope."
+      },
+      {
+        "key": "execution_lane_id",
+        "valueType": "STRING",
+        "description": "Affected execution lane scope."
+      },
+      {
+        "key": "supervisor_action",
+        "valueType": "STRING",
+        "description": "Dependency-scoped action selected by RootSupervisorPolicy."
+      }
+    ]
+  }
+}

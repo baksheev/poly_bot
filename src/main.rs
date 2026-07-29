@@ -76,10 +76,12 @@ use arb_bot::{
     strategy_runtime::{
         CompiledStrategyDependencyIndex, HotPathDecisionOwner, LatestOnlySizingSlots,
         ShadowSizingJob, ShadowSizingTaskResult, ShadowStrategyEvaluator, SizingSubmission,
-        TelemetryCoordinatorShadowSink,
+        StrategyDependencyFault, StrategyEvaluator, TelemetryCoordinatorShadowSink,
     },
+    supervision::{DependencyFaultClass, DependencyScope, RootSupervisorPolicy, SupervisorAction},
     telemetry::{
-        ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryHandle, TelemetryWriter,
+        ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, PRIMARY_BINANCE_ACCOUNT_ID,
+        TelemetryHandle, TelemetryWriter, execution_lane_id,
     },
     wallet::{
         EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest,
@@ -2266,6 +2268,30 @@ async fn run(
         .pairs
         .first()
         .context("compiled M4 shadow strategy has no projected pair")?;
+    let root_supervisor = RootSupervisorPolicy::new(
+        dependencies
+            .plan()
+            .strategies
+            .iter()
+            .map(|strategy| {
+                let chain_id = strategy
+                    .domain_config
+                    .snapshot()
+                    .pairs
+                    .first()
+                    .context("supervised strategy has no projected pair")?
+                    .chain
+                    .chain_id;
+                Ok(DependencyScope {
+                    binance_account_id: PRIMARY_BINANCE_ACCOUNT_ID.to_owned(),
+                    network_id: strategy.network_id.as_str().to_owned(),
+                    strategy_id: strategy.strategy_id.as_str().to_owned(),
+                    execution_lane_id: execution_lane_id(chain_id),
+                    execution_enabled: strategy.execute,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    )?;
     let shadow_evaluator = ShadowStrategyEvaluator::new(
         shadow_plan.strategy_id.clone(),
         shadow_plan.symbol.clone(),
@@ -2278,6 +2304,9 @@ async fn run(
         Box::new(TelemetryCoordinatorShadowSink::new(
             telemetry.clone(),
             config.engine_id.clone(),
+            PRIMARY_BINANCE_ACCOUNT_ID.to_owned(),
+            shadow_plan.network_id.as_str().to_owned(),
+            execution_lane_id(shadow_pair.chain.chain_id),
         )),
     );
     let mut engine = HotPathDecisionOwner::new(
@@ -2285,6 +2314,19 @@ async fn run(
         vec![Box::new(shadow_evaluator)],
         dependencies,
     )?;
+    tracing::info!(
+        binance_account_id = PRIMARY_BINANCE_ACCOUNT_ID,
+        live_strategy_id = %engine.strategy_id().as_str(),
+        shadow_strategy_id = %shadow_plan.strategy_id.as_str(),
+        shadow_network_id = %shadow_plan.network_id.as_str(),
+        shadow_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
+        old_baseline_comparison = "background_immutable_decision_projection",
+        shadow_reservation_mode = "pure_shadow_proposal",
+        shadow_rebalance_mode = "network_scoped_shadow_only",
+        shadow_external_mutation_authorized = false,
+        root_supervisor_policy = "dependency_scoped_v1",
+        "M7 combined production shadow configured"
+    );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
         task: mut shadow_dex_task,
@@ -2386,6 +2428,7 @@ async fn run(
         &wallet_heads,
         &receipt_heads,
     )?;
+    report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
     if startup_primary_dex.pool_build_count > 0 {
         engine.evaluate_after_dex_refreshes()?;
     }
@@ -2520,6 +2563,7 @@ async fn run(
     let mut binance_market_event = Box::pin(binance_feed.next_event());
     let mut gas_market_event = Box::pin(gas_price_feed.next_event());
     let mut commission_market_event = Box::pin(commission_price_feed.next_event());
+    let mut shadow_dex_running = true;
 
     loop {
         tokio::select! {
@@ -2558,13 +2602,21 @@ async fn run(
                     handler_duration,
                 );
             }
-            event = shadow_dex_receiver.recv() => {
+            event = shadow_dex_receiver.recv(), if shadow_dex_running => {
                 let handler_started_at = Instant::now();
                 let Some(event) = event else {
-                    bail!("Arbitrum shadow DEX stream stopped; process restart will rehydrate state");
+                    engine.degrade_shadow_strategy(
+                        &shadow_plan.strategy_id,
+                        "network_ingestion",
+                        anyhow::anyhow!("Arbitrum shadow DEX stream stopped"),
+                    )?;
+                    shadow_dex_running = false;
+                    report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
+                    continue;
                 };
                 let _evaluation =
                     engine.on_shadow_dex_event(&shadow_plan.strategy_id, event)?;
+                report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -2589,6 +2641,7 @@ async fn run(
                 if engine.dependencies().for_symbol(event_symbol).next().is_some() {
                     let _summary =
                         engine.on_market_event(event, binance_feed.depth_book())?;
+                    report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
                 } else {
                     let (event_kind, generation, parse_time_us, wire_frame_size_bytes) =
                         observed_market_event_fields(&event);
@@ -2793,9 +2846,20 @@ async fn run(
                 result.context("Alchemy DEX connector task failed")??;
                 bail!("Alchemy DEX connector stopped; process restart will rehydrate state");
             }
-            result = &mut shadow_dex_task => {
-                result.context("Arbitrum shadow DEX connector task failed")??;
-                bail!("Arbitrum shadow DEX connector stopped; process restart will rehydrate state");
+            result = &mut shadow_dex_task, if shadow_dex_running => {
+                let error = match result {
+                    Ok(Ok(())) => anyhow::anyhow!("Arbitrum shadow DEX connector stopped"),
+                    Ok(Err(error)) => error.context("Arbitrum shadow DEX connector task failed"),
+                    Err(error) => anyhow::Error::new(error)
+                        .context("Arbitrum shadow DEX connector task panicked"),
+                };
+                engine.degrade_shadow_strategy(
+                    &shadow_plan.strategy_id,
+                    "network_ingestion",
+                    error,
+                )?;
+                shadow_dex_running = false;
+                report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
             }
             result = &mut binance_balance_task => {
                 result.context("Binance balance synchronization task failed")??;
@@ -3640,6 +3704,53 @@ fn record_longest_handler(
         *longest_us = duration_us;
         *longest_name = handler_name;
     }
+}
+
+fn report_strategy_dependency_faults(
+    engine: &mut HotPathDecisionOwner<TradingEngine>,
+    supervisor: &RootSupervisorPolicy,
+) -> anyhow::Result<()> {
+    for fault in engine.take_dependency_faults() {
+        report_strategy_dependency_fault(supervisor, fault)?;
+    }
+    Ok(())
+}
+
+fn report_strategy_dependency_fault(
+    supervisor: &RootSupervisorPolicy,
+    fault: StrategyDependencyFault,
+) -> anyhow::Result<()> {
+    let class = if fault.dependency.contains("network_ingestion") {
+        DependencyFaultClass::NetworkIngestion
+    } else {
+        DependencyFaultClass::Strategy
+    };
+    let decision = supervisor.decide(fault.strategy_id.as_str(), class)?;
+    ensure!(
+        !decision.process_termination_required,
+        "a non-critical dependency fault unexpectedly required process termination"
+    );
+    let action = match decision.action {
+        SupervisorAction::DegradeStrategy => "degrade_strategy",
+        SupervisorAction::ReconnectShard => "reconnect_shard",
+        SupervisorAction::DegradeNetwork => "degrade_network",
+        SupervisorAction::FailFast => "fail_fast",
+        SupervisorAction::ObserveOnly => "observe_only",
+    };
+    tracing::error!(
+        binance_account_id = %decision.scope.binance_account_id,
+        network_id = %fault.network_id,
+        strategy_id = %fault.strategy_id.as_str(),
+        execution_lane_id = %decision.scope.execution_lane_id,
+        symbol = %fault.symbol,
+        dependency = fault.dependency,
+        supervisor_action = action,
+        closes_new_mutations = decision.closes_new_mutations,
+        process_termination_required = decision.process_termination_required,
+        error_class = "dependency_owner_reported_error",
+        "runtime dependency fault"
+    );
+    Ok(())
 }
 
 fn chain_endpoints(domain_config: &LoadedDomainConfig) -> anyhow::Result<(String, String)> {

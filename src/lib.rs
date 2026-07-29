@@ -20,5 +20,6 @@ pub mod portfolio;
 pub mod rebalance;
 pub mod state;
 pub mod strategy_runtime;
+pub mod supervision;
 pub mod telemetry;
 pub mod wallet;

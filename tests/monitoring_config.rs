@@ -14,6 +14,10 @@ const TRADING_INVENTORY_BLOCKED_POLICY: &str =
     include_str!("../infra/gcp/monitoring/trading-inventory-blocked-policy.json");
 const BINANCE_DEPTH_UNHEALTHY_METRIC: &str =
     include_str!("../infra/gcp/monitoring/binance-depth-unhealthy-log-metric.json");
+const RUNTIME_DEPENDENCY_FAULT_METRIC: &str =
+    include_str!("../infra/gcp/monitoring/runtime-dependency-fault-log-metric.json");
+const RUNTIME_DEPENDENCY_FAULT_POLICY: &str =
+    include_str!("../infra/gcp/monitoring/runtime-dependency-fault-policy.json");
 
 fn filter_from(config: &str, name: &str) -> String {
     let config: Value = serde_json::from_str(config).unwrap_or_else(|error| {
@@ -129,4 +133,43 @@ fn binance_depth_health_is_a_separate_gke_metric() {
     assert!(filter.contains(r#"jsonPayload.fields.message="Binance depth health heartbeat""#));
     assert!(filter.contains(r#"jsonPayload.fields.healthy=false"#));
     assert!(!filter.contains("runtime phase changed"));
+}
+
+#[test]
+fn runtime_dependency_fault_alert_is_gke_only_and_grouped_by_owner_scope() {
+    let metric: Value = serde_json::from_str(RUNTIME_DEPENDENCY_FAULT_METRIC).unwrap();
+    let policy: Value = serde_json::from_str(RUNTIME_DEPENDENCY_FAULT_POLICY).unwrap();
+    let filter = metric["filter"].as_str().unwrap();
+    let policy_filter = first_condition_filter_from(
+        RUNTIME_DEPENDENCY_FAULT_POLICY,
+        "runtime dependency fault policy",
+    );
+
+    assert!(filter.contains(r#"resource.type="k8s_container""#));
+    assert!(!filter.contains(r#"resource.type="gce_instance""#));
+    assert!(filter.contains(r#"jsonPayload.fields.message="runtime dependency fault""#));
+    for label in [
+        "binance_account_id",
+        "network_id",
+        "strategy_id",
+        "execution_lane_id",
+        "supervisor_action",
+    ] {
+        assert_eq!(
+            metric["labelExtractors"][label],
+            format!("EXTRACT(jsonPayload.fields.{label})")
+        );
+        assert!(
+            policy["conditions"][0]["conditionThreshold"]["aggregations"][0]["groupByFields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == &format!("metric.label.{label}"))
+        );
+    }
+    assert!(policy_filter.contains(r#"resource.type = "k8s_container""#));
+    assert!(!policy_filter.contains(r#"resource.type = "gce_instance""#));
+    assert!(policy_filter.contains(
+        r#"metric.type = "logging.googleapis.com/user/poly_bot_runtime_dependency_fault""#
+    ));
 }

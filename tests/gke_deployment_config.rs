@@ -91,6 +91,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("portfolio_allocator_mode"));
     assert!(MAIN.contains("portfolio_external_mutation_authorized"));
     assert!(MAIN.contains("live_rebalance_adapter"));
+    assert!(MAIN.contains("M7 combined production shadow configured"));
+    assert!(MAIN.contains("background_immutable_decision_projection"));
+    assert!(MAIN.contains("pure_shadow_proposal"));
+    assert!(MAIN.contains("network_scoped_shadow_only"));
+    assert!(MAIN.contains("report_strategy_dependency_faults"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
         .expect("startup DEX backlog drain is wired");

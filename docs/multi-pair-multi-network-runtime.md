@@ -1644,6 +1644,31 @@ account, owner counts, executable symbol, journal schema, scheduler policy,
 parent/child fsync latency, recovery scopes, and then chains the unchanged M5
 portfolio and M0 hot-path gates.
 
+Production acceptance used revision
+`012deb46722368998bd06f9e4bdfe06c713ad7cc` (CI `30486542791`, Deploy GKE
+`30486903741`) and image
+`sha256:e7865f41e78cf375cd6ce2e29c2b51d19acce5ce7080ce67714ac9beb4d4a7ec`.
+The sole Pod `arb-bot-59cd8fd59-d6ch9` and both containers started at
+`2026-07-29T20:09:17Z`, became ready with zero restarts, and GCE remained
+`TERMINATED`.
+
+In the authoritative early half-open window
+`[2026-07-29T20:09:17Z,2026-07-29T20:13:20Z)`, the ownership record proved one
+Binance owner, two EVM owners, one executable strategy (`WLDUSDC`), global
+serialization, schema v2, and zero rebalance signer access. Trade, rebalance,
+and EVM journal recovery all completed successfully. There was no live parent
+dispatch in this market window; deterministic DEX-first, recovery,
+parent/child fsync, v1 compatibility, shared-inventory, and same-chain/cross-
+chain nonce tests therefore remain the mutation evidence.
+
+Under 1,085 WLD strategy frames, baseline p99/max was 11/18 microseconds,
+JSON parse/depth/socket p99 was 5/13/24 microseconds, World Chain fee-500
+receive max was 48 microseconds, and prepared publication p99/max was 142/142
+microseconds. Hot telemetry drops, production errors, container restarts, CPU
+throttling, and memory pressure/OOM were zero. CPU max was 0.0163 core and
+cgroup memory current/peak was 47.7/49.8 MB. These tails and resources stayed
+inside the frozen M0/M5 gates, so M6 required no corrective release.
+
 ### M7 — Combined production shadow
 
 Deliver:
@@ -1670,6 +1695,41 @@ Exit criteria:
 Rollback:
 
 - deploy the last verified v12 single-pair digest through the GKE workflow.
+
+M7 keeps the executable WLD evaluator unchanged inside
+`HotPathDecisionOwner`; consequently there is no second implementation of
+financial arithmetic that could silently drift from v12. Each immutable WLD
+`PairEvaluation` already crossing the bounded hot-telemetry channel is
+projected independently into the legacy-v12 and ownership-graph decision
+shapes by the background writer. It publishes
+`strategy_decision_compatibility` with the exact update identity, candidate
+counts, queue latency, and equality result. This adds no queue, allocation, or
+serialization to the accepted Binance frame-to-baseline interval.
+
+An ESP shadow candidate now produces pure `shadow_reservation_plan` and
+`shadow_rebalance_plan` records in addition to the coordinator observation.
+The reservation proposal describes both exact primary debits but does not
+create an `InventoryReservations` entry. The rebalance proposal deliberately
+stops at the post-trade authoritative-balance trigger and has neither an
+executor nor a signer/order command handle. Every record carries
+`external_mutation_authorized=false`; Arbitrum execution remains disabled by
+the compiled graph and network runtime.
+
+`RootSupervisorPolicy` indexes the compiled account/network/strategy/execution-
+lane scopes once at startup. Strategy and network faults degrade only that
+scope; a shadow evaluator fault is retained once and subsequent ESP events are
+ignored while the synchronous WLD route continues. A terminal Arbitrum shadow
+connector is likewise converted into network-scoped degradation instead of
+terminating the live WLD owner. Critical owner faults remain fail-fast and
+telemetry faults remain observation-only. Deterministic injection covers ESP
+strategy/network degradation, WLD mutation closure, critical fail-fast, and
+telemetry isolation.
+
+The `poly_bot_runtime_dependency_fault` GKE-only log metric extracts and groups
+alerts by Binance account, network, strategy, execution lane, and selected
+supervisor action. `scripts/report-m7-combined-shadow START_UTC END_UTC`
+reports those faults, exact background WLD comparisons, ESP planning/mutation
+proofs, and then chains the unchanged M6 through M0 gates.
 
 ### M8 — ESP/USDC Arbitrum live readiness
 

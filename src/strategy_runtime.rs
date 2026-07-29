@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
     time::Instant,
 };
@@ -153,6 +153,15 @@ pub struct StrategyDispatchSummary {
     pub maximum_calculation_time_us: u128,
 }
 
+#[derive(Debug)]
+pub struct StrategyDependencyFault {
+    pub strategy_id: StrategyId,
+    pub network_id: String,
+    pub symbol: String,
+    pub dependency: &'static str,
+    pub error: anyhow::Error,
+}
+
 impl StrategyEvaluation {
     pub fn budget_exceeded(&self) -> bool {
         self.calculation_time_us > u128::from(self.budget_us)
@@ -207,6 +216,8 @@ pub struct HotPathDecisionOwner<P> {
     primary_strategy_id: StrategyId,
     primary: P,
     shadows: BTreeMap<StrategyId, Box<dyn StrategyEvaluator + Send>>,
+    degraded_shadows: BTreeSet<StrategyId>,
+    dependency_faults: Vec<StrategyDependencyFault>,
     dependencies: CompiledStrategyDependencyIndex,
 }
 
@@ -264,6 +275,8 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             primary_strategy_id,
             primary,
             shadows: indexed_shadows,
+            degraded_shadows: BTreeSet::new(),
+            dependency_faults: Vec::new(),
             dependencies,
         })
     }
@@ -279,6 +292,8 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             primary_strategy_id,
             primary,
             shadows,
+            degraded_shadows,
+            dependency_faults,
             dependencies,
         } = self;
         let indices = dependencies.symbol_indices(symbol);
@@ -297,11 +312,26 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             };
             let evaluation = if strategy.strategy_id == *primary_strategy_id {
                 primary.on_market_event(routed_event, depth)?
+            } else if degraded_shadows.contains(&strategy.strategy_id) {
+                continue;
             } else {
                 let evaluator = shadows
                     .get_mut(&strategy.strategy_id)
                     .context("compiled shadow route has no evaluator")?;
-                evaluator.on_market_event(routed_event, None)?
+                match evaluator.on_market_event(routed_event, None) {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        degraded_shadows.insert(strategy.strategy_id.clone());
+                        dependency_faults.push(StrategyDependencyFault {
+                            strategy_id: strategy.strategy_id.clone(),
+                            network_id: strategy.network_id.as_str().to_owned(),
+                            symbol: strategy.symbol.clone(),
+                            dependency: "strategy_evaluator",
+                            error,
+                        });
+                        continue;
+                    }
+                }
             };
             summary.routed_strategies = summary.routed_strategies.saturating_add(1);
             summary.evaluated_strategies = summary
@@ -333,10 +363,21 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             strategy_id != &self.primary_strategy_id,
             "primary DEX events must use the existing compatibility coordinator path"
         );
-        self.shadows
+        if self.degraded_shadows.contains(strategy_id) {
+            return Ok(idle_strategy_evaluation());
+        }
+        match self
+            .shadows
             .get_mut(strategy_id)
             .context("shadow DEX route has no evaluator")?
             .on_dex_event(event)
+        {
+            Ok(evaluation) => Ok(evaluation),
+            Err(error) => {
+                self.degrade_shadow_strategy(strategy_id, "network_ingestion", error)?;
+                Ok(idle_strategy_evaluation())
+            }
+        }
     }
 
     pub fn on_shadow_startup_dex_event(
@@ -348,10 +389,52 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             strategy_id != &self.primary_strategy_id,
             "primary DEX events must use the existing compatibility coordinator path"
         );
-        self.shadows
+        if self.degraded_shadows.contains(strategy_id) {
+            return Ok(idle_strategy_evaluation());
+        }
+        match self
+            .shadows
             .get_mut(strategy_id)
             .context("shadow DEX route has no evaluator")?
             .on_startup_dex_event(event)
+        {
+            Ok(evaluation) => Ok(evaluation),
+            Err(error) => {
+                self.degrade_shadow_strategy(strategy_id, "startup_network_ingestion", error)?;
+                Ok(idle_strategy_evaluation())
+            }
+        }
+    }
+
+    pub fn degrade_shadow_strategy(
+        &mut self,
+        strategy_id: &StrategyId,
+        dependency: &'static str,
+        error: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            strategy_id != &self.primary_strategy_id,
+            "primary strategy cannot be dependency-degraded"
+        );
+        let plan = self.dependencies.strategy(strategy_id)?;
+        if self.degraded_shadows.insert(strategy_id.clone()) {
+            self.dependency_faults.push(StrategyDependencyFault {
+                strategy_id: strategy_id.clone(),
+                network_id: plan.network_id.as_str().to_owned(),
+                symbol: plan.symbol.clone(),
+                dependency,
+                error,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn take_dependency_faults(&mut self) -> Vec<StrategyDependencyFault> {
+        std::mem::take(&mut self.dependency_faults)
+    }
+
+    pub fn shadow_is_degraded(&self, strategy_id: &StrategyId) -> bool {
+        self.degraded_shadows.contains(strategy_id)
     }
 
     pub fn take_next_shadow_sizing_job(&mut self) -> Option<ShadowSizingJob> {
@@ -369,6 +452,15 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             .get_mut(&strategy_id)
             .context("shadow sizing result has no evaluator")?
             .on_sizing_result(result)
+    }
+}
+
+fn idle_strategy_evaluation() -> StrategyEvaluation {
+    StrategyEvaluation {
+        evaluated: false,
+        candidate_produced: false,
+        calculation_time_us: 0,
+        budget_us: 0,
     }
 }
 
@@ -405,13 +497,25 @@ pub trait CoordinatorShadowSink: Send {
 pub struct TelemetryCoordinatorShadowSink {
     telemetry: TelemetryHandle,
     engine_id: String,
+    binance_account_id: String,
+    network_id: String,
+    execution_lane_id: String,
 }
 
 impl TelemetryCoordinatorShadowSink {
-    pub fn new(telemetry: TelemetryHandle, engine_id: String) -> Self {
+    pub fn new(
+        telemetry: TelemetryHandle,
+        engine_id: String,
+        binance_account_id: String,
+        network_id: String,
+        execution_lane_id: String,
+    ) -> Self {
         Self {
             telemetry,
             engine_id,
+            binance_account_id,
+            network_id,
+            execution_lane_id,
         }
     }
 }
@@ -423,6 +527,9 @@ impl CoordinatorShadowSink for TelemetryCoordinatorShadowSink {
             serde_json::json!({
                 "engine_id": self.engine_id,
                 "strategy_id": strategy_id.as_str(),
+                "binance_account_id": self.binance_account_id,
+                "network_id": self.network_id,
+                "execution_lane_id": self.execution_lane_id,
                 "sink_mode": "non_mutating",
                 "candidate_source": candidate.source,
                 "external_mutation_authorized": false,
@@ -435,6 +542,56 @@ impl CoordinatorShadowSink for TelemetryCoordinatorShadowSink {
                 "dex_amount_in": candidate.trade.dex_amount_in.to_string(),
                 "dex_amount_out_minimum": candidate.trade.dex_amount_out_minimum.to_string(),
                 "gross_profit_bps_x100": candidate.trade.gross_profit_bps_x100,
+            }),
+        );
+        let (wallet_debit_asset, wallet_debit_amount, binance_debit_asset, binance_debit_amount) =
+            match candidate.direction {
+                ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
+                    "USDC",
+                    candidate.trade.dex_amount_in,
+                    "ESP",
+                    candidate.trade.token_b_amount,
+                ),
+                ArbitrageDirection::BuyTokenBOnCexSellOnDex => (
+                    "ESP",
+                    candidate.trade.dex_amount_in,
+                    "USDC",
+                    candidate.trade.cex_token_a_amount,
+                ),
+            };
+        self.telemetry.emit(
+            "shadow_reservation_plan",
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "strategy_id": strategy_id.as_str(),
+                "binance_account_id": self.binance_account_id,
+                "network_id": self.network_id,
+                "execution_lane_id": self.execution_lane_id,
+                "source": candidate.source,
+                "claim_count": 2,
+                "wallet_debit_asset": wallet_debit_asset,
+                "wallet_debit_base_units": wallet_debit_amount.to_string(),
+                "binance_debit_asset": binance_debit_asset,
+                "binance_debit_base_units": binance_debit_amount.to_string(),
+                "reservation_mode": "pure_shadow_proposal",
+                "reservation_created": false,
+                "external_mutation_authorized": false,
+            }),
+        );
+        self.telemetry.emit(
+            "shadow_rebalance_plan",
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "strategy_id": strategy_id.as_str(),
+                "binance_account_id": self.binance_account_id,
+                "network_id": self.network_id,
+                "execution_lane_id": self.execution_lane_id,
+                "candidate_direction": candidate.direction.as_str(),
+                "planning_trigger": "post_trade_authoritative_balance_generation",
+                "route_validation": "network_scoped_shadow_only",
+                "plan_materialized": false,
+                "execution_enabled": false,
+                "external_mutation_authorized": false,
             }),
         );
     }
@@ -1140,6 +1297,31 @@ mod tests {
         evaluations: Arc<AtomicU64>,
     }
 
+    struct FaultingEvaluator {
+        strategy_id: StrategyId,
+        symbol: String,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl StrategyEvaluator for FaultingEvaluator {
+        fn strategy_id(&self) -> StrategyId {
+            self.strategy_id.clone()
+        }
+
+        fn symbol(&self) -> &str {
+            &self.symbol
+        }
+
+        fn on_market_event(
+            &mut self,
+            _event: MarketEvent,
+            _depth: Option<&SpotDepthBook>,
+        ) -> anyhow::Result<StrategyEvaluation> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("injected shadow evaluator failure")
+        }
+    }
+
     impl StrategyEvaluator for CountingEvaluator {
         fn strategy_id(&self) -> StrategyId {
             self.strategy_id.clone()
@@ -1287,6 +1469,55 @@ mod tests {
         assert_eq!(wld_summary.routed_strategies, 1);
         assert_eq!(wld_count.load(Ordering::Relaxed), 1);
         assert_eq!(esp_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn injected_esp_fault_degrades_only_esp_and_wld_keeps_evaluating() {
+        let wld = strategy(
+            "strategy:world-chain-usdc-wld",
+            "WLDUSDC",
+            "eip155:480:pool:wld",
+            true,
+        );
+        let esp = strategy(
+            "strategy:arbitrum-usdc-esp",
+            "ESPUSDC",
+            "eip155:42161:pool:esp",
+            false,
+        );
+        let dependencies = CompiledStrategyDependencyIndex::new(CompiledHotPathRuntimePlan {
+            strategies: vec![esp.clone(), wld.clone()],
+        })
+        .unwrap();
+        let wld_calls = Arc::new(AtomicU64::new(0));
+        let esp_calls = Arc::new(AtomicU64::new(0));
+        let primary = CountingEvaluator {
+            strategy_id: wld.strategy_id,
+            symbol: wld.symbol,
+            evaluations: Arc::clone(&wld_calls),
+        };
+        let shadow = FaultingEvaluator {
+            strategy_id: esp.strategy_id.clone(),
+            symbol: esp.symbol,
+            calls: Arc::clone(&esp_calls),
+        };
+        let mut owner =
+            HotPathDecisionOwner::new(primary, vec![Box::new(shadow)], dependencies).unwrap();
+
+        owner
+            .on_market_event(MarketEvent::BinanceTopOfBook(quote("ESPUSDC", 1)), None)
+            .unwrap();
+        owner
+            .on_market_event(MarketEvent::BinanceTopOfBook(quote("ESPUSDC", 2)), None)
+            .unwrap();
+        owner
+            .on_market_event(MarketEvent::BinanceTopOfBook(quote("WLDUSDC", 3)), None)
+            .unwrap();
+
+        assert!(owner.shadow_is_degraded(&esp.strategy_id));
+        assert_eq!(owner.take_dependency_faults().len(), 1);
+        assert_eq!(esp_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(wld_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

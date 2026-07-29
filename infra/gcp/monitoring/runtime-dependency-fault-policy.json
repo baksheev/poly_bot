@@ -1,0 +1,44 @@
+{
+  "displayName": "poly_bot runtime dependency fault",
+  "combiner": "OR",
+  "enabled": true,
+  "conditions": [
+    {
+      "displayName": "Dependency-scoped runtime fault observed",
+      "conditionThreshold": {
+        "filter": "resource.type = \"k8s_container\" AND metric.type = \"logging.googleapis.com/user/poly_bot_runtime_dependency_fault\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_RATE",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": [
+              "metric.label.binance_account_id",
+              "metric.label.network_id",
+              "metric.label.strategy_id",
+              "metric.label.execution_lane_id",
+              "metric.label.supervisor_action"
+            ]
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "trigger": {
+          "count": 1
+        }
+      }
+    }
+  ],
+  "documentation": {
+    "mimeType": "text/markdown",
+    "content": "The active `poly_bot` GKE runtime emitted a dependency-scoped supervisor fault. The alert series identifies the Binance account, network, strategy, execution lane, and selected supervisor action. A shadow ESP/Arbitrum degradation must leave WLD/World Chain ready; a critical-owner fault must close new mutations and fail fast."
+  },
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "userLabels": {
+    "service": "poly_bot",
+    "component": "root_supervisor"
+  }
+}

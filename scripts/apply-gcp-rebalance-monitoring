@@ -44,6 +44,9 @@ upsert_log_metric \
 upsert_log_metric \
   poly_bot_binance_depth_unhealthy \
   "${monitoring_dir}/binance-depth-unhealthy-log-metric.json"
+upsert_log_metric \
+  poly_bot_runtime_dependency_fault \
+  "${monitoring_dir}/runtime-dependency-fault-log-metric.json"
 
 channels_json="$("${gcloud_bin}" alpha monitoring channels list \
   "${project_args[@]}" \
@@ -132,5 +135,8 @@ upsert_policy \
 upsert_policy \
   "poly_bot trading inventory blocked" \
   "${monitoring_dir}/trading-inventory-blocked-policy.json"
+upsert_policy \
+  "poly_bot runtime dependency fault" \
+  "${monitoring_dir}/runtime-dependency-fault-policy.json"
 
 echo "production runtime monitoring configured for ${ALERT_EMAIL}"

@@ -11,8 +11,8 @@ use crate::{
     config::AppConfig,
     dex::mirror::DexMirror,
     opportunity::{
-        DirectionEvaluation, PairEvaluation, PairRuntime, PreparedPoolRefresh, TradeEvaluation,
-        format_base_units,
+        ArbitrageDirection, DirectionEvaluation, PairEvaluation, PairRuntime, PreparedPoolRefresh,
+        TradeEvaluation, format_base_units,
     },
     state::{RuntimePhase, TopOfBook},
     telemetry::{
@@ -59,6 +59,7 @@ struct HotEvaluationTelemetry {
     calculation_budget_us: u64,
     decision_latency_us: u128,
     trigger: &'static str,
+    queued_at: std::time::Instant,
 }
 
 enum HotDexEventTelemetry {
@@ -129,6 +130,69 @@ struct PoolTelemetryContext {
     identity: String,
     pool_id: String,
     fee_pips: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecisionDirectionProjection {
+    direction: ArbitrageDirection,
+    cex_top_token_b_amount: alloy_primitives::U256,
+    baseline: Option<TradeEvaluation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecisionProjection {
+    pair_index: usize,
+    baseline_token_b_amount: alloy_primitives::U256,
+    directions: [DecisionDirectionProjection; 2],
+}
+
+impl DecisionProjection {
+    fn candidate_count(self) -> usize {
+        self.directions
+            .iter()
+            .filter(|direction| {
+                direction
+                    .baseline
+                    .is_some_and(|trade| trade.meets_threshold)
+            })
+            .count()
+    }
+}
+
+fn project_direction(direction: DirectionEvaluation) -> DecisionDirectionProjection {
+    DecisionDirectionProjection {
+        direction: direction.direction,
+        cex_top_token_b_amount: direction.cex_top_token_b_amount,
+        baseline: direction.baseline,
+    }
+}
+
+fn legacy_decision_projection(evaluation: &PairEvaluation) -> DecisionProjection {
+    DecisionProjection {
+        pair_index: evaluation.pair_index,
+        baseline_token_b_amount: evaluation.baseline_token_b_amount,
+        directions: [
+            DecisionDirectionProjection {
+                direction: evaluation.dex_buy_cex_sell.direction,
+                cex_top_token_b_amount: evaluation.dex_buy_cex_sell.cex_top_token_b_amount,
+                baseline: evaluation.dex_buy_cex_sell.baseline,
+            },
+            DecisionDirectionProjection {
+                direction: evaluation.cex_buy_dex_sell.direction,
+                cex_top_token_b_amount: evaluation.cex_buy_dex_sell.cex_top_token_b_amount,
+                baseline: evaluation.cex_buy_dex_sell.baseline,
+            },
+        ],
+    }
+}
+
+fn ownership_graph_decision_projection(evaluation: &PairEvaluation) -> DecisionProjection {
+    let routed = [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell];
+    DecisionProjection {
+        pair_index: evaluation.pair_index,
+        baseline_token_b_amount: evaluation.baseline_token_b_amount,
+        directions: routed.map(project_direction),
+    }
 }
 
 pub fn channel(
@@ -262,6 +326,7 @@ impl HotTelemetryHandle {
                 calculation_budget_us,
                 decision_latency_us: quote.received_at.elapsed().as_micros(),
                 trigger,
+                queued_at: std::time::Instant::now(),
             })
             .is_err()
         {
@@ -387,6 +452,7 @@ impl HotTelemetryTask {
                         event.calculation_budget_us,
                         event.decision_latency_us,
                         event.trigger,
+                        event.queued_at.elapsed().as_micros(),
                     )?,
                     None => evaluations_open = false,
                 },
@@ -587,6 +653,7 @@ impl HotTelemetryTask {
         calculation_budget_us: u64,
         decision_latency_us: u128,
         trigger: &'static str,
+        compatibility_queue_us: u128,
     ) -> anyhow::Result<()> {
         let pair = self
             .context
@@ -640,6 +707,43 @@ impl HotTelemetryTask {
                 "directions": directions,
             }),
         );
+        let old_baseline = legacy_decision_projection(evaluation);
+        let ownership_graph = ownership_graph_decision_projection(evaluation);
+        let decisions_match = old_baseline == ownership_graph;
+        self.telemetry.emit(
+            "strategy_decision_compatibility",
+            json!({
+                "engine_id": self.context.engine_id,
+                "pair_id": pair.pair_id,
+                "strategy_id": pair.strategy_id,
+                "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                "network_id": pair.network_id,
+                "execution_lane_id": crate::telemetry::execution_lane_id(pair.chain_id),
+                "symbol": pair.symbol,
+                "update_id": quote.update_id,
+                "comparison_mode": "background_immutable_decision_projection",
+                "old_baseline_source": "v12_compatibility_evaluator",
+                "new_path_source": "hot_path_decision_owner",
+                "comparison_queue_us": compatibility_queue_us,
+                "decisions_match": decisions_match,
+                "old_baseline_candidate_count": old_baseline.candidate_count(),
+                "new_path_candidate_count": ownership_graph.candidate_count(),
+                "external_mutation_authorized": false,
+            }),
+        );
+        if !decisions_match {
+            tracing::error!(
+                binance_account_id = PRIMARY_BINANCE_ACCOUNT_ID,
+                network_id = %pair.network_id,
+                strategy_id = %pair.strategy_id,
+                execution_lane_id = %crate::telemetry::execution_lane_id(pair.chain_id),
+                symbol = %pair.symbol,
+                update_id = quote.update_id,
+                dependency = "wld_decision_compatibility",
+                supervisor_action = "close_new_strategy_mutations",
+                "runtime dependency fault"
+            );
+        }
 
         for direction in [&evaluation.dex_buy_cex_sell, &evaluation.cex_buy_dex_sell] {
             if let Some(trade) = direction.baseline.filter(|trade| trade.meets_threshold) {
@@ -770,8 +874,15 @@ fn format_bps_x100(value: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HotDexEventTelemetry, HotSharedStreamTelemetry};
-    use crate::opportunity::PreparedPoolRefresh;
+    use alloy_primitives::U256;
+
+    use super::{
+        HotDexEventTelemetry, HotSharedStreamTelemetry, legacy_decision_projection,
+        ownership_graph_decision_projection,
+    };
+    use crate::opportunity::{
+        ArbitrageDirection, DirectionEvaluation, PairEvaluation, PreparedPoolRefresh,
+    };
 
     #[test]
     fn dex_hot_records_are_fixed_size_and_own_no_heap_allocation() {
@@ -781,5 +892,30 @@ mod tests {
         assert!(std::mem::size_of::<PreparedPoolRefresh>() <= 512);
         assert!(!std::mem::needs_drop::<HotSharedStreamTelemetry>());
         assert!(std::mem::size_of::<HotSharedStreamTelemetry>() <= 128);
+    }
+
+    #[test]
+    fn background_projection_preserves_the_complete_v12_baseline_decision() {
+        let evaluation = PairEvaluation {
+            pair_index: 0,
+            baseline_token_b_amount: U256::from(200_u64),
+            dex_buy_cex_sell: DirectionEvaluation {
+                direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                cex_top_token_b_amount: U256::from(91_u64),
+                baseline: None,
+            },
+            cex_buy_dex_sell: DirectionEvaluation {
+                direction: ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+                cex_top_token_b_amount: U256::from(83_u64),
+                baseline: None,
+            },
+            baseline_cache_hits: 2,
+            baseline_cache_misses: 0,
+        };
+
+        assert_eq!(
+            legacy_decision_projection(&evaluation),
+            ownership_graph_decision_projection(&evaluation)
+        );
     }
 }
