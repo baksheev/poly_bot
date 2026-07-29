@@ -78,6 +78,21 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("top_of_book_max_trade_notional_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("balance_safety_multiplier"));
     assert!(DEPLOY_WORKFLOW.contains("previous_runtime_config"));
+    assert!(DEPLOY_WORKFLOW.contains("RUNTIME_STARTUP_CONTRACT_FILE"));
+    assert!(DEPLOY_WORKFLOW.contains("network_runtime_count"));
+    assert!(DEPLOY_WORKFLOW.contains("binance_strategy_max_transport_silence_ms"));
+    assert!(DEPLOY_WORKFLOW.contains("hot_path_strategy_count"));
+    assert!(DEPLOY_WORKFLOW.contains("hot_path_direct_binance_poll"));
+    assert!(DEPLOY_WORKFLOW.contains("hot_path_dependency_index"));
+    assert!(DEPLOY_WORKFLOW.contains("hot_path_sizing_policy"));
+    assert!(DEPLOY_WORKFLOW.contains("hot_path_shadow_external_mutation_authorized"));
+    assert!(
+        RELEASE_PLATFORM
+            .contains("RUNTIME_STARTUP_CONTRACT_FILE: /tmp/arb-bot-startup-contract.json")
+    );
+    assert!(DEPLOY_WORKFLOW.contains("kubectl exec"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-startup-contract.json"));
+    assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
 }
 

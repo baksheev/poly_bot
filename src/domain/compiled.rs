@@ -535,6 +535,7 @@ pub struct CompatibilitySelection {
     pub graph_summary: Option<CompiledGraphSummary>,
     pub binance_runtime: Option<CompiledBinanceRuntimePlan>,
     pub network_runtime: Option<CompiledNetworkRuntimePlan>,
+    pub hot_path_runtime: Option<CompiledHotPathRuntimePlan>,
 }
 
 /// Immutable account-scoped Binance topology consumed by the M2 runtime.
@@ -562,6 +563,31 @@ pub struct CompiledBinanceStreamShard {
 pub struct CompiledNetworkRuntimePlan {
     pub networks: Vec<CompiledNetworkPlan>,
 }
+
+/// Process-scoped M4 routing plan. It is compiled from the same authoritative
+/// graph as account and network ownership, so the hot path does not reconstruct
+/// symbol or pool allowlists from environment variables.
+#[derive(Debug, Clone)]
+pub struct CompiledHotPathRuntimePlan {
+    pub strategies: Vec<CompiledHotPathStrategyPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledHotPathStrategyPlan {
+    pub strategy_id: StrategyId,
+    pub pair_id: String,
+    pub instrument_id: InstrumentId,
+    pub symbol: String,
+    pub network_id: NetworkId,
+    pub pool_ids: Vec<PoolId>,
+    pub observe: bool,
+    pub plan: bool,
+    pub execute: bool,
+    pub baseline_budget_us: u64,
+    pub domain_config: LoadedDomainConfig,
+}
+
+const DEFAULT_BASELINE_CALCULATION_BUDGET_US: u64 = 200;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompiledNetworkPlan {
@@ -1085,7 +1111,7 @@ impl CompiledDomainGraph {
             .retain(|pair| selected.contains(pair.id.as_str()));
         snapshot.live_trading_enabled = snapshot.pairs.iter().any(|pair| pair.execution_enabled);
         let config = LoadedDomainConfig::from_projected_snapshot(
-            path,
+            path.as_ref(),
             self.fingerprint_sha256.clone(),
             snapshot,
         )?;
@@ -1093,6 +1119,7 @@ impl CompiledDomainGraph {
             config,
             binance_runtime: Some(self.binance_runtime_plan()?),
             network_runtime: Some(self.network_runtime_plan(role)?),
+            hot_path_runtime: Some(self.hot_path_runtime_plan(path)?),
             graph_summary: Some(CompiledGraphSummary {
                 bundle_id: self.bundle.bundle_id.clone(),
                 projection_id: projection.id.clone(),
@@ -1385,6 +1412,102 @@ impl CompiledDomainGraph {
         );
         Ok(CompiledNetworkRuntimePlan { networks })
     }
+
+    fn hot_path_runtime_plan(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<CompiledHotPathRuntimePlan> {
+        let instruments: BTreeMap<_, _> = self
+            .bundle
+            .instruments
+            .iter()
+            .map(|instrument| (instrument.id.clone(), instrument))
+            .collect();
+        let dependencies: BTreeMap<_, _> = self
+            .bundle
+            .dependencies
+            .iter()
+            .map(|dependency| (dependency.strategy_id.clone(), dependency))
+            .collect();
+        let capabilities: BTreeMap<_, _> = self
+            .bundle
+            .capabilities
+            .iter()
+            .map(|capability| (capability.strategy_id.clone(), capability))
+            .collect();
+        let mut strategies = Vec::with_capacity(self.bundle.strategies.len());
+        for strategy in &self.bundle.strategies {
+            let instrument = instruments.get(&strategy.instrument_id).with_context(|| {
+                format!(
+                    "hot-path strategy {} has no compiled instrument",
+                    strategy.id.as_str()
+                )
+            })?;
+            let dependency = dependencies.get(&strategy.id).with_context(|| {
+                format!(
+                    "hot-path strategy {} has no compiled dependency",
+                    strategy.id.as_str()
+                )
+            })?;
+            let capability = capabilities.get(&strategy.id).with_context(|| {
+                format!(
+                    "hot-path strategy {} has no compiled capability",
+                    strategy.id.as_str()
+                )
+            })?;
+            let source = self
+                .bundle
+                .sources
+                .iter()
+                .find(|source| source.snapshot_id == strategy.source_snapshot_id)
+                .expect("compiled graph validation checked strategy source");
+            let mut snapshot = source.snapshot.clone();
+            snapshot.pairs.retain(|pair| pair.id == strategy.pair_id);
+            ensure!(
+                snapshot.pairs.len() == 1,
+                "hot-path strategy {} did not select exactly one source pair",
+                strategy.id.as_str()
+            );
+            snapshot.live_trading_enabled = capability.execute;
+            let domain_config = LoadedDomainConfig::from_projected_snapshot(
+                path.as_ref(),
+                self.fingerprint_sha256.clone(),
+                snapshot,
+            )?;
+            ensure!(
+                !dependency.pool_ids.is_empty(),
+                "hot-path strategy {} has no pools",
+                strategy.id.as_str()
+            );
+            let mut pool_ids = dependency.pool_ids.clone();
+            pool_ids.sort();
+            pool_ids.dedup();
+            ensure!(
+                pool_ids.len() == dependency.pool_ids.len(),
+                "hot-path strategy {} repeats a pool dependency",
+                strategy.id.as_str()
+            );
+            strategies.push(CompiledHotPathStrategyPlan {
+                strategy_id: strategy.id.clone(),
+                pair_id: strategy.pair_id.clone(),
+                instrument_id: strategy.instrument_id.clone(),
+                symbol: instrument.symbol.clone(),
+                network_id: strategy.network_id.clone(),
+                pool_ids,
+                observe: capability.observe,
+                plan: capability.plan,
+                execute: capability.execute,
+                baseline_budget_us: DEFAULT_BASELINE_CALCULATION_BUDGET_US,
+                domain_config,
+            });
+        }
+        strategies.sort_by(|left, right| left.strategy_id.cmp(&right.strategy_id));
+        ensure!(
+            !strategies.is_empty(),
+            "compiled hot-path runtime plan is empty"
+        );
+        Ok(CompiledHotPathRuntimePlan { strategies })
+    }
 }
 
 pub fn load_compatibility_domain(
@@ -1425,6 +1548,7 @@ pub fn load_compatibility_domain(
             graph_summary: None,
             binance_runtime: None,
             network_runtime: None,
+            hot_path_runtime: None,
         })
     }
 }
@@ -2369,6 +2493,32 @@ mod tests {
         assert_eq!(
             live.config.fingerprint_sha256(),
             collector.config.fingerprint_sha256()
+        );
+        let hot_path = live.hot_path_runtime.unwrap();
+        assert_eq!(hot_path.strategies.len(), 2);
+        let wld = hot_path
+            .strategies
+            .iter()
+            .find(|strategy| strategy.symbol == "WLDUSDC")
+            .unwrap();
+        assert!(wld.observe && wld.plan && wld.execute);
+        assert_eq!(wld.network_id.as_str(), "eip155:480");
+        assert_eq!(wld.pool_ids.len(), 4);
+        assert!(wld.domain_config.snapshot().live_trading_enabled);
+        let esp = hot_path
+            .strategies
+            .iter()
+            .find(|strategy| strategy.symbol == "ESPUSDC")
+            .unwrap();
+        assert!(esp.observe && esp.plan && !esp.execute);
+        assert_eq!(esp.network_id.as_str(), "eip155:42161");
+        assert_eq!(esp.pool_ids.len(), 1);
+        assert!(
+            esp.domain_config
+                .snapshot()
+                .pairs
+                .iter()
+                .all(|pair| !pair.execution_enabled && !pair.rebalance.enabled)
         );
         assert_ne!(
             live.config.fingerprint_sha256(),

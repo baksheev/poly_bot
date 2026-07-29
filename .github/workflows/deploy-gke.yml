@@ -332,6 +332,8 @@ jobs:
             = full_live
           test "$(jq -r '.data.REBALANCE_EXECUTION_MODE' <<<"${runtime_config}")" \
             = full_live
+          test "$(jq -r '.data.RUNTIME_STARTUP_CONTRACT_FILE' <<<"${runtime_config}")" \
+            = /tmp/arb-bot-startup-contract.json
           esp_runtime_config="$(kubectl get configmap arb-bot-esp-market-data \
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
@@ -352,6 +354,28 @@ jobs:
             <<<"${deployment_json}")" = true
           test "$(jq -r '.spec.template.spec.volumes[] | select(.name == "esp-market-data-secrets") | .csi.volumeAttributes.secretProviderClass' \
             <<<"${deployment_json}")" = arb-bot-esp-market-data
+          pod_name="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${pod_name}"
+          startup_contract="$(kubectl exec "${pod_name}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            -- cat /tmp/arb-bot-startup-contract.json)"
+          test "$(jq -r '.network_runtime_count' <<<"${startup_contract}")" = 2
+          test "$(jq -r '.arbitrum_execution_enabled' <<<"${startup_contract}")" = false
+          test "$(jq -r '.binance_strategy_max_transport_silence_ms' <<<"${startup_contract}")" = 30000
+          test "$(jq -r '.hot_path_strategy_count' <<<"${startup_contract}")" = 2
+          test "$(jq -r '.hot_path_direct_binance_poll' <<<"${startup_contract}")" = true
+          test "$(jq -r '.hot_path_dependency_index' <<<"${startup_contract}")" \
+            = compiled_exact_symbol_pool
+          test "$(jq -r '.hot_path_sizing_policy' <<<"${startup_contract}")" \
+            = one_running_one_latest_pending_per_strategy
+          test "$(jq -r '.hot_path_shadow_strategy_id' <<<"${startup_contract}")" \
+            = strategy:arbitrum-usdc-esp
+          test "$(jq -r '.hot_path_shadow_external_mutation_authorized' <<<"${startup_contract}")" \
+            = false
           rebalance_mode="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"

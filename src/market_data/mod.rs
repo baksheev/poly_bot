@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Instant};
 
 use crate::state::TopOfBook;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MarketEvent {
     FeedConnected {
         symbol: Arc<str>,

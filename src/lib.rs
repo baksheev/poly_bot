@@ -18,5 +18,6 @@ pub mod network_runtime;
 pub mod opportunity;
 pub mod rebalance;
 pub mod state;
+pub mod strategy_runtime;
 pub mod telemetry;
 pub mod wallet;

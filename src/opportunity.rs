@@ -128,7 +128,7 @@ pub struct OpportunityEngine {
     pair_indices_by_symbol: HashMap<String, usize>,
     pair_index_by_pool: Vec<Option<usize>>,
     pool_generations: Vec<u64>,
-    prepared_pools: Vec<Option<PreparedPoolQuotes>>,
+    prepared_pools: Vec<Option<PreparedCurveGenerationHandle>>,
     baseline_quote_cache: Vec<PoolBaselineQuoteCache>,
 }
 
@@ -139,6 +139,19 @@ struct PreparedPoolQuotes {
     token_a_limit: U256,
     exact_output_token_b_limit: U256,
     exact_input_token_b_limit: U256,
+}
+
+/// Immutable, generation-tagged prepared curves shared by the single-owner
+/// baseline path and only cloned when a snapshot crosses into a sizing worker.
+///
+/// The hot owner always borrows the installed handle. Cloning an
+/// `OpportunityEngine` therefore clones one `Arc` per prepared pool instead of
+/// cloning every curve segment.
+#[derive(Debug, Clone)]
+pub struct PreparedCurveGenerationHandle {
+    pool_index: usize,
+    generation: u64,
+    quotes: Arc<PreparedPoolQuotes>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,7 +185,7 @@ pub struct PreparedPoolBuildRequest {
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
     estimated_build_segments: usize,
-    previous_prepared: Option<PreparedPoolQuotes>,
+    previous_prepared: Option<PreparedCurveGenerationHandle>,
     timing: PreparedPoolBuildTimingHandle,
 }
 
@@ -417,7 +430,7 @@ impl OpportunityEngine {
             pairs.push(runtime);
         }
         let mut pair_index_by_pool = vec![None; dex.pool_count()];
-        let mut prepared_pools: Vec<Option<PreparedPoolQuotes>> =
+        let mut prepared_pools: Vec<Option<PreparedCurveGenerationHandle>> =
             (0..dex.pool_count()).map(|_| None).collect();
         for (pair_index, pair) in pairs.iter().enumerate() {
             for &pool_index in &pair.pool_indices {
@@ -425,7 +438,11 @@ impl OpportunityEngine {
                     pair_index_by_pool[pool_index].replace(pair_index).is_none(),
                     "DEX pool belongs to more than one enabled pair"
                 );
-                prepared_pools[pool_index] = Some(prepare_pool_quotes(pair, dex, pool_index, 1)?);
+                prepared_pools[pool_index] = Some(PreparedCurveGenerationHandle::new(
+                    pool_index,
+                    1,
+                    prepare_pool_quotes(pair, dex, pool_index, 1)?,
+                ));
             }
         }
         Ok(Self {
@@ -583,7 +600,7 @@ impl OpportunityEngine {
             .take();
         let estimated_build_segments = previous_prepared
             .as_ref()
-            .map_or(usize::MAX, PreparedPoolQuotes::total_segments);
+            .map_or(usize::MAX, PreparedCurveGenerationHandle::total_segments);
         self.pool_generations[pool_index] = generation;
         self.invalidate_pool(pool_index)?;
         let pair = &self.pairs[pair_index];
@@ -621,7 +638,11 @@ impl OpportunityEngine {
         let exact_input_token_b_limit = result.prepared.exact_input_token_b_limit;
         let build_time_us = result.build_time_us;
         let timing = result.timing.clone();
-        self.prepared_pools[result.pool_index] = Some(result.prepared);
+        self.prepared_pools[result.pool_index] = Some(PreparedCurveGenerationHandle::new(
+            result.pool_index,
+            result.generation,
+            result.prepared,
+        ));
         timing.mark_published();
         timing.wait_for_result_send_finished();
         let stages = timing.snapshot();
@@ -668,7 +689,34 @@ impl OpportunityEngine {
         self.prepared_pools
             .get(pool_index)
             .context("prepared pool generation index is invalid")
-            .map(|prepared| prepared.as_ref().map(|_| generation))
+            .map(|prepared| {
+                prepared.as_ref().map(|prepared| {
+                    debug_assert_eq!(prepared.pool_index, pool_index);
+                    debug_assert_eq!(prepared.generation, generation);
+                    prepared.generation
+                })
+            })
+    }
+
+    pub fn exact_candidate_capacity(
+        &self,
+        pair_index: usize,
+        direction: ArbitrageDirection,
+        pool_index: usize,
+    ) -> anyhow::Result<Option<U256>> {
+        let pair = self.pair(pair_index)?;
+        ensure!(
+            pair.pool_indices.contains(&pool_index),
+            "candidate capacity pool does not belong to pair"
+        );
+        self.prepared_pools
+            .get(pool_index)
+            .context("candidate capacity pool index is invalid")
+            .map(|prepared| {
+                prepared.as_ref().map(|prepared| {
+                    prepared.quotes.by_direction[direction.cache_index()].specified_capacity()
+                })
+            })
     }
 
     pub fn preflight_exact_input_curves(
@@ -681,8 +729,8 @@ impl OpportunityEngine {
             .map(|prepared| {
                 prepared.as_ref().map(|prepared| {
                     [
-                        prepared.token_a_exact_input.clone(),
-                        prepared.by_direction
+                        prepared.quotes.token_a_exact_input.clone(),
+                        prepared.quotes.by_direction
                             [ArbitrageDirection::BuyTokenBOnCexSellOnDex.cache_index()]
                         .clone(),
                     ]
@@ -723,7 +771,8 @@ impl PreparedPoolBuildRequest {
             self.exact_input_zero_for_one,
             self.token_a_limit,
             self.generation,
-            self.previous_prepared,
+            self.previous_prepared
+                .map(PreparedCurveGenerationHandle::into_quotes),
         )?;
         let build_time_us = started.elapsed().as_micros();
         self.timing.mark_build_finished();
@@ -782,6 +831,24 @@ impl PreparedPoolQuotes {
             .segment_count()
             .saturating_add(self.by_direction[1].segment_count())
             .saturating_add(self.token_a_exact_input.segment_count())
+    }
+}
+
+impl PreparedCurveGenerationHandle {
+    fn new(pool_index: usize, generation: u64, quotes: PreparedPoolQuotes) -> Self {
+        Self {
+            pool_index,
+            generation,
+            quotes: Arc::new(quotes),
+        }
+    }
+
+    fn total_segments(&self) -> usize {
+        self.quotes.total_segments()
+    }
+
+    fn into_quotes(self) -> PreparedPoolQuotes {
+        Arc::try_unwrap(self.quotes).unwrap_or_else(|quotes| (*quotes).clone())
     }
 }
 
@@ -983,10 +1050,14 @@ fn evaluate_direction(
     baseline_token_b: U256,
     direction: ArbitrageDirection,
 ) -> anyhow::Result<DirectionEvaluation> {
-    let mut prepared_pools: Vec<Option<PreparedPoolQuotes>> =
+    let mut prepared_pools: Vec<Option<PreparedCurveGenerationHandle>> =
         (0..dex.pool_count()).map(|_| None).collect();
     for &pool_index in &pair.pool_indices {
-        prepared_pools[pool_index] = Some(prepare_pool_quotes(pair, dex, pool_index, 1)?);
+        prepared_pools[pool_index] = Some(PreparedCurveGenerationHandle::new(
+            pool_index,
+            1,
+            prepare_pool_quotes(pair, dex, pool_index, 1)?,
+        ));
     }
     evaluate_direction_impl(
         pair,
@@ -1001,7 +1072,7 @@ fn evaluate_direction(
 
 fn evaluate_direction_with_cache(
     pair: &PairRuntime,
-    prepared_pools: &[Option<PreparedPoolQuotes>],
+    prepared_pools: &[Option<PreparedCurveGenerationHandle>],
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
@@ -1021,7 +1092,7 @@ fn evaluate_direction_with_cache(
 
 fn evaluate_direction_impl(
     pair: &PairRuntime,
-    prepared_pools: &[Option<PreparedPoolQuotes>],
+    prepared_pools: &[Option<PreparedCurveGenerationHandle>],
     quote: &TopOfBook,
     baseline_token_b: U256,
     direction: ArbitrageDirection,
@@ -1134,7 +1205,7 @@ impl PoolBaselineQuoteCache {
 
 fn evaluate_trade(
     pair: &PairRuntime,
-    prepared_pools: &[Option<PreparedPoolQuotes>],
+    prepared_pools: &[Option<PreparedCurveGenerationHandle>],
     quote: &TopOfBook,
     direction: ArbitrageDirection,
     pool_index: usize,
@@ -1159,7 +1230,7 @@ fn evaluate_trade(
 
 fn apply_dex_execution_bounds(
     pair: &PairRuntime,
-    prepared_pools: &[Option<PreparedPoolQuotes>],
+    prepared_pools: &[Option<PreparedCurveGenerationHandle>],
     direction: ArbitrageDirection,
     pool_index: usize,
     trade: &mut TradeEvaluation,
@@ -1171,6 +1242,7 @@ fn apply_dex_execution_bounds(
                 .and_then(Option::as_ref)
                 .context("prepared DEX pool is unavailable")?;
             let expected_output = prepared
+                .quotes
                 .token_a_exact_input
                 .quote(trade.dex_amount_in)
                 .context("Uniswap exact-input DEX-buy exceeds prepared curve")?;
@@ -1192,7 +1264,7 @@ fn apply_dex_execution_bounds(
 }
 
 fn quote_dex(
-    prepared_pools: &[Option<PreparedPoolQuotes>],
+    prepared_pools: &[Option<PreparedCurveGenerationHandle>],
     direction: ArbitrageDirection,
     pool_index: usize,
     token_b_amount: U256,
@@ -1201,7 +1273,7 @@ fn quote_dex(
         .get(pool_index)
         .and_then(Option::as_ref)
         .context("prepared DEX pool is unavailable")?;
-    let result = prepared.by_direction[direction.cache_index()].quote(token_b_amount);
+    let result = prepared.quotes.by_direction[direction.cache_index()].quote(token_b_amount);
     match result {
         Ok(value) => Ok(DexQuoteOutcome::Available(value)),
         Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => {
@@ -1212,7 +1284,7 @@ fn quote_dex(
 }
 
 fn quote_token_a_exact_input_baseline(
-    prepared_pools: &[Option<PreparedPoolQuotes>],
+    prepared_pools: &[Option<PreparedCurveGenerationHandle>],
     pool_index: usize,
     token_a_amount: U256,
 ) -> anyhow::Result<Option<U256>> {
@@ -1220,7 +1292,7 @@ fn quote_token_a_exact_input_baseline(
         .get(pool_index)
         .and_then(Option::as_ref)
         .context("prepared DEX pool is unavailable")?;
-    match prepared.token_a_exact_input.quote(token_a_amount) {
+    match prepared.quotes.token_a_exact_input.quote(token_a_amount) {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.downcast_ref::<InsufficientLiquidity>().is_some() => Ok(None),
         Err(error) => Err(error),
@@ -1648,7 +1720,9 @@ mod tests {
             pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
             pair_index_by_pool: vec![Some(0)],
             pool_generations: vec![1],
-            prepared_pools: vec![Some(prepared)],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, prepared,
+            ))],
             baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
         };
         let book = quote("1.10", "100", "1.11", "100");
@@ -1698,6 +1772,140 @@ mod tests {
             prepared.exact_input_token_b_limit
         );
         assert_eq!(prepared.token_a_limit, pair.prepared_token_a_limit);
+    }
+
+    #[test]
+    fn opportunity_snapshot_shares_immutable_generation_tagged_curves() {
+        let (pair, mirror) = fixture();
+        let prepared = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut owner = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, prepared,
+            ))],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let worker_snapshot = owner.clone();
+        let owner_handle = owner.prepared_pools[0].as_ref().unwrap();
+        let worker_handle = worker_snapshot.prepared_pools[0].as_ref().unwrap();
+
+        assert_eq!(owner_handle.generation, 1);
+        assert_eq!(owner_handle.pool_index, 0);
+        assert!(Arc::ptr_eq(&owner_handle.quotes, &worker_handle.quotes));
+        assert_eq!(Arc::strong_count(&owner_handle.quotes), 2);
+
+        let request = owner.request_pool_refresh(0, &mirror).unwrap();
+        assert_eq!(request.generation(), 2);
+        assert!(
+            owner
+                .finish_pool_refresh(request.build().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(owner.prepared_pool_generation(0).unwrap(), Some(2));
+        assert_eq!(
+            worker_snapshot.prepared_pool_generation(0).unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn compatibility_and_generation_handle_replay_produce_identical_candidate_bounds() {
+        let (pair, mirror) = fixture();
+        let prepared = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut compatibility = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, prepared,
+            ))],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let mut replay = compatibility.clone();
+        let book = quote("1.10", "100", "1.11", "100");
+
+        let expected = compatibility.evaluate(&book).unwrap().unwrap();
+        let actual = replay.evaluate(&book).unwrap().unwrap();
+
+        assert_eq!(
+            actual.baseline_token_b_amount,
+            expected.baseline_token_b_amount
+        );
+        assert_eq!(
+            actual.dex_buy_cex_sell.baseline,
+            expected.dex_buy_cex_sell.baseline
+        );
+        assert_eq!(
+            actual.cex_buy_dex_sell.baseline,
+            expected.cex_buy_dex_sell.baseline
+        );
+        for trade in [
+            actual.dex_buy_cex_sell.baseline,
+            actual.cex_buy_dex_sell.baseline,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(!trade.dex_amount_in.is_zero());
+            assert!(!trade.dex_amount_out_minimum.is_zero());
+        }
+    }
+
+    #[test]
+    fn saturated_shadow_sizing_snapshots_do_not_mutate_baseline_owner() {
+        let (pair, mirror) = fixture();
+        let prepared = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+        let mut owner = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0)],
+            pool_generations: vec![1],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, prepared,
+            ))],
+            baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+        };
+        let mut expected_owner = owner.clone();
+        let worker_snapshot = owner.clone();
+        let book = quote("1.10", "100", "1.11", "100");
+        let evaluation = worker_snapshot.clone().evaluate(&book).unwrap().unwrap();
+        let generations = worker_snapshot.pool_generations().collect::<Vec<_>>();
+        let expected_sizing = crate::strategy_runtime::evaluate_shadow_sizing(
+            &worker_snapshot,
+            &book,
+            evaluation,
+            &generations,
+        )
+        .unwrap();
+
+        for _ in 0..1_000 {
+            assert_eq!(
+                crate::strategy_runtime::evaluate_shadow_sizing(
+                    &worker_snapshot,
+                    &book,
+                    evaluation,
+                    &generations,
+                )
+                .unwrap(),
+                expected_sizing
+            );
+        }
+
+        let actual_baseline = owner.evaluate(&book).unwrap().unwrap();
+        let expected_baseline = expected_owner.evaluate(&book).unwrap().unwrap();
+        assert_eq!(
+            actual_baseline.dex_buy_cex_sell.baseline,
+            expected_baseline.dex_buy_cex_sell.baseline
+        );
+        assert_eq!(
+            actual_baseline.cex_buy_dex_sell.baseline,
+            expected_baseline.cex_buy_dex_sell.baseline
+        );
     }
 
     #[test]
@@ -1820,7 +2028,9 @@ mod tests {
             pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
             pair_index_by_pool: vec![Some(0)],
             pool_generations: vec![1],
-            prepared_pools: vec![Some(initial)],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, initial,
+            ))],
             baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
         };
         assert!(engine.is_ready());
@@ -1855,7 +2065,9 @@ mod tests {
             pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
             pair_index_by_pool: vec![Some(0)],
             pool_generations: vec![1],
-            prepared_pools: vec![Some(initial)],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, initial,
+            ))],
             baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
         };
         let superseded = engine.request_pool_refresh(0, &mirror).unwrap();
@@ -1889,7 +2101,9 @@ mod tests {
                 pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
                 pair_index_by_pool: vec![Some(0)],
                 pool_generations: vec![1],
-                prepared_pools: vec![Some(initial)],
+                prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                    0, 1, initial,
+                ))],
                 baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
             };
             let mut request = engine.request_pool_refresh(0, &mirror).unwrap();
@@ -1919,7 +2133,9 @@ mod tests {
             pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
             pair_index_by_pool: vec![Some(0)],
             pool_generations: vec![1],
-            prepared_pools: vec![Some(initial)],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, initial,
+            ))],
             baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
         };
         let request = engine.request_pool_refresh(0, &mirror).unwrap();
@@ -1955,7 +2171,9 @@ mod tests {
             pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
             pair_index_by_pool: vec![Some(0)],
             pool_generations: vec![1],
-            prepared_pools: vec![Some(initial)],
+            prepared_pools: vec![Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, initial,
+            ))],
             baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
         };
         let book = quote("1.10", "100", "1.11", "100");
@@ -2081,7 +2299,9 @@ mod tests {
 
         let result = super::evaluate_direction_impl(
             &pair,
-            &[Some(prepared)],
+            &[Some(super::PreparedCurveGenerationHandle::new(
+                0, 1, prepared,
+            ))],
             &quote,
             binance_ask_baseline,
             ArbitrageDirection::BuyTokenBOnDexSellOnCex,

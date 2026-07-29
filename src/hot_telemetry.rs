@@ -56,6 +56,7 @@ struct HotEvaluationTelemetry {
     evaluation: PairEvaluation,
     world_chain_block: u64,
     calculation_time_us: u128,
+    calculation_budget_us: u64,
     decision_latency_us: u128,
     trigger: &'static str,
 }
@@ -248,6 +249,7 @@ impl HotTelemetryHandle {
         evaluation: PairEvaluation,
         chain_block: u64,
         calculation_time_us: u128,
+        calculation_budget_us: u64,
         trigger: &'static str,
     ) {
         if self
@@ -257,6 +259,7 @@ impl HotTelemetryHandle {
                 evaluation,
                 world_chain_block: chain_block,
                 calculation_time_us,
+                calculation_budget_us,
                 decision_latency_us: quote.received_at.elapsed().as_micros(),
                 trigger,
             })
@@ -381,6 +384,7 @@ impl HotTelemetryTask {
                         &event.evaluation,
                         event.world_chain_block,
                         event.calculation_time_us,
+                        event.calculation_budget_us,
                         event.decision_latency_us,
                         event.trigger,
                     )?,
@@ -573,12 +577,14 @@ impl HotTelemetryTask {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_evaluation(
         &self,
         quote: &TopOfBook,
         evaluation: &PairEvaluation,
         world_chain_block: u64,
         calculation_time_us: u128,
+        calculation_budget_us: u64,
         decision_latency_us: u128,
         trigger: &'static str,
     ) -> anyhow::Result<()> {
@@ -625,6 +631,9 @@ impl HotTelemetryTask {
                 "baseline_quote_cache_hits": evaluation.baseline_cache_hits,
                 "baseline_quote_cache_misses": evaluation.baseline_cache_misses,
                 "calculation_time_us": calculation_time_us,
+                "calculation_budget_us": calculation_budget_us,
+                "calculation_budget_exceeded":
+                    calculation_time_us > u128::from(calculation_budget_us),
                 "decision_latency_us": decision_latency_us,
                 "evaluation_trigger": trigger,
                 "dependency_fanout_count": 1,
@@ -659,6 +668,9 @@ impl HotTelemetryTask {
                         "binance_buy_fee_bps": pair.binance_buy_fee_bps,
                         "binance_sell_fee_bps": pair.binance_sell_fee_bps,
                         "calculation_time_us": calculation_time_us,
+                        "calculation_budget_us": calculation_budget_us,
+                        "calculation_budget_exceeded":
+                            calculation_time_us > u128::from(calculation_budget_us),
                         "decision_latency_us": decision_latency_us,
                         "evaluation_trigger": trigger,
                         "dependency_fanout_count": 1,

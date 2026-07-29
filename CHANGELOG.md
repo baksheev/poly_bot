@@ -20,6 +20,13 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Add the M4 multi-strategy hot-path owner. The compiled domain now supplies
+  exact symbol/pool dependencies for WLD and ESP; the primary process directly
+  evaluates both strategy-price streams, keeps ESP read-only behind a
+  non-mutating coordinator sink, shares immutable generation-tagged prepared
+  curves with sizing snapshots, and gives each strategy one running plus one
+  latest pending exhaustive-sizing slot. WLD continues through the existing
+  compatibility coordinator and execution path.
 - Introduce the compiled World Chain/Arbitrum `NetworkRuntime` registry with
   reusable clients, canonical block-hash-pinned bounded batches, independently
   backpressured read classes, network-scoped wallet hydration, and a generic

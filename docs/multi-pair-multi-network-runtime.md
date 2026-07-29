@@ -1371,6 +1371,37 @@ network, generation, and read-class queue/provider/decode/publication
 percentiles, completeness, EIP-1898 capability, chunks, and response bytes,
 then runs the unchanged M0 WLD report.
 
+Production record (2026-07-29): the accepted M3 revision is
+`39827f6b01d14e4cd87c1de46ba684eb9df6c2ab` (CI `30468060778`, Deploy GKE
+`30468466425`, immutable image
+`sha256:a274156c1fc3c275de9a4fa26e11e4342baf0bc68102ee9b30244a019861fb23`).
+The sole Pod was `arb-bot-5c78b9b9ff-fx6js`; both containers started at
+`2026-07-29T16:05:09Z`, became Ready without a restart, and the GCE rollback
+owner remained `TERMINATED`. The authoritative half-open cohort
+`[16:05:09Z, 16:22:30Z)` contained two runtime identities, kept Arbitrum
+execution disabled, and completed every pinned startup and wallet batch with
+exact requested/returned counts. The World Chain startup lane hydrated
+1,729 calls in 13 rounds; the Arbitrum collector hydrated 6,940 calls in four
+rounds. Wallet queue p99 remained 2 microseconds while provider p99 reached
+688,278 microseconds, demonstrating that the slow provider/indexing tail did
+not head-of-line block the market-data owner.
+
+The first M3 rollout exposed two real WLD DEX tails and was not accepted. The
+owner was changed to drain newly arrived canonical events between individual
+prepared-pool builds, and the fee-500 builder was then fused so its sparse
+106-segment exact-input traversal reuses the exact-output capacity traversal
+instead of walking the same words twice. In the accepted cohort, the fee-500
+pool had 114 complete builds: build p95/p99/max was 139/155/159 microseconds
+and total publication p95/p99/max was 148/160/168 microseconds. Its
+receive-to-owner cohort had 124 observations at p95/p99/max 43/80/129
+microseconds. WLD had 3,499 strategy frames with JSON parse p99 9
+microseconds, socket-to-decision p99 45 microseconds, depth apply p99 21
+microseconds, and zero hot-telemetry drops. CPU max was 0.01396 core; cgroup
+memory peak was 48.0 MB; throttling, memory high/max/OOM, container restarts,
+and production `ERROR` records were all zero. M3 therefore passes the frozen
+WLD compatibility and the 175-microsecond DEX receive /
+200-microsecond prepared-publication hard gates.
+
 ### M4 — Multi-pair hot-path decision owner
 
 Deliver:
@@ -1398,6 +1429,40 @@ Exit criteria:
 Rollback:
 
 - switch WLD to the existing single-pair hot-path adapter.
+
+The compiled graph now emits an immutable hot-path plan for every observed
+strategy. `CompiledStrategyDependencyIndex` is the only `symbol -> strategy`
+and `pool -> strategy` routing source; an unrelated event has no evaluator to
+call. `HotPathDecisionOwner` is not a Tokio task and owns no input channel. The
+task polling the combined authenticated Binance shard calls its synchronous
+`StrategyEvaluator` implementations directly. A single-route event is moved
+into its evaluator without even an `Arc` clone; cloning is reserved for the
+future case where multiple strategies intentionally share one dependency.
+
+The existing `TradingEngine` is the executable WLD compatibility evaluator and
+retains the complete reviewed coordinator, reservations, journals, preflight,
+and recovery path. The ESP evaluator is constructed without order, signer,
+wallet mutation, reservation, nonce, or coordinator command handles. It owns
+the Arbitrum mirror hydrated through the shared `NetworkRuntime`, publishes
+baseline and exhaustive candidates only to
+`TelemetryCoordinatorShadowSink`, and records
+`external_mutation_authorized=false`.
+
+Prepared curves are installed as immutable generation-tagged `Arc` handles.
+The owner borrows them for baseline calculations; only a snapshot crossing to
+a blocking sizing worker clones the handles. A rebuild reuses the old
+allocation when uniquely owned and falls back to a deep copy only when an
+in-flight worker still retains the old generation. WLD and ESP each have an
+independent `LatestOnlySizingSlots`: one running snapshot and one replaceable
+latest snapshot, with no unbounded queue. Results compare both Binance
+connection/update identity and every pool generation before publication, so a
+stale result is deterministically superseded.
+
+Per-strategy hot telemetry includes the 200-microsecond baseline budget and an
+explicit exceeded flag. Worker queue/runtime, superseded outcomes, latest
+replacement overload, and non-mutating sink proofs are reported by
+`scripts/report-m4-hot-path-runtime START_UTC END_UTC`, followed by the
+unchanged WLD M0 regression report.
 
 ### M5 — Portfolio owner and shared capital allocation
 

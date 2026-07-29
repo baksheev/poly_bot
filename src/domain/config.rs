@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LoadedDomainConfig {
     path: PathBuf,
     fingerprint_sha256: String,

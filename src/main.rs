@@ -46,12 +46,12 @@ use arb_bot::{
     domain::{
         compiled::{
             CompatibilityRole, CompiledBinanceRuntimePlan, CompiledGraphSummary,
-            CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan, compile_manifest_to_path,
-            load_compatibility_domain,
+            CompiledHotPathRuntimePlan, CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan,
+            compile_manifest_to_path, load_compatibility_domain,
         },
         config::{DexProvider, LoadedDomainConfig},
     },
-    engine::{BinanceFeeBps, TradingEngine},
+    engine::{AdaptiveSizingJob, AdaptiveSizingTaskResult, BinanceFeeBps, TradingEngine},
     execution_accounting::{CommissionAssetValuation, binance_leg_result},
     hot_telemetry,
     live_execution::{
@@ -71,6 +71,11 @@ use arb_bot::{
         RebalanceRuntimeLimits, RebalanceTracker, route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
+    strategy_runtime::{
+        CompiledStrategyDependencyIndex, HotPathDecisionOwner, LatestOnlySizingSlots,
+        ShadowSizingJob, ShadowSizingTaskResult, ShadowStrategyEvaluator, SizingSubmission,
+        TelemetryCoordinatorShadowSink,
+    },
     telemetry::{
         ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryHandle, TelemetryWriter,
     },
@@ -153,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
             log_compiled_graph(selection.graph_summary.as_ref());
             let binance_runtime = selection.binance_runtime.map(Arc::new);
             let network_runtime = selection.network_runtime;
+            let hot_path_runtime = selection.hot_path_runtime;
             let domain_config = Arc::new(selection.config);
             let bootstrap = BootstrapTiming {
                 process_started_at,
@@ -164,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 domain_config,
                 binance_runtime,
                 network_runtime,
+                hot_path_runtime,
                 bootstrap,
             )
             .await
@@ -1444,6 +1451,7 @@ fn emit_price_collector_evaluation(
             evaluation,
             chain_block,
             started_at.elapsed().as_micros(),
+            200,
             trigger,
         );
     }
@@ -1507,6 +1515,7 @@ async fn run(
     domain_config: Arc<LoadedDomainConfig>,
     compiled_binance_runtime: Option<Arc<CompiledBinanceRuntimePlan>>,
     compiled_network_runtime: Option<CompiledNetworkRuntimePlan>,
+    compiled_hot_path_runtime: Option<CompiledHotPathRuntimePlan>,
     bootstrap: BootstrapTiming,
 ) -> anyhow::Result<()> {
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
@@ -1518,6 +1527,9 @@ async fn run(
         ),
         None => None,
     };
+    let hot_path_dependencies = compiled_hot_path_runtime
+        .map(CompiledStrategyDependencyIndex::new)
+        .transpose()?;
     if let Some(registry) = network_registry.as_ref() {
         let world = registry.get_by_chain_id(WORLD_CHAIN_CHAIN_ID)?;
         ensure!(
@@ -1541,12 +1553,55 @@ async fn run(
             "Arbitrum network runtime must remain read-only in M3"
         );
     }
+    let shadow_strategy_plan = hot_path_dependencies.as_ref().and_then(|dependencies| {
+        dependencies
+            .plan()
+            .strategies
+            .iter()
+            .find(|strategy| strategy.observe && !strategy.execute)
+            .cloned()
+    });
+    if let Some(dependencies) = hot_path_dependencies.as_ref() {
+        ensure!(
+            dependencies
+                .plan()
+                .strategies
+                .iter()
+                .filter(|strategy| strategy.execute)
+                .count()
+                == 1,
+            "M4 production hot path requires exactly one executable compatibility strategy"
+        );
+        ensure!(
+            dependencies
+                .plan()
+                .strategies
+                .iter()
+                .filter(|strategy| strategy.observe && !strategy.execute)
+                .count()
+                == 1,
+            "M4 production hot path requires exactly one non-mutating shadow strategy"
+        );
+    }
+    let (initialized_dex, shadow_initialized_dex) =
+        if let Some(shadow) = shadow_strategy_plan.as_ref() {
+            let (primary, observed) = tokio::try_join!(
+                initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()),
+                initialize_dex(&config, &shadow.domain_config, network_registry.as_ref()),
+            )?;
+            (primary, Some(observed))
+        } else {
+            (
+                initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()).await?,
+                None,
+            )
+        };
     let InitializedDex {
         mirror,
         stream,
         rpc: wallet_rpc,
         timings: dex_timings,
-    } = initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()).await?;
+    } = initialized_dex;
     let initial_wallet_head = mirror.latest_head();
     let (receipt_heads, receipt_head_receiver) = tokio::sync::watch::channel(initial_wallet_head);
     let AlchemyDexStream {
@@ -2055,7 +2110,7 @@ async fn run(
         let (_event_sender, events) = tokio::sync::mpsc::unbounded_channel();
         (None, None, events, None)
     };
-    let (mut engine, hot_telemetry) = TradingEngine::new(
+    let (primary_engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
         mirror,
@@ -2074,8 +2129,57 @@ async fn run(
             sell: binance_sell_fee_bps,
         },
     )?;
+    let dependencies =
+        hot_path_dependencies.context("run requires the compiled M4 hot-path runtime plan")?;
+    let shadow_plan =
+        shadow_strategy_plan.context("compiled M4 hot path has no non-mutating shadow strategy")?;
+    let InitializedDex {
+        mirror: shadow_mirror,
+        stream: shadow_stream,
+        rpc: _shadow_wallet_rpc,
+        timings: _shadow_dex_timings,
+    } = shadow_initialized_dex
+        .context("compiled M4 shadow strategy has no initialized DEX runtime")?;
+    let shadow_opportunities =
+        OpportunityEngine::new(shadow_plan.domain_config.snapshot(), &shadow_mirror)?;
+    let (shadow_hot_telemetry, shadow_hot_telemetry_writer) = hot_telemetry::channel(
+        &config,
+        shadow_opportunities.pairs(),
+        &shadow_mirror,
+        telemetry.clone(),
+    )?;
+    let shadow_pair = shadow_plan
+        .domain_config
+        .snapshot()
+        .pairs
+        .first()
+        .context("compiled M4 shadow strategy has no projected pair")?;
+    let shadow_evaluator = ShadowStrategyEvaluator::new(
+        shadow_plan.strategy_id.clone(),
+        shadow_plan.symbol.clone(),
+        shadow_plan.baseline_budget_us,
+        shadow_pair.strategy.max_transport_silence_ms(),
+        config.dex_head_max_age_ms,
+        shadow_mirror,
+        shadow_opportunities,
+        shadow_hot_telemetry,
+        Box::new(TelemetryCoordinatorShadowSink::new(
+            telemetry.clone(),
+            config.engine_id.clone(),
+        )),
+    );
+    let mut engine = HotPathDecisionOwner::new(
+        primary_engine,
+        vec![Box::new(shadow_evaluator)],
+        dependencies,
+    )?;
+    let AlchemyDexStream {
+        receiver: mut shadow_dex_receiver,
+        task: mut shadow_dex_task,
+    } = shadow_stream;
     engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
+    let shadow_hot_telemetry_task = tokio::spawn(shadow_hot_telemetry_writer.run());
     let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
         tokio::sync::mpsc::channel(4);
     let binance_clock_sync_task = tokio::spawn(run_binance_clock_sync(
@@ -2130,8 +2234,30 @@ async fn run(
     let mut first_ready_emitted = false;
     let mut longest_non_price_handler_us = 0_u128;
     let mut longest_non_price_handler = "none";
-    let mut adaptive_sizing_tasks = tokio::task::JoinSet::new();
-    let mut latest_adaptive_sizing_job = None;
+    let mut adaptive_sizing_tasks: tokio::task::JoinSet<AdaptiveSizingTaskResult> =
+        tokio::task::JoinSet::new();
+    let sizing_strategy_ids = engine
+        .dependencies()
+        .plan()
+        .strategies
+        .iter()
+        .filter(|strategy| strategy.execute)
+        .map(|strategy| strategy.strategy_id.clone())
+        .collect::<Vec<_>>();
+    let mut adaptive_sizing_slots: LatestOnlySizingSlots<AdaptiveSizingJob> =
+        LatestOnlySizingSlots::new(sizing_strategy_ids)?;
+    let mut shadow_sizing_tasks: tokio::task::JoinSet<ShadowSizingTaskResult> =
+        tokio::task::JoinSet::new();
+    let shadow_sizing_strategy_ids = engine
+        .dependencies()
+        .plan()
+        .strategies
+        .iter()
+        .filter(|strategy| strategy.observe && !strategy.execute)
+        .map(|strategy| strategy.strategy_id.clone())
+        .collect::<Vec<_>>();
+    let mut shadow_sizing_slots: LatestOnlySizingSlots<ShadowSizingJob> =
+        LatestOnlySizingSlots::new(shadow_sizing_strategy_ids)?;
     let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
     let network_runtime_ids = network_registry
         .as_ref()
@@ -2142,6 +2268,13 @@ async fn run(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let hot_path_strategy_ids = engine
+        .dependencies()
+        .plan()
+        .strategies
+        .iter()
+        .map(|strategy| strategy.strategy_id.as_str())
+        .collect::<Vec<_>>();
 
     tracing::info!(
         service = %config.service_name,
@@ -2152,6 +2285,13 @@ async fn run(
         domain_config_sha256 = %domain_config.fingerprint_sha256(),
         network_runtime_ids = ?network_runtime_ids,
         network_runtime_count = network_runtime_ids.len(),
+        hot_path_strategy_ids = ?hot_path_strategy_ids,
+        hot_path_strategy_count = hot_path_strategy_ids.len(),
+        hot_path_direct_binance_poll = true,
+        hot_path_dependency_index = "compiled_exact_symbol_pool",
+        hot_path_sizing_policy = "one_running_one_latest_pending_per_strategy",
+        hot_path_shadow_strategy_id = %shadow_plan.strategy_id.as_str(),
+        hot_path_shadow_external_mutation_authorized = false,
         arbitrum_execution_enabled = network_registry
             .as_ref()
             .and_then(|registry| registry.get_by_chain_id(42_161).ok())
@@ -2215,6 +2355,21 @@ async fn run(
         rebalance_execution_mode = %config.rebalance_execution_mode,
         "arbitrage shadow service started with authenticated Binance account state"
     );
+    write_runtime_startup_contract(serde_json::json!({
+        "network_runtime_count": network_runtime_ids.len(),
+        "arbitrum_execution_enabled": network_registry
+            .as_ref()
+            .and_then(|registry| registry.get_by_chain_id(42_161).ok())
+            .is_some_and(|runtime| runtime.execution().mutation_enabled()),
+        "binance_strategy_max_transport_silence_ms":
+            pair.strategy.max_transport_silence_ms(),
+        "hot_path_strategy_count": hot_path_strategy_ids.len(),
+        "hot_path_direct_binance_poll": true,
+        "hot_path_dependency_index": "compiled_exact_symbol_pool",
+        "hot_path_sizing_policy": "one_running_one_latest_pending_per_strategy",
+        "hot_path_shadow_strategy_id": shadow_plan.strategy_id.as_str(),
+        "hot_path_shadow_external_mutation_authorized": false,
+    }))?;
     let runtime_ready_file = mark_runtime_ready()?;
 
     let shutdown = shutdown_signal();
@@ -2269,6 +2424,20 @@ async fn run(
                     handler_duration,
                 );
             }
+            event = shadow_dex_receiver.recv() => {
+                let handler_started_at = Instant::now();
+                let Some(event) = event else {
+                    bail!("Arbitrum shadow DEX stream stopped; process restart will rehydrate state");
+                };
+                let _evaluation =
+                    engine.on_shadow_dex_event(&shadow_plan.strategy_id, event)?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "shadow_dex",
+                    handler_started_at.elapsed(),
+                );
+            }
             scheduled_at = health_tick.tick() => {
                 let loop_lag_us = scheduled_at.elapsed().as_micros();
                 engine.refresh_health();
@@ -2282,10 +2451,11 @@ async fn run(
             },
             event = &mut binance_market_event => {
                 drop(binance_market_event);
-                if market_event_symbol(&event) == pair.binance.symbol {
-                    engine.on_market_event(event, binance_feed.depth_book())?;
+                let event_symbol = market_event_symbol(&event);
+                if engine.dependencies().for_symbol(event_symbol).next().is_some() {
+                    let _summary =
+                        engine.on_market_event(event, binance_feed.depth_book())?;
                 } else {
-                    let event_symbol = market_event_symbol(&event);
                     let (event_kind, generation, parse_time_us, wire_frame_size_bytes) =
                         observed_market_event_fields(&event);
                     engine.record_shared_binance_stream_event(
@@ -2432,6 +2602,7 @@ async fn run(
                 let result = result
                     .context("adaptive sizing worker join set stopped unexpectedly")?
                     .context("adaptive sizing worker panicked")?;
+                let completed_strategy_id = result.strategy_id().clone();
                 let (prepared_dex, _) = build_prepared_pools_interleaved(
                     &mut engine,
                     &mut pending_prepared_pool_builds,
@@ -2443,6 +2614,9 @@ async fn run(
                     engine.evaluate_after_dex_refreshes()?;
                 }
                 engine.on_adaptive_sizing_result(result)?;
+                if let Some(next) = adaptive_sizing_slots.complete(&completed_strategy_id)? {
+                    adaptive_sizing_tasks.spawn_blocking(move || next.run());
+                }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -2450,9 +2624,44 @@ async fn run(
                     handler_started_at.elapsed(),
                 );
             }
+            result = shadow_sizing_tasks.join_next(), if !shadow_sizing_tasks.is_empty() => {
+                let handler_started_at = Instant::now();
+                let result = result
+                    .context("shadow sizing worker join set stopped unexpectedly")?
+                    .context("shadow sizing worker panicked")?;
+                let strategy_id = result.strategy_id().clone();
+                let queue_time_us = result.queue_time_us();
+                let worker_time_us = result.worker_time_us();
+                let disposition = engine.on_shadow_sizing_result(result)?;
+                telemetry.emit(
+                    "strategy_sizing_task",
+                    serde_json::json!({
+                        "engine_id": config.engine_id,
+                        "strategy_id": strategy_id.as_str(),
+                        "work_class": "exhaustive_sizing",
+                        "queue_policy": "one_running_one_latest_pending_per_strategy",
+                        "queue_time_us": queue_time_us,
+                        "worker_time_us": worker_time_us,
+                        "disposition": disposition.as_str(),
+                    }),
+                );
+                if let Some(next) = shadow_sizing_slots.complete(&strategy_id)? {
+                    shadow_sizing_tasks.spawn_blocking(move || next.run());
+                }
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "shadow_sizing_result",
+                    handler_started_at.elapsed(),
+                );
+            }
             result = &mut dex_task => {
                 result.context("Alchemy DEX connector task failed")??;
                 bail!("Alchemy DEX connector stopped; process restart will rehydrate state");
+            }
+            result = &mut shadow_dex_task => {
+                result.context("Arbitrum shadow DEX connector task failed")??;
+                bail!("Arbitrum shadow DEX connector stopped; process restart will rehydrate state");
             }
             result = &mut binance_balance_task => {
                 result.context("Binance balance synchronization task failed")??;
@@ -2468,12 +2677,34 @@ async fn run(
             first_ready_emitted = true;
         }
         for job in engine.take_adaptive_sizing_jobs() {
-            latest_adaptive_sizing_job = Some(job);
+            let strategy_id = job.strategy_id()?;
+            match adaptive_sizing_slots.submit(&strategy_id, job)? {
+                SizingSubmission::Start(job) => {
+                    adaptive_sizing_tasks.spawn_blocking(move || job.run());
+                }
+                SizingSubmission::Pending { replaced } => {
+                    engine.record_adaptive_sizing_overload(
+                        &strategy_id,
+                        replaced,
+                        adaptive_sizing_slots.total_retained_work(),
+                    );
+                }
+            }
         }
-        if adaptive_sizing_tasks.is_empty()
-            && let Some(job) = latest_adaptive_sizing_job.take()
-        {
-            adaptive_sizing_tasks.spawn_blocking(move || job.run());
+        while let Some(job) = engine.take_next_shadow_sizing_job() {
+            let strategy_id = job.strategy_id().clone();
+            match shadow_sizing_slots.submit(&strategy_id, job)? {
+                SizingSubmission::Start(job) => {
+                    shadow_sizing_tasks.spawn_blocking(move || job.run());
+                }
+                SizingSubmission::Pending { replaced } => {
+                    engine.record_adaptive_sizing_overload(
+                        &strategy_id,
+                        replaced,
+                        shadow_sizing_slots.total_retained_work(),
+                    );
+                }
+            }
         }
     }
 
@@ -2491,8 +2722,12 @@ async fn run(
     let _ = binance_clock_sync_task.await;
     dex_task.abort();
     let _ = dex_task.await;
+    shadow_dex_task.abort();
+    let _ = shadow_dex_task.await;
     adaptive_sizing_tasks.abort_all();
     while adaptive_sizing_tasks.join_next().await.is_some() {}
+    shadow_sizing_tasks.abort_all();
+    while shadow_sizing_tasks.join_next().await.is_some() {}
     drop(engine);
     if let Some(task) = paper_trade_task.take() {
         task.await??;
@@ -2501,6 +2736,7 @@ async fn run(
         task.await?;
     }
     hot_telemetry_task.await??;
+    shadow_hot_telemetry_task.await??;
     writer_task.await??;
     if let Some(path) = runtime_ready_file
         && let Err(error) = std::fs::remove_file(&path)
@@ -2647,6 +2883,25 @@ fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
         )
     })?;
     Ok(Some(path))
+}
+
+fn write_runtime_startup_contract(contract: serde_json::Value) -> anyhow::Result<()> {
+    let Some(path) = std::env::var_os("RUNTIME_STARTUP_CONTRACT_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    ensure!(
+        !path.as_os_str().is_empty(),
+        "RUNTIME_STARTUP_CONTRACT_FILE must not be empty"
+    );
+    let encoded =
+        serde_json::to_vec(&contract).context("failed to encode runtime startup contract")?;
+    std::fs::write(&path, encoded).with_context(|| {
+        format!(
+            "failed to write runtime startup contract {}",
+            path.display()
+        )
+    })
 }
 
 fn runtime_ready_marker_path() -> anyhow::Result<Option<PathBuf>> {

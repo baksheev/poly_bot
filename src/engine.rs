@@ -44,11 +44,45 @@ use crate::{
     },
     rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
+    strategy_runtime::{StrategyEvaluation, StrategyEvaluator, measure_strategy_evaluation},
     telemetry::{
         PRIMARY_BINANCE_ACCOUNT_ID, PRIMARY_EVM_WALLET_ID, TelemetryHandle, execution_lane_id,
         instrument_id, network_id, strategy_id, wallet_location_id,
     },
 };
+
+impl StrategyEvaluator for TradingEngine {
+    fn strategy_id(&self) -> crate::domain::compiled::StrategyId {
+        let pair = self
+            .opportunities
+            .pairs()
+            .first()
+            .expect("validated trading engine must contain one compatibility pair");
+        crate::domain::compiled::StrategyId::new(strategy_id(&pair.pair_id))
+            .expect("telemetry strategy id must be a valid compiled id")
+    }
+
+    fn symbol(&self) -> &str {
+        &self
+            .opportunities
+            .pairs()
+            .first()
+            .expect("validated trading engine must contain one compatibility pair")
+            .symbol
+    }
+
+    fn on_market_event(
+        &mut self,
+        event: MarketEvent,
+        depth: Option<&SpotDepthBook>,
+    ) -> anyhow::Result<StrategyEvaluation> {
+        let evaluated = matches!(event, MarketEvent::BinanceTopOfBook(_));
+        measure_strategy_evaluation(200, || {
+            TradingEngine::on_market_event(self, event, depth)?;
+            Ok((evaluated, false))
+        })
+    }
+}
 
 pub struct TradingEngine {
     config: AppConfig,
@@ -114,6 +148,7 @@ const TRADING_INVENTORY_ALERT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 const ADAPTIVE_OPTIMIZER_VERSION: &str = "maximum_slippage_slot_v2";
 const MAX_ADAPTIVE_EXACT_EVALUATIONS: u16 = 128;
+const STRATEGY_BASELINE_CALCULATION_BUDGET_US: u64 = 200;
 
 #[derive(Debug)]
 struct RebalanceSettlementBarrier {
@@ -276,6 +311,7 @@ pub struct AdaptiveSizingJob {
 }
 
 pub struct AdaptiveSizingTaskResult {
+    strategy_id: crate::domain::compiled::StrategyId,
     pending: PendingAdaptiveAdmission,
     limits: AdaptiveSizingRuntimeLimits,
     pool_generations: Vec<(usize, u64)>,
@@ -287,7 +323,18 @@ pub struct AdaptiveSizingTaskResult {
 }
 
 impl AdaptiveSizingJob {
+    pub fn strategy_id(&self) -> anyhow::Result<crate::domain::compiled::StrategyId> {
+        let pair = self
+            .snapshot
+            .opportunities
+            .pair(self.pending.evaluation.pair_index)?;
+        crate::domain::compiled::StrategyId::new(strategy_id(&pair.pair_id))
+    }
+
     pub fn run(self) -> AdaptiveSizingTaskResult {
+        let strategy_id = self
+            .strategy_id()
+            .expect("validated adaptive sizing job must retain its compiled strategy");
         let started_at = Instant::now();
         let result = self.snapshot.evaluate_adaptive_sizing(
             &self.pending.quote,
@@ -296,6 +343,7 @@ impl AdaptiveSizingJob {
             self.pending.evaluation_trigger,
         );
         AdaptiveSizingTaskResult {
+            strategy_id,
             pending: self.pending,
             limits: self.limits,
             pool_generations: self.pool_generations,
@@ -305,6 +353,12 @@ impl AdaptiveSizingJob {
             started_at,
             finished_at: Instant::now(),
         }
+    }
+}
+
+impl AdaptiveSizingTaskResult {
+    pub fn strategy_id(&self) -> &crate::domain::compiled::StrategyId {
+        &self.strategy_id
     }
 }
 
@@ -867,6 +921,26 @@ impl TradingEngine {
 
     pub fn take_adaptive_sizing_jobs(&mut self) -> Vec<AdaptiveSizingJob> {
         std::mem::take(&mut self.pending_adaptive_sizing)
+    }
+
+    pub fn record_adaptive_sizing_overload(
+        &self,
+        strategy_id: &crate::domain::compiled::StrategyId,
+        replaced_pending_snapshot: bool,
+        total_retained_work: usize,
+    ) {
+        self.telemetry.emit(
+            "strategy_calculation_overload",
+            json!({
+                "engine_id": self.config.engine_id,
+                "strategy_id": strategy_id.as_str(),
+                "work_class": "exhaustive_sizing",
+                "policy": "one_running_one_latest_pending_per_strategy",
+                "replaced_pending_snapshot": replaced_pending_snapshot,
+                "total_retained_work": total_retained_work,
+                "unbounded_queue": false,
+            }),
+        );
     }
 
     pub fn on_adaptive_sizing_result(
@@ -1963,6 +2037,7 @@ impl TradingEngine {
                 evaluation,
                 self.dex.latest_head().number,
                 calculation_started.elapsed().as_micros(),
+                STRATEGY_BASELINE_CALCULATION_BUDGET_US,
                 trigger,
             );
             if let Some(admission) = admission {
