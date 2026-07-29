@@ -13,6 +13,7 @@ use tokio::{
 use crate::{
     binance::account::{AccountInformation, BinanceAccountClient},
     chain::rpc::{CanonicalBlock, EthCall, JsonRpcClient, RpcStats},
+    network_runtime::{NetworkReadClass, NetworkReadCoordinator},
     wallet::TokenBalanceRequest,
 };
 
@@ -70,10 +71,13 @@ pub struct WalletBalanceSnapshot {
     pub observed_at: Instant,
     pub request_duration_us: u128,
     pub batch_build_us: u128,
+    pub batch_coordinator_queue_us: u128,
     pub batch_provider_us: u128,
+    pub batch_rpc_decode_us: u128,
     pub batch_decode_us: u128,
     pub batch_chunk_count: usize,
     pub batch_response_bytes: usize,
+    pub batch_complete: bool,
     pub rpc_stats: RpcStats,
 }
 
@@ -99,13 +103,36 @@ pub struct BalanceSync {
     pub wallet_task: JoinHandle<anyhow::Result<()>>,
 }
 
+#[derive(Clone)]
+pub enum WalletReadClient {
+    Direct(JsonRpcClient),
+    Coordinated(NetworkReadCoordinator),
+}
+
+impl WalletReadClient {
+    async fn fetch_snapshot(
+        &self,
+        owner: Address,
+        chain_id: u64,
+        tokens: &[TokenBalanceRequest],
+        block: CanonicalBlock,
+    ) -> anyhow::Result<WalletBalanceSnapshot> {
+        match self {
+            Self::Direct(rpc) => fetch_wallet_snapshot(rpc, owner, chain_id, tokens, block).await,
+            Self::Coordinated(reads) => {
+                fetch_wallet_snapshot_coordinated(reads, owner, chain_id, tokens, block).await
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_balance_sync(
     mut binance: BinanceAccountClient,
     binance_symbols: Vec<String>,
     binance_assets: Vec<Arc<str>>,
     binance_interval: std::time::Duration,
-    wallet_rpc: JsonRpcClient,
+    wallet_reads: WalletReadClient,
     wallet_owner: Address,
     wallet_chain_id: u64,
     wallet_tokens: Vec<TokenBalanceRequest>,
@@ -188,14 +215,9 @@ pub fn spawn_balance_sync(
     let wallet_task = tokio::spawn(async move {
         while wallet_head_receiver.changed().await.is_ok() {
             let head = *wallet_head_receiver.borrow_and_update();
-            let event = match fetch_wallet_snapshot(
-                &wallet_rpc,
-                wallet_owner,
-                wallet_chain_id,
-                &wallet_tokens,
-                head,
-            )
-            .await
+            let event = match wallet_reads
+                .fetch_snapshot(wallet_owner, wallet_chain_id, &wallet_tokens, head)
+                .await
             {
                 Ok(snapshot) => BalanceEvent::Wallet(snapshot),
                 Err(error) => BalanceEvent::Failed {
@@ -307,12 +329,86 @@ pub async fn fetch_wallet_snapshot(
         observed_at: Instant::now(),
         request_duration_us: started.elapsed().as_micros(),
         batch_build_us,
+        batch_coordinator_queue_us: 0,
         batch_provider_us,
+        batch_rpc_decode_us: 0,
         batch_decode_us,
         batch_chunk_count,
         batch_response_bytes,
+        batch_complete: true,
         rpc_stats: rpc.stats(),
     })
+}
+
+pub async fn fetch_wallet_snapshot_coordinated(
+    reads: &NetworkReadCoordinator,
+    owner: Address,
+    chain_id: u64,
+    tokens: &[TokenBalanceRequest],
+    block: CanonicalBlock,
+) -> anyhow::Result<WalletBalanceSnapshot> {
+    ensure!(!tokens.is_empty(), "wallet token set is empty");
+    let started = Instant::now();
+    let build_started = Instant::now();
+    let calls = tokens
+        .iter()
+        .map(|token| EthCall {
+            to: token.contract,
+            data: erc20_balance_of_call(owner),
+        })
+        .collect::<Vec<_>>();
+    let batch_build_us = build_started.elapsed().as_micros();
+    let batch = reads
+        .eth_call_batch(NetworkReadClass::WalletBalance, &calls, block)
+        .await?
+        .require_complete()?;
+    let decode_started = Instant::now();
+    let token_balances = decode_wallet_balances(tokens, batch.outputs)?;
+    let batch_decode_us = decode_started.elapsed().as_micros();
+    Ok(WalletBalanceSnapshot {
+        owner,
+        chain_id,
+        block_number: block.number,
+        block_hash: block.hash,
+        token_balances,
+        observed_at: Instant::now(),
+        request_duration_us: started.elapsed().as_micros(),
+        batch_build_us,
+        batch_coordinator_queue_us: batch.queue_us,
+        batch_provider_us: batch.provider_us,
+        batch_rpc_decode_us: batch.decode_us,
+        batch_decode_us,
+        batch_chunk_count: batch.chunk_count,
+        batch_response_bytes: batch.response_bytes,
+        batch_complete: batch.complete,
+        rpc_stats: reads.rpc().stats(),
+    })
+}
+
+fn decode_wallet_balances(
+    tokens: &[TokenBalanceRequest],
+    encoded_balances: Vec<Vec<u8>>,
+) -> anyhow::Result<Vec<WalletTokenBalance>> {
+    ensure!(
+        encoded_balances.len() == tokens.len(),
+        "wallet token balance response count mismatch"
+    );
+    tokens
+        .iter()
+        .zip(encoded_balances)
+        .map(|(token, encoded)| {
+            ensure!(
+                encoded.len() == 32,
+                "ERC-20 balance result for {} is not one ABI word",
+                token.symbol
+            );
+            Ok(WalletTokenBalance {
+                symbol: Arc::from(token.symbol.as_str()),
+                contract: token.contract,
+                base_units: U256::from_be_slice(&encoded),
+            })
+        })
+        .collect()
 }
 
 fn erc20_balance_of_call(owner: Address) -> Vec<u8> {

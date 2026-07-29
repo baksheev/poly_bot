@@ -534,6 +534,7 @@ pub struct CompatibilitySelection {
     pub config: LoadedDomainConfig,
     pub graph_summary: Option<CompiledGraphSummary>,
     pub binance_runtime: Option<CompiledBinanceRuntimePlan>,
+    pub network_runtime: Option<CompiledNetworkRuntimePlan>,
 }
 
 /// Immutable account-scoped Binance topology consumed by the M2 runtime.
@@ -555,6 +556,44 @@ pub struct CompiledBinanceRuntimePlan {
 pub struct CompiledBinanceStreamShard {
     pub id: String,
     pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledNetworkRuntimePlan {
+    pub networks: Vec<CompiledNetworkPlan>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledNetworkPlan {
+    pub network_id: NetworkId,
+    pub chain_id: u64,
+    pub name: String,
+    pub rpc_url_env: String,
+    pub ws_url_env: String,
+    pub wallet_location_id: WalletLocationId,
+    pub execution_lane_id: ExecutionLaneId,
+    pub pool_ids: Vec<PoolId>,
+    pub assets: Vec<CompiledNetworkAsset>,
+    pub multicall3_address: String,
+    pub gas_policy: CompiledNetworkGasPolicy,
+    pub execution_enabled: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledNetworkAsset {
+    pub venue_asset_id: VenueAssetId,
+    pub symbol: String,
+    pub contract: Option<String>,
+    pub decimals: u8,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CompiledNetworkGasPolicy {
+    WorldChainV12 {
+        fallback_gas_price_wei: u128,
+        includes_l1_fee: bool,
+    },
+    ReadOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -1053,6 +1092,7 @@ impl CompiledDomainGraph {
         Ok(CompatibilitySelection {
             config,
             binance_runtime: Some(self.binance_runtime_plan()?),
+            network_runtime: Some(self.network_runtime_plan(role)?),
             graph_summary: Some(CompiledGraphSummary {
                 bundle_id: self.bundle.bundle_id.clone(),
                 projection_id: projection.id.clone(),
@@ -1195,6 +1235,156 @@ impl CompiledDomainGraph {
             executable_symbols,
         })
     }
+
+    fn network_runtime_plan(
+        &self,
+        role: CompatibilityRole,
+    ) -> anyhow::Result<CompiledNetworkRuntimePlan> {
+        let projection = self
+            .bundle
+            .compatibility_projections
+            .iter()
+            .find(|projection| projection.role == role)
+            .context("compiled network runtime projection is missing")?;
+        let selected_networks: BTreeSet<_> = match role {
+            CompatibilityRole::LiveRuntime => self
+                .bundle
+                .networks
+                .iter()
+                .map(|item| item.id.clone())
+                .collect(),
+            CompatibilityRole::PublicPriceCollector => self
+                .bundle
+                .strategies
+                .iter()
+                .filter(|strategy| projection.pair_ids.contains(&strategy.pair_id))
+                .map(|strategy| strategy.network_id.clone())
+                .collect(),
+        };
+        let strategies_by_id: BTreeMap<_, _> = self
+            .bundle
+            .strategies
+            .iter()
+            .map(|strategy| (strategy.id.clone(), strategy))
+            .collect();
+        let executable_networks: BTreeSet<_> = self
+            .bundle
+            .capabilities
+            .iter()
+            .filter(|capability| capability.execute)
+            .map(|capability| {
+                strategies_by_id
+                    .get(&capability.strategy_id)
+                    .expect("compiled validation checked strategy capability")
+                    .network_id
+                    .clone()
+            })
+            .collect();
+        let mut networks = Vec::new();
+        for network in self
+            .bundle
+            .networks
+            .iter()
+            .filter(|network| selected_networks.contains(&network.id))
+        {
+            let location = self
+                .bundle
+                .wallet_locations
+                .iter()
+                .find(|location| location.network_id == network.id)
+                .with_context(|| {
+                    format!(
+                        "network {} has no compiled wallet location",
+                        network.id.as_str()
+                    )
+                })?;
+            let mut pool_ids = self
+                .bundle
+                .pools
+                .iter()
+                .filter(|pool| pool.network_id == network.id)
+                .map(|pool| pool.id.clone())
+                .collect::<Vec<_>>();
+            pool_ids.sort();
+            pool_ids.dedup();
+            let mut assets = self
+                .bundle
+                .venue_assets
+                .iter()
+                .filter(|asset| asset.network_id.as_ref() == Some(&network.id))
+                .map(|asset| {
+                    Ok(CompiledNetworkAsset {
+                        venue_asset_id: asset.id.clone(),
+                        symbol: asset.symbol.clone(),
+                        contract: asset.contract.clone(),
+                        decimals: asset.decimals.context("network asset lacks decimals")?,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            assets.sort_by(|left, right| left.venue_asset_id.cmp(&right.venue_asset_id));
+
+            let pairs = self
+                .bundle
+                .sources
+                .iter()
+                .flat_map(|source| source.snapshot.pairs.iter())
+                .filter(|pair| pair.chain.chain_id == network.chain_id)
+                .collect::<Vec<_>>();
+            ensure!(
+                !pairs.is_empty(),
+                "compiled network {} has no source pairs",
+                network.id.as_str()
+            );
+            let multicall3_address = pairs[0].chain.multicall3_address.clone();
+            ensure!(
+                pairs.iter().all(|pair| {
+                    pair.chain
+                        .multicall3_address
+                        .eq_ignore_ascii_case(&multicall3_address)
+                }),
+                "network {} has inconsistent Multicall3 addresses",
+                network.id.as_str()
+            );
+            ensure!(
+                multicall3_address
+                    .eq_ignore_ascii_case("0xcA11bde05977b3631167028862bE2a173976CA11"),
+                "network {} does not use the reviewed canonical Multicall3 deployment",
+                network.id.as_str()
+            );
+
+            let execution_enabled = executable_networks.contains(&network.id);
+            let gas_policy = match (network.chain_id, execution_enabled) {
+                (480, true) => CompiledNetworkGasPolicy::WorldChainV12 {
+                    fallback_gas_price_wei: 100_000,
+                    includes_l1_fee: true,
+                },
+                (_, false) => CompiledNetworkGasPolicy::ReadOnly,
+                _ => anyhow::bail!(
+                    "network {} has no reviewed live gas policy",
+                    network.id.as_str()
+                ),
+            };
+            networks.push(CompiledNetworkPlan {
+                network_id: network.id.clone(),
+                chain_id: network.chain_id,
+                name: network.name.clone(),
+                rpc_url_env: network.rpc_url_env.clone(),
+                ws_url_env: network.ws_url_env.clone(),
+                wallet_location_id: location.id.clone(),
+                execution_lane_id: location.execution_lane_id.clone(),
+                pool_ids,
+                assets,
+                multicall3_address: multicall3_address.to_ascii_lowercase(),
+                gas_policy,
+                execution_enabled,
+            });
+        }
+        ensure!(
+            !networks.is_empty(),
+            "compiled network runtime plan is empty"
+        );
+        Ok(CompiledNetworkRuntimePlan { networks })
+    }
 }
 
 pub fn load_compatibility_domain(
@@ -1234,6 +1424,7 @@ pub fn load_compatibility_domain(
             config,
             graph_summary: None,
             binance_runtime: None,
+            network_runtime: None,
         })
     }
 }
@@ -1986,8 +2177,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        CompatibilityRole, CompiledDomainBundle, CompiledDomainGraph, DomainCompilerManifest,
-        PoolLifecycle, compile_domain,
+        CompatibilityRole, CompiledDomainBundle, CompiledDomainGraph, CompiledNetworkGasPolicy,
+        DomainCompilerManifest, PoolLifecycle, compile_domain,
     };
     use crate::domain::config::LoadedDomainConfig;
 
@@ -2136,6 +2327,45 @@ mod tests {
             .unwrap();
         assert_eq!(live.config.snapshot(), original_live.snapshot());
         assert_eq!(collector.config.snapshot(), original_collector.snapshot());
+        let live_networks = live.network_runtime.unwrap();
+        assert_eq!(
+            live_networks
+                .networks
+                .iter()
+                .map(|network| network.chain_id)
+                .collect::<Vec<_>>(),
+            [42_161, 480]
+        );
+        let world = live_networks
+            .networks
+            .iter()
+            .find(|network| network.chain_id == 480)
+            .unwrap();
+        assert!(world.execution_enabled);
+        assert_eq!(
+            world.gas_policy,
+            CompiledNetworkGasPolicy::WorldChainV12 {
+                fallback_gas_price_wei: 100_000,
+                includes_l1_fee: true,
+            }
+        );
+        let arbitrum = live_networks
+            .networks
+            .iter()
+            .find(|network| network.chain_id == 42_161)
+            .unwrap();
+        assert!(!arbitrum.execution_enabled);
+        assert_eq!(arbitrum.gas_policy, CompiledNetworkGasPolicy::ReadOnly);
+        assert_eq!(
+            collector
+                .network_runtime
+                .unwrap()
+                .networks
+                .iter()
+                .map(|network| network.chain_id)
+                .collect::<Vec<_>>(),
+            [42_161]
+        );
         assert_eq!(
             live.config.fingerprint_sha256(),
             collector.config.fingerprint_sha256()

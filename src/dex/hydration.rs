@@ -5,6 +5,7 @@ use crate::{
     chain::rpc::{CanonicalBlock, EthCall, JsonRpcClient},
     dex::{clmm::ClmmPool, pool_id::V4PoolKey},
     domain::config::{DexProvider, DomainSnapshot, PairConfig, UniswapV4PoolConfig},
+    network_runtime::{NetworkReadClass, NetworkReadCoordinator},
 };
 
 const MIN_TICK: i32 = -887_272;
@@ -60,16 +61,51 @@ impl UnavailableReason {
 }
 
 pub struct DexHydrator<'client> {
-    rpc: &'client JsonRpcClient,
+    reader: DexHydrationReader<'client>,
+}
+
+#[derive(Clone, Copy)]
+enum DexHydrationReader<'client> {
+    Direct(&'client JsonRpcClient),
+    Coordinated(&'client NetworkReadCoordinator),
 }
 
 impl<'client> DexHydrator<'client> {
     pub const fn new(rpc: &'client JsonRpcClient) -> Self {
-        Self { rpc }
+        Self {
+            reader: DexHydrationReader::Direct(rpc),
+        }
+    }
+
+    pub const fn new_coordinated(reads: &'client NetworkReadCoordinator) -> Self {
+        Self {
+            reader: DexHydrationReader::Coordinated(reads),
+        }
+    }
+
+    fn rpc(&self) -> &JsonRpcClient {
+        match self.reader {
+            DexHydrationReader::Direct(rpc) => rpc,
+            DexHydrationReader::Coordinated(reads) => reads.rpc(),
+        }
+    }
+
+    async fn read_batch(
+        &self,
+        calls: &[EthCall],
+        block: CanonicalBlock,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        match self.reader {
+            DexHydrationReader::Direct(rpc) => rpc.eth_call_batch(calls, block).await,
+            DexHydrationReader::Coordinated(reads) => Ok(reads
+                .eth_call_batch(NetworkReadClass::StartupPoolHydration, calls, block)
+                .await?
+                .outputs),
+        }
     }
 
     pub async fn hydrate(&self, snapshot: &DomainSnapshot) -> anyhow::Result<HydratedDexState> {
-        let block = self.rpc.latest_block().await?;
+        let block = self.rpc().latest_block().await?;
         self.hydrate_at(snapshot, block).await
     }
 
@@ -135,7 +171,7 @@ impl<'client> DexHydrator<'client> {
                 ),
             })
             .collect();
-        let discovery = self.rpc.eth_call_batch(&discovery_calls, block).await?;
+        let discovery = self.read_batch(&discovery_calls, block).await?;
 
         for (fee_pips, output) in config.fee_tiers.iter().copied().zip(discovery) {
             let address = decode_address(&output, 0)?;
@@ -152,8 +188,7 @@ impl<'client> DexHydrator<'client> {
             }
 
             let head = self
-                .rpc
-                .eth_call_batch(
+                .read_batch(
                     &[
                         EthCall {
                             to: address,
@@ -227,7 +262,7 @@ impl<'client> DexHydrator<'client> {
                 data: encode_call("tickBitmap(int16)", &[word_i32(i32::from(*word))]),
             })
             .collect();
-        let bitmaps = self.rpc.eth_call_batch(&bitmap_calls, block).await?;
+        let bitmaps = self.read_batch(&bitmap_calls, block).await?;
         let initialized = initialized_ticks(&words, &bitmaps, tick_spacing)?;
         let tick_calls: Vec<_> = initialized
             .iter()
@@ -236,7 +271,7 @@ impl<'client> DexHydrator<'client> {
                 data: encode_call("ticks(int24)", &[word_i32(*tick)]),
             })
             .collect();
-        let outputs = self.rpc.eth_call_batch(&tick_calls, block).await?;
+        let outputs = self.read_batch(&tick_calls, block).await?;
         decode_ticks(&initialized, &outputs)
     }
 
@@ -269,8 +304,7 @@ impl<'client> DexHydrator<'client> {
             )?;
             let pool_id = key.pool_id();
             let head = self
-                .rpc
-                .eth_call_batch(
+                .read_batch(
                     &[
                         EthCall {
                             to: state_view,
@@ -358,7 +392,7 @@ impl<'client> DexHydrator<'client> {
                 ),
             })
             .collect();
-        let bitmaps = self.rpc.eth_call_batch(&bitmap_calls, block).await?;
+        let bitmaps = self.read_batch(&bitmap_calls, block).await?;
         let initialized = initialized_ticks(&words, &bitmaps, pool.tick_spacing)?;
         let tick_calls: Vec<_> = initialized
             .iter()
@@ -370,7 +404,7 @@ impl<'client> DexHydrator<'client> {
                 ),
             })
             .collect();
-        let outputs = self.rpc.eth_call_batch(&tick_calls, block).await?;
+        let outputs = self.read_batch(&tick_calls, block).await?;
         decode_ticks(&initialized, &outputs)
     }
 }

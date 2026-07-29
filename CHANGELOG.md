@@ -20,6 +20,11 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Introduce the compiled World Chain/Arbitrum `NetworkRuntime` registry with
+  reusable clients, canonical block-hash-pinned bounded batches, independently
+  backpressured read classes, network-scoped wallet hydration, and a generic
+  execution-owner boundary. World Chain preserves the v12 gas policy and
+  Arbitrum remains read-only.
 - Remove the unusable ESP/USDC Arbitrum V4 2.88% pool from the production
   price shadow after it remained on one tick, could not quote one direction,
   and returned a one-way executable quote far below V3 and Binance. The new

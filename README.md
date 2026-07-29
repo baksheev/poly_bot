@@ -20,6 +20,10 @@ settlement, reservations, rebalancing, or deployment.
   bundle: a directly-polled stream shard carries WLDUSDC and ESPUSDC, one
   account generation hydrates all Spot assets and per-symbol metadata, and the
   capability boundary continues to reject ESP order placement.
+- The same live projection derives one reusable `NetworkRuntime` for World
+  Chain and one for Arbitrum. Startup pool and wallet reads are canonical
+  block-hash-pinned and priority-isolated; only World Chain has a reviewed
+  mutation/gas policy, while Arbitrum remains read-only.
 - The stopped `arb-bot-rust-shadow-gce` VM is a rollback target only. It must
   never run while the GKE Deployment has a nonzero replica count.
 - Rails runs independently with separate mutable state. Rust never reads Rails

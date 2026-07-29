@@ -113,6 +113,51 @@ pub fn v4_exact_input_single(
     Ok(encoded)
 }
 
+pub fn v4_quote_exact_input_single(
+    pool_key: V4PoolKey,
+    zero_for_one: bool,
+    amount_in: U256,
+) -> anyhow::Result<Vec<u8>> {
+    ensure!(!amount_in.is_zero(), "Uniswap V4 quote input is zero");
+    ensure!(
+        amount_in <= U256::from(u128::MAX),
+        "Uniswap V4 quote input does not fit uint128"
+    );
+    ensure!(
+        pool_key.currency0 < pool_key.currency1,
+        "Uniswap V4 quote currencies are not sorted"
+    );
+
+    // quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes)).
+    // The only top-level tuple is dynamic because hookData is bytes.
+    let mut encoded = selector(
+        "quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))",
+    )
+    .to_vec();
+    push_usize_word(&mut encoded, WORD_BYTES);
+    push_address_word(&mut encoded, pool_key.currency0);
+    push_address_word(&mut encoded, pool_key.currency1);
+    push_u256_word(&mut encoded, U256::from(pool_key.fee_pips));
+    push_signed_i32_word(&mut encoded, pool_key.tick_spacing);
+    push_address_word(&mut encoded, pool_key.hooks);
+    push_bool_word(&mut encoded, zero_for_one);
+    push_u256_word(&mut encoded, amount_in);
+    push_usize_word(&mut encoded, 8 * WORD_BYTES);
+    encoded.extend_from_slice(&encode_bytes(&[]));
+    Ok(encoded)
+}
+
+pub fn decode_v4_quote_exact_input_single(encoded: &[u8]) -> anyhow::Result<(U256, U256)> {
+    ensure!(
+        encoded.len() >= 2 * WORD_BYTES,
+        "Uniswap V4 quote result is truncated"
+    );
+    Ok((
+        U256::from_be_slice(&encoded[..WORD_BYTES]),
+        U256::from_be_slice(&encoded[WORD_BYTES..2 * WORD_BYTES]),
+    ))
+}
+
 pub fn permit2_allowance(
     owner: Address,
     token: Address,

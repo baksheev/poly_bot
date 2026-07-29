@@ -92,6 +92,18 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOYMENT.contains("name: esp-market-data"));
     assert!(DEPLOYMENT.contains("exec arb_bot collect-prices"));
     assert!(DEPLOYMENT.contains("secretProviderClass: arb-bot-esp-market-data"));
+    assert_eq!(
+        DEPLOYMENT
+            .matches("export ARBITRUM_RPC_URL=\"https://arb-mainnet.g.alchemy.com/v2/")
+            .count(),
+        2
+    );
+    assert_eq!(
+        DEPLOYMENT
+            .matches("export ARBITRUM_WS_URL=\"wss://arb-mainnet.g.alchemy.com/v2/")
+            .count(),
+        2
+    );
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
     assert!(DEPLOY_WORKFLOW.contains("arb-bot-shadow-usdc-esp-arbitrum-v2-public-v3-prices"));

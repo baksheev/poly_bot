@@ -1295,6 +1295,24 @@ identities and reject duplicate placement after recovery.
 generation, both hydrated symbols, shard/capability/asset registries, direct
 ESP parse latency, then runs the unchanged M0 report for WLD regression gates.
 
+#### M2 production record
+
+The final M2 revision
+`edb650e0758eac9703997d1618743c1ca9728898` was deployed on 2026-07-29 as
+immutable image
+`sha256:3114902609de10be7cd60e14f771c5e6c7cb0a3694f1cbdec0a6d05a8aac9762`.
+The live process hydrated one account generation with `ESPUSDC` and `WLDUSDC`,
+four Spot assets, seven explicit owners, and WLD as the sole executable
+instrument. During the initial half-open cohort, 653 ESP observer frames
+crossed the fixed-size non-mutating record boundary with queue p95/p99/max
+30/172/249 microseconds and zero drops. The contemporaneous WLD sample had
+150 frames, parse p99 8 microseconds, and socket-to-decision p99 54
+microseconds. Fee-500 prepared-curve p99/max was 176 microseconds. CPU p99 was
+0.00918 core, cgroup peak memory was 44.4 MB, and throttling, memory pressure,
+OOM, restarts, and production ERROR count were all zero. This is the reviewed
+M2 deployment regression cohort, not a replacement for the formal large-sample
+M0 gate.
+
 ### M3 — Network runtime registry and batched hydration
 
 Deliver:
@@ -1328,6 +1346,30 @@ Rollback:
 
 - use the World Chain compatibility runtime and the existing standalone ESP
   collector.
+
+Implementation derives one typed runtime plan per compiled network. The live
+projection starts World Chain and Arbitrum concurrently; the public collector
+starts only Arbitrum. Each runtime owns one reusable HTTP client pool, its WSS
+endpoint, initial canonical head, deduplicated pool and asset registries,
+wallet location, execution lane, provider capability profile, and five
+independently bounded read lanes. Startup pool and ERC-20 wallet reads use
+EIP-1898 block-hash pinning and bounded JSON-RPC batches. A mismatched response
+count cannot publish a wallet snapshot or ready pool generation.
+
+The generic `EvmExecutionOwner` requires matching chain and execution-lane
+identities. World Chain alone receives the reviewed v12 policy with the
+100,000-wei fallback and L1 fee accounting; Arbitrum receives `ReadOnly`, and
+any other executable network fails compilation. The compatibility hot owner
+continues to use local V3/V4 CLMM curves only. The captured World Chain fixture
+proves individual and batched reads are byte-identical at block hash
+`0x8a5e…7a90`; the explicit archival-RPC integration gate proves both hookless
+World Chain V4 fee tiers match the V4 Quoter with exact integer output at one
+pinned head.
+
+`scripts/report-m3-network-runtime START_UTC END_UTC` reports exact-engine,
+network, generation, and read-class queue/provider/decode/publication
+percentiles, completeness, EIP-1898 capability, chunks, and response bytes,
+then runs the unchanged M0 WLD report.
 
 ### M4 — Multi-pair hot-path decision owner
 

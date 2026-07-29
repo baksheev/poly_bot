@@ -408,10 +408,13 @@ mod tests {
                 observed_at,
                 request_duration_us: 1,
                 batch_build_us: 0,
+                batch_coordinator_queue_us: 0,
                 batch_provider_us: 1,
+                batch_rpc_decode_us: 0,
                 batch_decode_us: 0,
                 batch_chunk_count: 1,
                 batch_response_bytes: 64,
+                batch_complete: true,
                 rpc_stats: RpcStats {
                     http_requests: 1,
                     eth_calls: 2,

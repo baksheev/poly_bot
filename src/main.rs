@@ -17,7 +17,8 @@ use arb_bot::{
         paper_trade_channel,
     },
     balances::{
-        BalanceEvent, BalanceSync, binance_snapshot, fetch_wallet_snapshot, spawn_balance_sync,
+        BalanceEvent, BalanceSync, WalletBalanceSnapshot, WalletReadClient, binance_snapshot,
+        fetch_wallet_snapshot, fetch_wallet_snapshot_coordinated, spawn_balance_sync,
     },
     binance::account::{BinanceAccountClient, BinanceAccountState, BinanceClockSync},
     binance::capital::{
@@ -45,7 +46,8 @@ use arb_bot::{
     domain::{
         compiled::{
             CompatibilityRole, CompiledBinanceRuntimePlan, CompiledGraphSummary,
-            compile_manifest_to_path, load_compatibility_domain,
+            CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan, compile_manifest_to_path,
+            load_compatibility_domain,
         },
         config::{DexProvider, LoadedDomainConfig},
     },
@@ -60,6 +62,7 @@ use arb_bot::{
         alchemy::{AlchemyDexStream, connect_dex_stream},
         binance::BookTickerFeed,
     },
+    network_runtime::NetworkRuntimeRegistry,
     opportunity::{
         ArbitrageDirection, OpportunityEngine, PreparedPoolBuildBatch, PreparedPoolBuildRequest,
     },
@@ -77,6 +80,7 @@ use arb_bot::{
     },
 };
 use clap::Parser;
+use futures_util::future::try_join_all;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use tokio::time::MissedTickBehavior;
@@ -148,13 +152,21 @@ async fn main() -> anyhow::Result<()> {
             )?;
             log_compiled_graph(selection.graph_summary.as_ref());
             let binance_runtime = selection.binance_runtime.map(Arc::new);
+            let network_runtime = selection.network_runtime;
             let domain_config = Arc::new(selection.config);
             let bootstrap = BootstrapTiming {
                 process_started_at,
                 domain_validation_complete_at: Instant::now(),
                 domain_load_us: domain_validation_started_at.elapsed().as_micros(),
             };
-            run(cli.config, domain_config, binance_runtime, bootstrap).await
+            run(
+                cli.config,
+                domain_config,
+                binance_runtime,
+                network_runtime,
+                bootstrap,
+            )
+            .await
         }
         Command::CollectPrices => {
             let selection = load_compatibility_domain(
@@ -163,8 +175,9 @@ async fn main() -> anyhow::Result<()> {
                 true,
             )?;
             log_compiled_graph(selection.graph_summary.as_ref());
+            let network_runtime = selection.network_runtime;
             let domain_config = Arc::new(selection.config);
-            collect_prices(cli.config, domain_config).await
+            collect_prices(cli.config, domain_config, network_runtime).await
         }
         Command::Migrate => TelemetryWriter::new(&cli.config).migrate().await,
         Command::Check => {
@@ -922,6 +935,7 @@ async fn hydrate(domain_config: &LoadedDomainConfig) -> anyhow::Result<()> {
 async fn collect_prices(
     config: config::AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
+    compiled_network_runtime: Option<CompiledNetworkRuntimePlan>,
 ) -> anyhow::Result<()> {
     ensure!(
         !domain_config.snapshot().live_trading_enabled
@@ -949,19 +963,26 @@ async fn collect_prices(
         .find(|pair| pair.market_data_enabled)
         .context("collect-prices requires one enabled pair")?;
 
+    let (telemetry, writer) = TelemetryWriter::new(&config).channel();
+    let writer_task = tokio::spawn(writer.run());
+    let network_registry = match compiled_network_runtime {
+        Some(plan) => Some(
+            NetworkRuntimeRegistry::connect(plan, telemetry.clone(), config.engine_id.clone())
+                .await?,
+        ),
+        None => None,
+    };
     let InitializedDex {
         mut mirror,
         stream,
         rpc: wallet_rpc,
         timings: _,
-    } = initialize_dex(&config, domain_config.as_ref()).await?;
+    } = initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()).await?;
     let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &mirror)?;
-    let (telemetry, writer) = TelemetryWriter::new(&config).channel();
-    let writer_task = tokio::spawn(writer.run());
     let balance_telemetry = telemetry.clone();
     let pool_quote_telemetry = telemetry.clone();
     let (hot_telemetry, hot_telemetry_task) =
-        hot_telemetry::channel(&config, opportunities.pairs(), &mirror, telemetry)?;
+        hot_telemetry::channel(&config, opportunities.pairs(), &mirror, telemetry.clone())?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry_task.run());
 
     let AlchemyDexStream {
@@ -995,6 +1016,10 @@ async fn collect_prices(
                 .context("configured token_b address is invalid")?,
         },
     ];
+    if let Some(registry) = network_registry.as_ref() {
+        hydrate_network_wallet_registries(registry, wallet_owner, &telemetry, &config.engine_id)
+            .await?;
+    }
     let (balance_heads, balance_head_receiver) = tokio::sync::watch::channel(mirror.latest_head());
     let balance_context = CollectorBalanceContext {
         telemetry: balance_telemetry,
@@ -1481,22 +1506,53 @@ async fn run(
     config: config::AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
     compiled_binance_runtime: Option<Arc<CompiledBinanceRuntimePlan>>,
+    compiled_network_runtime: Option<CompiledNetworkRuntimePlan>,
     bootstrap: BootstrapTiming,
 ) -> anyhow::Result<()> {
+    let (telemetry, writer) = TelemetryWriter::new(&config).channel();
+    let writer_task = tokio::spawn(writer.run());
+    let network_registry = match compiled_network_runtime {
+        Some(plan) => Some(
+            NetworkRuntimeRegistry::connect(plan, telemetry.clone(), config.engine_id.clone())
+                .await?,
+        ),
+        None => None,
+    };
+    if let Some(registry) = network_registry.as_ref() {
+        let world = registry.get_by_chain_id(WORLD_CHAIN_CHAIN_ID)?;
+        ensure!(
+            world.execution().mutation_enabled()
+                && matches!(
+                    world.execution().gas_policy(),
+                    CompiledNetworkGasPolicy::WorldChainV12 {
+                        fallback_gas_price_wei: 100_000,
+                        includes_l1_fee: true,
+                    }
+                ),
+            "World Chain network runtime does not preserve reviewed v12 execution gas policy"
+        );
+        let arbitrum = registry.get_by_chain_id(42_161)?;
+        ensure!(
+            !arbitrum.execution().mutation_enabled()
+                && matches!(
+                    arbitrum.execution().gas_policy(),
+                    CompiledNetworkGasPolicy::ReadOnly
+                ),
+            "Arbitrum network runtime must remain read-only in M3"
+        );
+    }
     let InitializedDex {
         mirror,
         stream,
         rpc: wallet_rpc,
         timings: dex_timings,
-    } = initialize_dex(&config, domain_config.as_ref()).await?;
+    } = initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()).await?;
     let initial_wallet_head = mirror.latest_head();
     let (receipt_heads, receipt_head_receiver) = tokio::sync::watch::channel(initial_wallet_head);
     let AlchemyDexStream {
         receiver: mut dex_receiver,
         task: mut dex_task,
     } = stream;
-    let (telemetry, writer) = TelemetryWriter::new(&config).channel();
-    let writer_task = tokio::spawn(writer.run());
     emit_bootstrap_telemetry(
         &telemetry,
         &config,
@@ -1679,6 +1735,10 @@ async fn run(
                 .context("configured token_b address is invalid")?,
         },
     ];
+    if let Some(registry) = network_registry.as_ref() {
+        hydrate_network_wallet_registries(registry, wallet_owner, &telemetry, &config.engine_id)
+            .await?;
+    }
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -1701,14 +1761,37 @@ async fn run(
         .iter()
         .map(|asset| Arc::<str>::from(asset.as_str()))
         .collect();
-    let initial_wallet_balances = fetch_wallet_snapshot(
-        &wallet_rpc,
-        wallet_owner,
-        wallet_chain_id,
-        &wallet_tokens,
-        initial_wallet_head,
-    )
-    .await?;
+    let wallet_reads = network_registry
+        .as_ref()
+        .map(|registry| {
+            registry
+                .get_by_chain_id(wallet_chain_id)
+                .map(|runtime| WalletReadClient::Coordinated(runtime.reads().clone()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| WalletReadClient::Direct(wallet_rpc.clone()));
+    let initial_wallet_balances = match &wallet_reads {
+        WalletReadClient::Direct(rpc) => {
+            fetch_wallet_snapshot(
+                rpc,
+                wallet_owner,
+                wallet_chain_id,
+                &wallet_tokens,
+                initial_wallet_head,
+            )
+            .await?
+        }
+        WalletReadClient::Coordinated(reads) => {
+            fetch_wallet_snapshot_coordinated(
+                reads,
+                wallet_owner,
+                wallet_chain_id,
+                &wallet_tokens,
+                initial_wallet_head,
+            )
+            .await?
+        }
+    };
     let (mut full_rebalance_executor, rebalance_recovery_operation) = if config
         .rebalance_execution_mode
         == "full_live"
@@ -1937,7 +2020,7 @@ async fn run(
         binance_symbols.clone(),
         binance_assets,
         Duration::from_millis(config.balance_sync_interval_ms),
-        wallet_rpc.clone(),
+        wallet_reads,
         wallet_owner,
         wallet_chain_id,
         wallet_tokens,
@@ -2050,6 +2133,15 @@ async fn run(
     let mut adaptive_sizing_tasks = tokio::task::JoinSet::new();
     let mut latest_adaptive_sizing_job = None;
     let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
+    let network_runtime_ids = network_registry
+        .as_ref()
+        .map(|registry| {
+            registry
+                .runtimes()
+                .map(|runtime| runtime.plan().network_id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     tracing::info!(
         service = %config.service_name,
@@ -2058,6 +2150,12 @@ async fn run(
         gcp_region = %config.gcp_region,
         domain_snapshot_id = %domain_config.snapshot().snapshot_id,
         domain_config_sha256 = %domain_config.fingerprint_sha256(),
+        network_runtime_ids = ?network_runtime_ids,
+        network_runtime_count = network_runtime_ids.len(),
+        arbitrum_execution_enabled = network_registry
+            .as_ref()
+            .and_then(|registry| registry.get_by_chain_id(42_161).ok())
+            .is_some_and(|runtime| runtime.execution().mutation_enabled()),
         binance_symbols = ?binance_symbols,
         binance_account_snapshot_generation = binance_account_generation,
         binance_account_snapshot_duration_us,
@@ -2778,6 +2876,80 @@ struct BootstrapTiming {
     domain_load_us: u128,
 }
 
+async fn hydrate_network_wallet_registries(
+    registry: &NetworkRuntimeRegistry,
+    owner: Address,
+    telemetry: &TelemetryHandle,
+    engine_id: &str,
+) -> anyhow::Result<()> {
+    let snapshots = try_join_all(registry.runtimes().map(|runtime| async move {
+        let tokens = runtime
+            .plan()
+            .assets
+            .iter()
+            .filter_map(|asset| {
+                asset.contract.as_ref().map(|contract| {
+                    Ok(TokenBalanceRequest {
+                        symbol: asset.symbol.clone(),
+                        contract: contract.parse::<Address>().with_context(|| {
+                            format!(
+                                "network {} asset {} has invalid contract",
+                                runtime.plan().network_id.as_str(),
+                                asset.venue_asset_id.as_str()
+                            )
+                        })?,
+                    })
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(
+            !tokens.is_empty(),
+            "network {} has no configured ERC-20 wallet assets",
+            runtime.plan().network_id.as_str()
+        );
+        let snapshot = fetch_wallet_snapshot_coordinated(
+            runtime.reads(),
+            owner,
+            runtime.plan().chain_id,
+            &tokens,
+            runtime.initial_head(),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((runtime, snapshot))
+    }))
+    .await?;
+    for (runtime, snapshot) in snapshots {
+        emit_network_wallet_hydrated(telemetry, engine_id, runtime, &snapshot);
+    }
+    Ok(())
+}
+
+fn emit_network_wallet_hydrated(
+    telemetry: &TelemetryHandle,
+    engine_id: &str,
+    runtime: &arb_bot::network_runtime::NetworkRuntime,
+    snapshot: &WalletBalanceSnapshot,
+) {
+    telemetry.emit(
+        "network_wallet_hydrated",
+        serde_json::json!({
+            "engine_id": engine_id,
+            "network_id": runtime.plan().network_id.as_str(),
+            "chain_id": snapshot.chain_id,
+            "block_number": snapshot.block_number,
+            "block_hash": format!("{:#x}", snapshot.block_hash),
+            "asset_count": snapshot.token_balances.len(),
+            "batch_complete": snapshot.batch_complete,
+            "batch_coordinator_queue_us": snapshot.batch_coordinator_queue_us,
+            "batch_provider_us": snapshot.batch_provider_us,
+            "batch_rpc_decode_us": snapshot.batch_rpc_decode_us,
+            "batch_decode_us": snapshot.batch_decode_us,
+            "batch_chunk_count": snapshot.batch_chunk_count,
+            "batch_response_bytes": snapshot.batch_response_bytes,
+        }),
+    );
+}
+
 #[derive(Clone, Copy)]
 struct DexInitializationTimings {
     total_us: u128,
@@ -2795,17 +2967,46 @@ struct DexInitializationTimings {
 async fn initialize_dex(
     config: &config::AppConfig,
     domain_config: &LoadedDomainConfig,
+    network_registry: Option<&NetworkRuntimeRegistry>,
 ) -> anyhow::Result<InitializedDex> {
     let total_started_at = Instant::now();
-    let (rpc_endpoint, ws_endpoint) = chain_endpoints(domain_config)?;
-    let rpc = JsonRpcClient::new(rpc_endpoint)?;
+    let chain_id = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.market_data_enabled)
+        .context("no enabled pair network")?
+        .chain
+        .chain_id;
+    let runtime = network_registry
+        .map(|registry| registry.get_by_chain_id(chain_id))
+        .transpose()?;
+    let (rpc, ws_endpoint) = match runtime {
+        Some(runtime) => (runtime.rpc().clone(), runtime.ws_endpoint().to_owned()),
+        None => {
+            let (rpc_endpoint, ws_endpoint) = chain_endpoints(domain_config)?;
+            (JsonRpcClient::new(rpc_endpoint)?, ws_endpoint)
+        }
+    };
     let canonical_block_started_at = Instant::now();
-    let hydration_block = rpc.latest_block().await?;
+    let hydration_block = match runtime {
+        Some(runtime) => runtime.initial_head(),
+        None => rpc.latest_block().await?,
+    };
     let canonical_block_selection_us = canonical_block_started_at.elapsed().as_micros();
     let hydration_started_at = Instant::now();
-    let hydrated = DexHydrator::new(&rpc)
-        .hydrate_at(domain_config.snapshot(), hydration_block)
-        .await?;
+    let hydrated = match runtime {
+        Some(runtime) => {
+            DexHydrator::new_coordinated(runtime.reads())
+                .hydrate_at(domain_config.snapshot(), hydration_block)
+                .await?
+        }
+        None => {
+            DexHydrator::new(&rpc)
+                .hydrate_at(domain_config.snapshot(), hydration_block)
+                .await?
+        }
+    };
     let hydration_us = hydration_started_at.elapsed().as_micros();
     let hydration_block = hydrated.block;
     let filter_build_started_at = Instant::now();

@@ -38,6 +38,15 @@ pub struct EthCall {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub struct EthCallBatchResult {
+    pub outputs: Vec<Vec<u8>>,
+    pub provider_us: u128,
+    pub decode_us: u128,
+    pub chunk_count: usize,
+    pub response_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionCall {
     pub from: Address,
@@ -605,10 +614,27 @@ impl JsonRpcClient {
         calls: &[EthCall],
         block: CanonicalBlock,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
+        Ok(self
+            .eth_call_batch_bounded(calls, block, self.batch_size)
+            .await?
+            .outputs)
+    }
+
+    pub async fn eth_call_batch_bounded(
+        &self,
+        calls: &[EthCall],
+        block: CanonicalBlock,
+        chunk_size: usize,
+    ) -> anyhow::Result<EthCallBatchResult> {
+        ensure!(chunk_size > 0, "eth_call batch chunk size is zero");
         self.eth_calls
             .fetch_add(calls.len() as u64, Ordering::Relaxed);
         let mut results = Vec::with_capacity(calls.len());
-        for chunk in calls.chunks(self.batch_size) {
+        let mut provider_us = 0_u128;
+        let mut decode_us = 0_u128;
+        let mut chunk_count = 0_usize;
+        for chunk in calls.chunks(chunk_size) {
+            chunk_count += 1;
             let mut requests = Vec::with_capacity(chunk.len());
             let mut ids = Vec::with_capacity(chunk.len());
             for call in chunk {
@@ -625,9 +651,14 @@ impl JsonRpcClient {
             let body = Value::Array(requests);
             let mut attempt = 0;
             let mut by_id = loop {
+                let provider_started = std::time::Instant::now();
                 let values = match self.send_json(body.clone()).await {
-                    Ok(values) => values,
+                    Ok(values) => {
+                        provider_us += provider_started.elapsed().as_micros();
+                        values
+                    }
                     Err(error) if attempt < MAX_RATE_LIMIT_RETRIES => {
+                        provider_us += provider_started.elapsed().as_micros();
                         tracing::warn!(
                             attempt = attempt + 1,
                             error = %error,
@@ -637,8 +668,11 @@ impl JsonRpcClient {
                         attempt += 1;
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        return Err(error);
+                    }
                 };
+                let decode_started = std::time::Instant::now();
                 let responses = values
                     .as_array()
                     .context("JSON-RPC batch response is not an array")?;
@@ -657,22 +691,33 @@ impl JsonRpcClient {
                     );
                 }
                 if rate_limited && attempt < MAX_RATE_LIMIT_RETRIES {
+                    decode_us += decode_started.elapsed().as_micros();
                     self.rate_limit_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(retry_delay(attempt)).await;
                     attempt += 1;
                     continue;
                 }
+                decode_us += decode_started.elapsed().as_micros();
                 break decoded_by_id;
             };
 
+            let decode_started = std::time::Instant::now();
             for id in ids {
                 let response = by_id
                     .remove(&id)
                     .with_context(|| format!("missing JSON-RPC response id {id}"))?;
                 results.push(decode_call_result(response)?);
             }
+            decode_us += decode_started.elapsed().as_micros();
         }
-        Ok(results)
+        let response_bytes = results.iter().map(Vec::len).sum();
+        Ok(EthCallBatchResult {
+            outputs: results,
+            provider_us,
+            decode_us,
+            chunk_count,
+            response_bytes,
+        })
     }
 
     pub async fn get_logs(

@@ -14,6 +14,7 @@ pub mod hot_telemetry;
 pub mod inventory;
 pub mod live_execution;
 pub mod market_data;
+pub mod network_runtime;
 pub mod opportunity;
 pub mod rebalance;
 pub mod state;

@@ -1394,6 +1394,10 @@ impl TradingEngine {
                 );
             }
             BalanceEvent::Wallet(snapshot) => {
+                ensure!(
+                    snapshot.batch_complete,
+                    "partial wallet batch cannot advance inventory readiness"
+                );
                 let batch_queue_us = snapshot.observed_at.elapsed().as_micros();
                 let publication_started_at = Instant::now();
                 let wallet_inventory = snapshot
@@ -1433,11 +1437,14 @@ impl TradingEngine {
                         "request_duration_us": snapshot.request_duration_us,
                         "batch_build_us": snapshot.batch_build_us,
                         "batch_queue_us": batch_queue_us,
+                        "batch_coordinator_queue_us": snapshot.batch_coordinator_queue_us,
                         "batch_provider_us": snapshot.batch_provider_us,
+                        "batch_rpc_decode_us": snapshot.batch_rpc_decode_us,
                         "batch_decode_us": snapshot.batch_decode_us,
                         "batch_publication_us": publication_started_at.elapsed().as_micros(),
                         "batch_chunk_count": snapshot.batch_chunk_count,
                         "batch_response_bytes": snapshot.batch_response_bytes,
+                        "batch_complete": snapshot.batch_complete,
                         "rpc_http_requests": snapshot.rpc_stats.http_requests,
                         "rpc_eth_calls": snapshot.rpc_stats.eth_calls,
                         "rpc_rate_limit_retries": snapshot.rpc_stats.rate_limit_retries,
