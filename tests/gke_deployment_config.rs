@@ -86,6 +86,15 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("hot_path_dependency_index"));
     assert!(MAIN.contains("hot_path_sizing_policy"));
     assert!(MAIN.contains("hot_path_shadow_external_mutation_authorized"));
+    let startup_drain = MAIN
+        .find("drain_startup_dex_backlog(")
+        .expect("startup DEX backlog drain is wired");
+    let readiness = MAIN
+        .find("let runtime_ready_file = mark_runtime_ready()")
+        .expect("runtime readiness is wired");
+    assert!(startup_drain < readiness);
+    assert!(MAIN.contains("backlog_empty_before_ready"));
+    assert!(MAIN.contains("on_startup_dex_event"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl exec"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));

@@ -827,28 +827,45 @@ impl TradingEngine {
         &mut self,
         event: DexStreamEvent,
     ) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
+        self.apply_dex_event(event, true)
+    }
+
+    pub fn on_startup_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+    ) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
+        self.apply_dex_event(event, false)
+    }
+
+    fn apply_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+        emit_hot_path_latency: bool,
+    ) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
         let request = match event {
             DexStreamEvent::Log { log, received_at } => {
                 if let LogApplyResult::Applied { pool_index, kind } = self.dex.apply_log(&log)? {
                     let request = self
                         .opportunities
                         .request_pool_refresh(pool_index, &self.dex)?;
-                    self.hot_telemetry.emit_dex_pool_event(
-                        pool_index,
-                        kind,
-                        log.block_number,
-                        log.transaction_index,
-                        log.log_index,
-                        received_at.elapsed().as_micros(),
-                        request.generation(),
-                    );
+                    if emit_hot_path_latency {
+                        self.hot_telemetry.emit_dex_pool_event(
+                            pool_index,
+                            kind,
+                            log.block_number,
+                            log.transaction_index,
+                            log.log_index,
+                            received_at.elapsed().as_micros(),
+                            request.generation(),
+                        );
+                    }
                     Some(request)
                 } else {
                     None
                 }
             }
             DexStreamEvent::Head { head, received_at } => {
-                if self.dex.apply_head(head, received_at)? {
+                if self.dex.apply_head(head, received_at)? && emit_hot_path_latency {
                     self.hot_telemetry
                         .emit_dex_head(head.number, received_at.elapsed().as_micros());
                 }

@@ -26,7 +26,10 @@ the exact artifact used by each rollout.
   non-mutating coordinator sink, shares immutable generation-tagged prepared
   curves with sizing snapshots, and gives each strategy one running plus one
   latest pending exhaustive-sizing slot. WLD continues through the existing
-  compatibility coordinator and execution path.
+  compatibility coordinator and execution path. DEX events received while the
+  remaining account startup runs are applied and prepared before readiness as
+  a separately measured startup backlog, so they cannot enter the steady-state
+  DEX receive-latency cohort.
 - Introduce the compiled World Chain/Arbitrum `NetworkRuntime` registry with
   reusable clients, canonical block-hash-pinned bounded batches, independently
   backpressured read classes, network-scoped wallet hydration, and a generic

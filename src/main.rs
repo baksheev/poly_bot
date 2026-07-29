@@ -59,7 +59,7 @@ use arb_bot::{
     },
     market_data::{
         MarketEvent,
-        alchemy::{AlchemyDexStream, connect_dex_stream},
+        alchemy::{AlchemyDexStream, DexStreamEvent, connect_dex_stream},
         binance::BookTickerFeed,
     },
     network_runtime::NetworkRuntimeRegistry,
@@ -2259,6 +2259,30 @@ async fn run(
     let mut shadow_sizing_slots: LatestOnlySizingSlots<ShadowSizingJob> =
         LatestOnlySizingSlots::new(shadow_sizing_strategy_ids)?;
     let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
+    let (startup_primary_dex, startup_shadow_dex) = drain_startup_dex_backlog(
+        &mut engine,
+        &shadow_plan.strategy_id,
+        &mut pending_prepared_pool_builds,
+        &mut dex_receiver,
+        &mut shadow_dex_receiver,
+        &wallet_heads,
+        &receipt_heads,
+    )?;
+    if startup_primary_dex.pool_build_count > 0 {
+        engine.evaluate_after_dex_refreshes()?;
+    }
+    telemetry.emit(
+        "startup_dex_backlog_drain",
+        serde_json::json!({
+            "engine_id": config.engine_id,
+            "primary_event_count": startup_primary_dex.event_count,
+            "primary_pool_build_count": startup_primary_dex.pool_build_count,
+            "primary_max_queue_age_us": startup_primary_dex.max_queue_age_us,
+            "shadow_event_count": startup_shadow_dex.event_count,
+            "shadow_max_queue_age_us": startup_shadow_dex.max_queue_age_us,
+            "backlog_empty_before_ready": true,
+        }),
+    );
     let network_runtime_ids = network_registry
         .as_ref()
         .map(|registry| {
@@ -3039,6 +3063,111 @@ fn build_prepared_pool_inline(
     engine.on_prepared_pool(result)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupDexDrainStats {
+    event_count: usize,
+    pool_build_count: usize,
+    max_queue_age_us: u128,
+}
+
+impl StartupDexDrainStats {
+    fn observe(&mut self, event: &DexStreamEvent) {
+        let queue_age_us = match event {
+            DexStreamEvent::Log { received_at, .. } | DexStreamEvent::Head { received_at, .. } => {
+                received_at.elapsed().as_micros()
+            }
+        };
+        self.event_count = self.event_count.saturating_add(1);
+        self.max_queue_age_us = self.max_queue_age_us.max(queue_age_us);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.event_count = self.event_count.saturating_add(other.event_count);
+        self.pool_build_count = self.pool_build_count.saturating_add(other.pool_build_count);
+        self.max_queue_age_us = self.max_queue_age_us.max(other.max_queue_age_us);
+    }
+}
+
+fn drain_startup_dex_backlog(
+    engine: &mut HotPathDecisionOwner<TradingEngine>,
+    shadow_strategy_id: &arb_bot::domain::compiled::StrategyId,
+    pending: &mut PreparedPoolBuildBatch,
+    dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
+    shadow_dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
+    wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+) -> anyhow::Result<(StartupDexDrainStats, StartupDexDrainStats)> {
+    let mut primary_total = StartupDexDrainStats::default();
+    let mut shadow_total = StartupDexDrainStats::default();
+    loop {
+        let primary = drain_startup_primary_dex_backlog(
+            engine,
+            pending,
+            dex_receiver,
+            wallet_heads,
+            receipt_heads,
+        )?;
+        let shadow =
+            drain_startup_shadow_dex_backlog(engine, shadow_strategy_id, shadow_dex_receiver)?;
+        let drained_events = primary.event_count.saturating_add(shadow.event_count);
+        primary_total.merge(primary);
+        shadow_total.merge(shadow);
+        if drained_events == 0 {
+            return Ok((primary_total, shadow_total));
+        }
+    }
+}
+
+fn drain_startup_primary_dex_backlog(
+    engine: &mut TradingEngine,
+    pending: &mut PreparedPoolBuildBatch,
+    dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
+    wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+) -> anyhow::Result<StartupDexDrainStats> {
+    let mut stats = StartupDexDrainStats::default();
+    loop {
+        while let Ok(event) = dex_receiver.try_recv() {
+            stats.observe(&event);
+            let wallet_head = match &event {
+                DexStreamEvent::Head { head, .. } => Some(*head),
+                DexStreamEvent::Log { .. } => None,
+            };
+            if let Some(request) = engine.on_startup_dex_event(event)? {
+                pending.queue(request);
+            }
+            if let Some(head) = wallet_head
+                && *wallet_heads.borrow() != head
+            {
+                wallet_heads.send_replace(head);
+            }
+            if let Some(head) = wallet_head
+                && *receipt_heads.borrow() != head
+            {
+                receipt_heads.send_replace(head);
+            }
+        }
+        let Some(request) = pending.pop_next() else {
+            return Ok(stats);
+        };
+        build_prepared_pool_inline(engine, request)?;
+        stats.pool_build_count = stats.pool_build_count.saturating_add(1);
+    }
+}
+
+fn drain_startup_shadow_dex_backlog(
+    engine: &mut HotPathDecisionOwner<TradingEngine>,
+    shadow_strategy_id: &arb_bot::domain::compiled::StrategyId,
+    shadow_dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
+) -> anyhow::Result<StartupDexDrainStats> {
+    let mut stats = StartupDexDrainStats::default();
+    while let Ok(event) = shadow_dex_receiver.try_recv() {
+        stats.observe(&event);
+        let _evaluation = engine.on_shadow_startup_dex_event(shadow_strategy_id, event)?;
+    }
+    Ok(stats)
+}
+
 fn drain_dex_events_inline(
     engine: &mut TradingEngine,
     pending: &mut PreparedPoolBuildBatch,
@@ -3425,9 +3554,12 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::rebalance_quote_retry_delay;
+    use alloy_primitives::B256;
+    use arb_bot::{chain::rpc::CanonicalBlock, market_data::alchemy::DexStreamEvent};
+
+    use super::{StartupDexDrainStats, rebalance_quote_retry_delay};
 
     #[test]
     fn rebalance_quote_retry_backoff_is_bounded() {
@@ -3437,5 +3569,28 @@ mod tests {
         assert_eq!(rebalance_quote_retry_delay(4), Duration::from_secs(40));
         assert_eq!(rebalance_quote_retry_delay(5), Duration::from_secs(60));
         assert_eq!(rebalance_quote_retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn startup_dex_backlog_has_separate_count_and_queue_age() {
+        let mut first = StartupDexDrainStats::default();
+        first.observe(&DexStreamEvent::Head {
+            head: CanonicalBlock {
+                number: 1,
+                hash: B256::repeat_byte(1),
+                parent_hash: B256::ZERO,
+            },
+            received_at: Instant::now() - Duration::from_millis(2),
+        });
+        first.pool_build_count = 1;
+        let second = StartupDexDrainStats {
+            event_count: 2,
+            pool_build_count: 3,
+            max_queue_age_us: 7_000,
+        };
+        first.merge(second);
+        assert_eq!(first.event_count, 3);
+        assert_eq!(first.pool_build_count, 4);
+        assert!(first.max_queue_age_us >= 7_000);
     }
 }

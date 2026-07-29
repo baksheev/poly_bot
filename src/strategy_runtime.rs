@@ -178,6 +178,13 @@ pub trait StrategyEvaluator {
         )
     }
 
+    fn on_startup_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+    ) -> anyhow::Result<StrategyEvaluation> {
+        self.on_dex_event(event)
+    }
+
     fn take_sizing_job(&mut self) -> Option<ShadowSizingJob> {
         None
     }
@@ -332,6 +339,21 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             .on_dex_event(event)
     }
 
+    pub fn on_shadow_startup_dex_event(
+        &mut self,
+        strategy_id: &StrategyId,
+        event: DexStreamEvent,
+    ) -> anyhow::Result<StrategyEvaluation> {
+        ensure!(
+            strategy_id != &self.primary_strategy_id,
+            "primary DEX events must use the existing compatibility coordinator path"
+        );
+        self.shadows
+            .get_mut(strategy_id)
+            .context("shadow DEX route has no evaluator")?
+            .on_startup_dex_event(event)
+    }
+
     pub fn take_next_shadow_sizing_job(&mut self) -> Option<ShadowSizingJob> {
         self.shadows
             .values_mut()
@@ -466,6 +488,21 @@ impl ShadowStrategyEvaluator {
     }
 
     pub fn on_dex_event(&mut self, event: DexStreamEvent) -> anyhow::Result<StrategyEvaluation> {
+        self.apply_dex_event(event, true)
+    }
+
+    pub fn on_startup_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+    ) -> anyhow::Result<StrategyEvaluation> {
+        self.apply_dex_event(event, false)
+    }
+
+    fn apply_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+        emit_hot_path_latency: bool,
+    ) -> anyhow::Result<StrategyEvaluation> {
         let mut changed = false;
         match event {
             DexStreamEvent::Log { log, received_at } => {
@@ -473,15 +510,17 @@ impl ShadowStrategyEvaluator {
                     let request = self
                         .opportunities
                         .request_pool_refresh(pool_index, &self.mirror)?;
-                    self.hot_telemetry.emit_dex_pool_event(
-                        pool_index,
-                        kind,
-                        log.block_number,
-                        log.transaction_index,
-                        log.log_index,
-                        received_at.elapsed().as_micros(),
-                        request.generation(),
-                    );
+                    if emit_hot_path_latency {
+                        self.hot_telemetry.emit_dex_pool_event(
+                            pool_index,
+                            kind,
+                            log.block_number,
+                            log.transaction_index,
+                            log.log_index,
+                            received_at.elapsed().as_micros(),
+                            request.generation(),
+                        );
+                    }
                     let timing = request.timing_handle();
                     timing.mark_request_dispatch_started();
                     timing.mark_request_dispatch_finished();
@@ -497,7 +536,7 @@ impl ShadowStrategyEvaluator {
                 }
             }
             DexStreamEvent::Head { head, received_at } => {
-                if self.mirror.apply_head(head, received_at)? {
+                if self.mirror.apply_head(head, received_at)? && emit_hot_path_latency {
                     self.hot_telemetry
                         .emit_dex_head(head.number, received_at.elapsed().as_micros());
                 }
@@ -676,6 +715,13 @@ impl StrategyEvaluator for ShadowStrategyEvaluator {
 
     fn on_dex_event(&mut self, event: DexStreamEvent) -> anyhow::Result<StrategyEvaluation> {
         ShadowStrategyEvaluator::on_dex_event(self, event)
+    }
+
+    fn on_startup_dex_event(
+        &mut self,
+        event: DexStreamEvent,
+    ) -> anyhow::Result<StrategyEvaluation> {
+        ShadowStrategyEvaluator::on_startup_dex_event(self, event)
     }
 
     fn take_sizing_job(&mut self) -> Option<ShadowSizingJob> {

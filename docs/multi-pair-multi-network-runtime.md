@@ -1458,6 +1458,15 @@ latest snapshot, with no unbounded queue. Results compare both Binance
 connection/update identity and every pool generation before publication, so a
 stale result is deterministically superseded.
 
+Both DEX subscriptions can begin delivering ordered events while the remaining
+Binance account and journal startup work is still running. Immediately before
+publishing readiness, the owner therefore drains and applies both startup
+backlogs, rebuilds every affected prepared generation, and records their count
+and maximum queue age as `startup_dex_backlog_drain`. Those pre-owner events do
+not enter `dex_event_receive_to_owner` or `head_receive_to_owner`; the latter
+remain steady-state socket-to-owner latency measures. Readiness is published
+only after both receivers have been observed empty.
+
 Per-strategy hot telemetry includes the 200-microsecond baseline budget and an
 explicit exceeded flag. Worker queue/runtime, superseded outcomes, latest
 replacement overload, and non-mutating sink proofs are reported by
