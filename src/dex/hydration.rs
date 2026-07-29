@@ -70,6 +70,14 @@ impl<'client> DexHydrator<'client> {
 
     pub async fn hydrate(&self, snapshot: &DomainSnapshot) -> anyhow::Result<HydratedDexState> {
         let block = self.rpc.latest_block().await?;
+        self.hydrate_at(snapshot, block).await
+    }
+
+    pub async fn hydrate_at(
+        &self,
+        snapshot: &DomainSnapshot,
+        block: CanonicalBlock,
+    ) -> anyhow::Result<HydratedDexState> {
         let mut pools = Vec::new();
         let mut unavailable = Vec::new();
 

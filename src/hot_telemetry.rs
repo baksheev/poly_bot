@@ -14,7 +14,10 @@ use crate::{
         DirectionEvaluation, PairEvaluation, PairRuntime, TradeEvaluation, format_base_units,
     },
     state::{RuntimePhase, TopOfBook},
-    telemetry::TelemetryHandle,
+    telemetry::{
+        PRIMARY_BINANCE_ACCOUNT_ID, TelemetryHandle, instrument_id, network_id, pool_id,
+        strategy_id,
+    },
 };
 
 #[derive(Clone)]
@@ -58,6 +61,9 @@ struct HotTelemetryContext {
 
 struct PairTelemetryContext {
     pair_id: String,
+    strategy_id: String,
+    instrument_id: String,
+    network_id: String,
     chain_id: u64,
     symbol: String,
     token_a_symbol: String,
@@ -74,6 +80,7 @@ struct PairTelemetryContext {
 
 struct PoolTelemetryContext {
     identity: String,
+    pool_id: String,
     fee_pips: u32,
 }
 
@@ -86,8 +93,14 @@ pub fn channel(
     let mut pools = Vec::with_capacity(dex.pool_count());
     for index in 0..dex.pool_count() {
         let pool = dex.pool(index)?;
+        let pair = pairs
+            .iter()
+            .find(|pair| pair.pair_id == pool.pair_id)
+            .context("hot telemetry pool pair is invalid")?;
+        let identity = format!("{:?}", pool.identity);
         pools.push(PoolTelemetryContext {
-            identity: format!("{:?}", pool.identity),
+            pool_id: pool_id(pair.chain_id, &identity),
+            identity,
             fee_pips: pool.pool.fee_pips,
         });
     }
@@ -95,6 +108,9 @@ pub fn channel(
         .iter()
         .map(|pair| PairTelemetryContext {
             pair_id: pair.pair_id.clone(),
+            strategy_id: strategy_id(&pair.pair_id),
+            instrument_id: instrument_id(&pair.symbol),
+            network_id: network_id(pair.chain_id),
             chain_id: pair.chain_id,
             symbol: pair.symbol.clone(),
             token_a_symbol: pair.token_a_symbol.clone(),
@@ -242,6 +258,8 @@ impl HotTelemetryTask {
             "binance_book_ticker",
             json!({
                 "engine_id": self.context.engine_id,
+                "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                "instrument_id": instrument_id(quote.symbol.as_ref()),
                 "product": "spot",
                 "symbol": quote.symbol.as_ref(),
                 "update_id": quote.update_id,
@@ -290,6 +308,10 @@ impl HotTelemetryTask {
             json!({
                 "engine_id": self.context.engine_id,
                 "pair_id": pair.pair_id,
+                "strategy_id": pair.strategy_id,
+                "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                "instrument_id": pair.instrument_id,
+                "network_id": pair.network_id,
                 "chain_id": pair.chain_id,
                 "chain_block": world_chain_block,
                 "symbol": pair.symbol,
@@ -317,6 +339,7 @@ impl HotTelemetryTask {
                 "calculation_time_us": calculation_time_us,
                 "decision_latency_us": decision_latency_us,
                 "evaluation_trigger": trigger,
+                "dependency_fanout_count": 1,
                 "directions": directions,
             }),
         );
@@ -328,6 +351,10 @@ impl HotTelemetryTask {
                     json!({
                         "engine_id": self.context.engine_id,
                         "pair_id": pair.pair_id,
+                        "strategy_id": pair.strategy_id,
+                        "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                        "instrument_id": pair.instrument_id,
+                        "network_id": pair.network_id,
                         "chain_id": pair.chain_id,
                         "chain_block": world_chain_block,
                         "symbol": pair.symbol,
@@ -346,6 +373,7 @@ impl HotTelemetryTask {
                         "calculation_time_us": calculation_time_us,
                         "decision_latency_us": decision_latency_us,
                         "evaluation_trigger": trigger,
+                        "dependency_fanout_count": 1,
                         "baseline_pool_index": trade.pool_index,
                         "baseline_token_b_base_units": trade.token_b_amount.to_string(),
                         "baseline_gross_profit_bps_x100": trade.gross_profit_bps_x100,
@@ -402,6 +430,7 @@ impl HotTelemetryTask {
         };
         Ok(json!({
             "pool_index": trade.pool_index,
+            "pool_id": pool.pool_id,
             "pool_identity": pool.identity,
             "pool_fee_pips": pool.fee_pips,
             "token_b_symbol": pair.token_b_symbol,

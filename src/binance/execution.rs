@@ -41,6 +41,9 @@ pub struct BinanceOrderRequest {
     pub client_order_id: String,
     pub symbol: String,
     pub kind: BinanceOrderRequestKind,
+    /// Optional upstream receipt boundary used only for latency telemetry.
+    /// It is never persisted into the order intent or used for execution.
+    pub latency_origin: Option<Instant>,
 }
 
 impl BinanceOrderRequest {
@@ -191,13 +194,30 @@ impl BinanceExecutor {
         journal_path: PathBuf,
         latency_telemetry: Option<ExecutionLatencyTelemetry>,
     ) -> anyhow::Result<Self> {
+        let journal_started = Instant::now();
         let journal = BinanceOrderJournal::open(journal_path)?;
+        if let Some(telemetry) = &latency_telemetry {
+            telemetry.emit_stage(
+                "binance",
+                "startup",
+                "journal_lock_recovery",
+                duration_us(journal_started.elapsed()),
+                "success",
+            );
+        }
         let mut executor = Self {
             client,
             journal,
             latency_telemetry,
         };
+        let reconciliation_started = Instant::now();
         executor.reconcile_startup().await?;
+        executor.emit_latency_stage(
+            "startup",
+            "journal_external_reconciliation",
+            reconciliation_started,
+            "success",
+        );
         Ok(executor)
     }
 
@@ -261,9 +281,10 @@ impl BinanceExecutor {
         Ok(())
     }
 
-    async fn execute(
+    async fn execute_instrumented(
         &mut self,
         request: BinanceOrderRequest,
+        enqueued_at: Option<Instant>,
     ) -> anyhow::Result<BinanceOrderOutcome> {
         request.validate()?;
         let request_intent = request.intent();
@@ -363,6 +384,22 @@ impl BinanceExecutor {
             },
         );
         journal_intent_result?;
+        if let Some(enqueued_at) = enqueued_at {
+            self.emit_latency_stage(
+                &request.operation_id,
+                "enqueue_to_first_write",
+                enqueued_at,
+                "success",
+            );
+        }
+        if let Some(origin) = request.latency_origin {
+            self.emit_latency_stage(
+                &request.operation_id,
+                "dex_receipt_to_binance_first_write",
+                origin,
+                "success",
+            );
+        }
         let placement_started = Instant::now();
         let result = match &request.kind {
             BinanceOrderRequestKind::MarketBuy { quote_quantity } => {
@@ -752,6 +789,7 @@ fn classify_execution_error(
 struct WorkItem {
     request: BinanceOrderRequest,
     enqueued_at: Instant,
+    queue_depth_before_enqueue: usize,
     response: oneshot::Sender<Result<BinanceOrderOutcome, BinanceExecutionServiceError>>,
 }
 
@@ -825,16 +863,25 @@ impl BinanceExecutionService {
                         work.enqueued_at,
                         "success",
                     );
+                    if let Some(telemetry) = &executor.latency_telemetry {
+                        telemetry.emit_queue_stage(
+                            "binance",
+                            &operation_id,
+                            "worker_queue_depth",
+                            duration_us(work.enqueued_at.elapsed()),
+                            work.queue_depth_before_enqueue,
+                            "success",
+                        );
+                    }
                     let execution_started = Instant::now();
-                    let result =
-                        runtime
-                            .block_on(executor.execute(work.request))
-                            .map_err(|error| {
-                                executor.classify_execution_error(
-                                    &client_order_id,
-                                    format!("{error:#}"),
-                                )
-                            });
+                    let result = runtime
+                        .block_on(
+                            executor.execute_instrumented(work.request, Some(work.enqueued_at)),
+                        )
+                        .map_err(|error| {
+                            executor
+                                .classify_execution_error(&client_order_id, format!("{error:#}"))
+                        });
                     executor.emit_latency_stage(
                         &operation_id,
                         "worker_total",
@@ -875,10 +922,12 @@ impl BinanceExecutionService {
                     reason: "Binance execution service is shut down".to_owned(),
                 })?;
         let (response, receiver) = oneshot::channel();
+        let queue_depth_before_enqueue = sender.max_capacity() - sender.capacity();
         sender
             .send(WorkItem {
                 request,
                 enqueued_at: Instant::now(),
+                queue_depth_before_enqueue,
                 response,
             })
             .await
@@ -1014,6 +1063,7 @@ mod tests {
             kind: BinanceOrderRequestKind::MarketBuy {
                 quote_quantity: Decimal::ZERO,
             },
+            latency_origin: None,
         };
         assert!(request.validate().is_err());
     }

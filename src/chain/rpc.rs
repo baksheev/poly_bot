@@ -223,6 +223,10 @@ impl JsonRpcClient {
         self
     }
 
+    pub const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
     pub async fn latest_block(&self) -> anyhow::Result<CanonicalBlock> {
         let value = self
             .request("eth_getBlockByNumber", json!(["latest", false]))

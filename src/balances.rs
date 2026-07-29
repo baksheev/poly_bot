@@ -68,6 +68,11 @@ pub struct WalletBalanceSnapshot {
     pub token_balances: Vec<WalletTokenBalance>,
     pub observed_at: Instant,
     pub request_duration_us: u128,
+    pub batch_build_us: u128,
+    pub batch_provider_us: u128,
+    pub batch_decode_us: u128,
+    pub batch_chunk_count: usize,
+    pub batch_response_bytes: usize,
     pub rpc_stats: RpcStats,
 }
 
@@ -244,6 +249,7 @@ pub async fn fetch_wallet_snapshot(
 ) -> anyhow::Result<WalletBalanceSnapshot> {
     ensure!(!tokens.is_empty(), "wallet token set is empty");
     let started = Instant::now();
+    let build_started = Instant::now();
     let calls = tokens
         .iter()
         .map(|token| EthCall {
@@ -251,14 +257,20 @@ pub async fn fetch_wallet_snapshot(
             data: erc20_balance_of_call(owner),
         })
         .collect::<Vec<_>>();
+    let batch_build_us = build_started.elapsed().as_micros();
     // Trading readiness depends only on the ERC-20 balances consumed by an
     // admitted plan. Native gas funding is an operational invariant and is
     // deliberately absent from the balance snapshot and reservation model.
+    let batch_chunk_count = calls.len().div_ceil(rpc.batch_size());
+    let provider_started = Instant::now();
     let encoded_balances = rpc.eth_call_batch(&calls, block).await?;
+    let batch_provider_us = provider_started.elapsed().as_micros();
+    let batch_response_bytes = encoded_balances.iter().map(Vec::len).sum();
     ensure!(
         encoded_balances.len() == tokens.len(),
         "wallet token balance response count mismatch"
     );
+    let decode_started = Instant::now();
     let token_balances = tokens
         .iter()
         .zip(encoded_balances)
@@ -275,6 +287,7 @@ pub async fn fetch_wallet_snapshot(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let batch_decode_us = decode_started.elapsed().as_micros();
     Ok(WalletBalanceSnapshot {
         owner,
         chain_id,
@@ -283,6 +296,11 @@ pub async fn fetch_wallet_snapshot(
         token_balances,
         observed_at: Instant::now(),
         request_duration_us: started.elapsed().as_micros(),
+        batch_build_us,
+        batch_provider_us,
+        batch_decode_us,
+        batch_chunk_count,
+        batch_response_bytes,
         rpc_stats: rpc.stats(),
     })
 }

@@ -901,6 +901,31 @@ work onto the decision owner.
 `679 ms` for its successor. This telemetry begins after some DEX bootstrap work,
 so it is not a complete process-startup metric.
 
+### Target-node resource reference
+
+`scripts/report-gke-runtime-resources` reproduced this reference for the same
+`[2026-07-28T10:00:05Z, 2026-07-29T02:57:52Z)` window:
+
+| Resource | n | p50 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| container CPU cores, 60-second aligned rate | 1,018 | 0.00972 | 0.01912 | 0.02422 | 0.02878 |
+| CPU limit utilization | 1,018 | 0.00162 | 0.00319 | 0.00416 | 0.00488 |
+| memory used bytes | 2,036 | 22,577,152 | 74,985,472 | 75,251,712 | 76,595,200 |
+| page faults per second | 2,036 | 0 | 112.61 | 118.36 | 218.27 |
+
+A read-only cgroup/process snapshot of the successor Pod at
+`2026-07-29T04:26:21Z`, still on source revision `d93fb29`, recorded:
+
+- `nr_throttled=0` and `throttled_usec=0` across 32,339 CFS periods;
+- cgroup `memory.peak=99,835,904` bytes with zero `high`, `max`, OOM, and
+  OOM-kill events;
+- process `VmHWM=79,988 KiB`, nine threads, 442,698 voluntary and 120
+  involuntary context switches.
+
+The very low CPU utilization is not a license to add hot-path handoffs. M1–M11
+must continue to compare the decision percentiles and background-tail
+non-interference, not only aggregate CPU headroom.
+
 ### Missing measurements required in M0
 
 Before structural migration, telemetry must add:
@@ -923,6 +948,83 @@ Before structural migration, telemetry must add:
 Instrumentation itself must use fixed-size/bounded hot records and background
 formatting. Adding the measurement may not invalidate the baseline it is meant
 to protect.
+
+### M0 implementation contract
+
+M0 uses the following versioned operator reports:
+
+- `scripts/report-m0-performance START_UTC END_UTC` executes the checked-in
+  ClickHouse queries in `scripts/sql/m0_*.sql` and reproduces counts, hot-path,
+  sizing/admission, execution, queue, startup, journal, owner-loop, balance
+  batch, and allocator tables for one half-open UTC window;
+- `scripts/report-gke-runtime-resources START_UTC END_UTC` reports aligned GKE
+  container CPU, CPU-limit utilization when present, memory, and page-fault
+  distributions, then captures read-only cgroup CPU-throttling, memory
+  high-water, memory-event, thread, and context-switch counters from the sole
+  production Pod.
+
+The compatibility runtime emits stable identity fields before M1 introduces the
+compiled typed registries. Their formats are deliberately deterministic:
+
+| Typed identity | M0 compatibility encoding |
+| --- | --- |
+| `BinanceAccountId` | `binance-spot:primary` |
+| `InstrumentId` | `binance-spot:primary:<SYMBOL>` |
+| `StrategyId` | `strategy:<pair_id>` |
+| `NetworkId` | `eip155:<chain_id>` |
+| `WalletId` | `evm-wallet:primary` |
+| `WalletLocation` / `ExecutionLaneId` | `eip155:<chain_id>:evm-wallet:primary` |
+| `PoolId` | `eip155:<chain_id>:pool:<canonical debug identity>` |
+
+These strings are telemetry compatibility projections, not the M1 registry
+implementation. M1 must round-trip them or introduce an explicitly versioned
+replacement; it may not silently merge histories.
+
+M0 adds only non-blocking/background or already-existing event-boundary
+measurements:
+
+- process start through domain validation, canonical block selection, pool
+  hydration, subscription acknowledgement, backfill, and first ready;
+- journal lock/recovery by trade, Binance order, EVM, and rebalance owner;
+- wallet JSON-RPC batch build, provider, decode, publication, chunks, and
+  response bytes;
+- per-frame dependency fanout, dependency-scoped DEX drain, decision-loop lag,
+  and longest non-price handler;
+- candidate-to-reservation, reservation-to-preflight,
+  preflight-to-parent-fsync, worker queue depth, and enqueue-to-first durable
+  child write;
+- capital-allocation calculation plus validation.
+
+No new queue, lock, RPC call, JSON construction, or typed-ID formatting occurs
+between a parsed strategy-price frame and completed baseline evaluation. The
+fixed-size hot records continue to be formatted only by the background
+telemetry task.
+
+### Current single-pair assumption register
+
+Every known production bootstrap restriction has an explicit migration owner:
+
+| Current assumption or restriction | Current owner | Removal milestone |
+| --- | --- | --- |
+| `run` requires exactly one enabled Binance symbol | direct hot-path bootstrap in `main` | M2 |
+| `collect-prices` requires one enabled symbol and selects one market-data pair | ESP compatibility collector | M1, then M4 |
+| Binance account hydration returns one symbol rule/commission view | authenticated account bootstrap | M2 |
+| one `BookTickerFeed` plus one depth book drives executable strategy state | direct hot-path bootstrap | M2 and M4 |
+| `chain_endpoints` accepts one enabled chain and one RPC/WSS pair | DEX bootstrap | M3 |
+| one `DexMirror` owns pools for the selected network and emits the legacy `world_chain_head` kind | DEX owner | M3 |
+| balance sync receives one Binance symbol, one wallet location, and one pair's asset list | balance bootstrap | M2, M3, and M5 |
+| inventory keys are only `(Binance|Wallet, symbol)` | inventory owner | M5 |
+| admission selects the first matching domain pair and one global execution mailbox | strategy/coordinator compatibility path | M4 and M6 |
+| one global trade coordinator serializes all live parents | trade coordinator | retained through M6; reviewed only after M9 |
+| EVM journals and nonce ownership are World Chain/wallet compatibility paths | DEX and rebalance executors | M6 |
+| gas policy contains reviewed World Chain fallback constants | DEX executor | generic boundary in M3; Arbitrum policy in M8 |
+| rebalancing assumes Binance plus the World Chain wallet and Optimism fallback | rebalance tracker/executor | M5, M6, and M10 |
+| the deployment workflow validates WLD v12 and ESP v2 as separate artifacts | production delivery | M1 |
+| validation/canary commands intentionally restrict mutations to WLD/World Chain | operator-only validation commands | retained until M8/M9 |
+
+The initial single signer is a target-topology decision, not an accidental
+single-pair restriction. Multi-wallet selection remains deferred as specified
+below.
 
 ### Release gates
 

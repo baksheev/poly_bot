@@ -507,6 +507,14 @@ impl DexExecutor {
         &mut self,
         request: ExactInputSwapRequest,
     ) -> anyhow::Result<SwapExecutionOutcome> {
+        self.execute_exact_input_instrumented(request, None).await
+    }
+
+    async fn execute_exact_input_instrumented(
+        &mut self,
+        request: ExactInputSwapRequest,
+        enqueued_at: Option<Instant>,
+    ) -> anyhow::Result<SwapExecutionOutcome> {
         self.last_terminal_receipt = None;
         request.validate()?;
         ensure!(self.nonce_lane.ready(), "DEX nonce lane is not ready");
@@ -561,6 +569,7 @@ impl DexExecutor {
                     confirmation_timeout: request.confirmation_timeout,
                     submission_policy: request.submission_policy,
                 },
+                enqueued_at,
             )
             .await?;
         ensure!(
@@ -710,6 +719,7 @@ impl DexExecutor {
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
+                None,
             )
             .await?;
         ensure!(receipt.status == 1, "ERC-20 approval reverted");
@@ -764,6 +774,7 @@ impl DexExecutor {
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
                 },
+                None,
             )
             .await?;
         ensure!(receipt.status == 1, "Permit2 approval reverted");
@@ -776,6 +787,7 @@ impl DexExecutor {
         purpose: &str,
         call: &WalletCall,
         policy: ExecuteCallPolicy,
+        enqueued_at: Option<Instant>,
     ) -> anyhow::Result<TransactionReceipt> {
         if let Some(existing) = self.journal.operation(&operation_id) {
             ensure!(
@@ -907,6 +919,14 @@ impl DexExecutor {
             nonce_and_sign_started,
             "success",
         );
+        if let Some(enqueued_at) = enqueued_at {
+            self.emit_latency_stage(
+                &operation_id,
+                "enqueue_to_first_write",
+                enqueued_at,
+                "success",
+            );
+        }
 
         let broadcast_started = Instant::now();
         let broadcast_result = tokio::time::timeout(
@@ -1166,6 +1186,7 @@ fn wallet_transfer_totals(
 struct WorkItem {
     request: ExactInputSwapRequest,
     enqueued_at: Instant,
+    queue_depth_before_enqueue: usize,
     response: oneshot::Sender<Result<SwapExecutionOutcome, DexExecutionServiceError>>,
 }
 
@@ -1262,9 +1283,22 @@ impl DexExecutionService {
                                     work.enqueued_at,
                                     "success",
                                 );
+                                if let Some(telemetry) = &executor.latency_telemetry {
+                                    telemetry.emit_queue_stage(
+                                        "dex",
+                                        &operation_id,
+                                        "worker_queue_depth",
+                                        duration_us(work.enqueued_at.elapsed()),
+                                        work.queue_depth_before_enqueue,
+                                        "success",
+                                    );
+                                }
                                 let execution_started = Instant::now();
                                 let result = executor
-                                    .execute_exact_input(work.request)
+                                    .execute_exact_input_instrumented(
+                                        work.request,
+                                        Some(work.enqueued_at),
+                                    )
                                     .await
                                     .map_err(|error| {
                                         executor.classify_execution_error(
@@ -1324,10 +1358,12 @@ impl DexExecutionService {
                     reason: "DEX execution service is shut down".to_owned(),
                 })?;
         let (response, receiver) = oneshot::channel();
+        let queue_depth_before_enqueue = sender.max_capacity() - sender.capacity();
         sender
             .send(WorkItem {
                 request,
                 enqueued_at: Instant::now(),
+                queue_depth_before_enqueue,
                 response,
             })
             .await

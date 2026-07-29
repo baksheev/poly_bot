@@ -19,6 +19,32 @@ pub const ARBITRAGE_RESULT_KIND: &str = "arbitrage_result";
 pub const ARBITRAGE_EXECUTION_STAGE_KIND: &str = "arbitrage_execution_stage";
 pub const ARBITRAGE_BINANCE_ORDER_KIND: &str = "arbitrage_binance_order";
 pub const ARBITRAGE_DEX_REVERT_KIND: &str = "arbitrage_dex_revert";
+pub const PRIMARY_BINANCE_ACCOUNT_ID: &str = "binance-spot:primary";
+pub const PRIMARY_EVM_WALLET_ID: &str = "evm-wallet:primary";
+
+pub fn instrument_id(symbol: &str) -> String {
+    format!("{PRIMARY_BINANCE_ACCOUNT_ID}:{symbol}")
+}
+
+pub fn strategy_id(pair_id: &str) -> String {
+    format!("strategy:{pair_id}")
+}
+
+pub fn network_id(chain_id: u64) -> String {
+    format!("eip155:{chain_id}")
+}
+
+pub fn wallet_location_id(chain_id: u64) -> String {
+    format!("{}:{PRIMARY_EVM_WALLET_ID}", network_id(chain_id))
+}
+
+pub fn execution_lane_id(chain_id: u64) -> String {
+    wallet_location_id(chain_id)
+}
+
+pub fn pool_id(chain_id: u64, identity: &str) -> String {
+    format!("{}:pool:{identity}", network_id(chain_id))
+}
 
 #[derive(Clone)]
 pub struct TelemetryHandle {
@@ -81,6 +107,29 @@ impl ExecutionLatencyTelemetry {
                 "operation_id": operation_id,
                 "stage": stage,
                 "duration_us": duration_us,
+                "outcome": outcome,
+            }),
+        );
+    }
+
+    pub fn emit_queue_stage(
+        &self,
+        venue: &'static str,
+        operation_id: &str,
+        stage: &'static str,
+        duration_us: u64,
+        queue_depth_before_enqueue: usize,
+        outcome: &'static str,
+    ) {
+        self.handle.emit(
+            ARBITRAGE_EXECUTION_STAGE_KIND,
+            serde_json::json!({
+                "engine_id": self.engine_id,
+                "venue": venue,
+                "operation_id": operation_id,
+                "stage": stage,
+                "duration_us": duration_us,
+                "queue_depth_before_enqueue": queue_depth_before_enqueue,
                 "outcome": outcome,
             }),
         );
@@ -342,7 +391,10 @@ fn validate_identifier(value: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_RESULT_KIND, validate_identifier};
+    use super::{
+        ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_RESULT_KIND, PRIMARY_BINANCE_ACCOUNT_ID,
+        execution_lane_id, instrument_id, network_id, pool_id, strategy_id, validate_identifier,
+    };
 
     #[test]
     fn clickhouse_identifier_is_restricted() {
@@ -354,5 +406,18 @@ mod tests {
     fn live_result_kind_matches_the_materialized_view_contract() {
         assert_eq!(ARBITRAGE_RESULT_KIND, "arbitrage_result");
         assert_eq!(ARBITRAGE_BINANCE_ORDER_KIND, "arbitrage_binance_order");
+    }
+
+    #[test]
+    fn m0_compatibility_ids_are_stable_and_location_scoped() {
+        assert_eq!(PRIMARY_BINANCE_ACCOUNT_ID, "binance-spot:primary");
+        assert_eq!(instrument_id("WLDUSDC"), "binance-spot:primary:WLDUSDC");
+        assert_eq!(
+            strategy_id("world-chain-usdc-wld"),
+            "strategy:world-chain-usdc-wld"
+        );
+        assert_eq!(network_id(480), "eip155:480");
+        assert_eq!(execution_lane_id(42161), "eip155:42161:evm-wallet:primary");
+        assert_eq!(pool_id(480, "V3:0xabc"), "eip155:480:pool:V3:0xabc");
     }
 }

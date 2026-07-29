@@ -189,6 +189,7 @@ pub async fn execute_order_round_trip(
                     kind: BinanceOrderRequestKind::MarketSell {
                         quantity: remaining,
                     },
+                    latency_origin: None,
                 })
                 .await?;
             ensure!(
@@ -278,6 +279,7 @@ fn buy_request(
         client_order_id: format!("{run_id}b"),
         symbol: pair.binance.symbol.clone(),
         kind,
+        latency_origin: None,
     })
 }
 
@@ -303,6 +305,7 @@ fn sell_request(
         client_order_id: format!("{run_id}s"),
         symbol: pair.binance.symbol.clone(),
         kind,
+        latency_origin: None,
     })
 }
 

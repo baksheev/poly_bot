@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use alloy_primitives::U256;
@@ -41,7 +41,10 @@ use crate::{
     },
     rebalance::{Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceTracker},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
-    telemetry::TelemetryHandle,
+    telemetry::{
+        PRIMARY_BINANCE_ACCOUNT_ID, PRIMARY_EVM_WALLET_ID, TelemetryHandle, execution_lane_id,
+        instrument_id, network_id, pool_id, strategy_id, wallet_location_id,
+    },
 };
 
 pub struct TradingEngine {
@@ -82,6 +85,7 @@ pub struct TradingEngine {
     last_inventory_blocked_alert_at: Option<Instant>,
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
+    terminal_child_observed_at: BTreeMap<String, Instant>,
     pending_adaptive_sizing: Vec<AdaptiveSizingJob>,
 }
 
@@ -567,6 +571,7 @@ impl TradingEngine {
                 last_inventory_blocked_alert_at: None,
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
+                terminal_child_observed_at: BTreeMap::new(),
                 pending_adaptive_sizing: Vec::new(),
             },
             hot_telemetry_task,
@@ -769,12 +774,23 @@ impl TradingEngine {
                         .opportunities
                         .request_pool_refresh(pool_index, &self.dex)?;
                     let pool = self.dex.pool(pool_index)?;
+                    let pair = self
+                        .domain_config
+                        .snapshot()
+                        .pairs
+                        .iter()
+                        .find(|pair| pair.id == pool.pair_id)
+                        .context("DEX telemetry pool pair is missing")?;
+                    let identity = format!("{:?}", pool.identity);
                     self.telemetry.emit(
                         "dex_pool_event",
                         json!({
                             "engine_id": self.config.engine_id,
                             "pair_id": pool.pair_id,
-                            "identity": format!("{:?}", pool.identity),
+                            "strategy_id": strategy_id(&pool.pair_id),
+                            "network_id": network_id(pair.chain.chain_id),
+                            "pool_id": pool_id(pair.chain.chain_id, &identity),
+                            "identity": identity,
                             "kind": kind,
                             "block_number": log.block_number,
                             "transaction_index": log.transaction_index,
@@ -791,10 +807,19 @@ impl TradingEngine {
             }
             DexStreamEvent::Head { head, received_at } => {
                 if self.dex.apply_head(head, received_at)? {
+                    let chain_id = self
+                        .domain_config
+                        .snapshot()
+                        .pairs
+                        .iter()
+                        .find(|pair| pair.market_data_enabled)
+                        .map(|pair| pair.chain.chain_id);
                     self.telemetry.emit(
                         "world_chain_head",
                         json!({
                             "engine_id": self.config.engine_id,
+                            "network_id": chain_id.map(network_id),
+                            "chain_id": chain_id,
                             "block_number": head.number,
                             "engine_queue_age_us": received_at.elapsed().as_micros(),
                         }),
@@ -816,12 +841,24 @@ impl TradingEngine {
         let pool = self.dex.pool(prepared.pool_index)?;
         let pool_pair_id = pool.pair_id.clone();
         let pool_identity = format!("{:?}", pool.identity);
+        let chain_id = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.id == pool_pair_id)
+            .context("prepared pool telemetry pair is missing")?
+            .chain
+            .chain_id;
         self.refresh_preflight_dex_pool(prepared.pool_index)?;
         self.telemetry.emit(
             "dex_pool_prepared",
             json!({
                 "engine_id": self.config.engine_id,
                 "pair_id": pool_pair_id,
+                "strategy_id": strategy_id(&pool_pair_id),
+                "network_id": network_id(chain_id),
+                "pool_id": pool_id(chain_id, &pool_identity),
                 "identity": pool_identity,
                 "pool_index": prepared.pool_index,
                 "prepared_generation": prepared.generation,
@@ -1393,6 +1430,7 @@ impl TradingEngine {
                     "binance_balance_snapshot",
                     json!({
                         "engine_id": self.config.engine_id,
+                        "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
                         "account_update_time_ms": snapshot.account_update_time_ms,
                         "account_type": snapshot.account_type,
                         "can_trade": snapshot.can_trade,
@@ -1419,6 +1457,8 @@ impl TradingEngine {
                 );
             }
             BalanceEvent::Wallet(snapshot) => {
+                let batch_queue_us = snapshot.observed_at.elapsed().as_micros();
+                let publication_started_at = Instant::now();
                 let wallet_inventory = snapshot
                     .token_balances
                     .iter()
@@ -1444,12 +1484,23 @@ impl TradingEngine {
                     "wallet_balance_snapshot",
                     json!({
                         "engine_id": self.config.engine_id,
+                        "wallet_id": PRIMARY_EVM_WALLET_ID,
+                        "network_id": network_id(snapshot.chain_id),
+                        "wallet_location_id": wallet_location_id(snapshot.chain_id),
+                        "execution_lane_id": execution_lane_id(snapshot.chain_id),
                         "owner": format!("{:#x}", snapshot.owner),
                         "chain_id": snapshot.chain_id,
                         "block_number": snapshot.block_number,
                         "block_hash": format!("{:#x}", snapshot.block_hash),
                         "token_balances": token_balances,
                         "request_duration_us": snapshot.request_duration_us,
+                        "batch_build_us": snapshot.batch_build_us,
+                        "batch_queue_us": batch_queue_us,
+                        "batch_provider_us": snapshot.batch_provider_us,
+                        "batch_decode_us": snapshot.batch_decode_us,
+                        "batch_publication_us": publication_started_at.elapsed().as_micros(),
+                        "batch_chunk_count": snapshot.batch_chunk_count,
+                        "batch_response_bytes": snapshot.batch_response_bytes,
                         "rpc_http_requests": snapshot.rpc_stats.http_requests,
                         "rpc_eth_calls": snapshot.rpc_stats.eth_calls,
                         "rpc_rate_limit_retries": snapshot.rpc_stats.rate_limit_retries,
@@ -1694,6 +1745,10 @@ impl TradingEngine {
             if self.inventory.reservation(operation_id).is_some() {
                 continue;
             }
+            if let Some(terminal_observed_at) = self.terminal_child_observed_at.remove(operation_id)
+            {
+                self.emit_child_terminal_to_reservation_settled(operation_id, terminal_observed_at);
+            }
             self.telemetry.emit(
                 "inventory_settlement_reconciled",
                 json!({
@@ -1705,6 +1760,25 @@ impl TradingEngine {
                 self.rebalance_inventory_reservation = None;
             }
         }
+    }
+
+    fn emit_child_terminal_to_reservation_settled(
+        &self,
+        plan_id: &str,
+        terminal_observed_at: Instant,
+    ) {
+        self.telemetry.emit(
+            crate::telemetry::ARBITRAGE_EXECUTION_STAGE_KIND,
+            json!({
+                "engine_id": self.config.engine_id,
+                "venue": "orchestrator",
+                "plan_id": plan_id,
+                "operation_id": plan_id,
+                "stage": "child_terminal_to_reservation_settled",
+                "duration_us": duration_us(terminal_observed_at.elapsed()),
+                "outcome": "success",
+            }),
+        );
     }
 
     fn evaluate_rebalance(&mut self) {
@@ -1730,8 +1804,20 @@ impl TradingEngine {
                 }),
             );
         }
+        let calculation_started_at = Instant::now();
         match self.rebalance.evaluate(binance, wallet) {
             Ok(evaluations) => {
+                let calculation_us = duration_us(calculation_started_at.elapsed());
+                self.telemetry.emit(
+                    "capital_allocation_evaluated",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "allocator_mode": "v12_rebalance_compatibility",
+                        "calculation_validation_us": calculation_us,
+                        "proposal_count": evaluations.len(),
+                        "outcome": "success",
+                    }),
+                );
                 let mode = self.config.rebalance_execution_mode.as_str();
                 for evaluation in evaluations {
                     let action = evaluation.plan.action.as_ref();
@@ -1739,6 +1825,7 @@ impl TradingEngine {
                         "rebalance_plan_evaluated",
                         json!({
                             "engine_id": self.config.engine_id,
+                            "calculation_validation_us": calculation_us,
                             "mode": mode,
                             "token": evaluation.token_symbol,
                             "token_decimals": evaluation.token_decimals,
@@ -1769,6 +1856,16 @@ impl TradingEngine {
                 }
             }
             Err(error) => {
+                self.telemetry.emit(
+                    "capital_allocation_evaluated",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "allocator_mode": "v12_rebalance_compatibility",
+                        "calculation_validation_us": duration_us(calculation_started_at.elapsed()),
+                        "proposal_count": 0,
+                        "outcome": "failed",
+                    }),
+                );
                 self.rebalance.mark_unbalanced();
                 tracing::warn!(error = %error, "rebalance planning failed closed");
                 self.telemetry.emit(
@@ -2493,6 +2590,7 @@ impl TradingEngine {
         let Some((direction, trade)) = candidate else {
             return Ok(false);
         };
+        let candidate_selected_at = Instant::now();
         let native_price_token_a = self.native_price_token_a().unwrap_or(Decimal::ZERO);
         let economics = evaluate_execution_admission(
             quote,
@@ -2511,6 +2609,7 @@ impl TradingEngine {
         let dex_pool_generation = self.opportunities.pool_generation(trade.pool_index)?;
         let token_a_symbol = pair_config.token_a.symbol.clone();
         let token_b_symbol = pair_config.token_b.symbol.clone();
+        let pair_chain_id = pair_config.chain.chain_id;
         let deadline_unix_seconds =
             admission_deadline_unix_seconds(quote.received_unix_us, quote.received_at.elapsed())?;
         let dex_plan = DexSwapPlan::build(
@@ -2520,12 +2619,13 @@ impl TradingEngine {
             trade,
             deadline_unix_seconds,
         )?;
-        let opportunity = PaperOpportunity {
+        let mut opportunity = PaperOpportunity {
             source_revision: self.domain_config.snapshot().source.revision.clone(),
             pair_id: pair_id.clone(),
             symbol: pair_symbol.clone(),
             update_id: quote.update_id,
             received_unix_us: quote.received_unix_us,
+            reservation_completed_unix_us: 0,
             direction,
             dex_pool_index: trade.pool_index,
             dex_pool_generation,
@@ -2660,6 +2760,9 @@ impl TradingEngine {
             return Ok(false);
         }
         let inventory_reservation_us = duration_us(reservation_started.elapsed());
+        opportunity.reservation_completed_unix_us = unix_timestamp_us()?;
+        let candidate_selected_to_reservation_complete_us =
+            duration_us(candidate_selected_at.elapsed());
         self.arbitrage_plan_freshness.insert(
             plan_id.clone(),
             ArbitragePlanFreshness {
@@ -2696,6 +2799,13 @@ impl TradingEngine {
         let admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,
+            "strategy_id": strategy_id(&pair_id),
+            "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+            "instrument_id": instrument_id(&pair_symbol),
+            "network_id": network_id(pair_chain_id),
+            "wallet_id": PRIMARY_EVM_WALLET_ID,
+            "wallet_location_id": wallet_location_id(pair_chain_id),
+            "execution_lane_id": execution_lane_id(pair_chain_id),
             "mode": self.config.arbitrage_execution_mode,
             "admission_liquidity_source": liquidity_source,
             "sizing_mode": if adaptive_candidate.is_some() { "adaptive" } else { "baseline" },
@@ -2711,6 +2821,7 @@ impl TradingEngine {
             "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
             "admission_total_us": duration_us(admission_started.elapsed()),
             "inventory_reservation_us": inventory_reservation_us,
+            "candidate_selected_to_reservation_complete_us": candidate_selected_to_reservation_complete_us,
             "mailbox_submit_us": mailbox_submit_us,
             "inventory_claims": self.inventory_claim_details(&claims),
             "execution_slippage_bps": trade.execution_slippage_bps,
@@ -2868,6 +2979,8 @@ impl TradingEngine {
         match event.state {
             PaperTradeEventState::Balanced => {
                 if self.inventory.reservation(&event.plan_id).is_some() {
+                    self.terminal_child_observed_at
+                        .insert(event.plan_id.clone(), event.terminal_observed_at);
                     self.inventory.mark_pending_settlement(&event.plan_id)?;
                 } else {
                     tracing::warn!(
@@ -2878,6 +2991,7 @@ impl TradingEngine {
                 self.arbitrage_plan_freshness.remove(&event.plan_id);
             }
             PaperTradeEventState::RejectedUnsubmitted => {
+                let terminal_observed_at = event.terminal_observed_at;
                 self.arbitrage_plan_freshness.remove(&event.plan_id);
                 if self.inventory.reservation(&event.plan_id).is_some() {
                     self.inventory.release_unsubmitted(&event.plan_id)?;
@@ -2887,6 +3001,10 @@ impl TradingEngine {
                         "rejected arbitrage event has no in-memory reservation after restart"
                     );
                 }
+                self.emit_child_terminal_to_reservation_settled(
+                    &event.plan_id,
+                    terminal_observed_at,
+                );
             }
             PaperTradeEventState::BlockedUnknown => {
                 self.arbitrage_plan_freshness.remove(&event.plan_id);
@@ -3217,6 +3335,47 @@ impl TradingEngine {
         self.state.phase
     }
 
+    pub fn record_runtime_first_ready(&self, process_elapsed: Duration) {
+        self.telemetry.emit(
+            "runtime_first_ready",
+            json!({
+                "engine_id": self.config.engine_id,
+                "process_start_to_first_ready_us": duration_us(process_elapsed),
+                "runtime_phase": self.state.phase,
+            }),
+        );
+    }
+
+    pub fn record_owner_loop_health(
+        &self,
+        loop_lag_us: u128,
+        longest_handler: &'static str,
+        longest_non_price_handler_us: u128,
+    ) {
+        self.telemetry.emit(
+            "decision_owner_health",
+            json!({
+                "engine_id": self.config.engine_id,
+                "loop_lag_us": loop_lag_us,
+                "longest_non_price_handler": longest_handler,
+                "longest_non_price_handler_us": longest_non_price_handler_us,
+                "hot_telemetry_dropped_records": self.hot_telemetry.dropped_records(),
+            }),
+        );
+    }
+
+    pub fn record_dex_drain(&self, event_count: usize, duration: Duration) {
+        self.telemetry.emit(
+            "decision_owner_dex_drain",
+            json!({
+                "engine_id": self.config.engine_id,
+                "event_count": event_count,
+                "dependency_fanout_count": 1,
+                "duration_us": duration_us(duration),
+            }),
+        );
+    }
+
     pub fn shutdown(&mut self) {
         self.state.stop();
         self.telemetry.emit(
@@ -3356,6 +3515,14 @@ fn admission_deadline_unix_seconds(
         .and_then(|admission_unix_us| admission_unix_us.checked_div(1_000_000))
         .and_then(|seconds| seconds.checked_add(DEX_PLAN_TTL_SECONDS))
         .context("DEX plan deadline overflow")
+}
+
+fn unix_timestamp_us() -> anyhow::Result<u64> {
+    let micros = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_micros();
+    u64::try_from(micros).context("Unix timestamp exceeds u64")
 }
 
 fn exact_execution_envelope_amounts(

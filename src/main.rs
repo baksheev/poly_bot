@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, bail, ensure};
@@ -82,6 +87,7 @@ enum RebalanceExecutorEvent {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let process_started_at = Instant::now();
     load_dotenv()?;
     init_tracing();
 
@@ -90,8 +96,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run => {
+            let domain_validation_started_at = Instant::now();
             let domain_config = Arc::new(LoadedDomainConfig::load(&cli.config.domain_config_path)?);
-            run(cli.config, domain_config).await
+            let bootstrap = BootstrapTiming {
+                process_started_at,
+                domain_validation_complete_at: Instant::now(),
+                domain_load_us: domain_validation_started_at.elapsed().as_micros(),
+            };
+            run(cli.config, domain_config, bootstrap).await
         }
         Command::CollectPrices => {
             let domain_config = Arc::new(LoadedDomainConfig::load(&cli.config.domain_config_path)?);
@@ -878,6 +890,7 @@ async fn collect_prices(
         mut mirror,
         stream,
         rpc: wallet_rpc,
+        timings: _,
     } = initialize_dex(&config, domain_config.as_ref()).await?;
     let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &mirror)?;
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
@@ -1352,11 +1365,13 @@ fn emit_price_collector_evaluation(
 async fn run(
     config: config::AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
+    bootstrap: BootstrapTiming,
 ) -> anyhow::Result<()> {
     let InitializedDex {
         mirror,
         stream,
         rpc: wallet_rpc,
+        timings: dex_timings,
     } = initialize_dex(&config, domain_config.as_ref()).await?;
     let initial_wallet_head = mirror.latest_head();
     let (receipt_heads, receipt_head_receiver) = tokio::sync::watch::channel(initial_wallet_head);
@@ -1366,6 +1381,13 @@ async fn run(
     } = stream;
     let (telemetry, writer) = TelemetryWriter::new(&config).channel();
     let writer_task = tokio::spawn(writer.run());
+    emit_bootstrap_telemetry(
+        &telemetry,
+        &config,
+        domain_config.as_ref(),
+        bootstrap,
+        dex_timings,
+    );
     let binance_symbols = domain_config.binance_symbols();
     ensure!(
         binance_symbols.len() == 1,
@@ -1514,6 +1536,7 @@ async fn run(
         let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
             .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
         let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
+        let rebalance_journal_started_at = Instant::now();
         let executor = RebalanceExecutor::hydrate(
             binance_account_client.clone(),
             treasury_client,
@@ -1532,6 +1555,17 @@ async fn run(
             },
         )
         .await?;
+        telemetry.emit(
+            "runtime_journal_recovery",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "owner": "rebalance_saga",
+                "journal_scope": "rebalance",
+                "duration_us": rebalance_journal_started_at.elapsed().as_micros(),
+                "active_operation_count": usize::from(executor.active_operation()?.is_some()),
+                "outcome": "success",
+            }),
+        );
         let recovery_operation = executor.active_operation()?.cloned();
         if let Some(operation) = recovery_operation.as_ref() {
             tracing::warn!(
@@ -1590,6 +1624,7 @@ async fn run(
                     "required environment variable {ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV} is not set"
                 )
             })?;
+        let evm_journal_started_at = Instant::now();
         let mut dex_executor = DexExecutor::hydrate(
             wallet_rpc.clone(),
             wallet,
@@ -1597,6 +1632,18 @@ async fn run(
             wallet_journal_path.into(),
         )
         .await?;
+        telemetry.emit(
+            "runtime_journal_recovery",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "owner": "evm_execution",
+                "journal_scope": arb_bot::telemetry::execution_lane_id(wallet_chain_id),
+                "network_id": arb_bot::telemetry::network_id(wallet_chain_id),
+                "wallet_id": arb_bot::telemetry::PRIMARY_EVM_WALLET_ID,
+                "duration_us": evm_journal_started_at.elapsed().as_micros(),
+                "outcome": "success",
+            }),
+        );
         dex_executor.set_receipt_heads(receipt_head_receiver.clone());
         let mut allowance_requirements = Vec::new();
         for token in &initial_wallet_balances.token_balances {
@@ -1806,6 +1853,9 @@ async fn run(
     engine.on_user_data_connected(user_data_subscription_id);
     dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
     engine.start();
+    let mut first_ready_emitted = false;
+    let mut longest_non_price_handler_us = 0_u128;
+    let mut longest_non_price_handler = "none";
     let mut adaptive_sizing_tasks = tokio::task::JoinSet::new();
     let mut latest_adaptive_sizing_job = None;
 
@@ -1883,12 +1933,15 @@ async fn run(
             biased;
             _ = &mut shutdown => break,
             event = dex_receiver.recv() => {
+                let handler_started_at = Instant::now();
                 let Some(event) = event else {
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
                 };
                 let mut next_event = Some(event);
                 let mut prepared_dex = false;
+                let mut drained_events = 0_usize;
                 while let Some(event) = next_event {
+                    drained_events += 1;
                     prepared_dex |= process_dex_event_inline(
                         &mut engine,
                         event,
@@ -1900,27 +1953,67 @@ async fn run(
                 if prepared_dex {
                     engine.evaluate_after_dex_refreshes()?;
                 }
+                let handler_duration = handler_started_at.elapsed();
+                engine.record_dex_drain(drained_events, handler_duration);
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "dex_drain",
+                    handler_duration,
+                );
             }
-            _ = health_tick.tick() => engine.refresh_health(),
+            scheduled_at = health_tick.tick() => {
+                let loop_lag_us = scheduled_at.elapsed().as_micros();
+                engine.refresh_health();
+                engine.record_owner_loop_health(
+                    loop_lag_us,
+                    longest_non_price_handler,
+                    longest_non_price_handler_us,
+                );
+                longest_non_price_handler_us = 0;
+                longest_non_price_handler = "none";
+            },
             event = &mut binance_market_event => {
                 drop(binance_market_event);
                 engine.on_market_event(event, binance_feed.depth_book())?;
                 binance_market_event = Box::pin(binance_feed.next_event());
             },
             event = &mut gas_market_event => {
+                let handler_started_at = Instant::now();
                 drop(gas_market_event);
                 engine.on_gas_market_event(event)?;
                 gas_market_event = Box::pin(gas_price_feed.next_event());
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "native_conversion_price",
+                    handler_started_at.elapsed(),
+                );
             },
             event = &mut commission_market_event => {
+                let handler_started_at = Instant::now();
                 drop(commission_market_event);
                 engine.on_commission_market_event(event)?;
                 commission_market_event = Box::pin(commission_price_feed.next_event());
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "commission_conversion_price",
+                    handler_started_at.elapsed(),
+                );
             },
             event = user_data_stream.next_event() => {
+                let handler_started_at = Instant::now();
                 engine.on_user_data_event(event?)?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "binance_user_data",
+                    handler_started_at.elapsed(),
+                );
             },
             observation = binance_clock_sync_receiver.recv(), if binance_clock_sync_running => {
+                let handler_started_at = Instant::now();
                 match observation {
                     Some(Ok(clock_sync)) => engine.on_binance_clock_sync(clock_sync),
                     Some(Err(error)) => engine.on_binance_clock_sync_failure(&error),
@@ -1931,15 +2024,29 @@ async fn run(
                         );
                     }
                 }
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "binance_clock_sync",
+                    handler_started_at.elapsed(),
+                );
             },
             event = balance_receiver.recv() => {
+                let handler_started_at = Instant::now();
                 let Some(event) = event else {
                     bail!("balance synchronization channel stopped unexpectedly");
                 };
                 engine.on_balance_event(event)?;
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "balance_publication",
+                    handler_started_at.elapsed(),
+                );
             }
             result = rebalance_receiver.recv(), if rebalance_sender.is_some() => {
+                let handler_started_at = Instant::now();
                 let Some(result) = result else {
                     bail!("rebalance executor result channel stopped unexpectedly");
                 };
@@ -1958,8 +2065,15 @@ async fn run(
                     }
                 }
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "rebalance_result",
+                    handler_started_at.elapsed(),
+                );
             }
             event = paper_trade_events.recv(), if paper_trade_task.is_some() => {
+                let handler_started_at = Instant::now();
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
@@ -1981,8 +2095,15 @@ async fn run(
                 if prepared_dex || receipt_applied {
                     engine.evaluate_after_dex_refreshes()?;
                 }
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "trade_result_settlement",
+                    handler_started_at.elapsed(),
+                );
             }
             result = adaptive_sizing_tasks.join_next(), if !adaptive_sizing_tasks.is_empty() => {
+                let handler_started_at = Instant::now();
                 let result = result
                     .context("adaptive sizing worker join set stopped unexpectedly")?
                     .context("adaptive sizing worker panicked")?;
@@ -1999,6 +2120,12 @@ async fn run(
                     engine.evaluate_after_dex_refreshes()?;
                 }
                 engine.on_adaptive_sizing_result(result)?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "adaptive_sizing_result",
+                    handler_started_at.elapsed(),
+                );
             }
             result = &mut dex_task => {
                 result.context("Alchemy DEX connector task failed")??;
@@ -2012,6 +2139,10 @@ async fn run(
                 result.context("wallet balance synchronization task failed")??;
                 bail!("wallet balance synchronization stopped unexpectedly");
             }
+        }
+        if !first_ready_emitted && engine.phase() == RuntimePhase::Ready {
+            engine.record_runtime_first_ready(bootstrap.process_started_at.elapsed());
+            first_ready_emitted = true;
         }
         for job in engine.take_adaptive_sizing_jobs() {
             latest_adaptive_sizing_job = Some(job);
@@ -2397,26 +2528,61 @@ struct InitializedDex {
     mirror: DexMirror,
     stream: AlchemyDexStream,
     rpc: JsonRpcClient,
+    timings: DexInitializationTimings,
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapTiming {
+    process_started_at: Instant,
+    domain_validation_complete_at: Instant,
+    domain_load_us: u128,
+}
+
+#[derive(Clone, Copy)]
+struct DexInitializationTimings {
+    total_us: u128,
+    canonical_block_selection_us: u128,
+    hydration_us: u128,
+    filter_build_us: u128,
+    subscription_ack_us: u128,
+    backfill_head_us: u128,
+    backfill_provider_us: u128,
+    backfill_apply_us: u128,
+    backfill_log_count: usize,
+    backfill_applied_count: usize,
 }
 
 async fn initialize_dex(
     config: &config::AppConfig,
     domain_config: &LoadedDomainConfig,
 ) -> anyhow::Result<InitializedDex> {
+    let total_started_at = Instant::now();
     let (rpc_endpoint, ws_endpoint) = chain_endpoints(domain_config)?;
     let rpc = JsonRpcClient::new(rpc_endpoint)?;
+    let canonical_block_started_at = Instant::now();
+    let hydration_block = rpc.latest_block().await?;
+    let canonical_block_selection_us = canonical_block_started_at.elapsed().as_micros();
+    let hydration_started_at = Instant::now();
     let hydrated = DexHydrator::new(&rpc)
-        .hydrate(domain_config.snapshot())
+        .hydrate_at(domain_config.snapshot(), hydration_block)
         .await?;
+    let hydration_us = hydration_started_at.elapsed().as_micros();
     let hydration_block = hydrated.block;
+    let filter_build_started_at = Instant::now();
     let filters = build_log_filters(domain_config.snapshot(), &hydrated)?;
+    let filter_build_us = filter_build_started_at.elapsed().as_micros();
+    let subscription_started_at = Instant::now();
     let stream =
         connect_dex_stream(&ws_endpoint, &filters, config.dex_event_channel_capacity).await?;
+    let subscription_ack_us = subscription_started_at.elapsed().as_micros();
 
     // The subscription is live before the upper backfill bound is captured.
     // Logs emitted during hydration/subscription are recovered over HTTP;
     // duplicate WSS notifications at or below this bound are ignored.
+    let backfill_head_started_at = Instant::now();
     let backfill_head = rpc.latest_block().await?;
+    let backfill_head_us = backfill_head_started_at.elapsed().as_micros();
+    let backfill_provider_started_at = Instant::now();
     let mut backfill = Vec::new();
     if backfill_head.number > hydration_block.number {
         for filter in &filters {
@@ -2432,7 +2598,9 @@ async fn initialize_dex(
             && right.address == left.address
             && right.block_hash == left.block_hash
     });
+    let backfill_provider_us = backfill_provider_started_at.elapsed().as_micros();
 
+    let backfill_apply_started_at = Instant::now();
     let mut mirror = DexMirror::new(hydrated)?;
     let mut applied = 0_usize;
     for log in &backfill {
@@ -2441,6 +2609,7 @@ async fn initialize_dex(
         }
     }
     mirror.finish_backfill(backfill_head)?;
+    let backfill_apply_us = backfill_apply_started_at.elapsed().as_micros();
     tracing::info!(
         hydration_block = hydration_block.number,
         ready_block = backfill_head.number,
@@ -2455,7 +2624,85 @@ async fn initialize_dex(
         mirror,
         stream,
         rpc,
+        timings: DexInitializationTimings {
+            total_us: total_started_at.elapsed().as_micros(),
+            canonical_block_selection_us,
+            hydration_us,
+            filter_build_us,
+            subscription_ack_us,
+            backfill_head_us,
+            backfill_provider_us,
+            backfill_apply_us,
+            backfill_log_count: backfill.len(),
+            backfill_applied_count: applied,
+        },
     })
+}
+
+fn emit_bootstrap_telemetry(
+    telemetry: &TelemetryHandle,
+    config: &config::AppConfig,
+    domain_config: &LoadedDomainConfig,
+    bootstrap: BootstrapTiming,
+    dex: DexInitializationTimings,
+) {
+    let chain_id = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.market_data_enabled)
+        .map(|pair| pair.chain.chain_id);
+    let stages = [
+        (
+            "process_to_domain_validation",
+            bootstrap
+                .domain_validation_complete_at
+                .saturating_duration_since(bootstrap.process_started_at)
+                .as_micros(),
+        ),
+        ("domain_bundle_load_validation", bootstrap.domain_load_us),
+        ("dex_total", dex.total_us),
+        (
+            "canonical_block_selection",
+            dex.canonical_block_selection_us,
+        ),
+        ("pool_hydration", dex.hydration_us),
+        ("log_filter_build", dex.filter_build_us),
+        ("subscription_ack", dex.subscription_ack_us),
+        ("backfill_head_selection", dex.backfill_head_us),
+        ("backfill_provider", dex.backfill_provider_us),
+        ("backfill_apply_publication", dex.backfill_apply_us),
+    ];
+    for (stage, duration_us) in stages {
+        telemetry.emit(
+            "runtime_bootstrap_stage",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "domain_snapshot_id": domain_config.snapshot().snapshot_id,
+                "domain_config_sha256": domain_config.fingerprint_sha256(),
+                "network_id": chain_id.map(arb_bot::telemetry::network_id),
+                "chain_id": chain_id,
+                "stage": stage,
+                "duration_us": duration_us,
+                "backfill_log_count": dex.backfill_log_count,
+                "backfill_applied_count": dex.backfill_applied_count,
+                "outcome": "success",
+            }),
+        );
+    }
+}
+
+fn record_longest_handler(
+    longest_us: &mut u128,
+    longest_name: &mut &'static str,
+    handler_name: &'static str,
+    duration: Duration,
+) {
+    let duration_us = duration.as_micros();
+    if duration_us > *longest_us {
+        *longest_us = duration_us;
+        *longest_name = handler_name;
+    }
 }
 
 fn chain_endpoints(domain_config: &LoadedDomainConfig) -> anyhow::Result<(String, String)> {

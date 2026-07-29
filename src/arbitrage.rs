@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -700,6 +700,10 @@ pub struct PaperOpportunity {
     pub symbol: String,
     pub update_id: u64,
     pub received_unix_us: u64,
+    /// Set only after the exact inventory reservation succeeds. This is
+    /// scheduler telemetry and is deliberately excluded from plan identity.
+    #[serde(skip)]
+    pub reservation_completed_unix_us: u64,
     pub direction: ArbitrageDirection,
     pub dex_pool_index: usize,
     pub dex_pool_generation: u64,
@@ -720,6 +724,10 @@ impl PaperOpportunity {
         ensure!(
             self.received_unix_us > 0,
             "paper opportunity receive timestamp is zero"
+        );
+        ensure!(
+            self.reservation_completed_unix_us > 0,
+            "paper opportunity reservation timestamp is zero"
         );
         ensure!(
             self.token_b_base_units > 0,
@@ -1265,6 +1273,7 @@ pub struct PaperTradeEvent {
     pub state: PaperTradeEventState,
     pub dex_filled: bool,
     pub dex_settlement_log: Option<ChainLog>,
+    pub terminal_observed_at: Instant,
 }
 
 pub struct PaperTradeHandle {
@@ -1433,7 +1442,19 @@ pub fn paper_trade_channel(
     mpsc::UnboundedReceiver<PaperTradeEvent>,
 )> {
     validate_id("engine id", &engine_id, 96)?;
+    let journal_started = Instant::now();
     let coordinator = PaperTradeCoordinator::open(path)?;
+    telemetry.emit(
+        "runtime_journal_recovery",
+        json!({
+            "engine_id": engine_id,
+            "owner": "trade_saga",
+            "journal_scope": "trade",
+            "duration_us": journal_started.elapsed().as_micros(),
+            "active_operation_count": coordinator.active_operations().len(),
+            "outcome": "success",
+        }),
+    );
     let initial_lane = initial_execution_lane(&coordinator);
     let (handle, receiver, discarded) = PaperTradeHandle::channel(initial_lane);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -1587,6 +1608,7 @@ impl PaperTradeTask {
                 state,
                 dex_filled,
                 dex_settlement_log,
+                terminal_observed_at: Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("paper trade event receiver is closed"))
     }

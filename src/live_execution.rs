@@ -1,8 +1,9 @@
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -68,6 +69,7 @@ pub struct ComposedLiveLegExecutor {
     dex_revert_diagnostics: DexRevertDiagnosticHandle,
     telemetry: TelemetryHandle,
     engine_id: String,
+    dex_receipt_observed_at: Mutex<BTreeMap<String, Instant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +169,7 @@ impl ComposedLiveLegExecutor {
             dex_revert_diagnostics,
             telemetry,
             engine_id,
+            dex_receipt_observed_at: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -234,6 +237,14 @@ impl ComposedLiveLegExecutor {
                                         operation_id,
                                         surplus_token_b_base_units = surplus,
                                         "favorable DEX output above the immutable hedge envelope remains in wallet inventory"
+                                    );
+                                }
+                                if let Ok(mut timings) = self.dex_receipt_observed_at.lock() {
+                                    timings.insert(intent.plan_id.clone(), Instant::now());
+                                } else {
+                                    tracing::warn!(
+                                        plan_id = intent.plan_id,
+                                        "DEX receipt latency telemetry lock is poisoned"
                                     );
                                 }
                                 (role, result)
@@ -399,7 +410,7 @@ impl ComposedLiveLegExecutor {
         let Some(limit_price) = limit_price else {
             return failed(role, "cex:missing-limit");
         };
-        let planned = match plan_limit_ioc(
+        let mut planned = match plan_limit_ioc(
             client_order_id.clone(),
             client_order_id.clone(),
             target_token_b_delta_base_units,
@@ -431,6 +442,16 @@ impl ComposedLiveLegExecutor {
                 );
                 tracing::error!(client_order_id, error = %error, "bounded Binance IOC plan is invalid");
                 return failed(role, "cex:invalid-plan");
+            }
+        };
+        planned.request.latency_origin = match self.dex_receipt_observed_at.lock() {
+            Ok(mut timings) => timings.remove(&intent.plan_id),
+            Err(_) => {
+                tracing::warn!(
+                    plan_id = intent.plan_id,
+                    "DEX receipt latency telemetry lock is poisoned"
+                );
+                None
             }
         };
         let placement = self.emit_binance_order_plan(
@@ -998,7 +1019,19 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
     mpsc::UnboundedReceiver<PaperTradeEvent>,
 )> {
     risk_limits.validate()?;
+    let journal_started = Instant::now();
     let coordinator = PaperTradeCoordinator::open(path)?;
+    telemetry.emit(
+        "runtime_journal_recovery",
+        serde_json::json!({
+            "engine_id": engine_id,
+            "owner": "trade_saga",
+            "journal_scope": "trade",
+            "duration_us": duration_us(journal_started.elapsed()),
+            "active_operation_count": coordinator.active_operations().len(),
+            "outcome": "success",
+        }),
+    );
     let initial_lane = initial_execution_lane(&coordinator);
     let (handle, receiver, _discarded) = PaperTradeHandle::channel(initial_lane);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -1107,16 +1140,25 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         let preflight_result = opportunity
             .validate()
             .and_then(|()| self.authorize_entry(&opportunity));
+        let preflight_outcome = if preflight_result.is_ok() {
+            "success"
+        } else {
+            "failed"
+        };
         self.emit_live_stage(
             &plan_id,
             &plan_id,
             "entry_validation_preflight",
             duration_us(preflight_started.elapsed()),
-            if preflight_result.is_ok() {
-                "success"
-            } else {
-                "failed"
-            },
+            preflight_outcome,
+            None,
+        );
+        self.emit_live_stage(
+            &plan_id,
+            &plan_id,
+            "reservation_to_preflight_proof",
+            elapsed_since_unix_us(opportunity.reservation_completed_unix_us),
+            preflight_outcome,
             None,
         );
         preflight_result?;
@@ -1131,6 +1173,18 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             &plan_id,
             &plan_id,
             "coordinator_admit_journal",
+            duration_us(coordinator_admit_started.elapsed()),
+            if admit_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+            None,
+        );
+        self.emit_live_stage(
+            &plan_id,
+            &plan_id,
+            "preflight_proof_to_parent_fsync",
             duration_us(coordinator_admit_started.elapsed()),
             if admit_result.is_ok() {
                 "success"
@@ -1444,6 +1498,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 state,
                 dex_filled,
                 dex_settlement_log,
+                terminal_observed_at: Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("live trade event receiver is closed"))
     }
@@ -1758,6 +1813,7 @@ mod tests {
             symbol: "WLDUSDC".to_owned(),
             update_id: 7,
             received_unix_us: 1_800_000_000_000_000,
+            reservation_completed_unix_us: 1_800_000_000_000_001,
             direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             dex_pool_index: 0,
             dex_pool_generation: 1,
@@ -1801,6 +1857,14 @@ mod tests {
                 deadline_unix_seconds: 1_800_000_030,
             },
         }
+    }
+
+    #[test]
+    fn reservation_timestamp_does_not_change_plan_identity() {
+        let mut first = opportunity();
+        let plan_id = first.plan_id();
+        first.reservation_completed_unix_us += 99;
+        assert_eq!(first.plan_id(), plan_id);
     }
 
     fn result(token_b: i128, token_a: i128, gas: u128, reference: &str) -> LegResult {

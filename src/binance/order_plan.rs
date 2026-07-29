@@ -80,6 +80,7 @@ pub fn plan_limit_ioc(
             quantity,
             price,
         },
+        latency_origin: None,
     };
     request.validate()?;
     Ok(Some(PlannedLimitIoc {
@@ -158,6 +159,7 @@ pub fn plan_market_order(
         client_order_id,
         symbol: rules.symbol.clone(),
         kind,
+        latency_origin: None,
     };
     request.validate()?;
     Ok(Some(PlannedMarketOrder {
