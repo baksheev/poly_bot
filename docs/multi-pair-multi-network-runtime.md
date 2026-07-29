@@ -1011,7 +1011,11 @@ Prepared CLMM segments store only their cumulative end points; each segment's
 start is the preceding end point and is derived during lookup. The bounded
 curve vector reserves 128 segments, covering the measured sparse V3 execution
 envelope without allocator growth while adding only bounded sub-megabyte
-working-set overhead to the current four-pool runtime. Exact quote parity and
+working-set overhead to the current four-pool runtime. Each pool also shares an
+immutable cache of the square-root prices at empty bitmap-word boundaries
+across its cheap event-build clones. Initialized ticks still use the canonical
+tick calculation, while sparse empty-word traversal avoids recalculating the
+same deterministic boundary prices after every swap. Exact quote parity and
 rounding remain regression-tested at every segment boundary.
 
 `m0_cohort.sql` is the authoritative cohort gate in

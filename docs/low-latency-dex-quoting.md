@@ -131,7 +131,11 @@ traversal and stores contiguous cumulative segments with the original
 rounding. A quote then performs a binary search and at most one
 `compute_swap_step`; an amount above the prepared execution envelope fails in
 constant time. Capacity-search probes use the curve directly and do not need
-their own cache.
+their own cache. Empty bitmap-word boundary square-root prices are immutable
+for a tick spacing and are cached once per hydrated pool, then shared by the
+pool clones sent through the inline refresh path. This removes repeated tick
+exponentiation from sparse rebuilds without coalescing word boundaries or
+changing per-boundary fee rounding.
 
 Any applied `Swap`, `Mint`, `Burn`, or `ModifyLiquidity` event immediately
 marks only the affected pool stale, clears its rings, and rebuilds that pool's

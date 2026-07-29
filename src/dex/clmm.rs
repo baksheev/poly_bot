@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, fmt};
+use std::{collections::HashMap, error::Error, fmt, sync::Arc};
 
 use alloy_primitives::{I256, U256};
 use anyhow::{Context, ensure};
@@ -28,6 +28,7 @@ pub struct ClmmPool {
     pub liquidity: u128,
     tick_bitmap: HashMap<i16, U256>,
     ticks: HashMap<i32, TickLiquidity>,
+    word_boundary_sqrt_ratios: Arc<HashMap<i32, U256>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,7 @@ impl ClmmPool {
             liquidity,
             tick_bitmap: HashMap::new(),
             ticks: HashMap::new(),
+            word_boundary_sqrt_ratios: Arc::new(word_boundary_sqrt_ratios(tick_spacing)?),
         })
     }
 
@@ -285,8 +287,7 @@ impl ClmmPool {
             .context("failed to find next initialized tick")?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
 
-            let sqrt_price_next_x96 =
-                get_sqrt_ratio_at_tick(tick_next).context("failed to price next tick")?;
+            let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
             let target = if zero_for_one {
                 sqrt_price_next_x96.max(sqrt_price_limit_x96)
             } else {
@@ -433,8 +434,7 @@ impl ClmmPool {
             )
             .context("failed to find next initialized tick while preparing curve")?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
-            let sqrt_price_next_x96 =
-                get_sqrt_ratio_at_tick(tick_next).context("failed to price prepared tick")?;
+            let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
             let target = if zero_for_one {
                 sqrt_price_next_x96.max(sqrt_price_limit_x96)
             } else {
@@ -538,8 +538,7 @@ impl ClmmPool {
             .context("failed to find next initialized tick")?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
 
-            let sqrt_price_next_x96 =
-                get_sqrt_ratio_at_tick(tick_next).context("failed to price next tick")?;
+            let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
             let target = if zero_for_one {
                 sqrt_price_next_x96.max(sqrt_price_limit_x96)
             } else {
@@ -607,6 +606,18 @@ impl ClmmPool {
             liquidity_after: liquidity,
             initialized_ticks_crossed,
         })
+    }
+
+    #[inline]
+    fn sqrt_ratio_at_traversal_tick(&self, tick: i32, initialized: bool) -> anyhow::Result<U256> {
+        if !initialized {
+            return self
+                .word_boundary_sqrt_ratios
+                .get(&tick)
+                .copied()
+                .with_context(|| format!("missing cached sqrt ratio for word boundary {tick}"));
+        }
+        get_sqrt_ratio_at_tick(tick).context("failed to price initialized tick")
     }
 }
 
@@ -709,6 +720,33 @@ fn updated_boundary(
         "zero gross tick liquidity has non-zero net liquidity"
     );
     Ok(TickLiquidity { gross, net })
+}
+
+fn word_boundary_sqrt_ratios(tick_spacing: i32) -> anyhow::Result<HashMap<i32, U256>> {
+    let minimum_compressed = MIN_TICK.div_euclid(tick_spacing);
+    let maximum_compressed = MAX_TICK.div_euclid(tick_spacing);
+    let minimum_word = minimum_compressed >> 8;
+    let maximum_word = maximum_compressed >> 8;
+    let mut ratios = HashMap::with_capacity(((maximum_word - minimum_word + 1) as usize) * 2 + 2);
+
+    for word in minimum_word..=maximum_word {
+        let word_start = i64::from(word) << 8;
+        let lower = (word_start * i64::from(tick_spacing))
+            .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
+        let upper = ((word_start + 255) * i64::from(tick_spacing))
+            .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
+        for tick in [lower, upper] {
+            ratios.entry(tick).or_insert(
+                get_sqrt_ratio_at_tick(tick).context("failed to cache word-boundary price")?,
+            );
+        }
+    }
+    for tick in [MIN_TICK, MAX_TICK] {
+        ratios
+            .entry(tick)
+            .or_insert(get_sqrt_ratio_at_tick(tick).context("failed to cache terminal price")?);
+    }
+    Ok(ratios)
 }
 
 #[cfg(test)]

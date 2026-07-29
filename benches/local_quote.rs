@@ -50,6 +50,9 @@ fn main() {
     });
 
     let sparse = sparse_pool();
+    measure_iterations("prepare_sparse_exact_input_curve", 20_000, || {
+        sparse.prepare_exact_input_curve(true).unwrap()
+    });
     let prepared_sparse = sparse.prepare_exact_output_curve(true).unwrap();
     let above_capacity = prepared_sparse.specified_capacity() + U256::ONE;
     measure_iterations("iterative_exact_out_above_sparse_capacity", 20_000, || {
