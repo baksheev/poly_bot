@@ -311,21 +311,21 @@ impl BookTickerFeed {
             serde_json::from_slice(payload).context("invalid Binance stream JSON")?;
         match envelope.event_type {
             Some("bookTicker") | None => {
-                let wire_symbol: WireSymbol<'_> =
-                    serde_json::from_slice(payload).context("invalid Binance bookTicker symbol")?;
+                let frame: WireBookTicker<'_> =
+                    serde_json::from_slice(payload).context("invalid Binance bookTicker JSON")?;
                 let symbol = self
                     .symbols
                     .iter()
-                    .find(|symbol| symbol.as_ref() == wire_symbol.symbol)
+                    .find(|symbol| symbol.as_ref() == frame.symbol)
                     .cloned()
                     .with_context(|| {
                         format!(
                             "received Binance symbol {} outside configured stream shard",
-                            wire_symbol.symbol
+                            frame.symbol
                         )
                     })?;
-                let mut quote = parse_book_ticker(
-                    payload,
+                let mut quote = top_of_book_from_frame(
+                    frame,
                     symbol,
                     self.generation,
                     received_at,
@@ -449,12 +449,6 @@ struct WireEventType<'a> {
 }
 
 #[derive(Deserialize)]
-struct WireSymbol<'a> {
-    #[serde(rename = "s")]
-    symbol: &'a str,
-}
-
-#[derive(Deserialize)]
 struct WireSubscriptionAck {
     result: serde_json::Value,
     id: u64,
@@ -487,6 +481,7 @@ struct WireBookTicker<'a> {
     ask_quantity: &'a str,
 }
 
+#[cfg(test)]
 fn parse_book_ticker(
     payload: &[u8],
     expected_symbol: Arc<str>,
@@ -497,6 +492,22 @@ fn parse_book_ticker(
     let frame: WireBookTicker<'_> =
         serde_json::from_slice(payload).context("invalid Binance bookTicker JSON")?;
 
+    top_of_book_from_frame(
+        frame,
+        expected_symbol,
+        generation,
+        received_at,
+        received_unix_us,
+    )
+}
+
+fn top_of_book_from_frame(
+    frame: WireBookTicker<'_>,
+    expected_symbol: Arc<str>,
+    generation: u64,
+    received_at: std::time::Instant,
+    received_unix_us: u64,
+) -> anyhow::Result<TopOfBook> {
     if let Some(event_type) = frame.event_type {
         ensure!(
             event_type == "bookTicker",
