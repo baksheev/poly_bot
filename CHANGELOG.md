@@ -20,6 +20,11 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Classify a journaled DEX `status=0` receipt and a proven pre-submission
+  rejection as expected terminal warnings while retaining `ERROR` for unknown
+  DEX outcomes, accounting failures, and confirmation failures. Receipt
+  telemetry, gas accounting, revert diagnostics, and trading semantics are
+  unchanged.
 - Add the M4 multi-strategy hot-path owner. The compiled domain now supplies
   exact symbol/pool dependencies for WLD and ESP; the primary process directly
   evaluates both strategy-price streams, keeps ESP read-only behind a

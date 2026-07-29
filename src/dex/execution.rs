@@ -1038,7 +1038,7 @@ impl DexExecutor {
                 "DEX transaction mined successfully and was journaled"
             );
         } else {
-            tracing::error!(
+            tracing::warn!(
                 operation_id,
                 transaction_hash = %receipt.transaction_hash,
                 block_number = receipt.block_number,
@@ -1313,11 +1313,31 @@ impl DexExecutionService {
                                     if result.is_ok() { "success" } else { "failed" },
                                 );
                                 if let Err(error) = &result {
-                                    tracing::error!(
-                                        operation_id,
-                                        error = %error,
-                                        "DEX execution request failed; inspect transaction journal before retry"
-                                    );
+                                    match error {
+                                        DexExecutionServiceError::Reverted { .. } => {
+                                            tracing::warn!(
+                                                operation_id,
+                                                error = %error,
+                                                "DEX execution request reached a known reverted receipt"
+                                            );
+                                        }
+                                        DexExecutionServiceError::FailedBeforeSubmission {
+                                            ..
+                                        } => {
+                                            tracing::warn!(
+                                                operation_id,
+                                                error = %error,
+                                                "DEX execution request failed before submission"
+                                            );
+                                        }
+                                        DexExecutionServiceError::OutcomeUnknown { .. } => {
+                                            tracing::error!(
+                                                operation_id,
+                                                error = %error,
+                                                "DEX execution outcome is unknown; inspect transaction journal before recovery"
+                                            );
+                                        }
+                                    }
                                 }
                                 if work.response.send(result).is_err() {
                                     tracing::warn!(
