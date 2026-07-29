@@ -69,6 +69,10 @@ jobs:
           test "$(jq -r '.bundle_id' "${domain_config}")" = arb-bot-production-multi-pair-v1
           test "$(jq -c '.instruments | map(.symbol)' "${domain_config}")" \
             = '["ESPUSDC","WLDUSDC"]'
+          test "$(jq -c '.stream_shards' "${domain_config}")" = \
+            '[{"id":"stream:binance-spot:primary:0","account_id":"binance-spot:primary","instrument_ids":["binance-spot:primary:ESPUSDC","binance-spot:primary:WLDUSDC"]}]'
+          test "$(jq -c '[.venue_assets[] | select(.kind == "binance_spot") | .symbol]' "${domain_config}")" \
+            = '["BNB","ESP","USDC","WLD"]'
           test "$(jq -c '.networks | map(.id)' "${domain_config}")" \
             = '["eip155:42161","eip155:480"]'
           test "$(jq -c '.capabilities' "${domain_config}")" = \

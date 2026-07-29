@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use alloy_primitives::{Address, B256, U256};
 use anyhow::ensure;
+use futures_util::future::try_join_all;
 use rust_decimal::Decimal;
 use tokio::{
     sync::{mpsc, watch},
@@ -101,7 +102,7 @@ pub struct BalanceSync {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_balance_sync(
     mut binance: BinanceAccountClient,
-    binance_symbol: String,
+    binance_symbols: Vec<String>,
     binance_assets: Vec<Arc<str>>,
     binance_interval: std::time::Duration,
     wallet_rpc: JsonRpcClient,
@@ -124,13 +125,21 @@ pub fn spawn_balance_sync(
             let started = Instant::now();
             let reconciliation = match tokio::try_join!(
                 binance.account_information(),
-                binance.open_orders(&binance_symbol),
+                try_join_all(
+                    binance_symbols
+                        .iter()
+                        .map(|symbol| binance.open_orders(symbol))
+                ),
             ) {
                 Ok(reconciliation) => Ok(reconciliation),
                 Err(first_error) => match binance.synchronize_clock().await {
                     Ok(()) => tokio::try_join!(
                         binance.account_information(),
-                        binance.open_orders(&binance_symbol),
+                        try_join_all(
+                            binance_symbols
+                                .iter()
+                                .map(|symbol| binance.open_orders(symbol))
+                        ),
                     ),
                     Err(clock_error) => Err(anyhow::anyhow!(
                         "{first_error:#}; Binance clock resynchronization failed: {clock_error:#}"
@@ -147,6 +156,7 @@ pub fn spawn_balance_sync(
                     BalanceEvent::BinanceOpenOrders {
                         client_order_ids: open_orders
                             .into_iter()
+                            .flatten()
                             .map(|order| order.client_order_id)
                             .collect(),
                         observed_at: Instant::now(),

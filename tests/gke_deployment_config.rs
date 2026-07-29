@@ -57,6 +57,9 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("compiled-multi-pair-production.v1.json"));
     assert!(DEPLOY_WORKFLOW.contains(".bundle_kind"));
     assert!(DEPLOY_WORKFLOW.contains(".capabilities"));
+    assert!(DEPLOY_WORKFLOW.contains(".stream_shards"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:ESPUSDC"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:WLDUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("live_runtime"));
     assert!(DEPLOY_WORKFLOW.contains("public_price_collector"));
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));

@@ -32,7 +32,8 @@ type BinanceSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// path. Reconnects remain fail-closed through the normal feed state events.
 pub struct BookTickerFeed {
     base_url: String,
-    symbol: Arc<str>,
+    symbols: Vec<Arc<str>>,
+    depth_symbol: Option<Arc<str>>,
     generation: u64,
     socket: Option<BinanceSocket>,
     reconnect_delay: Duration,
@@ -40,21 +41,33 @@ pub struct BookTickerFeed {
     rotate_at: TokioInstant,
     depth_client: Option<BinanceAccountClient>,
     depth_book: Option<SpotDepthBook>,
+    pending_events: VecDeque<MarketEvent>,
 }
 
 impl BookTickerFeed {
     pub fn new(config: &AppConfig, symbol: String) -> Self {
+        Self::from_symbols(config, vec![symbol], None, None)
+    }
+
+    fn from_symbols(
+        config: &AppConfig,
+        symbols: Vec<String>,
+        depth_symbol: Option<String>,
+        depth_client: Option<BinanceAccountClient>,
+    ) -> Self {
         let now = TokioInstant::now();
         Self {
             base_url: config.binance_ws_base_url.trim_end_matches('/').to_owned(),
-            symbol: Arc::from(symbol),
+            symbols: symbols.into_iter().map(Arc::from).collect(),
+            depth_symbol: depth_symbol.map(Arc::from),
             generation: 0,
             socket: None,
             reconnect_delay: INITIAL_RECONNECT_DELAY,
             connect_not_before: now,
             rotate_at: now + ROTATE_CONNECTION_AFTER,
-            depth_client: None,
+            depth_client,
             depth_book: None,
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -63,9 +76,44 @@ impl BookTickerFeed {
         symbol: String,
         depth_client: BinanceAccountClient,
     ) -> Self {
-        let mut feed = Self::new(config, symbol);
-        feed.depth_client = Some(depth_client);
-        feed
+        Self::from_symbols(
+            config,
+            vec![symbol.clone()],
+            Some(symbol),
+            Some(depth_client),
+        )
+    }
+
+    /// Builds one deterministic Binance Spot stream shard. Every bookTicker is
+    /// parsed in the decision-owner task; only the execution symbol carries the
+    /// heavier depth bootstrap.
+    pub fn new_shard_with_depth(
+        config: &AppConfig,
+        mut symbols: Vec<String>,
+        depth_symbol: String,
+        depth_client: BinanceAccountClient,
+    ) -> anyhow::Result<Self> {
+        symbols.sort();
+        symbols.dedup();
+        ensure!(!symbols.is_empty(), "Binance stream shard is empty");
+        ensure!(
+            symbols.iter().any(|symbol| symbol == &depth_symbol),
+            "depth symbol {depth_symbol} is absent from Binance stream shard"
+        );
+        for symbol in &symbols {
+            ensure!(
+                symbol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+                "invalid Binance stream symbol {symbol}"
+            );
+        }
+        Ok(Self::from_symbols(
+            config,
+            symbols,
+            Some(depth_symbol),
+            Some(depth_client),
+        ))
     }
 
     pub fn depth_book(&self) -> Option<&SpotDepthBook> {
@@ -74,6 +122,9 @@ impl BookTickerFeed {
 
     pub async fn next_event(&mut self) -> MarketEvent {
         loop {
+            if let Some(event) = self.pending_events.pop_front() {
+                return event;
+            }
             if self.socket.is_none() {
                 tokio::time::sleep_until(self.connect_not_before).await;
                 let next_generation = self.generation.saturating_add(1);
@@ -83,11 +134,21 @@ impl BookTickerFeed {
                         self.socket = Some(socket);
                         self.reconnect_delay = INITIAL_RECONNECT_DELAY;
                         self.rotate_at = TokioInstant::now() + ROTATE_CONNECTION_AFTER;
-                        return MarketEvent::FeedConnected {
-                            symbol: Arc::clone(&self.symbol),
-                            generation: self.generation,
-                            observed_at: std::time::Instant::now(),
-                        };
+                        let observed_at = std::time::Instant::now();
+                        self.pending_events
+                            .extend(
+                                self.symbols
+                                    .iter()
+                                    .map(|symbol| MarketEvent::FeedConnected {
+                                        symbol: Arc::clone(symbol),
+                                        generation: self.generation,
+                                        observed_at,
+                                    }),
+                            );
+                        return self
+                            .pending_events
+                            .pop_front()
+                            .expect("validated Binance shard is non-empty");
                     }
                     Err(error) => {
                         return self.disconnect(format!("{error:#}"));
@@ -123,11 +184,18 @@ impl BookTickerFeed {
                             if let Err(error) = socket.send(Message::Pong(payload)).await {
                                 return self.disconnect(format!("failed to send Binance pong: {error:#}"));
                             }
-                            return MarketEvent::FeedHeartbeat {
-                                symbol: Arc::clone(&self.symbol),
-                                generation: self.generation,
-                                observed_at: std::time::Instant::now(),
-                            };
+                            let observed_at = std::time::Instant::now();
+                            self.pending_events.extend(self.symbols.iter().map(|symbol| {
+                                MarketEvent::FeedHeartbeat {
+                                    symbol: Arc::clone(symbol),
+                                    generation: self.generation,
+                                    observed_at,
+                                }
+                            }));
+                            return self
+                                .pending_events
+                                .pop_front()
+                                .expect("validated Binance shard is non-empty");
                         }
                         Message::Pong(_) => {}
                         Message::Close(frame) => {
@@ -142,13 +210,14 @@ impl BookTickerFeed {
 
     async fn connect(&mut self, generation: u64) -> anyhow::Result<BinanceSocket> {
         let with_depth = self.depth_client.is_some();
-        let url = if with_depth {
+        let multiplexed = self.symbols.len() > 1;
+        let url = if with_depth || multiplexed {
             self.base_url.clone()
         } else {
             format!(
                 "{}/{}@bookTicker",
                 self.base_url,
-                self.symbol.to_ascii_lowercase()
+                self.symbols[0].to_ascii_lowercase()
             )
         };
         let (mut socket, response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url))
@@ -159,7 +228,7 @@ impl BookTickerFeed {
             "Binance WebSocket upgrade returned {}",
             response.status()
         );
-        if with_depth {
+        if with_depth || multiplexed {
             tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 self.subscribe_and_bootstrap_depth(&mut socket, generation),
@@ -168,7 +237,8 @@ impl BookTickerFeed {
             .context("Binance depth bootstrap timed out")??;
         }
         tracing::info!(
-            symbol = self.symbol.as_ref(),
+            symbols = ?self.symbols,
+            depth_symbol = ?self.depth_symbol,
             generation,
             %url,
             "Binance Spot bookTicker connected"
@@ -181,15 +251,12 @@ impl BookTickerFeed {
         socket: &mut BinanceSocket,
         generation: u64,
     ) -> anyhow::Result<()> {
-        let stream_symbol = self.symbol.to_ascii_lowercase();
+        let params = subscription_params(&self.symbols, self.depth_symbol.as_deref());
         socket
             .send(Message::Text(
                 json!({
                     "method": "SUBSCRIBE",
-                    "params": [
-                        format!("{stream_symbol}@bookTicker"),
-                        format!("{stream_symbol}@depth@100ms"),
-                    ],
+                    "params": params,
                     "id": generation,
                 })
                 .to_string()
@@ -203,9 +270,18 @@ impl BookTickerFeed {
             .depth_client
             .as_ref()
             .context("Binance depth client disappeared")?
-            .depth_snapshot(&self.symbol, 5_000)
+            .depth_snapshot(
+                self.depth_symbol
+                    .as_deref()
+                    .context("Binance depth symbol disappeared")?,
+                5_000,
+            )
             .await?;
-        let mut book = SpotDepthBook::from_snapshot(self.symbol.to_string(), snapshot)?;
+        let depth_symbol = self
+            .depth_symbol
+            .as_ref()
+            .context("Binance depth symbol disappeared")?;
+        let mut book = SpotDepthBook::from_snapshot(depth_symbol.to_string(), snapshot)?;
         loop {
             let payload = match buffered.pop_front() {
                 Some(payload) => payload,
@@ -215,7 +291,7 @@ impl BookTickerFeed {
                 serde_json::from_slice(&payload).context("invalid Binance stream JSON")?;
             match envelope.event_type {
                 Some("depthUpdate") => {
-                    let update = parse_depth_update(&payload, &self.symbol)?;
+                    let update = parse_depth_update(&payload, depth_symbol)?;
                     if book.apply(update)? == DepthApplyResult::Applied {
                         self.depth_book = Some(book);
                         return Ok(());
@@ -235,9 +311,22 @@ impl BookTickerFeed {
             serde_json::from_slice(payload).context("invalid Binance stream JSON")?;
         match envelope.event_type {
             Some("bookTicker") | None => {
+                let wire_symbol: WireSymbol<'_> =
+                    serde_json::from_slice(payload).context("invalid Binance bookTicker symbol")?;
+                let symbol = self
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.as_ref() == wire_symbol.symbol)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "received Binance symbol {} outside configured stream shard",
+                            wire_symbol.symbol
+                        )
+                    })?;
                 let mut quote = parse_book_ticker(
                     payload,
-                    Arc::clone(&self.symbol),
+                    symbol,
                     self.generation,
                     received_at,
                     received_unix_us,
@@ -247,7 +336,11 @@ impl BookTickerFeed {
                 Ok(MarketEvent::BinanceTopOfBook(quote))
             }
             Some("depthUpdate") => {
-                let update = parse_depth_update(payload, &self.symbol)?;
+                let depth_symbol = self
+                    .depth_symbol
+                    .as_ref()
+                    .context("Binance depth update arrived on a shard without depth")?;
+                let update = parse_depth_update(payload, depth_symbol)?;
                 let exchange_event_ts_ms = update.event_time_ms;
                 let book = self
                     .depth_book
@@ -259,7 +352,7 @@ impl BookTickerFeed {
                     "stale Binance depth event after bootstrap"
                 );
                 Ok(MarketEvent::BinanceDepthApplied {
-                    symbol: Arc::clone(&self.symbol),
+                    symbol: Arc::clone(depth_symbol),
                     generation: self.generation,
                     last_update_id: book.last_update_id(),
                     exchange_event_ts_ms,
@@ -280,18 +373,27 @@ impl BookTickerFeed {
         self.connect_not_before = TokioInstant::now() + delay;
         self.reconnect_delay = (delay * 2).min(MAX_RECONNECT_DELAY);
         tracing::warn!(
-            symbol = self.symbol.as_ref(),
+            symbols = ?self.symbols,
             generation = self.generation,
             %reason,
             reconnect_delay_ms = delay.as_millis(),
             "Binance bookTicker disconnected"
         );
-        MarketEvent::FeedDisconnected {
-            symbol: Arc::clone(&self.symbol),
-            generation: self.generation,
-            reason,
-            observed_at: std::time::Instant::now(),
-        }
+        let observed_at = std::time::Instant::now();
+        self.pending_events
+            .extend(
+                self.symbols
+                    .iter()
+                    .map(|symbol| MarketEvent::FeedDisconnected {
+                        symbol: Arc::clone(symbol),
+                        generation: self.generation,
+                        reason: reason.clone(),
+                        observed_at,
+                    }),
+            );
+        self.pending_events
+            .pop_front()
+            .expect("validated Binance shard is non-empty")
     }
 }
 
@@ -344,6 +446,12 @@ async fn next_data_payload(socket: &mut BinanceSocket) -> anyhow::Result<Vec<u8>
 struct WireEventType<'a> {
     #[serde(rename = "e")]
     event_type: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct WireSymbol<'a> {
+    #[serde(rename = "s")]
+    symbol: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -426,13 +534,37 @@ fn unix_timestamp_us() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn subscription_params(symbols: &[Arc<str>], depth_symbol: Option<&str>) -> Vec<String> {
+    let mut params: Vec<_> = symbols
+        .iter()
+        .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+        .collect();
+    if let Some(depth_symbol) = depth_symbol {
+        params.push(format!("{}@depth@100ms", depth_symbol.to_ascii_lowercase()));
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use rust_decimal::Decimal;
 
-    use super::parse_book_ticker;
+    use super::{parse_book_ticker, subscription_params};
+
+    #[test]
+    fn builds_deterministic_multi_symbol_subscription_with_one_depth_owner() {
+        let symbols = vec![Arc::<str>::from("ESPUSDC"), Arc::<str>::from("WLDUSDC")];
+        assert_eq!(
+            subscription_params(&symbols, Some("WLDUSDC")),
+            [
+                "espusdc@bookTicker",
+                "wldusdc@bookTicker",
+                "wldusdc@depth@100ms",
+            ]
+        );
+    }
 
     #[test]
     fn parses_spot_book_ticker_without_floating_point() {

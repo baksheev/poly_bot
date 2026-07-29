@@ -1226,6 +1226,20 @@ Linux RSS before/after values before any network connection.
 both compatibility projections from Cloud Logging; the normal M0 hot-path and
 GKE resource reports remain the latency and memory comparison sources.
 
+#### M1 production record
+
+Revision `9c5f929849ec6650338fdac129216ff6dc766a2e` was deployed on
+2026-07-29 as immutable image
+`sha256:4fb9b9207dde26ccaf9b85ef49404e11fd6bb9e2fb0986be6f7374e8786ac5be`.
+Both containers validated the same 25,831-byte compiled bundle before network
+startup. The live projection loaded in 363 microseconds and the collector
+projection in 320 microseconds; observed RSS deltas were 1,613,824 and
+1,634,304 bytes. The first WLD cohort had 499 frames, zero telemetry drops,
+3-microsecond parse p99/max, 24-microsecond socket-to-decision p99, and
+48-microsecond maximum. CPU, memory, throttling, restarts, and production ERROR
+checks showed no M0 regression. This was a deployment regression check, not a
+new formal percentile cohort.
+
 ### M2 — Shared Binance account runtime
 
 Deliver:
@@ -1258,6 +1272,28 @@ Rollback:
 
 - retain the new code but select the single-symbol v12 artifact, or revert to
   the M1 compatibility adapter.
+
+Implementation keeps the compatibility strategy projection for World Chain
+execution, but derives the account-wide symbol, asset, stream-shard, and
+execution-capability registries from the compiled graph. One directly-polled
+Spot socket subscribes deterministically to `ESPUSDC@bookTicker`,
+`WLDUSDC@bookTicker`, and WLD depth; ESP frames are parsed and emitted as
+symbol-scoped observer telemetry in the same owner loop and can never enter
+the WLD execution engine. The startup order is clock synchronization, User
+Data subscription, then one shared `/api/v3/account` generation plus concurrent
+per-symbol filters, commissions, and open-order reads. Periodic account REST
+and all-symbol open-order reconciliation remain in the existing background
+task and cannot head-of-line block socket parsing.
+
+`SharedBinanceRuntime` makes market-data, account-state, User Data, order,
+rate-limit, reconciliation, and capital-saga ownership explicit. Its
+capability check permits WLD orders and rejects ESP orders, and the capital
+owner retains the separate treasury credential scope. The durable order
+journal remains account-wide; restart tests cover interleaved WLD and ESP
+identities and reject duplicate placement after recovery.
+`scripts/report-m2-binance-runtime START_UTC END_UTC` reports the single account
+generation, both hydrated symbols, shard/capability/asset registries, direct
+ESP parse latency, then runs the unchanged M0 report for WLD regression gates.
 
 ### M3 — Network runtime registry and batched hydration
 

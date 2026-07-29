@@ -16,6 +16,10 @@ settlement, reservations, rebalancing, or deployment.
   compatibility projection preserves the reviewed WLD/USDC v12 adaptive-live
   artifact with arbitrage and rebalancing in `full_live`; its collector
   projection preserves non-mutating ESP/USDC v2 behavior.
+- The live container derives one shared Binance account runtime from that
+  bundle: a directly-polled stream shard carries WLDUSDC and ESPUSDC, one
+  account generation hydrates all Spot assets and per-symbol metadata, and the
+  capability boundary continues to reject ESP order placement.
 - The stopped `arb-bot-rust-shadow-gce` VM is a rollback target only. It must
   never run while the GKE Deployment has a nonzero replica count.
 - Rails runs independently with separate mutable state. Rust never reads Rails

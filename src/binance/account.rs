@@ -1,10 +1,12 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     str::FromStr,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail, ensure};
+use futures_util::future::try_join_all;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
@@ -138,28 +140,80 @@ impl BinanceAccountClient {
     }
 
     pub async fn hydrate(&mut self, symbol: &str) -> anyhow::Result<BinanceAccountState> {
+        self.hydrate_symbols([symbol.to_owned()])
+            .await?
+            .into_symbol(symbol)
+    }
+
+    /// Hydrates one account generation and all symbol-local metadata.
+    ///
+    /// `/api/v3/account` and the account-wide rate-limit endpoint are each
+    /// requested once. Symbol filters, commissions, and open orders are fetched
+    /// concurrently and remain isolated in the returned registry.
+    pub async fn hydrate_symbols(
+        &mut self,
+        symbols: impl IntoIterator<Item = String>,
+    ) -> anyhow::Result<SharedBinanceAccountState> {
         let clock_sync = self.synchronize_clock_observed().await?;
-        let (account, commission, exchange_information, open_orders, order_rate_limits) = tokio::try_join!(
-            self.account_information(),
-            self.commission_rates(symbol),
-            self.exchange_information(symbol),
-            self.open_orders(symbol),
-            self.order_rate_limits(),
-        )?;
+        self.hydrate_symbols_after_subscription(symbols, clock_sync)
+            .await
+    }
+
+    /// Completes hydration after the caller has opened User Data using the
+    /// supplied clock observation. This ordering closes the snapshot/stream
+    /// race while still producing exactly one account snapshot generation.
+    pub async fn hydrate_symbols_after_subscription(
+        &self,
+        symbols: impl IntoIterator<Item = String>,
+        clock_sync: BinanceClockSync,
+    ) -> anyhow::Result<SharedBinanceAccountState> {
         ensure!(
-            commission.symbol == symbol,
-            "Binance commission response returned symbol {}, expected {symbol}",
-            commission.symbol
+            clock_sync.offset_ms == self.clock_offset_ms,
+            "Binance clock observation does not belong to this client generation"
         );
-        let symbol_rules = exchange_information.symbol_rules(symbol)?;
-        Ok(BinanceAccountState {
+        let symbols: BTreeSet<_> = symbols.into_iter().collect();
+        ensure!(!symbols.is_empty(), "Binance hydration requires symbols");
+        for symbol in &symbols {
+            validate_symbol(symbol)?;
+        }
+        let client = self;
+        let ((account, account_snapshot_duration_us), order_rate_limits, symbol_states) = tokio::try_join!(
+            async {
+                let started = Instant::now();
+                let account = client.account_information().await?;
+                Ok::<_, anyhow::Error>((account, started.elapsed().as_micros()))
+            },
+            client.order_rate_limits(),
+            try_join_all(symbols.iter().map(|symbol| async move {
+                let (commission, exchange_information, open_orders) = tokio::try_join!(
+                    client.commission_rates(symbol),
+                    client.exchange_information(symbol),
+                    client.open_orders(symbol),
+                )?;
+                ensure!(
+                    commission.symbol == *symbol,
+                    "Binance commission response returned symbol {}, expected {symbol}",
+                    commission.symbol
+                );
+                let symbol_rules = exchange_information.symbol_rules(symbol)?;
+                Ok::<_, anyhow::Error>((
+                    symbol.clone(),
+                    BinanceSymbolState {
+                        commission,
+                        symbol_rules,
+                        open_orders,
+                    },
+                ))
+            })),
+        )?;
+        Ok(SharedBinanceAccountState {
+            generation: 1,
+            account_snapshot_duration_us,
             clock_offset_ms: self.clock_offset_ms,
             clock_sync,
             account,
-            commission,
-            symbol_rules,
-            open_orders,
             order_rate_limits,
+            symbols: symbol_states.into_iter().collect(),
         })
     }
 
@@ -390,6 +444,46 @@ pub struct BinanceAccountState {
     pub symbol_rules: SymbolRules,
     pub open_orders: Vec<OpenOrder>,
     pub order_rate_limits: Vec<OrderRateLimit>,
+}
+
+#[derive(Debug)]
+pub struct SharedBinanceAccountState {
+    pub generation: u64,
+    pub account_snapshot_duration_us: u128,
+    pub clock_offset_ms: i64,
+    pub clock_sync: BinanceClockSync,
+    pub account: AccountInformation,
+    pub order_rate_limits: Vec<OrderRateLimit>,
+    pub symbols: BTreeMap<String, BinanceSymbolState>,
+}
+
+impl SharedBinanceAccountState {
+    pub fn symbol(&self, symbol: &str) -> Option<&BinanceSymbolState> {
+        self.symbols.get(symbol)
+    }
+
+    pub fn into_symbol(mut self, symbol: &str) -> anyhow::Result<BinanceAccountState> {
+        let symbol_state = self
+            .symbols
+            .remove(symbol)
+            .with_context(|| format!("shared Binance account state omitted symbol {symbol}"))?;
+        Ok(BinanceAccountState {
+            clock_offset_ms: self.clock_offset_ms,
+            clock_sync: self.clock_sync,
+            account: self.account,
+            commission: symbol_state.commission,
+            symbol_rules: symbol_state.symbol_rules,
+            open_orders: symbol_state.open_orders,
+            order_rate_limits: self.order_rate_limits,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct BinanceSymbolState {
+    pub commission: CommissionRates,
+    pub symbol_rules: SymbolRules,
+    pub open_orders: Vec<OpenOrder>,
 }
 
 #[derive(Clone, Copy, Debug)]

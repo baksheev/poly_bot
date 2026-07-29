@@ -1,7 +1,7 @@
 # Binance runtime parity and low-latency design
 
 Status: autonomous Spot execution and rebalancing enabled in GKE production
-Last reviewed: 2026-07-26
+Last reviewed: 2026-07-29
 
 ## Decisions
 
@@ -22,6 +22,10 @@ Last reviewed: 2026-07-26
 - Market data, account state, orders, fills, reservations, and recovery state
   live in the Rust process. Postgres and ClickHouse are not coordination or
   readiness dependencies.
+- The compiled account runtime owns WLDUSDC and ESPUSDC together. One
+  deterministic public stream shard is polled directly by the decision owner;
+  WLD retains depth and execution capability, while ESP is symbol-scoped
+  observer input and is rejected by the order-capability boundary.
 
 ## Rails endpoint inventory
 
@@ -96,9 +100,10 @@ close the global execution lane.
 
 ## Faster transport
 
-The target topology uses three persistent Binance connections:
+The target topology uses three persistent Binance connection classes:
 
-1. Spot market-data WebSocket for `bookTicker` and diff depth.
+1. One account-scoped Spot market-data WebSocket shard for both configured
+   `bookTicker` streams and WLD diff depth.
 2. Spot WebSocket API for `order.place`, `order.status`, account queries, and
    the User Data Stream subscription.
 3. A pooled REST client for depth bootstrap and independent recovery.
@@ -108,10 +113,11 @@ the User Data Stream. It owns the WebSocket, routes responses by request ID,
 and forwards id-less subscription events through a bounded lossless channel,
 including while an order response is pending. A transport or protocol break
 fails the runtime closed; the child journal is reconciled after process
-restart. Startup subscribes first,
-then independently re-reads account state and `openOrders`, closing the race
-between the original account snapshot and the first stream event. The steady
-state repeats account and `openOrders` REST reconciliation on the configured
+restart. Startup synchronizes the clock, subscribes User Data, then materializes
+exactly one account snapshot generation together with concurrent per-symbol
+filters, commissions, and `openOrders`, closing the race between the account
+snapshot and the first stream event. The steady state repeats one account
+snapshot and all-symbol `openOrders` REST reconciliation on the configured
 five-second balance interval. Open orders and locked balances remain observable
 but do not remove readiness; admission uses only free balance minus exact
 active reservations. A successful REST account snapshot clears diagnostic

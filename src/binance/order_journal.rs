@@ -562,4 +562,38 @@ mod tests {
         drop(journal);
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn restart_preserves_interleaved_symbol_order_identity_without_duplicates() {
+        let path = path("multi-symbol-restart");
+        let _ = fs::remove_file(&path);
+        let mut wld = intent();
+        wld.operation_id = "rustarb-wld-operation".to_owned();
+        wld.client_order_id = "rustarb-wld-order".to_owned();
+        wld.symbol = "WLDUSDC".to_owned();
+        let mut esp = intent();
+        esp.operation_id = "rustarb-esp-operation".to_owned();
+        esp.client_order_id = "rustarb-esp-order".to_owned();
+        esp.symbol = "ESPUSDC".to_owned();
+        {
+            let mut journal = BinanceOrderJournal::open(&path).unwrap();
+            journal.record_intent(wld.clone()).unwrap();
+            journal.record_intent(esp.clone()).unwrap();
+        }
+
+        let mut recovered = BinanceOrderJournal::open(&path).unwrap();
+        assert_eq!(recovered.active_operations().len(), 2);
+        assert_eq!(
+            recovered.operations()[&wld.client_order_id].intent.symbol,
+            "WLDUSDC"
+        );
+        assert_eq!(
+            recovered.operations()[&esp.client_order_id].intent.symbol,
+            "ESPUSDC"
+        );
+        assert!(recovered.record_intent(wld).is_err());
+        assert!(recovered.record_intent(esp).is_err());
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
 }

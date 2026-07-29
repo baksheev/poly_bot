@@ -27,6 +27,7 @@ use arb_bot::{
     binance::{
         execution::BinanceExecutionService,
         order_journal::{BinanceOrderJournal, BinanceOrderProgress},
+        runtime::SharedBinanceRuntime,
         user_data::UserDataStream,
         validation::{BinanceCanaryKind, execute_order_round_trip},
         ws_api::BinanceWsApiClient,
@@ -43,8 +44,8 @@ use arb_bot::{
     },
     domain::{
         compiled::{
-            CompatibilityRole, CompiledGraphSummary, compile_manifest_to_path,
-            load_compatibility_domain,
+            CompatibilityRole, CompiledBinanceRuntimePlan, CompiledGraphSummary,
+            compile_manifest_to_path, load_compatibility_domain,
         },
         config::{DexProvider, LoadedDomainConfig},
     },
@@ -146,13 +147,14 @@ async fn main() -> anyhow::Result<()> {
                 true,
             )?;
             log_compiled_graph(selection.graph_summary.as_ref());
+            let binance_runtime = selection.binance_runtime.map(Arc::new);
             let domain_config = Arc::new(selection.config);
             let bootstrap = BootstrapTiming {
                 process_started_at,
                 domain_validation_complete_at: Instant::now(),
                 domain_load_us: domain_validation_started_at.elapsed().as_micros(),
             };
-            run(cli.config, domain_config, bootstrap).await
+            run(cli.config, domain_config, binance_runtime, bootstrap).await
         }
         Command::CollectPrices => {
             let selection = load_compatibility_domain(
@@ -1423,9 +1425,45 @@ fn emit_price_collector_evaluation(
     Ok(())
 }
 
+fn market_event_symbol(event: &MarketEvent) -> &str {
+    match event {
+        MarketEvent::FeedConnected { symbol, .. }
+        | MarketEvent::FeedDisconnected { symbol, .. }
+        | MarketEvent::FeedHeartbeat { symbol, .. }
+        | MarketEvent::BinanceDepthApplied { symbol, .. } => symbol,
+        MarketEvent::BinanceTopOfBook(quote) => &quote.symbol,
+    }
+}
+
+fn observed_market_event_fields(event: &MarketEvent) -> (&'static str, u64, u128, usize) {
+    match event {
+        MarketEvent::FeedConnected { generation, .. } => ("connected", *generation, 0, 0),
+        MarketEvent::FeedDisconnected { generation, .. } => ("disconnected", *generation, 0, 0),
+        MarketEvent::FeedHeartbeat { generation, .. } => ("heartbeat", *generation, 0, 0),
+        MarketEvent::BinanceTopOfBook(quote) => (
+            "book_ticker",
+            quote.connection_generation,
+            quote.parse_time_us,
+            quote.wire_frame_size_bytes,
+        ),
+        MarketEvent::BinanceDepthApplied {
+            generation,
+            parse_apply_time_us,
+            wire_frame_size_bytes,
+            ..
+        } => (
+            "depth",
+            *generation,
+            *parse_apply_time_us,
+            *wire_frame_size_bytes,
+        ),
+    }
+}
+
 async fn run(
     config: config::AppConfig,
     domain_config: Arc<LoadedDomainConfig>,
+    compiled_binance_runtime: Option<Arc<CompiledBinanceRuntimePlan>>,
     bootstrap: BootstrapTiming,
 ) -> anyhow::Result<()> {
     let InitializedDex {
@@ -1449,13 +1487,70 @@ async fn run(
         bootstrap,
         dex_timings,
     );
-    let binance_symbols = domain_config.binance_symbols();
+    let pair = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.market_data_enabled)
+        .context("balance synchronization requires one enabled pair")?;
+    let binance_symbols = compiled_binance_runtime
+        .as_ref()
+        .map(|runtime| runtime.symbols.clone())
+        .unwrap_or_else(|| domain_config.binance_symbols());
     ensure!(
-        binance_symbols.len() == 1,
-        "direct Binance hot path currently requires exactly one enabled symbol"
+        binance_symbols
+            .iter()
+            .any(|symbol| symbol == &pair.binance.symbol),
+        "shared Binance runtime omitted execution symbol {}",
+        pair.binance.symbol
     );
+    if let Some(runtime) = compiled_binance_runtime.as_ref() {
+        ensure!(
+            runtime.stream_shards.len() == 1,
+            "current production account requires one directly-polled Binance stream shard"
+        );
+        ensure!(
+            runtime.stream_shards[0].symbols == binance_symbols,
+            "compiled Binance stream shard and account symbol registry differ"
+        );
+        ensure!(
+            runtime.executable_symbols.len() == 1
+                && runtime.executable_symbols.contains(&pair.binance.symbol),
+            "compiled Binance capabilities must enable only the reviewed WLD execution symbol"
+        );
+    }
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
-    let binance_account = binance_account_client.hydrate(&binance_symbols[0]).await?;
+    let startup_binance_clock_sync = binance_account_client.synchronize_clock_observed().await?;
+    let mut user_data_stream =
+        UserDataStream::connect(&config, startup_binance_clock_sync.offset_ms).await?;
+    let shared_binance_account = binance_account_client
+        .hydrate_symbols_after_subscription(binance_symbols.clone(), startup_binance_clock_sync)
+        .await?;
+    let binance_account_generation = shared_binance_account.generation;
+    let binance_account_snapshot_duration_us = shared_binance_account.account_snapshot_duration_us;
+    let hydrated_binance_symbols: Vec<_> = shared_binance_account.symbols.keys().cloned().collect();
+    let hydrated_binance_open_orders: usize = shared_binance_account
+        .symbols
+        .values()
+        .map(|symbol| symbol.open_orders.len())
+        .sum();
+    let shared_binance_runtime = match compiled_binance_runtime.as_ref() {
+        Some(runtime) => SharedBinanceRuntime::from_compiled(runtime, binance_account_generation)?,
+        None => SharedBinanceRuntime::single_symbol(
+            pair.binance.symbol.clone(),
+            binance_account_generation,
+        )?,
+    };
+    shared_binance_runtime.ensure_order_enabled(&pair.binance.symbol)?;
+    for symbol in &binance_symbols {
+        if symbol != &pair.binance.symbol {
+            ensure!(
+                shared_binance_runtime.ensure_order_enabled(symbol).is_err(),
+                "non-reviewed Binance symbol {symbol} unexpectedly permits orders"
+            );
+        }
+    }
+    let binance_account = shared_binance_account.into_symbol(&pair.binance.symbol)?;
     let binance_clock_sync_client = binance_account_client.clone();
     validate_binance_account(&binance_account)?;
     let binance_buy_fee_bps = binance_account
@@ -1464,18 +1559,20 @@ async fn run(
     let binance_sell_fee_bps = binance_account
         .commission
         .conservative_taker_fee_bps("SELL")?;
-    let mut binance_feed = BookTickerFeed::new_with_depth(
-        &config,
-        binance_symbols[0].clone(),
-        binance_account_client.clone(),
-    );
-
-    let pair = domain_config
-        .snapshot()
-        .pairs
-        .iter()
-        .find(|pair| pair.market_data_enabled)
-        .context("balance synchronization requires one enabled pair")?;
+    let mut binance_feed = if compiled_binance_runtime.is_some() {
+        BookTickerFeed::new_shard_with_depth(
+            &config,
+            binance_symbols.clone(),
+            pair.binance.symbol.clone(),
+            binance_account_client.clone(),
+        )?
+    } else {
+        BookTickerFeed::new_with_depth(
+            &config,
+            pair.binance.symbol.clone(),
+            binance_account_client.clone(),
+        )
+    };
     ensure!(
         binance_account.symbol_rules.base_asset == pair.binance.base_asset
             && binance_account.symbol_rules.quote_asset == pair.binance.quote_asset,
@@ -1565,11 +1662,28 @@ async fn run(
                 .context("configured token_b address is invalid")?,
         },
     ];
-    let binance_assets = vec![
-        Arc::<str>::from(pair.binance.quote_asset.as_str()),
-        Arc::<str>::from(pair.binance.base_asset.as_str()),
-        Arc::<str>::from(commission_asset.as_str()),
-    ];
+    let mut binance_asset_symbols = compiled_binance_runtime
+        .as_ref()
+        .map(|runtime| runtime.asset_symbols.clone())
+        .unwrap_or_else(|| {
+            vec![
+                pair.binance.quote_asset.clone(),
+                pair.binance.base_asset.clone(),
+                commission_asset.clone(),
+            ]
+        });
+    if !binance_asset_symbols
+        .iter()
+        .any(|asset| asset == &commission_asset)
+    {
+        binance_asset_symbols.push(commission_asset.clone());
+    }
+    binance_asset_symbols.sort();
+    binance_asset_symbols.dedup();
+    let binance_assets: Vec<_> = binance_asset_symbols
+        .iter()
+        .map(|asset| Arc::<str>::from(asset.as_str()))
+        .collect();
     let initial_wallet_balances = fetch_wallet_snapshot(
         &wallet_rpc,
         wallet_owner,
@@ -1639,28 +1753,23 @@ async fn run(
     } else {
         (None, None)
     };
-    let mut user_data_stream =
-        UserDataStream::connect(&config, binance_account.clock_offset_ms).await?;
     let user_data_subscription_id = user_data_stream.subscription_id();
     let multiplexed_binance_api = user_data_stream.api();
-    let reconciliation_started = std::time::Instant::now();
-    let (reconciled_account, reconciled_open_orders) = tokio::try_join!(
-        binance_account_client.account_information(),
-        binance_account_client.open_orders(&pair.binance.symbol),
-    )?;
     tracing::info!(
-        binance_open_orders = reconciled_open_orders.len(),
-        binance_locked_assets = reconciled_account
+        binance_account_snapshot_generation = binance_account_generation,
+        binance_hydrated_symbols = ?hydrated_binance_symbols,
+        binance_open_orders = hydrated_binance_open_orders,
+        binance_locked_assets = binance_account.account
             .balances
             .iter()
             .filter(|balance| !balance.locked.is_zero())
             .count(),
-        "Binance account reconciled after User Data subscription; open orders and locked balances remain available as diagnostics"
+        "shared Binance account generation materialized; User Data and all symbols use one owner"
     );
     let initial_binance_balances = binance_snapshot(
-        &reconciled_account,
+        &binance_account.account,
         &binance_assets,
-        reconciliation_started.elapsed().as_micros(),
+        binance_account_snapshot_duration_us,
     );
     let entry_preflight = EntryPreflightHandle::default();
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
@@ -1808,7 +1917,7 @@ async fn run(
         wallet_task: mut wallet_balance_task,
     } = spawn_balance_sync(
         binance_account_client,
-        pair.binance.symbol.clone(),
+        binance_symbols.clone(),
         binance_assets,
         Duration::from_millis(config.balance_sync_interval_ms),
         wallet_rpc.clone(),
@@ -1850,7 +1959,7 @@ async fn run(
         config.clone(),
         Arc::clone(&domain_config),
         mirror,
-        telemetry,
+        telemetry.clone(),
         rebalance_tracker,
         arb_bot::engine::TradingExecutionHandles {
             paper_trades,
@@ -1929,6 +2038,20 @@ async fn run(
         domain_snapshot_id = %domain_config.snapshot().snapshot_id,
         domain_config_sha256 = %domain_config.fingerprint_sha256(),
         binance_symbols = ?binance_symbols,
+        binance_account_snapshot_generation = binance_account_generation,
+        binance_account_snapshot_duration_us,
+        binance_hydrated_symbols = ?hydrated_binance_symbols,
+        binance_stream_shards = ?compiled_binance_runtime
+            .as_ref()
+            .map(|runtime| &runtime.stream_shards),
+        binance_runtime_account_id = %shared_binance_runtime.account_id(),
+        binance_runtime_owner_count = shared_binance_runtime.owners().len(),
+        binance_runtime_direct_market_data = ?shared_binance_runtime
+            .owner(arb_bot::binance::runtime::BinanceOwnerKind::MarketData)?,
+        binance_executable_symbols = ?compiled_binance_runtime
+            .as_ref()
+            .map(|runtime| &runtime.executable_symbols),
+        binance_asset_symbols = ?binance_asset_symbols,
         binance_account_type = %binance_account.account.account_type,
         binance_can_trade = binance_account.account.can_trade,
         binance_permissions = ?binance_account.account.permissions,
@@ -2042,7 +2165,28 @@ async fn run(
             },
             event = &mut binance_market_event => {
                 drop(binance_market_event);
-                engine.on_market_event(event, binance_feed.depth_book())?;
+                let event_symbol = market_event_symbol(&event).to_owned();
+                if event_symbol == pair.binance.symbol {
+                    engine.on_market_event(event, binance_feed.depth_book())?;
+                } else {
+                    let (event_kind, generation, parse_time_us, wire_frame_size_bytes) =
+                        observed_market_event_fields(&event);
+                    telemetry.emit(
+                        "binance_shared_stream_event",
+                        serde_json::json!({
+                            "engine_id": config.engine_id,
+                            "account_scope": "primary_spot",
+                            "symbol": event_symbol,
+                            "event_kind": event_kind,
+                            "generation": generation,
+                            "wire_frame_size_bytes": wire_frame_size_bytes,
+                            "parse_time_us": parse_time_us,
+                            "readiness_scope": "symbol",
+                            "execution_enabled": false,
+                            "direct_owner_poll": true,
+                        }),
+                    );
+                }
                 binance_market_event = Box::pin(binance_feed.next_event());
             },
             event = &mut gas_market_event => {

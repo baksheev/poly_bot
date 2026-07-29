@@ -533,6 +533,27 @@ pub struct CompiledDomainGraph {
 pub struct CompatibilitySelection {
     pub config: LoadedDomainConfig,
     pub graph_summary: Option<CompiledGraphSummary>,
+    pub binance_runtime: Option<CompiledBinanceRuntimePlan>,
+}
+
+/// Immutable account-scoped Binance topology consumed by the M2 runtime.
+///
+/// Compatibility projections still select which strategy may execute, while
+/// this plan deliberately retains every instrument on the shared account so
+/// market data and authenticated account state are not rebuilt per pair.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledBinanceRuntimePlan {
+    pub account_id: BinanceAccountId,
+    pub stream_shards: Vec<CompiledBinanceStreamShard>,
+    pub symbols: Vec<String>,
+    pub asset_symbols: Vec<String>,
+    pub executable_symbols: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledBinanceStreamShard {
+    pub id: String,
+    pub symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1030,6 +1051,7 @@ impl CompiledDomainGraph {
         )?;
         Ok(CompatibilitySelection {
             config,
+            binance_runtime: Some(self.binance_runtime_plan()?),
             graph_summary: Some(CompiledGraphSummary {
                 bundle_id: self.bundle.bundle_id.clone(),
                 projection_id: projection.id.clone(),
@@ -1048,6 +1070,94 @@ impl CompiledDomainGraph {
                 rss_after_bytes: None,
                 rss_delta_bytes: None,
             }),
+        })
+    }
+
+    fn binance_runtime_plan(&self) -> anyhow::Result<CompiledBinanceRuntimePlan> {
+        ensure!(
+            self.bundle.accounts.len() == 1,
+            "M2 Binance runtime currently requires exactly one compiled account"
+        );
+        let account_id = self.bundle.accounts[0].id.clone();
+        let instruments_by_id: BTreeMap<_, _> = self
+            .bundle
+            .instruments
+            .iter()
+            .map(|instrument| (instrument.id.clone(), instrument))
+            .collect();
+        let strategies_by_id: BTreeMap<_, _> = self
+            .bundle
+            .strategies
+            .iter()
+            .map(|strategy| (strategy.id.clone(), strategy))
+            .collect();
+        let stream_shards = self
+            .bundle
+            .stream_shards
+            .iter()
+            .filter(|shard| shard.account_id == account_id)
+            .map(|shard| {
+                let symbols = shard
+                    .instrument_ids
+                    .iter()
+                    .map(|instrument_id| {
+                        instruments_by_id
+                            .get(instrument_id)
+                            .map(|instrument| instrument.symbol.clone())
+                            .with_context(|| {
+                                format!(
+                                    "stream shard {} references missing instrument {}",
+                                    shard.id,
+                                    instrument_id.as_str()
+                                )
+                            })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok(CompiledBinanceStreamShard {
+                    id: shard.id.clone(),
+                    symbols,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let symbols = self
+            .bundle
+            .instruments
+            .iter()
+            .filter(|instrument| instrument.account_id == account_id)
+            .map(|instrument| instrument.symbol.clone())
+            .collect();
+        let asset_symbols = self
+            .bundle
+            .venue_assets
+            .iter()
+            .filter(|asset| {
+                asset.kind == VenueAssetKind::BinanceSpot
+                    && asset.account_id.as_ref() == Some(&account_id)
+            })
+            .map(|asset| asset.symbol.clone())
+            .collect();
+        let executable_symbols = self
+            .bundle
+            .capabilities
+            .iter()
+            .filter(|capability| capability.execute)
+            .map(|capability| {
+                let strategy = strategies_by_id
+                    .get(&capability.strategy_id)
+                    .expect("compiled validation checked capability strategy");
+                instruments_by_id
+                    .get(&strategy.instrument_id)
+                    .expect("compiled validation checked strategy instrument")
+                    .symbol
+                    .clone()
+            })
+            .collect();
+        Ok(CompiledBinanceRuntimePlan {
+            account_id,
+            stream_shards,
+            symbols,
+            asset_symbols,
+            executable_symbols,
         })
     }
 }
@@ -1088,6 +1198,7 @@ pub fn load_compatibility_domain(
         Ok(CompatibilitySelection {
             config,
             graph_summary: None,
+            binance_runtime: None,
         })
     }
 }
@@ -1887,6 +1998,19 @@ mod tests {
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
         assert_eq!(bundle.strategies.len(), 2);
         assert_eq!(bundle.pools.len(), 5);
+        let runtime = CompiledDomainGraph::from_bundle(bundle.clone())
+            .unwrap()
+            .binance_runtime_plan()
+            .unwrap();
+        assert_eq!(runtime.symbols, ["ESPUSDC", "WLDUSDC"]);
+        assert_eq!(runtime.stream_shards.len(), 1);
+        assert_eq!(runtime.stream_shards[0].symbols, ["ESPUSDC", "WLDUSDC"]);
+        assert_eq!(
+            runtime.executable_symbols,
+            std::collections::BTreeSet::from(["WLDUSDC".to_owned()])
+        );
+        assert!(runtime.asset_symbols.contains(&"BNB".to_owned()));
+        assert!(runtime.asset_symbols.contains(&"ESP".to_owned()));
         assert_eq!(
             bundle
                 .wallet_locations
