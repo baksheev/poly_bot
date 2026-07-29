@@ -60,6 +60,9 @@ the exact artifact used by each rollout.
 
 ### Fixed
 
+- Interleave newly arrived canonical DEX events between coalesced prepared-pool
+  builds. A multi-pool swap burst can no longer make later logs wait behind the
+  sum of every inline curve build before the owner observes them.
 - Prevent unknown or halted arbitrage operations from dead-ending the global
   execution lane. Their exact inventory reservations remain held and reduce
   available balance while independent plans continue; only a plan that is

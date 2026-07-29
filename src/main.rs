@@ -2241,29 +2241,27 @@ async fn run(
                 let Some(event) = event else {
                     bail!("Alchemy DEX stream stopped; process restart will rehydrate state");
                 };
-                let mut next_event = Some(event);
-                let mut drained_events = 0_usize;
-                while let Some(event) = next_event {
-                    drained_events += 1;
-                    if let Some(request) = process_dex_event_inline(
-                        &mut engine,
-                        event,
-                        &wallet_heads,
-                        &receipt_heads,
-                    )? {
-                        pending_prepared_pool_builds.queue(request);
-                    }
-                    next_event = dex_receiver.try_recv().ok();
+                if let Some(request) = process_dex_event_inline(
+                    &mut engine,
+                    event,
+                    &wallet_heads,
+                    &receipt_heads,
+                )? {
+                    pending_prepared_pool_builds.queue(request);
                 }
-                let prepared_dex = build_prepared_pools_inline(
+                let (prepared_dex, additionally_drained) =
+                    build_prepared_pools_interleaved(
                     &mut engine,
                     &mut pending_prepared_pool_builds,
+                    &mut dex_receiver,
+                    &wallet_heads,
+                    &receipt_heads,
                 )?;
                 if prepared_dex {
                     engine.evaluate_after_dex_refreshes()?;
                 }
                 let handler_duration = handler_started_at.elapsed();
-                engine.record_dex_drain(drained_events, handler_duration);
+                engine.record_dex_drain(1 + additionally_drained, handler_duration);
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -2399,24 +2397,24 @@ async fn run(
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
-                while let Ok(dex_event) = dex_receiver.try_recv() {
-                    if let Some(request) = process_dex_event_inline(
-                        &mut engine,
-                        dex_event,
-                        &wallet_heads,
-                        &receipt_heads,
-                    )? {
-                        pending_prepared_pool_builds.queue(request);
-                    }
-                }
+                drain_dex_events_inline(
+                    &mut engine,
+                    &mut pending_prepared_pool_builds,
+                    &mut dex_receiver,
+                    &wallet_heads,
+                    &receipt_heads,
+                )?;
                 let receipt_refresh = engine.apply_arbitrage_receipt_settlement(&event)?;
                 let receipt_applied = receipt_refresh.is_some();
                 if let Some(refresh) = receipt_refresh {
                     pending_prepared_pool_builds.queue(refresh);
                 }
-                let prepared_dex = build_prepared_pools_inline(
+                let (prepared_dex, _) = build_prepared_pools_interleaved(
                     &mut engine,
                     &mut pending_prepared_pool_builds,
+                    &mut dex_receiver,
+                    &wallet_heads,
+                    &receipt_heads,
                 )?;
                 engine.on_paper_trade_event(event)?;
                 if prepared_dex || receipt_applied {
@@ -2434,19 +2432,12 @@ async fn run(
                 let result = result
                     .context("adaptive sizing worker join set stopped unexpectedly")?
                     .context("adaptive sizing worker panicked")?;
-                while let Ok(event) = dex_receiver.try_recv() {
-                    if let Some(request) = process_dex_event_inline(
-                        &mut engine,
-                        event,
-                        &wallet_heads,
-                        &receipt_heads,
-                    )? {
-                        pending_prepared_pool_builds.queue(request);
-                    }
-                }
-                let prepared_dex = build_prepared_pools_inline(
+                let (prepared_dex, _) = build_prepared_pools_interleaved(
                     &mut engine,
                     &mut pending_prepared_pool_builds,
+                    &mut dex_receiver,
+                    &wallet_heads,
+                    &receipt_heads,
                 )?;
                 if prepared_dex {
                     engine.evaluate_after_dex_refreshes()?;
@@ -2827,15 +2818,42 @@ fn build_prepared_pool_inline(
     engine.on_prepared_pool(result)
 }
 
-fn build_prepared_pools_inline(
+fn drain_dex_events_inline(
     engine: &mut TradingEngine,
     pending: &mut PreparedPoolBuildBatch,
-) -> anyhow::Result<bool> {
-    let prepared = !pending.is_empty();
-    for request in pending.drain() {
-        build_prepared_pool_inline(engine, request)?;
+    dex_receiver: &mut tokio::sync::mpsc::Receiver<arb_bot::market_data::alchemy::DexStreamEvent>,
+    wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+) -> anyhow::Result<usize> {
+    let mut drained = 0;
+    while let Ok(event) = dex_receiver.try_recv() {
+        drained += 1;
+        if let Some(request) = process_dex_event_inline(engine, event, wallet_heads, receipt_heads)?
+        {
+            pending.queue(request);
+        }
     }
-    Ok(prepared)
+    Ok(drained)
+}
+
+fn build_prepared_pools_interleaved(
+    engine: &mut TradingEngine,
+    pending: &mut PreparedPoolBuildBatch,
+    dex_receiver: &mut tokio::sync::mpsc::Receiver<arb_bot::market_data::alchemy::DexStreamEvent>,
+    wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+) -> anyhow::Result<(bool, usize)> {
+    let mut prepared = false;
+    let mut drained = 0;
+    loop {
+        drained +=
+            drain_dex_events_inline(engine, pending, dex_receiver, wallet_heads, receipt_heads)?;
+        let Some(request) = pending.pop_next() else {
+            return Ok((prepared, drained));
+        };
+        build_prepared_pool_inline(engine, request)?;
+        prepared = true;
+    }
 }
 
 fn process_dex_event_inline(

@@ -143,11 +143,13 @@ branch first applies every already-queued canonical event, retaining only the
 newest build request for each affected pool, and then rebuilds those pools
 inline before the owner handles a strategy evaluation. Independent pool builds
 run by ascending last-published segment count, preventing a short curve from
-inheriting an unrelated sparse curve's publication tail. Consequently an
-intermediate generation that no evaluation could observe does not make the
-next queued log wait behind a redundant sparse-curve build. Generation
-validation remains mandatory when publishing a build and again in entry
-preflight.
+inheriting an unrelated sparse curve's publication tail. Between any two
+builds, the owner drains newly arrived canonical events and coalesces their
+requests again. Consequently a log can wait behind at most one bounded curve
+build, not the sum of a multi-pool burst, and an intermediate generation that
+no evaluation could observe does not trigger a redundant sparse build.
+Generation validation remains mandatory when publishing a build and again in
+entry preflight.
 
 `dex_pool_prepared` records the token-A and derived token-B limits, segment
 counts, build time, and total publication time under

@@ -757,13 +757,13 @@ impl PreparedPoolBuildBatch {
         }
     }
 
-    pub fn drain(&mut self) -> impl Iterator<Item = PreparedPoolBuildRequest> + '_ {
-        // Independent pools are not observable until the owner finishes this
-        // batch. Shortest estimated builds go first so a small curve does not
-        // inherit a sparse pool's publication tail.
+    /// Returns one shortest estimated build while leaving the rest attached to
+    /// the owner. The caller can drain newly arrived canonical DEX events
+    /// before taking the next build, bounding receive delay to one curve.
+    pub fn pop_next(&mut self) -> Option<PreparedPoolBuildRequest> {
         self.requests
             .sort_unstable_by_key(|request| (request.estimated_build_segments, request.pool_index));
-        self.requests.drain(..)
+        (!self.requests.is_empty()).then(|| self.requests.remove(0))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1878,7 +1878,7 @@ mod tests {
         batch.queue(current);
 
         assert_eq!(batch.len(), 1);
-        let queued = batch.drain().next().unwrap();
+        let queued = batch.pop_next().unwrap();
         assert_eq!(queued.generation(), expected_generation);
         assert_eq!(queued.estimated_build_segments, expected_estimate);
         assert!(queued.previous_prepared.is_some());
@@ -1907,9 +1907,13 @@ mod tests {
         batch.queue(request(0, 109));
         batch.queue(request(1, 3));
 
-        let order: Vec<_> = batch.drain().map(|request| request.pool_index).collect();
+        let first = batch.pop_next().unwrap();
+        assert_eq!(first.pool_index, 1);
+        assert_eq!(batch.len(), 1);
+        let second = batch.pop_next().unwrap();
 
-        assert_eq!(order, [1, 0]);
+        assert_eq!(second.pool_index, 0);
+        assert!(batch.is_empty());
     }
 
     #[test]
