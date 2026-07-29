@@ -1008,12 +1008,15 @@ the background hot-telemetry task. This prevents telemetry for one pool log
 from increasing the receive-to-owner age of later logs in the same burst.
 
 The owner applies an already-queued canonical DEX burst before doing any curve
-work. Build requests are coalesced by pool generation, preserving first-seen
-pool order and keeping only the newest mirror snapshot for each pool. All
-affected curves are still rebuilt inline before any strategy evaluation,
+work. Build requests are coalesced by pool generation and keep only the newest
+mirror snapshot for each pool. Independent pools are then built by ascending
+last-published segment count, with pool index as the deterministic tie-breaker,
+so a small curve does not wait behind an unrelated sparse curve. A replacement
+generation inherits the estimate captured by the first request for that pool.
+All affected curves are still rebuilt inline before any strategy evaluation,
 receipt settlement completes, or an adaptive-sizing result is accepted. This
 removes an unobservable intermediate build from the receive path of the next
-queued log without weakening generation validation or canonical ordering.
+queued log without weakening generation validation or canonical event order.
 
 Prepared CLMM segments store only their cumulative end points; each segment's
 start is the preceding end point and is derived during lookup. The bounded

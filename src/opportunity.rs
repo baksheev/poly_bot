@@ -171,6 +171,7 @@ pub struct PreparedPoolBuildRequest {
     exact_output_zero_for_one: bool,
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
+    estimated_build_segments: usize,
     timing: PreparedPoolBuildTimingHandle,
 }
 
@@ -574,6 +575,12 @@ impl OpportunityEngine {
             .copied()
             .context("opportunity pool generation index is invalid")?
             .saturating_add(1);
+        let estimated_build_segments = self
+            .prepared_pools
+            .get(pool_index)
+            .context("prepared pool estimate index is invalid")?
+            .as_ref()
+            .map_or(usize::MAX, PreparedPoolQuotes::total_segments);
         self.pool_generations[pool_index] = generation;
         self.prepared_pools[pool_index] = None;
         self.invalidate_pool(pool_index)?;
@@ -586,6 +593,7 @@ impl OpportunityEngine {
             exact_output_zero_for_one: hydrated.token0 == pair.token_a,
             exact_input_zero_for_one: hydrated.token0 == pair.token_b,
             token_a_limit: pair.prepared_token_a_limit,
+            estimated_build_segments,
             timing: PreparedPoolBuildTimingHandle::new(),
         })
     }
@@ -726,14 +734,16 @@ impl PreparedPoolBuildRequest {
 }
 
 impl PreparedPoolBuildBatch {
-    /// Keeps only the newest request for each pool while preserving the order
-    /// in which distinct pools first appeared in the canonical DEX drain.
-    pub fn queue(&mut self, request: PreparedPoolBuildRequest) {
+    /// Keeps only the newest request for each pool. A replacement inherits the
+    /// last published work estimate retained by the first request in the
+    /// canonical drain.
+    pub fn queue(&mut self, mut request: PreparedPoolBuildRequest) {
         if let Some(queued) = self
             .requests
             .iter_mut()
             .find(|queued| queued.pool_index == request.pool_index)
         {
+            request.estimated_build_segments = queued.estimated_build_segments;
             *queued = request;
         } else {
             self.requests.push(request);
@@ -741,6 +751,11 @@ impl PreparedPoolBuildBatch {
     }
 
     pub fn drain(&mut self) -> impl Iterator<Item = PreparedPoolBuildRequest> + '_ {
+        // Independent pools are not observable until the owner finishes this
+        // batch. Shortest estimated builds go first so a small curve does not
+        // inherit a sparse pool's publication tail.
+        self.requests
+            .sort_unstable_by_key(|request| (request.estimated_build_segments, request.pool_index));
         self.requests.drain(..)
     }
 
@@ -751,6 +766,15 @@ impl PreparedPoolBuildBatch {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.requests.len()
+    }
+}
+
+impl PreparedPoolQuotes {
+    fn total_segments(&self) -> usize {
+        self.by_direction[0]
+            .segment_count()
+            .saturating_add(self.by_direction[1].segment_count())
+            .saturating_add(self.token_a_exact_input.segment_count())
     }
 }
 
@@ -1806,6 +1830,9 @@ mod tests {
         let superseded = engine.request_pool_refresh(0, &mirror).unwrap();
         let current = engine.request_pool_refresh(0, &mirror).unwrap();
         let expected_generation = current.generation();
+        let expected_estimate = superseded.estimated_build_segments;
+        assert_ne!(expected_estimate, usize::MAX);
+        assert_eq!(current.estimated_build_segments, usize::MAX);
         let mut batch = PreparedPoolBuildBatch::default();
 
         batch.queue(superseded);
@@ -1814,7 +1841,35 @@ mod tests {
         assert_eq!(batch.len(), 1);
         let queued = batch.drain().next().unwrap();
         assert_eq!(queued.generation(), expected_generation);
+        assert_eq!(queued.estimated_build_segments, expected_estimate);
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn prepared_pool_batch_prioritizes_the_shortest_independent_build() {
+        let request = |pool_index, estimated_build_segments| {
+            let (pair, mirror) = fixture();
+            let initial = super::prepare_pool_quotes(&pair, &mirror, 0, 1).unwrap();
+            let mut engine = OpportunityEngine {
+                pairs: vec![pair],
+                pair_indices_by_symbol: std::collections::HashMap::from([("BA".into(), 0)]),
+                pair_index_by_pool: vec![Some(0)],
+                pool_generations: vec![1],
+                prepared_pools: vec![Some(initial)],
+                baseline_quote_cache: vec![PoolBaselineQuoteCache::default()],
+            };
+            let mut request = engine.request_pool_refresh(0, &mirror).unwrap();
+            request.pool_index = pool_index;
+            request.estimated_build_segments = estimated_build_segments;
+            request
+        };
+        let mut batch = PreparedPoolBuildBatch::default();
+        batch.queue(request(0, 109));
+        batch.queue(request(1, 3));
+
+        let order: Vec<_> = batch.drain().map(|request| request.pool_index).collect();
+
+        assert_eq!(order, [1, 0]);
     }
 
     #[test]

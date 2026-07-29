@@ -141,7 +141,9 @@ Any applied `Swap`, `Mint`, `Burn`, or `ModifyLiquidity` event immediately
 marks only the affected pool stale and clears its rings. The prioritized DEX
 branch first applies every already-queued canonical event, retaining only the
 newest build request for each affected pool, and then rebuilds those pools
-inline before the owner handles a strategy evaluation. Consequently an
+inline before the owner handles a strategy evaluation. Independent pool builds
+run by ascending last-published segment count, preventing a short curve from
+inheriting an unrelated sparse curve's publication tail. Consequently an
 intermediate generation that no evaluation could observe does not make the
 next queued log wait behind a redundant sparse-curve build. Generation
 validation remains mandatory when publishing a build and again in entry
