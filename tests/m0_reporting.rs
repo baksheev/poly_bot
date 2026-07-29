@@ -69,3 +69,21 @@ fn m0_admission_report_is_strategy_and_account_scoped() {
     assert!(query.contains("instrument_id,"));
     assert!(query.contains("network_id,"));
 }
+
+#[test]
+fn admitted_telemetry_carries_the_pair_scope_used_by_the_m0_report() {
+    let engine = fs::read_to_string(repository_root().join("src/engine.rs"))
+        .expect("engine source must be readable");
+    let admitted_payload = engine
+        .split_once("let admitted_payload = json!({")
+        .expect("admitted telemetry payload must exist")
+        .1
+        .split_once("self.telemetry.emit(\"arbitrage_admitted\"")
+        .expect("admitted telemetry emission must exist")
+        .0;
+
+    assert!(
+        admitted_payload.contains("\"pair_id\": pair_id,"),
+        "arbitrage_admitted must carry pair_id for the per-pair M0 report"
+    );
+}

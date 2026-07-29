@@ -2738,6 +2738,7 @@ impl TradingEngine {
         let admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,
+            "pair_id": pair_id,
             "strategy_id": strategy_id(&pair_id),
             "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
             "instrument_id": instrument_id(&pair_symbol),
