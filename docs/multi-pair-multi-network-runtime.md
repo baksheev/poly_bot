@@ -1007,6 +1007,13 @@ base-unit string conversion, JSON construction, and serialization run only on
 the background hot-telemetry task. This prevents telemetry for one pool log
 from increasing the receive-to-owner age of later logs in the same burst.
 
+Prepared CLMM segments store only their cumulative end points; each segment's
+start is the preceding end point and is derived during lookup. The bounded
+curve vector reserves 128 segments, covering the measured sparse V3 execution
+envelope without allocator growth while adding only bounded sub-megabyte
+working-set overhead to the current four-pool runtime. Exact quote parity and
+rounding remain regression-tested at every segment boundary.
+
 `m0_cohort.sql` is the authoritative cohort gate in
 `scripts/report-m0-performance`: WLD percentile claims remain `collecting`
 until the selected half-open window contains at least 100,000 strategy frames,

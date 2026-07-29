@@ -12,6 +12,8 @@ use uniswap_v3_math::{
     },
 };
 
+const PREPARED_CURVE_INITIAL_SEGMENT_CAPACITY: usize = 128;
+
 /// The complete state needed to quote a hookless Uniswap V3/V4 pool locally.
 ///
 /// The maps are mutated only by the engine's single state owner. `quote_exact_in`
@@ -64,8 +66,6 @@ enum PreparedQuoteKind {
 
 #[derive(Debug, Clone, Copy)]
 struct PreparedQuoteSegment {
-    specified_start: U256,
-    result_start: U256,
     specified_end: U256,
     result_end: U256,
     sqrt_price_start_x96: U256,
@@ -404,7 +404,10 @@ impl ClmmPool {
         } else {
             MAX_SQRT_RATIO - U256::ONE
         };
-        let mut segments = Vec::new();
+        // Sparse V3 tails can cross more than one hundred empty bitmap words
+        // inside the reviewed execution envelope. A bounded initial reserve
+        // avoids allocator/copy tails during owner-side curve publication.
+        let mut segments = Vec::with_capacity(PREPARED_CURVE_INITIAL_SEGMENT_CAPACITY);
         let mut specified_total = U256::ZERO;
         let mut result_total = U256::ZERO;
         let mut sqrt_price_x96 = self.sqrt_price_x96;
@@ -460,8 +463,6 @@ impl ClmmPool {
                 .context("prepared result amount overflow")?;
             if !specified_step.is_zero() {
                 segments.push(PreparedQuoteSegment {
-                    specified_start: specified_total,
-                    result_start: result_total,
                     specified_end,
                     result_end,
                     sqrt_price_start_x96: sqrt_price_x96,
@@ -632,8 +633,14 @@ impl PreparedQuoteCurve {
             return Ok(segment.result_end);
         }
 
+        let (specified_start, result_start) = segment_index
+            .checked_sub(1)
+            .and_then(|previous| self.segments.get(previous))
+            .map_or((U256::ZERO, U256::ZERO), |previous| {
+                (previous.specified_end, previous.result_end)
+            });
         let remaining = specified_amount
-            .checked_sub(segment.specified_start)
+            .checked_sub(specified_start)
             .context("prepared quote amount precedes segment")?;
         let amount_remaining = match self.kind {
             PreparedQuoteKind::ExactInput => I256::from_raw(remaining),
@@ -653,8 +660,7 @@ impl PreparedQuoteCurve {
                 .checked_add(fee_amount)
                 .context("prepared exact-output input overflow")?,
         };
-        segment
-            .result_start
+        result_start
             .checked_add(step_result)
             .context("prepared quote result overflow")
     }
@@ -710,7 +716,12 @@ mod tests {
     use alloy_primitives::{U256, uint};
     use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
 
-    use super::ClmmPool;
+    use super::{ClmmPool, PreparedQuoteSegment};
+
+    #[test]
+    fn prepared_segment_keeps_only_non_derivable_state() {
+        assert!(std::mem::size_of::<PreparedQuoteSegment>() <= 144);
+    }
 
     fn pool() -> ClmmPool {
         let mut pool = ClmmPool::new(
@@ -890,25 +901,29 @@ mod tests {
 
         for zero_for_one in [true, false] {
             let exact_in = pool.prepare_exact_input_curve(zero_for_one).unwrap();
+            let mut specified_start = U256::ZERO;
             for segment in &exact_in.segments {
-                for amount in boundary_samples(segment.specified_start, segment.specified_end) {
+                for amount in boundary_samples(specified_start, segment.specified_end) {
                     assert_eq!(
                         exact_in.quote(amount).unwrap(),
                         pool.quote_exact_in_amount_out(zero_for_one, amount)
                             .unwrap()
                     );
                 }
+                specified_start = segment.specified_end;
             }
 
             let exact_out = pool.prepare_exact_output_curve(zero_for_one).unwrap();
+            let mut specified_start = U256::ZERO;
             for segment in &exact_out.segments {
-                for amount in boundary_samples(segment.specified_start, segment.specified_end) {
+                for amount in boundary_samples(specified_start, segment.specified_end) {
                     assert_eq!(
                         exact_out.quote(amount).unwrap(),
                         pool.quote_exact_out_amount_in(zero_for_one, amount)
                             .unwrap()
                     );
                 }
+                specified_start = segment.specified_end;
             }
         }
     }
