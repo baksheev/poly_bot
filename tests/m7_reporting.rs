@@ -20,5 +20,6 @@ fn m7_report_proves_background_compatibility_shadow_planning_and_scoped_faults()
     }
     assert!(query.contains("wld_comparison_mismatches"));
     assert!(query.contains("shadow_mutation_capability_records"));
+    assert!(query.contains("'arb-bot-rust-shadow-gke-'"));
     assert!(query.contains("'ready'"));
 }

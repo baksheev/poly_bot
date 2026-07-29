@@ -19,6 +19,10 @@ WITH events AS
     )
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
+      AND startsWith(
+          JSONExtractString(payload_json, 'engine_id'),
+          'arb-bot-rust-shadow-gke-'
+      )
 )
 SELECT
     engine_id,
