@@ -31,7 +31,15 @@ if [[ ! "${clickhouse_database}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
 fi
 
 query_url="${CLICKHOUSE_URL}?database=${clickhouse_database}&param_start_utc=${start_utc}&param_end_utc=${end_utc}"
-for query_name in m0_cohort m0_counts m0_hot_path m0_admission_execution m0_execution_stages m0_background; do
+for query_name in \
+  m0_cohort \
+  m0_counts \
+  m0_hot_path \
+  m0_dex_pool_hot_path \
+  m0_admission_execution \
+  m0_execution_stages \
+  m0_background
+do
   echo "query=${query_name}"
   curl --fail --silent --show-error \
     --user "${clickhouse_user}:${CLICKHOUSE_PASSWORD}" \

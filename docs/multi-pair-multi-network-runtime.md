@@ -955,8 +955,9 @@ M0 uses the following versioned operator reports:
 
 - `scripts/report-m0-performance START_UTC END_UTC` executes the checked-in
   ClickHouse queries in `scripts/sql/m0_*.sql` and reproduces counts, hot-path,
-  sizing/admission, execution, queue, startup, journal, owner-loop, balance
-  batch, and allocator tables for one half-open UTC window;
+  pool-specific DEX receive/build/publication, sizing/admission, execution,
+  queue, startup, journal, owner-loop, balance batch, and allocator tables for
+  one half-open UTC window;
 - `scripts/report-gke-runtime-resources START_UTC END_UTC` reports aligned GKE
   container CPU, CPU-limit utilization when present, memory, and page-fault
   distributions, then captures read-only cgroup CPU-throttling, memory
@@ -1006,6 +1007,13 @@ as bounded fixed-size records. Pool/pair lookup, compatibility-ID formatting,
 base-unit string conversion, JSON construction, and serialization run only on
 the background hot-telemetry task. This prevents telemetry for one pool log
 from increasing the receive-to-owner age of later logs in the same burst.
+
+The aggregate hot-path table remains stable for comparison with the frozen
+single-engine baseline. A separate `m0_dex_pool_hot_path.sql` table groups the
+DEX event, curve-build, and total publication distributions by engine, pair,
+strategy, network, stable pool ID, and canonical pool identity. It also reports
+complete stage-timing counts and maximum prepared segment counts, so a sparse
+fee tier cannot be hidden inside a faster aggregate pool distribution.
 
 The owner applies an already-queued canonical DEX burst before doing any curve
 work. Build requests are coalesced by pool generation and keep only the newest
