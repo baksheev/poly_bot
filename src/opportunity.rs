@@ -863,8 +863,12 @@ fn prepare_pool_quotes_from_pool(
         "DEX-buy execution envelope has no token-B output"
     );
 
-    let exact_input_token_b_limit =
-        pool.exact_output_result_capacity_bounded(exact_input_zero_for_one, token_a_limit)?;
+    let exact_input = pool.prepare_exact_input_curve_bounded_by_exact_output_reusing(
+        exact_input_zero_for_one,
+        token_a_limit,
+        previous_exact_input,
+    )?;
+    let exact_input_token_b_limit = exact_input.specified_capacity();
     ensure!(
         !exact_input_token_b_limit.is_zero(),
         "DEX-sell execution envelope has no token-B input"
@@ -882,16 +886,6 @@ fn prepare_pool_quotes_from_pool(
             exact_output_token_b_limit,
         )?
     };
-    let exact_input = if let Some(previous) = previous_exact_input {
-        pool.prepare_exact_input_curve_bounded_reusing(
-            exact_input_zero_for_one,
-            exact_input_token_b_limit,
-            previous,
-        )?
-    } else {
-        pool.prepare_exact_input_curve_bounded(exact_input_zero_for_one, exact_input_token_b_limit)?
-    };
-
     Ok(PreparedPoolQuotes {
         by_direction: [exact_output, exact_input],
         token_a_exact_input,

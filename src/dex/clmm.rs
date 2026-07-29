@@ -269,6 +269,7 @@ impl ClmmPool {
     /// Computes the input capacity reached while walking toward a bounded
     /// exact-output amount. Unlike a quote, exhaustion returns the reachable
     /// input capacity, matching a bounded prepared curve's result capacity.
+    #[cfg(test)]
     pub(crate) fn exact_output_result_capacity_bounded(
         &self,
         zero_for_one: bool,
@@ -410,6 +411,166 @@ impl ClmmPool {
             maximum_amount_in,
             Some(previous),
         )
+    }
+
+    /// Builds the exact-input curve whose maximum input is the minimum input
+    /// required to reach `maximum_amount_out`.
+    ///
+    /// The old hot rebuild first walked the pool as exact-output to discover
+    /// that input limit and then walked the same sparse bitmap words again to
+    /// build the exact-input curve. Full word-boundary steps have identical
+    /// cumulative input/output under both views, so retain them directly and
+    /// recompute only the final partial exact-input step where integer rounding
+    /// can differ. This preserves exact quote semantics while removing one
+    /// complete sparse traversal from every prepared-pool refresh.
+    pub(crate) fn prepare_exact_input_curve_bounded_by_exact_output_reusing(
+        &self,
+        zero_for_one: bool,
+        maximum_amount_out: U256,
+        previous: Option<PreparedQuoteCurve>,
+    ) -> anyhow::Result<PreparedQuoteCurve> {
+        ensure!(
+            !maximum_amount_out.is_zero(),
+            "prepared curve output maximum must be positive"
+        );
+        ensure!(
+            maximum_amount_out < (U256::ONE << 255),
+            "prepared curve output maximum exceeds int256"
+        );
+        let sqrt_price_limit_x96 = if zero_for_one {
+            MIN_SQRT_RATIO + U256::ONE
+        } else {
+            MAX_SQRT_RATIO - U256::ONE
+        };
+        let mut segments = if let Some(previous) = previous {
+            let mut segments = previous.segments;
+            segments.clear();
+            segments
+        } else {
+            Vec::with_capacity(PREPARED_CURVE_INITIAL_SEGMENT_CAPACITY)
+        };
+        let mut specified_total = U256::ZERO;
+        let mut result_total = U256::ZERO;
+        let mut result_remaining = maximum_amount_out;
+        let mut sqrt_price_x96 = self.sqrt_price_x96;
+        let mut tick = self.tick;
+        let mut liquidity = self.liquidity;
+        let mut last_productive_segment_count = 0;
+
+        while !result_remaining.is_zero()
+            && sqrt_price_x96 != sqrt_price_limit_x96
+            && liquidity != 0
+        {
+            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
+                &self.tick_bitmap,
+                tick,
+                self.tick_spacing,
+                zero_for_one,
+            )
+            .context("failed to find next initialized tick while preparing fused curve")?;
+            tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
+            let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
+            let target = if zero_for_one {
+                sqrt_price_next_x96.max(sqrt_price_limit_x96)
+            } else {
+                sqrt_price_next_x96.min(sqrt_price_limit_x96)
+            };
+            let (sqrt_after, step_in, step_out, fee_amount) = compute_swap_step(
+                sqrt_price_x96,
+                target,
+                liquidity,
+                -I256::from_raw(result_remaining),
+                self.fee_pips,
+            )
+            .context("failed to build fused exact-output boundary")?;
+            let input_with_fee = step_in
+                .checked_add(fee_amount)
+                .context("fused prepared swap input overflow")?;
+
+            // A partial exact-output step may round to an input whose
+            // exact-input result differs by one base unit. Recompute that one
+            // final step in the curve's actual quote mode; full boundary steps
+            // retain the already exact cumulative values.
+            let partial = sqrt_after != sqrt_price_next_x96;
+            let (specified_step, result_step) = if partial {
+                let (_, exact_input_step_in, exact_input_step_out, exact_input_fee) =
+                    compute_swap_step(
+                        sqrt_price_x96,
+                        target,
+                        liquidity,
+                        I256::from_raw(input_with_fee),
+                        self.fee_pips,
+                    )
+                    .context("failed to finalize fused exact-input segment")?;
+                (
+                    exact_input_step_in
+                        .checked_add(exact_input_fee)
+                        .context("fused exact-input specified amount overflow")?,
+                    exact_input_step_out,
+                )
+            } else {
+                (input_with_fee, step_out)
+            };
+            let specified_end = specified_total
+                .checked_add(specified_step)
+                .context("fused prepared specified amount overflow")?;
+            let result_end = result_total
+                .checked_add(result_step)
+                .context("fused prepared result amount overflow")?;
+            if !specified_step.is_zero() {
+                segments.push(PreparedQuoteSegment {
+                    specified_end,
+                    result_end,
+                    sqrt_price_start_x96: sqrt_price_x96,
+                    sqrt_price_target_x96: target,
+                    liquidity,
+                });
+            }
+            specified_total = specified_end;
+            result_total = result_end;
+            if !step_out.is_zero() {
+                last_productive_segment_count = segments.len();
+            }
+            result_remaining = result_remaining
+                .checked_sub(step_out)
+                .context("fused swap produced more than remaining output")?;
+            sqrt_price_x96 = sqrt_after;
+
+            if partial {
+                break;
+            }
+            if initialized {
+                let tick_state = self
+                    .ticks
+                    .get(&tick_next)
+                    .with_context(|| format!("bitmap references missing tick {tick_next}"))?;
+                let liquidity_net = if zero_for_one {
+                    tick_state
+                        .net
+                        .checked_neg()
+                        .context("liquidity net overflow")?
+                } else {
+                    tick_state.net
+                };
+                liquidity = add_delta(liquidity, liquidity_net)
+                    .context("failed to cross fused prepared initialized tick")?;
+            }
+            tick = if zero_for_one {
+                tick_next.saturating_sub(1)
+            } else {
+                tick_next
+            };
+        }
+        // Match the old capacity pass: input spent after the last non-zero
+        // output is outside the executable envelope and must not extend the
+        // exact-input curve at extreme price boundaries.
+        segments.truncate(last_productive_segment_count);
+
+        Ok(PreparedQuoteCurve {
+            kind: PreparedQuoteKind::ExactInput,
+            fee_pips: self.fee_pips,
+            segments,
+        })
     }
 
     /// Precomputes the exact-output path for one swap direction.
@@ -1027,6 +1188,93 @@ mod tests {
                 pool.quote_exact_out_amount_in(zero_for_one, maximum)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn fused_output_bounded_exact_input_curve_matches_two_pass_path_exactly() {
+        let mut pool = ClmmPool::new(
+            500,
+            10,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000_000,
+        )
+        .unwrap();
+        for (tick, net) in [
+            (-1_100, 150_000_000_i128),
+            (-500, -50_000_000_i128),
+            (500, 50_000_000_i128),
+            (1_100, -150_000_000_i128),
+        ] {
+            pool.set_tick(tick, net.unsigned_abs(), net).unwrap();
+        }
+
+        for zero_for_one in [true, false] {
+            for maximum_output in [
+                U256::from(20_000_u64),
+                U256::from(2_000_000_u64),
+                U256::from(200_000_000_u64),
+                (U256::ONE << 255) - U256::ONE,
+            ] {
+                let legacy_input_limit = pool
+                    .exact_output_result_capacity_bounded(zero_for_one, maximum_output)
+                    .unwrap();
+                let legacy = pool
+                    .prepare_exact_input_curve_bounded(zero_for_one, legacy_input_limit)
+                    .unwrap();
+                let previous = pool
+                    .prepare_exact_input_curve_bounded(zero_for_one, legacy_input_limit)
+                    .unwrap();
+                let retained_capacity = previous.segments.capacity();
+                let fused = pool
+                    .prepare_exact_input_curve_bounded_by_exact_output_reusing(
+                        zero_for_one,
+                        maximum_output,
+                        Some(previous),
+                    )
+                    .unwrap();
+
+                assert!(fused.segments.capacity() >= retained_capacity);
+                assert_eq!(
+                    fused.specified_capacity(),
+                    legacy.specified_capacity(),
+                    "specified capacity direction={zero_for_one} maximum_output={maximum_output}"
+                );
+                assert_eq!(
+                    fused.result_capacity(),
+                    legacy.result_capacity(),
+                    "result capacity direction={zero_for_one} maximum_output={maximum_output}"
+                );
+                assert_eq!(
+                    fused.segment_count(),
+                    legacy.segment_count(),
+                    "segment count direction={zero_for_one} maximum_output={maximum_output}"
+                );
+                let mut probes = vec![
+                    U256::ONE,
+                    fused.specified_capacity() / U256::from(2_u8),
+                    fused.specified_capacity(),
+                ];
+                for segment in &legacy.segments {
+                    probes.push(segment.specified_end);
+                    if segment.specified_end > U256::ONE {
+                        probes.push(segment.specified_end - U256::ONE);
+                    }
+                }
+                probes.sort_unstable();
+                probes.dedup();
+                for amount in probes {
+                    if amount.is_zero() {
+                        continue;
+                    }
+                    assert_eq!(
+                        fused.quote(amount).unwrap(),
+                        legacy.quote(amount).unwrap(),
+                        "direction={zero_for_one} maximum_output={maximum_output} amount={amount}"
+                    );
+                }
+            }
         }
     }
 

@@ -60,6 +60,10 @@ the exact artifact used by each rollout.
 
 ### Fixed
 
+- Fuse the DEX-sell exact-output capacity pass with construction of its
+  exact-input prepared curve. Full sparse-word boundary steps are reused
+  directly and only the final partial step is recomputed, removing one complete
+  106-segment traversal from the production fee-500 pool refresh.
 - Interleave newly arrived canonical DEX events between coalesced prepared-pool
   builds. A multi-pool swap burst can no longer make later logs wait behind the
   sum of every inline curve build before the owner observes them.

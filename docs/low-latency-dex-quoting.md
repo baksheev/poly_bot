@@ -151,6 +151,15 @@ no evaluation could observe does not trigger a redundant sparse build.
 Generation validation remains mandatory when publishing a build and again in
 entry preflight.
 
+For the DEX-sell direction, the token-B input envelope is defined by a bounded
+token-A exact-output capacity. Curve refresh computes that capacity and the
+corresponding exact-input curve in one sparse-word traversal: complete boundary
+steps have identical cumulative input/output values, while the final partial
+step is recomputed in exact-input mode to preserve integer rounding exactly.
+Fixtures compare every segment boundary and adjacent base unit with the former
+two-pass implementation. This removes a duplicate 106-segment traversal from
+the fee-500 production pool without changing its executable envelope.
+
 `dex_pool_prepared` records the token-A and derived token-B limits, segment
 counts, build time, and total publication time under
 `prepared_curve_scope=execution_envelope_v1` and
