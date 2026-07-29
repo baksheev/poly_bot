@@ -547,6 +547,7 @@ pub struct CompiledBinanceRuntimePlan {
     pub stream_shards: Vec<CompiledBinanceStreamShard>,
     pub symbols: Vec<String>,
     pub asset_symbols: Vec<String>,
+    pub asset_decimals: BTreeMap<String, u8>,
     pub executable_symbols: BTreeSet<String>,
 }
 
@@ -1136,6 +1137,39 @@ impl CompiledDomainGraph {
             })
             .map(|asset| asset.symbol.clone())
             .collect();
+        let mut asset_decimals = BTreeMap::new();
+        for pair in self
+            .bundle
+            .sources
+            .iter()
+            .flat_map(|source| source.snapshot.pairs.iter())
+        {
+            for token in [&pair.token_a, &pair.token_b] {
+                insert_same(
+                    &mut asset_decimals,
+                    token.symbol.clone(),
+                    token.decimals,
+                    "Binance asset decimals",
+                )?;
+            }
+            if let (Some(asset), Some(decimals)) = (
+                pair.binance.commission_asset.as_ref(),
+                pair.binance.commission_asset_decimals,
+            ) {
+                insert_same(
+                    &mut asset_decimals,
+                    asset.clone(),
+                    decimals,
+                    "Binance commission asset decimals",
+                )?;
+            }
+        }
+        for symbol in &asset_symbols {
+            ensure!(
+                asset_decimals.contains_key(symbol),
+                "Binance asset {symbol} has no compiled decimals"
+            );
+        }
         let executable_symbols = self
             .bundle
             .capabilities
@@ -1157,6 +1191,7 @@ impl CompiledDomainGraph {
             stream_shards,
             symbols,
             asset_symbols,
+            asset_decimals,
             executable_symbols,
         })
     }
@@ -2011,6 +2046,10 @@ mod tests {
         );
         assert!(runtime.asset_symbols.contains(&"BNB".to_owned()));
         assert!(runtime.asset_symbols.contains(&"ESP".to_owned()));
+        assert_eq!(runtime.asset_decimals["USDC"], 6);
+        assert_eq!(runtime.asset_decimals["ESP"], 18);
+        assert_eq!(runtime.asset_decimals["WLD"], 18);
+        assert_eq!(runtime.asset_decimals["BNB"], 8);
         assert_eq!(
             bundle
                 .wallet_locations

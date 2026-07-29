@@ -58,6 +58,7 @@ pub struct TradingEngine {
     hot_telemetry: HotTelemetryHandle,
     paper_trades: Option<PaperTradeHandle>,
     inventory: InventoryReservations,
+    binance_asset_decimals: BTreeMap<String, u8>,
     binance_inventory_generation: u64,
     binance_user_data_connected: bool,
     binance_user_data_clean: bool,
@@ -92,6 +93,7 @@ pub struct TradingEngine {
 pub struct TradingExecutionHandles {
     pub paper_trades: Option<PaperTradeHandle>,
     pub entry_preflight: EntryPreflightHandle,
+    pub binance_asset_decimals: BTreeMap<String, u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,6 +546,7 @@ impl TradingEngine {
                 hot_telemetry,
                 paper_trades: execution.paper_trades,
                 inventory: InventoryReservations::default(),
+                binance_asset_decimals: execution.binance_asset_decimals,
                 binance_inventory_generation: 0,
                 binance_user_data_connected: false,
                 binance_user_data_clean: true,
@@ -1654,6 +1657,9 @@ impl TradingEngine {
     }
 
     fn token_decimals(&self, symbol: &str) -> anyhow::Result<u8> {
+        if let Some(decimals) = self.binance_asset_decimals.get(symbol) {
+            return Ok(*decimals);
+        }
         let domain = self.domain_config.snapshot();
         domain
             .pairs

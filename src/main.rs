@@ -1964,6 +1964,10 @@ async fn run(
         arb_bot::engine::TradingExecutionHandles {
             paper_trades,
             entry_preflight,
+            binance_asset_decimals: compiled_binance_runtime
+                .as_ref()
+                .map(|runtime| runtime.asset_decimals.clone())
+                .unwrap_or_default(),
         },
         BinanceFeeBps {
             buy: binance_buy_fee_bps,
