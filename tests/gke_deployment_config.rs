@@ -1,6 +1,8 @@
 const RELEASE_PLATFORM: &str = include_str!("../infra/gcp/gke/release-platform.yaml");
 const DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
+const COMPILED_DOMAIN: &str =
+    include_str!("../config/domain/compiled-multi-pair-production.v1.json");
 
 #[test]
 fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
@@ -41,6 +43,14 @@ fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
 
 #[test]
 fn gke_workflow_verifies_the_runtime_startup_mode() {
+    let compiled: serde_json::Value = serde_json::from_str(COMPILED_DOMAIN).unwrap();
+    let live_strategy = &compiled["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["snapshot"]["live_trading_enabled"] == true)
+        .unwrap()["snapshot"]["pairs"][0]["strategy"];
+    assert!(live_strategy.get("balance_safety_multiplier").is_none());
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));

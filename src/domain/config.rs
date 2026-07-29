@@ -168,13 +168,13 @@ impl DomainSnapshot {
 pub struct SnapshotSource {
     pub repository: String,
     pub revision: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rails_pair_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rails_pair_updated_at_utc: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rails_pair_candidate_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rails_pair_candidate_updated_at_utc: Option<String>,
     pub captured_at_utc: String,
     pub evidence: Vec<String>,
@@ -484,14 +484,22 @@ pub struct ChainConfig {
     pub binance_network_name: String,
     pub gas_symbol: String,
     pub gas_decimals: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gas_price_binance_symbol: Option<String>,
     pub multicall3_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v3_factory_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v3_quoter_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v3_router_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_quoter_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_router_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_pool_manager_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_state_view_address: Option<String>,
 }
 
@@ -569,15 +577,15 @@ pub struct BinanceConfig {
     pub quote_asset: String,
     /// Optional discounted-fee asset. Historical artifacts omit it; live
     /// production config declares BNB explicitly.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commission_asset: Option<String>,
     /// Decimal precision used to normalize the commission-asset balance into
     /// the process-scoped inventory ledger.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commission_asset_decimals: Option<u8>,
     /// Spot symbol whose bid values one commission asset in token-A-equivalent
     /// quote units, matching Rails' BNBUSDT valuation.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commission_price_binance_symbol: Option<String>,
     pub market_data_product: BinanceProduct,
     pub execution_product: BinanceProduct,
@@ -677,7 +685,7 @@ pub struct StrategyConfig {
     /// Production v12 uses `max_transport_silence_ms`; older artifacts fall
     /// back to this value so transport readiness remains fail-closed.
     pub max_quote_age_ms: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_transport_silence_ms: Option<u64>,
     pub min_slippage_bps: u16,
     pub max_slippage_bps: u16,
@@ -685,16 +693,27 @@ pub struct StrategyConfig {
     /// Deserializes historical artifacts that copied the 0x-only four-basis-
     /// point reserve. Uniswap V3/V4 execution never reads this value, and the
     /// production v12 artifact omits it.
-    #[serde(default, rename = "dex_fee_reserve_bps")]
+    #[serde(
+        default,
+        rename = "dex_fee_reserve_bps",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub legacy_dex_fee_reserve_bps: Option<u16>,
     /// Read-only compatibility for pre-adaptive artifacts. Rust inventory
     /// reservations use an exact execution envelope and never multiply claims.
-    #[serde(default = "default_legacy_balance_safety_multiplier")]
+    #[serde(
+        default = "default_legacy_balance_safety_multiplier",
+        skip_serializing_if = "is_default_legacy_balance_safety_multiplier"
+    )]
     pub balance_safety_multiplier: u16,
 }
 
 const fn default_legacy_balance_safety_multiplier() -> u16 {
     1
+}
+
+fn is_default_legacy_balance_safety_multiplier(value: &u16) -> bool {
+    *value == default_legacy_balance_safety_multiplier()
 }
 
 impl StrategyConfig {
@@ -752,7 +771,9 @@ pub enum ArbitrageStrategy {
 #[serde(deny_unknown_fields)]
 pub struct DexConfig {
     pub allowed_providers: Vec<DexProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v3: Option<UniswapV3Config>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4: Option<UniswapV4Config>,
 }
 

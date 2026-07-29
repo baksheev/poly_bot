@@ -15,8 +15,6 @@
           "revision": "e381dff246e806b86ca9cf3de4a5c805204cb86c",
           "rails_pair_id": 3,
           "rails_pair_updated_at_utc": "2026-07-21T18:35:54.337674Z",
-          "rails_pair_candidate_id": null,
-          "rails_pair_candidate_updated_at_utc": null,
           "captured_at_utc": "2026-07-23T10:00:09Z",
           "evidence": [
             "production PostgreSQL whitelist SELECT from arb_bot_production",
@@ -110,9 +108,7 @@
               "max_transport_silence_ms": 30000,
               "min_slippage_bps": 5,
               "max_slippage_bps": 50,
-              "slippage_profit_share_bps": 5000,
-              "dex_fee_reserve_bps": null,
-              "balance_safety_multiplier": 1
+              "slippage_profit_share_bps": 5000
             },
             "rebalance": {
               "enabled": true,
@@ -157,8 +153,6 @@
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
-          "rails_pair_id": null,
-          "rails_pair_updated_at_utc": null,
           "rails_pair_candidate_id": 3144,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
           "captured_at_utc": "2026-07-28T09:48:35Z",
@@ -188,12 +182,7 @@
               "gas_price_binance_symbol": "ETHUSDT",
               "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
               "uniswap_v3_factory_address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
-              "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
-              "uniswap_v3_router_address": null,
-              "uniswap_v4_quoter_address": null,
-              "uniswap_v4_router_address": null,
-              "uniswap_v4_pool_manager_address": null,
-              "uniswap_v4_state_view_address": null
+              "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
             },
             "token_a": {
               "symbol": "USDC",
@@ -209,9 +198,6 @@
               "symbol": "ESPUSDC",
               "base_asset": "ESP",
               "quote_asset": "USDC",
-              "commission_asset": null,
-              "commission_asset_decimals": null,
-              "commission_price_binance_symbol": null,
               "market_data_product": "spot",
               "execution_product": "spot",
               "step_size": "1.000000000000000",
@@ -233,9 +219,7 @@
               "max_transport_silence_ms": 30000,
               "min_slippage_bps": 5,
               "max_slippage_bps": 50,
-              "slippage_profit_share_bps": 5000,
-              "dex_fee_reserve_bps": null,
-              "balance_safety_multiplier": 1
+              "slippage_profit_share_bps": 5000
             },
             "rebalance": {
               "enabled": false,
@@ -249,8 +233,7 @@
                 "fee_tiers": [
                   100
                 ]
-              },
-              "uniswap_v4": null
+              }
             }
           }
         ]
