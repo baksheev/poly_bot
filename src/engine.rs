@@ -29,7 +29,10 @@ use crate::{
     },
     domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
     execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
-    hot_telemetry::{HotTelemetryHandle, HotTelemetryTask, channel as hot_telemetry_channel},
+    hot_telemetry::{
+        HotTelemetryHandle, HotTelemetryTask, SharedStreamEventKind,
+        channel as hot_telemetry_channel,
+    },
     inventory::{
         InventoryClaim, InventoryKey, InventoryReservations, InventoryVenue, ReservationPurpose,
         ReservationRequest,
@@ -3307,6 +3310,23 @@ impl TradingEngine {
                 "longest_non_price_handler_us": longest_non_price_handler_us,
                 "hot_telemetry_dropped_records": self.hot_telemetry.dropped_records(),
             }),
+        );
+    }
+
+    pub fn record_shared_binance_stream_event(
+        &self,
+        symbol: &str,
+        event_kind: SharedStreamEventKind,
+        generation: u64,
+        parse_time_us: u128,
+        wire_frame_size_bytes: usize,
+    ) {
+        self.hot_telemetry.emit_shared_stream_event(
+            symbol,
+            event_kind,
+            generation,
+            parse_time_us,
+            wire_frame_size_bytes,
         );
     }
 

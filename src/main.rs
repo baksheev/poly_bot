@@ -1435,13 +1435,30 @@ fn market_event_symbol(event: &MarketEvent) -> &str {
     }
 }
 
-fn observed_market_event_fields(event: &MarketEvent) -> (&'static str, u64, u128, usize) {
+fn observed_market_event_fields(
+    event: &MarketEvent,
+) -> (hot_telemetry::SharedStreamEventKind, u64, u128, usize) {
     match event {
-        MarketEvent::FeedConnected { generation, .. } => ("connected", *generation, 0, 0),
-        MarketEvent::FeedDisconnected { generation, .. } => ("disconnected", *generation, 0, 0),
-        MarketEvent::FeedHeartbeat { generation, .. } => ("heartbeat", *generation, 0, 0),
+        MarketEvent::FeedConnected { generation, .. } => (
+            hot_telemetry::SharedStreamEventKind::Connected,
+            *generation,
+            0,
+            0,
+        ),
+        MarketEvent::FeedDisconnected { generation, .. } => (
+            hot_telemetry::SharedStreamEventKind::Disconnected,
+            *generation,
+            0,
+            0,
+        ),
+        MarketEvent::FeedHeartbeat { generation, .. } => (
+            hot_telemetry::SharedStreamEventKind::Heartbeat,
+            *generation,
+            0,
+            0,
+        ),
         MarketEvent::BinanceTopOfBook(quote) => (
-            "book_ticker",
+            hot_telemetry::SharedStreamEventKind::BookTicker,
             quote.connection_generation,
             quote.parse_time_us,
             quote.wire_frame_size_bytes,
@@ -1452,7 +1469,7 @@ fn observed_market_event_fields(event: &MarketEvent) -> (&'static str, u64, u128
             wire_frame_size_bytes,
             ..
         } => (
-            "depth",
+            hot_telemetry::SharedStreamEventKind::Depth,
             *generation,
             *parse_apply_time_us,
             *wire_frame_size_bytes,
@@ -2169,26 +2186,18 @@ async fn run(
             },
             event = &mut binance_market_event => {
                 drop(binance_market_event);
-                let event_symbol = market_event_symbol(&event).to_owned();
-                if event_symbol == pair.binance.symbol {
+                if market_event_symbol(&event) == pair.binance.symbol {
                     engine.on_market_event(event, binance_feed.depth_book())?;
                 } else {
+                    let event_symbol = market_event_symbol(&event);
                     let (event_kind, generation, parse_time_us, wire_frame_size_bytes) =
                         observed_market_event_fields(&event);
-                    telemetry.emit(
-                        "binance_shared_stream_event",
-                        serde_json::json!({
-                            "engine_id": config.engine_id,
-                            "account_scope": "primary_spot",
-                            "symbol": event_symbol,
-                            "event_kind": event_kind,
-                            "generation": generation,
-                            "wire_frame_size_bytes": wire_frame_size_bytes,
-                            "parse_time_us": parse_time_us,
-                            "readiness_scope": "symbol",
-                            "execution_enabled": false,
-                            "direct_owner_poll": true,
-                        }),
+                    engine.record_shared_binance_stream_event(
+                        event_symbol,
+                        event_kind,
+                        generation,
+                        parse_time_us,
+                        wire_frame_size_bytes,
                     );
                 }
                 binance_market_event = Box::pin(binance_feed.next_event());
