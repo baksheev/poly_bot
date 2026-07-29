@@ -19,8 +19,8 @@ use crate::{
         CoordinatorCommand, EntryPreflightHandle, ExecutionMode, FreshBinanceTopSnapshot,
         LatestOpportunityReceiver, LegResult, LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS,
         PaperOpportunity, PaperTradeCoordinator, PaperTradeEvent, PaperTradeEventState,
-        PaperTradeHandle, TradeIntent, TradeOperation, TradeStage, execution_failure_event_state,
-        initial_execution_lane,
+        PaperTradeHandle, TradeIntent, TradeJournalScope, TradeOperation, TradeStage,
+        execution_failure_event_state, initial_execution_lane,
     },
     binance::{
         account::SymbolRules,
@@ -1046,6 +1046,7 @@ pub struct LiveRiskLimits {
     pub entry_preflight: EntryPreflightHandle,
     pub binance_symbol: String,
     pub binance_base_decimals: u8,
+    pub journal_scope: TradeJournalScope,
 }
 
 impl LiveRiskLimits {
@@ -1065,6 +1066,11 @@ impl LiveRiskLimits {
         ensure!(
             self.binance_base_decimals <= 28,
             "live Binance base decimals exceed Decimal precision"
+        );
+        self.journal_scope.validate()?;
+        ensure!(
+            self.journal_scope.symbol == self.binance_symbol,
+            "live journal scope symbol mismatch"
         );
         Ok(())
     }
@@ -1238,7 +1244,8 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             None,
         );
         preflight_result?;
-        let intent = opportunity.intent(ExecutionMode::DexFirst);
+        let mut intent = opportunity.intent(ExecutionMode::DexFirst);
+        intent.journal_scope = Some(self.risk_limits.journal_scope.clone());
         ensure!(
             intent.admission.is_some() && intent.dex_plan.is_some(),
             "live intent is incomplete"
@@ -1854,7 +1861,7 @@ mod tests {
             AdmissionRiskBounds, ArbitrageDirection, CoordinatorCommand, EntryPreflightHandle,
             ExecutionMode, FreshBinanceTopSnapshot, LegResult, LegRole, LegStatus,
             PaperOpportunity, PaperTradeCoordinator, PaperTradeEventState, PaperTradeSubmitResult,
-            TerminalOutcome, TradeIntent, execution_failure_event_state,
+            TerminalOutcome, TradeIntent, TradeJournalScope, execution_failure_event_state,
         },
         binance::ws_api::{OrderFill, OrderResult},
         dex::clmm::ClmmPool,
@@ -1967,6 +1974,19 @@ mod tests {
             entry_preflight: default_preflight(),
             binance_symbol: "WLDUSDC".to_owned(),
             binance_base_decimals: 18,
+            journal_scope: scope(),
+        }
+    }
+
+    fn scope() -> TradeJournalScope {
+        TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-account-main".to_owned(),
+            network_id: "world-chain".to_owned(),
+            chain_id: 480,
+            wallet_id: "world-chain:wallet-primary".to_owned(),
+            strategy_id: "strategy-wld-usdc".to_owned(),
+            symbol: "WLDUSDC".to_owned(),
         }
     }
 
@@ -2458,6 +2478,7 @@ mod tests {
             entry_preflight: default_preflight(),
             binance_symbol: "WLDUSDC".to_owned(),
             binance_base_decimals: 18,
+            journal_scope: scope(),
         };
         valid.validate().unwrap();
         let mut invalid = valid;
@@ -2518,6 +2539,65 @@ mod tests {
         assert_eq!(
             task.receiver.recv().await.unwrap().plan_id(),
             latest.plan_id()
+        );
+
+        drop(handle);
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_scheduler_is_latest_per_strategy_and_round_robin() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-m6-candidate-scheduler-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+
+        let wld = opportunity();
+        let mut esp = opportunity();
+        esp.pair_id = "arbitrum-usdc-esp".to_owned();
+        esp.symbol = "ESPUSDC".to_owned();
+        esp.update_id += 1;
+        let mut latest_wld = wld.clone();
+        latest_wld.received_unix_us += 2;
+        latest_wld.update_id += 2;
+
+        assert!(matches!(
+            handle.try_submit(wld),
+            PaperTradeSubmitResult::Accepted
+        ));
+        assert!(matches!(
+            handle.try_submit(esp.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        assert_eq!(
+            task.receiver.recv().await.unwrap().pair_id,
+            "world-chain-usdc-wld"
+        );
+        assert!(matches!(
+            handle.try_submit(latest_wld.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        handle.finish(PaperTradeEventState::Balanced);
+        assert_eq!(task.receiver.recv().await.unwrap().plan_id(), esp.plan_id());
+        handle.finish(PaperTradeEventState::Balanced);
+        assert_eq!(
+            task.receiver.recv().await.unwrap().plan_id(),
+            latest_wld.plan_id()
         );
 
         drop(handle);

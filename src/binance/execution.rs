@@ -9,7 +9,9 @@ use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::binance::{
-    order_journal::{BinanceOrderIntent, BinanceOrderJournal, BinanceOrderProgress},
+    order_journal::{
+        BinanceOrderIntent, BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress,
+    },
     user_data::MultiplexedBinanceWsApi,
     ws_api::{OrderResult, WsApiError},
 };
@@ -105,7 +107,7 @@ impl BinanceOrderRequest {
         Ok(())
     }
 
-    fn intent(&self) -> BinanceOrderIntent {
+    fn intent(&self, scope: Option<&BinanceOrderJournalScope>) -> BinanceOrderIntent {
         let (side, order_type, quantity, quote_order_quantity, limit_price) = match &self.kind {
             BinanceOrderRequestKind::MarketBuy { quote_quantity } => (
                 "BUY".to_owned(),
@@ -141,6 +143,7 @@ impl BinanceOrderRequest {
             ),
         };
         BinanceOrderIntent {
+            scope: scope.cloned(),
             operation_id: self.operation_id.clone(),
             client_order_id: self.client_order_id.clone(),
             symbol: self.symbol.clone(),
@@ -186,6 +189,7 @@ struct BinanceExecutor {
     client: MultiplexedBinanceWsApi,
     journal: BinanceOrderJournal,
     latency_telemetry: Option<ExecutionLatencyTelemetry>,
+    journal_scope: Option<BinanceOrderJournalScope>,
 }
 
 impl BinanceExecutor {
@@ -193,7 +197,11 @@ impl BinanceExecutor {
         client: MultiplexedBinanceWsApi,
         journal_path: PathBuf,
         latency_telemetry: Option<ExecutionLatencyTelemetry>,
+        journal_scope: Option<BinanceOrderJournalScope>,
     ) -> anyhow::Result<Self> {
+        if let Some(scope) = &journal_scope {
+            scope.validate()?;
+        }
         let journal_started = Instant::now();
         let journal = BinanceOrderJournal::open(journal_path)?;
         if let Some(telemetry) = &latency_telemetry {
@@ -209,6 +217,7 @@ impl BinanceExecutor {
             client,
             journal,
             latency_telemetry,
+            journal_scope,
         };
         let reconciliation_started = Instant::now();
         executor.reconcile_startup().await?;
@@ -287,12 +296,12 @@ impl BinanceExecutor {
         enqueued_at: Option<Instant>,
     ) -> anyhow::Result<BinanceOrderOutcome> {
         request.validate()?;
-        let request_intent = request.intent();
+        let request_intent = request.intent(self.journal_scope.as_ref());
         let client_order_id = request.client_order_id.clone();
         let symbol = request.symbol.clone();
         if let Some(existing) = self.journal.operations().get(&client_order_id).cloned() {
             ensure!(
-                existing.intent == request_intent,
+                compatible_replayed_intent(&existing.intent, &request_intent),
                 "journaled Binance order does not match the replayed request"
             );
             match existing.progress {
@@ -768,6 +777,18 @@ impl BinanceExecutor {
     }
 }
 
+fn compatible_replayed_intent(
+    existing: &BinanceOrderIntent,
+    requested: &BinanceOrderIntent,
+) -> bool {
+    if existing.scope.is_some() && existing.scope != requested.scope {
+        return false;
+    }
+    let mut normalized = requested.clone();
+    normalized.scope = existing.scope.clone();
+    existing == &normalized
+}
+
 fn classify_execution_error(
     progress: Option<&BinanceOrderProgress>,
     reason: String,
@@ -806,7 +827,7 @@ impl BinanceExecutionService {
         journal_path: PathBuf,
         capacity: usize,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(client, journal_path, capacity, None).await
+        Self::spawn_inner(client, journal_path, capacity, None, None).await
     }
 
     pub async fn spawn_instrumented(
@@ -815,7 +836,31 @@ impl BinanceExecutionService {
         capacity: usize,
         latency_telemetry: ExecutionLatencyTelemetry,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(client, journal_path, capacity, Some(latency_telemetry)).await
+        Self::spawn_inner(
+            client,
+            journal_path,
+            capacity,
+            Some(latency_telemetry),
+            None,
+        )
+        .await
+    }
+
+    pub async fn spawn_scoped_instrumented(
+        client: MultiplexedBinanceWsApi,
+        journal_path: PathBuf,
+        capacity: usize,
+        latency_telemetry: ExecutionLatencyTelemetry,
+        journal_scope: BinanceOrderJournalScope,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            client,
+            journal_path,
+            capacity,
+            Some(latency_telemetry),
+            Some(journal_scope),
+        )
+        .await
     }
 
     async fn spawn_inner(
@@ -823,6 +868,7 @@ impl BinanceExecutionService {
         journal_path: PathBuf,
         capacity: usize,
         latency_telemetry: Option<ExecutionLatencyTelemetry>,
+        journal_scope: Option<BinanceOrderJournalScope>,
     ) -> anyhow::Result<Self> {
         ensure!(capacity > 0, "Binance execution channel capacity is zero");
         let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity);
@@ -844,6 +890,7 @@ impl BinanceExecutionService {
                     client,
                     journal_path,
                     latency_telemetry,
+                    journal_scope,
                 )) {
                     Ok(executor) => executor,
                     Err(error) => {
@@ -958,7 +1005,7 @@ impl Drop for BinanceExecutionService {
 }
 
 fn validate_response(request: &BinanceOrderRequest, order: &OrderResult) -> anyhow::Result<()> {
-    let intent = request.intent();
+    let intent = request.intent(None);
     ensure!(
         order.symbol == intent.symbol,
         "Binance response symbol mismatch"
@@ -1051,7 +1098,8 @@ mod tests {
     use super::{
         BinanceExecutionServiceError, BinanceOrderProgress, BinanceOrderRequest,
         BinanceOrderRequestKind, RECONCILIATION_ATTEMPTS, classify_execution_error,
-        order_not_found_details, rejection_outcome_unknown, terminal_status,
+        compatible_replayed_intent, order_not_found_details, rejection_outcome_unknown,
+        terminal_status,
     };
 
     #[test]
@@ -1081,6 +1129,28 @@ mod tests {
         }
         assert!(!terminal_status("NEW"));
         assert!(!terminal_status("PARTIALLY_FILLED"));
+    }
+
+    #[test]
+    fn scoped_request_can_reconcile_a_compatible_v1_order_intent() {
+        let request = BinanceOrderRequest {
+            operation_id: "rustarb-operation".to_owned(),
+            client_order_id: "rustarb-order".to_owned(),
+            symbol: "WLDUSDC".to_owned(),
+            kind: BinanceOrderRequestKind::MarketSell {
+                quantity: Decimal::ONE,
+            },
+            latency_origin: None,
+        };
+        let legacy = request.intent(None);
+        let scope = crate::binance::order_journal::BinanceOrderJournalScope {
+            schema_version: crate::binance::order_journal::BinanceOrderJournalScope::SCHEMA_VERSION,
+            account_id: "binance-main".to_owned(),
+            strategy_id: "strategy-wld-usdc".to_owned(),
+        };
+        let scoped = request.intent(Some(&scope));
+        assert!(compatible_replayed_intent(&legacy, &scoped));
+        assert!(!compatible_replayed_intent(&scoped, &legacy));
     }
 
     #[test]

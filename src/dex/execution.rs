@@ -16,9 +16,9 @@ use crate::{
     dex::events::{PoolLocator, PoolUpdate, decode_pool_event},
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
-        EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
-        TransactionJournal, UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
-        acquire_process_nonce_lock, broadcast_signed_transaction,
+        EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
+        PROCESS_NONCE_LOCK_TTL, TransactionJournal, UnknownOutcomeReason, WalletCall,
+        WalletTransactionParameters, acquire_process_nonce_lock, broadcast_signed_transaction,
     },
 };
 
@@ -438,6 +438,10 @@ impl DexExecutor {
 
     pub fn chain_id(&self) -> u64 {
         self.nonce_lane.chain_id()
+    }
+
+    pub fn set_journal_scope(&mut self, scope: EvmJournalScope) -> anyhow::Result<()> {
+        self.nonce_lane.set_journal_scope(scope)
     }
 
     /// Performs any required approval writes before trading starts, then makes

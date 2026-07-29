@@ -13,8 +13,8 @@ use arb_bot::{
         WORLD_CHAIN_USDC, is_retryable_quote_error, validate_quote,
     },
     arbitrage::{
-        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator, TradeStage,
-        paper_trade_channel,
+        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator,
+        TradeJournalScope, TradeStage, paper_trade_channel,
     },
     balances::{
         BalanceEvent, BalanceSync, WalletBalanceSnapshot, WalletReadClient, binance_snapshot,
@@ -27,7 +27,7 @@ use arb_bot::{
     },
     binance::{
         execution::BinanceExecutionService,
-        order_journal::{BinanceOrderJournal, BinanceOrderProgress},
+        order_journal::{BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress},
         runtime::SharedBinanceRuntime,
         user_data::UserDataStream,
         validation::{BinanceCanaryKind, execute_order_round_trip},
@@ -82,8 +82,8 @@ use arb_bot::{
         ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, TelemetryHandle, TelemetryWriter,
     },
     wallet::{
-        EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV,
-        hydrate_chain_wallet,
+        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest,
+        WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
     },
 };
 use clap::Parser;
@@ -1592,6 +1592,54 @@ async fn run(
                 == 1,
             "M4 production hot path requires exactly one non-mutating shadow strategy"
         );
+        let executable = dependencies
+            .plan()
+            .strategies
+            .iter()
+            .filter(|strategy| strategy.execute)
+            .collect::<Vec<_>>();
+        ensure!(
+            executable.len() == 1 && executable[0].symbol == "WLDUSDC",
+            "M6 permits execution only for WLDUSDC"
+        );
+        let account_id = compiled_binance_runtime
+            .as_ref()
+            .context("M6 ownership graph requires one Binance account")?
+            .account_id
+            .as_str();
+        let evm_owner_count = network_registry
+            .as_ref()
+            .context("M6 ownership graph requires network runtimes")?
+            .runtimes()
+            .count();
+        telemetry.emit(
+            "execution_ownership_runtime_started",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "schema_version": 2,
+                "account_id": account_id,
+                "strategy_count": dependencies.plan().strategies.len(),
+                "executable_strategy_count": executable.len(),
+                "executable_symbol": executable[0].symbol,
+                "evm_owner_count": evm_owner_count,
+                "candidate_policy": "latest_per_strategy_round_robin",
+                "portfolio_admission": "atomic_shared_owner",
+                "parent_protocol": "fsync_before_child_dispatch",
+                "binance_owner_count": 1,
+                "global_trade_serialization": true,
+                "rebalance_signer_access": false,
+            }),
+        );
+        tracing::info!(
+            account_id,
+            strategy_count = dependencies.plan().strategies.len(),
+            executable_symbol = executable[0].symbol,
+            evm_owner_count,
+            journal_schema_version = 2,
+            candidate_policy = "latest_per_strategy_round_robin",
+            global_trade_serialization = true,
+            "M6 execution ownership graph validated"
+        );
     }
     let (initialized_dex, shadow_initialized_dex) =
         if let Some(shadow) = shadow_strategy_plan.as_ref() {
@@ -1951,6 +1999,38 @@ async fn run(
             domain_config.snapshot().live_trading_enabled && pair.execution_enabled,
             "composed live arbitrage requires both versioned execution gates"
         );
+        let trade_journal_scope = {
+            let account_id = compiled_binance_runtime
+                .as_ref()
+                .context("M6 live execution requires a compiled Binance account")?
+                .account_id
+                .as_str()
+                .to_owned();
+            let strategy = hot_path_dependencies
+                .as_ref()
+                .context("M6 live execution requires compiled strategy ownership")?
+                .plan()
+                .strategies
+                .iter()
+                .find(|strategy| strategy.execute)
+                .context("M6 live execution has no executable strategy")?;
+            let network = network_registry
+                .as_ref()
+                .context("M6 live execution requires the network registry")?
+                .runtimes()
+                .find(|runtime| runtime.plan().network_id == strategy.network_id)
+                .context("M6 executable strategy has no EVM execution owner")?
+                .plan();
+            TradeJournalScope {
+                schema_version: TradeJournalScope::SCHEMA_VERSION,
+                account_id,
+                network_id: network.network_id.as_str().to_owned(),
+                chain_id: network.chain_id,
+                wallet_id: network.wallet_location_id.as_str().to_owned(),
+                strategy_id: strategy.strategy_id.as_str().to_owned(),
+                symbol: strategy.symbol.clone(),
+            }
+        };
         let wallet = EvmWallet::from_env()?;
         ensure!(
             wallet.address() == wallet_owner,
@@ -1976,6 +2056,12 @@ async fn run(
             wallet_journal_path.into(),
         )
         .await?;
+        dex_executor.set_journal_scope(EvmJournalScope {
+            schema_version: EvmJournalScope::SCHEMA_VERSION,
+            network_id: trade_journal_scope.network_id.clone(),
+            wallet_id: trade_journal_scope.wallet_id.clone(),
+            strategy_id: trade_journal_scope.strategy_id.clone(),
+        })?;
         telemetry.emit(
             "runtime_journal_recovery",
             serde_json::json!({
@@ -2033,11 +2119,16 @@ async fn run(
             dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?;
-        let binance_service = BinanceExecutionService::spawn_instrumented(
+        let binance_service = BinanceExecutionService::spawn_scoped_instrumented(
             multiplexed_binance_api.clone(),
             binance_journal_path.into(),
             config.arbitrage_leg_execution_channel_capacity,
             execution_latency_telemetry,
+            BinanceOrderJournalScope {
+                schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                account_id: trade_journal_scope.account_id.clone(),
+                strategy_id: trade_journal_scope.strategy_id.clone(),
+            },
         )
         .await?;
         let (dex_revert_diagnostics, dex_revert_diagnostic_task) = dex_revert_diagnostic_channel(
@@ -2073,6 +2164,7 @@ async fn run(
                 entry_preflight: entry_preflight.clone(),
                 binance_symbol: pair.binance.symbol.clone(),
                 binance_base_decimals: pair.token_b.decimals,
+                journal_scope: trade_journal_scope,
             },
         )?;
         Some((

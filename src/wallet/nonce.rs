@@ -11,8 +11,8 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use crate::chain::rpc::{JsonRpcClient, RpcTransaction, TransactionReceipt};
 
 use super::{
-    JournalIntent, JournalOperationIdentity, SignedTransaction, TransactionJournal,
-    UnknownOutcomeReason, WalletCall,
+    EvmJournalScope, JournalIntent, JournalOperationIdentity, SignedTransaction,
+    TransactionJournal, UnknownOutcomeReason, WalletCall,
 };
 
 pub const PROCESS_NONCE_LOCK_TTL: Duration = Duration::from_secs(10);
@@ -113,6 +113,7 @@ pub struct NonceLane {
     chain_id: u64,
     wallet: Address,
     state: NonceLaneState,
+    journal_scope: Option<EvmJournalScope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +284,7 @@ impl NonceLane {
             chain_id,
             wallet,
             state,
+            journal_scope: None,
         })
     }
 
@@ -300,6 +302,16 @@ impl NonceLane {
 
     pub fn ready(&self) -> bool {
         matches!(self.state, NonceLaneState::Ready { .. })
+    }
+
+    pub fn set_journal_scope(&mut self, scope: EvmJournalScope) -> anyhow::Result<()> {
+        scope.validate()?;
+        ensure!(
+            matches!(self.state, NonceLaneState::Ready { .. }),
+            "cannot change EVM journal scope while an operation is active"
+        );
+        self.journal_scope = Some(scope);
+        Ok(())
     }
 
     pub fn next_nonce(&self) -> Option<u64> {
@@ -346,6 +358,7 @@ impl NonceLane {
             chain_id: self.chain_id,
             wallet: self.wallet,
             nonce,
+            scope: self.journal_scope.clone(),
         };
         let intent = JournalIntent {
             identity: identity.clone(),
@@ -857,7 +870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_nonce_lock_shares_the_advanced_nonce_between_lanes() {
+    async fn m6_trade_and_rebalance_lanes_share_the_advanced_nonce() {
         let wallet = Address::repeat_byte(0x71);
         let mut first = super::acquire_process_nonce_lock(480, wallet, 7)
             .await
@@ -870,6 +883,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.nonce(), 8);
+    }
+
+    #[tokio::test]
+    async fn m6_process_nonce_owner_isolated_by_chain_for_the_same_wallet() {
+        let wallet = Address::repeat_byte(0x72);
+        let world = super::acquire_process_nonce_lock(480, wallet, 11)
+            .await
+            .unwrap();
+        let arbitrum = super::acquire_process_nonce_lock(42_161, wallet, 11)
+            .await
+            .unwrap();
+        assert_eq!(world.nonce(), 11);
+        assert_eq!(arbitrum.nonce(), 11);
     }
 
     #[test]

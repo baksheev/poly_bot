@@ -1553,6 +1553,32 @@ Scheduler, portfolio snapshot, reservation snapshot, allocator validation, and
 unchanged WLD hot tails are reported by
 `scripts/report-m5-portfolio-runtime START_UTC END_UTC`.
 
+Production acceptance used revision
+`1fe5d58399ac6f6e4dfce76969097731d6d78a5a` (CI `30483032907`, Deploy GKE
+`30483422913`) and image
+`sha256:31d7023f179ba510c2d0d8bcb88c2bd0187b2365bccb4764863d9743477706ab`.
+The sole Pod `arb-bot-5775cd5b99-4rkqp` and both containers started at
+`2026-07-29T19:20:24Z`, stayed ready with zero restarts, and reported three
+inventory locations, ten venue assets, five economic assets, shadow allocator,
+v12 parity adapter, and no Arbitrum or allocator mutation authority. GCE
+remained `TERMINATED`.
+
+In the authoritative half-open window
+`[2026-07-29T19:20:24Z,2026-07-29T19:26:41Z)`, 313 portfolio audits all passed
+conservation with zero failure or mutation record. Allocator p99/max was 7/16
+microseconds, latest-only scheduler max was 81 microseconds, and portfolio
+snapshot max was 4 microseconds. The shared owner completed 112 live trade
+reservations at p99/max 4/5 microseconds; the v12 parity adapter p99/max was
+4/12 microseconds. Under 2,021 ESP sizing jobs, WLD baseline p99/max improved
+to 11/25 microseconds, JSON parse/depth/socket p99 were 5/14/35 microseconds,
+and hot drops remained zero. World Chain fee-500 receive p99/max was 34/34
+microseconds and prepared publication p99/max was 125/125 microseconds. CPU
+max was 0.0207 core and cgroup memory current/peak was 78.8/81.3 MB; CPU
+throttling, memory pressure/OOM, container restarts, and production errors were
+zero. Three market-movement DEX receipts reverted with known terminal status
+and remained warning-classified; they did not dispatch a Binance leg or create
+an unknown outcome.
+
 ### M6 — Durable trade sagas and per-network EVM owners
 
 Deliver:
@@ -1587,6 +1613,36 @@ Rollback:
 - deploy the last v12 single-pair revision and its compatible journals;
 - do not downgrade after the new runtime has written incompatible live journal
   records unless the workflow includes a reviewed journal migration.
+
+The M6 implementation keeps admission synchronous through the shared portfolio
+owner and replaces the single pending trade slot with a bounded
+latest-per-strategy scheduler. Eligible strategies are selected round-robin,
+while the accepted-work lane still permits only one newly dispatching parent.
+The existing production-shaped coordinator is the durable `TradeSaga`: it
+fsyncs the parent before returning any DEX-first child command, and each
+single-owner Binance or EVM worker fsyncs its child intent before external
+mutation.
+
+New parent and child records carry schema-v2 ownership scopes. Trade parents
+record account, network, chain, wallet, strategy, and symbol; Binance orders
+record account and strategy; EVM transactions record network, wallet, and
+strategy; rebalance parents record account, origin network, and strategy.
+Missing scopes remain readable for v1 recovery, and a scoped request may
+reconcile an otherwise identical v1 Binance intent without authorizing a
+duplicate order.
+
+`RebalanceExecutor` no longer owns signer or nonce fields. Its typed
+`RebalanceEvmExecutionOwner` owns both chain clients, signing material, the
+durable transaction journal, and the World/Optimism nonce lanes. Trade and
+rebalance lanes continue to meet at the process-scoped `(chain_id, wallet)`
+nonce owner; different chains deliberately have independent nonce spaces.
+The compiled startup gate fails closed unless exactly one executable strategy
+exists and it is `WLDUSDC`; ESP remains observation/planning-only.
+
+`scripts/report-m6-execution-ownership START_UTC END_UTC` reports the exact
+account, owner counts, executable symbol, journal schema, scheduler policy,
+parent/child fsync latency, recovery scopes, and then chains the unchanged M5
+portfolio and M0 hot-path gates.
 
 ### M7 — Combined production shadow
 

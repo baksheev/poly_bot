@@ -21,6 +21,9 @@ const MAX_REASON_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BinanceOrderIntent {
+    /// M6 owner scope. Omitted only in compatible v1 journal records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<BinanceOrderJournalScope>,
     pub operation_id: String,
     pub client_order_id: String,
     pub symbol: String,
@@ -29,6 +32,29 @@ pub struct BinanceOrderIntent {
     pub quantity: Option<String>,
     pub quote_order_quantity: Option<String>,
     pub limit_price: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BinanceOrderJournalScope {
+    pub schema_version: u16,
+    pub account_id: String,
+    pub strategy_id: String,
+}
+
+impl BinanceOrderJournalScope {
+    pub const SCHEMA_VERSION: u16 = 2;
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.schema_version == Self::SCHEMA_VERSION,
+            "unsupported Binance order journal scope schema version"
+        );
+        ensure!(
+            !self.account_id.trim().is_empty() && !self.strategy_id.trim().is_empty(),
+            "Binance order journal scope is incomplete"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -457,7 +483,9 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use std::fs;
 
-    use super::{BinanceOrderIntent, BinanceOrderJournal, BinanceOrderProgress};
+    use super::{
+        BinanceOrderIntent, BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress,
+    };
 
     fn path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -469,6 +497,7 @@ mod tests {
 
     fn intent() -> BinanceOrderIntent {
         BinanceOrderIntent {
+            scope: None,
             operation_id: "rustval-limit-buy".to_owned(),
             client_order_id: "rustval123LB".to_owned(),
             symbol: "WLDUSDC".to_owned(),
@@ -507,6 +536,29 @@ mod tests {
             BinanceOrderProgress::Terminal { .. }
         ));
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn m6_account_and_strategy_scope_survives_order_fsync() {
+        let path = path("m6-scope");
+        let _ = fs::remove_file(&path);
+        let mut scoped = intent();
+        scoped.scope = Some(BinanceOrderJournalScope {
+            schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+            account_id: "binance-main".to_owned(),
+            strategy_id: "strategy-wld-usdc".to_owned(),
+        });
+        {
+            let mut journal = BinanceOrderJournal::open(&path).unwrap();
+            journal.record_intent(scoped.clone()).unwrap();
+        }
+        let recovered = BinanceOrderJournal::open(&path).unwrap();
+        assert_eq!(
+            recovered.operations()[&scoped.client_order_id].intent.scope,
+            scoped.scope
+        );
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 

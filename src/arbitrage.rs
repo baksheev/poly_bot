@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions, symlink_metadata},
     io::{BufRead, BufReader, Write},
     path::Path,
@@ -60,6 +60,10 @@ pub struct TradeIntent {
     pub plan_id: String,
     pub source_revision: String,
     pub pair_id: String,
+    /// Explicit M6 ownership scope. Historical v1 records omit this field and
+    /// remain readable; every newly admitted live parent carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_scope: Option<TradeJournalScope>,
     /// Stable market-observation timestamp used to attribute a result even
     /// when an old journal operation is reconciled after a process restart.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -79,6 +83,34 @@ pub struct TradeIntent {
     pub admission: Option<AdmissionRiskBounds>,
     #[serde(default)]
     pub dex_plan: Option<DexSwapPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TradeJournalScope {
+    pub schema_version: u16,
+    pub account_id: String,
+    pub network_id: String,
+    pub chain_id: u64,
+    pub wallet_id: String,
+    pub strategy_id: String,
+    pub symbol: String,
+}
+
+impl TradeJournalScope {
+    pub const SCHEMA_VERSION: u16 = 2;
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.schema_version == Self::SCHEMA_VERSION,
+            "unsupported trade journal scope schema version"
+        );
+        validate_id("account id", &self.account_id, 96)?;
+        validate_id("network id", &self.network_id, 96)?;
+        ensure!(self.chain_id > 0, "trade journal scope chain id is zero");
+        validate_id("wallet id", &self.wallet_id, 128)?;
+        validate_id("strategy id", &self.strategy_id, 96)?;
+        validate_id("symbol", &self.symbol, 24)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -231,6 +263,9 @@ impl TradeIntent {
         validate_id("plan id", &self.plan_id, 96)?;
         validate_id("source revision", &self.source_revision, 96)?;
         validate_id("pair id", &self.pair_id, 96)?;
+        if let Some(scope) = &self.journal_scope {
+            scope.validate()?;
+        }
         validate_id("DEX operation id", &self.dex_operation_id, 120)?;
         validate_id("CEX client order id", &self.cex_client_order_id, 36)?;
         ensure!(
@@ -774,6 +809,7 @@ impl PaperOpportunity {
             plan_id,
             source_revision: self.source_revision.clone(),
             pair_id: self.pair_id.clone(),
+            journal_scope: None,
             opportunity_received_unix_us: self.received_unix_us,
             mode,
             direction: self.direction,
@@ -1296,7 +1332,8 @@ pub(crate) enum ExecutionLaneState {
 
 #[derive(Debug)]
 struct LatestOpportunityState {
-    pending: Option<PaperOpportunity>,
+    pending_by_strategy: BTreeMap<String, PaperOpportunity>,
+    round_robin: VecDeque<String>,
     lane: ExecutionLaneState,
     senders: usize,
     receiver_open: bool,
@@ -1340,7 +1377,8 @@ impl PaperTradeHandle {
         let discarded = Arc::new(AtomicU64::new(0));
         let mailbox = Arc::new(LatestOpportunityMailbox {
             state: Mutex::new(LatestOpportunityState {
-                pending: None,
+                pending_by_strategy: BTreeMap::new(),
+                round_robin: VecDeque::new(),
                 lane: initial_lane,
                 senders: 1,
                 receiver_open: true,
@@ -1367,7 +1405,13 @@ impl PaperTradeHandle {
             self.discarded.fetch_add(1, Ordering::Relaxed);
             return PaperTradeSubmitResult::Unavailable;
         }
-        let previous = state.pending.replace(opportunity);
+        let strategy_id = opportunity.pair_id.clone();
+        let previous = state
+            .pending_by_strategy
+            .insert(strategy_id.clone(), opportunity);
+        if previous.is_none() {
+            state.round_robin.push_back(strategy_id);
+        }
         drop(state);
         self.mailbox.notify.notify_one();
         match previous {
@@ -1397,7 +1441,8 @@ impl LatestOpportunityReceiver {
             {
                 let mut state = self.mailbox.state.lock().ok()?;
                 if state.lane == ExecutionLaneState::Available
-                    && let Some(opportunity) = state.pending.take()
+                    && let Some(strategy_id) = state.round_robin.pop_front()
+                    && let Some(opportunity) = state.pending_by_strategy.remove(&strategy_id)
                 {
                     state.lane = ExecutionLaneState::Busy;
                     return Some(opportunity);
@@ -1415,7 +1460,8 @@ impl Drop for LatestOpportunityReceiver {
     fn drop(&mut self) {
         if let Ok(mut state) = self.mailbox.state.lock() {
             state.receiver_open = false;
-            state.pending = None;
+            state.pending_by_strategy.clear();
+            state.round_robin.clear();
         }
         self.mailbox.notify.notify_waiters();
     }
@@ -2739,7 +2785,7 @@ mod tests {
     use super::{
         ArbitrageDirection, CoordinatorCommand, ExecutionLaneState, ExecutionMode, LegResult,
         LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS, PaperTradeCoordinator,
-        RECOVERY_RETRY_BASE_DELAY_MS, TerminalOutcome, TradeIntent, TradeStage,
+        RECOVERY_RETRY_BASE_DELAY_MS, TerminalOutcome, TradeIntent, TradeJournalScope, TradeStage,
         initial_execution_lane, meets_spread_threshold, token_b_at_price_in_token_a_base_units,
     };
 
@@ -2787,6 +2833,7 @@ mod tests {
             plan_id: format!("arb-plan-{mode:?}").to_lowercase(),
             source_revision: "abc123".to_owned(),
             pair_id: "world-chain-usdc-wld".to_owned(),
+            journal_scope: None,
             opportunity_received_unix_us: 1_800_000_000_000_000,
             mode,
             direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
@@ -2821,6 +2868,34 @@ mod tests {
             }),
             dex_plan: None,
         }
+    }
+
+    #[test]
+    fn m6_trade_parent_scope_survives_parent_fsync_and_restart() {
+        let path = path("m6-scoped-parent");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let mut scoped = intent(ExecutionMode::DexFirst);
+        scoped.journal_scope = Some(TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-main".to_owned(),
+            network_id: "world-chain".to_owned(),
+            chain_id: 480,
+            wallet_id: "world-chain:wallet-primary".to_owned(),
+            strategy_id: "strategy-wld-usdc".to_owned(),
+            symbol: "WLDUSDC".to_owned(),
+        });
+        let plan_id = scoped.plan_id.clone();
+        coordinator.admit(scoped.clone()).unwrap();
+        drop(coordinator);
+
+        let recovered = PaperTradeCoordinator::open(&path).unwrap();
+        assert_eq!(
+            recovered.operation(&plan_id).unwrap().intent.journal_scope,
+            scoped.journal_scope
+        );
+        drop(recovered);
+        fs::remove_file(path).unwrap();
     }
 
     fn filled(token_b: i128, token_a: i128, reference: &str) -> LegResult {

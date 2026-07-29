@@ -13,8 +13,8 @@ mod journal;
 mod nonce;
 
 pub use journal::{
-    JournalIntent, JournalOperation, JournalOperationIdentity, JournalStatus, TransactionJournal,
-    UnknownOutcomeReason,
+    EvmJournalScope, JournalIntent, JournalOperation, JournalOperationIdentity, JournalStatus,
+    TransactionJournal, UnknownOutcomeReason,
 };
 pub use nonce::{
     NonceLane, NonceLaneState, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,

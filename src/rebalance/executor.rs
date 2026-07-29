@@ -33,6 +33,8 @@ pub struct RebalanceExecutionRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RebalanceExecutionIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RebalanceJournalScope>,
     pub operation_id: String,
     pub fingerprint: String,
     pub withdraw_order_id: String,
@@ -50,6 +52,18 @@ pub struct RebalanceExecutionIntent {
     pub binance_balance_before: U256,
     #[serde(with = "u256_serde")]
     pub wallet_balance_before: U256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RebalanceJournalScope {
+    pub schema_version: u16,
+    pub account_id: String,
+    pub network_id: String,
+    pub strategy_id: String,
+}
+
+impl RebalanceJournalScope {
+    pub const SCHEMA_VERSION: u16 = 2;
 }
 
 impl RebalanceExecutionIntent {
@@ -317,6 +331,17 @@ impl RebalanceExecutionJournal {
         let withdraw_order_id = format!("rb{}", &fingerprint[..30]);
         let operation = RebalanceExecutionOperation {
             intent: RebalanceExecutionIntent {
+                scope: Some(RebalanceJournalScope {
+                    schema_version: RebalanceJournalScope::SCHEMA_VERSION,
+                    account_id: "binance:trading-subaccount".to_owned(),
+                    network_id: match &request.action.route {
+                        Route::Direct { chain_id, .. } => format!("chain:{chain_id}"),
+                        Route::Across {
+                            bridge_chain_id, ..
+                        } => format!("chain:{bridge_chain_id}"),
+                    },
+                    strategy_id: "rebalance-world-chain-v12".to_owned(),
+                }),
                 operation_id,
                 fingerprint,
                 withdraw_order_id,
@@ -970,6 +995,22 @@ mod tests {
             binance_balance_before: U256::from(8_000_000_u64),
             wallet_balance_before: U256::from(8_000_000_u64),
         }
+    }
+
+    #[test]
+    fn m6_rebalance_parent_is_account_network_and_strategy_scoped() {
+        let path = path("m6-scope");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        let scope = operation.intent.scope.unwrap();
+        assert_eq!(scope.schema_version, 2);
+        assert_eq!(scope.account_id, "binance:trading-subaccount");
+        assert_eq!(scope.network_id, "chain:10");
+        assert_eq!(scope.strategy_id, "rebalance-world-chain-v12");
+        drop(journal);
+        fs::remove_file(path).unwrap();
     }
 
     fn across() -> Route {

@@ -26,6 +26,33 @@ pub struct JournalOperationIdentity {
     pub chain_id: u64,
     pub wallet: Address,
     pub nonce: u64,
+    pub scope: Option<EvmJournalScope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmJournalScope {
+    pub schema_version: u16,
+    pub network_id: String,
+    pub wallet_id: String,
+    pub strategy_id: String,
+}
+
+impl EvmJournalScope {
+    pub const SCHEMA_VERSION: u16 = 2;
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.schema_version == Self::SCHEMA_VERSION,
+            "unsupported EVM journal scope schema version"
+        );
+        ensure!(
+            !self.network_id.trim().is_empty()
+                && !self.wallet_id.trim().is_empty()
+                && !self.strategy_id.trim().is_empty(),
+            "EVM journal scope is incomplete"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +408,7 @@ impl TransactionJournal {
             chain_id: identity.chain_id,
             wallet: format!("{:#x}", identity.wallet),
             nonce: identity.nonce,
+            scope: identity.scope.clone(),
             event,
         };
 
@@ -446,6 +474,8 @@ struct WirePayload {
     chain_id: u64,
     wallet: String,
     nonce: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<EvmJournalScope>,
     event: WireEvent,
 }
 
@@ -489,6 +519,7 @@ fn apply_payload(
         chain_id: payload.chain_id,
         wallet: Address::from_str(&payload.wallet).context("journal wallet address is invalid")?,
         nonce: payload.nonce,
+        scope: payload.scope.clone(),
     };
     validate_identity(&identity)?;
 
@@ -657,6 +688,9 @@ fn validate_identity(identity: &JournalOperationIdentity) -> anyhow::Result<()> 
     )?;
     ensure!(identity.chain_id > 0, "journal chain id is zero");
     ensure!(identity.wallet != Address::ZERO, "journal wallet is zero");
+    if let Some(scope) = &identity.scope {
+        scope.validate()?;
+    }
     Ok(())
 }
 
@@ -739,8 +773,8 @@ mod tests {
     use alloy_primitives::{Address, B256, U256, keccak256};
 
     use super::{
-        JournalIntent, JournalOperationIdentity, JournalStatus, TransactionJournal,
-        UnknownOutcomeReason,
+        EvmJournalScope, JournalIntent, JournalOperationIdentity, JournalStatus,
+        TransactionJournal, UnknownOutcomeReason,
     };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -759,6 +793,7 @@ mod tests {
             chain_id: 480,
             wallet: Address::repeat_byte(0x11),
             nonce: 7,
+            scope: None,
         }
     }
 
@@ -801,6 +836,34 @@ mod tests {
             journal.highest_consumed_nonce(480, identity().wallet),
             Some(7)
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn m6_network_wallet_and_strategy_scope_survives_evm_fsync() {
+        let path = journal_path("m6-scope");
+        let mut scoped = intent();
+        scoped.identity.scope = Some(EvmJournalScope {
+            schema_version: EvmJournalScope::SCHEMA_VERSION,
+            network_id: "world-chain".to_owned(),
+            wallet_id: "world-chain:wallet-primary".to_owned(),
+            strategy_id: "strategy-wld-usdc".to_owned(),
+        });
+        {
+            let mut journal = TransactionJournal::open(&path).unwrap();
+            journal.record_intent(&scoped).unwrap();
+        }
+        let recovered = TransactionJournal::open(&path).unwrap();
+        assert_eq!(
+            recovered
+                .operation(&scoped.identity.operation_id)
+                .unwrap()
+                .intent
+                .identity
+                .scope,
+            scoped.identity.scope
+        );
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 

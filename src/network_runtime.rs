@@ -364,6 +364,7 @@ pub enum EvmExecutionCommandKind {
     Swap,
     Approval,
     Transfer,
+    Bridge,
     Rebalance,
 }
 

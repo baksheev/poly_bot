@@ -17,9 +17,9 @@ use crate::{
     },
     chain::rpc::{JsonRpcClient, TransactionReceipt},
     wallet::{
-        EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
-        TransactionJournal, UnknownOutcomeReason, WalletCall, WalletTransactionParameters,
-        acquire_process_nonce_lock, broadcast_signed_transaction,
+        EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
+        PROCESS_NONCE_LOCK_TTL, TransactionJournal, UnknownOutcomeReason, WalletCall,
+        WalletTransactionParameters, acquire_process_nonce_lock, broadcast_signed_transaction,
     },
 };
 
@@ -61,23 +61,77 @@ pub struct RebalanceExecutor {
     treasury_binance: BinanceAccountClient,
     subaccount_email: String,
     across: AcrossClient,
+    execution_journal: RebalanceExecutionJournal,
+    evm: RebalanceEvmExecutionOwner,
+    limits: RebalanceRuntimeLimits,
+}
+
+/// The only rebalancing component that can access signing material or nonce
+/// lanes. The saga receives only typed call/chain commands.
+struct RebalanceEvmExecutionOwner {
     world: JsonRpcClient,
     optimism: JsonRpcClient,
     wallet: EvmWallet,
-    execution_journal: RebalanceExecutionJournal,
     transaction_journal: TransactionJournal,
     world_nonce: NonceLane,
     optimism_nonce: NonceLane,
-    limits: RebalanceRuntimeLimits,
+}
+
+impl RebalanceEvmExecutionOwner {
+    fn wallet_address(&self) -> Address {
+        self.wallet.address()
+    }
+
+    fn rpc(&self, chain_id: u64) -> anyhow::Result<&JsonRpcClient> {
+        match chain_id {
+            WORLD_CHAIN_CHAIN_ID => Ok(&self.world),
+            OPTIMISM_CHAIN_ID => Ok(&self.optimism),
+            _ => bail!("rebalance EVM owner has no lane for chain {chain_id}"),
+        }
+    }
+
+    fn nonce_state(&self, chain_id: u64) -> anyhow::Result<&crate::wallet::NonceLaneState> {
+        match chain_id {
+            WORLD_CHAIN_CHAIN_ID => Ok(self.world_nonce.state()),
+            OPTIMISM_CHAIN_ID => Ok(self.optimism_nonce.state()),
+            _ => bail!("rebalance EVM owner has no nonce lane for chain {chain_id}"),
+        }
+    }
+
+    async fn execute(
+        &mut self,
+        chain_id: u64,
+        operation_id: String,
+        purpose: &str,
+        call: &WalletCall,
+        timeout: Duration,
+    ) -> anyhow::Result<B256> {
+        let (rpc, nonce) = match chain_id {
+            WORLD_CHAIN_CHAIN_ID => (&self.world, &mut self.world_nonce),
+            OPTIMISM_CHAIN_ID => (&self.optimism, &mut self.optimism_nonce),
+            _ => bail!("rebalance EVM owner has no execution lane for chain {chain_id}"),
+        };
+        execute_wallet_call(
+            rpc,
+            &self.wallet,
+            nonce,
+            &mut self.transaction_journal,
+            operation_id,
+            purpose,
+            call,
+            timeout,
+        )
+        .await
+    }
 }
 
 impl std::fmt::Debug for RebalanceExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RebalanceExecutor")
-            .field("wallet", &self.wallet.address())
-            .field("world_nonce", &self.world_nonce.state())
-            .field("optimism_nonce", &self.optimism_nonce.state())
+            .field("wallet", &self.evm.wallet_address())
+            .field("world_nonce", &self.evm.nonce_state(WORLD_CHAIN_CHAIN_ID))
+            .field("optimism_nonce", &self.evm.nonce_state(OPTIMISM_CHAIN_ID))
             .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
@@ -199,33 +253,48 @@ impl RebalanceExecutor {
             optimism_pending,
         )
         .await?;
-        let world_nonce = finish_known_pending_recovery(
+        let mut world_nonce = finish_known_pending_recovery(
             &world,
             &mut transaction_journal,
             world_reconciled,
             limits.operation_timeout,
         )
         .await?;
-        let optimism_nonce = finish_known_pending_recovery(
+        let mut optimism_nonce = finish_known_pending_recovery(
             &optimism,
             &mut transaction_journal,
             optimism_reconciled,
             limits.operation_timeout,
         )
         .await?;
+        let wallet_id = format!("wallet:{owner:#x}");
+        world_nonce.set_journal_scope(EvmJournalScope {
+            schema_version: EvmJournalScope::SCHEMA_VERSION,
+            network_id: "world-chain".to_owned(),
+            wallet_id: wallet_id.clone(),
+            strategy_id: "rebalance-world-chain-v12".to_owned(),
+        })?;
+        optimism_nonce.set_journal_scope(EvmJournalScope {
+            schema_version: EvmJournalScope::SCHEMA_VERSION,
+            network_id: "optimism".to_owned(),
+            wallet_id,
+            strategy_id: "rebalance-world-chain-v12".to_owned(),
+        })?;
 
         Ok(Self {
             trading_binance,
             treasury_binance,
             subaccount_email,
             across,
-            world,
-            optimism,
-            wallet,
             execution_journal: RebalanceExecutionJournal::open(execution_journal_path)?,
-            transaction_journal,
-            world_nonce,
-            optimism_nonce,
+            evm: RebalanceEvmExecutionOwner {
+                world,
+                optimism,
+                wallet,
+                transaction_journal,
+                world_nonce,
+                optimism_nonce,
+            },
             limits,
         })
     }
@@ -244,7 +313,7 @@ impl RebalanceExecutor {
             operation.intent.token_contract,
         )?;
         ensure!(
-            operation.intent.wallet_owner == self.wallet.address(),
+            operation.intent.wallet_owner == self.evm.wallet_address(),
             "journaled rebalance wallet differs from signer"
         );
         self.process(operation, false).await.map(Some)
@@ -255,7 +324,7 @@ impl RebalanceExecutor {
         request: RebalanceExecutionRequest,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
         ensure!(
-            request.wallet_owner == self.wallet.address(),
+            request.wallet_owner == self.evm.wallet_address(),
             "rebalance request wallet differs from signer"
         );
         validate_approved_world_asset(
@@ -321,7 +390,8 @@ impl RebalanceExecutor {
         ) {
             self.verify_route(&operation, true).await?;
             let bridge_before = self
-                .world
+                .evm
+                .rpc(WORLD_CHAIN_CHAIN_ID)?
                 .erc20_balance(
                     operation.intent.token_contract,
                     operation.intent.wallet_owner,
@@ -348,7 +418,7 @@ impl RebalanceExecutor {
         let received = withdrawal_received_base_units(&record, operation.intent.token_decimals)?;
         let wallet_after = self
             .wait_direct_withdrawal_credit(
-                &self.world,
+                self.evm.rpc(WORLD_CHAIN_CHAIN_ID)?,
                 operation.intent.token_contract,
                 operation.intent.wallet_owner,
                 &record.tx_id,
@@ -395,17 +465,16 @@ impl RebalanceExecutor {
                 address.address,
                 operation.intent.amount,
             )?;
-            let transaction_hash = execute_wallet_call(
-                &self.world,
-                &self.wallet,
-                &mut self.world_nonce,
-                &mut self.transaction_journal,
-                format!("{}:deposit", operation.intent.operation_id),
-                "rebalance_wallet_to_binance",
-                &call,
-                self.limits.operation_timeout,
-            )
-            .await?;
+            let transaction_hash = self
+                .evm
+                .execute(
+                    WORLD_CHAIN_CHAIN_ID,
+                    format!("{}:deposit", operation.intent.operation_id),
+                    "rebalance_wallet_to_binance",
+                    &call,
+                    self.limits.operation_timeout,
+                )
+                .await?;
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::DepositTransferMined {
@@ -449,7 +518,8 @@ impl RebalanceExecutor {
         ) {
             self.verify_route(&operation, true).await?;
             let bridge_before = self
-                .optimism
+                .evm
+                .rpc(OPTIMISM_CHAIN_ID)?
                 .erc20_balance(
                     token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
                     operation.intent.wallet_owner,
@@ -472,7 +542,7 @@ impl RebalanceExecutor {
             let received =
                 withdrawal_received_base_units(&record, operation.intent.token_decimals)?;
             self.wait_token_credit(
-                &self.optimism,
+                self.evm.rpc(OPTIMISM_CHAIN_ID)?,
                 token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
                 operation.intent.wallet_owner,
                 bridge_balance_before,
@@ -538,17 +608,16 @@ impl RebalanceExecutor {
                 deposit_address.address,
                 received_base_units,
             )?;
-            let transaction_hash = execute_wallet_call(
-                &self.optimism,
-                &self.wallet,
-                &mut self.optimism_nonce,
-                &mut self.transaction_journal,
-                format!("{}:deposit", operation.intent.operation_id),
-                "rebalance_bridge_to_binance",
-                &call,
-                self.limits.operation_timeout,
-            )
-            .await?;
+            let transaction_hash = self
+                .evm
+                .execute(
+                    OPTIMISM_CHAIN_ID,
+                    format!("{}:deposit", operation.intent.operation_id),
+                    "rebalance_bridge_to_binance",
+                    &call,
+                    self.limits.operation_timeout,
+                )
+                .await?;
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::DepositTransferMined {
@@ -781,12 +850,14 @@ impl RebalanceExecutor {
     ) -> anyhow::Result<(Address, Vec<u8>, U256, U256)> {
         let destination_balance_before = match destination_chain_id {
             WORLD_CHAIN_CHAIN_ID => {
-                self.world
+                self.evm
+                    .rpc(WORLD_CHAIN_CHAIN_ID)?
                     .erc20_balance(output_token, operation.intent.wallet_owner)
                     .await?
             }
             OPTIMISM_CHAIN_ID => {
-                self.optimism
+                self.evm
+                    .rpc(OPTIMISM_CHAIN_ID)?
                     .erc20_balance(output_token, operation.intent.wallet_owner)
                     .await?
             }
@@ -807,35 +878,15 @@ impl RebalanceExecutor {
         purpose: &str,
         call: &WalletCall,
     ) -> anyhow::Result<B256> {
-        match chain_id {
-            WORLD_CHAIN_CHAIN_ID => {
-                execute_wallet_call(
-                    &self.world,
-                    &self.wallet,
-                    &mut self.world_nonce,
-                    &mut self.transaction_journal,
-                    operation_id,
-                    purpose,
-                    call,
-                    self.limits.operation_timeout,
-                )
-                .await
-            }
-            OPTIMISM_CHAIN_ID => {
-                execute_wallet_call(
-                    &self.optimism,
-                    &self.wallet,
-                    &mut self.optimism_nonce,
-                    &mut self.transaction_journal,
-                    operation_id,
-                    purpose,
-                    call,
-                    self.limits.operation_timeout,
-                )
-                .await
-            }
-            _ => bail!("unsupported rebalance transaction chain"),
-        }
+        self.evm
+            .execute(
+                chain_id,
+                operation_id,
+                purpose,
+                call,
+                self.limits.operation_timeout,
+            )
+            .await
     }
 
     async fn wait_across_fill(
@@ -892,11 +943,7 @@ impl RebalanceExecutor {
                     } else {
                         WORLD_CHAIN_CHAIN_ID
                     };
-                    let rpc = if destination_chain_id == OPTIMISM_CHAIN_ID {
-                        &self.optimism
-                    } else {
-                        &self.world
-                    };
+                    let rpc = self.evm.rpc(destination_chain_id)?;
                     let token =
                         token_on_chain(&operation.intent.token_symbol, destination_chain_id)?;
                     let receipt =
@@ -944,7 +991,7 @@ impl RebalanceExecutor {
             return Ok(operation);
         };
         let receipt = wait_receipt(
-            &self.world,
+            self.evm.rpc(WORLD_CHAIN_CHAIN_ID)?,
             fill_transaction_hash,
             self.limits.operation_timeout,
         )
@@ -957,7 +1004,8 @@ impl RebalanceExecutor {
             received_base_units,
         )?;
         let wallet_after = self
-            .world
+            .evm
+            .rpc(WORLD_CHAIN_CHAIN_ID)?
             .erc20_balance(
                 operation.intent.token_contract,
                 operation.intent.wallet_owner,
@@ -1016,7 +1064,8 @@ impl RebalanceExecutor {
                 );
             }
             let wallet_after = self
-                .world
+                .evm
+                .rpc(WORLD_CHAIN_CHAIN_ID)?
                 .erc20_balance(
                     operation.intent.token_contract,
                     operation.intent.wallet_owner,
