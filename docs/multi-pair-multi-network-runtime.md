@@ -1,0 +1,1428 @@
+# Multi-pair, multi-network trading runtime
+
+Status: **proposed migration specification**
+Last reviewed: 2026-07-29
+Applies to: Binance account ownership, EVM network runtimes, pool state,
+strategy scheduling, inventory, execution, recovery, and rebalancing
+
+This proposal is subordinate to
+[`rust-production-architecture.md`](rust-production-architecture.md). It
+describes how to evolve the current single-pair bootstrap into one process that
+can safely trade 10–20 pairs on several EVM networks from one Rust-owned Binance
+subaccount and, initially, one EVM signer.
+
+The migration must preserve the current WLD/USDC World Chain v12 production
+behavior at every milestone. ESP/USDC Arbitrum remains read-only until the
+milestone that explicitly authorizes a bounded live canary.
+
+## Decision summary
+
+The target runtime has five ownership layers:
+
+1. one `HotPathDecisionOwner` directly polls Binance strategy-price streams,
+   applies ordered DEX events, owns local pool mirrors and strategy state, and
+   immediately evaluates only the affected strategies;
+2. one `BinanceAccountRuntime` supervises the shared Rust subaccount
+   infrastructure while separate internal owners isolate public market data,
+   authenticated account state, order execution, rate limits, and capital
+   operations;
+3. one `NetworkRuntime` owns the reusable I/O and read coordination for each EVM
+   network;
+4. one `PortfolioOwner` atomically owns observed inventory, reservations, and
+   account-wide capital/risk allocation;
+5. one `EvmExecutionOwner` per `(chain_id, wallet_id)` owns every signed
+   transaction and nonce on that lane, whether it belongs to a trade,
+   allowance, transfer, bridge, or rebalance.
+
+The first production topology uses:
+
+- one shared Rust-owned Binance Spot subaccount for all configured pairs;
+- one Binance market-data and authenticated-account infrastructure stack;
+- one account-wide capital allocator and durable rebalance saga owner;
+- one configured EVM signer, reused across networks but with independent nonce
+  space on every chain;
+- one single-owner EVM executor per `(chain_id, wallet_id)`;
+- one local pool mirror per configured Uniswap pool;
+- no Postgres, Rails, Redis, or ClickHouse dependency in the trading path.
+
+The rule is **one owner per external mutation namespace**, not one subaccount or
+wallet per strategy.
+
+There is no separate production paper milestone for ESP/USDC. Implementation
+still starts behind the repository's non-mutating execution mode and explicit
+live-trading gate, but that mode is used only for deterministic tests,
+read-only production validation, and preflight verification. Once its exit
+criteria pass, the next rollout is the bounded live canary rather than an
+extended paper observation period.
+
+## Goals
+
+- Add pairs without creating another Binance account runtime, User Data Stream,
+  balance cache, rate limiter, journal owner, or rebalancer.
+- Add EVM networks without duplicating strategy logic or allowing two tasks to
+  allocate the same nonce.
+- Subscribe to and hydrate all configured pools once per network.
+- Use network-level Multicall3 batches for bootstrap, reconciliation, wallet
+  balance reads, and sampled Quoter parity where appropriate.
+- Keep executable DEX quotes local and synchronous after startup.
+- Let strategies evaluate independently while all external mutations remain
+  serialized by their real ownership boundary.
+- Reserve shared Binance assets atomically across every pair.
+- Route every on-chain mutation for one wallet location through the same signer,
+  nonce allocator, gas policy, and transaction journal.
+- Preserve deterministic recovery after process restart.
+- Leave a clean extension point for multiple wallets without implementing that
+  extension in the first migration.
+
+## Non-goals
+
+- Running one OS process or Pod per pair.
+- Requiring one Tokio task or OS thread per strategy before profiling proves
+  that sharding the decision owner is necessary.
+- Assigning one Binance subaccount to every pair.
+- Adding a second production replica or distributed coordinator.
+- Using Multicall, Quoter, RPC, Postgres, or ClickHouse in opportunity
+  evaluation or entry preflight.
+- Enabling ESP/USDC trading as part of the structural refactor.
+- Implementing multi-wallet allocation, wallet selection, or capital routing
+  in the first version.
+- Changing the reviewed WLD/USDC economics, adaptive sizing, DEX-first ordering,
+  recovery behavior, or live thresholds.
+
+## Target topology
+
+```text
+Binance strategy-price sockets ───────────────────────────────────────┐
+Network WSS logs/heads ─> ordered canonical events ───────────────────┤
+                                                                      v
+                                                          HotPathDecisionOwner
+                                                     pool mirrors + strategy state
+                                                               │ candidates
+                                                               v
+                                                        CandidateScheduler
+                                                               │
+                                                               v
+                                                          PortfolioOwner
+                                                     admission + reservation
+                                                               │
+                                                               v
+                                                            TradeSaga
+                                              ┌────────────────┴───────────────┐
+                                              v                                v
+                                  BinanceOrderExecutionOwner       EvmExecutionOwner
+                                                                   per chain/wallet
+
+Binance REST/User Data ─> BinanceAccountStateOwner ─────────> PortfolioOwner
+Network HTTP/Multicall ─> NetworkReadCoordinator ───────────> hydration/balances
+CapitalAllocator ───────> RebalanceSaga ────────────────────> same venue owners
+```
+
+The diagram omits individual evaluator instances because strategies have no
+mutation authority. The registries and identifiers must not encode a two-pair
+limit.
+
+## Identity and ownership model
+
+Every stateful component uses explicit typed identities:
+
+| Identity | Meaning | Initial cardinality |
+| --- | --- | --- |
+| `BinanceAccountId` | One authenticated Spot account and order namespace | 1 |
+| `InstrumentId` | Binance account plus Spot symbol | 2 |
+| `StrategyId` | Versioned pair strategy and its execution policy | 2 |
+| `NetworkId` | EVM `chain_id` | 2 |
+| `WalletId` | Stable configured signer identity, not an address string alias | 1 |
+| `WalletLocation` | `(chain_id, wallet_id)` | 2 |
+| `PoolId` | `(chain_id, protocol, address-or-v4-pool-id)` | all configured pools |
+| `ExecutionLaneId` | `(chain_id, wallet_id)` | 2 |
+| `VenueAssetId` | Exact Binance asset or chain/token-contract identity | all configured assets |
+| `EconomicAssetId` | Capital-policy identity joining reviewed representations | configured currencies |
+
+The same private key produces the same address on World Chain and Arbitrum, but
+the two wallet locations have independent balances, gas policies, RPC health,
+journals, and nonce sequences. They must never share a wallet inventory key or
+nonce lane.
+
+### Single-owner rules
+
+- `HotPathDecisionOwner` is the only writer of executable Binance price state,
+  local pool mirrors, prepared curves, and strategy calculation state.
+- `BinanceAccountStateOwner` is the only writer of authenticated Binance account
+  state.
+- `BinanceOrderExecutionOwner` is the only component allowed to place or
+  reconcile Spot orders for the configured account.
+- One `NetworkRuntime` is the only owner of canonical network ingestion,
+  hydration, gap repair, and block-pinned read scheduling for its chain. It
+  delivers ordered events to the hot-path owner, which applies them to the local
+  mirrors.
+- One `EvmExecutionOwner` is the only component allowed to sign, broadcast, or
+  reconcile any transaction for an `ExecutionLaneId`.
+- `PortfolioOwner` is the only writer of observed inventory, reservations, and
+  capital allocations.
+- `CapitalAllocator` is the only component allowed to propose movement between
+  the Binance account and wallet locations. A durable `RebalanceSaga` routes its
+  child mutations through the normal Binance and EVM venue owners.
+- Strategies are synchronous evaluators owned by the hot-path runtime. They
+  never perform I/O, place orders, reserve funds, select nonces, rebalance, or
+  mutate pool state.
+
+## Binance account runtime
+
+One account runtime serves all configured symbols and assets, but it is a
+supervision and shared-infrastructure boundary rather than one large event loop.
+It contains:
+
+- `BinanceMarketDataIngress`, which owns the derived set of public Spot
+  subscriptions and exposes their socket futures directly to the
+  `HotPathDecisionOwner`;
+- `BinanceAccountStateOwner`, which owns the authenticated WebSocket API
+  session, User Data subscription, account snapshots, open-order observations,
+  filters, commissions, and clock synchronization;
+- `BinanceOrderExecutionOwner`, which owns deterministic client-order IDs,
+  placement, order journals, fill reconciliation, and recovery-required orders;
+- `BinanceRateLimitGovernor`, which accounts for request weight and order limits
+  across every symbol and authenticated client;
+- `BinanceCapitalSagaOwner`, which owns only the Binance transfer, deposit, and
+  withdrawal children of account-wide rebalancing.
+
+The children reuse process-scoped connection pools and account metadata. They
+have separate bounded queues and failure handling so a slow withdrawal,
+commission refresh, or REST reconciliation cannot delay strategy-price parsing
+or opportunity evaluation.
+
+The public connection set is one account-level facility, not necessarily one
+physical socket. The domain compiler deterministically assigns symbols to a
+small bounded set of combined streams based on measured message rate and
+Binance connection limits. Connection generation and liveness remain
+per-stream and per-symbol. Adding a noisy symbol must not create an unbounded
+queue or force unrelated symbols onto a failed connection shard.
+
+Public price state remains per symbol. Account balances, BNB commission
+inventory, rate limits, open orders, and recovery state are shared.
+
+An unavailable or stale symbol degrades only strategies that require that
+symbol. An unavailable authenticated account snapshot prevents new execution
+for every strategy because shared inventory is then unknown. Existing recovery
+continues with priority.
+
+### Binance order concurrency
+
+The first migration preserves the current globally serialized trade
+coordinator. This minimizes behavioral change while WLD/USDC remains live.
+
+The interfaces must still permit a later reviewed increase in concurrency:
+
+- reservations are operation-scoped rather than lane-global;
+- client order IDs include the strategy and parent operation identity;
+- the Binance owner can reconcile several known orders;
+- global exchange rate limits remain enforced across all symbols.
+
+Parallel order placement is not enabled merely because strategies run in
+separate evaluators or are later assigned to separate decision shards.
+
+The trading/order credential and the master treasury credential remain
+capability-separated. The order owner cannot withdraw or perform master-account
+capital operations. The capital saga owner cannot expose treasury credentials
+to strategies or the order-placement path. Both remain under one Binance
+account infrastructure and rate-limit policy without sharing mutation
+authority.
+
+## Network runtime
+
+The process creates exactly one `NetworkRuntime` for every enabled `chain_id`.
+It owns reusable network-scoped resources:
+
+- Alchemy or equivalent HTTP and WebSocket clients;
+- canonical head, ordered log ingestion, and reorg state;
+- the registry of V3/V4 pools on that network;
+- a `NetworkReadCoordinator` for startup hydration, wallet reads,
+  reconciliation, Quoter parity, and gap repair;
+- block-pinned wallet balances for configured tokens;
+- the chain-specific gas and transaction fee policy;
+- router, Quoter, Multicall3, factory, PoolManager, and StateView contracts;
+- one `EvmExecutionOwner` for the initial wallet;
+- one durable transaction/nonce journal namespace per wallet location.
+
+The network runtime does not evaluate strategies. It delivers canonical,
+ordered, generation-tagged DEX events and hydration results to the
+`HotPathDecisionOwner`. The hot-path owner applies those events, owns the local
+CLMM mirrors, and publishes immutable prepared curve generations without
+cloning complete pools or acquiring a lock during evaluation.
+
+Large Multicall responses, bitmap/tick decoding, gap repair, and provider retry
+logic remain on network I/O workers. They may publish only bounded typed results
+to the hot-path owner. A burst on one network cannot execute response decoding
+or allocate large temporary collections on the decision thread.
+
+Gas policy is part of the network configuration. World Chain fallback constants
+must not be reused on Arbitrum. A missing reviewed fee policy makes execution on
+that network unavailable while read-only pool observation may continue.
+
+### Multicall and local quote boundary
+
+“One request per network” means one logical, block-hash-pinned batch round for
+all reads in the same traffic class on that network. It does not mean combining
+unrelated readiness and diagnostic work into one giant Multicall.
+
+`NetworkReadCoordinator` has these priority classes:
+
+| Class | Priority and isolation |
+| --- | --- |
+| canonical gap repair and restart recovery | highest; new chain entries remain closed |
+| wallet balance snapshot | high; independent freshness deadline |
+| startup pool hydration | startup-critical for dependent strategies |
+| periodic state reconciliation | bounded background work |
+| sampled Quoter parity and diagnostics | lowest; freely shed before critical reads |
+
+All classes reuse the same network client pool and provider capability profile,
+but have independent deadlines, concurrency limits, chunk sizes, and
+backpressure. The implementation may split a logical round when an RPC
+provider's response-size, batch-count, or Multicall gas limit requires bounded
+chunks. It must not create one client or sequential request loop per pair.
+
+Use Multicall3 or a JSON-RPC batch for:
+
+- initial pool head and static metadata reads;
+- V3 bitmap/tick and V4 state hydration reads that are known for the selected
+  canonical block;
+- ERC-20 `balanceOf` reads for all configured wallet assets;
+- periodic state reconciliation and gap repair;
+- read-only collector quotes and sampled local-vs-Quoter parity.
+
+Do not use Multicall or a Quoter for:
+
+- opportunity evaluation after the mirror is ready;
+- adaptive sizing;
+- admission;
+- entry preflight;
+- transaction construction.
+
+After hydration, canonical WebSocket logs update local CLMM mirrors. Binance
+price events evaluate all relevant local prepared curves without network I/O.
+Pool state is shared when several strategies reference the same pool.
+
+Every batch result is tagged with:
+
+- `chain_id`;
+- canonical block number and hash;
+- network connection generation;
+- read class and provider capability profile;
+- requested and returned pool/token identities;
+- batch/chunk count and duration;
+- partial or failed call identities.
+
+A partial hydration does not produce a ready pool generation. A failed pool is
+removed from the eligible candidate set; a strategy degrades only when it no
+longer has the minimum healthy pool set required by its policy. Unknown
+canonical head continuity still degrades every strategy on that network.
+
+The provider profile records support for EIP-1898 block-hash `eth_call`,
+maximum safe batch/chunk sizes, and the reviewed Multicall3 code identity.
+Failure to prove the requested block hash invalidates the round rather than
+silently falling back to an unpinned latest-state read.
+
+## Hot-path decision and strategy runtime
+
+The first multi-pair runtime has one `HotPathDecisionOwner` on a dedicated
+single-thread Tokio runtime. It directly polls the Binance strategy-price socket
+futures, prioritizes and drains already-queued canonical DEX events, applies
+local mirror changes, and synchronously invokes affected strategy evaluators.
+There is no channel or task wakeup between an accepted Binance price frame and
+baseline opportunity evaluation.
+
+Before evaluating a symbol, the owner drains already-queued DEX events only for
+the networks and pools in that symbol's strategy dependencies. An unrelated
+Arbitrum burst cannot postpone a World Chain WLD/USDC decision, and vice versa.
+Canonical events are still never discarded; unrelated work remains queued for
+its own dependency-scoped turn.
+
+Each enabled strategy is a synchronous `StrategyEvaluator` owned by that
+runtime. It contains only pair-specific calculation state:
+
+- the selected Binance instrument;
+- its candidate pool set;
+- direction-specific thresholds and sizing rules;
+- pair execution mode and risk caps;
+- latest-only pending opportunity;
+- pair telemetry and health projection.
+
+The owner maintains two precompiled dependency indexes:
+
+- calculation dependencies map Binance symbols, pools, and networks to the
+  strategies that must be evaluated when they change;
+- admission dependencies map account and wallet-location balances, execution
+  capabilities, and risk policies to strategies whose candidates may become
+  eligible or ineligible.
+
+A market event invokes only strategies from the calculation index. A balance
+event updates admission state without needlessly repeating DEX math. Strategy
+output is an immutable candidate carrying the complete dependency vector used
+to calculate and admit it:
+
+```text
+artifact fingerprint
+Binance symbol + connection/update generation
+network canonical head generation
+selected pool generation(s)
+Binance account balance generation
+wallet-location balance generation
+strategy policy generation
+```
+
+Prepared curves are immutable generations. Baseline evaluation borrows them
+directly from the single owner without an atomic reference-count operation,
+deep pool clone, shared lock, string lookup, or heap allocation. Only work that
+actually crosses into an asynchronous sizing worker receives a
+reference-counted immutable handle.
+
+Baseline evaluation is bounded and synchronous. Exhaustive adaptive sizing and
+other measured-heavy pure calculations use bounded workers against immutable
+snapshots. Each worker has one latest-only slot per strategy. A completed result
+is accepted only when its entire dependency vector is still current.
+
+The runtime does not assume one task or thread per pair. If production profiling
+shows that one decision owner cannot meet the target-node p99 budget at the
+configured maximum pair count, the same synchronous evaluators may be assigned
+to a small fixed set of decision shards. Every symbol, pool mirror, and strategy
+then has exactly one shard owner; no hot-path mutex or arbitrary work-stealing
+is introduced.
+
+## Candidate scheduling, portfolio, and trade sagas
+
+The mutation path is split into explicit owners rather than one process
+coordinator:
+
+- `CandidateScheduler` keeps at most one latest candidate per strategy, applies
+  a versioned deterministic scheduling policy and the current globally
+  serialized live policy, and never owns venue state;
+- `PortfolioOwner` atomically validates account/pair risk and creates exact
+  resource reservations;
+- one durable `TradeSaga` owns the parent state machine, child identities,
+  DEX-first ordering, recovery, settlement, and terminal PnL for each admitted
+  operation;
+- the Binance and EVM owners perform and reconcile only their typed child
+  mutations.
+
+An architectural owner is not automatically a Tokio task. In the first
+implementation, `CandidateScheduler` and the admission-facing portion of
+`PortfolioOwner` are co-located with `HotPathDecisionOwner` and invoked
+synchronously. No actor/channel handoff is added between price receipt,
+baseline evaluation, candidate selection, and exact reservation. The first
+normal asynchronous handoff is the bounded accepted-work mailbox to the durable
+trade path.
+
+Admission is a two-phase protocol:
+
+1. candidate scheduler submits the immutable candidate;
+2. portfolio owner validates balance, capability, and risk generations and
+   atomically reserves inventory/risk;
+3. `HotPathDecisionOwner` validates current market generations, locally
+   requotes when required, and returns an immutable `EntryPreflightProof`;
+4. the trade saga validates that proof, selects the execution lane, and fsyncs
+   its parent intent;
+5. venue owners validate only their typed venue commands and durably accept
+   their child intents before external mutation;
+6. failure before any child submission releases the reservation;
+7. an unknown child outcome retains only that operation's exact claims while
+   reconciliation continues.
+
+The initial live policy permits one newly dispatching parent at a time. The
+interfaces and journals still support several known or recovering parent sagas,
+so an old unknown operation does not globally erase unrelated available
+inventory or order state.
+
+The initial scheduling policy is starvation-bounded round robin across
+strategies with eligible latest candidates. A later policy may rank comparable
+economic value only through a separately reviewed artifact field; scheduler
+implementation order, hash-map order, or task wakeup timing must never decide
+which pair receives the shared lane.
+
+The scheduler uses the compiled dependency index and a ready bitset/queue; it
+does not scan every configured strategy on every price frame.
+
+Lane availability is scheduling, not market-data readiness. A busy lane keeps
+the latest candidate for each dependent strategy; a newer candidate supersedes
+only the older candidate for that same strategy.
+
+### Location-aware inventory
+
+The current `(venue, asset)` wallet key is insufficient for multiple networks.
+It would incorrectly merge World Chain USDC and Arbitrum USDC.
+
+The target key is equivalent to:
+
+```text
+InventoryLocation =
+  Binance { account_id }
+  | EvmWallet { chain_id, wallet_id }
+
+VenueAssetId =
+  BinanceAsset { account_id, symbol }
+  | Erc20Asset { chain_id, token_address }
+
+InventoryKey = { location, venue_asset_id }
+```
+
+`EconomicAssetId` is a separate capital-policy identity such as `USDC`. A
+reviewed configuration mapping may associate Binance `USDC`, World Chain USDC,
+and Arbitrum USDC with that economic asset, but exact balance and reservation
+keys always retain their venue/contract identity. An economic mapping never
+makes the representations interchangeable for execution.
+
+Consequences:
+
+- Binance USDC is one shared account balance across WLD/USDC and ESP/USDC.
+- World Chain USDC and Arbitrum USDC are independent balances.
+- reservations on either pair atomically reduce the same Binance USDC
+  availability;
+- a World Chain wallet reservation cannot reduce Arbitrum wallet inventory;
+- token identity always includes the chain-specific contract on EVM locations;
+- balance generations and settlement barriers are location-scoped.
+
+The first implementation keeps exact primary-debit reservations and the current
+v12 rules. It must not restore the Rails `3x` multiplier or reserve hypothetical
+recovery.
+
+The portfolio owner also records bounded non-inventory resource claims when
+needed, including execution-lane assignment, pair/account exposure limits, and
+canary budgets. These claims never fabricate balances and do not replace the
+venue owners' nonce and exchange-rate-limit checks.
+
+Observed and reserved totals are indexed by `InventoryKey`. Admission reads the
+pre-aggregated reserved total and updates only the candidate's small fixed claim
+set; it must not fold over every active or unknown reservation on each
+opportunity. Operation-level claims remain available for audit and settlement.
+
+## Account-wide rebalancing
+
+Rebalancing is shared infrastructure, not a strategy-owned job. It has three
+separate responsibilities:
+
+- `CapitalAllocator` calculates desired location balances;
+- `RebalanceSaga` durably coordinates one transfer operation and its recovery;
+- Binance and EVM venue owners perform the actual child mutations.
+
+The planner observes:
+
+- the single Binance account inventory;
+- every enabled wallet location;
+- active trade and rebalance reservations;
+- pending deposits, withdrawals, bridges, and settlement barriers;
+- per-asset, per-network route availability and configured capital targets;
+- explicit `minimum`, `target`, `maximum`, and priority for every funded
+  location.
+
+The allocator evaluates each `EconomicAssetId` once across the entire account.
+The shared Binance balance appears once in the conservation equation and is
+never copied into a separate pair-level budget. Wallet targets remain
+location-specific. The allocator must prove that proposed debits, credits, fees,
+and in-flight transfers conserve the account-wide economic asset within exact
+configured representation mappings.
+
+Capital allocation is triggered by balance/settlement generations, never by a
+Binance price frame. Calculation runs as latest-only cold work against an
+immutable portfolio snapshot; `PortfolioOwner` revalidates its generations
+before reserving a proposed transfer. A slow multi-location allocation cannot
+extend strategy decision latency.
+
+It emits at most one new external transfer operation at a time during the first
+migration. This retains the current simple recovery boundary and avoids two
+transfers competing for shared Binance inventory or the same wallet nonce.
+
+Rebalance policy is location-aware:
+
+- a deficit of USDC on Arbitrum is not repaired by measuring World Chain USDC
+  as if it were local;
+- a Binance-side asset target is account-wide;
+- a wallet-side target belongs to a specific `(chain_id, wallet_id, asset)`;
+- route selection is pinned after the first external side effect;
+- every wallet transaction is routed exclusively through that network's
+  `EvmExecutionOwner`; the rebalance saga never signs or allocates a nonce.
+
+The rebalancer may move capital while strategy evaluation continues. Active
+operations reduce available inventory through reservations but do not become a
+global market-data readiness gate.
+
+The EVM lane scheduler prefers recovery and admitted trades over starting a new
+rebalance child. Once a rebalance transaction has been broadcast, its nonce and
+recovery remain authoritative; a later trade may be queued or assigned a later
+nonce according to the reviewed lane policy, but cannot bypass or replace the
+rebalance transaction.
+
+Before ESP/USDC live trading, its Arbitrum deposit/withdrawal/bridge routes and
+recovery semantics require independent validation. World Chain route evidence
+must not be reused as Arbitrum evidence.
+
+## Journals and restart recovery
+
+All mutation identities must be globally unique and recoverable:
+
+```text
+account/{account_id}/orders
+network/{chain_id}/wallet/{wallet_id}/transactions
+rebalance/{account_id}
+trade/{strategy_id}/{parent_id}
+```
+
+These are logical namespaces; the implementation may use fewer physical files
+if one file has a single lock-owning writer and typed records.
+
+Every journal record contains a schema version, domain fingerprint, process
+epoch, owner identity, operation identity, monotonic sequence, previous-record
+checksum, and payload checksum. The GKE single-process deployment and file lock
+remain the primary ownership fence; the process epoch prevents an older
+in-memory owner from accepting work after a supervised restart has begun.
+
+Parent/child mutation ordering is:
+
+1. the trade or rebalance parent intent is written and fsynced;
+2. the venue owner validates the typed child command, writes its child intent,
+   and fsyncs before acknowledging acceptance;
+3. only the venue owner performs the external mutation;
+4. the venue outcome or explicit Unknown state is written and fsynced;
+5. the parent consumes that durable child state and fsyncs its transition;
+6. authoritative settlement observations advance the reservation barrier;
+7. only then may the portfolio owner release the settled claims.
+
+No cross-file atomic commit is assumed. Deterministic parent/child IDs and the
+ordering above make every partially completed handoff recoverable and
+idempotent.
+
+Startup order is:
+
+1. validate the entire domain artifact and unique identities;
+2. acquire every required journal lock before accepting live work;
+3. hydrate Binance account and order recovery state;
+4. hydrate each configured network's wallet nonce and transaction recovery
+   state;
+5. recover non-terminal rebalance and trade operations;
+6. hydrate market data, pool mirrors, filters, commissions, and balances;
+7. mark each strategy independently ready only when its dependencies are ready;
+8. open new execution only after all shared-account authorization invariants
+   hold.
+
+An unresolved operation blocks only inventory and the mutation lane it actually
+owns, except when authenticated Binance account state is unknown or journal
+ownership cannot be proven. Those account-level failures close all new entries.
+
+Every journal schema change declares:
+
+- the oldest readable version;
+- whether the previous production binary can safely read records written by the
+  new binary;
+- an explicit migration and rollback procedure when it cannot;
+- fixtures for restart at every fsync boundary.
+
+A deployment must fail before acquiring live ownership when journal
+compatibility cannot be proved. Rollback to an older binary is forbidden after
+an incompatible record has been written unless the reviewed workflow migrates
+or archives the journal after all operations are terminal.
+
+## Configuration model
+
+Operators maintain modular source documents for accounts, instruments,
+networks, wallets, tokens, pools, strategies, and policies. A deterministic
+domain compiler resolves and validates them into one canonical immutable
+runtime bundle. Production loads only that bundle and records its fingerprint;
+it never resolves includes, queries Rails, or discovers executable policy at
+runtime.
+
+The compiled bundle defines:
+
+- Binance accounts;
+- instruments and their account association;
+- networks and their RPC/WSS environment-variable names;
+- wallets and enabled wallet locations;
+- contracts and chain-specific fee policies;
+- tokens with chain-specific contract identities;
+- pools;
+- strategies and their pool/instrument references;
+- account-wide risk, order, and rebalance policies;
+- per-strategy execution modes and caps.
+
+The runtime derives every Binance subscription and network pool filter from this
+bundle. Environment variables provide secrets and endpoints only; they must not
+become a second pair, symbol, pool, or network allowlist.
+
+Validation rejects:
+
+- duplicate typed identities;
+- a strategy referencing different networks in one atomic DEX leg;
+- a pool/token/network mismatch;
+- a live strategy without a router and reviewed chain fee policy;
+- two owners configured for the same Binance account or execution lane;
+- overlapping journal paths with incompatible owners;
+- a symbol whose assets do not match the strategy tokens;
+- rebalancing without a location-specific route policy;
+- live execution on a network that has only read-only validation evidence.
+
+The current v12 WLD/USDC artifact and ESP/USDC v2 artifact remain immutable.
+Migration creates a new combined artifact version; it does not edit historical
+artifacts in place.
+
+Pool configuration has an explicit lifecycle:
+
+```text
+discovered -> observed -> validated -> execution_eligible
+```
+
+Runtime factory checks may discover or revalidate pools, but a newly discovered
+pool remains observation-only until a reviewed source artifact promotes it.
+On-chain discovery can never silently add a pool to live routing.
+
+The compiler also emits:
+
+- the strategy dependency index;
+- deterministic Binance stream-shard assignments;
+- network read limits and provider capabilities;
+- exact venue-to-economic-asset mappings;
+- journal namespace and owner assignments;
+- a capability matrix showing which pairs may observe, plan, rebalance, or
+  execute.
+
+## Readiness projection
+
+Readiness is a dependency-scoped capability projection rather than one
+undifferentiated boolean. Strategy evaluation, new admission, each execution
+lane, and recovery have separate capability views.
+
+| Failure | Effect on new work |
+| --- | --- |
+| ESPUSDC public stream stale | ESP strategies only |
+| Arbitrum pool mirror incoherent | Remove that pool; degrade only strategies without another policy-eligible pool |
+| Arbitrum canonical head unknown | All Arbitrum strategies |
+| World Chain head unknown | All World Chain strategies |
+| Arbitrum wallet balance stale | Arbitrum strategies requiring that inventory |
+| Binance authenticated balance stale | Every strategy on the shared account |
+| Binance order ownership unknown | Every new Binance mutation |
+| One strategy sizing worker overloaded | That strategy's older sizing work is superseded |
+| One EVM lane busy | No readiness change; candidates remain latest-only and lane scheduling applies |
+| One asset fully reserved | Candidates that debit that location and asset |
+| ClickHouse unavailable | No readiness effect |
+
+Existing recovery always continues even when new entries are disabled.
+
+## Event delivery and backpressure
+
+Every boundary has an explicit loss policy:
+
+| Event class | Delivery contract |
+| --- | --- |
+| Binance strategy-price frame | Parsed directly by the hot-path owner; no intermediate queue before baseline evaluation |
+| canonical DEX log | Never deliberately dropped; overflow or ordering uncertainty degrades the network and requires gap repair/rehydration |
+| canonical head | May be coalesced only after parent continuity and every intervening log range are proved |
+| Binance User Data order/fill event | Never deliberately dropped; overflow closes new account mutations and triggers authoritative reconciliation |
+| complete balance snapshot | Latest valid generation wins; regressed generations are rejected |
+| strategy sizing request/result | Latest per strategy wins; stale dependency vectors are rejected |
+| candidate | Latest per strategy wins before reservation |
+| accepted execution/recovery command | Durable and never dropped |
+| telemetry | May be dropped from a bounded channel with an explicit counter |
+
+Queue capacity, enqueue latency, high-water mark, dropped/superseded count, and
+recovery action are observable per boundary. An owner must never continue from a
+plausible partial event stream after its loss contract has been violated.
+
+## Supervision and shutdown
+
+One `RootSupervisor` owns every task/thread handle and applies these policies:
+
+- a validated strategy error or sizing-worker overload disables only that
+  strategy and alerts;
+- a public stream failure reconnects its bounded shard and degrades only
+  dependent strategies;
+- a network ingestion failure degrades that network until canonical recovery;
+- a panic or death of the hot-path owner, portfolio owner, Binance order owner,
+  capital saga owner, trade saga supervisor, or EVM execution owner closes new
+  mutations and terminates the process after durable state is flushed;
+- telemetry failure is observable but never changes trading readiness;
+- panic or unexpected channel closure is never treated as a clean terminal
+  child result.
+
+Controlled shutdown first closes new admission, then stops producing new
+rebalance work, preserves/reconciles already accepted mutations, flushes
+durable journals, and finally relinquishes locks. It must not wait indefinitely
+for market-data or telemetry drains.
+
+## Performance preservation contract
+
+The migration is not allowed to trade the current latency advantage for
+architectural neatness. Ownership boundaries are logical boundaries; they do
+not authorize extra queues, task wakeups, serialization, locks, allocations, or
+network calls in the hot path.
+
+### Primary regression risks
+
+| Risk introduced by this design | Required control |
+| --- | --- |
+| actor handoff between price receipt, evaluator, scheduler, and portfolio | co-locate the initial owners and call them synchronously through reservation |
+| draining every network before every pair evaluation | dependency-scoped DEX drain only |
+| evaluating or scanning every strategy for one symbol | compiled adjacency index plus ready bitset |
+| cloning prepared pools or `Arc` handles on every frame | borrowed single-owner baseline path; clone only for asynchronous sizing |
+| rebuilding unrelated pool curves | rebuild only the event's affected pool and dependent execution envelope |
+| decoding large Multicall responses on the decision runtime | bounded network worker decode and compact typed publication |
+| summing every active reservation during admission | indexed observed and reserved totals per `InventoryKey` |
+| running capital allocation on price events | latest-only cold calculation on balance/settlement generations |
+| adding parent/child journal barriers before first network write | reuse existing necessary durable barriers, add no new sequential barrier, and instrument their combined span |
+| formatting more per-frame JSON telemetry | fixed-size hot records and background serialization; bounded drops remain visible |
+| public-stream, RPC, sizing, or telemetry tasks contending for the hot core | separate bounded runtimes/queues; measure target-node CPU, throttling, and decision tails |
+
+No implementation may add a generic `mpsc`, `watch`, mutex, `RwLock`, dynamic
+JSON construction, string-key lookup, RPC call, `fsync`, or heap allocation
+between accepted Binance strategy-price frame parsing and completed baseline
+evaluation.
+
+### Frozen production reference
+
+The reference below was queried from ClickHouse on 2026-07-29. It is a completed
+stable GKE owner window, not a laptop benchmark:
+
+| Property | Value |
+| --- | --- |
+| deployment source-revision annotation | `d93fb2955b47de64fc8118a36e339a7c8fa90207` |
+| engine | `arb-bot-rust-shadow-gke-arb-bot-7964b95cf7-7hjkv` |
+| artifact | `config/strategies/usdc-wld-world-chain.v12.json` |
+| node | fixed `c4-highcpu-8`, `asia-southeast1-b` |
+| telemetry interval | `[2026-07-28T10:00:05Z, 2026-07-29T02:57:52Z]` |
+| WLDUSDC strategy frames | 157,247 |
+| Binance-triggered WLD evaluations | 157,248 |
+| threshold direction events | 1,815 |
+| adaptive sizing tasks | 1,623 |
+| admitted plans | 1,325 |
+| superseded pending plans | 1,180 |
+| plans reaching live task | 145 |
+| entry-preflight rejections | 49 |
+| terminal results | 96 |
+| maximum reported hot-telemetry drops | 0 |
+
+The immediately following Pod at the same source revision produced 11,429
+WLDUSDC frames in its initial short sample with p99 `parse_time_us=3`,
+`decision_complete_us=41`, `calculation_time_us=10`, and
+`decision_latency_us=18`. This confirms that the completed window below is a
+conservative current reference rather than a one-off fast sample.
+
+### Market-data and local-decision reference
+
+Durations are microseconds. `max` is diagnostic; release gates use p95/p99 and
+sample sufficiency.
+
+| Stage and telemetry field | n | p50 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WLDUSDC JSON parse, `binance_book_ticker.parse_time_us` | 157,247 | 0 | 4 | 7 | 35 |
+| socket receipt to completed decision, `decision_complete_us` | 157,247 | 13 | 36 | 46 | 162 |
+| Binance-triggered baseline calculation, `arbitrage_evaluation.calculation_time_us` | 157,248 | 7 | 17 | 19 | 89 |
+| Binance-triggered receipt-to-evaluation, `decision_latency_us` | 157,248 | 11 | 29 | 37 | 112 |
+| WLD depth parse/apply, `binance_depth_applied.parse_apply_time_us` | 161,212 | 7 | 15 | 21 | 72 |
+| DEX event receive-to-owner, `dex_pool_event.engine_queue_age_us` | 6,890 | 28 | 61 | 122 | 1,189 |
+| head receive-to-owner, `world_chain_head.engine_queue_age_us` | 30,534 | 25 | 48 | 145 | 377,922 |
+| V3 fee-500 prepared-curve total, `dex_pool_prepared.total_time_us` | 5,776 | 19 | 30 | 146 | 168 |
+| V3 fee-3000 prepared-curve total | 1,147 | 16 | 26 | 32 | 55 |
+| V4 fee-3000 prepared-curve total | 12 | 62 | 87 | 87 | 87 |
+
+The V4 cohort is too small for a percentile gate and is reference-only. The
+head maximum is one tail outlier; p99 plus canonical continuity, not maximum
+head delay, is the release comparison.
+
+### Adaptive sizing and admission reference
+
+| Stage and telemetry field | n | p50 μs | p95 μs | p99 μs | max μs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sizing snapshot | 1,623 | 5 | 15 | 19 | 37 |
+| sizing worker queue | 1,623 | 10 | 67 | 115 | 208 |
+| sizing worker calculation | 1,623 | 30 | 51 | 62 | 73 |
+| sizing result handoff | 1,623 | 15 | 63 | 143 | 626 |
+| optimizer calculation | 1,623 | 21 | 36 | 45 | 54 |
+| trigger to admitted | 1,325 | 130 | 245 | 296 | 483 |
+| admission total | 1,325 | 20 | 38 | 45 | 64 |
+| exact inventory reservation | 1,325 | 1 | 3 | 4 | 10 |
+| accepted mailbox submit | 1,325 | 6 | 10 | 12 | 21 |
+
+`market_to_admitted_us` had p50 `134`, p95 `269`, p99 `609,200`, and maximum
+`10,323,119`. It includes asynchronous sizing and the age of an unchanged
+event-driven quote, so it is not a local compute-latency gate. It remains a
+cohort/scheduling diagnostic.
+
+### Durable and venue-execution reference
+
+The execution cohorts are smaller (`n=72–266`), so these values are frozen
+references rather than precise long-run tail claims.
+
+| Stage | n | p50 μs | p95 μs | p99 μs | max μs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| entry validation preflight | 145 | 13 | 26 | 29 | 31 |
+| coordinator admission journal | 96 | 3,353 | 4,299 | 5,720 | 5,720 |
+| coordinator command journal | 266 | 2,856 | 3,929 | 4,995 | 8,938 |
+| coordinator result journal | 170 | 2,849 | 3,640 | 4,078 | 4,319 |
+| DEX worker queue | 96 | 17 | 30 | 32,193 | 32,193 |
+| nonce reserve/sign/journal | 96 | 3,241 | 4,376 | 7,538 | 7,538 |
+| DEX receipt journal | 96 | 1,794 | 2,285 | 2,831 | 2,831 |
+| Binance worker queue | 72 | 13 | 33 | 109 | 109 |
+| Binance intent journal | 72 | 2,555 | 3,096 | 3,371 | 3,371 |
+| Binance placement WebSocket API | 72 | 72,695 | 77,071 | 79,145 | 79,145 |
+| DEX broadcast RPC | 96 | 177,666 | 223,661 | 366,677 | 366,677 |
+| DEX confirmation RPC | 96 | 414,318 | 548,515 | 721,110 | 721,110 |
+| DEX worker total | 96 | 602,507 | 768,301 | 908,769 | 908,769 |
+| live task total | 145 | 605,741 | 851,069 | 1,013,033 | 1,092,708 |
+| latest-only mailbox wait | 145 | 14,439 | 1,079,037 | 6,371,251 | 10,323,135 |
+| market observation to terminal | 145 | 701,354 | 1,686,850 | 7,146,342 | 10,870,321 |
+
+RPC and Binance placement distributions include external venue/network latency.
+They must be reported, but a code release is rejected primarily on new local
+queue, journal, and handoff time unless an equal-window comparison also proves
+an external regression.
+
+The new saga architecture must add direct spans that the current telemetry does
+not provide:
+
+- `candidate_selected_to_reservation_complete_us`;
+- `reservation_to_preflight_proof_us`;
+- `preflight_proof_to_parent_fsync_us`;
+- `parent_fsync_to_evm_first_write_us`;
+- `dex_receipt_to_binance_first_write_us`;
+- `child_terminal_to_reservation_settled_us`.
+
+Without these spans, an extra sequential fsync or owner wakeup could hide inside
+an end-to-end venue duration.
+
+### Background isolation reference
+
+Background calls were materially slower than the local decision path:
+
+| Background request | n | p50 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Binance account balance REST | 12,214 | 75.050 ms | 83.050 ms | 210.876 ms | 3.975 s |
+| block-pinned wallet balance read | 30,523 | 8.397 ms | 484.338 ms | 686.113 ms | 11.547 s |
+
+Despite those tails, strategy decision p99 stayed at `46 μs`. Every milestone
+must preserve this isolation. Making balance, Multicall, reconciliation, or
+capital-allocation latency faster is useful, but never at the cost of moving its
+work onto the decision owner.
+
+`runtime_starting` to first `ready` was `897 ms` for the frozen engine and
+`679 ms` for its successor. This telemetry begins after some DEX bootstrap work,
+so it is not a complete process-startup metric.
+
+### Missing measurements required in M0
+
+Before structural migration, telemetry must add:
+
+- process start to domain validation complete;
+- journal lock/recovery duration by owner;
+- per-network canonical block selection, hydration, subscription acknowledgement,
+  backfill, and first-ready duration;
+- Multicall/JSON-RPC batch queue, provider, decode, publication, chunk count, and
+  response bytes;
+- per-frame dependency fanout count and dependency-scoped DEX drain duration;
+- decision-owner loop lag and longest non-price handler duration;
+- candidate scheduler and portfolio synchronous spans;
+- executor queue depth and enqueue-to-first-write spans;
+- capital allocation calculation/validation duration;
+- per-thread/runtime CPU time, Pod CPU throttling, memory high-water mark, and
+  allocator pressure from Cloud Monitoring or an equivalent non-blocking
+  source.
+
+Instrumentation itself must use fixed-size/bounded hot records and background
+formatting. Adding the measurement may not invalidate the baseline it is meant
+to protect.
+
+### Release gates
+
+For WLD/USDC, every milestone that changes runtime code must compare an optimized
+build on the target C4 class against this reference:
+
+1. at least 100,000 WLDUSDC strategy frames and 1,000 adaptive tasks for
+   hot-path percentile claims;
+2. for reference percentiles at or above `10 μs`, p95 may not exceed `1.15x`
+   and p99 may not exceed `1.20x` without an explicit reviewed exception;
+   smaller values use the independent absolute ceiling because integer
+   microsecond quantization makes a relative comparison misleading;
+3. independent hard p99 ceilings are `10 μs` parse, `60 μs`
+   socket-to-decision, `25 μs` baseline calculation, `30 μs` depth apply,
+   `175 μs` DEX event receive-to-owner, `200 μs` prepared-curve publication,
+   `150 μs` sizing queue, `75 μs` sizing worker, `400 μs`
+   trigger-to-admitted, `60 μs` admission total, `10 μs` reservation, and
+   `20 μs` accepted mailbox submit;
+4. hot telemetry drops, canonical DEX event drops, execution-command drops, and
+   unknown queue overflows must remain zero;
+5. no new network call, lock, allocation, serialization, task wakeup, or
+   all-strategy scan may appear in the Binance frame-to-baseline path;
+6. small execution cohorts must report p50/p95/p99 and exact `n`; no release may
+   claim tail improvement from fewer than 100 observations;
+7. background p95/p99 may change, but WLD decision tails during their slowest
+   cohorts must still meet the same hot-path gates;
+8. M11 maximum-pair replay must run on the target CPU class and include
+   reconnect/rehydration bursts, not only steady-state average load.
+
+The hard ceilings do not replace relative comparison. Passing `60 μs` after
+moving from `46 μs` to `59 μs` is still a regression requiring review.
+
+### Performance evidence by milestone
+
+| Milestone | Required evidence before exit |
+| --- | --- |
+| M0 | freeze the queries above, add missing spans, and record target-node CPU/throttling baseline |
+| M1 | compiled bundle load/validation time and memory; unchanged WLD hot tables |
+| M2 | per-stream parse/decision percentiles, shard fairness, reconnect isolation, zero hot drops |
+| M3 | batch queue/provider/decode/publication percentiles and unchanged WLD decision/Dex-event tails |
+| M4 | dependency fanout, DEX drain, baseline evaluation, sizing, loop lag, and no frame-to-evaluator handoff |
+| M5 | scheduler/portfolio/reservation and allocator spans; allocator slow cohorts must not move WLD tails |
+| M6 | parent/child fsync and enqueue-to-first-write spans; no additional sequential durable barrier |
+| M7 | full frozen-table comparison from the new WLD production path with equal or larger cohorts |
+| M8 | Arbitrum pool-event, curve-build, read-batch, and ESP decision percentiles while WLD gates still pass |
+| M9 | ESP live local/external execution table plus unchanged WLD execution and decision tails |
+| M10 | rebalance child/saga/settlement spans and WLD/ESP non-interference during slow transfer cohorts |
+| M11 | maximum 10–20 pair target-node replay, burst recovery, stream-shard fairness, CPU and memory headroom |
+
+The matching row is a mandatory exit criterion for every milestone, alongside
+its functional criteria below.
+
+## Milestones
+
+Each milestone is independently deployable and must leave production in a
+supported state. No milestone combines a structural ownership change with
+enabling ESP/USDC live trading.
+
+### M0 — Baseline contracts and observability
+
+Deliver:
+
+- capture current WLD/USDC v12 startup, readiness, latency, opportunity,
+  execution, recovery, nonce, balance, and rebalance behavior as regression
+  tests and production baselines;
+- add stable typed IDs to telemetry where they are currently implicit;
+- document the current single-pair assumptions and map each one to a later
+  milestone;
+- define latency and dropped-work counters per account, network, pool, and
+  strategy;
+- capture current event-delivery, journal, and shutdown behavior at every
+  mutation boundary;
+- version the ClickHouse baseline queries and add the missing spans listed in
+  the performance contract before changing the measured ownership path;
+- capture target-node CPU, throttling, memory, and decision-loop interference
+  under normal and background-RPC-tail cohorts.
+
+Exit criteria:
+
+- `scripts/quality.sh` passes;
+- production WLD/USDC behavior is unchanged;
+- baseline dashboards/queries can separate WLD/USDC and ESP/USDC;
+- the frozen performance tables are reproducible from versioned queries and the
+  new instrumentation itself passes the same hot-path gates;
+- every known `exactly one pair/symbol` bootstrap restriction has an owner and
+  target milestone.
+
+Rollback:
+
+- code-only rollback; no artifact or secret change.
+
+### M1 — Compiled multi-pair domain graph
+
+Deliver:
+
+- introduce typed registries for accounts, instruments, networks, wallets,
+  venue assets, economic assets, pools, and strategies;
+- add the deterministic domain compiler and load its canonical combined
+  read-only bundle containing WLD/USDC World Chain and ESP/USDC Arbitrum;
+- validate references, uniqueness, execution capabilities, and environment
+  requirements before network connections start;
+- emit the dependency index, stream shards, owner/journal assignments, asset
+  mappings, and capability matrix;
+- keep the existing WLD live runtime adapter and ESP collector behavior behind
+  compatibility projections.
+
+Exit criteria:
+
+- both existing artifacts round-trip into the new internal graph in tests;
+- the combined artifact derives exactly `WLDUSDC` and `ESPUSDC`;
+- source ordering does not change the canonical bundle or fingerprint;
+- no symbol, pool, or network list is duplicated in environment variables;
+- selecting the combined artifact alone cannot enable a new live pair.
+
+Rollback:
+
+- select the unchanged WLD/USDC v12 artifact.
+
+### M2 — Shared Binance account runtime
+
+Deliver:
+
+- remove the live bootstrap restriction requiring exactly one symbol;
+- introduce the supervised market-data, account-state, order, rate-limit, and
+  capital-owner boundaries under one account runtime;
+- multiplex and deterministically shard public Spot subscriptions for all
+  configured instruments;
+- hydrate filters and commissions per symbol;
+- materialize one shared account balance snapshot for all configured assets and
+  BNB;
+- centralize User Data, rate limits, open-order tracking, order identity, and
+  reconciliation;
+- keep ESP order placement disabled.
+
+Exit criteria:
+
+- one process connection set serves both WLDUSDC and ESPUSDC;
+- there is exactly one authenticated account snapshot generation;
+- slow capital REST calls cannot delay parsed bookTicker evaluation;
+- trading and treasury credentials remain capability-separated;
+- symbol-local failures have the readiness scope defined above;
+- shadow telemetry proves no WLD decision-latency or transport-liveness
+  regression against M0;
+- restart tests reconcile interleaved deterministic orders from two symbols
+  without duplicate placement.
+
+Rollback:
+
+- retain the new code but select the single-symbol v12 artifact, or revert to
+  the M1 compatibility adapter.
+
+### M3 — Network runtime registry and batched hydration
+
+Deliver:
+
+- create one World Chain and one Arbitrum `NetworkRuntime`;
+- move RPC/WSS clients, head tracking, pool registries, wallet readers, and
+  chain configuration behind the registry;
+- implement priority-isolated, block-hash-pinned read classes with bounded
+  batch chunking;
+- share a pool mirror when multiple strategies reference the same pool;
+- retain local CLMM quoting as the only executable quote path;
+- define the generic `EvmExecutionOwner` command and ownership interface without
+  enabling Arbitrum mutations;
+- introduce chain-specific gas/fee policy and fail closed for unsupported live
+  networks.
+
+Exit criteria:
+
+- no client is constructed per pair, tick, quote, or order;
+- captured and fork/integration fixtures prove batch hydration is identical to
+  individual reads at the same block;
+- wallet reads, gap repair, and Quoter parity cannot head-of-line block one
+  another;
+- local quotes match sampled V3/V4 Quoter results within exact integer
+  semantics;
+- a partial batch cannot mark the affected strategy ready;
+- World Chain live execution still uses the reviewed v12 gas semantics;
+- Arbitrum remains read-only.
+
+Rollback:
+
+- use the World Chain compatibility runtime and the existing standalone ESP
+  collector.
+
+### M4 — Multi-pair hot-path decision owner
+
+Deliver:
+
+- move pair-specific evaluation behind a synchronous `StrategyEvaluator`
+  interface owned by one hot-path runtime;
+- add the compiled dependency index and immutable generation-tagged curve
+  handles;
+- directly poll all Binance strategy-price sockets and apply prioritized ordered
+  DEX events without a Binance frame-to-evaluation handoff;
+- move exhaustive sizing to bounded latest-only workers;
+- add per-strategy calculation budget and overload telemetry;
+- route candidates to a non-mutating coordinator sink for shadow comparison.
+
+Exit criteria:
+
+- deterministic replay produces the same WLD/USDC candidate and calldata bounds
+  as the current engine;
+- saturating ESP sizing does not affect WLD baseline ingestion or decisions;
+- stale snapshot results are rejected deterministically;
+- no unbounded queue exists between market data and strategies;
+- an unrelated symbol or pool update does not evaluate WLD/USDC;
+- production WLD execution still uses the existing coordinator path.
+
+Rollback:
+
+- switch WLD to the existing single-pair hot-path adapter.
+
+### M5 — Portfolio owner and shared capital allocation
+
+Deliver:
+
+- replace `(venue, asset)` wallet accounting with
+  `(inventory_location, venue_asset_id)`;
+- add reviewed `VenueAssetId` to `EconomicAssetId` mappings;
+- keep Binance assets account-scoped and wallet assets chain/wallet-scoped;
+- centralize reservations across every strategy and rebalance operation;
+- extend settlement barriers with explicit locations;
+- implement an account-wide, conservation-checked `CapitalAllocator` in
+  `disabled`/shadow mode for the combined graph;
+- keep the live WLD rebalance behavior behind a parity adapter until replay
+  proves equivalence.
+
+Exit criteria:
+
+- concurrent reservation tests prove two pairs cannot double-spend Binance
+  USDC;
+- tests prove World Chain USDC and Arbitrum USDC never collide;
+- property tests prove Binance USDC is counted once across any number of wallet
+  targets;
+- allocator proposals conserve each economic asset across balances, fees, and
+  in-flight transfers;
+- trade and rebalance requests contend through the same atomic reservation
+  owner;
+- replay of WLD production snapshots produces the current v12 rebalance
+  decision;
+- Arbitrum routes remain incapable of external mutation.
+
+Rollback:
+
+- retain the combined market-data runtime but use the v12 inventory/rebalance
+  adapter for the only live pair.
+
+### M6 — Durable trade sagas and per-network EVM owners
+
+Deliver:
+
+- add the candidate scheduler, portfolio admission protocol, and one durable
+  `TradeSaga` per accepted parent;
+- use the single Binance order owner for the subaccount;
+- create one generic `EvmExecutionOwner` per `(chain_id, wallet_id)` for swaps,
+  approvals, transfers, bridges, and rebalance calls;
+- make trade, DEX transaction, Binance order, and recovery journals explicitly
+  account/network/strategy scoped;
+- implement the parent/child fsync protocol, schema compatibility, and supervised
+  shutdown;
+- route every rebalancing wallet mutation through the same EVM owner;
+- preserve global trade serialization for the first live revision.
+
+Exit criteria:
+
+- WLD/USDC replay and deterministic execution simulation preserve DEX-first
+  ordering and recovery;
+- two simulated strategies cannot allocate the same Binance inventory;
+- trade and rebalance simulations cannot allocate the same network nonce;
+- no rebalance component can access a signer or nonce allocator directly;
+- World Chain and Arbitrum may both allocate nonce `N` because their chain IDs
+  differ;
+- unknown Binance placement and unknown EVM broadcast recover without a
+  duplicate external mutation;
+- only WLD/USDC is execution-enabled.
+
+Rollback:
+
+- deploy the last v12 single-pair revision and its compatible journals;
+- do not downgrade after the new runtime has written incompatible live journal
+  records unless the workflow includes a reviewed journal migration.
+
+### M7 — Combined production shadow
+
+Deliver:
+
+- run WLD/USDC live through the new ownership graph;
+- run ESP/USDC price, pool, balances, strategies, reservations, and rebalance
+  planning in shadow;
+- compare old-baseline and new-path WLD decisions asynchronously;
+- add production alerts scoped by account, network, strategy, and execution
+  lane.
+
+Exit criteria:
+
+- a representative production window shows no material WLD opportunity,
+  sizing, execution, recovery, or realized-PnL regression;
+- WLD decision latency remains within the M0 budget;
+- ESP failures do not degrade WLD readiness;
+- supervisor fault injection produces the documented dependency-scoped
+  degradation or fail-fast behavior;
+- GKE remains the only process owner and the GCE rollback target remains
+  `TERMINATED`;
+- no ESP signer/order mutation is possible from its strategy gates.
+
+Rollback:
+
+- deploy the last verified v12 single-pair digest through the GKE workflow.
+
+### M8 — ESP/USDC Arbitrum live readiness
+
+Deliver:
+
+- add the reviewed Arbitrum V3 router, allowance policy, fee construction,
+  receipt accounting, revert diagnostics, and transaction recovery;
+- validate Arbitrum wallet funding and exact token contracts;
+- validate Binance ESPUSDC filters, commissions, quantity/price rounding, IOC
+  and MARKET recovery requests without enabling unrestricted live entries;
+- validate Arbitrum-specific rebalance routes separately;
+- validate end-to-end immutable plans through the
+  candidate/portfolio/trade-saga path using deterministic fixtures and read-only
+  live market data;
+- prepare a new immutable artifact with an explicit ESP live gate and bounded
+  canary limits, without enabling that artifact in production yet.
+
+Exit criteria:
+
+- local V3 quotes and calldata match block-pinned on-chain validation;
+- Arbitrum gas policy has no World Chain fallback constants;
+- allowance, transaction construction, and restart-recovery fixtures are
+  deterministic;
+- prepared primary and recovery orders pass Binance filters for both
+  directions;
+- opportunity telemetry reports gross and realized/counterfactual costs without
+  changing the reviewed 20 bps admission model;
+- deterministic failure injection covers DEX revert, unknown broadcast,
+  Binance rejection, partial IOC, unknown placement, and bounded MARKET
+  recovery;
+- an explicit production approval is still required to select the live ESP
+  artifact.
+
+Rollback:
+
+- disable the ESP pair execution gate; retain read-only collection.
+
+### M9 — Bounded ESP/USDC live canary
+
+Deliver:
+
+- enable ESP/USDC on the same Rust-owned Binance subaccount and the same
+  configured signer, under the shared owners;
+- make this canary the first ESP/USDC external trading mutation from the new
+  runtime;
+- prefund Arbitrum inventory and keep live Arbitrum rebalance mutation disabled;
+- start with a versioned `CanaryPolicy` containing per-trade notional, active
+  parent, cumulative notional/loss, failure-count, gas, and time-window limits;
+- retain the one-newly-dispatching-parent execution policy;
+- observe fills, gas, recovery, wallet settlement, BNB commissions, and
+  contention with WLD/USDC.
+
+Exit criteria:
+
+- no duplicate orders, nonces, reservations, or transfers;
+- both strategy inventories reconcile from authoritative venue observations;
+- recovery exercises complete within reviewed bounds;
+- shared Binance USDC contention rejects only the losing candidate;
+- account-wide rate limits and BNB fee inventory remain healthy;
+- canary stop conditions disable only new ESP entries while preserving
+  reconciliation;
+- a reviewed production cohort justifies enabling its rebalance route, raising
+  limits, or allowing parallel network lanes.
+
+Rollback:
+
+- disable only ESP execution while WLD/USDC remains live; Arbitrum rebalance is
+  not yet live in this milestone;
+- reconcile any non-terminal ESP operation before changing owner revisions.
+
+### M10 — Arbitrum rebalance live canary
+
+Deliver:
+
+- enable Arbitrum capital routes through the shared `CapitalAllocator` and
+  durable `RebalanceSaga`;
+- route Binance capital children through `BinanceCapitalSagaOwner` and every
+  wallet child through the existing Arbitrum `EvmExecutionOwner`;
+- begin with one external transfer at a time and independent transfer count,
+  value, fee, route, and recovery limits;
+- keep ESP trading enabled only if the funded balances and existing canary
+  limits permit it.
+
+Exit criteria:
+
+- no trade and rebalance operation can double-spend Binance or Arbitrum
+  inventory;
+- trade, allowance, transfer, and bridge children cannot allocate the same
+  Arbitrum nonce;
+- Binance USDC is counted once while World Chain and Arbitrum targets are
+  satisfied independently;
+- route pinning and restart recovery succeed at every external-side-effect
+  boundary;
+- disabling Arbitrum rebalance leaves ESP trading possible while prefunded
+  inventory remains sufficient.
+
+Rollback:
+
+- disable only Arbitrum rebalance route creation, reconcile the active saga, and
+  continue WLD/USDC plus bounded ESP/USDC trading from observed inventory.
+
+### M11 — Scale to 10–20 pairs
+
+Deliver:
+
+- add pairs only through modular reviewed sources compiled into a new immutable
+  domain bundle;
+- measure CPU, socket, RPC batch, pool-build, decision-owner, sizing-worker,
+  Binance
+  rate-limit, journal, and telemetry capacity;
+- tune bounded network batch chunking and fair candidate scheduling;
+- introduce decision sharding only if measured single-owner p99 exceeds its
+  reviewed budget;
+- optionally permit concurrent EVM lanes on different networks after explicit
+  risk review, while retaining one nonce owner per lane;
+- define per-pair and account-wide exposure caps.
+
+Exit criteria:
+
+- target-node p95/p99 latency and CPU headroom meet the production budget at
+  maximum configured pair/pool count;
+- reconnect and full rehydration complete within a measured bound;
+- one noisy symbol or pool cannot starve other strategies;
+- shared-account recovery and restart tests cover several simultaneous known
+  and unknown operations;
+- rate-limit usage remains below reviewed safety thresholds.
+
+Rollback:
+
+- remove strategies from a new immutable artifact without changing the shared
+  ownership topology.
+
+## Future multi-wallet extension
+
+Multi-wallet support adds more `WalletId` values and execution lanes; it must
+not change strategy code or Binance account ownership.
+
+The future allocator will choose a wallet location before reservation using
+explicit policy and observed inventory. Once admitted, the selected
+`(chain_id, wallet_id)` is immutable for that parent operation and recovery.
+
+Additional requirements will include:
+
+- separate signer and journal ownership per wallet;
+- explicit capital targets per wallet location;
+- deterministic wallet selection and fairness;
+- prevention of cross-wallet recovery;
+- bounded total exposure across wallets;
+- operator-visible wallet draining and disablement.
+
+This extension is intentionally deferred until the one-wallet multi-pair
+runtime has production evidence.
+
+## Verification matrix
+
+Every milestone runs `scripts/quality.sh` plus the relevant additions below:
+
+| Layer | Required verification |
+| --- | --- |
+| Domain | canonical compilation, duplicate/reference/capability/property tests |
+| Binance | multi-symbol replay, reconnect, rate-limit, order recovery |
+| Network | block-hash-pinned hydration, read-class isolation, reorg/gap repair, partial batch failure |
+| Pools | exact local/Quoter parity, shared-pool deduplication |
+| Strategies | dependency-index replay, stale generation, overload isolation |
+| Inventory | cross-pair contention, cross-chain separation, settlement |
+| Nonces | trade/rebalance serialization, restart and unknown broadcast |
+| Rebalance | location-aware route replay, idempotency, settlement barriers |
+| Journals | parent/child fsync boundaries, schema migration, rollback compatibility |
+| Supervision | dependency-scoped degradation, critical-owner fail-fast shutdown |
+| Production | WLD parity, ESP isolation, GKE single ownership |
+
+Production delivery continues exclusively through
+`.github/workflows/deploy-gke.yml` from `main`. Structural deployment alone
+must never implicitly change a pair from `disabled` or shadow to `full_live`.
+
+## Completion definition
+
+The migration is complete when:
+
+- WLD/USDC and ESP/USDC run inside one process and one domain graph;
+- both use one Binance account runtime, portfolio owner, capital allocator, and
+  rebalance saga infrastructure;
+- World Chain and Arbitrum each have one network runtime and one
+  `EvmExecutionOwner` for the initial wallet;
+- strategies perform no external mutations;
+- local pool mirrors provide every executable quote;
+- shared Binance assets and chain-specific wallet assets are reserved correctly;
+- restart recovery proves ownership for every account and network lane;
+- ESP/USDC has passed its separately approved canary;
+- Arbitrum rebalancing has passed its separately limited live canary;
+- the single hot-path owner meets its reviewed p99 budget at the configured pair
+  count, or measured evidence has justified a fixed owner-sharding plan;
+- adding another pair is primarily an artifact change, plus protocol/route code
+  only when the new pair requires genuinely new capabilities.
