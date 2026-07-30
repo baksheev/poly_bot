@@ -19,7 +19,10 @@ use crate::{
     },
     binance::{
         account::{AccountInformation, BinanceAccountClient},
-        capital::{DepositRecord, NetworkInformation, WithdrawalRecord, select_capital_routes},
+        capital::{
+            DepositRecord, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
+            select_capital_routes,
+        },
         sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
     chain::rpc::{JsonRpcClient, TransactionReceipt},
@@ -642,7 +645,7 @@ impl RebalanceExecutor {
                 .is_empty(),
             "approved Travel Rule rejection recovery found an indexed withdrawal"
         );
-        let travel_rule_history = self
+        let mut travel_rule_history = self
             .treasury_binance
             .travel_rule_withdrawal_history_v2(
                 &operation.intent.token_symbol,
@@ -650,6 +653,27 @@ impl RebalanceExecutor {
                 &operation.intent.withdraw_order_id,
             )
             .await?;
+        if travel_rule_history.is_empty() {
+            let requested =
+                base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+            travel_rule_history = self
+                .treasury_binance
+                .travel_rule_withdrawal_history_v2_for_network(
+                    &operation.intent.token_symbol,
+                    network,
+                )
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    matches_failed_travel_rule_record_without_client_id(
+                        record,
+                        requested,
+                        wallet_owner,
+                        &operation.intent.withdraw_order_id,
+                    )
+                })
+                .collect();
+        }
         ensure!(
             travel_rule_history.len() == 1 && travel_rule_history[0].is_failed_without_broadcast(),
             "approved Travel Rule rejection is not indexed as one failed unbroadcast record"
@@ -2323,6 +2347,28 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
     Ok(result)
 }
 
+fn matches_failed_travel_rule_record_without_client_id(
+    record: &TravelRuleWithdrawalRecord,
+    requested: Decimal,
+    wallet_owner: Address,
+    withdraw_order_id: &str,
+) -> bool {
+    let amount = Decimal::from_str(&record.amount).ok();
+    let fee = Decimal::from_str(&record.transaction_fee).ok();
+    let exact_debit = match (amount, fee) {
+        (Some(amount), Some(fee)) => {
+            amount == requested || amount.checked_add(fee) == Some(requested)
+        }
+        _ => false,
+    };
+    exact_debit
+        && record
+            .address
+            .eq_ignore_ascii_case(&format!("{wallet_owner:#x}"))
+        && (record.withdraw_order_id.is_empty() || record.withdraw_order_id == withdraw_order_id)
+        && record.is_failed_without_broadcast()
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -2331,16 +2377,17 @@ mod tests {
     use rust_decimal::Decimal;
 
     use crate::{
-        binance::capital::{NetworkInformation, WithdrawalRecord},
+        binance::capital::{NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord},
         chain::rpc::{ReceiptLog, TransactionReceipt},
     };
 
     use super::{
         ARBITRUM_CHAIN_ID, BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID,
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, plan_direct_prefunding, validate_across_fill_receipt,
-        validate_approved_asset, validate_direct_withdrawal_receipt,
-        withdrawal_received_base_units, withdrawal_requested_base_units,
+        decimal_to_base_units_floor, matches_failed_travel_rule_record_without_client_id,
+        plan_direct_prefunding, validate_across_fill_receipt, validate_approved_asset,
+        validate_direct_withdrawal_receipt, withdrawal_received_base_units,
+        withdrawal_requested_base_units,
     };
 
     fn arbitrum_network(fee: &str) -> NetworkInformation {
@@ -2391,6 +2438,40 @@ mod tests {
                 .validate(wallet, artifact.expires_at_unix_seconds - 1, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn failed_travel_rule_record_without_client_id_matches_exact_debit_and_wallet() {
+        let wallet = Address::from_str("0x90d990c81320221d2882de32beea78923c1e77a3").unwrap();
+        let record = TravelRuleWithdrawalRecord {
+            id: String::new(),
+            tr_id: 65_865_741,
+            amount: "400".to_owned(),
+            transaction_fee: "1.2".to_owned(),
+            coin: "ESP".to_owned(),
+            withdrawal_status: 3,
+            travel_rule_status: 2,
+            address: format!("{wallet:#x}"),
+            tx_id: String::new(),
+            network: "ARBITRUM".to_owned(),
+            withdraw_order_id: String::new(),
+            info: "[031031] User does not own this currency.".to_owned(),
+        };
+        assert!(matches_failed_travel_rule_record_without_client_id(
+            &record,
+            Decimal::from_str_exact("401.2").unwrap(),
+            wallet,
+            "rust-rebalance-client-id",
+        ));
+
+        let mut wrong_wallet = record.clone();
+        wrong_wallet.address = "0x1111111111111111111111111111111111111111".to_owned();
+        assert!(!matches_failed_travel_rule_record_without_client_id(
+            &wrong_wallet,
+            Decimal::from_str_exact("401.2").unwrap(),
+            wallet,
+            "rust-rebalance-client-id",
+        ));
     }
 
     #[test]

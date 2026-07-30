@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "c489be964b42ba12bb8b6d27cebd94d51d70a10603ac40c3c4f6e80e71b83015",
+      "source_fingerprint_sha256": "813ebd14c8ebe209e10ffac3dcd86c4857ad6b361d8d78bf4347ea6857e2c073",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -58,7 +58,16 @@
                 "maximum_token_b_withdrawal_fee_base_units": "100000000000000000000",
                 "maximum_token_a_debit_base_units": "30000000",
                 "maximum_token_b_debit_base_units": "500000000000000000000",
-                "approved_travel_rule_recovery": null
+                "retry_after_verified_address": true,
+                "approved_travel_rule_recovery": {
+                  "production_approval_actor": "operator",
+                  "production_approval_recorded_at_utc": "2026-07-30T07:22:10Z",
+                  "rejected_token_symbol": "ESP",
+                  "rejected_token_amount_base_units": "401200000000000000000",
+                  "rejected_http_status": 400,
+                  "rejected_error_code": -4024,
+                  "rejected_error_message": "[031031] User does not own this currency."
+                }
               }
             },
             "chain": {

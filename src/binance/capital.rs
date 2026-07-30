@@ -334,6 +334,34 @@ impl BinanceAccountClient {
         }
         Ok(matching)
     }
+
+    pub async fn travel_rule_withdrawal_history_v2_for_network(
+        &self,
+        coin: &str,
+        network: &str,
+    ) -> anyhow::Result<Vec<TravelRuleWithdrawalRecord>> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("network", network.to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let records: Vec<TravelRuleWithdrawalRecord> = self
+            .signed_get(
+                "/sapi/v2/localentity/withdraw/history",
+                &query,
+                "Travel Rule withdrawal history v2",
+            )
+            .await?;
+        for record in &records {
+            ensure!(
+                record.coin == coin && (record.network.is_empty() || record.network == network),
+                "Binance returned a Travel Rule withdrawal outside the requested asset or network"
+            );
+        }
+        Ok(records)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

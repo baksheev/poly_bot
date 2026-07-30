@@ -386,6 +386,14 @@ source/destination token identities, calldata, receipts, minimum output,
 idempotency, and recovery. Until one is proven, ESP execution stays read-only
 while WLD v12 remains live.
 
+After the exact Binance ownership record becomes `VERIFIED`, the operator's
+separate direct-withdrawal approval permits one new retry through the same
+Travel Rule endpoint. Recovery first closes the earlier unbroadcast rejection
+by matching exactly one failed history record on ESP debit amount plus fee,
+Arbitrum wallet, network, and empty transaction hash; a missing client ID in
+Binance's record is not treated as absence. This does not authorize the
+standard withdrawal API, a bridge, a swap, or any retry before verification.
+
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its
 complete state changes. It may observe repaired or degraded native gas

@@ -869,8 +869,8 @@ async fn prefund_arbitrum_canary(
         return Ok(());
     }
     ensure!(
-        approved_recovery.is_none(),
-        "ESP Travel Rule incident was closed without resubmission; direct or bridged ESP capability must be diagnosed before prefunding resumes"
+        approved_recovery.is_none() || prefunding.retry_after_verified_address,
+        "ESP Travel Rule incident was closed without an approved retry after address verification"
     );
 
     let targets = [

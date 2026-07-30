@@ -428,6 +428,8 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub maximum_token_a_debit_base_units: String,
     pub maximum_token_b_debit_base_units: String,
     #[serde(default)]
+    pub retry_after_verified_address: bool,
+    #[serde(default)]
     pub approved_travel_rule_recovery: Option<LiveCanaryTravelRuleRecoveryConfig>,
 }
 
@@ -496,6 +498,11 @@ impl LiveCanaryPrefundingRebalanceConfig {
         if let Some(recovery) = &self.approved_travel_rule_recovery {
             recovery.validate(pair, canary, self)?;
         }
+        ensure!(
+            !self.retry_after_verified_address || self.approved_travel_rule_recovery.is_some(),
+            "pair {} cannot retry after address verification without the exact rejected incident",
+            pair.id
+        );
         Ok(())
     }
 }
@@ -1433,7 +1440,11 @@ mod tests {
             prefunding.maximum_token_b_debit_base_units,
             "500000000000000000000"
         );
-        assert!(prefunding.approved_travel_rule_recovery.is_none());
+        assert!(prefunding.retry_after_verified_address);
+        let recovery = prefunding.approved_travel_rule_recovery.as_ref().unwrap();
+        assert_eq!(recovery.rejected_token_symbol, "ESP");
+        assert_eq!(recovery.rejected_http_status, 400);
+        assert_eq!(recovery.rejected_error_code, -4024);
         assert!(pair.execution_enabled);
         assert!(!pair.rebalance.enabled);
 
