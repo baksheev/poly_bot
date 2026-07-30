@@ -153,7 +153,7 @@ spec:
             - name: REBALANCE_LIVE_CONFIRMATION
               value: ENABLE_FULL_REBALANCE
             - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
-              value: travel_rule
+              value: standard
           resources:
             requests:
               cpu: "6"

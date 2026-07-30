@@ -420,11 +420,8 @@ impl AppConfig {
             "rebalance live amount limits must not be negative"
         );
         ensure!(
-            matches!(
-                self.rebalance_binance_withdrawal_api_mode.as_str(),
-                "standard" | "travel_rule"
-            ),
-            "REBALANCE_BINANCE_WITHDRAWAL_API_MODE must be standard or travel_rule"
+            self.rebalance_binance_withdrawal_api_mode == "standard",
+            "REBALANCE_BINANCE_WITHDRAWAL_API_MODE must be standard; Travel Rule is conditional deposit handling"
         );
         if self.rebalance_execution_mode == "full_live" {
             ensure!(
@@ -617,6 +614,13 @@ mod tests {
     #[test]
     fn default_shape_is_valid() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn travel_rule_is_not_a_withdrawal_mode() {
+        let mut value = config();
+        value.rebalance_binance_withdrawal_api_mode = "travel_rule".into();
+        assert!(value.validate().is_err());
     }
 
     #[test]

@@ -150,49 +150,6 @@ impl BinanceAccountClient {
         .await
     }
 
-    pub async fn withdraw(
-        &self,
-        coin: &str,
-        network: &str,
-        address: &str,
-        amount: Decimal,
-        withdraw_order_id: &str,
-    ) -> anyhow::Result<WithdrawalSubmission> {
-        validate_symbol("coin", coin)?;
-        validate_symbol("network", network)?;
-        ensure!(
-            address.starts_with("0x")
-                && address.len() == 42
-                && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "Binance withdrawal address must be an EVM address"
-        );
-        ensure!(amount > Decimal::ZERO, "withdrawal amount must be positive");
-        validate_withdraw_order_id(withdraw_order_id)?;
-        let query = self.signed_query(&[
-            ("coin", coin.to_owned()),
-            ("address", address.to_owned()),
-            ("amount", amount.normalize().to_string()),
-            ("withdrawOrderId", withdraw_order_id.to_owned()),
-            ("network", network.to_owned()),
-            ("walletType", "0".to_owned()),
-            (
-                "questionnaire",
-                serde_json::json!({
-                    "isAddressOwner": 1,
-                    "sendTo": 1,
-                })
-                .to_string(),
-            ),
-            ("recvWindow", "5000".to_owned()),
-        ])?;
-        self.signed_post(
-            "/sapi/v1/localentity/withdraw/apply",
-            &query,
-            "Travel Rule withdrawal submission",
-        )
-        .await
-    }
-
     pub async fn withdraw_standard(
         &self,
         coin: &str,
@@ -251,6 +208,27 @@ impl BinanceAccountClient {
             )
             .await?;
         matching_withdrawals(records, coin, withdraw_order_id)
+    }
+
+    pub async fn withdrawal_history_for_coin(
+        &self,
+        coin: &str,
+    ) -> anyhow::Result<Vec<WithdrawalRecord>> {
+        validate_symbol("coin", coin)?;
+        let query =
+            self.signed_query(&[("coin", coin.to_owned()), ("recvWindow", "5000".to_owned())])?;
+        let records: Vec<WithdrawalRecord> = self
+            .signed_get(
+                "/sapi/v1/capital/withdraw/history",
+                &query,
+                "withdrawal history",
+            )
+            .await?;
+        ensure!(
+            records.iter().all(|record| record.coin == coin),
+            "Binance withdrawal history returned another coin"
+        );
+        Ok(records)
     }
 
     pub async fn withdrawal_address_list(&self) -> anyhow::Result<Vec<WithdrawalAddressRecord>> {

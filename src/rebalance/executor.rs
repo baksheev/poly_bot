@@ -644,6 +644,16 @@ fn validate_transition(
             P::BinanceWithdrawalSubmissionStarted { .. },
             P::BinanceWithdrawalSubmitted { .. },
         ) => true,
+        // A separately approved operator withdrawal can satisfy a fail-closed
+        // unindexed submission. Its recovery validates the exact Binance
+        // record and on-chain receipt before appending this single terminal
+        // transition, so a crash cannot leave a synthetic Submitted state.
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::BinanceWithdrawalSubmissionStarted { .. },
+            P::Completed { .. },
+        ) => true,
         (
             Route::Direct { .. },
             Direction::BinanceToWallet,

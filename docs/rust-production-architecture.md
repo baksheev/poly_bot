@@ -377,34 +377,30 @@ confirmed before the prefunding workflow was restored. That completed journal
 entry cannot be replayed by later rollouts.
 
 An ESP bootstrap or later rebalance must deliver ESP as ESP. A USDC-to-ESP DEX
-swap is not a substitute for the missing asset-transfer capability. Rails'
-original direct-withdrawal implementation and Binance's distinct APIs establish
-that the capital endpoint is the correct non-Travel-Rule route; the later Rails
-change `6520658` selected the local-entity endpoint globally. The live ESP
-probe proved that this global selection is invalid for ESP: Binance advertises
-the direct Arbitrum capital route but local-entity rejects the asset with
-`[031031] User does not own this currency.` The M9 bootstrap therefore pins
-`standard` in its versioned artifact and Kubernetes init environment. The
-long-lived WLD executor remains pinned to `travel_rule`; there is no automatic
-fallback between APIs after a submission. A bridge remains out of scope while
-the direct capital route is available.
+swap is not a substitute for the missing asset-transfer capability. The
+authoritative Rails flow before commit `6520658` and the successful manual ESP
+withdrawal establish one withdrawal rule for every asset and amount:
+`/sapi/v1/capital/withdraw/apply`. Travel Rule belongs to the opposite
+direction. After a wallet-to-Binance transfer, the deposit-history response
+decides whether `deposit/provide-info` is required through
+`requireQuestionnaire` and `travelRuleReqStatus`; the runtime does not infer
+that decision from a hard-coded amount threshold. The later Rails commit
+`6520658` incorrectly replaced the withdrawal endpoint globally. Rust now
+rejects `travel_rule` as a withdrawal mode in configuration and code, while
+retaining local-entity withdrawal history only as evidence for the already
+journaled legacy incident.
 
-After the exact Binance ownership record becomes `VERIFIED`, the operator's
-separate direct-withdrawal approval permits one ESP submission through the
-standard capital endpoint. USDC remains on Travel Rule. Recovery first closes
-the earlier unbroadcast local-entity rejection against both Binance withdrawal
-histories and requires the exact Arbitrum address-list record to have
-`whiteStatus=true`. The live v2 record is `trId=67181540`,
-`travelRuleStatus=4`, with no
-`withdrawalStatus` and no transaction hash. Status `4` alone is never treated
-as success or failure: recovery refetches the exact `trId`, requires stable
-asset/network/address/amount/fee/client identity, no capital withdrawal, the
-durable successful subaccount-to-master transfer, and exactly `401.2 ESP`
-free/zero locked in master Spot. A status-2 failed record is accepted only
-without a completed withdrawal or transaction hash. An ambiguous, pending, or
-broadcast record fails closed. The API mode is persisted before the external
-request. The old ESP master transfer is reused, so no duplicate internal
-transfer is allowed; a bridge or swap remains unauthorized.
+The rejected legacy request is `trId=67181540`, `travelRuleStatus=4`, with no
+`withdrawalStatus` and no transaction hash. Recovery refetches the exact row,
+requires stable identity, proves no capital withdrawal was indexed, and
+validates the durable `401.2 ESP` subaccount-to-master transfer. The operator
+then completed the ordinary capital withdrawal manually: transaction
+`0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b`
+credited exactly `400 ESP` to the production Arbitrum wallet with a `1.2 ESP`
+fee. The M9 recovery is bound to that exact Binance history row, Arbitrum
+receipt, token, address, amount, fee, and zero pre-transfer wallet balance
+before it appends the terminal journal state. No duplicate transfer,
+withdrawal, bridge, or swap is permitted.
 
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its

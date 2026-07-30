@@ -13,7 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
@@ -714,7 +714,7 @@ async fn prefund_arbitrum_canary(
     let token_b_debit_cap = U256::from_str_radix(&prefunding.maximum_token_b_debit_base_units, 10)
         .context("M9 token_b debit cap is invalid")?;
     let approved_recovery = prefunding.approved_travel_rule_recovery.as_ref();
-    let approved_standard_recovery = prefunding.approved_unindexed_standard_recovery.as_ref();
+    let approved_manual_credit = prefunding.approved_manual_token_b_credit.as_ref();
 
     let mut direct_networks = BTreeMap::new();
     for token in [&pair.token_a, &pair.token_b] {
@@ -762,20 +762,18 @@ async fn prefund_arbitrum_canary(
             )?,
             maximum_esp: rebalance_base_units_to_decimal(token_b_debit_cap, pair.token_b.decimals)?,
             operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
-            binance_withdrawal_api_mode: prefunding.token_a_withdrawal_api_mode.clone(),
+            binance_withdrawal_api_mode: prefunding.withdrawal_api_mode.clone(),
         },
     )
     .await?;
     let active = executor.active_operation()?.cloned();
     if let Some(active) = &active {
-        let active_mode = if active.intent.token_symbol == pair.token_a.symbol {
-            &prefunding.token_a_withdrawal_api_mode
-        } else if active.intent.token_symbol == pair.token_b.symbol {
-            &prefunding.token_b_withdrawal_api_mode
-        } else {
-            bail!("active prefunding operation has an unexpected token")
-        };
-        executor.set_binance_withdrawal_api_mode(active_mode)?;
+        ensure!(
+            active.intent.token_symbol == pair.token_a.symbol
+                || active.intent.token_symbol == pair.token_b.symbol,
+            "active prefunding operation has an unexpected token"
+        );
+        executor.set_binance_withdrawal_api_mode(&prefunding.withdrawal_api_mode)?;
     }
     executor.log_active_operation_recovery_evidence().await?;
     let recovered = if recovery_only {
@@ -814,32 +812,36 @@ async fn prefund_arbitrum_canary(
             (Some(_), None) => None,
             (None, _) => bail!("versioned ESP incident recovery approval is absent"),
         }
-    } else if let (Some(recovery), Some(active)) = (approved_standard_recovery, active.as_ref())
+    } else if let (Some(recovery), Some(active)) = (approved_manual_credit, active.as_ref())
         && active.intent.operation_id == recovery.operation_id
     {
-        let amount = U256::from_str_radix(&recovery.token_amount_base_units, 10)
-            .context("approved standard-withdrawal recovery amount is invalid")?;
-        ensure!(
-            recovery.capital_withdrawal_count == 0 && recovery.travel_rule_withdrawal_count == 0,
-            "approved standard-withdrawal recovery permits an indexed withdrawal"
-        );
-        ensure!(
-            active.intent.token_symbol == recovery.token_symbol && active.intent.amount == amount,
-            "active rebalance operation differs from the approved USDC incident"
-        );
-        executor.set_binance_withdrawal_api_mode(&prefunding.token_a_withdrawal_api_mode)?;
+        let gross_debit = U256::from_str_radix(&recovery.gross_debit_base_units, 10)
+            .context("approved manual ESP gross debit is invalid")?;
+        let expected_credit = U256::from_str_radix(&recovery.expected_credit_base_units, 10)
+            .context("approved manual ESP credit is invalid")?;
+        let expected_fee = U256::from_str_radix(&recovery.expected_fee_base_units, 10)
+            .context("approved manual ESP fee is invalid")?;
+        let wallet_balance_before =
+            U256::from_str_radix(&recovery.wallet_balance_before_base_units, 10)
+                .context("approved manual ESP wallet balance is invalid")?;
+        let transaction_hash = recovery
+            .transaction_hash
+            .parse::<B256>()
+            .context("approved manual ESP transaction hash is invalid")?;
+        executor.set_binance_withdrawal_api_mode(&prefunding.withdrawal_api_mode)?;
         Some(
             executor
-                .recover_approved_unindexed_standard_submission(
-                    &recovery.token_symbol,
-                    amount,
-                    configured_wallet,
-                    &arb_bot::rebalance::Route::Direct {
-                        binance_network: prefunding.binance_network.clone(),
-                        chain_id: ARBITRUM_CHAIN_ID,
-                    },
+                .recover_approved_manual_direct_credit(
                     &recovery.operation_id,
-                    recovery.transfer_transaction_id,
+                    &recovery.token_symbol,
+                    gross_debit,
+                    expected_credit,
+                    expected_fee,
+                    wallet_balance_before,
+                    configured_wallet,
+                    &prefunding.binance_network,
+                    ARBITRUM_CHAIN_ID,
+                    transaction_hash,
                 )
                 .await?,
         )
@@ -937,12 +939,7 @@ async fn prefund_arbitrum_canary(
     ];
     let mut transfer_count = 0_u16;
     for (token, target, fee_cap, debit_cap) in targets {
-        let withdrawal_api_mode = if token.symbol == pair.token_a.symbol {
-            &prefunding.token_a_withdrawal_api_mode
-        } else {
-            &prefunding.token_b_withdrawal_api_mode
-        };
-        executor.set_binance_withdrawal_api_mode(withdrawal_api_mode)?;
+        executor.set_binance_withdrawal_api_mode(&prefunding.withdrawal_api_mode)?;
         let contract = token
             .contract
             .parse::<Address>()

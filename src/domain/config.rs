@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -422,8 +422,7 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub production_approval_actor: String,
     pub production_approval_recorded_at_utc: String,
     pub binance_network: String,
-    pub token_a_withdrawal_api_mode: String,
-    pub token_b_withdrawal_api_mode: String,
+    pub withdrawal_api_mode: String,
     pub maximum_transfer_count: u16,
     pub maximum_token_a_withdrawal_fee_base_units: String,
     pub maximum_token_b_withdrawal_fee_base_units: String,
@@ -434,7 +433,7 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     #[serde(default)]
     pub approved_travel_rule_recovery: Option<LiveCanaryTravelRuleRecoveryConfig>,
     #[serde(default)]
-    pub approved_unindexed_standard_recovery: Option<LiveCanaryUnindexedStandardRecoveryConfig>,
+    pub approved_manual_token_b_credit: Option<LiveCanaryManualCreditRecoveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -451,15 +450,16 @@ pub struct LiveCanaryTravelRuleRecoveryConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LiveCanaryUnindexedStandardRecoveryConfig {
+pub struct LiveCanaryManualCreditRecoveryConfig {
     pub production_approval_actor: String,
     pub production_approval_recorded_at_utc: String,
     pub operation_id: String,
     pub token_symbol: String,
-    pub token_amount_base_units: String,
-    pub transfer_transaction_id: u64,
-    pub capital_withdrawal_count: u16,
-    pub travel_rule_withdrawal_count: u16,
+    pub gross_debit_base_units: String,
+    pub expected_credit_base_units: String,
+    pub expected_fee_base_units: String,
+    pub wallet_balance_before_base_units: String,
+    pub transaction_hash: String,
 }
 
 impl LiveCanaryPrefundingRebalanceConfig {
@@ -470,8 +470,7 @@ impl LiveCanaryPrefundingRebalanceConfig {
                 && !self.production_approval_actor.trim().is_empty()
                 && self.production_approval_recorded_at_utc.ends_with('Z')
                 && self.binance_network == "ARBITRUM"
-                && self.token_a_withdrawal_api_mode == "travel_rule"
-                && self.token_b_withdrawal_api_mode == "standard"
+                && self.withdrawal_api_mode == "standard"
                 && pair.chain.chain_id == 42_161
                 && pair.chain.binance_network_name == self.binance_network
                 && self.maximum_transfer_count == 2,
@@ -517,8 +516,8 @@ impl LiveCanaryPrefundingRebalanceConfig {
         if let Some(recovery) = &self.approved_travel_rule_recovery {
             recovery.validate(pair, canary, self)?;
         }
-        if let Some(recovery) = &self.approved_unindexed_standard_recovery {
-            recovery.validate(pair)?;
+        if let Some(recovery) = &self.approved_manual_token_b_credit {
+            recovery.validate(pair, canary)?;
         }
         ensure!(
             !self.retry_after_verified_address || self.approved_travel_rule_recovery.is_some(),
@@ -529,25 +528,40 @@ impl LiveCanaryPrefundingRebalanceConfig {
     }
 }
 
-impl LiveCanaryUnindexedStandardRecoveryConfig {
-    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+impl LiveCanaryManualCreditRecoveryConfig {
+    fn validate(&self, pair: &PairConfig, canary: &LiveCanaryConfig) -> anyhow::Result<()> {
+        let gross_debit = parse_base_units_u256(
+            &self.gross_debit_base_units,
+            "live_canary.prefunding_rebalance.approved_manual_token_b_credit.gross_debit_base_units",
+        )?;
+        let expected_credit = parse_base_units_u256(
+            &self.expected_credit_base_units,
+            "live_canary.prefunding_rebalance.approved_manual_token_b_credit.expected_credit_base_units",
+        )?;
+        let expected_fee = parse_base_units_u256(
+            &self.expected_fee_base_units,
+            "live_canary.prefunding_rebalance.approved_manual_token_b_credit.expected_fee_base_units",
+        )?;
+        let wallet_balance_before = parse_base_units_u256(
+            &self.wallet_balance_before_base_units,
+            "live_canary.prefunding_rebalance.approved_manual_token_b_credit.wallet_balance_before_base_units",
+        )?;
+        let target = parse_base_units_u256(
+            &canary.minimum_wallet_token_b_base_units,
+            "live_canary.minimum_wallet_token_b_base_units",
+        )?;
         ensure!(
             !self.production_approval_actor.trim().is_empty()
                 && self.production_approval_recorded_at_utc.ends_with('Z')
-                && self.operation_id == "rebalance-272-c36484318ac04bca"
-                && self.token_symbol == pair.token_a.symbol
-                && self.transfer_transaction_id == 395_795_295_053
-                && self.capital_withdrawal_count == 0
-                && self.travel_rule_withdrawal_count == 0,
-            "pair {} unindexed standard-withdrawal recovery identity is invalid",
-            pair.id
-        );
-        ensure!(
-            parse_base_units_u256(
-                &self.token_amount_base_units,
-                "live_canary.prefunding_rebalance.approved_unindexed_standard_recovery.token_amount_base_units",
-            )? == U256::from(3_000_000_u64),
-            "pair {} unindexed standard-withdrawal recovery amount changed",
+                && self.operation_id == "rebalance-268-15f59bc55dcaed54"
+                && self.token_symbol == pair.token_b.symbol
+                && gross_debit == U256::from(401_200_000_000_000_000_000_u128)
+                && expected_credit == target
+                && expected_fee == U256::from(1_200_000_000_000_000_000_u128)
+                && gross_debit == expected_credit + expected_fee
+                && wallet_balance_before.is_zero()
+                && self.transaction_hash.parse::<B256>().is_ok(),
+            "pair {} manual ESP credit recovery identity is invalid",
             pair.id
         );
         Ok(())
@@ -1481,8 +1495,7 @@ mod tests {
         );
         let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
         assert_eq!(prefunding.binance_network, "ARBITRUM");
-        assert_eq!(prefunding.token_a_withdrawal_api_mode, "travel_rule");
-        assert_eq!(prefunding.token_b_withdrawal_api_mode, "standard");
+        assert_eq!(prefunding.withdrawal_api_mode, "standard");
         assert_eq!(prefunding.maximum_transfer_count, 2);
         assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
         assert_eq!(
@@ -1494,6 +1507,14 @@ mod tests {
         assert_eq!(recovery.rejected_token_symbol, "ESP");
         assert_eq!(recovery.rejected_http_status, 400);
         assert_eq!(recovery.rejected_error_code, -4024);
+        let manual = prefunding.approved_manual_token_b_credit.as_ref().unwrap();
+        assert_eq!(manual.operation_id, "rebalance-268-15f59bc55dcaed54");
+        assert_eq!(manual.token_symbol, "ESP");
+        assert_eq!(manual.expected_credit_base_units, "400000000000000000000");
+        assert_eq!(
+            manual.transaction_hash,
+            "0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b"
+        );
         assert!(pair.execution_enabled);
         assert!(!pair.rebalance.enabled);
 
@@ -1505,6 +1526,16 @@ mod tests {
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["prefunding_rebalance"]["maximum_token_a_withdrawal_fee_base_units"] =
             Value::String("5000001".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["prefunding_rebalance"]["approved_manual_token_b_credit"]
+            ["transaction_hash"] = Value::String("0xdeadbeef".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["prefunding_rebalance"]["withdrawal_api_mode"] =
+            Value::String("travel_rule".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 

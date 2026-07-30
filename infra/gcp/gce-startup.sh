@@ -42,7 +42,7 @@ if [[ ! "${rebalance_execution_mode}" =~ ^(disabled|full_live)$ ]]; then
   echo "invalid arb-bot-rebalance-execution-mode metadata" >&2
   exit 1
 fi
-if [[ ! "${rebalance_binance_withdrawal_api_mode}" =~ ^(standard|travel_rule)$ ]]; then
+if [[ "${rebalance_binance_withdrawal_api_mode}" != standard ]]; then
   echo "invalid arb-bot-rebalance-binance-withdrawal-api-mode metadata" >&2
   exit 1
 fi

@@ -280,21 +280,24 @@ Startup validates both account views before opening the live executor:
 - the master view of the subaccount matches the trading-key view;
 - both credentials are restricted to the production egress IP.
 
-The long-lived production executor uses
-`REBALANCE_BINANCE_WITHDRAWAL_API_MODE=travel_rule` and the Binance
-local-entity endpoint. The separately approved one-shot M9 prefunding policy
-is asset-scoped: USDC uses `travel_rule`, while ESP uses `standard` because
-ESP is advertised on the direct Arbitrum capital route but rejected by
-local-entity with `[031031]`. The exact wallet is independently present in
-Binance's withdrawal-address list for Arbitrum with `whiteStatus=true`.
-API selection is durably journaled before submission and cannot change after
-an ambiguous request.
+Every production withdrawal uses
+`REBALANCE_BINANCE_WITHDRAWAL_API_MODE=standard` and Binance
+`/sapi/v1/capital/withdraw/apply`, independent of asset, network, or amount.
+Configuration rejects `travel_rule` as a withdrawal mode. The exact wallet is
+also present in Binance's withdrawal-address list for Arbitrum with
+`whiteStatus=true`. The standard API selection is durably journaled before
+submission and cannot change after an ambiguous request. Local-entity
+withdrawal history is queried only to reconcile the already persisted legacy
+incident created by the incorrect endpoint; it is never a routing input.
 
-Deposit reconciliation uses Travel Rule history. A deposit with a required
-questionnaire is submitted once and then polled until credited. A missing
-history row means "not indexed yet", not failure. Transaction hashes are
-matched case-insensitively. Duplicate matches, wrong networks, malformed hashes,
-or ambiguous addresses fail closed.
+Travel Rule is conditional deposit handling. After a wallet-to-Binance transfer,
+Rust reads the exact deposit-history row and submits `deposit/provide-info`
+only when `requireQuestionnaire=true` and `travelRuleReqStatus` has not passed.
+The runtime deliberately follows those Binance fields instead of duplicating a
+fiat or token threshold. It then polls until credited. A missing history row
+means "not indexed yet", not failure. Transaction hashes are matched
+case-insensitively. Duplicate matches, wrong networks, malformed hashes, or
+ambiguous addresses fail closed.
 
 ## Durability, idempotency, and recovery
 
@@ -335,7 +338,7 @@ Production mutation requires all of the following:
 - `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE`;
 - positive `REBALANCE_MAX_WLD_AMOUNT` and `REBALANCE_MAX_USDC_AMOUNT`;
 - `REBALANCE_EXECUTOR_TIMEOUT_SECONDS` between 60 and 86,400;
-- `REBALANCE_BINANCE_WITHDRAWAL_API_MODE` set to `standard` or `travel_rule`;
+- `REBALANCE_BINANCE_WITHDRAWAL_API_MODE=standard`;
 - the trading, treasury, subaccount, wallet, RPC, and journal configuration
   described above.
 

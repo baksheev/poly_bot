@@ -1927,17 +1927,13 @@ canary trades have reduced a token balance; normal M9 readiness then fails
 closed instead of silently replenishing inventory. Before the marker exists,
 partial or unknown outcomes resume through the deterministic journal identity.
 
-The first production bootstrap attempt proved the USDC direct route and then
-failed closed on ESP. `25 USDC` arrived on Arbitrum; the later approved Satoshi
-ownership test returned `0.9987 USDC` to Binance, so the current wallet balance
-is `24.0013 USDC`. The exact `401.2 ESP`
-subaccount-to-master transfer completed, but Binance's local-entity Travel Rule
-endpoint rejected the ESP withdrawal with HTTP `400`, code `-4024`, business
-detail `[031031] User does not own this currency.` No ESP withdrawal was
-indexed and the ESP remains in master Spot. A USDC-to-ESP swap is not an
-acceptable rebalance substitute: steady-state inventory balancing must deliver
-ESP as ESP, either through a supported direct Binance route or a
-receipt-validated ESP bridge.
+The first production bootstrap attempt transferred `25 USDC` to Arbitrum; the
+later approved Satoshi ownership test returned `0.9987 USDC` to Binance. The
+exact `401.2 ESP` subaccount-to-master transfer also completed, but the
+incorrect local-entity withdrawal endpoint rejected ESP with HTTP `400`, code
+`-4024`, business detail `[031031] User does not own this currency.` No
+transaction was broadcast by that request. A USDC-to-ESP swap is not an
+acceptable rebalance substitute: inventory balancing must deliver ESP as ESP.
 
 While that capability is diagnosed, production projects the v3 read-only ESP
 artifact and keeps WLD v12 live unchanged. A Recreate init probe performs only
@@ -1965,19 +1961,25 @@ zero locked. Any completed status, transaction hash, identity mismatch, or
 balance mismatch fails closed.
 
 Rails originally used `/sapi/v1/capital/withdraw/apply`; commit `6520658`
-globally replaced it with `/sapi/v1/localentity/withdraw/apply`. That global
-choice works for USDC and WLD under the account's `AE` questionnaire but is
-the source of ESP's `[031031]` rejection. The exact address is now both
-ownership-`VERIFIED` and present in the capital withdrawal-address list for
-Arbitrum with `whiteStatus=true`. The separately approved M9 artifact
-therefore pins USDC to `travel_rule` and ESP to `standard`. A failed standard
-USDC probe is recovered only after both withdrawal histories remain empty,
-the exact internal transfer is `SUCCESS`, wallet balance is unchanged, and
-the whitelist record is live; the same durable operation then resumes through
-Travel Rule without another internal transfer. The prior ESP master inventory
-is likewise reused for the exact standard submission. API selection is
-journaled before the request, and no bridge or swap is authorized while
-direct Arbitrum withdrawal remains available.
+globally replaced it with `/sapi/v1/localentity/withdraw/apply`. That replacement
+mixed two independent flows. Withdrawals always use the standard capital
+endpoint, independent of asset, network, or amount. Travel Rule handling starts
+only after a wallet-to-Binance transfer: the deposit-history row's
+`requireQuestionnaire` and `travelRuleReqStatus` fields determine whether Rust
+submits `deposit/provide-info`. No local amount threshold selects an endpoint.
+The exact Arbitrum address is ownership-`VERIFIED` and present in the withdrawal
+address list with `whiteStatus=true`.
+
+The operator's ordinary capital withdrawal credited exactly `400 ESP` to that
+wallet in transaction
+`0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b`;
+Binance charged `1.2 ESP`. Recovery accepts it only after matching the exact
+capital-history transaction, successful receipt, token contract, recipient,
+credit, fee, gross debit, zero starting wallet balance, and exhausted master
+inventory. It then closes the already durable operation without another
+external submission. The legacy Travel Rule row remains recovery evidence
+only and cannot authorize a new withdrawal. No bridge or swap is authorized
+while direct Arbitrum withdrawal remains available.
 
 Deliver:
 
