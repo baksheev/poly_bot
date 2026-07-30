@@ -4,6 +4,8 @@ const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml"
 const MAIN: &str = include_str!("../src/main.rs");
 const COMPILED_DOMAIN: &str =
     include_str!("../config/domain/compiled-multi-pair-production.v1.json");
+const ADDRESS_VERIFICATION_ARTIFACT: &str =
+    include_str!("../config/operations/binance-esp-address-verification.v1.json");
 
 #[test]
 fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
@@ -150,14 +152,15 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
 }
 
 #[test]
-fn gke_esp_incident_probe_is_read_only_and_stops_the_live_owner_first() {
+fn gke_address_verification_transfer_is_exact_one_shot_and_stops_the_live_owner_first() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
     assert!(DEPLOYMENT.contains("initContainers:"));
-    assert!(DEPLOYMENT.contains("name: diagnose-arbitrum-esp"));
-    assert!(DEPLOYMENT.contains("exec arb_bot diagnose-arbitrum-esp-withdrawal"));
-    assert!(DEPLOYMENT.contains("ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION"));
-    assert!(DEPLOYMENT.contains("value: DIAGNOSE_ESP_031031"));
+    assert!(DEPLOYMENT.contains("name: verify-binance-esp-address"));
+    assert!(DEPLOYMENT.contains("exec arb_bot binance-esp-address-verification-transfer"));
+    assert!(DEPLOYMENT.contains("BINANCE_ESP_ADDRESS_VERIFICATION_CONFIRMATION"));
+    assert!(DEPLOYMENT.contains("value: SEND_998700_USDC_ARBITRUM_TO_BINANCE_VERIFY_20260730"));
     assert!(!DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
+    assert!(!DEPLOYMENT.contains("exec arb_bot diagnose-arbitrum-esp-withdrawal"));
     assert!(DEPLOYMENT.contains("REBALANCE_EXECUTION_MODE"));
     assert!(DEPLOYMENT.contains("value: disabled"));
     assert!(DEPLOYMENT.contains("claimName: arb-bot-state"));
@@ -167,4 +170,12 @@ fn gke_esp_incident_probe_is_read_only_and_stops_the_live_owner_first() {
     assert!(DEPLOY_WORKFLOW.contains("live_canary.prefunding_rebalance == null"));
     assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-esp-address-verification.v1.json"));
+    assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"amount_base_units\": \"998700\""));
+    assert!(
+        ADDRESS_VERIFICATION_ARTIFACT
+            .contains("\"recipient\": \"0x64d62673799a8dc69825ff1cc0d624b1065dab39\"")
+    );
+    assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"maximum_transfer_count\": 1"));
+    assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"bridge_allowed\": false"));
 }

@@ -130,6 +130,28 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_quoter_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
+          verification_artifact=config/operations/binance-esp-address-verification.v1.json
+          test "$(jq -r '.schema_version' "${verification_artifact}")" \
+            = binance_address_verification_transfer_v1
+          test "$(jq -r '.operation_id' "${verification_artifact}")" \
+            = m9-binance-esp-address-verification-usdc-20260730
+          test "$(jq -r '.approval_gate' "${verification_artifact}")" \
+            = explicit_production_approved
+          test "$(jq -r '.chain_id' "${verification_artifact}")" = 42161
+          test "$(jq -r '.network' "${verification_artifact}")" = ARBITRUM
+          test "$(jq -r '.token_symbol' "${verification_artifact}")" = USDC
+          test "$(jq -r '.token_contract | ascii_downcase' "${verification_artifact}")" \
+            = 0xaf88d065e77c8cc2239327c5edb3a432268e5831
+          test "$(jq -r '.amount_base_units' "${verification_artifact}")" = 998700
+          test "$(jq -r '.recipient | ascii_downcase' "${verification_artifact}")" \
+            = 0x64d62673799a8dc69825ff1cc0d624b1065dab39
+          test "$(jq -r '.source_wallet | ascii_downcase' "${verification_artifact}")" \
+            = 0x90d990c81320221d2882de32beea78923c1e77a3
+          test "$(jq -r '.initial_source_balance_base_units' "${verification_artifact}")" \
+            = 25000000
+          test "$(jq -r '.initial_recipient_balance_base_units' "${verification_artifact}")" = 0
+          test "$(jq -r '.maximum_transfer_count' "${verification_artifact}")" = 1
+          test "$(jq -r '.bridge_allowed' "${verification_artifact}")" = false
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -365,7 +387,7 @@ jobs:
           test "$(jq -r '.spec.template.spec.containers | map(.name) | sort | join(",")' \
             <<<"${deployment_json}")" = arb-bot,esp-market-data
           test "$(jq -r '.spec.template.spec.initContainers | map(.name) | join(",")' \
-            <<<"${deployment_json}")" = diagnose-arbitrum-esp
+            <<<"${deployment_json}")" = verify-binance-esp-address
           test "$(jq -r '.spec.template.spec.containers[] | select(.name == "esp-market-data") | .args[0] | contains("collect-prices")' \
             <<<"${deployment_json}")" = true
           test "$(jq -r '.spec.template.spec.volumes[] | select(.name == "esp-market-data-secrets") | .csi.volumeAttributes.secretProviderClass' \

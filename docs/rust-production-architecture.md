@@ -359,6 +359,18 @@ again. The init container must not create an ESP order, DEX allowance, wallet
 transaction, bridge, or ongoing route authority. General Arbitrum rebalance
 remains the separately reviewed M10 milestone.
 
+The operator separately approved Binance's one-time Satoshi deposit test for
+the same wallet address. Its versioned artifact permits exactly one direct
+Arbitrum transfer of `998700` USDC base units from
+`0x90D990C81320221D2882De32beeA78923c1e77A3` to the Binance-provided deposit
+address `0x64d62673799a8dc69825ff1cc0d624b1065dab39` before the recorded expiry.
+The `Recreate` init container reuses the future ESP Arbitrum nonce journal,
+requires the observed pre-transfer balances to remain exactly 25 USDC and
+zero, simulates and journals the exact calldata before signing, and proves the
+receipt's exact ERC-20 credit. A restart may reconcile that same operation but
+cannot send a second transfer. This approval does not authorize an ESP
+withdrawal, trade, swap, bridge, allowance, or steady-state rebalance.
+
 An ESP bootstrap or later rebalance must deliver ESP as ESP. A deterministic
 Travel Rule rejection cannot be converted into permission to use the standard
 withdrawal API, and a USDC-to-ESP DEX swap is not a substitute for the missing

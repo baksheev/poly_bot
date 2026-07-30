@@ -111,6 +111,25 @@ pub enum Command {
         #[arg(long, env = "ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION", default_value = "")]
         confirmation: String,
     },
+    /// Send the one approved Arbitrum USDC deposit test that verifies the ESP wallet address.
+    BinanceEspAddressVerificationTransfer {
+        /// Versioned exact amount, recipient, token, wallet, network, and expiry.
+        #[arg(
+            long,
+            default_value = "config/operations/binance-esp-address-verification.v1.json"
+        )]
+        artifact: PathBuf,
+        /// Explicit acknowledgement for the exact one-shot production transfer.
+        #[arg(
+            long,
+            env = "BINANCE_ESP_ADDRESS_VERIFICATION_CONFIRMATION",
+            default_value = ""
+        )]
+        confirmation: String,
+        /// Shared Arbitrum journal used by the later ESP execution owner.
+        #[arg(long, env = "ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH")]
+        journal_path: PathBuf,
+    },
     /// Reconcile a live arbitrage CEX unknown outcome from the Binance order journal.
     ArbitrageReconcileCex {
         /// Parent arbitrage plan id waiting in unknown_exposure.

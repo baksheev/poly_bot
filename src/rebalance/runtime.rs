@@ -1,8 +1,15 @@
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, bail, ensure};
 use rust_decimal::Decimal;
+use serde::Deserialize;
 
 use crate::{
     across::{
@@ -49,6 +56,197 @@ pub struct DirectPrefundingPlan {
     pub requested_debit: U256,
     pub expected_credit: U256,
     pub withdrawal_fee: U256,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BinanceAddressVerificationTransferArtifact {
+    pub schema_version: String,
+    pub operation_id: String,
+    pub approval_gate: String,
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub expires_at_unix_seconds: u64,
+    pub chain_id: u64,
+    pub network: String,
+    pub token_symbol: String,
+    pub token_contract: String,
+    pub token_decimals: u8,
+    pub amount_base_units: String,
+    pub recipient: String,
+    pub source_wallet: String,
+    pub initial_source_balance_base_units: String,
+    pub initial_recipient_balance_base_units: String,
+    pub maximum_transfer_count: u16,
+    pub bridge_allowed: bool,
+}
+
+impl BinanceAddressVerificationTransferArtifact {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let bytes = fs::read(path).with_context(|| {
+            format!(
+                "failed to read Binance address verification artifact {}",
+                path.display()
+            )
+        })?;
+        serde_json::from_slice(&bytes)
+            .context("Binance address verification artifact is invalid JSON")
+    }
+
+    fn validate(
+        &self,
+        wallet: Address,
+        now_unix_seconds: u64,
+        existing_operation: bool,
+    ) -> anyhow::Result<(Address, Address, U256, U256, U256)> {
+        ensure!(
+            self.schema_version == "binance_address_verification_transfer_v1"
+                && self.operation_id == "m9-binance-esp-address-verification-usdc-20260730"
+                && self.approval_gate == "explicit_production_approved"
+                && self.production_approval_actor == "operator"
+                && !self.production_approval_recorded_at_utc.trim().is_empty()
+                && self.chain_id == ARBITRUM_CHAIN_ID
+                && self.network == "ARBITRUM"
+                && self.token_symbol == "USDC"
+                && self.token_contract.eq_ignore_ascii_case(ARBITRUM_USDC)
+                && self.token_decimals == 6
+                && self.amount_base_units == "998700"
+                && self
+                    .recipient
+                    .eq_ignore_ascii_case("0x64d62673799a8dc69825ff1cc0d624b1065dab39")
+                && self
+                    .source_wallet
+                    .eq_ignore_ascii_case("0x90d990c81320221d2882de32beea78923c1e77a3")
+                && self.initial_source_balance_base_units == "25000000"
+                && self.initial_recipient_balance_base_units == "0"
+                && self.maximum_transfer_count == 1
+                && !self.bridge_allowed,
+            "Binance address verification artifact differs from the approved direct transfer"
+        );
+        ensure!(
+            wallet
+                == Address::from_str(&self.source_wallet)
+                    .context("approved address verification source wallet is invalid")?,
+            "address verification signer differs from the approved source wallet"
+        );
+        if !existing_operation {
+            ensure!(
+                now_unix_seconds < self.expires_at_unix_seconds,
+                "Binance address verification transfer approval has expired"
+            );
+        }
+        Ok((
+            Address::from_str(&self.token_contract)
+                .context("approved address verification token is invalid")?,
+            Address::from_str(&self.recipient)
+                .context("approved address verification recipient is invalid")?,
+            U256::from_str_radix(&self.amount_base_units, 10)
+                .context("approved address verification amount is invalid")?,
+            U256::from_str_radix(&self.initial_source_balance_base_units, 10)
+                .context("approved initial source balance is invalid")?,
+            U256::from_str_radix(&self.initial_recipient_balance_base_units, 10)
+                .context("approved initial recipient balance is invalid")?,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceAddressVerificationTransferOutcome {
+    pub operation_id: String,
+    pub transaction_hash: B256,
+    pub amount: U256,
+    pub recipient: Address,
+}
+
+pub async fn execute_binance_address_verification_transfer(
+    artifact: &BinanceAddressVerificationTransferArtifact,
+    rpc: JsonRpcClient,
+    wallet: EvmWallet,
+    journal_path: PathBuf,
+    timeout: Duration,
+) -> anyhow::Result<BinanceAddressVerificationTransferOutcome> {
+    ensure!(
+        timeout >= Duration::from_secs(60) && timeout <= Duration::from_secs(15 * 60),
+        "Binance address verification transfer timeout is outside the reviewed bounds"
+    );
+    ensure!(
+        rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
+        "address verification RPC is not Arbitrum One"
+    );
+    let mut journal = TransactionJournal::open(journal_path)?;
+    let existing_operation = journal.operation(&artifact.operation_id).is_some();
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time precedes Unix epoch")?
+        .as_secs();
+    let (token, recipient, amount, initial_source_balance, initial_recipient_balance) =
+        artifact.validate(wallet.address(), now_unix_seconds, existing_operation)?;
+    if !existing_operation {
+        let (source_balance, recipient_balance) = tokio::try_join!(
+            rpc.erc20_balance(token, wallet.address()),
+            rpc.erc20_balance(token, recipient),
+        )?;
+        ensure!(
+            source_balance == initial_source_balance,
+            "address verification source USDC balance changed from the approved snapshot"
+        );
+        ensure!(
+            recipient_balance == initial_recipient_balance,
+            "address verification recipient USDC balance changed from the approved snapshot"
+        );
+        ensure!(
+            source_balance >= amount,
+            "address verification source has insufficient USDC"
+        );
+    }
+    let (latest_nonce, pending_nonce) = tokio::try_join!(
+        rpc.latest_nonce(wallet.address()),
+        rpc.pending_nonce(wallet.address()),
+    )?;
+    let reconciled = NonceLane::reconcile(
+        &rpc,
+        &mut journal,
+        ARBITRUM_CHAIN_ID,
+        wallet.address(),
+        latest_nonce,
+        pending_nonce,
+    )
+    .await?;
+    let mut nonce_lane =
+        finish_known_pending_recovery(&rpc, &mut journal, reconciled, timeout).await?;
+    nonce_lane.set_journal_scope(EvmJournalScope {
+        schema_version: EvmJournalScope::SCHEMA_VERSION,
+        network_id: "arbitrum-one".to_owned(),
+        wallet_id: format!("wallet:{:#x}", wallet.address()),
+        strategy_id: "binance-esp-address-verification".to_owned(),
+    })?;
+    let call = WalletCall::erc20_transfer(token, recipient, amount)?;
+    let transaction_hash = execute_wallet_call(
+        &rpc,
+        &wallet,
+        &mut nonce_lane,
+        &mut journal,
+        artifact.operation_id.clone(),
+        "binance_esp_address_verification_usdc",
+        &call,
+        timeout,
+    )
+    .await?;
+    let receipt = rpc
+        .transaction_receipt(transaction_hash)
+        .await?
+        .context("address verification transfer receipt disappeared")?;
+    ensure!(
+        receipt.status == 1
+            && erc20_credit_from_receipt(&receipt, transaction_hash, token, recipient)? == amount,
+        "address verification receipt does not prove the exact approved USDC transfer"
+    );
+    Ok(BinanceAddressVerificationTransferOutcome {
+        operation_id: artifact.operation_id.clone(),
+        transaction_hash,
+        amount,
+        recipient,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2127,6 +2325,8 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use alloy_primitives::{Address, B256, U256, keccak256};
     use rust_decimal::Decimal;
 
@@ -2136,11 +2336,11 @@ mod tests {
     };
 
     use super::{
-        ARBITRUM_CHAIN_ID, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD,
-        base_units_to_decimal, decimal_to_base_units, decimal_to_base_units_floor,
-        plan_direct_prefunding, validate_across_fill_receipt, validate_approved_asset,
-        validate_direct_withdrawal_receipt, withdrawal_received_base_units,
-        withdrawal_requested_base_units,
+        ARBITRUM_CHAIN_ID, BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID,
+        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
+        decimal_to_base_units_floor, plan_direct_prefunding, validate_across_fill_receipt,
+        validate_approved_asset, validate_direct_withdrawal_receipt,
+        withdrawal_received_base_units, withdrawal_requested_base_units,
     };
 
     fn arbitrum_network(fee: &str) -> NetworkInformation {
@@ -2155,6 +2355,42 @@ mod tests {
             withdraw_max: Decimal::from_str_exact("1000000").unwrap(),
             withdraw_integer_multiple: Decimal::from_str_exact("0.01").unwrap(),
         }
+    }
+
+    #[test]
+    fn address_verification_artifact_is_exact_expiring_and_disallows_bridge() {
+        let mut artifact: BinanceAddressVerificationTransferArtifact = serde_json::from_str(
+            include_str!("../../config/operations/binance-esp-address-verification.v1.json"),
+        )
+        .unwrap();
+        let wallet = Address::from_str("0x90d990c81320221d2882de32beea78923c1e77a3").unwrap();
+        let (_, recipient, amount, source_balance, recipient_balance) = artifact
+            .validate(wallet, artifact.expires_at_unix_seconds - 1, false)
+            .unwrap();
+        assert_eq!(
+            recipient,
+            Address::from_str("0x64d62673799a8dc69825ff1cc0d624b1065dab39").unwrap()
+        );
+        assert_eq!(amount, U256::from(998_700_u64));
+        assert_eq!(source_balance, U256::from(25_000_000_u64));
+        assert_eq!(recipient_balance, U256::ZERO);
+        assert!(
+            artifact
+                .validate(wallet, artifact.expires_at_unix_seconds, false)
+                .is_err()
+        );
+        assert!(
+            artifact
+                .validate(wallet, artifact.expires_at_unix_seconds, true)
+                .is_ok()
+        );
+
+        artifact.bridge_allowed = true;
+        assert!(
+            artifact
+                .validate(wallet, artifact.expires_at_unix_seconds - 1, false)
+                .is_err()
+        );
     }
 
     #[test]

@@ -85,10 +85,12 @@ use arb_bot::{
     },
     portfolio::PortfolioCatalog,
     rebalance::{
-        RebalanceExecutionOperation, RebalanceExecutionProgress, RebalanceExecutionRequest,
-        RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
-        plan_direct_prefunding, rebalance_base_units_to_decimal,
-        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
+        BinanceAddressVerificationTransferArtifact, RebalanceExecutionOperation,
+        RebalanceExecutionProgress, RebalanceExecutionRequest, RebalanceExecutor,
+        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
+        execute_binance_address_verification_transfer, plan_direct_prefunding,
+        rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
+        route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -350,6 +352,19 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::BinanceEspAddressVerificationTransfer {
+            artifact,
+            confirmation,
+            journal_path,
+        } => {
+            binance_esp_address_verification_transfer(
+                &cli.config,
+                &artifact,
+                &confirmation,
+                journal_path,
+            )
+            .await
+        }
         Command::ArbitrageReconcileCex {
             plan_id,
             order_journal_path,
@@ -453,6 +468,49 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn binance_esp_address_verification_transfer(
+    config: &config::AppConfig,
+    artifact_path: &std::path::Path,
+    confirmation: &str,
+    journal_path: PathBuf,
+) -> anyhow::Result<()> {
+    ensure!(
+        confirmation == "SEND_998700_USDC_ARBITRUM_TO_BINANCE_VERIFY_20260730",
+        "Binance ESP address verification transfer requires the exact production confirmation"
+    );
+    let artifact = BinanceAddressVerificationTransferArtifact::load(artifact_path)?;
+    let wallet = EvmWallet::from_env()?;
+    let configured_wallet = config
+        .evm_wallet_address
+        .parse::<Address>()
+        .context("EVM_WALLET_ADDRESS is invalid")?;
+    ensure!(
+        wallet.address() == configured_wallet,
+        "Binance address verification signer differs from EVM_WALLET_ADDRESS"
+    );
+    let arbitrum_endpoint = std::env::var("ARBITRUM_RPC_URL")
+        .context("ARBITRUM_RPC_URL is required for Binance address verification")?;
+    let outcome = execute_binance_address_verification_transfer(
+        &artifact,
+        JsonRpcClient::new(arbitrum_endpoint)?,
+        wallet,
+        journal_path,
+        Duration::from_secs(10 * 60),
+    )
+    .await?;
+    tracing::info!(
+        operation_id = %outcome.operation_id,
+        network = "ARBITRUM",
+        token = "USDC",
+        amount_base_units = %outcome.amount,
+        recipient = %outcome.recipient,
+        transaction_hash = %outcome.transaction_hash,
+        bridge_used = false,
+        "exact Binance ESP address verification deposit test completed"
+    );
+    Ok(())
 }
 
 async fn prefund_arbitrum_canary(
