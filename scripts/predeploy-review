@@ -39,6 +39,8 @@ cargo test portfolio::tests --lib
 cargo test dex::execution::tests::capital_handle_uses_the_same_nonce_journal_and_cannot_keep_service_alive --lib
 cargo test rebalance::executor::tests --lib
 cargo test rebalance::runtime::tests --lib
+cargo test engine::tests::active_wld_reservations_are_contention_not_capital_shortfall --lib
+cargo test engine::tests::actual_inventory_shortfall_and_invariants_remain_actionable --lib
 cargo check --all-targets
 
 if rg -n '^- \[ \]' "$review_file"; then

@@ -101,11 +101,15 @@ contract error.
   withdrawal mode or local-entity withdrawal submission exists.
   Evidence: `rg` scan plus `tests/binance_capital_contract.rs`.
 - [x] Run all targeted restart/limit/owner tests embedded in
-  `scripts/predeploy-review`; the final artifact-complete invocation remains
-  below.
+  `scripts/predeploy-review`, including the production-derived WLD reservation
+  contention regression and the true shortfall/invariant controls.
+- [x] Audit current production `ERROR` rows before release. The observed WLD
+  rejection had sufficient raw inventory but insufficient *available*
+  inventory because active operations held the balance. The typed reserve
+  failure now classifies that case as rate-limited `INFO` without weakening
+  real capital-shortfall or reservation-invariant errors.
 - [x] Run `scripts/quality.sh` once after the final edit.
 - [x] Confirm a clean fast-forward to current `origin/main`; after explicit
   approval, the next external action is one consolidated push/deploy of the
   reviewed M10 revision. Evidence: fetched `origin/main` at `94b61e81f5ff`;
-  it is an ancestor of local `2f7d68c9eca3` plus the reviewed working-tree
-  implementation.
+  it is an ancestor of the reviewed local branch.

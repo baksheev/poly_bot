@@ -36,8 +36,8 @@ use crate::{
         channel as hot_telemetry_channel,
     },
     inventory::{
-        InventoryClaim, InventoryKey, InventoryLocation, ReservationPurpose, ReservationRequest,
-        SharedInventoryReservations,
+        InsufficientAvailableInventory, InventoryClaim, InventoryKey, InventoryLocation,
+        ReservationPurpose, ReservationRequest, SharedInventoryReservations,
     },
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{
@@ -129,6 +129,7 @@ pub struct TradingEngine {
     last_depth_health_log_at: Option<Instant>,
     last_binance_price_health_log_at: Option<Instant>,
     last_inventory_blocked_alert_at: Option<Instant>,
+    last_inventory_contention_log_at: Option<Instant>,
     entry_preflight: EntryPreflightHandle,
     arbitrage_plan_freshness: BTreeMap<String, ArbitragePlanFreshness>,
     terminal_child_observed_at: BTreeMap<String, Instant>,
@@ -650,6 +651,7 @@ impl TradingEngine {
                 last_depth_health_log_at: None,
                 last_binance_price_health_log_at: None,
                 last_inventory_blocked_alert_at: None,
+                last_inventory_contention_log_at: None,
                 entry_preflight: execution.entry_preflight,
                 arbitrage_plan_freshness: BTreeMap::new(),
                 terminal_child_observed_at: BTreeMap::new(),
@@ -3074,13 +3076,20 @@ impl TradingEngine {
         }
         if let Err(error) = self.inventory.reserve(request) {
             let claim_details = self.inventory_claim_details(&claims);
-            self.log_trading_inventory_blocked(&pair_id, &pair_symbol, &plan_id, &claim_details);
+            let failure_kind = classify_inventory_admission_failure(&error);
+            self.log_trading_inventory_blocked(
+                &pair_id,
+                &pair_symbol,
+                &plan_id,
+                &claim_details,
+                failure_kind,
+            );
             self.telemetry.emit(
                 "arbitrage_admission_rejected",
                 json!({
                     "engine_id": self.config.engine_id,
                     "plan_id": plan_id,
-                    "reason": "insufficient_available_inventory",
+                    "reason": failure_kind.telemetry_reason(),
                     "error": format!("{error:#}"),
                     "claims": claim_details,
                 }),
@@ -3174,16 +3183,35 @@ impl TradingEngine {
         pair_symbol: &str,
         plan_id: &str,
         claim_details: &[Value],
+        failure_kind: InventoryAdmissionFailureKind,
     ) {
         let now = Instant::now();
-        if self.last_inventory_blocked_alert_at.is_some_and(|last| {
+        let last_log_at = if failure_kind == InventoryAdmissionFailureKind::ReservationContention {
+            &mut self.last_inventory_contention_log_at
+        } else {
+            &mut self.last_inventory_blocked_alert_at
+        };
+        if last_log_at.is_some_and(|last| {
             now.saturating_duration_since(last) < TRADING_INVENTORY_ALERT_LOG_INTERVAL
         }) {
             return;
         }
-        self.last_inventory_blocked_alert_at = Some(now);
+        *last_log_at = Some(now);
         let claims = Value::Array(claim_details.to_vec());
-        if is_bounded_canary_pair(&self.domain_config, pair_id) {
+        if failure_kind == InventoryAdmissionFailureKind::ReservationContention {
+            tracing::info!(
+                engine_id = %self.config.engine_id,
+                pair_id,
+                pair_symbol,
+                plan_id,
+                claims = %claims,
+                "arbitrage admission skipped because inventory is reserved by an active operation"
+            );
+            return;
+        }
+        if failure_kind == InventoryAdmissionFailureKind::CapitalShortfall
+            && is_bounded_canary_pair(&self.domain_config, pair_id)
+        {
             tracing::info!(
                 engine_id = %self.config.engine_id,
                 pair_id,
@@ -3191,6 +3219,17 @@ impl TradingEngine {
                 plan_id,
                 claims = %claims,
                 "bounded canary admission skipped by insufficient inventory"
+            );
+            return;
+        }
+        if failure_kind == InventoryAdmissionFailureKind::InvariantViolation {
+            tracing::error!(
+                engine_id = %self.config.engine_id,
+                pair_id,
+                pair_symbol,
+                plan_id,
+                claims = %claims,
+                "arbitrage inventory reservation failed"
             );
             return;
         }
@@ -3760,6 +3799,34 @@ fn is_bounded_canary_pair(domain_config: &LoadedDomainConfig, pair_id: &str) -> 
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InventoryAdmissionFailureKind {
+    ReservationContention,
+    CapitalShortfall,
+    InvariantViolation,
+}
+
+impl InventoryAdmissionFailureKind {
+    const fn telemetry_reason(self) -> &'static str {
+        match self {
+            Self::ReservationContention => "inventory_reservation_contention",
+            Self::CapitalShortfall => "insufficient_available_inventory",
+            Self::InvariantViolation => "inventory_reservation_error",
+        }
+    }
+}
+
+fn classify_inventory_admission_failure(error: &anyhow::Error) -> InventoryAdmissionFailureKind {
+    let Some(insufficient) = error.downcast_ref::<InsufficientAvailableInventory>() else {
+        return InventoryAdmissionFailureKind::InvariantViolation;
+    };
+    if insufficient.caused_by_active_reservations() {
+        InventoryAdmissionFailureKind::ReservationContention
+    } else {
+        InventoryAdmissionFailureKind::CapitalShortfall
+    }
+}
+
 fn requires_depth_for_runtime_phase(arbitrage_execution_mode: &str) -> bool {
     matches!(arbitrage_execution_mode, "paper_concurrent_hedged")
 }
@@ -3962,8 +4029,8 @@ mod tests {
         domain::config::LoadedDomainConfig,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
-            InventoryClaim, InventoryKey, InventoryLocation, ReservationPurpose,
-            ReservationRequest, SharedInventoryReservations,
+            InsufficientAvailableInventory, InventoryClaim, InventoryKey, InventoryLocation,
+            ReservationPurpose, ReservationRequest, SharedInventoryReservations,
         },
         opportunity::{ArbitrageDirection as SizingDirection, TradeEvaluation},
         rebalance::Direction,
@@ -3973,11 +4040,12 @@ mod tests {
 
     use super::{
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
-        RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
-        adaptive_candidate_is_better, admission_deadline_unix_seconds, classify_depth_health,
-        clock_sync_estimate_valid, estimate_exchange_event_to_socket_us,
-        exact_execution_envelope_amounts, is_bounded_canary_pair, mark_sequence_matched_update,
-        rebalance_health_state, requires_depth_for_runtime_phase, reservation_precheck,
+        InventoryAdmissionFailureKind, RebalanceSettlementBarrier, ReservationPrecheck,
+        TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
+        classify_depth_health, classify_inventory_admission_failure, clock_sync_estimate_valid,
+        estimate_exchange_event_to_socket_us, exact_execution_envelope_amounts,
+        is_bounded_canary_pair, mark_sequence_matched_update, rebalance_health_state,
+        requires_depth_for_runtime_phase, reservation_precheck,
     };
 
     #[test]
@@ -4031,6 +4099,76 @@ mod tests {
         assert!(is_bounded_canary_pair(&config, "arbitrum-usdc-esp"));
         assert!(!is_bounded_canary_pair(&config, "world-chain-usdc-wld"));
         assert!(!is_bounded_canary_pair(&config, "unknown-pair"));
+    }
+
+    #[test]
+    fn active_wld_reservations_are_contention_not_capital_shortfall() {
+        let location = InventoryLocation::binance("binance-spot:primary").unwrap();
+        let asset = "binance-spot:primary:asset:WLD";
+        let observed = U256::from(2_228_078_371_150_000_000_000_u128);
+        let inventory = SharedInventoryReservations::default();
+        inventory
+            .update_location(location.clone(), 1, [(asset.to_owned(), observed)])
+            .unwrap();
+        inventory
+            .reserve(ReservationRequest {
+                operation_id: "production-active-wld-reservations".to_owned(),
+                purpose: ReservationPurpose::TradePrimary,
+                claims: vec![InventoryClaim {
+                    key: InventoryKey::new(location.clone(), asset).unwrap(),
+                    amount: U256::from(1_931_500_000_000_000_000_000_u128),
+                }],
+                settlement_locations: [location.clone()].into_iter().collect(),
+            })
+            .unwrap();
+        let error = inventory
+            .reserve(ReservationRequest {
+                operation_id: "production-rejected-wld-plan".to_owned(),
+                purpose: ReservationPurpose::TradePrimary,
+                claims: vec![InventoryClaim {
+                    key: InventoryKey::new(location.clone(), asset).unwrap(),
+                    amount: U256::from(643_900_000_000_000_000_000_u128),
+                }],
+                settlement_locations: [location].into_iter().collect(),
+            })
+            .unwrap_err();
+        let insufficient = error
+            .downcast_ref::<InsufficientAvailableInventory>()
+            .unwrap();
+
+        assert_eq!(
+            classify_inventory_admission_failure(&error),
+            InventoryAdmissionFailureKind::ReservationContention
+        );
+        assert_eq!(
+            insufficient.available,
+            U256::from(296_578_371_150_000_000_000_u128)
+        );
+        assert_eq!(
+            InventoryAdmissionFailureKind::ReservationContention.telemetry_reason(),
+            "inventory_reservation_contention"
+        );
+    }
+
+    #[test]
+    fn actual_inventory_shortfall_and_invariants_remain_actionable() {
+        let location = InventoryLocation::binance("binance-spot:primary").unwrap();
+        let error = anyhow::Error::new(InsufficientAvailableInventory {
+            key: InventoryKey::new(location, "binance-spot:primary:asset:WLD").unwrap(),
+            requested: U256::from(643_900_000_000_000_000_000_u128),
+            observed: U256::from(296_578_371_150_000_000_000_u128),
+            reserved: U256::ZERO,
+            available: U256::from(296_578_371_150_000_000_000_u128),
+        });
+
+        assert_eq!(
+            classify_inventory_admission_failure(&error),
+            InventoryAdmissionFailureKind::CapitalShortfall
+        );
+        assert_eq!(
+            classify_inventory_admission_failure(&anyhow::anyhow!("missing generation")),
+            InventoryAdmissionFailureKind::InvariantViolation
+        );
     }
 
     #[test]

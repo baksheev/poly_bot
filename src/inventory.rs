@@ -110,6 +110,33 @@ pub struct InventoryReservation {
     pub state: ReservationState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsufficientAvailableInventory {
+    pub key: InventoryKey,
+    pub requested: U256,
+    pub observed: U256,
+    pub reserved: U256,
+    pub available: U256,
+}
+
+impl InsufficientAvailableInventory {
+    pub fn caused_by_active_reservations(&self) -> bool {
+        self.requested <= self.observed && self.requested > self.available
+    }
+}
+
+impl std::fmt::Display for InsufficientAvailableInventory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "insufficient available {} inventory: requested {}, observed {}, reserved {}, available {}",
+            self.key.venue_asset_id, self.requested, self.observed, self.reserved, self.available
+        )
+    }
+}
+
+impl std::error::Error for InsufficientAvailableInventory {}
+
 /// Single atomic owner for every strategy and rebalance inventory claim.
 ///
 /// A key is the exact `(inventory_location, venue_asset_id)` pair. Observed
@@ -316,14 +343,27 @@ impl InventoryReservations {
                 self.location_generations.contains_key(&claim.key.location),
                 "inventory location has no observed generation"
             );
-            let available = self.available(&claim.key)?;
-            ensure!(
-                claim.amount <= available,
-                "insufficient available {} inventory: requested {}, available {}",
-                claim.key.venue_asset_id,
-                claim.amount,
-                available
-            );
+            let observed = self.observed(&claim.key).with_context(|| {
+                format!(
+                    "no observed inventory for {} at {}",
+                    claim.key.venue_asset_id,
+                    claim.key.location.stable_id()
+                )
+            })?;
+            let reserved = self.reserved(&claim.key);
+            let available = observed
+                .checked_sub(reserved)
+                .context("reservations exceed observed inventory")?;
+            if claim.amount > available {
+                return Err(InsufficientAvailableInventory {
+                    key: claim.key.clone(),
+                    requested: claim.amount,
+                    observed,
+                    reserved,
+                    available,
+                }
+                .into());
+            }
         }
         for claim in &request.claims {
             let reserved = self
