@@ -123,6 +123,16 @@ const DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY: usize = 32;
 const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
+fn m9_canary_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
+    let network_id = format!("eip155:{chain_id}");
+    EvmJournalScope {
+        schema_version: EvmJournalScope::SCHEMA_VERSION,
+        wallet_id: format!("{network_id}:evm-wallet:primary"),
+        network_id,
+        strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
+    }
+}
+
 enum RebalanceExecutorEvent {
     Recovery(Result<RebalanceExecutionOperation, String>),
     Execution(Result<RebalanceExecutionOperation, String>),
@@ -591,12 +601,7 @@ async fn prefund_arbitrum_canary(
                 wallet: configured_wallet,
                 nonce: recovery.nonce,
                 transaction_hash,
-                scope: EvmJournalScope {
-                    schema_version: EvmJournalScope::SCHEMA_VERSION,
-                    network_id: "eip155:42161".to_owned(),
-                    wallet_id: "evm-wallet:primary".to_owned(),
-                    strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
-                },
+                scope: m9_canary_evm_journal_scope(ARBITRUM_CHAIN_ID),
             },
         )
         .await?;
@@ -3106,6 +3111,15 @@ async fn run(
         };
         let trade_journal_scope = scope_for("WLDUSDC")?;
         let canary_journal_scope = scope_for("ESPUSDC")?;
+        ensure!(
+            EvmJournalScope {
+                schema_version: EvmJournalScope::SCHEMA_VERSION,
+                network_id: canary_journal_scope.network_id.clone(),
+                wallet_id: canary_journal_scope.wallet_id.clone(),
+                strategy_id: canary_journal_scope.strategy_id.clone(),
+            } == m9_canary_evm_journal_scope(ARBITRUM_CHAIN_ID),
+            "compiled M9 journal identity differs from the prefunding recovery identity"
+        );
         let wallet = EvmWallet::from_env()?;
         ensure!(
             wallet.address() == wallet_owner,
@@ -5314,12 +5328,44 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use alloy_primitives::{Address, B256};
-    use arb_bot::{chain::rpc::CanonicalBlock, market_data::alchemy::DexStreamEvent};
+    use arb_bot::{
+        chain::rpc::CanonicalBlock,
+        domain::compiled::{CompatibilityRole, load_compatibility_domain},
+        market_data::alchemy::DexStreamEvent,
+    };
 
     use super::{
-        StartupDexDrainStats, rebalance_quote_retry_delay, validate_prefunding_marker,
-        write_prefunding_marker,
+        StartupDexDrainStats, m9_canary_evm_journal_scope, rebalance_quote_retry_delay,
+        validate_prefunding_marker, write_prefunding_marker,
     };
+
+    #[test]
+    fn m9_recovery_scope_matches_the_production_runtime_journal_identity() {
+        let scope = m9_canary_evm_journal_scope(42_161);
+        assert_eq!(scope.schema_version, 2);
+        assert_eq!(scope.network_id, "eip155:42161");
+        assert_eq!(
+            scope.wallet_id, "eip155:42161:evm-wallet:primary",
+            "wallet location ids are network-qualified in the compiled runtime"
+        );
+        assert_eq!(scope.strategy_id, "strategy:arbitrum-usdc-esp");
+
+        let production = load_compatibility_domain(
+            "config/domain/compiled-multi-pair-production.v1.json",
+            CompatibilityRole::LiveRuntime,
+            false,
+        )
+        .unwrap();
+        let runtime = production
+            .network_runtime
+            .unwrap()
+            .networks
+            .into_iter()
+            .find(|network| network.chain_id == 42_161)
+            .unwrap();
+        assert_eq!(runtime.network_id.as_str(), scope.network_id);
+        assert_eq!(runtime.wallet_location_id.as_str(), scope.wallet_id);
+    }
 
     #[test]
     fn prefunding_marker_is_atomic_exact_and_prevents_a_second_funding_run() {
