@@ -1,6 +1,7 @@
 WITH readiness AS
 (
     SELECT
+        observed_at_ms,
         JSONExtractString(payload_json, 'engine_id') AS engine_id,
         JSONExtractString(payload_json, 'stage') AS stage,
         JSONExtractBool(payload_json, 'ready') AS ready,
@@ -23,6 +24,33 @@ WITH readiness AS
           'arb-bot-rust-shadow-gke-'
       )
 ),
+readiness_latest AS
+(
+    SELECT
+        engine_id,
+        stage,
+        argMax(ready, observed_at_ms) AS ready,
+        argMax(request_count, observed_at_ms) AS request_count,
+        argMax(filters_ready, observed_at_ms) AS filters_ready,
+        argMax(exact_token_contracts, observed_at_ms) AS exact_token_contracts,
+        argMax(token_code_present, observed_at_ms) AS token_code_present,
+        argMax(router_code_present, observed_at_ms) AS router_code_present,
+        argMax(native_gas_funded, observed_at_ms) AS native_gas_funded,
+        argMax(fresh_rpc_gas_price, observed_at_ms) AS fresh_rpc_gas_price,
+        argMax(direct_route_count, observed_at_ms) AS direct_route_count
+    FROM readiness
+    GROUP BY
+        engine_id,
+        stage
+),
+mutation_by_engine AS
+(
+    SELECT
+        engine_id,
+        countIf(mutation_authorized) AS mutation_capability_records
+    FROM readiness
+    GROUP BY engine_id
+),
 network AS
 (
     SELECT
@@ -42,10 +70,10 @@ network AS
 readiness_by_engine AS
 (
     SELECT
-        engine_id,
+        readiness_latest.engine_id AS engine_id,
         uniqExact(stage) AS readiness_stage_count,
         uniqExactIf(stage, ready) AS ready_stage_count,
-        countIf(mutation_authorized) AS mutation_capability_records,
+        mutation_capability_records,
         maxIf(request_count, stage = 'binance_order_matrix') AS binance_request_count,
         maxIf(filters_ready, stage = 'binance_order_matrix') AS binance_filters_ready,
         maxIf(exact_token_contracts, stage = 'arbitrum_chain') AS exact_token_contracts,
@@ -55,8 +83,11 @@ readiness_by_engine AS
         maxIf(fresh_rpc_gas_price, stage = 'arbitrum_chain') AS fresh_rpc_gas_price,
         maxIf(direct_route_count, stage = 'arbitrum_rebalance_routes')
             AS direct_rebalance_routes
-    FROM readiness
-    GROUP BY engine_id
+    FROM readiness_latest
+    INNER JOIN mutation_by_engine USING (engine_id)
+    GROUP BY
+        readiness_latest.engine_id,
+        mutation_capability_records
 )
 SELECT
     readiness_by_engine.engine_id AS engine_id,

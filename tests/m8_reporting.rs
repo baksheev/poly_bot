@@ -12,6 +12,9 @@ fn m8_report_proves_readiness_without_authorizing_esp_mutations() {
     assert!(query.contains("m8_live_readiness"));
     assert!(query.contains("binance_request_count = 4"));
     assert!(query.contains("readiness_stage_count = 3"));
+    assert!(query.contains("readiness_latest"));
+    assert!(query.contains("argMax(ready, observed_at_ms)"));
+    assert!(query.contains("mutation_by_engine"));
     assert!(query.contains("direct_rebalance_routes = 2"));
     assert!(query.contains("arbitrum_one_fail_closed"));
     assert!(query.contains("mutation_capability_records = 0"));

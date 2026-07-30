@@ -58,7 +58,9 @@ use arb_bot::{
         ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveRiskLimits, live_trade_channel,
     },
     m8_readiness::{
-        inspect_chain_readiness, validate_binance_readiness, validate_rebalance_readiness,
+        M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessProbe,
+        M8ChainReadinessStatus, inspect_chain_readiness, validate_binance_readiness,
+        validate_rebalance_readiness,
     },
     market_data::{
         MarketEvent,
@@ -1954,52 +1956,43 @@ async fn run(
     } else {
         Vec::new()
     };
-    if let Some(registry) = network_registry.as_ref() {
-        let runtime = registry.get_by_chain_id(42_161)?;
-        let snapshot = portfolio_wallet_snapshots
-            .iter()
-            .find(|snapshot| snapshot.chain_id == 42_161)
-            .context("M8 Arbitrum wallet snapshot is missing")?;
-        match inspect_chain_readiness(&m8_pair, runtime, snapshot).await {
-            Ok(readiness) => telemetry.emit(
-                "m8_live_readiness",
-                serde_json::json!({
-                    "engine_id": config.engine_id,
-                    "stage": "arbitrum_chain",
-                    "pair_id": m8_pair.id,
-                    "network_id": "eip155:42161",
-                    "chain_id": readiness.chain_id,
-                    "block_number": readiness.block_number,
-                    "exact_token_contracts": readiness.exact_token_contracts,
-                    "token_code_present": readiness.token_code_present,
-                    "router_code_present": readiness.router_code_present,
-                    "native_gas_funded": readiness.native_gas_funded,
-                    "fresh_rpc_gas_price": readiness.fresh_rpc_gas_price,
-                    "allowance_policy": readiness.allowance_policy,
-                    "receipt_l1_fee_mode": readiness.receipt_l1_fee_mode,
-                    "external_mutation_authorized": readiness.external_mutation_authorized,
-                    "ready": readiness.ready,
-                }),
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "M8 Arbitrum chain readiness is incomplete; mutations remain disabled"
-                );
-                telemetry.emit(
-                    "m8_live_readiness",
-                    serde_json::json!({
-                        "engine_id": config.engine_id,
-                        "stage": "arbitrum_chain",
-                        "pair_id": m8_pair.id,
-                        "network_id": "eip155:42161",
-                        "external_mutation_authorized": false,
-                        "ready": false,
-                    }),
-                );
+    let (m8_chain_readiness_probe, initial_m8_chain_readiness_status) =
+        if let Some(registry) = network_registry.as_ref() {
+            let runtime = registry.get_by_chain_id(42_161)?;
+            let snapshot = portfolio_wallet_snapshots
+                .iter()
+                .find(|snapshot| snapshot.chain_id == 42_161)
+                .context("M8 Arbitrum wallet snapshot is missing")?;
+            let probe = M8ChainReadinessProbe::new(&m8_pair, runtime, wallet_owner)?;
+            match inspect_chain_readiness(&m8_pair, runtime, snapshot).await {
+                Ok(readiness) => {
+                    emit_m8_chain_readiness(
+                        &telemetry,
+                        &config.engine_id,
+                        &m8_pair,
+                        &readiness,
+                        "startup",
+                    );
+                    (Some(probe), Some(readiness.status()))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "M8 Arbitrum chain readiness is incomplete; mutations remain disabled"
+                    );
+                    emit_m8_chain_readiness_failure(
+                        &telemetry,
+                        &config.engine_id,
+                        &m8_pair,
+                        "startup",
+                        &error,
+                    );
+                    (Some(probe), Some(M8ChainReadinessStatus::ProbeFailed))
+                }
             }
-        }
-    }
+        } else {
+            (None, None)
+        };
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -2502,6 +2495,15 @@ async fn run(
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     let portfolio_allocator_task = tokio::spawn(portfolio_allocator.run());
     let shadow_hot_telemetry_task = tokio::spawn(shadow_hot_telemetry_writer.run());
+    let m8_chain_readiness_task = m8_chain_readiness_probe.map(|probe| {
+        tokio::spawn(run_m8_chain_readiness_refresh(
+            probe,
+            telemetry.clone(),
+            config.engine_id.clone(),
+            m8_pair.clone(),
+            initial_m8_chain_readiness_status,
+        ))
+    });
     let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
         tokio::sync::mpsc::channel(4);
     let binance_clock_sync_task = tokio::spawn(run_binance_clock_sync(
@@ -3089,6 +3091,10 @@ async fn run(
     let _ = dex_task.await;
     shadow_dex_task.abort();
     let _ = shadow_dex_task.await;
+    if let Some(task) = m8_chain_readiness_task {
+        task.abort();
+        let _ = task.await;
+    }
     adaptive_sizing_tasks.abort_all();
     while adaptive_sizing_tasks.join_next().await.is_some() {}
     shadow_sizing_tasks.abort_all();
@@ -3131,6 +3137,125 @@ async fn run_binance_clock_sync(
             .map_err(|error| format!("{error:#}"));
         if sender.send(observation).await.is_err() {
             return;
+        }
+    }
+}
+
+fn emit_m8_chain_readiness(
+    telemetry: &TelemetryHandle,
+    engine_id: &str,
+    pair: &arb_bot::domain::config::PairConfig,
+    readiness: &M8ChainReadiness,
+    readiness_source: &'static str,
+) {
+    telemetry.emit(
+        "m8_live_readiness",
+        serde_json::json!({
+            "engine_id": engine_id,
+            "stage": "arbitrum_chain",
+            "pair_id": pair.id,
+            "network_id": "eip155:42161",
+            "chain_id": readiness.chain_id,
+            "block_number": readiness.block_number,
+            "exact_token_contracts": readiness.exact_token_contracts,
+            "token_code_present": readiness.token_code_present,
+            "router_code_present": readiness.router_code_present,
+            "native_gas_funded": readiness.native_gas_funded,
+            "fresh_rpc_gas_price": readiness.fresh_rpc_gas_price,
+            "allowance_policy": readiness.allowance_policy,
+            "receipt_l1_fee_mode": readiness.receipt_l1_fee_mode,
+            "readiness_source": readiness_source,
+            "external_mutation_authorized": readiness.external_mutation_authorized,
+            "ready": readiness.ready,
+        }),
+    );
+}
+
+fn emit_m8_chain_readiness_failure(
+    telemetry: &TelemetryHandle,
+    engine_id: &str,
+    pair: &arb_bot::domain::config::PairConfig,
+    readiness_source: &'static str,
+    error: &anyhow::Error,
+) {
+    telemetry.emit(
+        "m8_live_readiness",
+        serde_json::json!({
+            "engine_id": engine_id,
+            "stage": "arbitrum_chain",
+            "pair_id": pair.id,
+            "network_id": "eip155:42161",
+            "readiness_source": readiness_source,
+            "probe_error": format!("{error:#}"),
+            "external_mutation_authorized": false,
+            "ready": false,
+        }),
+    );
+}
+
+async fn run_m8_chain_readiness_refresh(
+    probe: M8ChainReadinessProbe,
+    telemetry: TelemetryHandle,
+    engine_id: String,
+    pair: arb_bot::domain::config::PairConfig,
+    mut last_status: Option<M8ChainReadinessStatus>,
+) {
+    let start = tokio::time::Instant::now() + M8_CHAIN_READINESS_REFRESH_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, M8_CHAIN_READINESS_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        match probe.inspect().await {
+            Ok(readiness) => {
+                let status = readiness.status();
+                if last_status == Some(status) {
+                    continue;
+                }
+                emit_m8_chain_readiness(
+                    &telemetry,
+                    &engine_id,
+                    &pair,
+                    &readiness,
+                    "background_transition",
+                );
+                if readiness.ready {
+                    tracing::info!(
+                        pair_id = pair.id,
+                        block_number = readiness.block_number,
+                        external_mutation_authorized = false,
+                        "M8 Arbitrum chain readiness became ready; mutations remain disabled"
+                    );
+                } else {
+                    tracing::warn!(
+                        pair_id = pair.id,
+                        block_number = readiness.block_number,
+                        native_gas_funded = readiness.native_gas_funded,
+                        fresh_rpc_gas_price = readiness.fresh_rpc_gas_price,
+                        external_mutation_authorized = false,
+                        "M8 Arbitrum chain readiness degraded; mutations remain disabled"
+                    );
+                }
+                last_status = Some(status);
+            }
+            Err(error) => {
+                if last_status == Some(M8ChainReadinessStatus::ProbeFailed) {
+                    continue;
+                }
+                tracing::warn!(
+                    pair_id = pair.id,
+                    error = %error,
+                    external_mutation_authorized = false,
+                    "M8 Arbitrum chain-readiness probe failed; mutations remain disabled"
+                );
+                emit_m8_chain_readiness_failure(
+                    &telemetry,
+                    &engine_id,
+                    &pair,
+                    "background_transition",
+                    &error,
+                );
+                last_status = Some(M8ChainReadinessStatus::ProbeFailed);
+            }
         }
     }
 }

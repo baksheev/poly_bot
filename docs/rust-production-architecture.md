@@ -347,6 +347,14 @@ allowance policy, per-trade/cumulative/loss/time limits, and an
 execution remain disabled. Selecting a later live ESP artifact is an explicit
 M9 production decision, not an implication of M8 readiness.
 
+The non-mutating Arbitrum chain-readiness probe runs in its own bounded
+background read class every 60 seconds and publishes telemetry only when its
+complete state changes. It may observe repaired or degraded native gas
+funding, bytecode identity, and RPC gas-price availability, but it cannot
+publish execution authority or enter the WLD decision loop. Operational gates
+use the latest state of each readiness stage and separately reject any
+mutation-capability record observed anywhere in the cohort.
+
 ## Binance hedge and recovery decisions
 
 1. The primary Binance leg is derived from the actual DEX token-B delta, not

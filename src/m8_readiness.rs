@@ -1,11 +1,11 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 
 use crate::{
-    balances::WalletBalanceSnapshot,
+    balances::{WalletBalanceSnapshot, fetch_wallet_snapshot_coordinated},
     binance::{
         account::BinanceSymbolState,
         capital::{CoinInformation, select_capital_routes},
@@ -15,15 +15,18 @@ use crate::{
             plan_market_order,
         },
     },
+    chain::rpc::{CanonicalBlock, JsonRpcClient},
     domain::config::{LiveCanaryApprovalGate, PairConfig},
-    network_runtime::NetworkRuntime,
+    network_runtime::{NetworkReadCoordinator, NetworkRuntime},
     rebalance::route_candidates_from_capital,
+    wallet::TokenBalanceRequest,
 };
 
 pub const ARBITRUM_CHAIN_ID: u64 = 42_161;
 pub const ARBITRUM_SWAP_ROUTER_02: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
 pub const ARBITRUM_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 pub const ARBITRUM_ESP: &str = "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1";
+pub const M8_CHAIN_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct M8BinanceReadiness {
@@ -160,16 +163,102 @@ pub struct M8ChainReadiness {
     pub ready: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum M8ChainReadinessStatus {
+    Observed {
+        exact_token_contracts: bool,
+        token_code_present: bool,
+        router_code_present: bool,
+        native_gas_funded: bool,
+        fresh_rpc_gas_price: bool,
+        ready: bool,
+    },
+    ProbeFailed,
+}
+
+impl M8ChainReadiness {
+    pub const fn status(&self) -> M8ChainReadinessStatus {
+        M8ChainReadinessStatus::Observed {
+            exact_token_contracts: self.exact_token_contracts,
+            token_code_present: self.token_code_present,
+            router_code_present: self.router_code_present,
+            native_gas_funded: self.native_gas_funded,
+            fresh_rpc_gas_price: self.fresh_rpc_gas_price,
+            ready: self.ready,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct M8ChainReadinessProbe {
+    pair: PairConfig,
+    reads: NetworkReadCoordinator,
+    owner: Address,
+}
+
+impl M8ChainReadinessProbe {
+    pub fn new(
+        pair: &PairConfig,
+        runtime: &NetworkRuntime,
+        owner: Address,
+    ) -> anyhow::Result<Self> {
+        validate_readiness_pair(pair)?;
+        ensure!(
+            runtime.plan().chain_id == ARBITRUM_CHAIN_ID,
+            "M8 chain-readiness probe requires the Arbitrum runtime"
+        );
+        Ok(Self {
+            pair: pair.clone(),
+            reads: runtime.reads().clone(),
+            owner,
+        })
+    }
+
+    pub async fn inspect(&self) -> anyhow::Result<M8ChainReadiness> {
+        let block = self.reads.rpc().latest_block().await?;
+        let tokens = [
+            (&self.pair.token_a.symbol, &self.pair.token_a.contract),
+            (&self.pair.token_b.symbol, &self.pair.token_b.contract),
+        ]
+        .into_iter()
+        .map(|(symbol, contract)| {
+            Ok(TokenBalanceRequest {
+                symbol: symbol.clone(),
+                contract: contract
+                    .parse()
+                    .with_context(|| format!("M8 token {symbol} has an invalid contract"))?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+        let snapshot = fetch_wallet_snapshot_coordinated(
+            &self.reads,
+            self.owner,
+            ARBITRUM_CHAIN_ID,
+            &tokens,
+            block,
+        )
+        .await?;
+        inspect_chain_readiness_at(&self.pair, self.reads.rpc(), block, &snapshot).await
+    }
+}
+
 pub async fn inspect_chain_readiness(
     pair: &PairConfig,
     runtime: &NetworkRuntime,
     snapshot: &WalletBalanceSnapshot,
 ) -> anyhow::Result<M8ChainReadiness> {
+    inspect_chain_readiness_at(pair, runtime.rpc(), runtime.initial_head(), snapshot).await
+}
+
+async fn inspect_chain_readiness_at(
+    pair: &PairConfig,
+    rpc: &JsonRpcClient,
+    block: CanonicalBlock,
+    snapshot: &WalletBalanceSnapshot,
+) -> anyhow::Result<M8ChainReadiness> {
     let canary = validate_readiness_pair(pair)?;
     ensure!(
-        runtime.plan().chain_id == ARBITRUM_CHAIN_ID
-            && snapshot.chain_id == ARBITRUM_CHAIN_ID
-            && snapshot.batch_complete,
+        snapshot.chain_id == ARBITRUM_CHAIN_ID && snapshot.batch_complete,
         "M8 chain readiness requires one complete Arbitrum wallet batch"
     );
     let token_a = Address::from_str(&pair.token_a.contract)?;
@@ -185,17 +274,16 @@ pub async fn inspect_chain_readiness(
     }) && snapshot.token_balances.iter().any(|balance| {
         balance.symbol.as_ref() == pair.token_b.symbol && balance.contract == token_b
     });
-    let block = runtime.initial_head();
     ensure!(
         block.number == snapshot.block_number && block.hash == snapshot.block_hash,
         "M8 wallet and contract-code reads are not pinned to the same block"
     );
     let (token_a_code, token_b_code, router_code, native_balance, gas_price) = tokio::try_join!(
-        runtime.rpc().contract_code_at(token_a, block),
-        runtime.rpc().contract_code_at(token_b, block),
-        runtime.rpc().contract_code_at(router, block),
-        runtime.rpc().native_balance_at(snapshot.owner, block),
-        runtime.rpc().gas_price(),
+        rpc.contract_code_at(token_a, block),
+        rpc.contract_code_at(token_b, block),
+        rpc.contract_code_at(router, block),
+        rpc.native_balance_at(snapshot.owner, block),
+        rpc.gas_price(),
     )?;
     let minimum_native =
         U256::from_str_radix(&canary.minimum_native_gas_wei, 10).context("invalid gas minimum")?;
@@ -392,6 +480,8 @@ pub const fn injected_failure_disposition(failure: M8InjectedFailure) -> M8Failu
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rust_decimal::Decimal;
 
     use crate::{
@@ -405,7 +495,10 @@ mod tests {
         domain::config::LoadedDomainConfig,
     };
 
-    use super::{M8InjectedFailure, injected_failure_disposition, validate_binance_readiness};
+    use super::{
+        M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessStatus,
+        M8InjectedFailure, injected_failure_disposition, validate_binance_readiness,
+    };
 
     fn rates() -> CommissionSideRates {
         CommissionSideRates {
@@ -508,5 +601,38 @@ mod tests {
         assert!(
             !injected_failure_disposition(M8InjectedFailure::BinanceRejection).retry_authorized
         );
+    }
+
+    #[test]
+    fn chain_readiness_transition_ignores_block_height_and_detects_funding() {
+        let readiness = M8ChainReadiness {
+            chain_id: super::ARBITRUM_CHAIN_ID,
+            block_number: 1,
+            exact_token_contracts: true,
+            token_code_present: true,
+            router_code_present: true,
+            native_gas_funded: false,
+            fresh_rpc_gas_price: true,
+            allowance_policy: "bounded_exact_canary_cap_then_locked",
+            receipt_l1_fee_mode: "included_in_effective_gas_price_no_world_l1fee_addition",
+            external_mutation_authorized: false,
+            ready: false,
+        };
+        let mut later = readiness.clone();
+        later.block_number = 2;
+        assert_eq!(readiness.status(), later.status());
+
+        later.native_gas_funded = true;
+        later.ready = true;
+        assert_ne!(readiness.status(), later.status());
+        assert!(matches!(
+            later.status(),
+            M8ChainReadinessStatus::Observed {
+                native_gas_funded: true,
+                ready: true,
+                ..
+            }
+        ));
+        assert!(M8_CHAIN_READINESS_REFRESH_INTERVAL >= Duration::from_secs(30));
     }
 }

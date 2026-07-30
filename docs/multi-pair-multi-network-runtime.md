@@ -1824,6 +1824,24 @@ fixtures also cover bounded allowances, transaction fees, restart journal
 reconciliation, known DEX revert, unknown broadcast, Binance rejection,
 partial IOC, unknown placement, and the three-attempt MARKET recovery bound.
 
+The first M8 production rollout, revision
+`748ac746d07a00bfc4f8fb69acde1d682f388ed1`, correctly failed its chain
+readiness stage because the Arbitrum wallet held zero native ETH. The operator
+funded the reviewed wallet, and a read-only Arbitrum RPC check at
+`2026-07-30T02:47Z` observed `49,980,000,000,000,000 wei` (`0.04998 ETH`)
+against the artifact's `1,000,000,000,000,000 wei` minimum.
+
+M8 chain readiness is therefore refreshed outside the decision owner every
+60 seconds using the isolated wallet-read class and one block-hash-pinned
+wallet snapshot. Token and router code, native balance, and current RPC gas
+price remain read-only inputs. Telemetry is emitted only when the complete
+readiness state changes; every record keeps external mutation authorization
+false. The production report selects the latest record for each readiness
+stage with `argMax`, so a later degradation fails closed, while any mutation
+capability record anywhere in the reporting window independently fails the
+gate. This lets an operator repair native gas funding without restarting the
+live WLD owner and without making an old successful readiness sample sticky.
+
 ### M9 — Bounded ESP/USDC live canary
 
 Deliver:
