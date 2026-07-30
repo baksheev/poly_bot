@@ -1950,12 +1950,16 @@ balance `401.2 ESP`, and live direct ESP withdrawal capabilities on Arbitrum
 and Ethereum. Binance's published UAE questionnaire defines
 `isAddressOwner=1` as self-owned and `sendTo=1` as a private wallet, so the
 submitted two-field questionnaire was already the complete UAE self-wallet
-shape. Travel Rule v2 also indexes the deterministic request as a failed
-record; this is distinct from a capital withdrawal or a broadcast
-transaction. Recovery therefore requires exactly one matching
-`travelRuleStatus=2` record with no transaction hash, plus an empty capital
-withdrawal history. The follow-up probe also reads the exact wallet's address
-verification status before any direct-route retry is designed.
+shape. The first probe appeared to expose a failed Travel Rule record, but the
+authoritative post-verification v2 queries returned no matching row, including
+when filtered only by ESP and Arbitrum. Binance's synchronous HTTP `400` /
+`-4024` validation rejection therefore did not produce a stable indexed
+withdrawal. Recovery accepts that absence only when capital history is also
+empty, the versioned rejection identity and durable successful master transfer
+match exactly, and no amount/address/network candidate is pending or broadcast.
+If a matching row exists it must instead be exactly one
+`travelRuleStatus=2` record with no transaction hash. The follow-up probe reads
+the exact wallet's address verification status before any direct-route retry.
 
 Deliver:
 

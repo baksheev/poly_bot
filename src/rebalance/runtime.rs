@@ -665,7 +665,7 @@ impl RebalanceExecutor {
                 .await?
                 .into_iter()
                 .filter(|record| {
-                    matches_failed_travel_rule_record_without_client_id(
+                    matches_travel_rule_record_identity_without_client_id(
                         record,
                         requested,
                         wallet_owner,
@@ -674,19 +674,27 @@ impl RebalanceExecutor {
                 })
                 .collect();
         }
-        ensure!(
-            travel_rule_history.len() == 1 && travel_rule_history[0].is_failed_without_broadcast(),
-            "approved Travel Rule rejection is not indexed as one failed unbroadcast record"
-        );
-        tracing::info!(
-            operation_id = operation.intent.operation_id,
-            token = operation.intent.token_symbol,
-            travel_rule_record_id = travel_rule_history[0].tr_id,
-            travel_rule_status = travel_rule_history[0].travel_rule_status,
-            withdrawal_status = travel_rule_history[0].withdrawal_status,
-            transaction_broadcast = false,
-            "reconciled the indexed failed Travel Rule submission"
-        );
+        let indexed_rejection = reconcile_approved_travel_rule_rejection(&travel_rule_history)?;
+        if let Some(record) = indexed_rejection {
+            tracing::info!(
+                operation_id = operation.intent.operation_id,
+                token = operation.intent.token_symbol,
+                travel_rule_record_id = record.tr_id,
+                travel_rule_status = record.travel_rule_status,
+                withdrawal_status = record.withdrawal_status,
+                transaction_broadcast = false,
+                "reconciled the indexed failed Travel Rule submission"
+            );
+        } else {
+            tracing::info!(
+                operation_id = operation.intent.operation_id,
+                token = operation.intent.token_symbol,
+                rejected_http_status = 400,
+                rejected_error_code = -4024,
+                transaction_broadcast = false,
+                "reconciled the synchronous Travel Rule rejection absent from withdrawal history"
+            );
+        }
         let transfer = self
             .treasury_binance
             .universal_transfer_history(&self.subaccount_email, &operation.intent.withdraw_order_id)
@@ -2347,7 +2355,7 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
     Ok(result)
 }
 
-fn matches_failed_travel_rule_record_without_client_id(
+fn matches_travel_rule_record_identity_without_client_id(
     record: &TravelRuleWithdrawalRecord,
     requested: Decimal,
     wallet_owner: Address,
@@ -2366,7 +2374,27 @@ fn matches_failed_travel_rule_record_without_client_id(
             .address
             .eq_ignore_ascii_case(&format!("{wallet_owner:#x}"))
         && (record.withdraw_order_id.is_empty() || record.withdraw_order_id == withdraw_order_id)
-        && record.is_failed_without_broadcast()
+}
+
+fn reconcile_approved_travel_rule_rejection(
+    records: &[TravelRuleWithdrawalRecord],
+) -> anyhow::Result<Option<&TravelRuleWithdrawalRecord>> {
+    ensure!(
+        records.len() <= 1,
+        "approved Travel Rule rejection matches multiple withdrawal records"
+    );
+    let Some(record) = records.first() else {
+        // The reviewed HTTP 400/-4024 response was a synchronous validation
+        // rejection and therefore may have no Travel Rule history row. The
+        // caller separately proves that both withdrawal histories are empty
+        // and that the successful master transfer is still durable.
+        return Ok(None);
+    };
+    ensure!(
+        record.is_failed_without_broadcast(),
+        "approved Travel Rule rejection matches a non-failed or broadcast withdrawal"
+    );
+    Ok(Some(record))
 }
 
 #[cfg(test)]
@@ -2384,10 +2412,10 @@ mod tests {
     use super::{
         ARBITRUM_CHAIN_ID, BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID,
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, matches_failed_travel_rule_record_without_client_id,
-        plan_direct_prefunding, validate_across_fill_receipt, validate_approved_asset,
-        validate_direct_withdrawal_receipt, withdrawal_received_base_units,
-        withdrawal_requested_base_units,
+        decimal_to_base_units_floor, matches_travel_rule_record_identity_without_client_id,
+        plan_direct_prefunding, reconcile_approved_travel_rule_rejection,
+        validate_across_fill_receipt, validate_approved_asset, validate_direct_withdrawal_receipt,
+        withdrawal_received_base_units, withdrawal_requested_base_units,
     };
 
     fn arbitrum_network(fee: &str) -> NetworkInformation {
@@ -2441,7 +2469,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_travel_rule_record_without_client_id_matches_exact_debit_and_wallet() {
+    fn travel_rule_record_without_client_id_matches_exact_debit_and_wallet() {
         let wallet = Address::from_str("0x90d990c81320221d2882de32beea78923c1e77a3").unwrap();
         let record = TravelRuleWithdrawalRecord {
             id: String::new(),
@@ -2457,7 +2485,7 @@ mod tests {
             withdraw_order_id: String::new(),
             info: "[031031] User does not own this currency.".to_owned(),
         };
-        assert!(matches_failed_travel_rule_record_without_client_id(
+        assert!(matches_travel_rule_record_identity_without_client_id(
             &record,
             Decimal::from_str_exact("401.2").unwrap(),
             wallet,
@@ -2466,12 +2494,37 @@ mod tests {
 
         let mut wrong_wallet = record.clone();
         wrong_wallet.address = "0x1111111111111111111111111111111111111111".to_owned();
-        assert!(!matches_failed_travel_rule_record_without_client_id(
+        assert!(!matches_travel_rule_record_identity_without_client_id(
             &wrong_wallet,
             Decimal::from_str_exact("401.2").unwrap(),
             wallet,
             "rust-rebalance-client-id",
         ));
+    }
+
+    #[test]
+    fn synchronous_travel_rule_rejection_may_be_absent_from_history() {
+        assert!(
+            reconcile_approved_travel_rule_rejection(&[])
+                .unwrap()
+                .is_none()
+        );
+
+        let broadcast = TravelRuleWithdrawalRecord {
+            id: "withdrawal-id".to_owned(),
+            tr_id: 65_865_742,
+            amount: "400".to_owned(),
+            transaction_fee: "1.2".to_owned(),
+            coin: "ESP".to_owned(),
+            withdrawal_status: 6,
+            travel_rule_status: 0,
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            tx_id: "0xabc".to_owned(),
+            network: "ARBITRUM".to_owned(),
+            withdraw_order_id: String::new(),
+            info: String::new(),
+        };
+        assert!(reconcile_approved_travel_rule_rejection(&[broadcast]).is_err());
     }
 
     #[test]

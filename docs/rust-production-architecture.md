@@ -389,10 +389,15 @@ while WLD v12 remains live.
 After the exact Binance ownership record becomes `VERIFIED`, the operator's
 separate direct-withdrawal approval permits one new retry through the same
 Travel Rule endpoint. Recovery first closes the earlier unbroadcast rejection
-by matching exactly one failed history record on ESP debit amount plus fee,
-Arbitrum wallet, network, and empty transaction hash; a missing client ID in
-Binance's record is not treated as absence. This does not authorize the
-standard withdrawal API, a bridge, a swap, or any retry before verification.
+against both Binance withdrawal histories. If Binance indexed the rejected
+request without its client ID, recovery requires exactly one failed record
+matching the ESP debit amount plus fee, Arbitrum wallet, network, and empty
+transaction hash. If the synchronous HTTP `400` / `-4024` validation rejection
+was not indexed at all, recovery instead requires no matching Travel Rule
+record, no capital withdrawal, the exact versioned rejection identity, and the
+durable successful subaccount-to-master transfer. An ambiguous, pending, or
+broadcast record fails closed. This does not authorize the standard withdrawal
+API, a bridge, a swap, or any retry before verification.
 
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its
