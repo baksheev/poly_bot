@@ -41,6 +41,7 @@ const RAILS_APPROVAL_DEFAULT_GAS_LIMIT: u64 = 800_000;
 // the largest observed Rails V3/V4 receipt from 2026-05-25..2026-07-25.
 const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
 const RAILS_PERMIT2_APPROVAL_GAS_LIMIT: u64 = 120_000;
+const CAPITAL_TRANSFER_GAS_LIMIT: u64 = 200_000;
 const GAS_PRICE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const GAS_PRICE_CACHE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_SWAP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1373,6 +1374,92 @@ struct WorkItem {
     response: oneshot::Sender<Result<SwapExecutionOutcome, DexExecutionServiceError>>,
 }
 
+struct CapitalWorkItem {
+    request: EvmExecutionRequest,
+    enqueued_at: Instant,
+    response: oneshot::Sender<Result<TransactionReceipt, DexExecutionServiceError>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmExecutionRequest {
+    pub operation_id: String,
+    pub purpose: String,
+    pub call: WalletCall,
+    pub confirmation_timeout: Duration,
+}
+
+impl EvmExecutionRequest {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.operation_id.is_empty()
+                && self.operation_id.len() <= 120
+                && self.operation_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+                }),
+            "EVM execution operation id is invalid"
+        );
+        ensure!(
+            !self.purpose.is_empty()
+                && self.purpose.len() <= 64
+                && self
+                    .purpose
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "EVM execution purpose is invalid"
+        );
+        ensure!(
+            (Duration::from_secs(5)..=Duration::from_secs(300))
+                .contains(&self.confirmation_timeout),
+            "EVM execution confirmation timeout is outside 5..=300 seconds"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct EvmExecutionOwnerHandle {
+    sender: mpsc::Sender<CapitalWorkItem>,
+    wallet_address: Address,
+    chain_id: u64,
+}
+
+impl EvmExecutionOwnerHandle {
+    pub fn wallet_address(&self) -> Address {
+        self.wallet_address
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub async fn execute(
+        &self,
+        request: EvmExecutionRequest,
+    ) -> Result<TransactionReceipt, DexExecutionServiceError> {
+        if let Err(error) = request.validate() {
+            return Err(DexExecutionServiceError::FailedBeforeSubmission {
+                reason: format!("{error:#}"),
+            });
+        }
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(CapitalWorkItem {
+                request,
+                enqueued_at: Instant::now(),
+                response,
+            })
+            .await
+            .map_err(|_| DexExecutionServiceError::OutcomeUnknown {
+                reason: "EVM execution owner stopped".to_owned(),
+            })?;
+        receiver
+            .await
+            .map_err(|_| DexExecutionServiceError::OutcomeUnknown {
+                reason: "EVM execution owner dropped its response".to_owned(),
+            })?
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DexExecutionServiceError {
     FailedBeforeSubmission {
@@ -1416,6 +1503,8 @@ impl std::error::Error for DexExecutionServiceError {}
 /// The thread owns the signer, nonce lane, RPC client and durable journal.
 pub struct DexExecutionService {
     sender: Option<mpsc::Sender<WorkItem>>,
+    capital_sender: Option<mpsc::Sender<CapitalWorkItem>>,
+    shutdown_sender: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     wallet_address: Address,
     chain_id: u64,
@@ -1427,6 +1516,8 @@ impl DexExecutionService {
         let wallet_address = executor.wallet_address();
         let chain_id = executor.chain_id();
         let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity);
+        let (capital_sender, mut capital_receiver) = mpsc::channel::<CapitalWorkItem>(1);
+        let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let thread = std::thread::Builder::new()
             .name("dex-executor".into())
             .spawn(move || {
@@ -1453,9 +1544,12 @@ impl DexExecutionService {
                     gas_price_refresh
                         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     gas_price_refresh.reset();
-                    loop {
+                    let mut trade_open = true;
+                    let mut capital_open = true;
+                    while trade_open || capital_open {
                         tokio::select! {
                             biased;
+                            _ = &mut shutdown_receiver => break,
                             _ = gas_price_refresh.tick() => {
                                 if executor.refresh_gas_price().await.is_err() {
                                     tracing::warn!(
@@ -1464,9 +1558,10 @@ impl DexExecutionService {
                                     );
                                 }
                             }
-                            work = receiver.recv() => {
+                            work = receiver.recv(), if trade_open => {
                                 let Some(work) = work else {
-                                    break;
+                                    trade_open = false;
+                                    continue;
                                 };
                                 let operation_id = work.request.operation_id.clone();
                                 let journal_operation_id = format!("{operation_id}.swap");
@@ -1539,6 +1634,53 @@ impl DexExecutionService {
                                     );
                                 }
                             }
+                            work = capital_receiver.recv(), if capital_open => {
+                                let Some(work) = work else {
+                                    capital_open = false;
+                                    continue;
+                                };
+                                let operation_id = work.request.operation_id.clone();
+                                executor.emit_latency_stage(
+                                    &operation_id,
+                                    "capital_worker_queue",
+                                    work.enqueued_at,
+                                    "success",
+                                );
+                                let result = executor
+                                    .execute_call(
+                                        work.request.operation_id.clone(),
+                                        &work.request.purpose,
+                                        &work.request.call,
+                                        ExecuteCallPolicy {
+                                            gas: GasLimitPolicy::fixed(CAPITAL_TRANSFER_GAS_LIMIT),
+                                            quoted_gas: None,
+                                            confirmation_timeout: work.request.confirmation_timeout,
+                                            submission_policy:
+                                                SwapSubmissionPolicy::SimulateAndEstimate,
+                                        },
+                                        Some(work.enqueued_at),
+                                    )
+                                    .await
+                                    .and_then(|receipt| {
+                                        ensure!(
+                                            receipt.status == 1,
+                                            "EVM capital transaction reverted"
+                                        );
+                                        Ok(receipt)
+                                    })
+                                    .map_err(|error| {
+                                        executor.classify_execution_error(
+                                            &operation_id,
+                                            format!("{error:#}"),
+                                        )
+                                    });
+                                if work.response.send(result).is_err() {
+                                    tracing::warn!(
+                                        operation_id,
+                                        "EVM capital execution caller dropped its response"
+                                    );
+                                }
+                            }
                         }
                     }
                 });
@@ -1546,6 +1688,8 @@ impl DexExecutionService {
             .context("failed to spawn DEX executor thread")?;
         Ok(Self {
             sender: Some(sender),
+            capital_sender: Some(capital_sender),
+            shutdown_sender: Some(shutdown_sender),
             thread: Some(thread),
             wallet_address,
             chain_id,
@@ -1558,6 +1702,18 @@ impl DexExecutionService {
 
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    pub fn evm_execution_owner(&self) -> EvmExecutionOwnerHandle {
+        EvmExecutionOwnerHandle {
+            sender: self
+                .capital_sender
+                .as_ref()
+                .expect("live DEX service still owns its capital sender")
+                .clone(),
+            wallet_address: self.wallet_address,
+            chain_id: self.chain_id,
+        }
     }
 
     pub async fn execute(
@@ -1598,6 +1754,10 @@ fn duration_us(duration: Duration) -> u64 {
 impl Drop for DexExecutionService {
     fn drop(&mut self) {
         self.sender.take();
+        self.capital_sender.take();
+        if let Some(shutdown) = self.shutdown_sender.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(thread) = self.thread.take()
             && let Err(payload) = thread.join()
         {
@@ -1681,17 +1841,17 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DexExecutionService, DexExecutionServiceError, DexExecutor, ExactInputSwapRequest,
-        GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, UniswapProtocol,
-        allowance_grant_for_policy, is_definitive_prebroadcast_rejection, settlement_log_for_route,
-        transaction_fees_for_policy, wallet_transfer_totals,
+        DexExecutionService, DexExecutionServiceError, DexExecutor, EvmExecutionRequest,
+        ExactInputSwapRequest, GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy,
+        UniswapProtocol, allowance_grant_for_policy, is_definitive_prebroadcast_rejection,
+        settlement_log_for_route, transaction_fees_for_policy, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
         chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
         dex::events::v3_swap_topic,
         domain::compiled::CompiledNetworkGasPolicy,
-        wallet::{EvmWallet, JournalStatus, TransactionJournal, UnknownOutcomeReason},
+        wallet::{EvmWallet, JournalStatus, TransactionJournal, UnknownOutcomeReason, WalletCall},
     };
 
     const PRIVATE_KEY: &str = "0x59c6995e998f97a5a0044976f7d04f8b2b7f4e5b5d5f3e49f2f4e7838a2b0c19";
@@ -2063,6 +2223,69 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn capital_handle_uses_the_same_nonce_journal_and_cannot_keep_service_alive() {
+        let (endpoint, server, _) = spawn_mock_rpc(MockOutcome::CapitalSuccess);
+        let path = journal_path("capital-success");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let wallet_address = wallet.address();
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        executor.allowance_mutations_enabled = false;
+        let service = DexExecutionService::spawn(executor, 1).unwrap();
+        let owner = service.evm_execution_owner();
+        let receipt = owner
+            .execute(EvmExecutionRequest {
+                operation_id: "rebalance-1:deposit".to_owned(),
+                purpose: "rebalance_wallet_to_binance".to_owned(),
+                call: WalletCall::erc20_transfer(
+                    Address::repeat_byte(0x11),
+                    Address::repeat_byte(0x22),
+                    U256::from(10_u64),
+                )
+                .unwrap(),
+                confirmation_timeout: Duration::from_secs(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, 1);
+        assert_eq!(owner.chain_id(), 480);
+        assert_eq!(owner.wallet_address(), wallet_address);
+
+        drop(service);
+        assert!(
+            owner
+                .execute(EvmExecutionRequest {
+                    operation_id: "rebalance-2:deposit".to_owned(),
+                    purpose: "rebalance_wallet_to_binance".to_owned(),
+                    call: WalletCall::erc20_transfer(
+                        Address::repeat_byte(0x11),
+                        Address::repeat_byte(0x22),
+                        U256::from(10_u64),
+                    )
+                    .unwrap(),
+                    confirmation_timeout: Duration::from_secs(5),
+                })
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+
+        let journal = TransactionJournal::open(&path).unwrap();
+        assert!(matches!(
+            journal.operation("rebalance-1:deposit").unwrap().status,
+            JournalStatus::MinedSuccess { .. }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
     fn v3_request(operation_id: &str) -> ExactInputSwapRequest {
         let mut request = ExactInputSwapRequest::with_rails_defaults(
             operation_id,
@@ -2112,6 +2335,7 @@ mod tests {
         RevertHighGas,
         RevertGasPriceUnavailable,
         BroadcastRejected,
+        CapitalSuccess,
     }
 
     fn spawn_mock_rpc(outcome: MockOutcome) -> (String, JoinHandle<()>, Arc<AtomicU64>) {
@@ -2123,6 +2347,7 @@ mod tests {
             | MockOutcome::RevertGasPriceUnavailable => 6,
             MockOutcome::TwoReverts => 8,
             MockOutcome::BroadcastRejected => 5,
+            MockOutcome::CapitalSuccess => 9,
         };
         let gas_price_requests = Arc::new(AtomicU64::new(0));
         let server_gas_price_requests = Arc::clone(&gas_price_requests);
@@ -2136,8 +2361,12 @@ mod tests {
                 let response = match method {
                     "eth_chainId" => rpc_result(id, json!("0x1e0")),
                     "eth_getTransactionCount" => rpc_result(id, json!("0x7")),
-                    "eth_call" => {
-                        panic!("immediate swap unexpectedly called eth_call")
+                    "eth_call" if matches!(outcome, MockOutcome::CapitalSuccess) => {
+                        rpc_result(id, json!("0x"))
+                    }
+                    "eth_call" => panic!("immediate swap unexpectedly called eth_call"),
+                    "eth_estimateGas" if matches!(outcome, MockOutcome::CapitalSuccess) => {
+                        rpc_result(id, json!("0x15f90"))
                     }
                     "eth_estimateGas" => {
                         panic!("immediate swap unexpectedly called eth_estimateGas")
@@ -2157,14 +2386,16 @@ mod tests {
                             _ => rpc_result(id, json!("0xf4240")),
                         }
                     }
-                    "eth_getBalance" => {
-                        panic!("immediate swap unexpectedly called eth_getBalance")
+                    "eth_getBalance" if matches!(outcome, MockOutcome::CapitalSuccess) => {
+                        rpc_result(id, json!("0x1000000000000000000"))
                     }
+                    "eth_getBalance" => panic!("immediate swap unexpectedly called eth_getBalance"),
                     "eth_sendRawTransaction" => match outcome {
                         MockOutcome::Revert
                         | MockOutcome::TwoReverts
                         | MockOutcome::RevertHighGas
-                        | MockOutcome::RevertGasPriceUnavailable => {
+                        | MockOutcome::RevertGasPriceUnavailable
+                        | MockOutcome::CapitalSuccess => {
                             let raw = request["params"][0].as_str().unwrap();
                             let raw = hex::decode(raw.trim_start_matches("0x")).unwrap();
                             let hash = keccak256(raw);
@@ -2187,7 +2418,11 @@ mod tests {
                             json!({
                                 "transactionHash": format!("{hash:#x}"),
                                 "blockNumber": "0x7b",
-                                "status": "0x0",
+                                "status": if matches!(outcome, MockOutcome::CapitalSuccess) {
+                                    "0x1"
+                                } else {
+                                    "0x0"
+                                },
                                 "gasUsed": "0x15f90",
                                 "effectiveGasPrice": "0xf4240",
                                 "l1Fee": "0x3e8"

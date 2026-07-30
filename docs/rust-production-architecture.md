@@ -406,10 +406,10 @@ direction. After a wallet-to-Binance transfer, the deposit-history response
 decides whether `deposit/provide-info` is required through
 `requireQuestionnaire` and `travelRuleReqStatus`; the runtime does not infer
 that decision from a hard-coded amount threshold. The later Rails commit
-`6520658` incorrectly replaced the withdrawal endpoint globally. Rust now
-rejects `travel_rule` as a withdrawal mode in configuration and code, while
-retaining local-entity withdrawal history only as evidence for the already
-journaled legacy incident.
+`6520658` incorrectly replaced the withdrawal endpoint globally. Rust exposes
+no withdrawal-mode configuration and pins the standard endpoint in code,
+while retaining local-entity withdrawal history only as evidence for the
+already journaled legacy incident.
 
 The rejected legacy request is `trId=67181540`, `travelRuleStatus=4`, with no
 `withdrawalStatus` and no transaction hash. Recovery refetches the exact row,
@@ -657,6 +657,16 @@ Every trading-path change must answer:
 - Does `scripts/quality.sh` pass?
 - If production behavior changes, is delivery through the reviewed GKE workflow
   on `main` and is the equal-window observation plan explicit?
+
+Every milestone that adds or changes an external mutation must also have a
+completed versioned artifact under `docs/reviews/`. Before the final quality
+run, `scripts/predeploy-review` checks that artifact and reruns the endpoint,
+allocator, durable-recovery, route, and all-target compilation contracts. The
+artifact must include the complete external-side-effect matrix, every
+unknown-outcome/restart boundary, the source-versus-compiled semantic diff, the
+production observation plan, and a review of the entire diff from
+`origin/main`. A passing CI/deploy cycle is not a substitute for this local
+review and is never used to discover contract errors that the matrix can catch.
 
 ## Supporting documents
 

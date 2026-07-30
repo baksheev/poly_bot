@@ -54,10 +54,10 @@ use arb_bot::{
     },
     domain::{
         compiled::{
-            CompatibilityRole, CompiledBinanceRuntimePlan, CompiledGraphSummary,
-            CompiledHotPathRuntimePlan, CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan,
-            CompiledPortfolioRuntimePlan, compile_manifest_to_path, load_compatibility_domain,
-            load_source_domain_for_pair,
+            CompatibilityRole, CompiledBinanceRuntimePlan, CompiledCapitalAllocatorMode,
+            CompiledCapitalCanaryPolicy, CompiledGraphSummary, CompiledHotPathRuntimePlan,
+            CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan, CompiledPortfolioRuntimePlan,
+            compile_manifest_to_path, load_compatibility_domain, load_source_domain_for_pair,
         },
         config::{DexProvider, LiveCanaryConfig, LoadedDomainConfig},
     },
@@ -83,14 +83,14 @@ use arb_bot::{
     opportunity::{
         ArbitrageDirection, OpportunityEngine, PreparedPoolBuildBatch, PreparedPoolBuildRequest,
     },
-    portfolio::PortfolioCatalog,
+    portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_m10_rebalance_authority},
     rebalance::{
-        BinanceAddressVerificationTransferArtifact, RebalanceExecutionOperation,
-        RebalanceExecutionProgress, RebalanceExecutionRequest, RebalanceExecutor,
-        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
-        execute_binance_address_verification_transfer, plan_direct_prefunding,
-        rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
-        route_candidates_from_capital,
+        BinanceAddressVerificationTransferArtifact, RebalanceCanaryRisk,
+        RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionProgress,
+        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
+        V12RebalanceParityAdapter, execute_binance_address_verification_transfer,
+        plan_direct_prefunding, rebalance_base_units_to_decimal,
+        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -188,9 +188,101 @@ fn m9_allowance_operation_id(symbol: &str, required: U256) -> String {
     format!("rustarb-m9-setup-v3-{symbol}.v2-{required}")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebalanceExecutionTarget {
+    Primary,
+    ArbitrumCanary,
+}
+
 enum RebalanceExecutorEvent {
-    Recovery(Result<RebalanceExecutionOperation, String>),
-    Execution(Result<RebalanceExecutionOperation, String>),
+    Recovery {
+        target: RebalanceExecutionTarget,
+        result: Result<RebalanceExecutionOperation, String>,
+    },
+    Execution {
+        target: RebalanceExecutionTarget,
+        result: Result<RebalanceExecutionOperation, String>,
+    },
+}
+
+fn rebalance_target(operation: &RebalanceExecutionOperation) -> RebalanceExecutionTarget {
+    if operation
+        .intent
+        .scope
+        .as_ref()
+        .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10")
+    {
+        RebalanceExecutionTarget::ArbitrumCanary
+    } else {
+        RebalanceExecutionTarget::Primary
+    }
+}
+
+fn emit_m10_rebalance_risk(
+    telemetry: &TelemetryHandle,
+    engine_id: &str,
+    executor: &RebalanceExecutor,
+) {
+    match executor.m10_canary_risk() {
+        Ok(risk) => telemetry.emit(
+            "m10_rebalance_risk_snapshot",
+            serde_json::json!({
+                "engine_id": engine_id,
+                "transfer_count": risk.transfer_count,
+                "active_transfer_count": risk.active_transfer_count,
+                "failed_transfer_count": risk.failed_transfer_count,
+                "token_a_debit": risk.token_a_debit.to_string(),
+                "token_b_debit": risk.token_b_debit.to_string(),
+                "token_a_maximum_fee": risk.token_a_maximum_fee.to_string(),
+                "token_b_maximum_fee": risk.token_b_maximum_fee.to_string(),
+                "first_started_at_unix_ms": risk.first_started_at_unix_ms,
+                "outcome": "success",
+            }),
+        ),
+        Err(error) => telemetry.emit(
+            "m10_rebalance_risk_snapshot",
+            serde_json::json!({
+                "engine_id": engine_id,
+                "outcome": "failed",
+                "error": format!("{error:#}"),
+            }),
+        ),
+    }
+}
+
+fn emit_m10_rebalance_saga(
+    telemetry: &TelemetryHandle,
+    engine_id: &str,
+    target: RebalanceExecutionTarget,
+    result: &Result<RebalanceExecutionOperation, String>,
+    executor: &RebalanceExecutor,
+    started_at: Instant,
+    recovered: bool,
+) {
+    if target != RebalanceExecutionTarget::ArbitrumCanary {
+        return;
+    }
+    let operation = result
+        .as_ref()
+        .ok()
+        .or_else(|| executor.active_operation().ok().flatten())
+        .or_else(|| executor.latest_m10_operation());
+    let saga_duration_us = started_at.elapsed().as_micros();
+    telemetry.emit(
+        "m10_rebalance_saga",
+        serde_json::json!({
+            "engine_id": engine_id,
+            "strategy_id": "rebalance-arbitrum-usdc-esp-m10",
+            "operation_id": operation.map(|operation| &operation.intent.operation_id),
+            "token": operation.map(|operation| &operation.intent.token_symbol),
+            "direction": operation.map(|operation| format!("{:?}", operation.intent.direction)),
+            "progress": operation.map(|operation| format!("{:?}", operation.progress)),
+            "saga_duration_us": saga_duration_us,
+            "recovered": recovered,
+            "outcome": if result.is_ok() { "success" } else { "failed" },
+            "error": result.as_ref().err(),
+        }),
+    );
 }
 
 fn log_compiled_graph(summary: Option<&CompiledGraphSummary>) {
@@ -1122,6 +1214,7 @@ async fn prefund_arbitrum_canary(
         );
         let completed = executor
             .execute(RebalanceExecutionRequest {
+                authority: RebalanceExecutionAuthority::ArbitrumM9Prefunding,
                 token_symbol: token.symbol.clone(),
                 token_decimals: token.decimals,
                 token_contract: contract,
@@ -1129,6 +1222,7 @@ async fn prefund_arbitrum_canary(
                 action: plan.action,
                 binance_balance_before: binance_before,
                 wallet_balance_before: wallet_before,
+                canary_maximum_fee: None,
             })
             .await?;
         let wallet_after = match completed.progress {
@@ -2828,9 +2922,9 @@ async fn run(
         .clone()
         .context("domain config has no Binance commission-price symbol")?;
     let mut commission_price_feed = BookTickerFeed::new(&config, commission_price_symbol.clone());
+    let capital_coins = binance_account_client.all_coin_information().await?;
     let rebalance_tracker = if pair.rebalance.enabled {
-        let coins = binance_account_client.all_coin_information().await?;
-        match validate_rebalance_readiness(&m8_pair, &coins) {
+        match validate_rebalance_readiness(&m8_pair, &capital_coins) {
             Ok(readiness) => telemetry.emit(
                 "m9_live_readiness",
                 serde_json::json!({
@@ -2868,7 +2962,7 @@ async fn run(
         let mut routes = BTreeMap::new();
         for token in [&pair.token_a, &pair.token_b] {
             let capital = select_capital_routes(
-                &coins,
+                &capital_coins,
                 &token.symbol,
                 &pair.chain.binance_network_name,
                 "OPTIMISM",
@@ -2889,6 +2983,51 @@ async fn run(
         portfolio_catalog.live_rebalance_adapter() == "world_chain_v12_parity",
         "live WLD rebalance is not behind the reviewed v12 parity adapter"
     );
+    let canary_rebalance_tracker =
+        if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary {
+            ensure!(
+                m8_pair.rebalance.enabled,
+                "live M10 allocator requires the ESP pair rebalance policy"
+            );
+            let mut routes = BTreeMap::new();
+            for token in [&m8_pair.token_a, &m8_pair.token_b] {
+                let capital = select_capital_routes(
+                    &capital_coins,
+                    &token.symbol,
+                    &m8_pair.chain.binance_network_name,
+                    "OPTIMISM",
+                )?;
+                let direct = capital
+                    .direct
+                    .as_ref()
+                    .filter(|route| route.network == m8_pair.chain.binance_network_name)
+                    .context("M10 direct Arbitrum capital route is absent")?;
+                ensure!(
+                    capital.deposit_all_enabled
+                        && capital.withdrawal_all_enabled
+                        && direct.deposit_available()
+                        && direct.withdrawal_available(),
+                    "M10 direct Arbitrum capital route is not fully available"
+                );
+                routes.insert(
+                    token.symbol.clone(),
+                    route_candidates_from_capital(
+                        &CapitalRouteState {
+                            coin: capital.coin.clone(),
+                            deposit_all_enabled: capital.deposit_all_enabled,
+                            withdrawal_all_enabled: capital.withdrawal_all_enabled,
+                            direct: Some(direct.clone()),
+                            fallback: None,
+                        },
+                        token.decimals,
+                        ARBITRUM_CHAIN_ID,
+                    )?,
+                );
+            }
+            RebalanceTracker::new(&m8_pair, routes)?
+        } else {
+            RebalanceTracker::disabled()
+        };
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -3042,7 +3181,19 @@ async fn run(
             .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
         let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
         let rebalance_journal_started_at = Instant::now();
-        let executor = RebalanceExecutor::hydrate(
+        let m10_capital_policy = portfolio_catalog.capital_canary().cloned();
+        let maximum_esp = m10_capital_policy
+            .as_ref()
+            .filter(|policy| policy.external_mutation_authorized)
+            .map(|policy| {
+                rebalance_base_units_to_decimal(
+                    policy.maximum_token_b_debit,
+                    m8_pair.token_b.decimals,
+                )
+            })
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+        let mut executor = RebalanceExecutor::hydrate(
             binance_account_client.clone(),
             treasury_client,
             subaccount_email,
@@ -3056,11 +3207,13 @@ async fn run(
             RebalanceRuntimeLimits {
                 maximum_wld: config.rebalance_max_wld_amount,
                 maximum_usdc: config.rebalance_max_usdc_amount,
-                maximum_esp: Decimal::ZERO,
+                maximum_esp,
                 operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
             },
         )
         .await?;
+        executor.set_capital_canary_policy(m10_capital_policy)?;
+        executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
         telemetry.emit(
             "runtime_journal_recovery",
             serde_json::json!({
@@ -3115,6 +3268,7 @@ async fn run(
         .context("M9 ESP execution has no Arbitrum wallet snapshot")?
         .clone();
     let entry_preflight = EntryPreflightHandle::default();
+    let mut shared_arbitrum_rebalance_owner_attached = false;
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
         ensure!(
             domain_config.snapshot().live_trading_enabled
@@ -3357,6 +3511,15 @@ async fn run(
             canary_dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?;
+        if let Some(executor) = full_rebalance_executor.as_mut() {
+            executor
+                .attach_arbitrum_execution_owner(
+                    canary_dex_service.evm_execution_owner(),
+                    canary_wallet_rpc.clone(),
+                )
+                .await?;
+            shared_arbitrum_rebalance_owner_attached = true;
+        }
         telemetry.emit(
             "runtime_journal_recovery",
             serde_json::json!({
@@ -3591,7 +3754,12 @@ async fn run(
         (None, None, events, None)
     };
     let shared_inventory = SharedInventoryReservations::default();
-    let (primary_engine, hot_telemetry, portfolio_allocator) = TradingEngine::new(
+    let (portfolio_allocator, portfolio_allocator_task) = capital_allocator_channel(
+        portfolio_catalog.as_ref(),
+        telemetry.clone(),
+        config.engine_id.clone(),
+    );
+    let (primary_engine, hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
         mirror,
@@ -3606,6 +3774,7 @@ async fn run(
                 .unwrap_or_default(),
             portfolio_catalog: Arc::clone(&portfolio_catalog),
             inventory: shared_inventory.clone(),
+            capital_allocator: portfolio_allocator.clone(),
         },
         BinanceFeeBps {
             buy: binance_buy_fee_bps,
@@ -3629,12 +3798,12 @@ async fn run(
         .pairs
         .first()
         .context("compiled M9 ESP strategy has no projected pair")?;
-    let (mut canary_engine, canary_hot_telemetry, canary_portfolio_allocator) = TradingEngine::new(
+    let (mut canary_engine, canary_hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::new(shadow_plan.domain_config.clone()),
         shadow_mirror,
         telemetry.clone(),
-        V12RebalanceParityAdapter::new(RebalanceTracker::disabled()),
+        V12RebalanceParityAdapter::new(canary_rebalance_tracker),
         arb_bot::engine::TradingExecutionHandles {
             paper_trades,
             entry_preflight: entry_preflight.clone(),
@@ -3644,6 +3813,7 @@ async fn run(
                 .unwrap_or_default(),
             portfolio_catalog: Arc::clone(&portfolio_catalog),
             inventory: shared_inventory.clone(),
+            capital_allocator: portfolio_allocator,
         },
         BinanceFeeBps {
             buy: esp_buy_fee_bps,
@@ -3683,7 +3853,8 @@ async fn run(
         canary_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
         shared_inventory_owner = true,
         shared_binance_order_owner = true,
-        canary_rebalance_mutation_enabled = false,
+        canary_rebalance_mutation_enabled =
+            portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary,
         canary_external_mutation_authorized = true,
         root_supervisor_policy = "dependency_scoped_v1",
         "M9 bounded ESP production canary configured"
@@ -3723,9 +3894,49 @@ async fn run(
         allowance_policy = "bounded_exact_canary_cap_then_locked",
         receipt_accounting = "effective_gas_price_includes_arbitrum_l1_component",
         execution_enabled = true,
-        rebalance_enabled = false,
+        rebalance_enabled = m8_pair.rebalance.enabled,
         external_mutation_authorized = true,
         "M9 Arbitrum live canary configured"
+    );
+    let m10_policy = m8_canary
+        .rebalance_live_canary
+        .as_ref()
+        .context("M10 rebalance policy is missing")?;
+    if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary {
+        ensure!(
+            shared_arbitrum_rebalance_owner_attached && full_rebalance_executor.is_some(),
+            "live M10 rebalance has no shared Arbitrum EVM execution owner"
+        );
+    }
+    tracing::info!(
+        pair_id = m8_pair.id,
+        strategy_id = "rebalance-arbitrum-usdc-esp-m10",
+        network_id = "eip155:42161",
+        approval_gate = ?m10_policy.approval_gate,
+        production_approval_actor = ?m10_policy.production_approval_actor,
+        production_approval_recorded_at_utc =
+            ?m10_policy.production_approval_recorded_at_utc,
+        allocator_mode = ?portfolio_catalog.allocator_mode(),
+        binance_network = m10_policy.binance_network,
+        maximum_transfer_count = m10_policy.maximum_transfer_count,
+        maximum_concurrent_transfers = m10_policy.maximum_concurrent_transfers,
+        maximum_failed_transfers = m10_policy.maximum_failed_transfers,
+        maximum_token_a_debit_base_units =
+            m10_policy.maximum_token_a_debit_base_units,
+        maximum_token_b_debit_base_units =
+            m10_policy.maximum_token_b_debit_base_units,
+        maximum_token_a_fee_base_units = m10_policy.maximum_token_a_fee_base_units,
+        maximum_token_b_fee_base_units = m10_policy.maximum_token_b_fee_base_units,
+        rollout_duration_seconds = m10_policy.rollout_duration_seconds,
+        maximum_unknown_reconciliation_queries =
+            m10_policy.maximum_unknown_reconciliation_queries,
+        direct_route_only = m10_policy.direct_route_only,
+        bridge_mutations_enabled = m10_policy.bridge_mutations_enabled,
+        shared_arbitrum_evm_owner = shared_arbitrum_rebalance_owner_attached,
+        external_mutation_authorized = portfolio_catalog
+            .capital_canary()
+            .is_some_and(|policy| policy.external_mutation_authorized),
+        "M10 Arbitrum rebalance live canary configured"
     );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
@@ -3734,9 +3945,8 @@ async fn run(
     engine.on_binance_clock_sync(binance_account.clock_sync);
     canary_engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
-    let portfolio_allocator_task = tokio::spawn(portfolio_allocator.run());
+    let portfolio_allocator_task = tokio::spawn(portfolio_allocator_task.run());
     let canary_hot_telemetry_task = tokio::spawn(canary_hot_telemetry.run());
-    let canary_portfolio_allocator_task = tokio::spawn(canary_portfolio_allocator.run());
     let m8_chain_readiness_task = m8_chain_readiness_probe.map(|probe| {
         tokio::spawn(run_m8_chain_readiness_refresh(
             probe,
@@ -3754,26 +3964,62 @@ async fn run(
         binance_clock_sync_sender,
     ));
     let mut binance_clock_sync_running = true;
-    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task) =
+    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task, m10_risk_receiver) =
         if let Some(mut executor) = full_rebalance_executor.take() {
             let recover_on_start = rebalance_recovery_operation.is_some();
+            let recovery_target = rebalance_recovery_operation
+                .as_ref()
+                .map(rebalance_target)
+                .unwrap_or(RebalanceExecutionTarget::Primary);
             let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
             let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
+            let (risk_sender, risk_receiver) =
+                tokio::sync::watch::channel(executor.m10_canary_risk()?);
+            let rebalance_telemetry = telemetry.clone();
+            let rebalance_engine_id = config.engine_id.clone();
             let task = tokio::spawn(async move {
+                emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                 if recover_on_start {
+                    let saga_started_at = Instant::now();
                     let result = recover_rebalance_with_quote_retries(&mut executor).await;
+                    emit_m10_rebalance_saga(
+                        &rebalance_telemetry,
+                        &rebalance_engine_id,
+                        recovery_target,
+                        &result,
+                        &executor,
+                        saga_started_at,
+                        true,
+                    );
+                    emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
+                    risk_sender.send_replace(executor.m10_canary_risk()?);
                     if result_sender
-                        .send(RebalanceExecutorEvent::Recovery(result))
+                        .send(RebalanceExecutorEvent::Recovery {
+                            target: recovery_target,
+                            result,
+                        })
                         .await
                         .is_err()
                     {
                         return Ok::<(), anyhow::Error>(());
                     }
                 }
-                while let Some(request) = request_receiver.recv().await {
+                while let Some((target, request)) = request_receiver.recv().await {
+                    let saga_started_at = Instant::now();
                     let result = execute_rebalance_with_quote_retries(&mut executor, request).await;
+                    emit_m10_rebalance_saga(
+                        &rebalance_telemetry,
+                        &rebalance_engine_id,
+                        target,
+                        &result,
+                        &executor,
+                        saga_started_at,
+                        false,
+                    );
+                    emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
+                    risk_sender.send_replace(executor.m10_canary_risk()?);
                     if result_sender
-                        .send(RebalanceExecutorEvent::Execution(result))
+                        .send(RebalanceExecutorEvent::Execution { target, result })
                         .await
                         .is_err()
                     {
@@ -3782,16 +4028,30 @@ async fn run(
                 }
                 Ok::<(), anyhow::Error>(())
             });
-            (Some(request_sender), result_receiver, Some(task))
+            (
+                Some(request_sender),
+                result_receiver,
+                Some(task),
+                risk_receiver,
+            )
         } else {
-            let (_request_sender, _request_receiver) =
-                tokio::sync::mpsc::channel::<RebalanceExecutionRequest>(1);
+            let (_request_sender, _request_receiver) = tokio::sync::mpsc::channel::<(
+                RebalanceExecutionTarget,
+                RebalanceExecutionRequest,
+            )>(1);
             let (_result_sender, result_receiver) =
                 tokio::sync::mpsc::channel::<RebalanceExecutorEvent>(1);
-            (None, result_receiver, None)
+            let (_risk_sender, risk_receiver) =
+                tokio::sync::watch::channel(RebalanceCanaryRisk::default());
+            (None, result_receiver, None, risk_receiver)
         };
     if let Some(operation) = rebalance_recovery_operation.as_ref() {
-        engine.on_rebalance_recovery_started(operation)?;
+        match rebalance_target(operation) {
+            RebalanceExecutionTarget::Primary => engine.on_rebalance_recovery_started(operation)?,
+            RebalanceExecutionTarget::ArbitrumCanary => {
+                canary_engine.on_rebalance_recovery_started(operation)?
+            }
+        }
     }
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances.clone()))?;
     canary_engine
@@ -3805,7 +4065,26 @@ async fn run(
     }
     engine.on_user_data_connected(user_data_subscription_id);
     canary_engine.on_shared_user_data_connected();
-    dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+    dispatch_rebalance_execution(
+        &mut engine,
+        rebalance_sender.as_ref(),
+        pair,
+        wallet_owner,
+        RebalanceExecutionTarget::Primary,
+        None,
+        None,
+    )
+    .await?;
+    dispatch_rebalance_execution(
+        &mut canary_engine,
+        rebalance_sender.as_ref(),
+        &m8_pair,
+        wallet_owner,
+        RebalanceExecutionTarget::ArbitrumCanary,
+        portfolio_catalog.capital_canary(),
+        Some(&m10_risk_receiver),
+    )
+    .await?;
     engine.start();
     canary_engine.start();
     let mut first_ready_emitted = false;
@@ -3887,13 +4166,16 @@ async fn run(
         hot_path_sizing_policy = "one_running_one_latest_pending_per_strategy",
         hot_path_canary_strategy_id = %shadow_plan.strategy_id.as_str(),
         hot_path_canary_external_mutation_authorized = true,
-        hot_path_canary_rebalance_mutation_authorized = false,
+        hot_path_canary_rebalance_mutation_authorized =
+            portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary,
         portfolio_inventory_key = "inventory_location+venue_asset_id",
         portfolio_location_count = portfolio_catalog.location_count(),
         portfolio_venue_asset_count = portfolio_catalog.asset_count(),
         portfolio_economic_asset_count = portfolio_catalog.economic_asset_count(),
         portfolio_allocator_mode = ?portfolio_catalog.allocator_mode(),
-        portfolio_external_mutation_authorized = false,
+        portfolio_external_mutation_authorized = portfolio_catalog
+            .capital_canary()
+            .is_some_and(|policy| policy.external_mutation_authorized),
         live_rebalance_adapter = portfolio_catalog.live_rebalance_adapter(),
         arbitrum_execution_enabled = network_registry
             .as_ref()
@@ -4198,7 +4480,26 @@ async fn run(
                     }
                     other => engine.on_balance_event(other)?,
                 }
-                dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+                dispatch_rebalance_execution(
+                    &mut engine,
+                    rebalance_sender.as_ref(),
+                    pair,
+                    wallet_owner,
+                    RebalanceExecutionTarget::Primary,
+                    None,
+                    None,
+                )
+                .await?;
+                dispatch_rebalance_execution(
+                    &mut canary_engine,
+                    rebalance_sender.as_ref(),
+                    &m8_pair,
+                    wallet_owner,
+                    RebalanceExecutionTarget::ArbitrumCanary,
+                    portfolio_catalog.capital_canary(),
+                    Some(&m10_risk_receiver),
+                )
+                .await?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4212,6 +4513,16 @@ async fn run(
                     bail!("Arbitrum wallet balance synchronization channel stopped unexpectedly");
                 };
                 canary_engine.on_balance_event(event)?;
+                dispatch_rebalance_execution(
+                    &mut canary_engine,
+                    rebalance_sender.as_ref(),
+                    &m8_pair,
+                    wallet_owner,
+                    RebalanceExecutionTarget::ArbitrumCanary,
+                    portfolio_catalog.capital_canary(),
+                    Some(&m10_risk_receiver),
+                )
+                .await?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4225,20 +4536,55 @@ async fn run(
                     bail!("rebalance executor result channel stopped unexpectedly");
                 };
                 match result {
-                    RebalanceExecutorEvent::Recovery(Ok(operation)) => {
-                        engine.on_rebalance_recovery_result(Ok(&operation))?
-                    }
-                    RebalanceExecutorEvent::Recovery(Err(error)) => {
-                        engine.on_rebalance_recovery_result(Err(&error))?
-                    }
-                    RebalanceExecutorEvent::Execution(Ok(operation)) => {
-                        engine.on_rebalance_execution_result(Ok(&operation))?
-                    }
-                    RebalanceExecutorEvent::Execution(Err(error)) => {
-                        engine.on_rebalance_execution_result(Err(&error))?
-                    }
+                    RebalanceExecutorEvent::Recovery { target, result } => match (target, result) {
+                        (RebalanceExecutionTarget::Primary, Ok(operation)) => {
+                            engine.on_rebalance_recovery_result(Ok(&operation))?
+                        }
+                        (RebalanceExecutionTarget::Primary, Err(error)) => {
+                            engine.on_rebalance_recovery_result(Err(&error))?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumCanary, Ok(operation)) => {
+                            canary_engine.on_rebalance_recovery_result(Ok(&operation))?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumCanary, Err(error)) => {
+                            canary_engine.on_rebalance_recovery_result(Err(&error))?
+                        }
+                    },
+                    RebalanceExecutorEvent::Execution { target, result } => match (target, result) {
+                        (RebalanceExecutionTarget::Primary, Ok(operation)) => {
+                            engine.on_rebalance_execution_result(Ok(&operation))?
+                        }
+                        (RebalanceExecutionTarget::Primary, Err(error)) => {
+                            engine.on_rebalance_execution_result(Err(&error))?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumCanary, Ok(operation)) => {
+                            canary_engine.on_rebalance_execution_result(Ok(&operation))?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumCanary, Err(error)) => {
+                            canary_engine.on_rebalance_execution_result(Err(&error))?
+                        }
+                    },
                 }
-                dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
+                dispatch_rebalance_execution(
+                    &mut engine,
+                    rebalance_sender.as_ref(),
+                    pair,
+                    wallet_owner,
+                    RebalanceExecutionTarget::Primary,
+                    None,
+                    None,
+                )
+                .await?;
+                dispatch_rebalance_execution(
+                    &mut canary_engine,
+                    rebalance_sender.as_ref(),
+                    &m8_pair,
+                    wallet_owner,
+                    RebalanceExecutionTarget::ArbitrumCanary,
+                    portfolio_catalog.capital_canary(),
+                    Some(&m10_risk_receiver),
+                )
+                .await?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4396,6 +4742,7 @@ async fn run(
     while adaptive_sizing_tasks.join_next().await.is_some() {}
     canary_engine.shutdown();
     drop(engine);
+    drop(canary_engine);
     if let Some(task) = paper_trade_task.take() {
         task.await??;
     }
@@ -4404,7 +4751,6 @@ async fn run(
     }
     hot_telemetry_task.await??;
     canary_hot_telemetry_task.await??;
-    canary_portfolio_allocator_task.await?;
     portfolio_allocator_task.await?;
     writer_task.await??;
     if let Some(path) = runtime_ready_file
@@ -4632,21 +4978,118 @@ fn rebalance_quote_retry_delay(retry_attempt: u32) -> Duration {
         .min(REBALANCE_QUOTE_RETRY_MAX_DELAY)
 }
 
-fn dispatch_rebalance_execution(
+async fn dispatch_rebalance_execution(
     engine: &mut TradingEngine,
-    sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutionRequest>>,
+    sender: Option<
+        &tokio::sync::mpsc::Sender<(RebalanceExecutionTarget, RebalanceExecutionRequest)>,
+    >,
     pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
+    target: RebalanceExecutionTarget,
+    capital_policy: Option<&CompiledCapitalCanaryPolicy>,
+    m10_risk: Option<&tokio::sync::watch::Receiver<RebalanceCanaryRisk>>,
 ) -> anyhow::Result<()> {
-    let Some(evaluation) = engine.take_rebalance_execution()? else {
+    let m10_remaining = if target == RebalanceExecutionTarget::ArbitrumCanary {
+        let Some(evaluation) = engine.pending_rebalance_execution() else {
+            return Ok(());
+        };
+        let action = evaluation
+            .plan
+            .action
+            .as_ref()
+            .context("M10 pending rebalance evaluation has no action")?;
+        let policy = capital_policy.context("M10 dispatch has no compiled capital policy")?;
+        let risk = m10_risk
+            .context("M10 dispatch has no durable risk publication")?
+            .borrow()
+            .clone();
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis()
+            .try_into()
+            .context("current Unix timestamp exceeds u64")?;
+        let Some(remaining) = remaining_m10_rebalance_authority(
+            policy,
+            &risk,
+            &evaluation.token_symbol,
+            action.direction,
+            now_unix_ms,
+        )?
+        else {
+            engine.stop_pending_rebalance_creation(
+                "M10 durable count, failure, concurrency, duration, value, or fee limit reached",
+            );
+            return Ok(());
+        };
+        engine.cap_pending_rebalance_amount(remaining.maximum_source_debit)?;
+        Some(remaining)
+    } else {
+        None
+    };
+    let Some(pending) = engine.pending_rebalance_execution().cloned() else {
         return Ok(());
     };
-    let sender = sender.context("rebalance engine produced live work without an executor")?;
-    let action = evaluation
+    let action = pending
         .plan
         .action
         .clone()
         .context("rebalance execution evaluation has no action")?;
+    let canary_maximum_fee = if target == RebalanceExecutionTarget::ArbitrumCanary {
+        let policy = capital_policy.context("M10 dispatch has no compiled capital policy")?;
+        ensure!(
+            policy.external_mutation_authorized,
+            "M10 dispatch has no external mutation authority"
+        );
+        let remaining_fee = m10_remaining
+            .context("M10 dispatch lost its durable remaining authority")?
+            .maximum_fee;
+        let authorized_fee = if action.direction == arb_bot::rebalance::Direction::WalletToBinance {
+            U256::ZERO
+        } else {
+            let maximum_with_positive_credit = action
+                .amount
+                .checked_sub(U256::ONE)
+                .context("M10 Binance withdrawal cannot preserve positive destination credit")?;
+            let bounded = remaining_fee.min(maximum_with_positive_credit);
+            ensure!(
+                !bounded.is_zero(),
+                "M10 Binance withdrawal has no remaining positive fee authority"
+            );
+            bounded
+        };
+        let proposal = engine
+            .authorize_pending_rebalance_allocation(authorized_fee)
+            .await?
+            .context("M10 capital allocator returned no proposal")?;
+        ensure!(
+            proposal.external_mutation_authorized
+                && proposal.source_debit == action.amount
+                && proposal.fee == authorized_fee,
+            "M10 capital allocator proposal differs from the pending rebalance"
+        );
+        Some(authorized_fee)
+    } else {
+        None
+    };
+    // Capital planning is asynchronous and must not reserve the sole
+    // execution queue slot while it waits. In particular, an M10 allocator
+    // observation cannot head-of-line block an already eligible WLD rebalance.
+    let sender = sender.context("rebalance engine produced live work without an executor")?;
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => return Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+            bail!("rebalance executor queue is closed")
+        }
+    };
+    let evaluation = engine
+        .take_rebalance_execution()?
+        .context("pending rebalance disappeared after capital allocation")?;
+    ensure!(
+        evaluation == pending,
+        "pending rebalance changed during capital allocation"
+    );
     let token = [&pair.token_a, &pair.token_b]
         .into_iter()
         .find(|token| token.symbol == evaluation.token_symbol)
@@ -4655,8 +5098,15 @@ fn dispatch_rebalance_execution(
         .contract
         .parse::<Address>()
         .context("rebalance execution token contract is invalid")?;
-    sender
-        .try_send(RebalanceExecutionRequest {
+    permit.send((
+        target,
+        RebalanceExecutionRequest {
+            authority: match target {
+                RebalanceExecutionTarget::Primary => RebalanceExecutionAuthority::WorldChainV12,
+                RebalanceExecutionTarget::ArbitrumCanary => {
+                    RebalanceExecutionAuthority::ArbitrumM10Canary
+                }
+            },
             token_symbol: evaluation.token_symbol,
             token_decimals: evaluation.token_decimals,
             token_contract,
@@ -4664,8 +5114,9 @@ fn dispatch_rebalance_execution(
             action,
             binance_balance_before: evaluation.plan.projected.binance,
             wallet_balance_before: evaluation.plan.projected.wallet,
-        })
-        .context("rebalance executor queue is full or closed")?;
+            canary_maximum_fee,
+        },
+    ));
     Ok(())
 }
 

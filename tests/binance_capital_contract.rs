@@ -43,3 +43,64 @@ fn travel_rule_submission_is_deposit_only_and_legacy_withdrawal_reads_are_recove
     assert!(CAPITAL.contains("/sapi/v2/localentity/withdraw/history"));
     assert!(!REBALANCE_RUNTIME.contains(".signed_post("));
 }
+
+#[test]
+fn deposit_questionnaire_matches_rails_order_and_is_durable_before_submission() {
+    let start = REBALANCE_RUNTIME
+        .find("async fn wait_binance_deposit(")
+        .unwrap();
+    let end = REBALANCE_RUNTIME[start..]
+        .find("async fn wait_token_credit(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let implementation = &REBALANCE_RUNTIME[start..end];
+
+    let requirement = implementation
+        .find("record.questionnaire_required()")
+        .unwrap();
+    let durable_state = implementation
+        .find("RebalanceExecutionProgress::DepositQuestionnaireSubmissionStarted")
+        .unwrap();
+    let submission = implementation
+        .find(".submit_deposit_questionnaire(")
+        .unwrap();
+    let credited = implementation.find("if record.is_credited()").unwrap();
+    assert!(requirement < durable_state);
+    assert!(durable_state < submission);
+    assert!(submission < credited);
+    assert!(implementation.contains("deposit_id == &record.deposit_id"));
+}
+
+#[test]
+fn withdrawal_unknown_outcome_and_live_fee_recheck_are_fail_closed() {
+    let direct_start = REBALANCE_RUNTIME
+        .find("async fn direct_binance_to_wallet(")
+        .unwrap();
+    let direct_end = REBALANCE_RUNTIME[direct_start..]
+        .find("async fn direct_wallet_to_binance(")
+        .map(|offset| direct_start + offset)
+        .unwrap();
+    let direct = &REBALANCE_RUNTIME[direct_start..direct_end];
+    let completed_transfer = direct
+        .find("RebalanceExecutionProgress::BinanceTransferCompleted")
+        .unwrap();
+    let last_route_check = direct[completed_transfer..].find(".verify_route(").unwrap();
+    let withdrawal = direct[completed_transfer..]
+        .find(".begin_binance_withdrawal(")
+        .unwrap();
+    assert!(last_route_check < withdrawal);
+
+    let begin_start = REBALANCE_RUNTIME
+        .find("async fn begin_binance_withdrawal(")
+        .unwrap();
+    let begin_end = REBALANCE_RUNTIME[begin_start..]
+        .find("async fn wait_master_transfer(")
+        .map(|offset| begin_start + offset)
+        .unwrap();
+    let begin = &REBALANCE_RUNTIME[begin_start..begin_end];
+    assert!(begin.contains("*reconciliation_queries == 0"));
+    assert!(begin.contains("reconciliation_queries: 1"));
+    assert!(begin.contains(
+        "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
+    ));
+}

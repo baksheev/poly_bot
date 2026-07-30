@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -569,6 +569,29 @@ pub struct CompiledNetworkRuntimePlan {
 pub enum CompiledCapitalAllocatorMode {
     Disabled,
     Shadow,
+    LiveCanary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledCapitalCanaryPolicy {
+    pub network_id: NetworkId,
+    pub binance_network: String,
+    pub token_a_symbol: String,
+    pub token_b_symbol: String,
+    pub token_a_economic_asset_id: EconomicAssetId,
+    pub token_b_economic_asset_id: EconomicAssetId,
+    pub maximum_transfer_count: u16,
+    pub maximum_concurrent_transfers: u16,
+    pub maximum_failed_transfers: u16,
+    pub maximum_token_a_debit: U256,
+    pub maximum_token_b_debit: U256,
+    pub maximum_token_a_fee: U256,
+    pub maximum_token_b_fee: U256,
+    pub rollout_duration_seconds: u64,
+    pub maximum_unknown_reconciliation_queries: u16,
+    pub direct_route_only: bool,
+    pub bridge_mutations_enabled: bool,
+    pub external_mutation_authorized: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -598,6 +621,7 @@ pub struct CompiledPortfolioAsset {
 pub struct CompiledPortfolioRuntimePlan {
     pub assets: Vec<CompiledPortfolioAsset>,
     pub allocator_mode: CompiledCapitalAllocatorMode,
+    pub capital_canary: Option<CompiledCapitalCanaryPolicy>,
     pub live_rebalance_adapter: String,
 }
 
@@ -1058,14 +1082,12 @@ impl CompiledDomainGraph {
                     source.snapshot.live_trading_enabled,
                     "live projection must preserve a live source artifact"
                 ),
-                CompatibilityRole::PublicPriceCollector => ensure!(
-                    projection.pair_ids.iter().all(|pair_id| source
-                        .snapshot
-                        .pairs
-                        .iter()
-                        .any(|pair| &pair.id == pair_id && !pair.rebalance.enabled)),
-                    "collector projection cannot include rebalance capabilities"
-                ),
+                // Public projection construction below always scrubs trading,
+                // rebalance, approval and credential-bearing capabilities.
+                // The reviewed source may itself become live after M10
+                // approval; source liveness must not make that projection
+                // impossible to compile.
+                CompatibilityRole::PublicPriceCollector => {}
             }
         }
         unique_by(
@@ -1160,7 +1182,15 @@ impl CompiledDomainGraph {
                     canary.production_approval_actor = None;
                     canary.production_approval_recorded_at_utc = None;
                     canary.prefunding_rebalance = None;
+                    canary.rebalance_mutations_enabled = false;
+                    if let Some(rebalance) = &mut canary.rebalance_live_canary {
+                        rebalance.approval_gate =
+                            crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired;
+                        rebalance.production_approval_actor = None;
+                        rebalance.production_approval_recorded_at_utc = None;
+                    }
                 }
+                pair.rebalance.enabled = false;
             }
         }
         snapshot.live_trading_enabled = snapshot.pairs.iter().any(|pair| pair.execution_enabled);
@@ -1674,12 +1704,92 @@ impl CompiledDomainGraph {
             assets.len() == self.bundle.asset_mappings.len(),
             "portfolio plan does not cover every reviewed asset mapping"
         );
+        let capital_canaries = self
+            .bundle
+            .sources
+            .iter()
+            .flat_map(|source| source.snapshot.pairs.iter())
+            .filter_map(|pair| {
+                pair.live_canary
+                    .as_ref()?
+                    .rebalance_live_canary
+                    .as_ref()
+                    .map(|policy| (pair, policy))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            capital_canaries.len() <= 1,
+            "compiled portfolio has multiple M10 capital canaries"
+        );
+        let capital_canary = capital_canaries
+            .first()
+            .map(|(pair, policy)| {
+                let economic_asset_id = |symbol: &str| {
+                    self.bundle
+                        .economic_assets
+                        .iter()
+                        .find(|asset| asset.symbol == symbol)
+                        .map(|asset| asset.id.clone())
+                        .with_context(|| {
+                            format!("compiled M10 token {symbol} has no economic asset")
+                        })
+                };
+                Ok::<_, anyhow::Error>(CompiledCapitalCanaryPolicy {
+                    network_id: NetworkId::new(format!("eip155:{}", pair.chain.chain_id))?,
+                    binance_network: policy.binance_network.clone(),
+                    token_a_symbol: pair.token_a.symbol.clone(),
+                    token_b_symbol: pair.token_b.symbol.clone(),
+                    token_a_economic_asset_id: economic_asset_id(&pair.token_a.symbol)?,
+                    token_b_economic_asset_id: economic_asset_id(&pair.token_b.symbol)?,
+                    maximum_transfer_count: policy.maximum_transfer_count,
+                    maximum_concurrent_transfers: policy.maximum_concurrent_transfers,
+                    maximum_failed_transfers: policy.maximum_failed_transfers,
+                    maximum_token_a_debit: U256::from_str_radix(
+                        &policy.maximum_token_a_debit_base_units,
+                        10,
+                    )
+                    .context("compiled M10 token_a debit cap is invalid")?,
+                    maximum_token_b_debit: U256::from_str_radix(
+                        &policy.maximum_token_b_debit_base_units,
+                        10,
+                    )
+                    .context("compiled M10 token_b debit cap is invalid")?,
+                    maximum_token_a_fee: U256::from_str_radix(
+                        &policy.maximum_token_a_fee_base_units,
+                        10,
+                    )
+                    .context("compiled M10 token_a fee cap is invalid")?,
+                    maximum_token_b_fee: U256::from_str_radix(
+                        &policy.maximum_token_b_fee_base_units,
+                        10,
+                    )
+                    .context("compiled M10 token_b fee cap is invalid")?,
+                    rollout_duration_seconds: policy.rollout_duration_seconds,
+                    maximum_unknown_reconciliation_queries: policy
+                        .maximum_unknown_reconciliation_queries,
+                    direct_route_only: policy.direct_route_only,
+                    bridge_mutations_enabled: policy.bridge_mutations_enabled,
+                    external_mutation_authorized: role == CompatibilityRole::LiveRuntime
+                        && policy.approval_gate
+                            == crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApproved,
+                })
+            })
+            .transpose()?;
+        let allocator_mode = match role {
+            CompatibilityRole::PublicPriceCollector => CompiledCapitalAllocatorMode::Disabled,
+            CompatibilityRole::LiveRuntime
+                if capital_canary
+                    .as_ref()
+                    .is_some_and(|policy| policy.external_mutation_authorized) =>
+            {
+                CompiledCapitalAllocatorMode::LiveCanary
+            }
+            CompatibilityRole::LiveRuntime => CompiledCapitalAllocatorMode::Shadow,
+        };
         Ok(CompiledPortfolioRuntimePlan {
             assets,
-            allocator_mode: match role {
-                CompatibilityRole::LiveRuntime => CompiledCapitalAllocatorMode::Shadow,
-                CompatibilityRole::PublicPriceCollector => CompiledCapitalAllocatorMode::Disabled,
-            },
+            allocator_mode,
+            capital_canary,
             live_rebalance_adapter: "world_chain_v12_parity".to_owned(),
         })
     }
@@ -2275,7 +2385,7 @@ pub fn compile_domain(
                 .snapshot
                 .pairs
                 .iter()
-                .any(|pair| pair.id == "arbitrum-usdc-esp" && !pair.rebalance.enabled)
+                .any(|pair| pair.id == "arbitrum-usdc-esp")
         })
         .context("compiled domain requires the reviewed ESP collector compatibility source")?;
     let compatibility_projections = vec![
@@ -2331,7 +2441,7 @@ pub fn compile_domain(
                 minimum.insert(account.order_secret_key_env.clone());
                 minimum.insert(wallet.private_key_env.clone());
             }
-            if pair.rebalance.enabled {
+            if pair.rebalance.enabled && projection.role == CompatibilityRole::LiveRuntime {
                 minimum.insert(account.treasury_api_key_env.clone());
                 minimum.insert(account.treasury_secret_key_env.clone());
                 minimum.insert(account.subaccount_email_env.clone());
@@ -2775,6 +2885,12 @@ mod tests {
             portfolio.allocator_mode,
             CompiledCapitalAllocatorMode::Shadow
         );
+        let capital_canary = portfolio.capital_canary.as_ref().unwrap();
+        assert_eq!(capital_canary.network_id.as_str(), "eip155:42161");
+        assert_eq!(capital_canary.maximum_transfer_count, 2);
+        assert!(!capital_canary.external_mutation_authorized);
+        assert!(capital_canary.direct_route_only);
+        assert!(!capital_canary.bridge_mutations_enabled);
         assert_eq!(portfolio.live_rebalance_adapter, "world_chain_v12_parity");
         assert_eq!(portfolio.assets.len(), 10);
         assert!(portfolio.assets.iter().any(|asset| {
@@ -2794,6 +2910,99 @@ mod tests {
                     }
                 )
         }));
+    }
+
+    #[test]
+    fn explicit_m10_approval_is_required_to_compile_live_allocator_authority() {
+        let (manifest, mut sources, _) = fixture();
+        let esp_index = sources
+            .iter()
+            .position(|source| {
+                source
+                    .snapshot()
+                    .pairs
+                    .iter()
+                    .any(|pair| pair.id == "arbitrum-usdc-esp")
+            })
+            .unwrap();
+        let mut approved = serde_json::to_value(sources[esp_index].snapshot()).unwrap();
+        approved["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
+            serde_json::Value::String("explicit_production_approved".to_owned());
+        approved["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_actor"] =
+            serde_json::Value::String("operator".to_owned());
+        approved["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_recorded_at_utc"] =
+            serde_json::Value::String("2026-07-31T00:00:00Z".to_owned());
+        approved["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] =
+            serde_json::Value::Bool(true);
+        approved["pairs"][0]["rebalance"]["enabled"] = serde_json::Value::Bool(true);
+        sources[esp_index] = LoadedDomainConfig::from_bytes(
+            sources[esp_index].path(),
+            &serde_json::to_vec(&approved).unwrap(),
+        )
+        .unwrap();
+
+        let approved_bundle = compile_domain(&manifest, &sources).unwrap();
+        let graph = CompiledDomainGraph::from_bundle(approved_bundle).unwrap();
+        let projected = graph
+            .project("approved-m10.json", CompatibilityRole::LiveRuntime, false)
+            .unwrap();
+        let portfolio = projected.portfolio_runtime.unwrap();
+        assert_eq!(
+            portfolio.allocator_mode,
+            CompiledCapitalAllocatorMode::LiveCanary
+        );
+        assert!(
+            portfolio
+                .capital_canary
+                .as_ref()
+                .is_some_and(|policy| policy.external_mutation_authorized)
+        );
+        let esp = projected
+            .hot_path_runtime
+            .unwrap()
+            .strategies
+            .into_iter()
+            .find(|strategy| strategy.symbol == "ESPUSDC")
+            .unwrap();
+        let pair = &esp.domain_config.snapshot().pairs[0];
+        assert!(pair.execution_enabled);
+        assert!(pair.rebalance.enabled);
+        assert!(
+            pair.live_canary
+                .as_ref()
+                .is_some_and(|canary| canary.rebalance_mutations_enabled)
+        );
+
+        let public = graph
+            .project(
+                "approved-m10-public.json",
+                CompatibilityRole::PublicPriceCollector,
+                false,
+            )
+            .unwrap();
+        assert!(
+            public
+                .portfolio_runtime
+                .as_ref()
+                .and_then(|portfolio| portfolio.capital_canary.as_ref())
+                .is_some_and(|policy| !policy.external_mutation_authorized)
+        );
+        let public_pair = &public.config.snapshot().pairs[0];
+        assert!(!public_pair.execution_enabled);
+        assert!(!public_pair.rebalance.enabled);
+        let public_canary = public_pair.live_canary.as_ref().unwrap();
+        assert!(!public_canary.rebalance_mutations_enabled);
+        assert!(
+            public_canary
+                .rebalance_live_canary
+                .as_ref()
+                .is_some_and(|policy| {
+                    policy.approval_gate
+                        == crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+                        && policy.production_approval_actor.is_none()
+                        && policy.production_approval_recorded_at_utc.is_none()
+                })
+        );
     }
 
     #[test]

@@ -329,6 +329,36 @@ the journal. Missing, replaced, unsigned, or contradictory evidence remains
 blocked for operator review; the runtime never blindly resubmits an unknown
 outcome.
 
+## M10 Arbitrum rebalance canary
+
+The checked-in V4 artifact defines M10 authority but leaves it at
+`explicit_production_approval_required`, with both rebalance mutation flags
+off. A local compiler fixture constructs the separately approved form and
+proves that live authority appears only when the gate, actor, UTC timestamp,
+pair rebalance flag, and canary rebalance flag agree. The public collector
+projection clears all of that authority again.
+
+The reviewed canary is direct Arbitrum only: at most two transfers, one active
+transfer, one failed transfer, 15 minutes from the first durable M10 intent,
+25 USDC and 401.2 ESP cumulative source debit, and 5 USDC and 2 ESP cumulative
+fee authority. Optimism and Across remain available only to the existing World
+Chain rebalance authority and cannot be selected by an M10 request.
+
+One process-scoped capital allocator validates economic-asset identity,
+inventory availability, source-debit conservation, route, and remaining
+durable authority before the engine reserves inventory. All Arbitrum wallet
+children use the same execution owner, nonce lane, signer, gas policy, and
+transaction journal as ESP trades and allowances. Binance withdrawal intent
+is fsynced before submission; after an ambiguous standard withdrawal the one
+exact history reconciliation query can only discover the existing result and
+never authorize a second withdrawal. Wallet deposits persist the exact
+deposit/questionnaire identity before conditional Travel Rule submission.
+
+The M10 report uses real allocator, Binance child, EVM owner, saga, and
+settlement spans. It does not label the full saga duration as a Binance child
+duration. Rollback stops only new M10 creation; active durable recovery and
+prefunded ESP trading remain available.
+
 ## Runtime configuration
 
 Production mutation requires all of the following:

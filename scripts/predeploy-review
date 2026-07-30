@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: scripts/predeploy-review docs/reviews/<milestone>.md [base-ref]" >&2
+  exit 2
+fi
+
+review_file=$1
+base_ref=${2:-origin/main}
+
+case "$review_file" in
+  docs/reviews/*.md) ;;
+  *)
+    echo "review artifact must be under docs/reviews/" >&2
+    exit 2
+    ;;
+esac
+
+test -f "$review_file"
+git rev-parse --verify "$base_ref^{commit}" >/dev/null
+git merge-base --is-ancestor "$base_ref" HEAD
+git diff --check "$base_ref"
+
+for required in \
+  "External mutation matrix" \
+  "Unknown-outcome and restart matrix" \
+  "Versioned artifact semantic diff" \
+  "Latency and resource observation plan" \
+  "Final diff review"; do
+  rg -F "$required" "$review_file" >/dev/null
+done
+
+cargo test --test binance_capital_contract
+cargo test --test m10_reporting
+cargo test domain::config::tests --lib
+cargo test domain::compiled::tests --lib
+cargo test portfolio::tests --lib
+cargo test dex::execution::tests::capital_handle_uses_the_same_nonce_journal_and_cannot_keep_service_alive --lib
+cargo test rebalance::executor::tests --lib
+cargo test rebalance::runtime::tests --lib
+cargo check --all-targets
+
+if rg -n '^- \[ \]' "$review_file"; then
+  echo "pre-deploy review still has unchecked gates" >&2
+  exit 1
+fi
+
+echo "pre-deploy review passed for $review_file against $base_ref"

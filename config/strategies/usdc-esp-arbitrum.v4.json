@@ -42,6 +42,21 @@
         "rollout_duration_seconds": 900,
         "rebalance_mutations_enabled": false,
         "arbitrum_max_fee_headroom_bps": 12000,
+        "rebalance_live_canary": {
+          "approval_gate": "explicit_production_approval_required",
+          "binance_network": "ARBITRUM",
+          "maximum_transfer_count": 2,
+          "maximum_concurrent_transfers": 1,
+          "maximum_failed_transfers": 1,
+          "maximum_token_a_debit_base_units": "25000000",
+          "maximum_token_b_debit_base_units": "401200000000000000000",
+          "maximum_token_a_fee_base_units": "5000000",
+          "maximum_token_b_fee_base_units": "2000000000000000000",
+          "rollout_duration_seconds": 900,
+          "maximum_unknown_reconciliation_queries": 1,
+          "direct_route_only": true,
+          "bridge_mutations_enabled": false
+        },
         "prefunding_rebalance": {
           "approval_gate": "explicit_production_approved",
           "production_approval_actor": "operator",

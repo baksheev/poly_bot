@@ -299,6 +299,8 @@ pub struct LiveCanaryConfig {
     pub arbitrum_max_fee_headroom_bps: u16,
     #[serde(default)]
     pub prefunding_rebalance: Option<LiveCanaryPrefundingRebalanceConfig>,
+    #[serde(default)]
+    pub rebalance_live_canary: Option<LiveCanaryRebalanceConfig>,
 }
 
 impl LiveCanaryConfig {
@@ -363,11 +365,15 @@ impl LiveCanaryConfig {
                 );
             }
         }
-        ensure!(
-            !self.rebalance_mutations_enabled && !pair.rebalance.enabled,
-            "pair {} steady-state canary artifact cannot enable rebalance mutations",
-            pair.id
-        );
+        if let Some(rebalance) = &self.rebalance_live_canary {
+            rebalance.validate(pair, self)?;
+        } else {
+            ensure!(
+                !self.rebalance_mutations_enabled && !pair.rebalance.enabled,
+                "pair {} cannot enable rebalance mutations without an M10 policy",
+                pair.id
+            );
+        }
         if let Some(prefunding) = &self.prefunding_rebalance {
             prefunding.validate(pair, self)?;
         }
@@ -448,6 +454,102 @@ impl LiveCanaryConfig {
                 && (self.approval_gate != LiveCanaryApprovalGate::ExplicitProductionApproved
                     || self.arbitrum_max_fee_headroom_bps >= 11_000),
             "pair {} Arbitrum maximum-fee headroom is outside the reviewed bounds",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryRebalanceConfig {
+    pub approval_gate: LiveCanaryApprovalGate,
+    #[serde(default)]
+    pub production_approval_actor: Option<String>,
+    #[serde(default)]
+    pub production_approval_recorded_at_utc: Option<String>,
+    pub binance_network: String,
+    pub maximum_transfer_count: u16,
+    pub maximum_concurrent_transfers: u16,
+    pub maximum_failed_transfers: u16,
+    pub maximum_token_a_debit_base_units: String,
+    pub maximum_token_b_debit_base_units: String,
+    pub maximum_token_a_fee_base_units: String,
+    pub maximum_token_b_fee_base_units: String,
+    pub rollout_duration_seconds: u64,
+    pub maximum_unknown_reconciliation_queries: u16,
+    pub direct_route_only: bool,
+    pub bridge_mutations_enabled: bool,
+}
+
+impl LiveCanaryRebalanceConfig {
+    fn validate(&self, pair: &PairConfig, canary: &LiveCanaryConfig) -> anyhow::Result<()> {
+        match self.approval_gate {
+            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired => {
+                ensure!(
+                    !canary.rebalance_mutations_enabled
+                        && !pair.rebalance.enabled
+                        && self.production_approval_actor.is_none()
+                        && self.production_approval_recorded_at_utc.is_none(),
+                    "pair {} unapproved M10 policy cannot enable rebalance mutations",
+                    pair.id
+                );
+            }
+            LiveCanaryApprovalGate::ExplicitProductionApproved => {
+                ensure!(
+                    canary.rebalance_mutations_enabled
+                        && pair.rebalance.enabled
+                        && self
+                            .production_approval_actor
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && self
+                            .production_approval_recorded_at_utc
+                            .as_deref()
+                            .is_some_and(|value| value.ends_with('Z')),
+                    "pair {} M10 live rebalance requires an auditable explicit approval",
+                    pair.id
+                );
+            }
+        }
+        ensure!(
+            pair.chain.chain_id == 42_161
+                && self.binance_network == "ARBITRUM"
+                && self.binance_network == pair.chain.binance_network_name
+                && self.maximum_transfer_count == 2
+                && self.maximum_concurrent_transfers == 1
+                && self.maximum_failed_transfers == 1
+                && self.rollout_duration_seconds == 900
+                && self.maximum_unknown_reconciliation_queries == 1
+                && self.direct_route_only
+                && !self.bridge_mutations_enabled,
+            "pair {} M10 route, concurrency, duration, or recovery bounds are invalid",
+            pair.id
+        );
+        let token_a_debit = parse_base_units_u256(
+            &self.maximum_token_a_debit_base_units,
+            "live_canary.rebalance_live_canary.maximum_token_a_debit_base_units",
+        )?;
+        let token_b_debit = parse_base_units_u256(
+            &self.maximum_token_b_debit_base_units,
+            "live_canary.rebalance_live_canary.maximum_token_b_debit_base_units",
+        )?;
+        let token_a_fee = parse_base_units_u256(
+            &self.maximum_token_a_fee_base_units,
+            "live_canary.rebalance_live_canary.maximum_token_a_fee_base_units",
+        )?;
+        let token_b_fee = parse_base_units_u256(
+            &self.maximum_token_b_fee_base_units,
+            "live_canary.rebalance_live_canary.maximum_token_b_fee_base_units",
+        )?;
+        ensure!(
+            token_a_debit == U256::from(25_000_000_u64)
+                && token_b_debit == U256::from(401_200_000_000_000_000_000_u128)
+                && token_a_fee == U256::from(5_000_000_u64)
+                && token_b_fee == U256::from(2_000_000_000_000_000_000_u128)
+                && token_a_fee < token_a_debit
+                && token_b_fee < token_b_debit,
+            "pair {} M10 value or fee caps differ from the reviewed bounded canary",
             pair.id
         );
         Ok(())
@@ -1600,6 +1702,17 @@ mod tests {
             "0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b"
         );
         assert_eq!(canary.arbitrum_max_fee_headroom_bps, 12_000);
+        let rebalance = canary.rebalance_live_canary.as_ref().unwrap();
+        assert_eq!(
+            rebalance.approval_gate,
+            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+        );
+        assert_eq!(rebalance.binance_network, "ARBITRUM");
+        assert_eq!(rebalance.maximum_transfer_count, 2);
+        assert_eq!(rebalance.maximum_concurrent_transfers, 1);
+        assert!(rebalance.direct_route_only);
+        assert!(!rebalance.bridge_mutations_enabled);
+        assert!(!canary.rebalance_mutations_enabled);
         let evm_recovery = prefunding
             .approved_evm_prebroadcast_rejection
             .as_ref()
@@ -1641,6 +1754,22 @@ mod tests {
         value["pairs"][0]["live_canary"]["prefunding_rebalance"]["withdrawal_api_mode"] =
             Value::String("travel_rule".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(true);
+        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(true);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
+            Value::String("explicit_production_approved".to_owned());
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_actor"] =
+            Value::String("operator".to_owned());
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_recorded_at_utc"] =
+            Value::String("2026-07-31T00:00:00Z".to_owned());
+        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(true);
+        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(true);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_ok());
     }
 
     #[test]

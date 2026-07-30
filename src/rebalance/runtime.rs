@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -26,7 +26,11 @@ use crate::{
         sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
     chain::rpc::{JsonRpcClient, TransactionReceipt},
+    dex::execution::{EvmExecutionOwnerHandle, EvmExecutionRequest},
+    domain::compiled::CompiledCapitalCanaryPolicy,
     m8_readiness::{ARBITRUM_CHAIN_ID, ARBITRUM_ESP, ARBITRUM_USDC},
+    portfolio::authorize_m10_rebalance_request,
+    telemetry::TelemetryHandle,
     wallet::{
         EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
         PROCESS_NONCE_LOCK_TTL, TransactionJournal, UnknownOutcomeReason, WalletCall,
@@ -44,6 +48,7 @@ const GAS_LIMIT_MARGIN_DENOMINATOR: u64 = 100;
 const MAX_ERC20_GAS_LIMIT: u64 = 1_000_000;
 const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
 const BINANCE_WITHDRAWAL_API_MODE: &str = "standard";
+const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct RebalanceRuntimeLimits {
@@ -346,6 +351,14 @@ pub struct RebalanceExecutor {
     execution_journal: RebalanceExecutionJournal,
     evm: RebalanceEvmExecutionOwner,
     limits: RebalanceRuntimeLimits,
+    capital_canary: Option<CompiledCapitalCanaryPolicy>,
+    telemetry: Option<RebalanceTelemetry>,
+}
+
+#[derive(Clone)]
+struct RebalanceTelemetry {
+    handle: TelemetryHandle,
+    engine_id: String,
 }
 
 /// The only rebalancing component that can access signing material or nonce
@@ -358,6 +371,7 @@ struct RebalanceEvmExecutionOwner {
     transaction_journal: TransactionJournal,
     world_nonce: NonceLane,
     optimism_nonce: NonceLane,
+    arbitrum: Option<EvmExecutionOwnerHandle>,
 }
 
 impl RebalanceEvmExecutionOwner {
@@ -383,6 +397,32 @@ impl RebalanceEvmExecutionOwner {
         }
     }
 
+    async fn attach_arbitrum(
+        &mut self,
+        owner: EvmExecutionOwnerHandle,
+        rpc: JsonRpcClient,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            owner.chain_id() == ARBITRUM_CHAIN_ID,
+            "shared Arbitrum EVM owner returned the wrong chain id"
+        );
+        ensure!(
+            owner.wallet_address() == self.wallet.address(),
+            "shared Arbitrum EVM owner returned a different wallet"
+        );
+        ensure!(
+            rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
+            "shared Arbitrum read RPC returned the wrong chain id"
+        );
+        ensure!(
+            !self.direct_read_rpcs.contains_key(&ARBITRUM_CHAIN_ID) && self.arbitrum.is_none(),
+            "shared Arbitrum EVM owner was attached twice"
+        );
+        self.direct_read_rpcs.insert(ARBITRUM_CHAIN_ID, rpc);
+        self.arbitrum = Some(owner);
+        Ok(())
+    }
+
     async fn execute(
         &mut self,
         chain_id: u64,
@@ -391,6 +431,21 @@ impl RebalanceEvmExecutionOwner {
         call: &WalletCall,
         timeout: Duration,
     ) -> anyhow::Result<B256> {
+        if chain_id == ARBITRUM_CHAIN_ID {
+            let receipt = self
+                .arbitrum
+                .as_ref()
+                .context("rebalance EVM owner has no shared Arbitrum execution lane")?
+                .execute(EvmExecutionRequest {
+                    operation_id,
+                    purpose: purpose.to_owned(),
+                    call: call.clone(),
+                    confirmation_timeout: shared_evm_confirmation_timeout(timeout),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            return Ok(receipt.transaction_hash);
+        }
         let (rpc, nonce) = match chain_id {
             WORLD_CHAIN_CHAIN_ID => (&self.world, &mut self.world_nonce),
             OPTIMISM_CHAIN_ID => (&self.optimism, &mut self.optimism_nonce),
@@ -410,6 +465,10 @@ impl RebalanceEvmExecutionOwner {
     }
 }
 
+fn shared_evm_confirmation_timeout(operation_timeout: Duration) -> Duration {
+    operation_timeout.min(SHARED_EVM_CONFIRMATION_TIMEOUT_MAX)
+}
+
 impl std::fmt::Debug for RebalanceExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -417,6 +476,8 @@ impl std::fmt::Debug for RebalanceExecutor {
             .field("wallet", &self.evm.wallet_address())
             .field("world_nonce", &self.evm.nonce_state(WORLD_CHAIN_CHAIN_ID))
             .field("optimism_nonce", &self.evm.nonce_state(OPTIMISM_CHAIN_ID))
+            .field("arbitrum_shared_owner", &self.evm.arbitrum.is_some())
+            .field("capital_canary", &self.capital_canary)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
@@ -585,17 +646,117 @@ impl RebalanceExecutor {
                 transaction_journal,
                 world_nonce,
                 optimism_nonce,
+                arbitrum: None,
             },
             limits,
+            capital_canary: None,
+            telemetry: None,
         })
+    }
+
+    pub fn set_capital_canary_policy(
+        &mut self,
+        policy: Option<CompiledCapitalCanaryPolicy>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.capital_canary.is_none(),
+            "M10 capital canary policy was configured twice"
+        );
+        self.capital_canary = policy;
+        Ok(())
+    }
+
+    pub fn set_telemetry(&mut self, handle: TelemetryHandle, engine_id: String) {
+        self.telemetry = Some(RebalanceTelemetry { handle, engine_id });
+    }
+
+    pub async fn attach_arbitrum_execution_owner(
+        &mut self,
+        owner: EvmExecutionOwnerHandle,
+        rpc: JsonRpcClient,
+    ) -> anyhow::Result<()> {
+        self.evm.attach_arbitrum(owner, rpc).await
     }
 
     pub fn active_operation(&self) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
         self.execution_journal.active_operation()
     }
 
+    pub fn m10_canary_risk(&self) -> anyhow::Result<super::RebalanceCanaryRisk> {
+        self.execution_journal.m10_canary_risk()
+    }
+
     pub fn operations(&self) -> &std::collections::BTreeMap<String, RebalanceExecutionOperation> {
         self.execution_journal.operations()
+    }
+
+    pub fn latest_m10_operation(&self) -> Option<&RebalanceExecutionOperation> {
+        self.execution_journal.latest_m10_operation()
+    }
+
+    fn emit_m10_binance_child(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        stage: &str,
+        started_at: Instant,
+        outcome: &str,
+        error: Option<&anyhow::Error>,
+    ) {
+        if operation
+            .intent
+            .scope
+            .as_ref()
+            .is_none_or(|scope| scope.strategy_id != "rebalance-arbitrum-usdc-esp-m10")
+        {
+            return;
+        }
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        telemetry.handle.emit(
+            "m10_rebalance_child",
+            serde_json::json!({
+                "engine_id": telemetry.engine_id,
+                "strategy_id": "rebalance-arbitrum-usdc-esp-m10",
+                "operation_id": operation.intent.operation_id,
+                "owner": "binance_capital",
+                "stage": stage,
+                "duration_us": started_at.elapsed().as_micros(),
+                "outcome": outcome,
+                "error": error.map(|error| format!("{error:#}")),
+            }),
+        );
+    }
+
+    fn emit_m10_risk_snapshot(&self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        match self.execution_journal.m10_canary_risk() {
+            Ok(risk) => telemetry.handle.emit(
+                "m10_rebalance_risk_snapshot",
+                serde_json::json!({
+                    "engine_id": telemetry.engine_id,
+                    "transfer_count": risk.transfer_count,
+                    "active_transfer_count": risk.active_transfer_count,
+                    "failed_transfer_count": risk.failed_transfer_count,
+                    "token_a_debit": risk.token_a_debit.to_string(),
+                    "token_b_debit": risk.token_b_debit.to_string(),
+                    "token_a_maximum_fee": risk.token_a_maximum_fee.to_string(),
+                    "token_b_maximum_fee": risk.token_b_maximum_fee.to_string(),
+                    "first_started_at_unix_ms": risk.first_started_at_unix_ms,
+                    "outcome": "success",
+                }),
+            ),
+            Err(error) => telemetry.handle.emit(
+                "m10_rebalance_risk_snapshot",
+                serde_json::json!({
+                    "engine_id": telemetry.engine_id,
+                    "outcome": "failed",
+                    "error": format!("{error:#}"),
+                }),
+            ),
+        }
     }
 
     pub async fn log_active_operation_recovery_evidence(&self) -> anyhow::Result<()> {
@@ -863,6 +1024,7 @@ impl RebalanceExecutor {
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                 api_mode,
                 bridge_balance_before,
+                ..
             } => {
                 ensure!(
                     api_mode == "standard",
@@ -1087,6 +1249,7 @@ impl RebalanceExecutor {
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                 api_mode: "standard".to_owned(),
                 bridge_balance_before,
+                reconciliation_queries: 0,
             },
         )?;
         let submission_reference = self
@@ -1166,7 +1329,24 @@ impl RebalanceExecutor {
             requested <= self.limits.maximum_for(&request.token_symbol)?,
             "rebalance request exceeds the configured live maximum"
         );
+        if request.authority == super::RebalanceExecutionAuthority::ArbitrumM10Canary {
+            let policy = self
+                .capital_canary
+                .as_ref()
+                .context("M10 request has no compiled capital policy")?;
+            let risk = self.execution_journal.m10_canary_risk()?;
+            let now_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?
+                .as_millis()
+                .try_into()
+                .context("current Unix timestamp exceeds u64")?;
+            authorize_m10_rebalance_request(policy, &risk, &request, now_unix_ms)?;
+        }
         let operation = self.execution_journal.reserve(&request)?;
+        if request.authority == super::RebalanceExecutionAuthority::ArbitrumM10Canary {
+            self.emit_m10_risk_snapshot();
+        }
         self.process(operation, true).await
     }
 
@@ -1213,6 +1393,13 @@ impl RebalanceExecutor {
                 RebalanceExecutionProgress::IntentRecorded
                     | RebalanceExecutionProgress::BinanceTransferSubmitted { .. }
             );
+        let observe_master_transfer = matches!(
+            operation.progress,
+            RebalanceExecutionProgress::IntentRecorded
+                | RebalanceExecutionProgress::BinanceTransferSubmitted { .. }
+        );
+        let master_transfer_started_at = Instant::now();
+        let master_transfer_observation = operation.clone();
         if matches!(
             operation.progress,
             RebalanceExecutionProgress::IntentRecorded
@@ -1226,24 +1413,111 @@ impl RebalanceExecutor {
                     operation.intent.wallet_owner,
                 )
                 .await?;
-            operation = self
+            operation = match self
                 .begin_master_transfer(operation, created_here, bridge_before)
-                .await?;
+                .await
+            {
+                Ok(operation) => operation,
+                Err(error) => {
+                    self.emit_m10_binance_child(
+                        &master_transfer_observation,
+                        "master_transfer",
+                        master_transfer_started_at,
+                        "failed",
+                        Some(&error),
+                    );
+                    return Err(error);
+                }
+            };
         }
-        operation = self.finish_master_transfer(operation).await?;
-        operation = self
+        operation = match self.finish_master_transfer(operation).await {
+            Ok(operation) => {
+                if observe_master_transfer {
+                    self.emit_m10_binance_child(
+                        &operation,
+                        "master_transfer",
+                        master_transfer_started_at,
+                        "success",
+                        None,
+                    );
+                }
+                operation
+            }
+            Err(error) => {
+                if observe_master_transfer {
+                    self.emit_m10_binance_child(
+                        &master_transfer_observation,
+                        "master_transfer",
+                        master_transfer_started_at,
+                        "failed",
+                        Some(&error),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if matches!(
+            operation.progress,
+            RebalanceExecutionProgress::BinanceTransferCompleted { .. }
+        ) {
+            self.verify_route(&operation, true).await?;
+        }
+        let withdrawal_started_at = Instant::now();
+        let withdrawal_observation = operation.clone();
+        operation = match self
             .begin_binance_withdrawal(operation, withdrawal_submission_safe, &binance_network)
-            .await?;
+            .await
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.emit_m10_binance_child(
+                    &withdrawal_observation,
+                    "withdrawal",
+                    withdrawal_started_at,
+                    "failed",
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        };
         let record = match &operation.progress {
             RebalanceExecutionProgress::BinanceWithdrawalSubmitted { .. } => {
-                self.wait_withdrawal(&operation).await?
+                match self.wait_withdrawal(&operation).await {
+                    Ok(record) => record,
+                    Err(error) => {
+                        self.emit_m10_binance_child(
+                            &operation,
+                            "withdrawal",
+                            withdrawal_started_at,
+                            "failed",
+                            Some(&error),
+                        );
+                        return Err(error);
+                    }
+                }
             }
-            RebalanceExecutionProgress::Completed { .. } => return Ok(operation),
+            RebalanceExecutionProgress::Completed { .. } => {
+                self.emit_m10_binance_child(
+                    &operation,
+                    "withdrawal",
+                    withdrawal_started_at,
+                    "success",
+                    None,
+                );
+                return Ok(operation);
+            }
             RebalanceExecutionProgress::Failed { reason } => {
                 bail!("rebalance previously failed: {reason}")
             }
             _ => bail!("direct Binance-to-wallet operation has invalid recovery state"),
         };
+        self.emit_m10_binance_child(
+            &operation,
+            "withdrawal",
+            withdrawal_started_at,
+            "success",
+            None,
+        );
         let received = withdrawal_received_base_units(&record, operation.intent.token_decimals)?;
         let wallet_after = self
             .wait_direct_withdrawal_credit(
@@ -1277,9 +1551,19 @@ impl RebalanceExecutor {
             _ => unreachable!(),
         };
         ensure!(
-            chain_id == WORLD_CHAIN_CHAIN_ID,
-            "direct rebalance source is not World Chain"
+            matches!(chain_id, WORLD_CHAIN_CHAIN_ID | ARBITRUM_CHAIN_ID),
+            "direct rebalance source chain is not approved"
         );
+        if chain_id == ARBITRUM_CHAIN_ID {
+            ensure!(
+                operation
+                    .intent
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10"),
+                "Arbitrum wallet-to-Binance transfer lacks M10 authority"
+            );
+        }
         if matches!(
             operation.progress,
             RebalanceExecutionProgress::IntentRecorded
@@ -1297,7 +1581,7 @@ impl RebalanceExecutor {
             let transaction_hash = self
                 .evm
                 .execute(
-                    WORLD_CHAIN_CHAIN_ID,
+                    chain_id,
                     format!("{}:deposit", operation.intent.operation_id),
                     "rebalance_wallet_to_binance",
                     &call,
@@ -1307,14 +1591,38 @@ impl RebalanceExecutor {
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::DepositTransferMined {
-                    chain_id: WORLD_CHAIN_CHAIN_ID,
+                    chain_id,
                     transaction_hash,
                 },
             )?;
         }
-        operation = self
+        let deposit_started_at = Instant::now();
+        let deposit_observation = operation.clone();
+        operation = match self
             .finish_binance_deposit(operation, &binance_network)
-            .await?;
+            .await
+        {
+            Ok(operation) => {
+                self.emit_m10_binance_child(
+                    &operation,
+                    "deposit_credit",
+                    deposit_started_at,
+                    "success",
+                    None,
+                );
+                operation
+            }
+            Err(error) => {
+                self.emit_m10_binance_child(
+                    &deposit_observation,
+                    "deposit_credit",
+                    deposit_started_at,
+                    "failed",
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        };
         Ok(operation)
     }
 
@@ -1359,6 +1667,12 @@ impl RebalanceExecutor {
                 .await?;
         }
         operation = self.finish_master_transfer(operation).await?;
+        if matches!(
+            operation.progress,
+            RebalanceExecutionProgress::BinanceTransferCompleted { .. }
+        ) {
+            self.verify_route(&operation, true).await?;
+        }
         operation = self
             .begin_binance_withdrawal(operation, withdrawal_submission_safe, &binance_network)
             .await?;
@@ -1855,13 +2169,21 @@ impl RebalanceExecutor {
         mut operation: RebalanceExecutionOperation,
         network: &str,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
-        if let RebalanceExecutionProgress::DepositTransferMined {
-            transaction_hash, ..
-        } = operation.progress
-        {
-            let deposit = self
-                .wait_binance_deposit(&operation, transaction_hash, network)
+        let transaction_hash = match &operation.progress {
+            RebalanceExecutionProgress::DepositTransferMined {
+                transaction_hash, ..
+            }
+            | RebalanceExecutionProgress::DepositQuestionnaireSubmissionStarted {
+                transaction_hash,
+                ..
+            } => Some(*transaction_hash),
+            _ => None,
+        };
+        if let Some(transaction_hash) = transaction_hash {
+            let (next_operation, deposit) = self
+                .wait_binance_deposit(operation, transaction_hash, network)
                 .await?;
+            operation = next_operation;
             let credited = decimal_to_base_units(deposit.amount, operation.intent.token_decimals)?;
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
@@ -1892,9 +2214,10 @@ impl RebalanceExecutor {
                     "Binance free balance is below pre-deposit balance plus credited deposit; treating Binance deposit history as settlement evidence because live trading may have consumed free balance"
                 );
             }
+            let wallet_chain_id = route_wallet_chain_id(&operation.intent.route);
             let wallet_after = self
                 .evm
-                .rpc(WORLD_CHAIN_CHAIN_ID)?
+                .rpc(wallet_chain_id)?
                 .erc20_balance(
                     operation.intent.token_contract,
                     operation.intent.wallet_owner,
@@ -1980,6 +2303,21 @@ impl RebalanceExecutor {
         submission_safe: bool,
         network: &str,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
+        if let RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+            api_mode,
+            reconciliation_queries,
+            ..
+        } = &operation.progress
+        {
+            ensure!(
+                api_mode == BINANCE_WITHDRAWAL_API_MODE,
+                "journaled Binance withdrawal API mode is not the standard capital API"
+            );
+            ensure!(
+                *reconciliation_queries == 0,
+                "journaled standard Binance withdrawal exhausted its one reconciliation query; operator review required"
+            );
+        }
         let bridge_balance_before = match &operation.progress {
             RebalanceExecutionProgress::BinanceTransferCompleted {
                 bridge_balance_before,
@@ -2003,6 +2341,7 @@ impl RebalanceExecutor {
             record.id.clone()
         } else if let RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
             api_mode,
+            reconciliation_queries,
             ..
         } = &operation.progress
         {
@@ -2010,6 +2349,18 @@ impl RebalanceExecutor {
                 api_mode == BINANCE_WITHDRAWAL_API_MODE,
                 "journaled Binance withdrawal API mode is not the standard capital API"
             );
+            ensure!(
+                *reconciliation_queries == 0,
+                "journaled standard Binance withdrawal exceeded its reconciliation query authority"
+            );
+            self.execution_journal.advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: api_mode.clone(),
+                    bridge_balance_before,
+                    reconciliation_queries: 1,
+                },
+            )?;
             bail!(
                 "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
             )
@@ -2023,6 +2374,7 @@ impl RebalanceExecutor {
                 RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                     api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned(),
                     bridge_balance_before,
+                    reconciliation_queries: 0,
                 },
             )?;
             let amount =
@@ -2152,17 +2504,17 @@ impl RebalanceExecutor {
     }
 
     async fn wait_binance_deposit(
-        &self,
-        operation: &RebalanceExecutionOperation,
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
         transaction_hash: B256,
         network: &str,
-    ) -> anyhow::Result<DepositRecord> {
-        let transaction_hash = format!("{transaction_hash:#x}");
+    ) -> anyhow::Result<(RebalanceExecutionOperation, DepositRecord)> {
+        let transaction_hash_text = format!("{transaction_hash:#x}");
         let deadline = tokio::time::Instant::now() + self.limits.operation_timeout;
         loop {
             if let Some(record) = self
                 .trading_binance
-                .deposit_history(&operation.intent.token_symbol, &transaction_hash)
+                .deposit_history(&operation.intent.token_symbol, &transaction_hash_text)
                 .await?
                 .into_iter()
                 .next()
@@ -2172,17 +2524,43 @@ impl RebalanceExecutor {
                     "Binance credited deposit on a different network"
                 );
                 if record.questionnaire_required() {
-                    let submission = self
-                        .trading_binance
-                        .submit_deposit_questionnaire(&record.deposit_id)
-                        .await?;
-                    ensure!(
-                        submission.accepted,
-                        "Binance rejected deposit questionnaire: {}",
-                        submission.info
-                    );
-                } else if record.is_credited() {
-                    return Ok(record);
+                    if let RebalanceExecutionProgress::DepositQuestionnaireSubmissionStarted {
+                        deposit_id,
+                        ..
+                    } = &operation.progress
+                    {
+                        ensure!(
+                            deposit_id == &record.deposit_id,
+                            "Binance changed the deposit id after questionnaire submission started"
+                        );
+                    } else {
+                        let chain_id = route_wallet_chain_id(&operation.intent.route);
+                        operation = self.execution_journal.advance(
+                            &operation.intent.operation_id,
+                            RebalanceExecutionProgress::DepositQuestionnaireSubmissionStarted {
+                                chain_id,
+                                transaction_hash,
+                                deposit_id: record.deposit_id.clone(),
+                            },
+                        )?;
+                        let submission = self
+                            .trading_binance
+                            .submit_deposit_questionnaire(&record.deposit_id)
+                            .await?;
+                        ensure!(
+                            submission.accepted,
+                            "Binance rejected deposit questionnaire: {}",
+                            submission.info
+                        );
+                    }
+                }
+                // Match the Rails contract: inspect and submit the deposit
+                // questionnaire first when Binance requests it, then accept
+                // either credited state from the same observation. Status 6
+                // means the funds are credited even if withdrawal remains
+                // temporarily locked.
+                if record.is_credited() {
+                    return Ok((operation, record));
                 }
             }
             ensure!(
@@ -2252,7 +2630,11 @@ impl RebalanceExecutor {
                 binance_network, ..
             } => (binance_network.as_str(), "WLD"),
         };
-        let coins = self.trading_binance.all_coin_information().await?;
+        let coins = if withdrawal {
+            self.treasury_binance.all_coin_information().await?
+        } else {
+            self.trading_binance.all_coin_information().await?
+        };
         let capital = select_capital_routes(
             &coins,
             &operation.intent.token_symbol,
@@ -2295,6 +2677,27 @@ impl RebalanceExecutor {
                     == U256::ZERO,
                 "rebalance withdrawal violates live integer multiple"
             );
+            if operation
+                .intent
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10")
+            {
+                let authorized_fee = operation
+                    .intent
+                    .canary_maximum_fee_base_units
+                    .as_deref()
+                    .context("M10 withdrawal has no durable fee authority")
+                    .and_then(|value| {
+                        U256::from_str(value).context("M10 fee authority is not a uint256")
+                    })?;
+                let current_fee =
+                    decimal_to_base_units(selected.withdraw_fee, operation.intent.token_decimals)?;
+                ensure!(
+                    current_fee <= authorized_fee,
+                    "live Binance withdrawal fee exceeds M10 durable authority"
+                );
+            }
         }
         Ok(())
     }
@@ -2927,7 +3330,7 @@ fn reconcile_approved_travel_rule_rejection(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, time::Duration};
 
     use alloy_primitives::{Address, B256, U256, keccak256};
     use rust_decimal::Decimal;
@@ -2949,11 +3352,23 @@ mod tests {
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, account_asset_balance_or_zero, base_units_to_decimal,
         decimal_to_base_units, decimal_to_base_units_floor,
         matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
-        plan_direct_prefunding, reconcile_approved_travel_rule_rejection,
-        validate_across_fill_receipt, validate_approved_asset, validate_direct_withdrawal_receipt,
-        validate_manual_prefunding_withdrawal_record, withdrawal_received_base_units,
-        withdrawal_requested_base_units,
+        plan_direct_prefunding, reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
+        shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
+        validate_direct_withdrawal_receipt, validate_manual_prefunding_withdrawal_record,
+        withdrawal_received_base_units, withdrawal_requested_base_units,
     };
+
+    #[test]
+    fn production_saga_timeout_is_bounded_for_one_shared_evm_child() {
+        assert_eq!(
+            shared_evm_confirmation_timeout(Duration::from_secs(1_800)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            shared_evm_confirmation_timeout(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
 
     fn arbitrum_network(fee: &str) -> NetworkInformation {
         NetworkInformation {
@@ -2967,6 +3382,17 @@ mod tests {
             withdraw_max: Decimal::from_str_exact("1000000").unwrap(),
             withdraw_integer_multiple: Decimal::from_str_exact("0.01").unwrap(),
         }
+    }
+
+    #[test]
+    fn direct_arbitrum_deposit_settlement_keeps_the_pinned_wallet_chain() {
+        assert_eq!(
+            route_wallet_chain_id(&Route::Direct {
+                binance_network: "ARBITRUM".to_owned(),
+                chain_id: ARBITRUM_CHAIN_ID,
+            }),
+            ARBITRUM_CHAIN_ID
+        );
     }
 
     #[test]
@@ -3310,10 +3736,12 @@ mod tests {
                 amount: U256::from(401_200_000_000_000_000_000_u128),
                 binance_balance_before: U256::from(10_000_000_000_000_000_000_000_u128),
                 wallet_balance_before: U256::ZERO,
+                canary_maximum_fee_base_units: None,
             },
             progress: RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                 api_mode: "standard".to_owned(),
                 bridge_balance_before: U256::ZERO,
+                reconciliation_queries: 0,
             },
         };
         let record = WithdrawalRecord {

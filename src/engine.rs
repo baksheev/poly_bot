@@ -44,10 +44,7 @@ use crate::{
         ArbitrageDirection, OpportunityEngine, PairEvaluation, PreparedPoolBuildRequest,
         PreparedPoolBuildResult, TradeEvaluation,
     },
-    portfolio::{
-        CapitalAllocatorShadowHandle, CapitalAllocatorShadowTask, PortfolioCatalog,
-        capital_allocator_shadow_channel,
-    },
+    portfolio::{AllocationIntent, AllocationProposal, CapitalAllocatorHandle, PortfolioCatalog},
     rebalance::{
         Direction, RebalanceEvaluation, RebalanceExecutionOperation, V12RebalanceParityAdapter,
     },
@@ -104,7 +101,7 @@ pub struct TradingEngine {
     paper_trades: Option<PaperTradeHandle>,
     inventory: SharedInventoryReservations,
     portfolio_catalog: Arc<PortfolioCatalog>,
-    capital_allocator: CapitalAllocatorShadowHandle,
+    capital_allocator: CapitalAllocatorHandle,
     binance_asset_decimals: BTreeMap<String, u8>,
     binance_inventory_generation: u64,
     binance_user_data_connected: bool,
@@ -126,6 +123,7 @@ pub struct TradingEngine {
     rebalance_inflight: bool,
     rebalance_inflight_since: Option<Instant>,
     rebalance_blocked: bool,
+    rebalance_creation_stop_reason: Option<String>,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
     last_depth_health_log_at: Option<Instant>,
@@ -143,6 +141,7 @@ pub struct TradingExecutionHandles {
     pub binance_asset_decimals: BTreeMap<String, u8>,
     pub portfolio_catalog: Arc<PortfolioCatalog>,
     pub inventory: SharedInventoryReservations,
+    pub capital_allocator: CapitalAllocatorHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +164,7 @@ const STRATEGY_BASELINE_CALCULATION_BUDGET_US: u64 = 200;
 #[derive(Debug)]
 struct RebalanceSettlementBarrier {
     operation_id: String,
+    strategy_id: String,
     token_symbol: String,
     direction: Direction,
     binance_after: Instant,
@@ -512,7 +512,7 @@ impl TradingEngine {
         rebalance: V12RebalanceParityAdapter,
         execution: TradingExecutionHandles,
         binance_fee_bps: BinanceFeeBps,
-    ) -> anyhow::Result<(Self, HotTelemetryTask, CapitalAllocatorShadowTask)> {
+    ) -> anyhow::Result<(Self, HotTelemetryTask)> {
         let strategy_price_transport_silence_limits_ms =
             domain_config.strategy_price_transport_silence_limits_ms();
         let symbols = strategy_price_transport_silence_limits_ms
@@ -603,11 +603,6 @@ impl TradingEngine {
         let (hot_telemetry, hot_telemetry_task) =
             hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
         let portfolio_catalog = execution.portfolio_catalog;
-        let (capital_allocator, capital_allocator_task) = capital_allocator_shadow_channel(
-            portfolio_catalog.as_ref(),
-            telemetry.clone(),
-            config.engine_id.clone(),
-        );
         let require_binance_depth =
             requires_depth_for_runtime_phase(config.arbitrage_execution_mode.as_str());
         Ok((
@@ -626,7 +621,7 @@ impl TradingEngine {
                 hot_telemetry,
                 paper_trades: execution.paper_trades,
                 inventory: execution.inventory,
-                capital_allocator,
+                capital_allocator: execution.capital_allocator,
                 portfolio_catalog,
                 binance_asset_decimals: execution.binance_asset_decimals,
                 binance_inventory_generation: 0,
@@ -649,6 +644,7 @@ impl TradingEngine {
                 rebalance_inflight: false,
                 rebalance_inflight_since: None,
                 rebalance_blocked: false,
+                rebalance_creation_stop_reason: None,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
                 last_depth_health_log_at: None,
@@ -660,7 +656,6 @@ impl TradingEngine {
                 pending_adaptive_sizing: Vec::new(),
             },
             hot_telemetry_task,
-            capital_allocator_task,
         ))
     }
 
@@ -1715,6 +1710,108 @@ impl TradingEngine {
         Ok(Some(evaluation))
     }
 
+    pub fn pending_rebalance_execution(&self) -> Option<&RebalanceEvaluation> {
+        self.pending_rebalance.as_ref()
+    }
+
+    pub fn cap_pending_rebalance_amount(&mut self, maximum: U256) -> anyhow::Result<()> {
+        ensure!(!maximum.is_zero(), "rebalance dispatch maximum is zero");
+        let Some(evaluation) = self.pending_rebalance.as_mut() else {
+            return Ok(());
+        };
+        let action = evaluation
+            .plan
+            .action
+            .as_mut()
+            .context("pending rebalance evaluation has no action")?;
+        action.amount = action.amount.min(maximum);
+        ensure!(!action.amount.is_zero(), "bounded rebalance action is zero");
+        Ok(())
+    }
+
+    pub fn stop_pending_rebalance_creation(&mut self, reason: &str) {
+        self.pending_rebalance = None;
+        self.rebalance_inflight = false;
+        self.rebalance_inflight_since = None;
+        self.rebalance_creation_stop_reason = Some(reason.to_owned());
+        self.telemetry.emit(
+            "rebalance_creation_stopped",
+            json!({
+                "engine_id": self.config.engine_id,
+                "reason": reason,
+            }),
+        );
+    }
+
+    pub async fn authorize_pending_rebalance_allocation(
+        &self,
+        transfer_fee: U256,
+    ) -> anyhow::Result<Option<AllocationProposal>> {
+        let Some(evaluation) = self.pending_rebalance.as_ref() else {
+            return Ok(None);
+        };
+        let action = evaluation
+            .plan
+            .action
+            .as_ref()
+            .context("pending rebalance evaluation has no action")?;
+        ensure!(
+            transfer_fee <= action.amount,
+            "rebalance transfer fee exceeds source debit"
+        );
+        let pair_chain_id = self
+            .domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.execution_enabled)
+            .context("rebalance requires one executable pair")?
+            .chain
+            .chain_id;
+        let binance = self.binance_inventory_location()?;
+        let wallet = self.wallet_inventory_location(pair_chain_id)?;
+        let (source_location, destination_location) = match action.direction {
+            Direction::BinanceToWallet => (binance, wallet),
+            Direction::WalletToBinance => (wallet, binance),
+        };
+        let source = self.portfolio_key(&source_location, &evaluation.token_symbol)?;
+        let destination = self.portfolio_key(&destination_location, &evaluation.token_symbol)?;
+        let intent = AllocationIntent {
+            proposal_id: format!(
+                "rebalance-allocation-{}-{}",
+                evaluation.token_symbol,
+                match action.direction {
+                    Direction::BinanceToWallet => "binance-to-wallet",
+                    Direction::WalletToBinance => "wallet-to-binance",
+                }
+            ),
+            economic_asset_id: self
+                .portfolio_catalog
+                .economic_asset_id(&source)?
+                .to_owned(),
+            source,
+            destination,
+            destination_credit: action
+                .amount
+                .checked_sub(transfer_fee)
+                .context("rebalance destination credit underflow")?,
+            fee: transfer_fee,
+        };
+        let proposals = self
+            .capital_allocator
+            .plan(
+                self.inventory.portfolio_snapshot(),
+                Vec::new(),
+                vec![intent],
+            )
+            .await?;
+        ensure!(
+            proposals.len() == 1,
+            "capital allocator did not return exactly one rebalance proposal"
+        );
+        Ok(proposals.into_iter().next())
+    }
+
     pub fn on_portfolio_wallet_snapshot(
         &mut self,
         snapshot: &crate::balances::WalletBalanceSnapshot,
@@ -1788,6 +1885,12 @@ impl TradingEngine {
                     ];
                     self.rebalance_settlement = Some(RebalanceSettlementBarrier {
                         operation_id: operation.intent.operation_id.clone(),
+                        strategy_id: operation
+                            .intent
+                            .scope
+                            .as_ref()
+                            .map_or("legacy", |scope| scope.strategy_id.as_str())
+                            .to_owned(),
                         token_symbol: operation.intent.token_symbol.clone(),
                         direction: operation.intent.direction,
                         binance_after: binance.observed_at,
@@ -1801,6 +1904,7 @@ impl TradingEngine {
                     json!({
                         "engine_id": self.config.engine_id,
                         "operation_id": operation.intent.operation_id,
+                        "strategy_id": operation.intent.scope.as_ref().map(|scope| &scope.strategy_id),
                         "recovered": true,
                     }),
                 );
@@ -1856,6 +1960,12 @@ impl TradingEngine {
                     ];
                     self.rebalance_settlement = Some(RebalanceSettlementBarrier {
                         operation_id: operation.intent.operation_id.clone(),
+                        strategy_id: operation
+                            .intent
+                            .scope
+                            .as_ref()
+                            .map_or("legacy", |scope| scope.strategy_id.as_str())
+                            .to_owned(),
                         token_symbol: operation.intent.token_symbol.clone(),
                         direction: operation.intent.direction,
                         binance_after: binance.observed_at,
@@ -1869,6 +1979,7 @@ impl TradingEngine {
                     json!({
                         "engine_id": self.config.engine_id,
                         "operation_id": operation.intent.operation_id,
+                        "strategy_id": operation.intent.scope.as_ref().map(|scope| &scope.strategy_id),
                     }),
                 );
                 self.telemetry.emit(
@@ -1994,8 +2105,10 @@ impl TradingEngine {
                 json!({
                     "engine_id": self.config.engine_id,
                     "operation_id": barrier.operation_id,
+                    "strategy_id": barrier.strategy_id,
                     "token": barrier.token_symbol,
                     "direction": format!("{:?}", barrier.direction),
+                    "settlement_duration_us": duration_us(barrier.started_at.elapsed()),
                     "settlement_locations": barrier
                         .settlement_locations
                         .iter()
@@ -2046,6 +2159,7 @@ impl TradingEngine {
                 if mode == "full_live"
                     && !self.rebalance_inflight
                     && !self.rebalance_blocked
+                    && self.rebalance_creation_stop_reason.is_none()
                     && self.rebalance_settlement.is_none()
                     && self.pending_rebalance.is_none()
                     && let Some(evaluation) = pending_action
@@ -4195,6 +4309,7 @@ mod tests {
         let later = now + std::time::Duration::from_millis(1);
         let barrier = RebalanceSettlementBarrier {
             operation_id: "rebalance-wld-1".to_owned(),
+            strategy_id: "rebalance-world-chain-v12".to_owned(),
             token_symbol: "WLD".to_owned(),
             direction: Direction::WalletToBinance,
             binance_after: now,

@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "7691d196e9dfbcb265f7836f8a43cb3716df256ddfd1cdcbf4e0a62e6af2e878",
+      "source_fingerprint_sha256": "c2cfbc2fca66360c965327f98b8a5286193932fe3f98b14791d26cf046ee5025",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -92,6 +92,23 @@
                   "rpc_error_code": -32000,
                   "rpc_error_message": "max fee per gas less than block base fee: address 0x90D990C81320221D2882De32beeA78923c1e77A3, maxFeePerGas: 20102000 baseFee: 20148000"
                 }
+              },
+              "rebalance_live_canary": {
+                "approval_gate": "explicit_production_approval_required",
+                "production_approval_actor": null,
+                "production_approval_recorded_at_utc": null,
+                "binance_network": "ARBITRUM",
+                "maximum_transfer_count": 2,
+                "maximum_concurrent_transfers": 1,
+                "maximum_failed_transfers": 1,
+                "maximum_token_a_debit_base_units": "25000000",
+                "maximum_token_b_debit_base_units": "401200000000000000000",
+                "maximum_token_a_fee_base_units": "5000000",
+                "maximum_token_b_fee_base_units": "2000000000000000000",
+                "rollout_duration_seconds": 900,
+                "maximum_unknown_reconciliation_queries": 1,
+                "direct_route_only": true,
+                "bridge_mutations_enabled": false
               }
             },
             "chain": {

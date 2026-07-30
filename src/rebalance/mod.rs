@@ -4,8 +4,9 @@ mod runtime;
 mod tracker;
 
 pub use executor::{
-    RebalanceExecutionIntent, RebalanceExecutionJournal, RebalanceExecutionOperation,
-    RebalanceExecutionProgress, RebalanceExecutionRequest,
+    RebalanceCanaryRisk, RebalanceExecutionAuthority, RebalanceExecutionIntent,
+    RebalanceExecutionJournal, RebalanceExecutionOperation, RebalanceExecutionProgress,
+    RebalanceExecutionRequest,
 };
 pub use planner::{
     BalanceSnapshot, Direction, Location, PendingTransfer, RebalanceAction, RebalancePlan,
