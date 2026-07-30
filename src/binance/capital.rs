@@ -253,6 +253,16 @@ impl BinanceAccountClient {
         matching_withdrawals(records, coin, withdraw_order_id)
     }
 
+    pub async fn withdrawal_address_list(&self) -> anyhow::Result<Vec<WithdrawalAddressRecord>> {
+        let query = self.signed_query(&[("recvWindow", "5000".to_owned())])?;
+        self.signed_get(
+            "/sapi/v1/capital/withdraw/address/list",
+            &query,
+            "withdrawal address list",
+        )
+        .await
+    }
+
     pub async fn travel_rule_withdrawal_history(
         &self,
         tr_id: i64,
@@ -566,6 +576,27 @@ pub struct StandardWithdrawalSubmission {
     pub id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalAddressRecord {
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub address_tag: String,
+    #[serde(default)]
+    pub coin: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub origin_type: String,
+    #[serde(default)]
+    pub white_status: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TravelRuleWithdrawalRecord {
@@ -876,9 +907,10 @@ mod tests {
     use super::{
         AddressVerificationRecord, CoinInformation, DEPOSIT_ADDRESS_ENDPOINT, DepositAddressRecord,
         DepositCreditState, DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
-        TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalRecord,
-        WithdrawalState, WithdrawalSubmission, matching_deposits, matching_withdrawals,
-        parse_address_verification_list, select_capital_routes, select_evm_deposit_address,
+        TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalAddressRecord,
+        WithdrawalRecord, WithdrawalState, WithdrawalSubmission, matching_deposits,
+        matching_withdrawals, parse_address_verification_list, select_capital_routes,
+        select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -1029,6 +1061,28 @@ mod tests {
             serde_json::from_str(r#"{"id":"7213fea8e94b4a5593d507237e5a555b"}"#).unwrap();
 
         assert_eq!(submission.id, "7213fea8e94b4a5593d507237e5a555b");
+    }
+
+    #[test]
+    fn parses_coin_scoped_withdrawal_whitelist_records() {
+        let records: Vec<WithdrawalAddressRecord> = serde_json::from_str(
+            r#"[{
+                "address":"0x90D990C81320221D2882De32beeA78923c1e77A3",
+                "addressTag":"",
+                "coin":"USDC",
+                "name":"Arbitrum canary",
+                "network":"ARBITRUM",
+                "origin":"others",
+                "originType":"others",
+                "whiteStatus":true
+            }]"#,
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].coin, "USDC");
+        assert_eq!(records[0].network, "ARBITRUM");
+        assert!(records[0].white_status);
     }
 
     #[test]

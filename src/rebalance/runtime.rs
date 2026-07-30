@@ -618,7 +618,7 @@ impl RebalanceExecutor {
                 binance_network, ..
             } => binance_network,
         };
-        let (withdrawals, travel_rule, transfers, account) = tokio::try_join!(
+        let (withdrawals, travel_rule, transfers, account, addresses, questionnaire) = tokio::try_join!(
             self.treasury_binance.withdrawal_history(
                 &operation.intent.token_symbol,
                 &operation.intent.withdraw_order_id,
@@ -633,11 +633,19 @@ impl RebalanceExecutor {
                 &operation.intent.withdraw_order_id,
             ),
             self.treasury_binance.account_information(),
+            self.treasury_binance.withdrawal_address_list(),
+            self.treasury_binance
+                .travel_rule_questionnaire_requirements(),
         )?;
         let balance = account
             .balances
             .iter()
             .find(|balance| balance.asset == operation.intent.token_symbol);
+        let wallet = format!("{:#x}", operation.intent.wallet_owner);
+        let matching_addresses = addresses
+            .iter()
+            .filter(|record| record.address.eq_ignore_ascii_case(&wallet))
+            .collect::<Vec<_>>();
         tracing::info!(
             operation_id = operation.intent.operation_id,
             token = operation.intent.token_symbol,
@@ -658,8 +666,24 @@ impl RebalanceExecutor {
                 .map_or("absent", |record| record.status.as_str()),
             master_free = %balance.map_or(Decimal::ZERO, |balance| balance.free),
             master_locked = %balance.map_or(Decimal::ZERO, |balance| balance.locked),
+            questionnaire_country_code = questionnaire
+                .questionnaire_country_code
+                .as_deref()
+                .unwrap_or("NIL"),
+            matching_withdrawal_address_count = matching_addresses.len(),
             "hydrated sanitised evidence for the sole active rebalance operation"
         );
+        for record in matching_addresses {
+            tracing::info!(
+                operation_id = operation.intent.operation_id,
+                token = record.coin,
+                network = record.network,
+                white_status = record.white_status,
+                origin = record.origin,
+                origin_type = record.origin_type,
+                "hydrated exact Binance withdrawal whitelist record for the active wallet"
+            );
+        }
         Ok(())
     }
 
