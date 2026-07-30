@@ -268,6 +268,64 @@ impl BinanceAccountClient {
         )
         .await
     }
+
+    pub async fn travel_rule_questionnaire_requirements(
+        &self,
+    ) -> anyhow::Result<TravelRuleQuestionnaireRequirements> {
+        let query = self.signed_query(&[("recvWindow", "5000".to_owned())])?;
+        self.signed_get(
+            "/sapi/v1/localentity/questionnaire-requirements",
+            &query,
+            "Travel Rule questionnaire requirements",
+        )
+        .await
+    }
+
+    pub async fn travel_rule_withdrawal_history_v2(
+        &self,
+        coin: &str,
+        network: &str,
+        withdraw_order_id: &str,
+    ) -> anyhow::Result<Vec<TravelRuleWithdrawalRecord>> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        validate_withdraw_order_id(withdraw_order_id)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("network", network.to_owned()),
+            ("withdrawOrderId", withdraw_order_id.to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let records: Vec<TravelRuleWithdrawalRecord> = self
+            .signed_get(
+                "/sapi/v2/localentity/withdraw/history",
+                &query,
+                "Travel Rule withdrawal history v2",
+            )
+            .await?;
+        let matching = records
+            .into_iter()
+            .filter(|record| record.coin == coin && record.withdraw_order_id == withdraw_order_id)
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() <= 1,
+            "Binance returned duplicate Travel Rule withdrawals for one client id"
+        );
+        if let Some(record) = matching.first() {
+            ensure!(
+                record.network.is_empty() || record.network == network,
+                "Binance returned a Travel Rule withdrawal for the client id on another network"
+            );
+        }
+        Ok(matching)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TravelRuleQuestionnaireRequirements {
+    #[serde(default)]
+    pub questionnaire_country_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -705,8 +763,9 @@ mod tests {
     use super::{
         CoinInformation, DEPOSIT_ADDRESS_ENDPOINT, DepositAddressRecord, DepositCreditState,
         DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
-        TravelRuleWithdrawalRecord, WithdrawalRecord, WithdrawalState, WithdrawalSubmission,
-        matching_deposits, matching_withdrawals, select_capital_routes, select_evm_deposit_address,
+        TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalRecord,
+        WithdrawalState, WithdrawalSubmission, matching_deposits, matching_withdrawals,
+        select_capital_routes, select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -748,6 +807,19 @@ mod tests {
 
         assert_eq!(submission.tr_id, 65_865_740);
         assert!(submission.accepted);
+    }
+
+    #[test]
+    fn parses_account_specific_travel_rule_questionnaire_country() {
+        let requirements: TravelRuleQuestionnaireRequirements =
+            serde_json::from_str(r#"{"questionnaireCountryCode":"SG"}"#).unwrap();
+        assert_eq!(
+            requirements.questionnaire_country_code.as_deref(),
+            Some("SG")
+        );
+
+        let absent: TravelRuleQuestionnaireRequirements = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(absent.questionnaire_country_code, None);
     }
 
     #[test]

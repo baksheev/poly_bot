@@ -400,6 +400,81 @@ impl RebalanceExecutor {
         self.execution_journal.active_operation()
     }
 
+    pub fn operations(&self) -> &std::collections::BTreeMap<String, RebalanceExecutionOperation> {
+        self.execution_journal.operations()
+    }
+
+    pub async fn close_approved_travel_rule_rejection(
+        &mut self,
+        token_symbol: &str,
+        amount: U256,
+        wallet_owner: Address,
+        network: &str,
+        chain_id: u64,
+        incident_reason: &str,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let operation = self
+            .execution_journal
+            .active_operation()?
+            .cloned()
+            .context("approved Travel Rule recovery has no active operation")?;
+        ensure!(
+            operation.intent.token_symbol == token_symbol
+                && operation.intent.amount == amount
+                && operation.intent.wallet_owner == wallet_owner
+                && operation.intent.direction == Direction::BinanceToWallet
+                && operation.intent.route
+                    == Route::Direct {
+                        binance_network: network.to_owned(),
+                        chain_id,
+                    }
+                && matches!(
+                    operation.progress,
+                    RebalanceExecutionProgress::BinanceTransferCompleted { .. }
+                ),
+            "active operation does not match the approved Travel Rule rejection"
+        );
+        ensure!(
+            self.treasury_binance
+                .withdrawal_history(
+                    &operation.intent.token_symbol,
+                    &operation.intent.withdraw_order_id,
+                )
+                .await?
+                .is_empty(),
+            "approved Travel Rule rejection recovery found an indexed withdrawal"
+        );
+        ensure!(
+            self.treasury_binance
+                .travel_rule_withdrawal_history_v2(
+                    &operation.intent.token_symbol,
+                    network,
+                    &operation.intent.withdraw_order_id,
+                )
+                .await?
+                .is_empty(),
+            "approved Travel Rule rejection recovery found an indexed Travel Rule withdrawal"
+        );
+        let transfer = self
+            .treasury_binance
+            .universal_transfer_history(&self.subaccount_email, &operation.intent.withdraw_order_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("approved Travel Rule rejection lost its master transfer evidence")?;
+        validate_master_transfer_record(&operation, &self.subaccount_email, &transfer)?;
+        ensure!(
+            transfer.status == "SUCCESS",
+            "approved Travel Rule rejection master transfer is not successful"
+        );
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::Failed {
+                reason: incident_reason.to_owned(),
+            },
+        )
+    }
+
     pub async fn recover_active(&mut self) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
         let Some(operation) = self.execution_journal.active_operation()?.cloned() else {
             return Ok(None);

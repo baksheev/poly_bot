@@ -1927,6 +1927,24 @@ canary trades have reduced a token balance; normal M9 readiness then fails
 closed instead of silently replenishing inventory. Before the marker exists,
 partial or unknown outcomes resume through the deterministic journal identity.
 
+The first production bootstrap attempt proved the USDC direct route and then
+failed closed on ESP. `25 USDC` arrived on Arbitrum. The exact `401.2 ESP`
+subaccount-to-master transfer completed, but Binance's local-entity Travel Rule
+endpoint rejected the ESP withdrawal with HTTP `400`, code `-4024`, business
+detail `[031031] User does not own this currency.` No ESP withdrawal was
+indexed and the ESP remains in master Spot. A USDC-to-ESP swap is not an
+acceptable rebalance substitute: steady-state inventory balancing must deliver
+ESP as ESP, either through a supported direct Binance route or a
+receipt-validated ESP bridge.
+
+While that capability is diagnosed, production projects the v3 read-only ESP
+artifact and keeps WLD v12 live unchanged. A Recreate init probe performs only
+signed reads, records the account-specific questionnaire country, sanitized
+master/subaccount balances, and every Binance ESP network capability, checks
+both capital and Travel Rule v2 history for the rejected deterministic client
+ID, and closes only that exact durable `-4024` incident. It submits no
+withdrawal, order, allowance, bridge, or wallet transaction.
+
 Deliver:
 
 - enable ESP/USDC on the same Rust-owned Binance subaccount and the same

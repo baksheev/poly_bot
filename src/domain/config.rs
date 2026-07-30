@@ -427,6 +427,20 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub maximum_token_b_withdrawal_fee_base_units: String,
     pub maximum_token_a_debit_base_units: String,
     pub maximum_token_b_debit_base_units: String,
+    #[serde(default)]
+    pub approved_travel_rule_recovery: Option<LiveCanaryTravelRuleRecoveryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryTravelRuleRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub rejected_token_symbol: String,
+    pub rejected_token_amount_base_units: String,
+    pub rejected_http_status: u16,
+    pub rejected_error_code: i64,
+    pub rejected_error_message: String,
 }
 
 impl LiveCanaryPrefundingRebalanceConfig {
@@ -477,6 +491,44 @@ impl LiveCanaryPrefundingRebalanceConfig {
                 && token_b_debit >= token_b_target
                 && token_b_debit <= token_b_target + token_b_fee,
             "pair {} prefunding fee or debit caps exceed the reviewed bounds",
+            pair.id
+        );
+        if let Some(recovery) = &self.approved_travel_rule_recovery {
+            recovery.validate(pair, canary, self)?;
+        }
+        Ok(())
+    }
+}
+
+impl LiveCanaryTravelRuleRecoveryConfig {
+    fn validate(
+        &self,
+        pair: &PairConfig,
+        canary: &LiveCanaryConfig,
+        prefunding: &LiveCanaryPrefundingRebalanceConfig,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            prefunding.maximum_transfer_count == 2
+                && !self.production_approval_actor.trim().is_empty()
+                && self.production_approval_recorded_at_utc.ends_with('Z')
+                && self.rejected_token_symbol == pair.token_b.symbol
+                && self.rejected_http_status == 400
+                && self.rejected_error_code == -4024
+                && self.rejected_error_message == "[031031] User does not own this currency.",
+            "pair {} Travel Rule recovery approval or incident identity is invalid",
+            pair.id
+        );
+        let rejected_amount = parse_base_units_u256(
+            &self.rejected_token_amount_base_units,
+            "live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_amount_base_units",
+        )?;
+        let token_b_target = parse_base_units_u256(
+            &canary.minimum_wallet_token_b_base_units,
+            "live_canary.minimum_wallet_token_b_base_units",
+        )?;
+        ensure!(
+            rejected_amount == token_b_target + U256::from(1_200_000_000_000_000_000_u128),
+            "pair {} Travel Rule incident amount differs from the rejected ESP debit",
             pair.id
         );
         Ok(())
@@ -1380,6 +1432,14 @@ mod tests {
         assert_eq!(
             prefunding.maximum_token_b_debit_base_units,
             "500000000000000000000"
+        );
+        let recovery = prefunding.approved_travel_rule_recovery.as_ref().unwrap();
+        assert_eq!(recovery.rejected_token_symbol, "ESP");
+        assert_eq!(recovery.rejected_http_status, 400);
+        assert_eq!(recovery.rejected_error_code, -4024);
+        assert_eq!(
+            recovery.rejected_error_message,
+            "[031031] User does not own this currency."
         );
         assert!(pair.execution_enabled);
         assert!(!pair.rebalance.enabled);

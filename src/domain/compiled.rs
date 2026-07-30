@@ -2557,7 +2557,7 @@ mod tests {
         assert_eq!(runtime.stream_shards[0].symbols, ["ESPUSDC", "WLDUSDC"]);
         assert_eq!(
             runtime.executable_symbols,
-            std::collections::BTreeSet::from(["ESPUSDC".to_owned(), "WLDUSDC".to_owned()])
+            std::collections::BTreeSet::from(["WLDUSDC".to_owned()])
         );
         assert!(runtime.asset_symbols.contains(&"BNB".to_owned()));
         assert!(runtime.asset_symbols.contains(&"ESP".to_owned()));
@@ -2703,7 +2703,7 @@ mod tests {
             .iter()
             .find(|network| network.chain_id == 42_161)
             .unwrap();
-        assert!(arbitrum.execution_enabled);
+        assert!(!arbitrum.execution_enabled);
         assert_eq!(
             arbitrum.gas_policy,
             CompiledNetworkGasPolicy::ArbitrumOne {
@@ -2742,10 +2742,10 @@ mod tests {
             .iter()
             .find(|strategy| strategy.symbol == "ESPUSDC")
             .unwrap();
-        assert!(esp.observe && esp.plan && esp.execute);
+        assert!(esp.observe && esp.plan && !esp.execute);
         assert_eq!(esp.network_id.as_str(), "eip155:42161");
         assert_eq!(esp.pool_ids.len(), 1);
-        assert!(esp.domain_config.snapshot().live_trading_enabled);
+        assert!(!esp.domain_config.snapshot().live_trading_enabled);
         assert_ne!(
             live.config.fingerprint_sha256(),
             original_live.fingerprint_sha256()

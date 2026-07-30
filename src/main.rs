@@ -85,8 +85,8 @@ use arb_bot::{
     },
     portfolio::PortfolioCatalog,
     rebalance::{
-        RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
-        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
+        RebalanceExecutionOperation, RebalanceExecutionProgress, RebalanceExecutionRequest,
+        RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
         plan_direct_prefunding, rebalance_base_units_to_decimal,
         rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
     },
@@ -330,7 +330,26 @@ async fn main() -> anyhow::Result<()> {
         Command::PrefundArbitrumCanary {
             live_confirmation,
             marker_path,
-        } => prefund_arbitrum_canary(&cli.config, &live_confirmation, &marker_path).await,
+        } => {
+            prefund_arbitrum_canary(&cli.config, &live_confirmation, &marker_path, None, false)
+                .await
+        }
+        Command::DiagnoseArbitrumEspWithdrawal { confirmation } => {
+            ensure!(
+                confirmation == "DIAGNOSE_ESP_031031",
+                "ESP diagnostic requires ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION=DIAGNOSE_ESP_031031"
+            );
+            prefund_arbitrum_canary(
+                &cli.config,
+                "PREFUND_ARBITRUM_M9",
+                std::path::Path::new("/var/lib/arb-bot/m9-prefunding-complete.json"),
+                Some(std::path::Path::new(
+                    "config/strategies/usdc-esp-arbitrum.v4.json",
+                )),
+                true,
+            )
+            .await
+        }
         Command::ArbitrageReconcileCex {
             plan_id,
             order_journal_path,
@@ -440,13 +459,17 @@ async fn prefund_arbitrum_canary(
     config: &config::AppConfig,
     live_confirmation: &str,
     marker_path: &std::path::Path,
+    source_config_override: Option<&std::path::Path>,
+    recovery_only: bool,
 ) -> anyhow::Result<()> {
     ensure!(
         live_confirmation == "PREFUND_ARBITRUM_M9",
         "Arbitrum prefunding requires ARBITRUM_PREFUNDING_LIVE_CONFIRMATION=PREFUND_ARBITRUM_M9"
     );
-    let source_domain =
-        load_source_domain_for_pair(&config.domain_config_path, "arbitrum-usdc-esp")?;
+    let source_domain = load_source_domain_for_pair(
+        source_config_override.unwrap_or(&config.domain_config_path),
+        "arbitrum-usdc-esp",
+    )?;
     let pair = source_domain
         .snapshot()
         .pairs
@@ -517,9 +540,68 @@ async fn prefund_arbitrum_canary(
     trading_binance.synchronize_clock().await?;
     let coins = trading_binance.all_coin_information().await?;
     let trading_account = trading_binance.account_information().await?;
-    let treasury_binance = BinanceAccountClient::from_treasury_env(config)?;
+    let mut treasury_binance = BinanceAccountClient::from_treasury_env(config)?;
     let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
         .context("Arbitrum prefunding requires BINANCE_SUBACCOUNT_EMAIL")?;
+    treasury_binance.synchronize_clock().await?;
+    if recovery_only {
+        let questionnaire = treasury_binance
+            .travel_rule_questionnaire_requirements()
+            .await?;
+        let master_account = treasury_binance.account_information().await?;
+        let master_subaccount = treasury_binance
+            .subaccount_spot_assets(&subaccount_email)
+            .await?;
+        for symbol in [&pair.token_a.symbol, &pair.token_b.symbol] {
+            let capital = coins
+                .iter()
+                .find(|coin| coin.coin == *symbol)
+                .with_context(|| format!("Binance omitted {symbol} capital state"))?;
+            let trading_free = trading_account
+                .balances
+                .iter()
+                .find(|balance| balance.asset == *symbol)
+                .map_or(Decimal::ZERO, |balance| balance.free);
+            let master_free = master_account
+                .balances
+                .iter()
+                .find(|balance| balance.asset == *symbol)
+                .map_or(Decimal::ZERO, |balance| balance.free);
+            let master_view_subaccount_free = master_subaccount
+                .balances
+                .iter()
+                .find(|balance| balance.asset == *symbol)
+                .map_or(Decimal::ZERO, |balance| balance.free);
+            tracing::info!(
+                token = symbol,
+                questionnaire_country_code = questionnaire
+                    .questionnaire_country_code
+                    .as_deref()
+                    .unwrap_or("none"),
+                trading_subaccount_free = %trading_free,
+                master_spot_free = %master_free,
+                master_view_subaccount_free = %master_view_subaccount_free,
+                deposit_all_enabled = capital.deposit_all_enable,
+                withdrawal_all_enabled = capital.withdraw_all_enable,
+                "read-only ESP prefunding account and Travel Rule capability probe"
+            );
+            for network in &capital.network_list {
+                tracing::info!(
+                    token = symbol,
+                    network = network.network,
+                    network_name = network.name,
+                    deposit_enabled = network.deposit_enable,
+                    withdrawal_enabled = network.withdraw_enable,
+                    busy = network.busy,
+                    withdrawal_fee = %network.withdraw_fee,
+                    withdrawal_minimum = %network.withdraw_min,
+                    withdrawal_maximum = %network.withdraw_max,
+                    withdrawal_multiple = %network.withdraw_integer_multiple,
+                    "read-only Binance capital network capability"
+                );
+            }
+        }
+    }
     let transaction_journal_path = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
         format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
     })?;
@@ -538,6 +620,7 @@ async fn prefund_arbitrum_canary(
         .context("M9 token_a debit cap is invalid")?;
     let token_b_debit_cap = U256::from_str_radix(&prefunding.maximum_token_b_debit_base_units, 10)
         .context("M9 token_b debit cap is invalid")?;
+    let approved_recovery = prefunding.approved_travel_rule_recovery.as_ref();
 
     let mut direct_networks = BTreeMap::new();
     for token in [&pair.token_a, &pair.token_b] {
@@ -589,13 +672,113 @@ async fn prefund_arbitrum_canary(
         },
     )
     .await?;
-    if let Some(recovered) = executor.recover_active().await? {
+    let active = executor.active_operation()?.cloned();
+    let recovered = if recovery_only {
+        match (approved_recovery, active) {
+            (Some(recovery), Some(active))
+                if active.intent.token_symbol == recovery.rejected_token_symbol
+                    && matches!(
+                        active.progress,
+                        RebalanceExecutionProgress::BinanceTransferCompleted { .. }
+                    ) =>
+            {
+                let rejected_amount =
+                    U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
+                        .context("approved Travel Rule rejected amount is invalid")?;
+                Some(
+                    executor
+                        .close_approved_travel_rule_rejection(
+                            &recovery.rejected_token_symbol,
+                            rejected_amount,
+                            configured_wallet,
+                            &prefunding.binance_network,
+                            ARBITRUM_CHAIN_ID,
+                            &format!(
+                                "approved deterministic Travel Rule rejection HTTP {} code {}: {}",
+                                recovery.rejected_http_status,
+                                recovery.rejected_error_code,
+                                recovery.rejected_error_message
+                            ),
+                        )
+                        .await?,
+                )
+            }
+            (Some(_), Some(_)) => {
+                bail!("active rebalance operation differs from the approved ESP incident")
+            }
+            (Some(_), None) => None,
+            (None, _) => bail!("versioned ESP incident recovery approval is absent"),
+        }
+    } else if let (Some(recovery), Some(active)) = (approved_recovery, active) {
+        if active.intent.token_symbol == recovery.rejected_token_symbol
+            && matches!(
+                active.progress,
+                RebalanceExecutionProgress::BinanceTransferCompleted { .. }
+            )
+        {
+            let rejected_amount =
+                U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
+                    .context("approved Travel Rule rejected amount is invalid")?;
+            Some(
+                executor
+                    .close_approved_travel_rule_rejection(
+                        &recovery.rejected_token_symbol,
+                        rejected_amount,
+                        configured_wallet,
+                        &prefunding.binance_network,
+                        ARBITRUM_CHAIN_ID,
+                        &format!(
+                            "approved deterministic Travel Rule rejection HTTP {} code {}: {}",
+                            recovery.rejected_http_status,
+                            recovery.rejected_error_code,
+                            recovery.rejected_error_message
+                        ),
+                    )
+                    .await?,
+            )
+        } else {
+            executor.recover_active().await?
+        }
+    } else {
+        executor.recover_active().await?
+    };
+    if let Some(recovered) = recovered {
         tracing::info!(
             operation_id = %recovered.intent.operation_id,
             progress = ?recovered.progress,
             "recovered the sole durable rebalance operation before Arbitrum prefunding"
         );
     }
+    if recovery_only {
+        let recovery = approved_recovery.context("approved ESP incident recovery is absent")?;
+        let rejected_amount = U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
+            .context("approved Travel Rule rejected amount is invalid")?;
+        let closed = executor.operations().values().any(|operation| {
+            operation.intent.token_symbol == recovery.rejected_token_symbol
+                && operation.intent.amount == rejected_amount
+                && operation.intent.wallet_owner == configured_wallet
+                && matches!(
+                    &operation.progress,
+                    RebalanceExecutionProgress::Failed { reason }
+                        if reason.contains("approved deterministic Travel Rule rejection")
+                )
+        });
+        ensure!(
+            closed,
+            "approved ESP incident was not closed in the durable rebalance journal"
+        );
+        tracing::info!(
+            token = recovery.rejected_token_symbol,
+            rejected_error_code = recovery.rejected_error_code,
+            new_withdrawal_submitted = false,
+            "ESP Travel Rule incident closed after standard and v2 history proved no withdrawal"
+        );
+        return Ok(());
+    }
+    ensure!(
+        approved_recovery.is_none(),
+        "ESP Travel Rule incident was closed without resubmission; direct or bridged ESP capability must be diagnosed before prefunding resumes"
+    );
 
     let targets = [
         (
@@ -694,7 +877,6 @@ async fn prefund_arbitrum_canary(
             token.symbol
         );
     }
-
     let final_usdc = arbitrum_rpc
         .erc20_balance(
             pair.token_a

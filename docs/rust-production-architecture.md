@@ -359,6 +359,16 @@ again. The init container must not create an ESP order, DEX allowance, wallet
 transaction, bridge, or ongoing route authority. General Arbitrum rebalance
 remains the separately reviewed M10 milestone.
 
+An ESP bootstrap or later rebalance must deliver ESP as ESP. A deterministic
+Travel Rule rejection cannot be converted into permission to use the standard
+withdrawal API, and a USDC-to-ESP DEX swap is not a substitute for the missing
+asset-transfer capability. The supported recovery choices are a direct ESP
+withdrawal whose account-specific questionnaire and history semantics are
+validated before submission, or a bounded ESP bridge with pinned
+source/destination token identities, calldata, receipts, minimum output,
+idempotency, and recovery. Until one is proven, ESP execution stays read-only
+while WLD v12 remains live.
+
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its
 complete state changes. It may observe repaired or degraded native gas

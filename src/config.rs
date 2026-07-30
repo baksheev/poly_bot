@@ -105,6 +105,12 @@ pub enum Command {
         )]
         marker_path: PathBuf,
     },
+    /// Close the exact ESP Travel Rule -4024 incident and emit read-only route diagnostics.
+    DiagnoseArbitrumEspWithdrawal {
+        /// Explicit acknowledgement for the versioned incident-journal transition.
+        #[arg(long, env = "ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION", default_value = "")]
+        confirmation: String,
+    },
     /// Reconcile a live arbitrage CEX unknown outcome from the Binance order journal.
     ArbitrageReconcileCex {
         /// Parent arbitrage plan id waiting in unknown_exposure.

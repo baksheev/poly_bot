@@ -140,9 +140,9 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.approval_gate"));
-    assert!(DEPLOY_WORKFLOW.contains("explicit_production_approved"));
+    assert!(DEPLOY_WORKFLOW.contains("explicit_production_approval_required"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.max_parent_trades"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.rebalance_mutations_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
@@ -150,23 +150,21 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
 }
 
 #[test]
-fn gke_prefunding_is_one_shot_bounded_and_stops_the_live_owner_first() {
+fn gke_esp_incident_probe_is_read_only_and_stops_the_live_owner_first() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
     assert!(DEPLOYMENT.contains("initContainers:"));
-    assert!(DEPLOYMENT.contains("name: prefund-arbitrum-m9"));
-    assert!(DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
-    assert!(DEPLOYMENT.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));
-    assert!(DEPLOYMENT.contains("value: PREFUND_ARBITRUM_M9"));
-    assert!(DEPLOYMENT.contains("ARBITRUM_PREFUNDING_MARKER_PATH"));
-    assert!(DEPLOYMENT.contains("/var/lib/arb-bot/m9-prefunding-complete.json"));
+    assert!(DEPLOYMENT.contains("name: diagnose-arbitrum-esp"));
+    assert!(DEPLOYMENT.contains("exec arb_bot diagnose-arbitrum-esp-withdrawal"));
+    assert!(DEPLOYMENT.contains("ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION"));
+    assert!(DEPLOYMENT.contains("value: DIAGNOSE_ESP_031031"));
+    assert!(!DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
     assert!(DEPLOYMENT.contains("REBALANCE_EXECUTION_MODE"));
     assert!(DEPLOYMENT.contains("value: disabled"));
     assert!(DEPLOYMENT.contains("claimName: arb-bot-state"));
     assert!(!DEPLOYMENT.contains("kind: Job"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
     assert!(!DEPLOY_WORKFLOW.contains("jobs.batch"));
-    assert!(DEPLOY_WORKFLOW.contains("maximum_token_a_withdrawal_fee_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("maximum_token_b_withdrawal_fee_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("has(\\\"prefunding_rebalance\\\")"));
     assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
 }
