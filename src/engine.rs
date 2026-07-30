@@ -27,7 +27,9 @@ use crate::{
         events::{PoolUpdate, decode_pool_event},
         mirror::{DexMirror, LogApplyResult},
     },
-    domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
+    domain::config::{
+        AdaptiveSizingConfig, DexProvider, LiveCanaryApprovalGate, LoadedDomainConfig,
+    },
     execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
     hot_telemetry::{
         HotTelemetryHandle, HotTelemetryTask, SharedStreamEventKind,
@@ -3067,6 +3069,17 @@ impl TradingEngine {
         }
         self.last_inventory_blocked_alert_at = Some(now);
         let claims = Value::Array(claim_details.to_vec());
+        if is_bounded_canary_pair(&self.domain_config, pair_id) {
+            tracing::info!(
+                engine_id = %self.config.engine_id,
+                pair_id,
+                pair_symbol,
+                plan_id,
+                claims = %claims,
+                "bounded canary admission skipped by insufficient inventory"
+            );
+            return;
+        }
         tracing::error!(
             engine_id = %self.config.engine_id,
             pair_id,
@@ -3623,6 +3636,16 @@ impl TradingEngine {
     }
 }
 
+fn is_bounded_canary_pair(domain_config: &LoadedDomainConfig, pair_id: &str) -> bool {
+    domain_config.snapshot().pairs.iter().any(|pair| {
+        pair.id == pair_id
+            && pair.execution_enabled
+            && pair.live_canary.as_ref().is_some_and(|canary| {
+                canary.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
+            })
+    })
+}
+
 fn requires_depth_for_runtime_phase(arbitrage_execution_mode: &str) -> bool {
     matches!(arbitrage_execution_mode, "paper_concurrent_hedged")
 }
@@ -3822,6 +3845,7 @@ mod tests {
 
     use crate::{
         arbitrage::ArbitrageDirection as TradeDirection,
+        domain::config::LoadedDomainConfig,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
             InventoryClaim, InventoryKey, InventoryLocation, ReservationPurpose,
@@ -3838,8 +3862,8 @@ mod tests {
         RebalanceSettlementBarrier, ReservationPrecheck, TradingReadiness,
         adaptive_candidate_is_better, admission_deadline_unix_seconds, classify_depth_health,
         clock_sync_estimate_valid, estimate_exchange_event_to_socket_us,
-        exact_execution_envelope_amounts, mark_sequence_matched_update, rebalance_health_state,
-        requires_depth_for_runtime_phase, reservation_precheck,
+        exact_execution_envelope_amounts, is_bounded_canary_pair, mark_sequence_matched_update,
+        rebalance_health_state, requires_depth_for_runtime_phase, reservation_precheck,
     };
 
     #[test]
@@ -3883,6 +3907,16 @@ mod tests {
         assert!(!requires_depth_for_runtime_phase("full_live"));
         assert!(!requires_depth_for_runtime_phase("paper_dex_first"));
         assert!(requires_depth_for_runtime_phase("paper_concurrent_hedged"));
+    }
+
+    #[test]
+    fn only_bounded_canary_inventory_exhaustion_is_expected() {
+        let config =
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+
+        assert!(is_bounded_canary_pair(&config, "arbitrum-usdc-esp"));
+        assert!(!is_bounded_canary_pair(&config, "world-chain-usdc-wld"));
+        assert!(!is_bounded_canary_pair(&config, "unknown-pair"));
     }
 
     #[test]

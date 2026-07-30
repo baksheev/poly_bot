@@ -9,8 +9,13 @@ fn m9_report_proves_bounded_live_authority_and_no_rebalance_mutation() {
 
     assert!(report.contains("M9 Arbitrum live canary configured"));
     assert!(report.contains("max_failed_parent_trades"));
+    assert!(report.contains("minimum_runtime_wallet_token_a_base_units"));
+    assert!(report.contains("minimum_runtime_wallet_token_b_base_units"));
     assert!(query.contains("kind = 'm9_live_readiness'"));
     assert!(query.contains("kind = 'm9_canary_gate'"));
+    assert!(query.contains("kind = 'm9_canary_risk_snapshot'"));
+    assert!(query.contains("max(admitted_parent_count) AS admitted_parents"));
+    assert!(query.contains("max(admitted_notional) AS admitted_notional"));
     assert!(query.contains("admitted_parents > 2"));
     assert!(query.contains("admitted_notional > 20000000"));
     assert!(query.contains("admitted_parents != unique_admitted_parents"));

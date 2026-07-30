@@ -361,6 +361,15 @@ proven. A restart validates the marker's immutable snapshot, wallet, targets,
 and approval identity and must never replenish inventory again. Its recorded
 domain fingerprint is provenance, not a reason to replenish after a corrective
 code or gas-policy revision; changing a target or approval still fails closed.
+The bootstrap targets are not steady-state readiness minima: after a legitimate
+fill, runtime readiness proves nonzero token presence while exact inventory
+reservations and durable canary limits decide whether a specific next parent is
+executable. Each M9 release must run a production-derived lifecycle fixture
+covering first-parent completion, reduced wallet balance, expected rejection,
+process restart, and recovery of the same journal before deployment approval.
+The recovered journal risk is emitted as an authoritative startup snapshot so
+reporting cannot lose an admitted parent merely because asynchronous telemetry
+was dropped during shutdown.
 The init container must not create an ESP order, DEX allowance, wallet
 transaction, bridge, or ongoing route authority. General Arbitrum rebalance
 remains the separately reviewed M10 milestone.

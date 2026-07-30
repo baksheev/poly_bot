@@ -36,24 +36,57 @@ canary AS
         JSONExtractString(payload_json, 'engine_id') AS engine_id,
         JSONExtractString(payload_json, 'decision') AS decision,
         JSONExtractString(payload_json, 'plan_id') AS plan_id,
+        JSONExtractUInt(payload_json, 'admitted_parent_count_after') AS admitted_parent_count,
+        JSONExtractUInt(payload_json, 'admitted_parent_count_after')
+            AS unique_admitted_parent_count,
         toUInt64OrZero(
-            JSONExtractString(payload_json, 'trade_notional_token_a_base_units')
-        ) AS notional
+            JSONExtractString(
+                payload_json,
+                'admitted_notional_token_a_base_units_after'
+            )
+        ) AS admitted_notional
     FROM runtime_telemetry
     WHERE kind = 'm9_canary_gate'
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND JSONExtractString(payload_json, 'pair_id') = 'arbitrum-usdc-esp'
 ),
+canary_risk_snapshot AS
+(
+    SELECT
+        JSONExtractString(payload_json, 'engine_id') AS engine_id,
+        'snapshot' AS decision,
+        '' AS plan_id,
+        JSONExtractUInt(payload_json, 'admitted_parent_count') AS admitted_parent_count,
+        JSONExtractUInt(payload_json, 'unique_admitted_parent_count')
+            AS unique_admitted_parent_count,
+        toUInt64OrZero(
+            JSONExtractString(
+                payload_json,
+                'admitted_notional_token_a_base_units'
+            )
+        ) AS admitted_notional
+    FROM runtime_telemetry
+    WHERE kind = 'm9_canary_risk_snapshot'
+      AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
+      AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
+      AND JSONExtractString(payload_json, 'pair_id') = 'arbitrum-usdc-esp'
+),
+canary_authority AS
+(
+    SELECT * FROM canary
+    UNION ALL
+    SELECT * FROM canary_risk_snapshot
+),
 canary_by_engine AS
 (
     SELECT
         engine_id,
-        countIf(decision = 'admit') AS admitted_parents,
-        uniqExactIf(plan_id, decision = 'admit') AS unique_admitted_parents,
-        sumIf(notional, decision = 'admit') AS admitted_notional,
+        max(admitted_parent_count) AS admitted_parents,
+        max(unique_admitted_parent_count) AS unique_admitted_parents,
+        max(admitted_notional) AS admitted_notional,
         countIf(decision = 'reject') AS rejected_entries
-    FROM canary
+    FROM canary_authority
     GROUP BY engine_id
 ),
 network AS

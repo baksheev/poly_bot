@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "bfb4f2e15af958a0562b5cf7a9dfa26c57ad808b19825a3b5dda5abbd27fad87",
+      "source_fingerprint_sha256": "7691d196e9dfbcb265f7836f8a43cb3716df256ddfd1cdcbf4e0a62e6af2e878",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -43,6 +43,8 @@
               "minimum_native_gas_wei": "1000000000000000",
               "minimum_wallet_token_a_base_units": "25000000",
               "minimum_wallet_token_b_base_units": "400000000000000000000",
+              "minimum_runtime_wallet_token_a_base_units": "1",
+              "minimum_runtime_wallet_token_b_base_units": "1",
               "max_parent_trades": 2,
               "max_failed_parent_trades": 1,
               "max_concurrent_trades": 1,

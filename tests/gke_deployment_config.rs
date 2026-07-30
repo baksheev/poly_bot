@@ -80,6 +80,8 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains(".adaptive_sizing.mode"));
     assert!(DEPLOY_WORKFLOW.contains("max_trade_notional_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("minimum_wallet_token_a_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("minimum_runtime_wallet_token_a_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("minimum_runtime_wallet_token_b_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("minimum_wallet_token_b_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_update_delta"));

@@ -1189,6 +1189,32 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
             "outcome": "success",
         }),
     );
+    for (pair_id, policy) in &risk_limits.canary_policies {
+        let risk = coordinator.canary_journal_risk(&policy.journal_scope.strategy_id)?;
+        telemetry.emit(
+            "m9_canary_risk_snapshot",
+            serde_json::json!({
+                "engine_id": engine_id,
+                "pair_id": pair_id,
+                "strategy_id": policy.journal_scope.strategy_id,
+                "symbol": policy.journal_scope.symbol,
+                "admitted_parent_count": risk.admitted_parent_count,
+                "unique_admitted_parent_count": risk.admitted_parent_count,
+                "active_parent_count": risk.active_parent_count,
+                "failed_parent_count": risk.failed_parent_count,
+                "admitted_notional_token_a_base_units":
+                    risk.admitted_notional_token_a_base_units.to_string(),
+                "realized_loss_token_a_base_units":
+                    risk.realized_loss_token_a_base_units.to_string(),
+                "first_admitted_unix_us": risk.first_admitted_unix_us.unwrap_or_default(),
+                "maximum_parent_trades": policy.maximum_parent_trades,
+                "maximum_total_notional_token_a_base_units":
+                    policy.maximum_total_notional_token_a_base_units.to_string(),
+                "durable_journal_authority": true,
+                "external_mutation_authorized": false,
+            }),
+        );
+    }
     let initial_lane = initial_execution_lane(&coordinator);
     let (handle, receiver, _discarded) = PaperTradeHandle::channel(initial_lane);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -1212,6 +1238,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         self.resume_active().await?;
         while let Some(opportunity) = self.receiver.recv().await {
             let plan_id = opportunity.plan_id();
+            let pair_id = opportunity.pair_id.clone();
             let received_unix_us = opportunity.received_unix_us;
             let operation_existed_before_attempt = self.coordinator.operation(&plan_id).is_some();
             let live_task_started = Instant::now();
@@ -1265,7 +1292,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     &plan_id,
                     operation_existed_before_attempt,
                 );
-                self.publish_event(plan_id, state, false, None)?;
+                self.publish_event(plan_id, Some(pair_id), state, false, None)?;
             }
         }
         Ok(())
@@ -1614,6 +1641,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     self.telemetry.emit(ARBITRAGE_RESULT_KIND, payload);
                     self.publish_event(
                         plan_id.to_owned(),
+                        None,
                         PaperTradeEventState::Balanced,
                         dex_filled(operation),
                         dex_settlement_log(operation),
@@ -1624,6 +1652,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 ) {
                     self.publish_event(
                         plan_id.to_owned(),
+                        None,
                         PaperTradeEventState::BlockedUnknown,
                         dex_filled(operation),
                         None,
@@ -1784,6 +1813,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
     fn publish_event(
         &self,
         plan_id: String,
+        rejected_pair_id: Option<String>,
         state: PaperTradeEventState,
         dex_filled: bool,
         dex_settlement_log: Option<crate::chain::logs::ChainLog>,
@@ -1791,10 +1821,9 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         let pair_id = self
             .coordinator
             .operation(&plan_id)
-            .context("live trade event operation is missing")?
-            .intent
-            .pair_id
-            .clone();
+            .map(|operation| operation.intent.pair_id.clone())
+            .or(rejected_pair_id)
+            .context("live trade event operation and rejected pair identity are missing")?;
         self.event_sender
             .send(PaperTradeEvent {
                 plan_id,
@@ -2782,14 +2811,14 @@ mod tests {
             "test-engine".to_owned(),
             LiveRiskLimits {
                 entry_stop_file: stop_file.clone(),
-                entry_preflight: preflight,
+                entry_preflight: preflight.clone(),
                 binance_symbol: "WLDUSDC".to_owned(),
                 binance_base_decimals: 18,
                 journal_scope: scope(),
                 canary_policies: BTreeMap::from([(
                     canary_opportunity.pair_id.clone(),
                     LiveCanaryPolicy {
-                        journal_scope: canary_scope,
+                        journal_scope: canary_scope.clone(),
                         maximum_trade_notional_token_a_base_units: 10_000_000,
                         maximum_total_notional_token_a_base_units: 20_000_000,
                         maximum_unhedged_notional_token_a_base_units: 10_000_000,
@@ -2821,7 +2850,84 @@ mod tests {
         let error = task.authorize_entry(&canary_opportunity).unwrap_err();
         assert!(format!("{error:#}").contains("per-trade notional limit"));
 
+        // Reproduce the exact production transition that was previously
+        // missing from pre-deploy coverage: one 9.960977 USDC parent becomes
+        // durable, completes, and the process reopens the same journal.
+        canary_opportunity.cost_token_a_base_units = 9_960_977;
+        task.authorize_entry(&canary_opportunity).unwrap();
+        let mut intent = canary_opportunity.intent(ExecutionMode::DexFirst);
+        intent.journal_scope = Some(canary_scope.clone());
+        let plan_id = intent.plan_id.clone();
+        task.coordinator.admit(intent).unwrap();
+        task.coordinator.take_commands(&plan_id).unwrap();
+        task.coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                result(100, -9_960_977, 0, "dex:production-parent"),
+            )
+            .unwrap();
+        task.coordinator.take_commands(&plan_id).unwrap();
+        task.coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Cex,
+                result(-100, 9_887_860, 0, "cex:production-parent"),
+            )
+            .unwrap();
+        task.coordinator.take_commands(&plan_id).unwrap();
         drop(task);
+
+        let recovered_executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (_recovered_handle, mut recovered_task, _recovered_events) = live_trade_channel(
+            &journal,
+            recovered_executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine-after-restart".to_owned(),
+            LiveRiskLimits {
+                entry_stop_file: stop_file.clone(),
+                entry_preflight: preflight,
+                binance_symbol: "WLDUSDC".to_owned(),
+                binance_base_decimals: 18,
+                journal_scope: scope(),
+                canary_policies: BTreeMap::from([(
+                    canary_opportunity.pair_id.clone(),
+                    LiveCanaryPolicy {
+                        journal_scope: canary_scope.clone(),
+                        maximum_trade_notional_token_a_base_units: 10_000_000,
+                        maximum_total_notional_token_a_base_units: 20_000_000,
+                        maximum_unhedged_notional_token_a_base_units: 10_000_000,
+                        maximum_realized_loss_token_a_base_units: 1_000_000,
+                        maximum_parent_trades: 2,
+                        maximum_failed_parent_trades: 1,
+                        maximum_concurrent_trades: 1,
+                        rollout_duration: Duration::from_secs(15 * 60),
+                        readiness: Arc::clone(&readiness),
+                        market_data_readiness: Arc::clone(&market_data_readiness),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+        let recovered_risk = recovered_task
+            .coordinator
+            .canary_journal_risk(&canary_scope.strategy_id)
+            .unwrap();
+        assert_eq!(recovered_risk.admitted_parent_count, 1);
+        assert_eq!(
+            recovered_risk.admitted_notional_token_a_base_units,
+            9_960_977
+        );
+        assert_eq!(recovered_risk.active_parent_count, 0);
+        assert_eq!(recovered_risk.failed_parent_count, 1);
+        let error = recovered_task
+            .authorize_entry(&canary_opportunity)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("failure limit reached"));
+
+        drop(recovered_task);
         fs::remove_file(journal).unwrap();
         let _ = fs::remove_file(stop_file);
     }
@@ -2884,6 +2990,62 @@ mod tests {
         drop(handle);
         drop(task);
         fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_admission_rejections_publish_identity_and_keep_the_live_task_running() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-pre-admission-rejection-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        fs::write(&stop_file, b"stop\n").unwrap();
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (handle, task, mut events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file.clone()),
+        )
+        .unwrap();
+        let runner = tokio::spawn(task.run());
+
+        let first = opportunity();
+        assert!(matches!(
+            handle.try_submit(first.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        let first_event = events.recv().await.unwrap();
+        assert_eq!(first_event.plan_id, first.plan_id());
+        assert_eq!(first_event.pair_id, first.pair_id);
+        assert_eq!(first_event.state, PaperTradeEventState::RejectedUnsubmitted);
+        handle.finish(first_event.state);
+
+        let mut second = opportunity();
+        second.update_id += 1;
+        assert!(matches!(
+            handle.try_submit(second.clone()),
+            PaperTradeSubmitResult::Accepted
+        ));
+        let second_event = events.recv().await.unwrap();
+        assert_eq!(second_event.plan_id, second.plan_id());
+        assert_eq!(second_event.pair_id, second.pair_id);
+        assert_eq!(
+            second_event.state,
+            PaperTradeEventState::RejectedUnsubmitted
+        );
+        handle.finish(second_event.state);
+
+        drop(handle);
+        runner.await.unwrap().unwrap();
+        fs::remove_file(journal).unwrap();
+        fs::remove_file(stop_file).unwrap();
     }
 
     #[tokio::test]

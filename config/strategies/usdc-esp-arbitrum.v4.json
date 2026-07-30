@@ -34,6 +34,8 @@
         "minimum_native_gas_wei": "1000000000000000",
         "minimum_wallet_token_a_base_units": "25000000",
         "minimum_wallet_token_b_base_units": "400000000000000000000",
+        "minimum_runtime_wallet_token_a_base_units": "1",
+        "minimum_runtime_wallet_token_b_base_units": "1",
         "max_parent_trades": 2,
         "max_failed_parent_trades": 1,
         "max_concurrent_trades": 1,

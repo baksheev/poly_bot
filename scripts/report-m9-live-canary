@@ -38,7 +38,7 @@ AND jsonPayload.fields.message=\"M9 Arbitrum live canary configured\"
 AND timestamp>=\"${start_utc}\"
 AND timestamp<\"${end_utc}\""
 
-echo $'timestamp\tpod\tpair\tstrategy\tnetwork\tapproval\ttrade_cap\ttotal_cap\twallet_usdc_min\twallet_esp_min\tparents\tfailures\tconcurrent\tduration\texecution\trebalance\tmutation'
+echo $'timestamp\tpod\tpair\tstrategy\tnetwork\tapproval\ttrade_cap\ttotal_cap\tbootstrap_usdc\tbootstrap_esp\truntime_usdc_min\truntime_esp_min\tparents\tfailures\tconcurrent\tduration\texecution\trebalance\tmutation'
 "${repo_root}/scripts/gcloud-local" logging read "${startup_filter}" \
   --project="${GCP_PROJECT_ID}" \
   --limit=100 \
@@ -58,6 +58,8 @@ echo $'timestamp\tpod\tpair\tstrategy\tnetwork\tapproval\ttrade_cap\ttotal_cap\t
           $fields.max_total_notional_token_a_base_units,
           $fields.minimum_wallet_token_a_base_units,
           $fields.minimum_wallet_token_b_base_units,
+          $fields.minimum_runtime_wallet_token_a_base_units,
+          $fields.minimum_runtime_wallet_token_b_base_units,
           $fields.max_parent_trades,
           $fields.max_failed_parent_trades,
           $fields.max_concurrent_trades,

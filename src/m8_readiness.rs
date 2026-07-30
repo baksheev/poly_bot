@@ -16,7 +16,7 @@ use crate::{
         },
     },
     chain::rpc::{CanonicalBlock, JsonRpcClient},
-    domain::config::{LiveCanaryApprovalGate, PairConfig},
+    domain::config::{LiveCanaryApprovalGate, LiveCanaryConfig, PairConfig},
     network_runtime::{NetworkReadCoordinator, NetworkRuntime},
     rebalance::route_candidates_from_capital,
     wallet::TokenBalanceRequest,
@@ -293,23 +293,19 @@ async fn inspect_chain_readiness_at(
     )?;
     let minimum_native =
         U256::from_str_radix(&canary.minimum_native_gas_wei, 10).context("invalid gas minimum")?;
-    let minimum_token_a = U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10)
-        .context("invalid token_a funding minimum")?;
-    let minimum_token_b = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
-        .context("invalid token_b funding minimum")?;
     let token_code_present = !token_a_code.is_empty() && !token_b_code.is_empty();
     let router_code_present = !router_code.is_empty();
     let native_gas_funded = native_balance >= minimum_native;
-    let token_a_funded = snapshot.token_balances.iter().any(|balance| {
-        balance.symbol.as_ref() == pair.token_a.symbol
-            && balance.contract == token_a
-            && balance.base_units >= minimum_token_a
+    let token_a_balance = snapshot.token_balances.iter().find_map(|balance| {
+        (balance.symbol.as_ref() == pair.token_a.symbol && balance.contract == token_a)
+            .then_some(balance.base_units)
     });
-    let token_b_funded = snapshot.token_balances.iter().any(|balance| {
-        balance.symbol.as_ref() == pair.token_b.symbol
-            && balance.contract == token_b
-            && balance.base_units >= minimum_token_b
+    let token_b_balance = snapshot.token_balances.iter().find_map(|balance| {
+        (balance.symbol.as_ref() == pair.token_b.symbol && balance.contract == token_b)
+            .then_some(balance.base_units)
     });
+    let (token_a_funded, token_b_funded) =
+        runtime_wallet_tokens_funded(canary, token_a_balance, token_b_balance)?;
     let fresh_rpc_gas_price = gas_price > 0;
     let ready = exact_token_contracts
         && token_code_present
@@ -333,6 +329,21 @@ async fn inspect_chain_readiness_at(
         external_mutation_authorized: pair.execution_enabled,
         ready,
     })
+}
+
+fn runtime_wallet_tokens_funded(
+    canary: &LiveCanaryConfig,
+    token_a_balance: Option<U256>,
+    token_b_balance: Option<U256>,
+) -> anyhow::Result<(bool, bool)> {
+    let minimum_token_a = U256::from_str_radix(canary.runtime_wallet_token_a_minimum(), 10)
+        .context("invalid token_a runtime minimum")?;
+    let minimum_token_b = U256::from_str_radix(canary.runtime_wallet_token_b_minimum(), 10)
+        .context("invalid token_b runtime minimum")?;
+    Ok((
+        token_a_balance.is_some_and(|balance| balance >= minimum_token_a),
+        token_b_balance.is_some_and(|balance| balance >= minimum_token_b),
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -508,6 +519,7 @@ pub const fn injected_failure_disposition(failure: M8InjectedFailure) -> M8Failu
 mod tests {
     use std::time::Duration;
 
+    use alloy_primitives::U256;
     use rust_decimal::Decimal;
 
     use crate::{
@@ -523,7 +535,8 @@ mod tests {
 
     use super::{
         M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessStatus,
-        M8InjectedFailure, injected_failure_disposition, validate_binance_readiness,
+        M8InjectedFailure, injected_failure_disposition, runtime_wallet_tokens_funded,
+        validate_binance_readiness,
     };
 
     fn rates() -> CommissionSideRates {
@@ -662,5 +675,32 @@ mod tests {
             }
         ));
         assert!(M8_CHAIN_READINESS_REFRESH_INTERVAL >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn post_first_parent_balance_uses_runtime_presence_not_bootstrap_target() {
+        let domain =
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+        let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
+        let post_trade_usdc = U256::from(16_860_785_u64);
+        let remaining_esp = U256::from(266_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+
+        assert!(
+            post_trade_usdc
+                < U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10).unwrap()
+        );
+        assert_eq!(
+            runtime_wallet_tokens_funded(canary, Some(post_trade_usdc), Some(remaining_esp))
+                .unwrap(),
+            (true, true)
+        );
+        assert_eq!(
+            runtime_wallet_tokens_funded(canary, Some(U256::ZERO), Some(remaining_esp)).unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            runtime_wallet_tokens_funded(canary, Some(post_trade_usdc), None).unwrap(),
+            (true, false)
+        );
     }
 }

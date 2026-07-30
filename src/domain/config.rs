@@ -285,6 +285,10 @@ pub struct LiveCanaryConfig {
     pub minimum_wallet_token_a_base_units: String,
     #[serde(default = "default_zero_base_units")]
     pub minimum_wallet_token_b_base_units: String,
+    #[serde(default)]
+    pub minimum_runtime_wallet_token_a_base_units: Option<String>,
+    #[serde(default)]
+    pub minimum_runtime_wallet_token_b_base_units: Option<String>,
     pub max_parent_trades: u16,
     #[serde(default = "default_live_canary_failure_limit")]
     pub max_failed_parent_trades: u16,
@@ -298,6 +302,18 @@ pub struct LiveCanaryConfig {
 }
 
 impl LiveCanaryConfig {
+    pub fn runtime_wallet_token_a_minimum(&self) -> &str {
+        self.minimum_runtime_wallet_token_a_base_units
+            .as_deref()
+            .unwrap_or(&self.minimum_wallet_token_a_base_units)
+    }
+
+    pub fn runtime_wallet_token_b_minimum(&self) -> &str {
+        self.minimum_runtime_wallet_token_b_base_units
+            .as_deref()
+            .unwrap_or(&self.minimum_wallet_token_b_base_units)
+    }
+
     fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
         ensure!(
             pair.id == "arbitrum-usdc-esp"
@@ -383,6 +399,14 @@ impl LiveCanaryConfig {
             &self.minimum_wallet_token_b_base_units,
             "live_canary.minimum_wallet_token_b_base_units",
         )?;
+        let minimum_runtime_wallet_token_a = parse_base_units_u256(
+            self.runtime_wallet_token_a_minimum(),
+            "live_canary.minimum_runtime_wallet_token_a_base_units",
+        )?;
+        let minimum_runtime_wallet_token_b = parse_base_units_u256(
+            self.runtime_wallet_token_b_minimum(),
+            "live_canary.minimum_runtime_wallet_token_b_base_units",
+        )?;
         ensure!(
             !maximum_trade.is_zero()
                 && maximum_trade <= maximum_total
@@ -394,7 +418,13 @@ impl LiveCanaryConfig {
         );
         if self.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved {
             ensure!(
-                minimum_wallet_token_a >= maximum_total && !minimum_wallet_token_b.is_zero(),
+                minimum_wallet_token_a >= maximum_total
+                    && !minimum_wallet_token_b.is_zero()
+                    && !minimum_runtime_wallet_token_a.is_zero()
+                    && minimum_runtime_wallet_token_a <= maximum_trade
+                    && minimum_runtime_wallet_token_a <= minimum_wallet_token_a
+                    && !minimum_runtime_wallet_token_b.is_zero()
+                    && minimum_runtime_wallet_token_b <= minimum_wallet_token_b,
                 "pair {} approved live canary requires prefunding for both trade directions",
                 pair.id
             );
@@ -1545,6 +1575,8 @@ mod tests {
             canary.minimum_wallet_token_b_base_units,
             "400000000000000000000"
         );
+        assert_eq!(canary.runtime_wallet_token_a_minimum(), "1");
+        assert_eq!(canary.runtime_wallet_token_b_minimum(), "1");
         let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
         assert_eq!(prefunding.binance_network, "ARBITRUM");
         assert_eq!(prefunding.withdrawal_api_mode, "standard");
@@ -1583,6 +1615,16 @@ mod tests {
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["minimum_wallet_token_a_base_units"] =
             Value::String("19999999".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["minimum_runtime_wallet_token_a_base_units"] =
+            Value::String("0".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["minimum_runtime_wallet_token_b_base_units"] =
+            Value::String("400000000000000000001".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();

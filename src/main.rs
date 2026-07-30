@@ -3630,6 +3630,10 @@ async fn run(
             %m8_canary.minimum_wallet_token_a_base_units,
         minimum_wallet_token_b_base_units =
             %m8_canary.minimum_wallet_token_b_base_units,
+        minimum_runtime_wallet_token_a_base_units =
+            %m8_canary.runtime_wallet_token_a_minimum(),
+        minimum_runtime_wallet_token_b_base_units =
+            %m8_canary.runtime_wallet_token_b_minimum(),
         max_parent_trades = m8_canary.max_parent_trades,
         max_failed_parent_trades = m8_canary.max_failed_parent_trades,
         max_concurrent_trades = m8_canary.max_concurrent_trades,

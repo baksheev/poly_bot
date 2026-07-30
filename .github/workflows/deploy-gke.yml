@@ -111,6 +111,8 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_realized_loss_token_a_base_units" "${domain_config}")" = 1000000
           test "$(jq -r "${esp} | .pairs[0].live_canary.minimum_wallet_token_a_base_units" "${domain_config}")" = 25000000
           test "$(jq -r "${esp} | .pairs[0].live_canary.minimum_wallet_token_b_base_units" "${domain_config}")" = 400000000000000000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.minimum_runtime_wallet_token_a_base_units" "${domain_config}")" = 1
+          test "$(jq -r "${esp} | .pairs[0].live_canary.minimum_runtime_wallet_token_b_base_units" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_parent_trades" "${domain_config}")" = 2
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_failed_parent_trades" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_concurrent_trades" "${domain_config}")" = 1

@@ -1892,8 +1892,11 @@ Implementation status:
 - Binance LIMIT IOC and bounded MARKET recovery share symbol-scoped journals
   for WLDUSDC and ESPUSDC. A request for an unreviewed symbol fails closed;
 - Arbitrum allowances are bounded by the reviewed cumulative USDC cap and the
-  funded ESP balance. Both token-funding minima are versioned readiness inputs;
-  Arbitrum rebalance route mutation remains disabled;
+  funded ESP balance. The one-shot `25 USDC` / `400 ESP` bootstrap targets are
+  distinct from the nonzero runtime-presence minima: after a legitimate canary
+  fill, exact inventory reservations decide whether another direction and
+  amount is executable instead of comparing the spent balance with its original
+  bootstrap target. Arbitrum rebalance route mutation remains disabled;
 - Arbitrum's versioned fee policy uses the fresh RPC sample with zero priority
   tip and a `12,000 bps` maximum-fee envelope. A narrowly recognized
   next-block fee-cap rejection is terminal before broadcast and can reuse its
@@ -1930,10 +1933,11 @@ snapshot-, and target-bound completion marker to the shared PVC. The recorded
 domain fingerprint preserves provenance, but a corrective code/artifact
 revision with the same funding identity still validates the marker and refuses
 to fund again. A changed target, approval, wallet, or snapshot fails closed.
-This remains true even if later canary trades have reduced a token balance;
-normal M9 readiness then fails closed instead of silently replenishing
-inventory. Before the marker exists, partial or unknown outcomes resume through
-the deterministic journal identity.
+This remains true even if later canary trades have reduced a token balance.
+The runtime does not silently replenish inventory: nonzero token presence,
+exact per-parent inventory reservation, and durable cumulative canary caps are
+separate gates. Before the marker exists, partial or unknown outcomes resume
+through the deterministic journal identity.
 
 The first live M9 allowance was signed at nonce `1` with transaction hash
 `0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977`.
