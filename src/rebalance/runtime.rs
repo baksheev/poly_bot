@@ -674,6 +674,18 @@ impl RebalanceExecutor {
                 })
                 .collect();
         }
+        for record in &travel_rule_history {
+            tracing::info!(
+                operation_id = operation.intent.operation_id,
+                token = operation.intent.token_symbol,
+                travel_rule_record_id = record.tr_id,
+                travel_rule_status = record.travel_rule_status,
+                withdrawal_status = record.withdrawal_status,
+                transaction_id_present = !record.tx_id.trim().is_empty(),
+                indexed_client_id_present = !record.withdraw_order_id.trim().is_empty(),
+                "hydrated an exact candidate for the approved Travel Rule rejection"
+            );
+        }
         let indexed_rejection = reconcile_approved_travel_rule_rejection(&travel_rule_history)?;
         if let Some(record) = indexed_rejection {
             tracing::info!(
