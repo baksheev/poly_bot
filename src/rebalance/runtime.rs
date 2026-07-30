@@ -605,6 +605,64 @@ impl RebalanceExecutor {
         self.execution_journal.operations()
     }
 
+    pub async fn log_active_operation_recovery_evidence(&self) -> anyhow::Result<()> {
+        let Some(operation) = self.execution_journal.active_operation()? else {
+            tracing::info!("no active rebalance operation requires recovery");
+            return Ok(());
+        };
+        let network = match &operation.intent.route {
+            Route::Direct {
+                binance_network, ..
+            }
+            | Route::Across {
+                binance_network, ..
+            } => binance_network,
+        };
+        let (withdrawals, travel_rule, transfers, account) = tokio::try_join!(
+            self.treasury_binance.withdrawal_history(
+                &operation.intent.token_symbol,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance.travel_rule_withdrawal_history_v2(
+                &operation.intent.token_symbol,
+                network,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance.universal_transfer_history(
+                &self.subaccount_email,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance.account_information(),
+        )?;
+        let balance = account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == operation.intent.token_symbol);
+        tracing::info!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            amount_base_units = operation.intent.amount.to_string(),
+            progress = ?operation.progress,
+            network,
+            capital_withdrawal_count = withdrawals.len(),
+            capital_transaction_present = withdrawals
+                .iter()
+                .any(|record| !record.tx_id.trim().is_empty()),
+            travel_rule_withdrawal_count = travel_rule.len(),
+            travel_rule_transaction_present = travel_rule
+                .iter()
+                .any(|record| !record.tx_id.trim().is_empty()),
+            master_transfer_count = transfers.len(),
+            master_transfer_status = transfers
+                .first()
+                .map_or("absent", |record| record.status.as_str()),
+            master_free = %balance.map_or(Decimal::ZERO, |balance| balance.free),
+            master_locked = %balance.map_or(Decimal::ZERO, |balance| balance.locked),
+            "hydrated sanitised evidence for the sole active rebalance operation"
+        );
+        Ok(())
+    }
+
     pub async fn close_approved_travel_rule_rejection(
         &mut self,
         token_symbol: &str,

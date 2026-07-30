@@ -770,6 +770,7 @@ async fn prefund_arbitrum_canary(
     )
     .await?;
     let active = executor.active_operation()?.cloned();
+    executor.log_active_operation_recovery_evidence().await?;
     let recovered = if recovery_only {
         match (approved_recovery, active) {
             (Some(recovery), Some(active))
@@ -807,15 +808,22 @@ async fn prefund_arbitrum_canary(
             (None, _) => bail!("versioned ESP incident recovery approval is absent"),
         }
     } else if let (Some(recovery), Some(active)) = (approved_recovery, active) {
+        let rejected_amount = U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
+            .context("approved Travel Rule rejected amount is invalid")?;
         if active.intent.token_symbol == recovery.rejected_token_symbol
+            && active.intent.amount == rejected_amount
+            && active.intent.wallet_owner == configured_wallet
+            && active.intent.direction == arb_bot::rebalance::Direction::BinanceToWallet
+            && active.intent.route
+                == (arb_bot::rebalance::Route::Direct {
+                    binance_network: prefunding.binance_network.clone(),
+                    chain_id: ARBITRUM_CHAIN_ID,
+                })
             && matches!(
                 active.progress,
                 RebalanceExecutionProgress::BinanceTransferCompleted { .. }
             )
         {
-            let rejected_amount =
-                U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
-                    .context("approved Travel Rule rejected amount is invalid")?;
             Some(
                 executor
                     .close_approved_travel_rule_rejection(
@@ -834,7 +842,9 @@ async fn prefund_arbitrum_canary(
                     .await?,
             )
         } else {
-            executor.recover_active().await?
+            bail!(
+                "active rebalance operation is outside the exact approved Travel Rule incident; sanitised recovery evidence was logged"
+            )
         }
     } else {
         executor.recover_active().await?
