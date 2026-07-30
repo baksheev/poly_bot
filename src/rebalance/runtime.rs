@@ -444,16 +444,26 @@ impl RebalanceExecutor {
                 .is_empty(),
             "approved Travel Rule rejection recovery found an indexed withdrawal"
         );
+        let travel_rule_history = self
+            .treasury_binance
+            .travel_rule_withdrawal_history_v2(
+                &operation.intent.token_symbol,
+                network,
+                &operation.intent.withdraw_order_id,
+            )
+            .await?;
         ensure!(
-            self.treasury_binance
-                .travel_rule_withdrawal_history_v2(
-                    &operation.intent.token_symbol,
-                    network,
-                    &operation.intent.withdraw_order_id,
-                )
-                .await?
-                .is_empty(),
-            "approved Travel Rule rejection recovery found an indexed Travel Rule withdrawal"
+            travel_rule_history.len() == 1 && travel_rule_history[0].is_failed_without_broadcast(),
+            "approved Travel Rule rejection is not indexed as one failed unbroadcast record"
+        );
+        tracing::info!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            travel_rule_record_id = travel_rule_history[0].tr_id,
+            travel_rule_status = travel_rule_history[0].travel_rule_status,
+            withdrawal_status = travel_rule_history[0].withdrawal_status,
+            transaction_broadcast = false,
+            "reconciled the indexed failed Travel Rule submission"
         );
         let transfer = self
             .treasury_binance

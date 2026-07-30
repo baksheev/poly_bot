@@ -548,6 +548,7 @@ async fn prefund_arbitrum_canary(
         let questionnaire = treasury_binance
             .travel_rule_questionnaire_requirements()
             .await?;
+        let address_verifications = treasury_binance.address_verification_list().await?;
         let master_account = treasury_binance.account_information().await?;
         let master_subaccount = treasury_binance
             .subaccount_spot_assets(&subaccount_email)
@@ -600,6 +601,32 @@ async fn prefund_arbitrum_canary(
                     "read-only Binance capital network capability"
                 );
             }
+        }
+        let matching_address_verifications = address_verifications
+            .iter()
+            .filter(|record| {
+                record
+                    .wallet_address
+                    .eq_ignore_ascii_case(&format!("{configured_wallet:#x}"))
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            wallet = %configured_wallet,
+            matching_records = matching_address_verifications.len(),
+            "read-only Binance address verification probe"
+        );
+        for record in matching_address_verifications {
+            tracing::info!(
+                wallet = %configured_wallet,
+                token = record.token,
+                network = record.network,
+                status = record.status,
+                send_to = ?record.address_questionnaire.send_to,
+                is_address_owner = ?record.address_questionnaire.is_address_owner,
+                verify_method = ?record.address_questionnaire.verify_method,
+                satoshi_token = record.address_questionnaire.satoshi_token,
+                "read-only matching Binance address verification record"
+            );
         }
     }
     let transaction_journal_path = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
@@ -771,7 +798,7 @@ async fn prefund_arbitrum_canary(
             token = recovery.rejected_token_symbol,
             rejected_error_code = recovery.rejected_error_code,
             new_withdrawal_submitted = false,
-            "ESP Travel Rule incident closed after standard and v2 history proved no withdrawal"
+            "ESP Travel Rule incident closed after capital history and failed unbroadcast Travel Rule history proved no withdrawal"
         );
         return Ok(());
     }

@@ -1945,6 +1945,18 @@ both capital and Travel Rule v2 history for the rejected deterministic client
 ID, and closes only that exact durable `-4024` incident. It submits no
 withdrawal, order, allowance, bridge, or wallet transaction.
 
+The first probe established questionnaire country `AE`, exact master Spot
+balance `401.2 ESP`, and live direct ESP withdrawal capabilities on Arbitrum
+and Ethereum. Binance's published UAE questionnaire defines
+`isAddressOwner=1` as self-owned and `sendTo=1` as a private wallet, so the
+submitted two-field questionnaire was already the complete UAE self-wallet
+shape. Travel Rule v2 also indexes the deterministic request as a failed
+record; this is distinct from a capital withdrawal or a broadcast
+transaction. Recovery therefore requires exactly one matching
+`travelRuleStatus=2` record with no transaction hash, plus an empty capital
+withdrawal history. The follow-up probe also reads the exact wallet's address
+verification status before any direct-route retry is designed.
+
 Deliver:
 
 - enable ESP/USDC on the same Rust-owned Binance subaccount and the same

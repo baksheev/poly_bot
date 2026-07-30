@@ -281,6 +281,18 @@ impl BinanceAccountClient {
         .await
     }
 
+    pub async fn address_verification_list(
+        &self,
+    ) -> anyhow::Result<Vec<AddressVerificationRecord>> {
+        let query = self.signed_query(&[("recvWindow", "5000".to_owned())])?;
+        self.signed_get(
+            "/sapi/v1/addressVerify/list",
+            &query,
+            "Travel Rule address verification list",
+        )
+        .await
+    }
+
     pub async fn travel_rule_withdrawal_history_v2(
         &self,
         coin: &str,
@@ -326,6 +338,31 @@ impl BinanceAccountClient {
 pub struct TravelRuleQuestionnaireRequirements {
     #[serde(default)]
     pub questionnaire_country_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressVerificationRecord {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub wallet_address: String,
+    #[serde(default)]
+    pub address_questionnaire: AddressVerificationQuestionnaire,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressVerificationQuestionnaire {
+    pub send_to: Option<i64>,
+    #[serde(default)]
+    pub satoshi_token: String,
+    pub is_address_owner: Option<i64>,
+    pub verify_method: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -493,6 +530,12 @@ pub struct TravelRuleWithdrawalRecord {
     pub withdraw_order_id: String,
     #[serde(default)]
     pub info: String,
+}
+
+impl TravelRuleWithdrawalRecord {
+    pub fn is_failed_without_broadcast(&self) -> bool {
+        self.travel_rule_status == 2 && self.withdrawal_status != 6 && self.tx_id.trim().is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -761,8 +804,8 @@ mod tests {
     use alloy_primitives::{Address, B256};
 
     use super::{
-        CoinInformation, DEPOSIT_ADDRESS_ENDPOINT, DepositAddressRecord, DepositCreditState,
-        DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
+        AddressVerificationRecord, CoinInformation, DEPOSIT_ADDRESS_ENDPOINT, DepositAddressRecord,
+        DepositCreditState, DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
         TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalRecord,
         WithdrawalState, WithdrawalSubmission, matching_deposits, matching_withdrawals,
         select_capital_routes, select_evm_deposit_address,
@@ -820,6 +863,43 @@ mod tests {
 
         let absent: TravelRuleQuestionnaireRequirements = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(absent.questionnaire_country_code, None);
+    }
+
+    #[test]
+    fn parses_address_verification_and_failed_travel_rule_history() {
+        let verification: AddressVerificationRecord = serde_json::from_str(
+            r#"{
+              "status":"VERIFIED","token":"ESP","network":"ARBITRUM",
+              "walletAddress":"0x1111111111111111111111111111111111111111",
+              "addressQuestionnaire":{
+                "sendTo":1,"satoshiToken":"ESP","isAddressOwner":1,"verifyMethod":2
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(verification.status, "VERIFIED");
+        assert_eq!(verification.address_questionnaire.send_to, Some(1));
+        assert_eq!(verification.address_questionnaire.is_address_owner, Some(1));
+
+        let failed: TravelRuleWithdrawalRecord = serde_json::from_str(
+            r#"{
+              "trId":65865741,"coin":"ESP","withdrawalStatus":3,
+              "travelRuleStatus":2,"network":"ARBITRUM",
+              "withdrawOrderId":"rustwd3","txId":""
+            }"#,
+        )
+        .unwrap();
+        assert!(failed.is_failed_without_broadcast());
+
+        let completed: TravelRuleWithdrawalRecord = serde_json::from_str(
+            r#"{
+              "trId":65865742,"coin":"ESP","withdrawalStatus":6,
+              "travelRuleStatus":0,"network":"ARBITRUM",
+              "withdrawOrderId":"rustwd4","txId":"0xabc"
+            }"#,
+        )
+        .unwrap();
+        assert!(!completed.is_failed_without_broadcast());
     }
 
     #[test]
