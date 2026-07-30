@@ -1,9 +1,10 @@
 use std::str::FromStr;
 
 use alloy_primitives::{Address, B256};
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::account::BinanceAccountClient;
 
@@ -285,12 +286,14 @@ impl BinanceAccountClient {
         &self,
     ) -> anyhow::Result<Vec<AddressVerificationRecord>> {
         let query = self.signed_query(&[("recvWindow", "5000".to_owned())])?;
-        self.signed_get(
-            "/sapi/v1/addressVerify/list",
-            &query,
-            "Travel Rule address verification list",
-        )
-        .await
+        let response: Value = self
+            .signed_get(
+                "/sapi/v1/addressVerify/list",
+                &query,
+                "Travel Rule address verification list",
+            )
+            .await?;
+        parse_address_verification_list(response)
     }
 
     pub async fn travel_rule_withdrawal_history_v2(
@@ -363,6 +366,37 @@ pub struct AddressVerificationQuestionnaire {
     pub satoshi_token: String,
     pub is_address_owner: Option<i64>,
     pub verify_method: Option<i64>,
+}
+
+fn parse_address_verification_list(
+    response: Value,
+) -> anyhow::Result<Vec<AddressVerificationRecord>> {
+    let records = match response {
+        Value::Array(records) => Value::Array(records),
+        Value::Object(mut envelope) => {
+            let array_fields = envelope
+                .iter()
+                .filter_map(|(key, value)| value.is_array().then_some(key.clone()))
+                .collect::<Vec<_>>();
+            ensure!(
+                array_fields.len() == 1,
+                "Binance Travel Rule address verification response envelope must contain exactly one record array"
+            );
+            let records = envelope
+                .remove(&array_fields[0])
+                .expect("the selected response envelope field exists");
+            ensure!(
+                envelope.values().all(|value| {
+                    value.is_null() || value.is_boolean() || value.is_number() || value.is_string()
+                }),
+                "Binance Travel Rule address verification response envelope contains unsupported fields"
+            );
+            records
+        }
+        _ => bail!("Binance Travel Rule address verification response is not a list or envelope"),
+    };
+    serde_json::from_value(records)
+        .context("invalid Binance Travel Rule address verification record list")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -808,7 +842,7 @@ mod tests {
         DepositCreditState, DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
         TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalRecord,
         WithdrawalState, WithdrawalSubmission, matching_deposits, matching_withdrawals,
-        select_capital_routes, select_evm_deposit_address,
+        parse_address_verification_list, select_capital_routes, select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -900,6 +934,46 @@ mod tests {
         )
         .unwrap();
         assert!(!completed.is_failed_without_broadcast());
+    }
+
+    #[test]
+    fn parses_documented_and_live_enveloped_address_verification_lists() {
+        let record = serde_json::json!({
+            "status":"VERIFIED","token":"ESP","network":"ARBITRUM",
+            "walletAddress":"0x1111111111111111111111111111111111111111",
+            "addressQuestionnaire":{
+                "sendTo":1,"satoshiToken":"ESP","isAddressOwner":1,"verifyMethod":2
+            }
+        });
+        let documented = parse_address_verification_list(serde_json::json!([record.clone()]))
+            .expect("the documented response list should parse");
+        let live_envelope = parse_address_verification_list(serde_json::json!({
+            "data":[record],
+            "success":true,
+            "total":1
+        }))
+        .expect("the live response envelope should parse");
+
+        assert_eq!(documented, live_envelope);
+        assert_eq!(live_envelope[0].token, "ESP");
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_nested_address_verification_envelopes() {
+        assert!(
+            parse_address_verification_list(serde_json::json!({
+                "data":[],
+                "records":[]
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_address_verification_list(serde_json::json!({
+                "data":[],
+                "metadata":{"page":1}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
