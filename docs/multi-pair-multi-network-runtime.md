@@ -1842,6 +1842,31 @@ capability record anywhere in the reporting window independently fails the
 gate. This lets an operator repair native gas funding without restarting the
 live WLD owner and without making an old successful readiness sample sticky.
 
+The corrective production revision
+`6c4e76b30456fac99463d06dc79417f59529ab3d` passed CI run `30509551085`
+and Deploy GKE run `30509795472`. The workflow deployed immutable image
+`sha256:47b4aa7037d450e45b29fd54dc671187c9b068ba2c9baaf422488649949cc0e9`
+to sole Pod `arb-bot-6c4f97bfb9-9js67`; both containers started at
+`2026-07-30T03:02:42Z`, became Ready at `03:02:51Z`, and had zero restarts.
+The authoritative read-only window
+`[2026-07-30T03:02:42Z, 2026-07-30T03:05:45Z)` reported all three M8
+readiness stages ready, four valid Binance request shapes, exact token and
+router code, funded native gas, a fresh fail-closed Arbitrum gas-price sample,
+two direct rebalance routes, zero Arbitrum execution authority, and zero
+external-mutation capability records. `m8_gate`, M7 combined shadow, and the
+M5 allocator gates were ready; all 255 WLD comparison projections matched.
+
+The same cohort had zero production `ERROR` records and zero hot-telemetry
+drops. WLD Binance parse p99/max was `7/9 us`, socket-to-decision p99/max was
+`44/83 us`, and the World Chain fee-500 prepared-curve total p99/max was
+`33/33 us`. CPU max was `0.01395` core; cgroup memory current/peak was
+`44.9/47.3 MB`; CPU throttling, memory high/max/OOM events, and container
+restarts were all zero. After more than two 60-second refresh intervals, the
+unchanged Arbitrum state still had exactly one startup readiness record, which
+proves transition-only publication. The GCE rollback owner remained
+`TERMINATED`. M8 is therefore closed without enabling an ESP trade or
+rebalance mutation; M9 still requires the explicit production approval below.
+
 ### M9 — Bounded ESP/USDC live canary
 
 Deliver:
