@@ -21,8 +21,8 @@ use arb_bot::{
         WORLD_CHAIN_USDC, is_retryable_quote_error, validate_quote,
     },
     arbitrage::{
-        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator,
-        TradeJournalScope, TradeStage, paper_trade_channel,
+        CanaryJournalRisk, EntryPreflightHandle, ExecutionMode, LegRole, LegStatus,
+        PaperTradeCoordinator, TradeJournalScope, TradeStage, paper_trade_channel,
     },
     balances::{
         BalanceEvent, BalanceSource, BalanceSync, WalletBalanceSnapshot, WalletReadClient,
@@ -59,7 +59,7 @@ use arb_bot::{
             CompiledPortfolioRuntimePlan, compile_manifest_to_path, load_compatibility_domain,
             load_source_domain_for_pair,
         },
-        config::{DexProvider, LoadedDomainConfig},
+        config::{DexProvider, LiveCanaryConfig, LoadedDomainConfig},
     },
     engine::{AdaptiveSizingJob, AdaptiveSizingTaskResult, BinanceFeeBps, TradingEngine},
     execution_accounting::{CommissionAssetValuation, binance_leg_result},
@@ -131,6 +131,61 @@ fn m9_canary_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
         network_id,
         strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
     }
+}
+
+fn m9_canary_allowance_requirements(
+    canary: &LiveCanaryConfig,
+    risk: CanaryJournalRisk,
+    token_a_balance: U256,
+    token_b_balance: U256,
+    now_unix_us: u64,
+) -> anyhow::Result<Option<(U256, U256)>> {
+    let maximum_total = canary
+        .max_total_notional_token_a_base_units
+        .parse::<u128>()
+        .context("M9 cumulative canary cap is invalid")?;
+    let maximum_loss = canary
+        .max_realized_loss_token_a_base_units
+        .parse::<u128>()
+        .context("M9 realized-loss cap is invalid")?;
+    ensure!(
+        risk.admitted_parent_count <= usize::from(canary.max_parent_trades)
+            && risk.failed_parent_count <= usize::from(canary.max_failed_parent_trades)
+            && risk.active_parent_count <= usize::from(canary.max_concurrent_trades)
+            && risk.admitted_notional_token_a_base_units <= maximum_total
+            && risk.realized_loss_token_a_base_units <= maximum_loss,
+        "durable M9 risk exceeds the reviewed canary limits"
+    );
+    let remaining_notional = maximum_total
+        .checked_sub(risk.admitted_notional_token_a_base_units)
+        .context("durable M9 notional exceeds the reviewed canary cap")?;
+    let rollout_window_open = risk.first_admitted_unix_us.is_none_or(|first| {
+        now_unix_us.saturating_sub(first)
+            <= canary.rollout_duration_seconds.saturating_mul(1_000_000)
+    });
+    let new_parent_authorized = remaining_notional > 0
+        && risk.admitted_parent_count < usize::from(canary.max_parent_trades)
+        && risk.failed_parent_count < usize::from(canary.max_failed_parent_trades)
+        && risk.active_parent_count < usize::from(canary.max_concurrent_trades)
+        && risk.realized_loss_token_a_base_units < maximum_loss
+        && rollout_window_open;
+    if !new_parent_authorized {
+        return Ok(None);
+    }
+
+    let bootstrap_token_b = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
+        .context("M9 ESP bootstrap target is invalid")?;
+    let token_a_required = token_a_balance.min(U256::from(remaining_notional));
+    let token_b_required = token_b_balance.min(bootstrap_token_b);
+    ensure!(
+        !token_a_required.is_zero() && !token_b_required.is_zero(),
+        "M9 remaining allowance authority requires both wallet tokens"
+    );
+    Ok(Some((token_a_required, token_b_required)))
+}
+
+fn m9_allowance_operation_id(symbol: &str, required: U256) -> String {
+    format!("rustarb-m9-setup-v3-{symbol}.v2-{required}")
 }
 
 enum RebalanceExecutorEvent {
@@ -3246,31 +3301,62 @@ async fn run(
             .context("M9 Arbitrum V3 router is missing")?
             .parse()
             .context("M9 Arbitrum V3 router is invalid")?;
-        let maximum_canary_usdc = m8_pair
+        let m9_canary = m8_pair
             .live_canary
             .as_ref()
-            .context("M9 canary policy is missing")?
-            .max_total_notional_token_a_base_units
-            .parse::<u128>()
-            .context("M9 cumulative canary cap is invalid")?;
-        let canary_allowances = canary_initial_wallet_balances
+            .context("M9 canary policy is missing")?;
+        let token_a = canary_initial_wallet_balances
             .token_balances
             .iter()
-            .map(|token| AllowanceRequirement {
-                operation_id: format!("rustarb-m9-setup-v3-{}", token.symbol),
-                protocol: UniswapProtocol::V3,
-                token: token.contract,
-                router: canary_router,
-                required: if token.symbol.as_ref() == m8_pair.token_a.symbol {
-                    token.base_units.min(U256::from(maximum_canary_usdc))
-                } else {
-                    token.base_units
-                },
-            })
-            .collect::<Vec<_>>();
-        canary_dex_executor
-            .prepare_and_lock_allowances(&canary_allowances)
-            .await?;
+            .find(|token| token.symbol.as_ref() == m8_pair.token_a.symbol)
+            .context("M9 startup wallet snapshot is missing token_a")?;
+        let token_b = canary_initial_wallet_balances
+            .token_balances
+            .iter()
+            .find(|token| token.symbol.as_ref() == m8_pair.token_b.symbol)
+            .context("M9 startup wallet snapshot is missing token_b")?;
+        let canary_risk = PaperTradeCoordinator::open(&config.arbitrage_trade_journal_path)?
+            .canary_journal_risk(&canary_journal_scope.strategy_id)?;
+        let now_unix_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_micros()
+            .try_into()
+            .context("current Unix timestamp exceeds u64")?;
+        if let Some((token_a_required, token_b_required)) = m9_canary_allowance_requirements(
+            m9_canary,
+            canary_risk,
+            token_a.base_units,
+            token_b.base_units,
+            now_unix_us,
+        )? {
+            let canary_allowances = [(token_a, token_a_required), (token_b, token_b_required)]
+                .into_iter()
+                .map(|(token, required)| AllowanceRequirement {
+                    operation_id: m9_allowance_operation_id(token.symbol.as_ref(), required),
+                    protocol: UniswapProtocol::V3,
+                    token: token.contract,
+                    router: canary_router,
+                    required,
+                })
+                .collect::<Vec<_>>();
+            canary_dex_executor
+                .prepare_and_lock_allowances(&canary_allowances)
+                .await?;
+        } else {
+            canary_dex_executor.lock_allowance_mutations_without_preparation()?;
+            tracing::info!(
+                pair_id = %m8_pair.id,
+                admitted_parent_count = canary_risk.admitted_parent_count,
+                failed_parent_count = canary_risk.failed_parent_count,
+                active_parent_count = canary_risk.active_parent_count,
+                admitted_notional_token_a_base_units =
+                    canary_risk.admitted_notional_token_a_base_units,
+                realized_loss_token_a_base_units =
+                    canary_risk.realized_loss_token_a_base_units,
+                "durable M9 stop condition locked allowance mutations without a new approval"
+            );
+        }
         canary_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
         let canary_dex_service = DexExecutionService::spawn(
             canary_dex_executor,
@@ -5331,16 +5417,19 @@ fn init_tracing() {
 mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::{Address, B256, U256};
     use arb_bot::{
+        arbitrage::CanaryJournalRisk,
         chain::rpc::CanonicalBlock,
         domain::compiled::{CompatibilityRole, load_compatibility_domain},
+        domain::config::LoadedDomainConfig,
         market_data::alchemy::DexStreamEvent,
     };
 
     use super::{
-        StartupDexDrainStats, m9_canary_evm_journal_scope, rebalance_quote_retry_delay,
-        validate_prefunding_marker, write_prefunding_marker,
+        StartupDexDrainStats, m9_allowance_operation_id, m9_canary_allowance_requirements,
+        m9_canary_evm_journal_scope, rebalance_quote_retry_delay, validate_prefunding_marker,
+        write_prefunding_marker,
     };
 
     #[test]
@@ -5369,6 +5458,69 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.network_id.as_str(), scope.network_id);
         assert_eq!(runtime.wallet_location_id.as_str(), scope.wallet_id);
+    }
+
+    #[test]
+    fn m9_post_first_parent_restart_uses_durable_remaining_allowance_authority() {
+        let domain =
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+        let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
+        let first_admitted_unix_us = 1_785_426_526_104_975_u64;
+        let post_trade_usdc = U256::from(16_860_785_u64);
+        let post_trade_esp = U256::from_str_radix("534000000000000000000", 10).unwrap();
+        let mut risk = CanaryJournalRisk {
+            admitted_parent_count: 1,
+            active_parent_count: 0,
+            failed_parent_count: 0,
+            admitted_notional_token_a_base_units: 9_960_977,
+            realized_loss_token_a_base_units: 0,
+            first_admitted_unix_us: Some(first_admitted_unix_us),
+        };
+
+        let (usdc_required, esp_required) = m9_canary_allowance_requirements(
+            canary,
+            risk,
+            post_trade_usdc,
+            post_trade_esp,
+            first_admitted_unix_us + 60_000_000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(usdc_required, U256::from(10_039_023_u64));
+        assert_eq!(
+            esp_required,
+            U256::from_str_radix("400000000000000000000", 10).unwrap()
+        );
+        assert_ne!(
+            m9_allowance_operation_id("USDC", usdc_required),
+            m9_allowance_operation_id("USDC", post_trade_usdc)
+        );
+
+        risk.failed_parent_count = 1;
+        assert_eq!(
+            m9_canary_allowance_requirements(
+                canary,
+                risk,
+                post_trade_usdc,
+                post_trade_esp,
+                first_admitted_unix_us + 60_000_000,
+            )
+            .unwrap(),
+            None
+        );
+
+        risk.failed_parent_count = 0;
+        assert_eq!(
+            m9_canary_allowance_requirements(
+                canary,
+                risk,
+                post_trade_usdc,
+                post_trade_esp,
+                first_admitted_unix_us + 901_000_000,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -538,6 +538,18 @@ impl DexExecutor {
         Ok(())
     }
 
+    /// Permanently disables allowance writes when durable launch/canary risk
+    /// proves that no new parent may be admitted. Existing journaled work can
+    /// still reconcile, but startup must not create fresh approval authority.
+    pub fn lock_allowance_mutations_without_preparation(&mut self) -> anyhow::Result<()> {
+        ensure!(
+            self.allowance_mutations_enabled,
+            "DEX allowance preparation is already locked"
+        );
+        self.allowance_mutations_enabled = false;
+        Ok(())
+    }
+
     pub async fn execute_exact_input(
         &mut self,
         request: ExactInputSwapRequest,

@@ -1896,7 +1896,10 @@ Implementation status:
   distinct from the nonzero runtime-presence minima: after a legitimate canary
   fill, exact inventory reservations decide whether another direction and
   amount is executable instead of comparing the spent balance with its original
-  bootstrap target. Arbitrum rebalance route mutation remains disabled;
+  bootstrap target. Restart allowance authority is derived from the durable
+  remaining cumulative notional and capped bootstrap ESP amount; exhausted
+  canary authority locks allowance mutation without a write. Arbitrum rebalance
+  route mutation remains disabled;
 - Arbitrum's versioned fee policy uses the fresh RPC sample with zero priority
   tip and a `12,000 bps` maximum-fee envelope. A narrowly recognized
   next-block fee-cap rejection is terminal before broadcast and can reuse its

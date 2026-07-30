@@ -370,6 +370,12 @@ process restart, and recovery of the same journal before deployment approval.
 The recovered journal risk is emitted as an authoritative startup snapshot so
 reporting cannot lose an admitted parent merely because asynchronous telemetry
 was dropped during shutdown.
+Allowance recovery uses the same durable risk. USDC authority is bounded by
+the unspent cumulative notional cap, ESP authority is capped by the versioned
+bootstrap amount, and any new approval operation ID commits to its exact
+amount. If parent, failure, loss, concurrency, or rollout-time authority is
+exhausted, startup locks allowance mutation without creating or replaying an
+approval.
 The init container must not create an ESP order, DEX allowance, wallet
 transaction, bridge, or ongoing route authority. General Arbitrum rebalance
 remains the separately reviewed M10 milestone.
