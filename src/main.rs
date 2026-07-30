@@ -5472,7 +5472,7 @@ mod tests {
             admitted_parent_count: 1,
             active_parent_count: 0,
             failed_parent_count: 0,
-            admitted_notional_token_a_base_units: 9_960_977,
+            admitted_notional_token_a_base_units: 9_940_515,
             realized_loss_token_a_base_units: 0,
             first_admitted_unix_us: Some(first_admitted_unix_us),
         };
@@ -5486,7 +5486,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(usdc_required, U256::from(10_039_023_u64));
+        assert_eq!(usdc_required, U256::from(10_059_485_u64));
         assert_eq!(
             esp_required,
             U256::from_str_radix("400000000000000000000", 10).unwrap()
@@ -5510,6 +5510,20 @@ mod tests {
         );
 
         risk.failed_parent_count = 0;
+        risk.admitted_parent_count = 2;
+        assert_eq!(
+            m9_canary_allowance_requirements(
+                canary,
+                risk,
+                post_trade_usdc,
+                post_trade_esp,
+                first_admitted_unix_us + 60_000_000,
+            )
+            .unwrap(),
+            None
+        );
+
+        risk.admitted_parent_count = 1;
         assert_eq!(
             m9_canary_allowance_requirements(
                 canary,

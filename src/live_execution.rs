@@ -2761,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn m9_canary_fails_closed_until_ready_and_enforces_the_parent_cap() {
+    fn m9_canary_fails_closed_until_ready_and_recovers_the_exact_production_parent() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-m9-canary-authority-{}-{}.jsonl",
             std::process::id(),
@@ -2851,10 +2851,26 @@ mod tests {
         assert!(format!("{error:#}").contains("per-trade notional limit"));
 
         // Reproduce the exact production transition that was previously
-        // missing from pre-deploy coverage: one 9.960977 USDC parent becomes
-        // durable, completes, and the process reopens the same journal.
-        canary_opportunity.cost_token_a_base_units = 9_960_977;
-        task.authorize_entry(&canary_opportunity).unwrap();
+        // missing from pre-deploy coverage: one 9.940515 USDC parent becomes
+        // durable, completes as balanced profit, and the process reopens the
+        // same journal.
+        canary_opportunity.received_unix_us = 1_785_426_526_104_975;
+        canary_opportunity.token_b_base_units = 135_000_000_000_000_000_000;
+        canary_opportunity.token_b_step_base_units = 1_000_000_000_000_000_000;
+        canary_opportunity.cost_token_a_base_units = 9_940_515;
+        canary_opportunity.proceeds_token_a_base_units = 9_961_650;
+        canary_opportunity.admission.cex_primary_limit_price = Decimal::new(7_379, 5);
+        canary_opportunity.admission.cex_recovery_limit_price = Decimal::new(7_379, 5);
+        canary_opportunity.admission.cex_recovery_sell_limit_price = Some(Decimal::new(7_379, 5));
+        canary_opportunity
+            .admission
+            .recovery_quote_token_a_base_units = 9_961_650;
+        canary_opportunity
+            .admission
+            .recovery_sell_quote_token_a_base_units = 9_961_650;
+        canary_opportunity.dex_plan.amount_in_base_units = 9_940_515;
+        canary_opportunity.dex_plan.amount_out_minimum_base_units = 134_865_011_740_512_845_647;
+        canary_opportunity.dex_plan.deadline_unix_seconds = 1_785_426_556;
         let mut intent = canary_opportunity.intent(ExecutionMode::DexFirst);
         intent.journal_scope = Some(canary_scope.clone());
         let plan_id = intent.plan_id.clone();
@@ -2864,7 +2880,12 @@ mod tests {
             .record_result(
                 &plan_id,
                 LegRole::Dex,
-                result(100, -9_960_977, 0, "dex:production-parent"),
+                result(
+                    134_923_638_887_482_447_575,
+                    -9_940_515,
+                    6_445,
+                    "dex:production-parent",
+                ),
             )
             .unwrap();
         task.coordinator.take_commands(&plan_id).unwrap();
@@ -2872,7 +2893,12 @@ mod tests {
             .record_result(
                 &plan_id,
                 LegRole::Cex,
-                result(-100, 9_887_860, 0, "cex:production-parent"),
+                result(
+                    -134_000_000_000_000_000_000,
+                    9_880_807,
+                    0,
+                    "cex:production-parent",
+                ),
             )
             .unwrap();
         task.coordinator.take_commands(&plan_id).unwrap();
@@ -2918,14 +2944,19 @@ mod tests {
         assert_eq!(recovered_risk.admitted_parent_count, 1);
         assert_eq!(
             recovered_risk.admitted_notional_token_a_base_units,
-            9_960_977
+            9_940_515
         );
         assert_eq!(recovered_risk.active_parent_count, 0);
-        assert_eq!(recovered_risk.failed_parent_count, 1);
+        assert_eq!(recovered_risk.failed_parent_count, 0);
+        assert_eq!(recovered_risk.realized_loss_token_a_base_units, 0);
+        let mut expired_opportunity = opportunity();
+        expired_opportunity.pair_id = "arbitrum-usdc-esp".to_owned();
+        expired_opportunity.symbol = "ESPUSDC".to_owned();
+        expired_opportunity.received_unix_us = 1_785_426_526_104_975;
         let error = recovered_task
-            .authorize_entry(&canary_opportunity)
+            .authorize_entry(&expired_opportunity)
             .unwrap_err();
-        assert!(format!("{error:#}").contains("failure limit reached"));
+        assert!(format!("{error:#}").contains("rollout window expired"));
 
         drop(recovered_task);
         fs::remove_file(journal).unwrap();
