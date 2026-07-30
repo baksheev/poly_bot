@@ -97,6 +97,13 @@ pub enum Command {
             default_value = ""
         )]
         live_confirmation: String,
+        /// Durable marker preventing a later restart from prefunding again.
+        #[arg(
+            long,
+            env = "ARBITRUM_PREFUNDING_MARKER_PATH",
+            default_value = "/var/lib/arb-bot/m9-prefunding-complete.json"
+        )]
+        marker_path: PathBuf,
     },
     /// Reconcile a live arbitrage CEX unknown outcome from the Binance order journal.
     ArbitrageReconcileCex {

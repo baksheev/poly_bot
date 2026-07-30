@@ -1908,18 +1908,24 @@ Binance-to-wallet transfers, gross debits of at most `30 USDC` and `500 ESP`,
 and withdrawal-fee caps of `5 USDC` and `100 ESP`. These are bootstrap and
 fee-risk limits, not relaxed trade admission limits.
 
-The bootstrap is not steady-state M10 rebalance authority. The deployment
-workflow first stops the sole GKE trading Pod and waits for its wallet,
-Binance, and journal ownership to end. An immutable-image Kubernetes Job then
-opens the existing durable rebalance and wallet journals, recovers the sole
-non-terminal saga if one exists, reads the current Binance withdrawal fee and
-Arbitrum balances, and transfers only the deficit plus that fee. A fee, minimum,
-integer multiple, route, or debit outside the versioned caps fails closed. The
-Job creates no order, DEX allowance, or wallet transaction, is never concurrent
-with the trading Deployment, and must complete and release the shared PVC
-before the M9 Pod starts. Failure restores the previous M8 owner. Re-running the
-same revision is idempotent because already-funded tokens are no-ops and every
-submitted transfer has a deterministic journal identity.
+The bootstrap is not steady-state M10 rebalance authority. The GKE Deployment
+uses `Recreate`, so Kubernetes removes the sole old Pod and ends its wallet,
+Binance, journal, and PVC ownership before the new Pod's immutable-image
+`prefund-arbitrum-m9` init container can start. That container opens the
+existing durable rebalance and wallet journals, recovers the sole non-terminal
+saga if one exists, reads the current Binance withdrawal fee and Arbitrum
+balances, and transfers only the deficit plus that fee. A fee, minimum, integer
+multiple, route, or debit outside the versioned caps fails closed. It creates no
+order, DEX allowance, or wallet transaction and must finish before either M9
+application container can start. Failure triggers the existing Deployment
+rollback to the previous M8 owner.
+
+On success the init container atomically fsyncs a version-, domain-, approval-,
+wallet-, and target-bound completion marker to the shared PVC. A restart of the
+same revision validates that marker and refuses to fund again, even if later
+canary trades have reduced a token balance; normal M9 readiness then fails
+closed instead of silently replenishing inventory. Before the marker exists,
+partial or unknown outcomes resume through the deterministic journal identity.
 
 Deliver:
 

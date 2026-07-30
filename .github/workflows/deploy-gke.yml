@@ -228,8 +228,6 @@ jobs:
           previous_runtime_config=""
           rollout_applied=false
           rollout_succeeded=false
-          previous_scaled_down=false
-          prefund_job=""
 
           if kubectl get deployment arb-bot --namespace "${GKE_NAMESPACE}" >/dev/null 2>&1; then
             had_previous=true
@@ -255,16 +253,6 @@ jobs:
               --namespace "${GKE_NAMESPACE}" \
               --selector=app.kubernetes.io/name=arb-bot \
               -o wide || true
-            if [[ -n "${prefund_job}" ]]; then
-              kubectl logs "job/${prefund_job}" \
-                --namespace "${GKE_NAMESPACE}" \
-                --all-containers=true || true
-              kubectl delete job "${prefund_job}" \
-                --namespace "${GKE_NAMESPACE}" \
-                --ignore-not-found \
-                --wait=true || true
-            fi
-
             if [[ "${rollout_applied}" == true ]]; then
               if [[ "${had_previous}" == true ]]; then
                 printf '%s\n' "${previous_runtime_config}" \
@@ -278,15 +266,6 @@ jobs:
                   --namespace "${GKE_NAMESPACE}" \
                   --ignore-not-found || true
               fi
-            elif [[ "${previous_scaled_down}" == true && "${had_previous}" == true ]]; then
-              printf '%s\n' "${previous_runtime_config}" \
-                | kubectl replace --namespace "${GKE_NAMESPACE}" -f - || true
-              kubectl scale deployment/arb-bot \
-                --namespace "${GKE_NAMESPACE}" \
-                --replicas=1 || true
-              kubectl rollout status deployment/arb-bot \
-                --namespace "${GKE_NAMESPACE}" \
-                --timeout=10m || true
             fi
 
             if [[ "${new_pool}" != "${previous_pool}" ]]; then
@@ -348,48 +327,6 @@ jobs:
             fi
           fi
 
-          prefund_job="arb-bot-prefund-${release_id}"
-          if [[ "${had_previous}" == true ]]; then
-            kubectl scale deployment/arb-bot \
-              --namespace "${GKE_NAMESPACE}" \
-              --replicas=0
-            previous_scaled_down=true
-            kubectl wait \
-              --namespace "${GKE_NAMESPACE}" \
-              --for=delete pod \
-              --selector=app.kubernetes.io/name=arb-bot \
-              --timeout=5m
-          fi
-          kubectl delete job "${prefund_job}" \
-            --namespace "${GKE_NAMESPACE}" \
-            --ignore-not-found \
-            --wait=true
-          sed \
-            -e "s|__IMAGE__|${IMAGE}|g" \
-            -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
-            -e "s|__RELEASE_ID__|${release_id}|g" \
-            -e "s|__NODE_POOL__|${new_pool}|g" \
-            infra/gcp/gke/prefund-arbitrum-job.yaml \
-            | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
-          if ! kubectl wait \
-            --namespace "${GKE_NAMESPACE}" \
-            --for=condition=complete \
-            "job/${prefund_job}" \
-            --timeout=40m; then
-            kubectl describe "job/${prefund_job}" --namespace "${GKE_NAMESPACE}" || true
-            kubectl logs "job/${prefund_job}" \
-              --namespace "${GKE_NAMESPACE}" \
-              --all-containers=true || true
-            false
-          fi
-          kubectl logs "job/${prefund_job}" \
-            --namespace "${GKE_NAMESPACE}" \
-            --all-containers=true
-          kubectl delete job "${prefund_job}" \
-            --namespace "${GKE_NAMESPACE}" \
-            --wait=true
-          prefund_job=""
-
           sed \
             -e "s|__IMAGE__|${IMAGE}|g" \
             -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
@@ -442,6 +379,8 @@ jobs:
             -o json)"
           test "$(jq -r '.spec.template.spec.containers | map(.name) | sort | join(",")' \
             <<<"${deployment_json}")" = arb-bot,esp-market-data
+          test "$(jq -r '.spec.template.spec.initContainers | map(.name) | join(",")' \
+            <<<"${deployment_json}")" = prefund-arbitrum-m9
           test "$(jq -r '.spec.template.spec.containers[] | select(.name == "esp-market-data") | .args[0] | contains("collect-prices")' \
             <<<"${deployment_json}")" = true
           test "$(jq -r '.spec.template.spec.volumes[] | select(.name == "esp-market-data-secrets") | .csi.volumeAttributes.secretProviderClass' \

@@ -1,12 +1,17 @@
 use std::{
     collections::BTreeMap,
+    fs::OpenOptions,
+    io::Write,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, bail, ensure};
@@ -322,9 +327,10 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceTravelRuleWithdrawalStatus { tr_id } => {
             binance_travel_rule_withdrawal_status(&cli.config, tr_id).await
         }
-        Command::PrefundArbitrumCanary { live_confirmation } => {
-            prefund_arbitrum_canary(&cli.config, &live_confirmation).await
-        }
+        Command::PrefundArbitrumCanary {
+            live_confirmation,
+            marker_path,
+        } => prefund_arbitrum_canary(&cli.config, &live_confirmation, &marker_path).await,
         Command::ArbitrageReconcileCex {
             plan_id,
             order_journal_path,
@@ -433,6 +439,7 @@ async fn main() -> anyhow::Result<()> {
 async fn prefund_arbitrum_canary(
     config: &config::AppConfig,
     live_confirmation: &str,
+    marker_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     ensure!(
         live_confirmation == "PREFUND_ARBITRUM_M9",
@@ -471,6 +478,22 @@ async fn prefund_arbitrum_canary(
         wallet.address() == configured_wallet,
         "Arbitrum prefunding signer differs from EVM_WALLET_ADDRESS"
     );
+    if validate_prefunding_marker(
+        marker_path,
+        source_domain.fingerprint_sha256(),
+        &source_domain.snapshot().snapshot_id,
+        configured_wallet,
+        &canary.minimum_wallet_token_a_base_units,
+        &canary.minimum_wallet_token_b_base_units,
+        &prefunding.production_approval_recorded_at_utc,
+    )? {
+        tracing::info!(
+            marker_path = %marker_path.display(),
+            wallet = %configured_wallet,
+            "durable Arbitrum prefunding marker already exists; refusing to fund again"
+        );
+        return Ok(());
+    }
     let world_endpoint = std::env::var("ALCHEMY_WORLDCHAIN_RPC_URL")
         .context("ALCHEMY_WORLDCHAIN_RPC_URL is required for journal recovery")?;
     let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
@@ -694,6 +717,15 @@ async fn prefund_arbitrum_canary(
         final_usdc >= token_a_target && final_esp >= token_b_target,
         "Arbitrum prefunding final balances are below the versioned M9 targets"
     );
+    write_prefunding_marker(
+        marker_path,
+        source_domain.fingerprint_sha256(),
+        &source_domain.snapshot().snapshot_id,
+        configured_wallet,
+        &canary.minimum_wallet_token_a_base_units,
+        &canary.minimum_wallet_token_b_base_units,
+        &prefunding.production_approval_recorded_at_utc,
+    )?;
     tracing::info!(
         wallet = %configured_wallet,
         usdc_base_units = final_usdc.to_string(),
@@ -702,6 +734,111 @@ async fn prefund_arbitrum_canary(
         steady_state_rebalance_enabled = false,
         "approved one-shot Arbitrum canary prefunding completed"
     );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_prefunding_marker(
+    path: &std::path::Path,
+    domain_fingerprint: &str,
+    snapshot_id: &str,
+    wallet: Address,
+    token_a_target: &str,
+    token_b_target: &str,
+    approval_recorded_at_utc: &str,
+) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect prefunding marker {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "prefunding marker is not a regular file"
+    );
+    let marker: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path)
+            .with_context(|| format!("failed to read prefunding marker {}", path.display()))?,
+    )
+    .context("prefunding marker is invalid JSON")?;
+    ensure!(
+        marker
+            == serde_json::json!({
+                "schema_version": 1,
+                "domain_fingerprint_sha256": domain_fingerprint,
+                "snapshot_id": snapshot_id,
+                "wallet": format!("{wallet:#x}"),
+                "token_a_target_base_units": token_a_target,
+                "token_b_target_base_units": token_b_target,
+                "approval_recorded_at_utc": approval_recorded_at_utc,
+                "completed": true,
+            }),
+        "prefunding marker differs from the approved M9 artifact"
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_prefunding_marker(
+    path: &std::path::Path,
+    domain_fingerprint: &str,
+    snapshot_id: &str,
+    wallet: Address,
+    token_a_target: &str,
+    token_b_target: &str,
+    approval_recorded_at_utc: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        !path.as_os_str().is_empty() && path.file_name().is_some(),
+        "prefunding marker path is invalid"
+    );
+    let parent = path
+        .parent()
+        .context("prefunding marker has no parent directory")?;
+    ensure!(
+        parent.is_dir(),
+        "prefunding marker parent directory does not exist"
+    );
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let temp_path = path.with_extension(format!("tmp-{suffix}"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temp_path)
+        .with_context(|| format!("failed to create prefunding marker {}", temp_path.display()))?;
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "domain_fingerprint_sha256": domain_fingerprint,
+        "snapshot_id": snapshot_id,
+        "wallet": format!("{wallet:#x}"),
+        "token_a_target_base_units": token_a_target,
+        "token_b_target_base_units": token_b_target,
+        "approval_recorded_at_utc": approval_recorded_at_utc,
+        "completed": true,
+    }))?;
+    bytes.push(b'\n');
+    file.write_all(&bytes)
+        .context("failed to write prefunding marker")?;
+    file.sync_all()
+        .context("failed to fsync prefunding marker")?;
+    drop(file);
+    std::fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to atomically install prefunding marker {}",
+            path.display()
+        )
+    })?;
+    OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .context("failed to open prefunding marker directory")?
+        .sync_all()
+        .context("failed to fsync prefunding marker directory")?;
     Ok(())
 }
 
@@ -4704,12 +4841,77 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use alloy_primitives::B256;
+    use alloy_primitives::{Address, B256};
     use arb_bot::{chain::rpc::CanonicalBlock, market_data::alchemy::DexStreamEvent};
 
-    use super::{StartupDexDrainStats, rebalance_quote_retry_delay};
+    use super::{
+        StartupDexDrainStats, rebalance_quote_retry_delay, validate_prefunding_marker,
+        write_prefunding_marker,
+    };
+
+    #[test]
+    fn prefunding_marker_is_atomic_exact_and_prevents_a_second_funding_run() {
+        let directory = std::env::temp_dir().join(format!(
+            "arb-bot-prefunding-marker-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("m9-prefunding.json");
+        let wallet = Address::repeat_byte(7);
+        assert!(
+            !validate_prefunding_marker(
+                &marker,
+                "fingerprint",
+                "snapshot",
+                wallet,
+                "25000000",
+                "400000000000000000000",
+                "2026-07-30T06:16:57Z",
+            )
+            .unwrap()
+        );
+        write_prefunding_marker(
+            &marker,
+            "fingerprint",
+            "snapshot",
+            wallet,
+            "25000000",
+            "400000000000000000000",
+            "2026-07-30T06:16:57Z",
+        )
+        .unwrap();
+        assert!(
+            validate_prefunding_marker(
+                &marker,
+                "fingerprint",
+                "snapshot",
+                wallet,
+                "25000000",
+                "400000000000000000000",
+                "2026-07-30T06:16:57Z",
+            )
+            .unwrap()
+        );
+        assert!(
+            validate_prefunding_marker(
+                &marker,
+                "another-fingerprint",
+                "snapshot",
+                wallet,
+                "25000000",
+                "400000000000000000000",
+                "2026-07-30T06:16:57Z",
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn rebalance_quote_retry_backoff_is_bounded() {
