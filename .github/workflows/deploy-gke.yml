@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: production-gke
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GCP_REGION: asia-southeast1
@@ -34,7 +34,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     environment: production
 
     steps:
@@ -116,6 +116,22 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_concurrent_trades" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.rollout_duration_seconds" "${domain_config}")" = 900
           test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_mutations_enabled" "${domain_config}")" = false
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approval_gate" "${domain_config}")" \
+            = explicit_production_approved
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.production_approval_actor" "${domain_config}")" \
+            = operator
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.binance_network" "${domain_config}")" \
+            = ARBITRUM
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.maximum_transfer_count" "${domain_config}")" \
+            = 2
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.maximum_token_a_withdrawal_fee_base_units" "${domain_config}")" \
+            = 5000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.maximum_token_b_withdrawal_fee_base_units" "${domain_config}")" \
+            = 100000000000000000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.maximum_token_a_debit_base_units" "${domain_config}")" \
+            = 30000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.maximum_token_b_debit_base_units" "${domain_config}")" \
+            = 500000000000000000000
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
             = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \
@@ -212,6 +228,8 @@ jobs:
           previous_runtime_config=""
           rollout_applied=false
           rollout_succeeded=false
+          previous_scaled_down=false
+          prefund_job=""
 
           if kubectl get deployment arb-bot --namespace "${GKE_NAMESPACE}" >/dev/null 2>&1; then
             had_previous=true
@@ -237,6 +255,15 @@ jobs:
               --namespace "${GKE_NAMESPACE}" \
               --selector=app.kubernetes.io/name=arb-bot \
               -o wide || true
+            if [[ -n "${prefund_job}" ]]; then
+              kubectl logs "job/${prefund_job}" \
+                --namespace "${GKE_NAMESPACE}" \
+                --all-containers=true || true
+              kubectl delete job "${prefund_job}" \
+                --namespace "${GKE_NAMESPACE}" \
+                --ignore-not-found \
+                --wait=true || true
+            fi
 
             if [[ "${rollout_applied}" == true ]]; then
               if [[ "${had_previous}" == true ]]; then
@@ -251,6 +278,15 @@ jobs:
                   --namespace "${GKE_NAMESPACE}" \
                   --ignore-not-found || true
               fi
+            elif [[ "${previous_scaled_down}" == true && "${had_previous}" == true ]]; then
+              printf '%s\n' "${previous_runtime_config}" \
+                | kubectl replace --namespace "${GKE_NAMESPACE}" -f - || true
+              kubectl scale deployment/arb-bot \
+                --namespace "${GKE_NAMESPACE}" \
+                --replicas=1 || true
+              kubectl rollout status deployment/arb-bot \
+                --namespace "${GKE_NAMESPACE}" \
+                --timeout=10m || true
             fi
 
             if [[ "${new_pool}" != "${previous_pool}" ]]; then
@@ -311,6 +347,48 @@ jobs:
                 --wait=true
             fi
           fi
+
+          prefund_job="arb-bot-prefund-${release_id}"
+          if [[ "${had_previous}" == true ]]; then
+            kubectl scale deployment/arb-bot \
+              --namespace "${GKE_NAMESPACE}" \
+              --replicas=0
+            previous_scaled_down=true
+            kubectl wait \
+              --namespace "${GKE_NAMESPACE}" \
+              --for=delete pod \
+              --selector=app.kubernetes.io/name=arb-bot \
+              --timeout=5m
+          fi
+          kubectl delete job "${prefund_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --ignore-not-found \
+            --wait=true
+          sed \
+            -e "s|__IMAGE__|${IMAGE}|g" \
+            -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
+            -e "s|__RELEASE_ID__|${release_id}|g" \
+            -e "s|__NODE_POOL__|${new_pool}|g" \
+            infra/gcp/gke/prefund-arbitrum-job.yaml \
+            | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+          if ! kubectl wait \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=complete \
+            "job/${prefund_job}" \
+            --timeout=40m; then
+            kubectl describe "job/${prefund_job}" --namespace "${GKE_NAMESPACE}" || true
+            kubectl logs "job/${prefund_job}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --all-containers=true || true
+            false
+          fi
+          kubectl logs "job/${prefund_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --all-containers=true
+          kubectl delete job "${prefund_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --wait=true
+          prefund_job=""
 
           sed \
             -e "s|__IMAGE__|${IMAGE}|g" \

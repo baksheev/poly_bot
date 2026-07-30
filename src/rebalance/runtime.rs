@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr, time::Duration};
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, bail, ensure};
@@ -12,10 +12,11 @@ use crate::{
     },
     binance::{
         account::{AccountInformation, BinanceAccountClient},
-        capital::{DepositRecord, WithdrawalRecord, select_capital_routes},
+        capital::{DepositRecord, NetworkInformation, WithdrawalRecord, select_capital_routes},
         sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
     chain::rpc::{JsonRpcClient, TransactionReceipt},
+    m8_readiness::{ARBITRUM_CHAIN_ID, ARBITRUM_ESP, ARBITRUM_USDC},
     wallet::{
         EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
         PROCESS_NONCE_LOCK_TTL, TransactionJournal, UnknownOutcomeReason, WalletCall,
@@ -24,8 +25,8 @@ use crate::{
 };
 
 use super::{
-    Direction, RebalanceExecutionJournal, RebalanceExecutionOperation, RebalanceExecutionProgress,
-    RebalanceExecutionRequest, Route,
+    Direction, RebalanceAction, RebalanceExecutionJournal, RebalanceExecutionOperation,
+    RebalanceExecutionProgress, RebalanceExecutionRequest, Route,
 };
 
 const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
@@ -37,8 +38,87 @@ const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
 pub struct RebalanceRuntimeLimits {
     pub maximum_wld: Decimal,
     pub maximum_usdc: Decimal,
+    pub maximum_esp: Decimal,
     pub operation_timeout: Duration,
     pub binance_withdrawal_api_mode: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectPrefundingPlan {
+    pub action: RebalanceAction,
+    pub requested_debit: U256,
+    pub expected_credit: U256,
+    pub withdrawal_fee: U256,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_direct_prefunding(
+    target_wallet_balance: U256,
+    current_wallet_balance: U256,
+    token_decimals: u8,
+    network: &NetworkInformation,
+    chain_id: u64,
+    maximum_fee: U256,
+    maximum_debit: U256,
+) -> anyhow::Result<Option<DirectPrefundingPlan>> {
+    if current_wallet_balance >= target_wallet_balance {
+        return Ok(None);
+    }
+    ensure!(
+        network.network == "ARBITRUM"
+            && chain_id == ARBITRUM_CHAIN_ID
+            && network.withdrawal_available(),
+        "prefunding requires the live direct Arbitrum withdrawal route"
+    );
+    let deficit = target_wallet_balance - current_wallet_balance;
+    let fee = decimal_to_base_units(network.withdraw_fee, token_decimals)?;
+    ensure!(
+        fee <= maximum_fee,
+        "live Binance withdrawal fee exceeds the approved prefunding cap"
+    );
+    let minimum = decimal_to_base_units(network.withdraw_min, token_decimals)?;
+    let maximum = decimal_to_base_units(network.withdraw_max, token_decimals)?;
+    let multiple =
+        decimal_to_base_units(network.withdraw_integer_multiple, token_decimals)?.max(U256::ONE);
+    let needed = deficit
+        .checked_add(fee)
+        .context("prefunding target plus withdrawal fee overflow")?
+        .max(minimum);
+    let remainder = needed % multiple;
+    let requested_debit = if remainder.is_zero() {
+        needed
+    } else {
+        needed
+            .checked_add(multiple - remainder)
+            .context("prefunding withdrawal rounding overflow")?
+    };
+    ensure!(
+        requested_debit <= maximum && requested_debit <= maximum_debit,
+        "required prefunding debit exceeds an approved or live withdrawal maximum"
+    );
+    let expected_credit = requested_debit
+        .checked_sub(fee)
+        .context("prefunding withdrawal fee exceeds debit")?;
+    ensure!(
+        current_wallet_balance
+            .checked_add(expected_credit)
+            .context("prefunding wallet target overflow")?
+            >= target_wallet_balance,
+        "prefunding withdrawal cannot reach the approved wallet target"
+    );
+    Ok(Some(DirectPrefundingPlan {
+        action: RebalanceAction {
+            direction: Direction::BinanceToWallet,
+            amount: requested_debit,
+            route: Route::Direct {
+                binance_network: network.network.clone(),
+                chain_id,
+            },
+        },
+        requested_debit,
+        expected_credit,
+        withdrawal_fee: fee,
+    }))
 }
 
 impl RebalanceRuntimeLimits {
@@ -46,7 +126,8 @@ impl RebalanceRuntimeLimits {
         let maximum = match symbol {
             "WLD" => self.maximum_wld,
             "USDC" => self.maximum_usdc,
-            _ => bail!("full rebalance executor only permits WLD and USDC"),
+            "ESP" => self.maximum_esp,
+            _ => bail!("full rebalance executor only permits WLD, USDC, and ESP"),
         };
         ensure!(
             maximum > Decimal::ZERO,
@@ -71,6 +152,7 @@ pub struct RebalanceExecutor {
 struct RebalanceEvmExecutionOwner {
     world: JsonRpcClient,
     optimism: JsonRpcClient,
+    direct_read_rpcs: BTreeMap<u64, JsonRpcClient>,
     wallet: EvmWallet,
     transaction_journal: TransactionJournal,
     world_nonce: NonceLane,
@@ -86,7 +168,9 @@ impl RebalanceEvmExecutionOwner {
         match chain_id {
             WORLD_CHAIN_CHAIN_ID => Ok(&self.world),
             OPTIMISM_CHAIN_ID => Ok(&self.optimism),
-            _ => bail!("rebalance EVM owner has no lane for chain {chain_id}"),
+            chain_id => self.direct_read_rpcs.get(&chain_id).with_context(|| {
+                format!("rebalance EVM owner has no read lane for chain {chain_id}")
+            }),
         }
     }
 
@@ -146,6 +230,7 @@ impl RebalanceExecutor {
         across: AcrossClient,
         world: JsonRpcClient,
         optimism: JsonRpcClient,
+        direct_read_rpcs: BTreeMap<u64, JsonRpcClient>,
         wallet: EvmWallet,
         execution_journal_path: PathBuf,
         transaction_journal_path: PathBuf,
@@ -177,6 +262,17 @@ impl RebalanceExecutor {
             optimism_chain == OPTIMISM_CHAIN_ID,
             "Optimism RPC returned the wrong chain id"
         );
+        for (expected_chain_id, rpc) in &direct_read_rpcs {
+            ensure!(
+                *expected_chain_id != WORLD_CHAIN_CHAIN_ID
+                    && *expected_chain_id != OPTIMISM_CHAIN_ID,
+                "additional direct-read RPC duplicates an owned execution lane"
+            );
+            ensure!(
+                rpc.chain_id().await? == *expected_chain_id,
+                "additional direct-read RPC returned the wrong chain id"
+            );
+        }
         ensure!(
             subaccount_email.contains('@') && subaccount_email.is_ascii(),
             "Binance sub-account email is invalid"
@@ -290,6 +386,7 @@ impl RebalanceExecutor {
             evm: RebalanceEvmExecutionOwner {
                 world,
                 optimism,
+                direct_read_rpcs,
                 wallet,
                 transaction_journal,
                 world_nonce,
@@ -307,10 +404,11 @@ impl RebalanceExecutor {
         let Some(operation) = self.execution_journal.active_operation()?.cloned() else {
             return Ok(None);
         };
-        validate_approved_world_asset(
+        validate_approved_asset(
             &operation.intent.token_symbol,
             operation.intent.token_decimals,
             operation.intent.token_contract,
+            route_wallet_chain_id(&operation.intent.route),
         )?;
         ensure!(
             operation.intent.wallet_owner == self.evm.wallet_address(),
@@ -327,10 +425,11 @@ impl RebalanceExecutor {
             request.wallet_owner == self.evm.wallet_address(),
             "rebalance request wallet differs from signer"
         );
-        validate_approved_world_asset(
+        validate_approved_asset(
             &request.token_symbol,
             request.token_decimals,
             request.token_contract,
+            route_wallet_chain_id(&request.action.route),
         )?;
         let requested = base_units_to_decimal(request.action.amount, request.token_decimals)?;
         ensure!(
@@ -375,8 +474,8 @@ impl RebalanceExecutor {
             _ => unreachable!(),
         };
         ensure!(
-            chain_id == WORLD_CHAIN_CHAIN_ID,
-            "direct rebalance target is not World Chain"
+            matches!(chain_id, WORLD_CHAIN_CHAIN_ID | ARBITRUM_CHAIN_ID),
+            "direct rebalance target chain is not approved"
         );
         let withdrawal_submission_safe = created_here
             || matches!(
@@ -391,7 +490,7 @@ impl RebalanceExecutor {
             self.verify_route(&operation, true).await?;
             let bridge_before = self
                 .evm
-                .rpc(WORLD_CHAIN_CHAIN_ID)?
+                .rpc(chain_id)?
                 .erc20_balance(
                     operation.intent.token_contract,
                     operation.intent.wallet_owner,
@@ -418,7 +517,7 @@ impl RebalanceExecutor {
         let received = withdrawal_received_base_units(&record, operation.intent.token_decimals)?;
         let wallet_after = self
             .wait_direct_withdrawal_credit(
-                self.evm.rpc(WORLD_CHAIN_CHAIN_ID)?,
+                self.evm.rpc(chain_id)?,
                 operation.intent.token_contract,
                 operation.intent.wallet_owner,
                 &record.tx_id,
@@ -1788,7 +1887,7 @@ fn validate_master_subaccount_view(
     trading_account: &AccountInformation,
     master_balances: &[SubAccountAssetBalance],
 ) -> anyhow::Result<()> {
-    for asset in ["USDC", "WLD"] {
+    for asset in ["ESP", "USDC", "WLD"] {
         let trading = trading_account
             .balances
             .iter()
@@ -1830,6 +1929,12 @@ fn withdrawal_requested_base_units(
 
 fn token_on_chain(symbol: &str, chain_id: u64) -> anyhow::Result<Address> {
     match (symbol, chain_id) {
+        ("ESP", ARBITRUM_CHAIN_ID) => {
+            Address::from_str(ARBITRUM_ESP).context("approved Arbitrum ESP address is invalid")
+        }
+        ("USDC", ARBITRUM_CHAIN_ID) => {
+            Address::from_str(ARBITRUM_USDC).context("approved Arbitrum USDC address is invalid")
+        }
         ("USDC", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_USDC),
         ("USDC", WORLD_CHAIN_CHAIN_ID) => Ok(WORLD_CHAIN_USDC),
         ("WLD", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_WLD),
@@ -1838,19 +1943,38 @@ fn token_on_chain(symbol: &str, chain_id: u64) -> anyhow::Result<Address> {
     }
 }
 
-fn validate_approved_world_asset(
+fn route_wallet_chain_id(route: &Route) -> u64 {
+    match route {
+        Route::Direct { chain_id, .. } => *chain_id,
+        Route::Across {
+            wallet_chain_id, ..
+        } => *wallet_chain_id,
+    }
+}
+
+fn validate_approved_asset(
     symbol: &str,
     decimals: u8,
     contract: Address,
+    chain_id: u64,
 ) -> anyhow::Result<()> {
-    let (expected_decimals, expected_contract) = match symbol {
-        "WLD" => (18, WORLD_CHAIN_WLD),
-        "USDC" => (6, WORLD_CHAIN_USDC),
-        _ => bail!("full rebalance executor only permits WLD and USDC"),
+    let (expected_decimals, expected_contract) = match (symbol, chain_id) {
+        ("WLD", WORLD_CHAIN_CHAIN_ID) => (18, WORLD_CHAIN_WLD),
+        ("USDC", WORLD_CHAIN_CHAIN_ID) => (6, WORLD_CHAIN_USDC),
+        ("USDC", ARBITRUM_CHAIN_ID) => (
+            6,
+            Address::from_str(ARBITRUM_USDC)
+                .context("approved Arbitrum USDC address is invalid")?,
+        ),
+        ("ESP", ARBITRUM_CHAIN_ID) => (
+            18,
+            Address::from_str(ARBITRUM_ESP).context("approved Arbitrum ESP address is invalid")?,
+        ),
+        _ => bail!("rebalance token is not approved on chain {chain_id}"),
     };
     ensure!(
         decimals == expected_decimals && contract == expected_contract,
-        "rebalance token metadata differs from the approved World Chain asset"
+        "rebalance token metadata differs from the approved chain asset"
     );
     Ok(())
 }
@@ -1878,6 +2002,14 @@ fn decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U
         .checked_mul(pow10(decimals.into())?)
         .context("decimal balance base-unit overflow")?;
     Ok(numerator / pow10(value.scale())?)
+}
+
+pub fn rebalance_decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
+    decimal_to_base_units_floor(value, decimals)
+}
+
+pub fn rebalance_base_units_to_decimal(value: U256, decimals: u8) -> anyhow::Result<Decimal> {
+    base_units_to_decimal(value, decimals)
 }
 
 fn base_units_to_decimal(value: U256, decimals: u8) -> anyhow::Result<Decimal> {
@@ -1914,16 +2046,78 @@ mod tests {
     use rust_decimal::Decimal;
 
     use crate::{
-        binance::capital::WithdrawalRecord,
+        binance::capital::{NetworkInformation, WithdrawalRecord},
         chain::rpc::{ReceiptLog, TransactionReceipt},
     };
 
     use super::{
-        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, validate_across_fill_receipt, validate_approved_world_asset,
+        ARBITRUM_CHAIN_ID, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD,
+        base_units_to_decimal, decimal_to_base_units, decimal_to_base_units_floor,
+        plan_direct_prefunding, validate_across_fill_receipt, validate_approved_asset,
         validate_direct_withdrawal_receipt, withdrawal_received_base_units,
         withdrawal_requested_base_units,
     };
+
+    fn arbitrum_network(fee: &str) -> NetworkInformation {
+        NetworkInformation {
+            network: "ARBITRUM".to_owned(),
+            name: "Arbitrum One".to_owned(),
+            deposit_enable: true,
+            withdraw_enable: true,
+            busy: false,
+            withdraw_fee: Decimal::from_str_exact(fee).unwrap(),
+            withdraw_min: Decimal::from_str_exact("2").unwrap(),
+            withdraw_max: Decimal::from_str_exact("1000000").unwrap(),
+            withdraw_integer_multiple: Decimal::from_str_exact("0.01").unwrap(),
+        }
+    }
+
+    #[test]
+    fn direct_prefunding_adds_the_live_fee_and_reaches_the_exact_target() {
+        let plan = plan_direct_prefunding(
+            U256::from(25_000_000_u64),
+            U256::ZERO,
+            6,
+            &arbitrum_network("1"),
+            ARBITRUM_CHAIN_ID,
+            U256::from(5_000_000_u64),
+            U256::from(30_000_000_u64),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.requested_debit, U256::from(26_000_000_u64));
+        assert_eq!(plan.withdrawal_fee, U256::from(1_000_000_u64));
+        assert_eq!(plan.expected_credit, U256::from(25_000_000_u64));
+    }
+
+    #[test]
+    fn direct_prefunding_is_noop_when_funded_and_fails_closed_on_fee_growth() {
+        assert!(
+            plan_direct_prefunding(
+                U256::from(25_000_000_u64),
+                U256::from(25_000_000_u64),
+                6,
+                &arbitrum_network("100"),
+                ARBITRUM_CHAIN_ID,
+                U256::from(5_000_000_u64),
+                U256::from(30_000_000_u64),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            plan_direct_prefunding(
+                U256::from(25_000_000_u64),
+                U256::ZERO,
+                6,
+                &arbitrum_network("5.01"),
+                ARBITRUM_CHAIN_ID,
+                U256::from(5_000_000_u64),
+                U256::from(30_000_000_u64),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn exact_decimal_conversion_round_trips_executor_limits() {
@@ -1944,10 +2138,13 @@ mod tests {
 
     #[test]
     fn permits_only_exact_world_chain_token_metadata() {
-        validate_approved_world_asset("WLD", 18, WORLD_CHAIN_WLD).unwrap();
-        validate_approved_world_asset("USDC", 6, WORLD_CHAIN_USDC).unwrap();
-        assert!(validate_approved_world_asset("WLD", 6, WORLD_CHAIN_WLD).is_err());
-        assert!(validate_approved_world_asset("USDT", 6, Address::repeat_byte(1)).is_err());
+        validate_approved_asset("WLD", 18, WORLD_CHAIN_WLD, WORLD_CHAIN_CHAIN_ID).unwrap();
+        validate_approved_asset("USDC", 6, WORLD_CHAIN_USDC, WORLD_CHAIN_CHAIN_ID).unwrap();
+        assert!(validate_approved_asset("WLD", 6, WORLD_CHAIN_WLD, WORLD_CHAIN_CHAIN_ID).is_err());
+        assert!(
+            validate_approved_asset("USDT", 6, Address::repeat_byte(1), WORLD_CHAIN_CHAIN_ID)
+                .is_err()
+        );
     }
 
     #[test]

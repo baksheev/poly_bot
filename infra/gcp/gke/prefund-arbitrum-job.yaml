@@ -1,0 +1,104 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: arb-bot-prefund-__RELEASE_ID__
+  namespace: arb-bot
+  labels:
+    app.kubernetes.io/name: arb-bot-prefund
+    app.kubernetes.io/component: one-shot-prefunding
+    arb-bot/source-revision: "__SOURCE_REVISION__"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 2400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: arb-bot-prefund
+        app.kubernetes.io/component: one-shot-prefunding
+        arb-bot/source-revision: "__SOURCE_REVISION__"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: arb-bot-runtime
+      priorityClassName: arb-bot-critical
+      terminationGracePeriodSeconds: 45
+      nodeSelector:
+        cloud.google.com/gke-nodepool: __NODE_POOL__
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prefund
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              for secret_name in \
+                ALCHEMY_WORLDCHAIN_RPC_URL \
+                ALCHEMY_OPTIMISM_RPC_URL \
+                BINANCE_API_KEY \
+                BINANCE_SECRET_KEY \
+                BINANCE_TREASURY_API_KEY \
+                BINANCE_TREASURY_SECRET_KEY \
+                BINANCE_SUBACCOUNT_EMAIL \
+                EVM_WALLET_PRIVATE_KEY; do
+                secret_value="$(cat "/var/run/secrets/arb-bot/${secret_name}")"
+                export "${secret_name}=${secret_value}"
+              done
+              alchemy_api_key="${ALCHEMY_WORLDCHAIN_RPC_URL##*/}"
+              test -n "${alchemy_api_key}"
+              export ARBITRUM_RPC_URL="https://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
+              unset alchemy_api_key
+              export ENGINE_ID="arb-bot-prefund-__RELEASE_ID__"
+              exec arb_bot prefund-arbitrum-canary
+          envFrom:
+            - configMapRef:
+                name: arb-bot-runtime
+          env:
+            - name: ARBITRAGE_EXECUTION_MODE
+              value: disabled
+            - name: REBALANCE_EXECUTION_MODE
+              value: disabled
+            - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
+              value: travel_rule
+            - name: ARBITRUM_PREFUNDING_LIVE_CONFIRMATION
+              value: PREFUND_ARBITRUM_M9
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: runtime-secrets
+              mountPath: /var/run/secrets/arb-bot
+              readOnly: true
+            - name: runtime-tmp
+              mountPath: /tmp
+            - name: runtime-state
+              mountPath: /var/lib/arb-bot
+      volumes:
+        - name: runtime-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: arb-bot-runtime
+        - name: runtime-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: runtime-state
+          persistentVolumeClaim:
+            claimName: arb-bot-state

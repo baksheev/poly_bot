@@ -88,6 +88,16 @@ pub enum Command {
         #[arg(long)]
         tr_id: i64,
     },
+    /// One-shot, journaled Binance-to-Arbitrum prefunding for the approved ESP canary.
+    PrefundArbitrumCanary {
+        /// Explicit acknowledgement for the bounded production transfer.
+        #[arg(
+            long,
+            env = "ARBITRUM_PREFUNDING_LIVE_CONFIRMATION",
+            default_value = ""
+        )]
+        live_confirmation: String,
+    },
     /// Reconcile a live arbitrage CEX unknown outcome from the Binance order journal.
     ArbitrageReconcileCex {
         /// Parent arbitrage plan id waiting in unknown_exposure.

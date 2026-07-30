@@ -291,6 +291,8 @@ pub struct LiveCanaryConfig {
     pub max_concurrent_trades: u16,
     pub rollout_duration_seconds: u64,
     pub rebalance_mutations_enabled: bool,
+    #[serde(default)]
+    pub prefunding_rebalance: Option<LiveCanaryPrefundingRebalanceConfig>,
 }
 
 impl LiveCanaryConfig {
@@ -345,9 +347,12 @@ impl LiveCanaryConfig {
         }
         ensure!(
             !self.rebalance_mutations_enabled && !pair.rebalance.enabled,
-            "pair {} readiness artifact cannot enable rebalance mutations",
+            "pair {} steady-state canary artifact cannot enable rebalance mutations",
             pair.id
         );
+        if let Some(prefunding) = &self.prefunding_rebalance {
+            prefunding.validate(pair, self)?;
+        }
         let maximum_trade = parse_base_units_u256(
             &self.max_trade_notional_token_a_base_units,
             "live_canary.max_trade_notional_token_a_base_units",
@@ -404,6 +409,74 @@ impl LiveCanaryConfig {
         ensure!(
             (60..=3_600).contains(&self.rollout_duration_seconds),
             "pair {} live canary duration is outside 60..=3600 seconds",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryPrefundingRebalanceConfig {
+    pub approval_gate: LiveCanaryApprovalGate,
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub binance_network: String,
+    pub maximum_transfer_count: u16,
+    pub maximum_token_a_withdrawal_fee_base_units: String,
+    pub maximum_token_b_withdrawal_fee_base_units: String,
+    pub maximum_token_a_debit_base_units: String,
+    pub maximum_token_b_debit_base_units: String,
+}
+
+impl LiveCanaryPrefundingRebalanceConfig {
+    fn validate(&self, pair: &PairConfig, canary: &LiveCanaryConfig) -> anyhow::Result<()> {
+        ensure!(
+            self.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
+                && canary.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
+                && !self.production_approval_actor.trim().is_empty()
+                && self.production_approval_recorded_at_utc.ends_with('Z')
+                && self.binance_network == "ARBITRUM"
+                && pair.chain.chain_id == 42_161
+                && pair.chain.binance_network_name == self.binance_network
+                && self.maximum_transfer_count == 2,
+            "pair {} prefunding rebalance approval or route is invalid",
+            pair.id
+        );
+        let token_a_fee = parse_base_units_u256(
+            &self.maximum_token_a_withdrawal_fee_base_units,
+            "live_canary.prefunding_rebalance.maximum_token_a_withdrawal_fee_base_units",
+        )?;
+        let token_b_fee = parse_base_units_u256(
+            &self.maximum_token_b_withdrawal_fee_base_units,
+            "live_canary.prefunding_rebalance.maximum_token_b_withdrawal_fee_base_units",
+        )?;
+        let token_a_debit = parse_base_units_u256(
+            &self.maximum_token_a_debit_base_units,
+            "live_canary.prefunding_rebalance.maximum_token_a_debit_base_units",
+        )?;
+        let token_b_debit = parse_base_units_u256(
+            &self.maximum_token_b_debit_base_units,
+            "live_canary.prefunding_rebalance.maximum_token_b_debit_base_units",
+        )?;
+        let token_a_target = parse_base_units_u256(
+            &canary.minimum_wallet_token_a_base_units,
+            "live_canary.minimum_wallet_token_a_base_units",
+        )?;
+        let token_b_target = parse_base_units_u256(
+            &canary.minimum_wallet_token_b_base_units,
+            "live_canary.minimum_wallet_token_b_base_units",
+        )?;
+        ensure!(
+            !token_a_fee.is_zero()
+                && token_a_fee <= U256::from(5_000_000_u64)
+                && !token_b_fee.is_zero()
+                && token_b_fee <= U256::from(100_000_000_000_000_000_000_u128)
+                && token_a_debit >= token_a_target
+                && token_a_debit <= token_a_target + token_a_fee
+                && token_b_debit >= token_b_target
+                && token_b_debit <= token_b_target + token_b_fee,
+            "pair {} prefunding fee or debit caps exceed the reviewed bounds",
             pair.id
         );
         Ok(())
@@ -1300,12 +1373,25 @@ mod tests {
             canary.minimum_wallet_token_b_base_units,
             "400000000000000000000"
         );
+        let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
+        assert_eq!(prefunding.binance_network, "ARBITRUM");
+        assert_eq!(prefunding.maximum_transfer_count, 2);
+        assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
+        assert_eq!(
+            prefunding.maximum_token_b_debit_base_units,
+            "500000000000000000000"
+        );
         assert!(pair.execution_enabled);
         assert!(!pair.rebalance.enabled);
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["minimum_wallet_token_a_base_units"] =
             Value::String("19999999".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["prefunding_rebalance"]["maximum_token_a_withdrawal_fee_base_units"] =
+            Value::String("5000001".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 

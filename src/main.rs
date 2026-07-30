@@ -52,6 +52,7 @@ use arb_bot::{
             CompatibilityRole, CompiledBinanceRuntimePlan, CompiledGraphSummary,
             CompiledHotPathRuntimePlan, CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan,
             CompiledPortfolioRuntimePlan, compile_manifest_to_path, load_compatibility_domain,
+            load_source_domain_for_pair,
         },
         config::{DexProvider, LoadedDomainConfig},
     },
@@ -64,9 +65,9 @@ use arb_bot::{
         RoutedLiveLegExecutor, live_trade_channel,
     },
     m8_readiness::{
-        M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessProbe,
-        M8ChainReadinessStatus, inspect_chain_readiness, validate_binance_readiness,
-        validate_rebalance_readiness,
+        ARBITRUM_CHAIN_ID, M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness,
+        M8ChainReadinessProbe, M8ChainReadinessStatus, inspect_chain_readiness,
+        validate_binance_readiness, validate_rebalance_readiness,
     },
     market_data::{
         MarketEvent,
@@ -81,7 +82,8 @@ use arb_bot::{
     rebalance::{
         RebalanceExecutionOperation, RebalanceExecutionRequest, RebalanceExecutor,
         RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
-        route_candidates_from_capital,
+        plan_direct_prefunding, rebalance_base_units_to_decimal,
+        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -320,6 +322,9 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceTravelRuleWithdrawalStatus { tr_id } => {
             binance_travel_rule_withdrawal_status(&cli.config, tr_id).await
         }
+        Command::PrefundArbitrumCanary { live_confirmation } => {
+            prefund_arbitrum_canary(&cli.config, &live_confirmation).await
+        }
         Command::ArbitrageReconcileCex {
             plan_id,
             order_journal_path,
@@ -423,6 +428,281 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn prefund_arbitrum_canary(
+    config: &config::AppConfig,
+    live_confirmation: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        live_confirmation == "PREFUND_ARBITRUM_M9",
+        "Arbitrum prefunding requires ARBITRUM_PREFUNDING_LIVE_CONFIRMATION=PREFUND_ARBITRUM_M9"
+    );
+    let source_domain =
+        load_source_domain_for_pair(&config.domain_config_path, "arbitrum-usdc-esp")?;
+    let pair = source_domain
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.id == "arbitrum-usdc-esp")
+        .context("compiled domain omitted the approved Arbitrum ESP pair")?;
+    let canary = pair
+        .live_canary
+        .as_ref()
+        .context("Arbitrum ESP pair omitted the live canary policy")?;
+    let prefunding = canary
+        .prefunding_rebalance
+        .as_ref()
+        .context("versioned artifact does not approve one-shot Arbitrum prefunding")?;
+    ensure!(
+        !canary.rebalance_mutations_enabled
+            && !pair.rebalance.enabled
+            && prefunding.binance_network == "ARBITRUM"
+            && prefunding.maximum_transfer_count == 2,
+        "one-shot prefunding cannot enable steady-state Arbitrum rebalance"
+    );
+
+    let wallet = EvmWallet::from_env()?;
+    let configured_wallet = config
+        .evm_wallet_address
+        .parse::<Address>()
+        .context("EVM_WALLET_ADDRESS is invalid")?;
+    ensure!(
+        wallet.address() == configured_wallet,
+        "Arbitrum prefunding signer differs from EVM_WALLET_ADDRESS"
+    );
+    let world_endpoint = std::env::var("ALCHEMY_WORLDCHAIN_RPC_URL")
+        .context("ALCHEMY_WORLDCHAIN_RPC_URL is required for journal recovery")?;
+    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
+        format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
+    })?;
+    let arbitrum_endpoint = std::env::var(&pair.chain.rpc_url_env).with_context(|| {
+        format!(
+            "required environment variable {} is not set",
+            pair.chain.rpc_url_env
+        )
+    })?;
+    let world_rpc = JsonRpcClient::new(world_endpoint)?;
+    let optimism_rpc = JsonRpcClient::new(optimism_endpoint)?;
+    let arbitrum_rpc = JsonRpcClient::new(arbitrum_endpoint)?;
+    ensure!(
+        arbitrum_rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
+        "prefunding RPC is not Arbitrum One"
+    );
+
+    let mut trading_binance = BinanceAccountClient::from_env(config)?;
+    trading_binance.synchronize_clock().await?;
+    let coins = trading_binance.all_coin_information().await?;
+    let trading_account = trading_binance.account_information().await?;
+    let treasury_binance = BinanceAccountClient::from_treasury_env(config)?;
+    let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
+        .context("Arbitrum prefunding requires BINANCE_SUBACCOUNT_EMAIL")?;
+    let transaction_journal_path = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
+        format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
+    })?;
+
+    let token_a_target = U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10)
+        .context("M9 token_a prefunding target is invalid")?;
+    let token_b_target = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
+        .context("M9 token_b prefunding target is invalid")?;
+    let token_a_fee_cap =
+        U256::from_str_radix(&prefunding.maximum_token_a_withdrawal_fee_base_units, 10)
+            .context("M9 token_a withdrawal fee cap is invalid")?;
+    let token_b_fee_cap =
+        U256::from_str_radix(&prefunding.maximum_token_b_withdrawal_fee_base_units, 10)
+            .context("M9 token_b withdrawal fee cap is invalid")?;
+    let token_a_debit_cap = U256::from_str_radix(&prefunding.maximum_token_a_debit_base_units, 10)
+        .context("M9 token_a debit cap is invalid")?;
+    let token_b_debit_cap = U256::from_str_radix(&prefunding.maximum_token_b_debit_base_units, 10)
+        .context("M9 token_b debit cap is invalid")?;
+
+    let mut direct_networks = BTreeMap::new();
+    for token in [&pair.token_a, &pair.token_b] {
+        let capital = select_capital_routes(
+            &coins,
+            &token.symbol,
+            &prefunding.binance_network,
+            "OPTIMISM",
+        )?;
+        let network = capital
+            .direct
+            .filter(|network| network.network == prefunding.binance_network)
+            .with_context(|| {
+                format!(
+                    "{} direct Arbitrum withdrawal route is absent",
+                    token.symbol
+                )
+            })?;
+        ensure!(
+            capital.withdrawal_all_enabled && network.withdrawal_available(),
+            "{} direct Arbitrum withdrawal is not live",
+            token.symbol
+        );
+        direct_networks.insert(token.symbol.clone(), network);
+    }
+
+    let mut direct_read_rpcs = BTreeMap::new();
+    direct_read_rpcs.insert(ARBITRUM_CHAIN_ID, arbitrum_rpc.clone());
+    let mut executor = RebalanceExecutor::hydrate(
+        trading_binance,
+        treasury_binance,
+        subaccount_email,
+        AcrossClient::new(config)?,
+        world_rpc,
+        optimism_rpc,
+        direct_read_rpcs,
+        wallet,
+        config.rebalance_executor_journal_path.clone(),
+        transaction_journal_path.into(),
+        RebalanceRuntimeLimits {
+            maximum_wld: config.rebalance_max_wld_amount,
+            maximum_usdc: rebalance_base_units_to_decimal(
+                token_a_debit_cap,
+                pair.token_a.decimals,
+            )?,
+            maximum_esp: rebalance_base_units_to_decimal(token_b_debit_cap, pair.token_b.decimals)?,
+            operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
+            binance_withdrawal_api_mode: config.rebalance_binance_withdrawal_api_mode.clone(),
+        },
+    )
+    .await?;
+    if let Some(recovered) = executor.recover_active().await? {
+        tracing::info!(
+            operation_id = %recovered.intent.operation_id,
+            progress = ?recovered.progress,
+            "recovered the sole durable rebalance operation before Arbitrum prefunding"
+        );
+    }
+
+    let targets = [
+        (
+            &pair.token_a,
+            token_a_target,
+            token_a_fee_cap,
+            token_a_debit_cap,
+        ),
+        (
+            &pair.token_b,
+            token_b_target,
+            token_b_fee_cap,
+            token_b_debit_cap,
+        ),
+    ];
+    let mut transfer_count = 0_u16;
+    for (token, target, fee_cap, debit_cap) in targets {
+        let contract = token
+            .contract
+            .parse::<Address>()
+            .with_context(|| format!("{} contract is invalid", token.symbol))?;
+        let wallet_before = arbitrum_rpc
+            .erc20_balance(contract, configured_wallet)
+            .await?;
+        let binance_before_decimal = trading_account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == token.symbol)
+            .map_or(Decimal::ZERO, |balance| balance.free);
+        let binance_before =
+            rebalance_decimal_to_base_units_floor(binance_before_decimal, token.decimals)?;
+        let network = direct_networks
+            .get(&token.symbol)
+            .with_context(|| format!("{} Arbitrum route disappeared", token.symbol))?;
+        let Some(plan) = plan_direct_prefunding(
+            target,
+            wallet_before,
+            token.decimals,
+            network,
+            ARBITRUM_CHAIN_ID,
+            fee_cap,
+            debit_cap,
+        )?
+        else {
+            tracing::info!(
+                token = token.symbol,
+                wallet_balance = wallet_before.to_string(),
+                target = target.to_string(),
+                "Arbitrum canary prefunding target already satisfied"
+            );
+            continue;
+        };
+        ensure!(
+            binance_before >= plan.requested_debit,
+            "{} Binance free balance is below the approved prefunding debit",
+            token.symbol
+        );
+        transfer_count = transfer_count
+            .checked_add(1)
+            .context("prefunding transfer count overflow")?;
+        ensure!(
+            transfer_count <= prefunding.maximum_transfer_count,
+            "prefunding would exceed the approved transfer count"
+        );
+        tracing::info!(
+            token = token.symbol,
+            wallet_balance_before = wallet_before.to_string(),
+            target = target.to_string(),
+            requested_debit = plan.requested_debit.to_string(),
+            expected_credit = plan.expected_credit.to_string(),
+            withdrawal_fee = plan.withdrawal_fee.to_string(),
+            transfer_number = transfer_count,
+            "executing approved one-shot Arbitrum canary prefunding transfer"
+        );
+        let completed = executor
+            .execute(RebalanceExecutionRequest {
+                token_symbol: token.symbol.clone(),
+                token_decimals: token.decimals,
+                token_contract: contract,
+                wallet_owner: configured_wallet,
+                action: plan.action,
+                binance_balance_before: binance_before,
+                wallet_balance_before: wallet_before,
+            })
+            .await?;
+        let wallet_after = match completed.progress {
+            arb_bot::rebalance::RebalanceExecutionProgress::Completed {
+                wallet_balance_after,
+                ..
+            } => wallet_balance_after,
+            _ => bail!("prefunding rebalance did not reach a terminal completed state"),
+        };
+        ensure!(
+            wallet_after >= target,
+            "{} prefunding completed below the approved wallet target",
+            token.symbol
+        );
+    }
+
+    let final_usdc = arbitrum_rpc
+        .erc20_balance(
+            pair.token_a
+                .contract
+                .parse()
+                .context("Arbitrum USDC contract is invalid")?,
+            configured_wallet,
+        )
+        .await?;
+    let final_esp = arbitrum_rpc
+        .erc20_balance(
+            pair.token_b
+                .contract
+                .parse()
+                .context("Arbitrum ESP contract is invalid")?,
+            configured_wallet,
+        )
+        .await?;
+    ensure!(
+        final_usdc >= token_a_target && final_esp >= token_b_target,
+        "Arbitrum prefunding final balances are below the versioned M9 targets"
+    );
+    tracing::info!(
+        wallet = %configured_wallet,
+        usdc_base_units = final_usdc.to_string(),
+        esp_base_units = final_esp.to_string(),
+        transfer_count,
+        steady_state_rebalance_enabled = false,
+        "approved one-shot Arbitrum canary prefunding completed"
+    );
+    Ok(())
 }
 
 async fn arbitrage_emit_result(
@@ -2111,12 +2391,14 @@ async fn run(
             AcrossClient::new(&config)?,
             wallet_rpc.clone(),
             JsonRpcClient::new(optimism_endpoint)?,
+            BTreeMap::new(),
             wallet,
             config.rebalance_executor_journal_path.clone(),
             transaction_journal_path.into(),
             RebalanceRuntimeLimits {
                 maximum_wld: config.rebalance_max_wld_amount,
                 maximum_usdc: config.rebalance_max_usdc_amount,
+                maximum_esp: Decimal::ZERO,
                 operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
                 binance_withdrawal_api_mode: config.rebalance_binance_withdrawal_api_mode.clone(),
             },

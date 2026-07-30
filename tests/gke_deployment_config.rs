@@ -1,5 +1,6 @@
 const RELEASE_PLATFORM: &str = include_str!("../infra/gcp/gke/release-platform.yaml");
 const DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
+const PREFUND_JOB: &str = include_str!("../infra/gcp/gke/prefund-arbitrum-job.yaml");
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
 const MAIN: &str = include_str!("../src/main.rs");
 const COMPILED_DOMAIN: &str =
@@ -112,7 +113,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("on_startup_dex_event"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl exec"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
-    assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
+    assert!(DEPLOY_WORKFLOW.contains("kubectl logs \"job/${prefund_job}\""));
 }
 
 #[test]
@@ -147,4 +148,34 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.rebalance_mutations_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
+}
+
+#[test]
+fn gke_prefunding_is_one_shot_bounded_and_stops_the_live_owner_first() {
+    assert!(PREFUND_JOB.contains("exec arb_bot prefund-arbitrum-canary"));
+    assert!(PREFUND_JOB.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));
+    assert!(PREFUND_JOB.contains("value: PREFUND_ARBITRUM_M9"));
+    assert!(PREFUND_JOB.contains("REBALANCE_EXECUTION_MODE"));
+    assert!(PREFUND_JOB.contains("value: disabled"));
+    assert!(PREFUND_JOB.contains("backoffLimit: 0"));
+    assert!(PREFUND_JOB.contains("activeDeadlineSeconds: 2400"));
+    assert!(PREFUND_JOB.contains("claimName: arb-bot-state"));
+    assert!(!PREFUND_JOB.contains("collect-prices"));
+    assert!(!PREFUND_JOB.contains("arb_bot run"));
+    assert!(!PREFUND_JOB.contains("ARBITRUM_WS_URL"));
+    let scale_down = DEPLOY_WORKFLOW
+        .find("kubectl scale deployment/arb-bot")
+        .expect("live owner scale-down is missing");
+    let job_apply = DEPLOY_WORKFLOW
+        .find("infra/gcp/gke/prefund-arbitrum-job.yaml")
+        .expect("one-shot prefunding Job is missing");
+    let deployment_apply = DEPLOY_WORKFLOW
+        .find("infra/gcp/gke/deployment.yaml")
+        .expect("application rollout is missing");
+    assert!(scale_down < job_apply);
+    assert!(job_apply < deployment_apply);
+    assert!(DEPLOY_WORKFLOW.contains("maximum_token_a_withdrawal_fee_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("maximum_token_b_withdrawal_fee_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("previous_scaled_down"));
+    assert!(DEPLOY_WORKFLOW.contains("--replicas=1"));
 }

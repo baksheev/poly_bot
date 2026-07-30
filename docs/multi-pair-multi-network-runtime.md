@@ -1901,9 +1901,25 @@ Implementation status:
 
 Before the production rollout, the shared Binance account already held
 `10,000 ESP`, sufficient USDC and BNB, and the Arbitrum wallet held
-`0.04998 ETH`. The rollout remains held until the same reviewed Arbitrum
-wallet contains at least `25 USDC` and `400 ESP`; these are operational
-prefunding targets, not relaxed admission limits.
+`0.04998 ETH`. The operator subsequently approved funding the same reviewed
+wallet through a one-shot direct Arbitrum rebalance. The immutable v4 artifact
+therefore pins targets of at least `25 USDC` and `400 ESP`, at most two
+Binance-to-wallet transfers, gross debits of at most `30 USDC` and `500 ESP`,
+and withdrawal-fee caps of `5 USDC` and `100 ESP`. These are bootstrap and
+fee-risk limits, not relaxed trade admission limits.
+
+The bootstrap is not steady-state M10 rebalance authority. The deployment
+workflow first stops the sole GKE trading Pod and waits for its wallet,
+Binance, and journal ownership to end. An immutable-image Kubernetes Job then
+opens the existing durable rebalance and wallet journals, recovers the sole
+non-terminal saga if one exists, reads the current Binance withdrawal fee and
+Arbitrum balances, and transfers only the deficit plus that fee. A fee, minimum,
+integer multiple, route, or debit outside the versioned caps fails closed. The
+Job creates no order, DEX allowance, or wallet transaction, is never concurrent
+with the trading Deployment, and must complete and release the shared PVC
+before the M9 Pod starts. Failure restores the previous M8 owner. Re-running the
+same revision is idempotent because already-funded tokens are no-ops and every
+submitted transfer has a deterministic journal identity.
 
 Deliver:
 
@@ -1911,7 +1927,8 @@ Deliver:
   configured signer, under the shared owners;
 - make this canary the first ESP/USDC external trading mutation from the new
   runtime;
-- prefund Arbitrum inventory and keep live Arbitrum rebalance mutation disabled;
+- prefund Arbitrum inventory through the reviewed one-shot bootstrap and keep
+  steady-state Arbitrum rebalance mutation disabled;
 - start with a versioned `CanaryPolicy` containing per-trade notional, active
   parent, cumulative notional/loss, failure-count, gas, and time-window limits;
 - retain the one-newly-dispatching-parent execution policy;

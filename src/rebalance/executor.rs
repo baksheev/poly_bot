@@ -340,7 +340,12 @@ impl RebalanceExecutionJournal {
                             bridge_chain_id, ..
                         } => format!("chain:{bridge_chain_id}"),
                     },
-                    strategy_id: "rebalance-world-chain-v12".to_owned(),
+                    strategy_id: match &request.action.route {
+                        Route::Direct {
+                            chain_id: 42_161, ..
+                        } => "prefund-arbitrum-usdc-esp-m9".to_owned(),
+                        _ => "rebalance-world-chain-v12".to_owned(),
+                    },
                 }),
                 operation_id,
                 fingerprint,

@@ -347,6 +347,16 @@ allowance policy, per-trade/cumulative/loss/time limits, and an
 execution remain disabled. Selecting a later live ESP artifact is an explicit
 M9 production decision, not an implication of M8 readiness.
 
+The approved M9 artifact may authorize one auditable prefunding bootstrap
+without authorizing steady-state Arbitrum rebalance. That bootstrap is limited
+to direct Binance-to-wallet USDC/ESP deficits and versioned count, debit, fee,
+network, token, target, and wallet bounds. The production workflow must stop
+the current sole owner before running the journaled one-shot Job, restore it if
+the Job fails, and start M9 only after both funding targets are proven. The Job
+must not create an ESP order, DEX allowance, wallet transaction, bridge, or
+ongoing route authority. General Arbitrum rebalance remains the separately
+reviewed M10 milestone.
+
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its
 complete state changes. It may observe repaired or degraded native gas

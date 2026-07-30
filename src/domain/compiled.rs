@@ -1158,6 +1158,7 @@ impl CompiledDomainGraph {
                         crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired;
                     canary.production_approval_actor = None;
                     canary.production_approval_recorded_at_utc = None;
+                    canary.prefunding_rebalance = None;
                 }
             }
         }
@@ -1706,6 +1707,51 @@ pub fn load_compatibility_domain(
             hot_path_runtime: None,
             portfolio_runtime: None,
         })
+    }
+}
+
+pub fn load_source_domain_for_pair(
+    path: impl AsRef<Path>,
+    pair_id: &str,
+) -> anyhow::Result<LoadedDomainConfig> {
+    let path = path.as_ref();
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read domain config {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse domain config {}", path.display()))?;
+    if value.get("bundle_kind").and_then(serde_json::Value::as_str) == Some(COMPILED_DOMAIN_KIND) {
+        let bundle: CompiledDomainBundle = serde_json::from_value(value)
+            .with_context(|| format!("failed to parse compiled domain {}", path.display()))?;
+        let graph = CompiledDomainGraph::from_bundle(bundle)
+            .with_context(|| format!("invalid compiled domain {}", path.display()))?;
+        let mut matching = graph
+            .bundle
+            .sources
+            .iter()
+            .filter(|source| source.snapshot.pairs.iter().any(|pair| pair.id == pair_id));
+        let source = matching
+            .next()
+            .with_context(|| format!("compiled domain has no source for pair {pair_id}"))?;
+        ensure!(
+            matching.next().is_none(),
+            "compiled domain has multiple sources for pair {pair_id}"
+        );
+        LoadedDomainConfig::from_projected_snapshot(
+            path,
+            graph.fingerprint_sha256.clone(),
+            source.snapshot.clone(),
+        )
+    } else {
+        let config = LoadedDomainConfig::from_bytes(path, &bytes)?;
+        ensure!(
+            config
+                .snapshot()
+                .pairs
+                .iter()
+                .any(|pair| pair.id == pair_id),
+            "domain config has no pair {pair_id}"
+        );
+        Ok(config)
     }
 }
 
@@ -2621,6 +2667,15 @@ mod tests {
             original_collector.snapshot().snapshot_id
         );
         assert!(!collector.config.snapshot().live_trading_enabled);
+        let collector_canary = collector.config.snapshot().pairs[0]
+            .live_canary
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            collector_canary.approval_gate,
+            crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+        );
+        assert!(collector_canary.prefunding_rebalance.is_none());
         let live_networks = live.network_runtime.unwrap();
         assert_eq!(
             live_networks
