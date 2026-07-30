@@ -4,7 +4,7 @@
   "compiler_version": "m1-v1",
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v12.json",
-    "config/strategies/usdc-esp-arbitrum.v3.json"
+    "config/strategies/usdc-esp-arbitrum.v4.json"
   ],
   "accounts": [
     {
@@ -45,6 +45,7 @@
     }
   ],
   "reviewed_live_strategies": [
+    "strategy:arbitrum-usdc-esp",
     "strategy:world-chain-usdc-wld"
   ],
   "stream_shard_symbol_capacity": 20,

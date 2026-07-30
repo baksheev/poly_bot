@@ -602,6 +602,14 @@ async fn prefund_arbitrum_canary(
     let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
         .context("Arbitrum prefunding requires BINANCE_SUBACCOUNT_EMAIL")?;
     treasury_binance.synchronize_clock().await?;
+    if !recovery_only {
+        wait_for_binance_address_verification(
+            &treasury_binance,
+            configured_wallet,
+            Duration::from_secs(10 * 60),
+        )
+        .await?;
+    }
     if recovery_only {
         let questionnaire = treasury_binance
             .travel_rule_questionnaire_requirements()
@@ -1002,6 +1010,76 @@ async fn prefund_arbitrum_canary(
         "approved one-shot Arbitrum canary prefunding completed"
     );
     Ok(())
+}
+
+async fn wait_for_binance_address_verification(
+    treasury_binance: &BinanceAccountClient,
+    wallet: Address,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    ensure!(
+        timeout >= Duration::from_secs(60) && timeout <= Duration::from_secs(15 * 60),
+        "Binance address verification wait is outside the reviewed bounds"
+    );
+    let started_at = Instant::now();
+    let mut last_status = None;
+    loop {
+        let records = treasury_binance.address_verification_list().await?;
+        let matching = records
+            .iter()
+            .filter(|record| {
+                record
+                    .wallet_address
+                    .eq_ignore_ascii_case(&format!("{wallet:#x}"))
+                    && record.network == "ARBITRUM"
+                    && record.token == "USDC"
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() <= 1,
+            "Binance returned multiple USDC Arbitrum verification records for the production wallet"
+        );
+        let status = matching
+            .first()
+            .map_or("MISSING", |record| record.status.as_str());
+        if last_status.as_deref() != Some(status) {
+            tracing::info!(
+                wallet = %wallet,
+                token = "USDC",
+                network = "ARBITRUM",
+                status,
+                "waiting for the approved Binance address verification before direct ESP prefunding"
+            );
+            last_status = Some(status.to_owned());
+        }
+        if let Some(record) = matching.first()
+            && record.status == "VERIFIED"
+        {
+            ensure!(
+                record.address_questionnaire.is_address_owner == Some(1)
+                    && record.address_questionnaire.verify_method == Some(1)
+                    && record.address_questionnaire.satoshi_token == "USDC",
+                "verified Binance address record differs from the approved Satoshi ownership test"
+            );
+            tracing::info!(
+                wallet = %wallet,
+                token = record.token,
+                network = record.network,
+                status = record.status,
+                "Binance address ownership verification completed before direct ESP prefunding"
+            );
+            return Ok(());
+        }
+        ensure!(
+            status == "MISSING" || status == "PENDING",
+            "Binance address verification entered an unsupported terminal state"
+        );
+        ensure!(
+            started_at.elapsed() < timeout,
+            "Binance address verification did not complete within the reviewed wait"
+        );
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

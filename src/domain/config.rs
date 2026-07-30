@@ -1433,14 +1433,7 @@ mod tests {
             prefunding.maximum_token_b_debit_base_units,
             "500000000000000000000"
         );
-        let recovery = prefunding.approved_travel_rule_recovery.as_ref().unwrap();
-        assert_eq!(recovery.rejected_token_symbol, "ESP");
-        assert_eq!(recovery.rejected_http_status, 400);
-        assert_eq!(recovery.rejected_error_code, -4024);
-        assert_eq!(
-            recovery.rejected_error_message,
-            "[031031] User does not own this currency."
-        );
+        assert!(prefunding.approved_travel_rule_recovery.is_none());
         assert!(pair.execution_enabled);
         assert!(!pair.rebalance.enabled);
 

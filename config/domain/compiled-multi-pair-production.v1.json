@@ -5,6 +5,135 @@
   "compiler_version": "m1-v1",
   "sources": [
     {
+      "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
+      "source_fingerprint_sha256": "c489be964b42ba12bb8b6d27cebd94d51d70a10603ac40c3c4f6e80e71b83015",
+      "snapshot": {
+        "schema_version": 1,
+        "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
+        "source": {
+          "repository": "baksheev/arb_bot",
+          "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
+          "rails_pair_candidate_id": 3144,
+          "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
+          "captured_at_utc": "2026-07-30T03:45:21Z",
+          "evidence": [
+            "production PostgreSQL read-only PairCandidate export for ESPUSDC",
+            "Binance Spot exchangeInfo and account commission filters for ESPUSDC",
+            "Uniswap contracts deployment registry for Arbitrum One SwapRouter02 and QuoterV2",
+            "block-pinned Arbitrum V3 local-curve and QuoterV2 parity validation",
+            "M8 production readiness gate passed with funded native gas and zero mutation capability",
+            "operator explicitly approved the bounded M9 production canary in Codex task poly-bot-architecture-milestone-loop on 2026-07-30",
+            "operator explicitly approved one-shot direct Arbitrum prefunding through the durable rebalance executor on 2026-07-30"
+          ]
+        },
+        "live_trading_enabled": true,
+        "pairs": [
+          {
+            "id": "arbitrum-usdc-esp",
+            "market_data_enabled": true,
+            "execution_enabled": true,
+            "live_canary": {
+              "approval_gate": "explicit_production_approved",
+              "production_approval_actor": "operator",
+              "production_approval_recorded_at_utc": "2026-07-30T03:45:21Z",
+              "max_trade_notional_token_a_base_units": "10000000",
+              "max_total_notional_token_a_base_units": "20000000",
+              "max_unhedged_notional_token_a_base_units": "10000000",
+              "max_realized_loss_token_a_base_units": "1000000",
+              "minimum_native_gas_wei": "1000000000000000",
+              "minimum_wallet_token_a_base_units": "25000000",
+              "minimum_wallet_token_b_base_units": "400000000000000000000",
+              "max_parent_trades": 2,
+              "max_failed_parent_trades": 1,
+              "max_concurrent_trades": 1,
+              "rollout_duration_seconds": 900,
+              "rebalance_mutations_enabled": false,
+              "prefunding_rebalance": {
+                "approval_gate": "explicit_production_approved",
+                "production_approval_actor": "operator",
+                "production_approval_recorded_at_utc": "2026-07-30T06:16:57Z",
+                "binance_network": "ARBITRUM",
+                "maximum_transfer_count": 2,
+                "maximum_token_a_withdrawal_fee_base_units": "5000000",
+                "maximum_token_b_withdrawal_fee_base_units": "100000000000000000000",
+                "maximum_token_a_debit_base_units": "30000000",
+                "maximum_token_b_debit_base_units": "500000000000000000000",
+                "approved_travel_rule_recovery": null
+              }
+            },
+            "chain": {
+              "name": "Arbitrum One",
+              "chain_id": 42161,
+              "rpc_url_env": "ARBITRUM_RPC_URL",
+              "ws_url_env": "ARBITRUM_WS_URL",
+              "binance_network_name": "ARBITRUM",
+              "gas_symbol": "ETH",
+              "gas_decimals": 18,
+              "gas_price_binance_symbol": "ETHUSDT",
+              "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+              "uniswap_v3_factory_address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+              "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+              "uniswap_v3_router_address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+            },
+            "token_a": {
+              "symbol": "USDC",
+              "contract": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+              "decimals": 6
+            },
+            "token_b": {
+              "symbol": "ESP",
+              "contract": "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
+              "decimals": 18
+            },
+            "binance": {
+              "symbol": "ESPUSDC",
+              "base_asset": "ESP",
+              "quote_asset": "USDC",
+              "commission_asset": "BNB",
+              "commission_asset_decimals": 8,
+              "commission_price_binance_symbol": "BNBUSDT",
+              "market_data_product": "spot",
+              "execution_product": "spot",
+              "step_size": "1.000000000000000",
+              "tick_size": "0.000010000000000"
+            },
+            "quote_sizing": {
+              "token_a_base_units": "10000000",
+              "token_b": {
+                "mode": "derive_from_binance_ask"
+              }
+            },
+            "adaptive_sizing": {
+              "mode": "baseline_only"
+            },
+            "strategy": {
+              "kind": "profit_token_a",
+              "opportunity_threshold_bps": 20,
+              "max_quote_age_ms": 30000,
+              "max_transport_silence_ms": 30000,
+              "min_slippage_bps": 5,
+              "max_slippage_bps": 50,
+              "slippage_profit_share_bps": 5000
+            },
+            "rebalance": {
+              "enabled": false,
+              "start_threshold_bps": 2500
+            },
+            "dex": {
+              "allowed_providers": [
+                "uniswap_v3"
+              ],
+              "uniswap_v3": {
+                "fee_tiers": [
+                  100
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
       "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
       "source_fingerprint_sha256": "f4f8533c6349d41a2086033582598a14ee6a47918aebb952168d4c425db91d56",
       "snapshot": {
@@ -137,119 +266,6 @@
                     "tick_spacing": 60,
                     "hooks": "0x0000000000000000000000000000000000000000"
                   }
-                ]
-              }
-            }
-          }
-        ]
-      }
-    },
-    {
-      "snapshot_id": "arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary",
-      "source_fingerprint_sha256": "9b253ceeef272f7c7fd8a45624714ae40afc9cb8a5117edd2392a056552fbe53",
-      "snapshot": {
-        "schema_version": 1,
-        "snapshot_id": "arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary",
-        "source": {
-          "repository": "baksheev/arb_bot",
-          "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
-          "rails_pair_candidate_id": 3144,
-          "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
-          "captured_at_utc": "2026-07-29T21:15:00Z",
-          "evidence": [
-            "production PostgreSQL read-only PairCandidate export for ESPUSDC",
-            "Binance Spot exchangeInfo and account commission filters for ESPUSDC",
-            "Uniswap contracts deployment registry for Arbitrum One SwapRouter02 and QuoterV2",
-            "block-pinned Arbitrum V3 local-curve and QuoterV2 parity validation",
-            "explicit M8 decision: bounded readiness artifact requires separate production approval and cannot mutate"
-          ]
-        },
-        "live_trading_enabled": false,
-        "pairs": [
-          {
-            "id": "arbitrum-usdc-esp",
-            "market_data_enabled": true,
-            "execution_enabled": false,
-            "live_canary": {
-              "approval_gate": "explicit_production_approval_required",
-              "production_approval_actor": null,
-              "production_approval_recorded_at_utc": null,
-              "max_trade_notional_token_a_base_units": "10000000",
-              "max_total_notional_token_a_base_units": "20000000",
-              "max_unhedged_notional_token_a_base_units": "10000000",
-              "max_realized_loss_token_a_base_units": "1000000",
-              "minimum_native_gas_wei": "1000000000000000",
-              "minimum_wallet_token_a_base_units": "0",
-              "minimum_wallet_token_b_base_units": "0",
-              "max_parent_trades": 2,
-              "max_failed_parent_trades": 1,
-              "max_concurrent_trades": 1,
-              "rollout_duration_seconds": 900,
-              "rebalance_mutations_enabled": false,
-              "prefunding_rebalance": null
-            },
-            "chain": {
-              "name": "Arbitrum One",
-              "chain_id": 42161,
-              "rpc_url_env": "ARBITRUM_RPC_URL",
-              "ws_url_env": "ARBITRUM_WS_URL",
-              "binance_network_name": "ARBITRUM",
-              "gas_symbol": "ETH",
-              "gas_decimals": 18,
-              "gas_price_binance_symbol": "ETHUSDT",
-              "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
-              "uniswap_v3_factory_address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
-              "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
-              "uniswap_v3_router_address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
-            },
-            "token_a": {
-              "symbol": "USDC",
-              "contract": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
-              "decimals": 6
-            },
-            "token_b": {
-              "symbol": "ESP",
-              "contract": "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1",
-              "decimals": 18
-            },
-            "binance": {
-              "symbol": "ESPUSDC",
-              "base_asset": "ESP",
-              "quote_asset": "USDC",
-              "market_data_product": "spot",
-              "execution_product": "spot",
-              "step_size": "1.000000000000000",
-              "tick_size": "0.000010000000000"
-            },
-            "quote_sizing": {
-              "token_a_base_units": "20000000",
-              "token_b": {
-                "mode": "derive_from_binance_ask"
-              }
-            },
-            "adaptive_sizing": {
-              "mode": "baseline_only"
-            },
-            "strategy": {
-              "kind": "profit_token_a",
-              "opportunity_threshold_bps": 20,
-              "max_quote_age_ms": 30000,
-              "max_transport_silence_ms": 30000,
-              "min_slippage_bps": 5,
-              "max_slippage_bps": 50,
-              "slippage_profit_share_bps": 5000
-            },
-            "rebalance": {
-              "enabled": false,
-              "start_threshold_bps": 2500
-            },
-            "dex": {
-              "allowed_providers": [
-                "uniswap_v3"
-              ],
-              "uniswap_v3": {
-                "fee_tiers": [
-                  100
                 ]
               }
             }
@@ -539,7 +555,7 @@
     {
       "id": "strategy:arbitrum-usdc-esp",
       "pair_id": "arbitrum-usdc-esp",
-      "source_snapshot_id": "arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary",
+      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ESPUSDC",
       "network_id": "eip155:42161",
@@ -703,7 +719,7 @@
       "strategy_id": "strategy:arbitrum-usdc-esp",
       "observe": true,
       "plan": true,
-      "execute": false,
+      "execute": true,
       "rebalance": false
     },
     {
@@ -726,7 +742,7 @@
     {
       "id": "compat-public-price-collector",
       "role": "public_price_collector",
-      "source_snapshot_id": "arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary",
+      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
       "pair_ids": [
         "arbitrum-usdc-esp"
       ]

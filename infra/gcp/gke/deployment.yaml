@@ -53,7 +53,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
-        - name: verify-binance-esp-address
+        - name: prefund-arbitrum-m9
           image: __IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-ec"]
@@ -61,6 +61,12 @@ spec:
             - |
               for secret_name in \
                 ALCHEMY_WORLDCHAIN_RPC_URL \
+                ALCHEMY_OPTIMISM_RPC_URL \
+                BINANCE_API_KEY \
+                BINANCE_SECRET_KEY \
+                BINANCE_TREASURY_API_KEY \
+                BINANCE_TREASURY_SECRET_KEY \
+                BINANCE_SUBACCOUNT_EMAIL \
                 EVM_WALLET_PRIVATE_KEY; do
                 secret_value="$(cat "/var/run/secrets/arb-bot/${secret_name}")"
                 export "${secret_name}=${secret_value}"
@@ -69,8 +75,8 @@ spec:
               test -n "${alchemy_api_key}"
               export ARBITRUM_RPC_URL="https://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
               unset alchemy_api_key
-              export ENGINE_ID="arb-bot-binance-address-verification-${HOSTNAME}"
-              exec arb_bot binance-esp-address-verification-transfer
+              export ENGINE_ID="arb-bot-prefund-${HOSTNAME}"
+              exec arb_bot prefund-arbitrum-canary
           envFrom:
             - configMapRef:
                 name: arb-bot-runtime
@@ -79,8 +85,12 @@ spec:
               value: disabled
             - name: REBALANCE_EXECUTION_MODE
               value: disabled
-            - name: BINANCE_ESP_ADDRESS_VERIFICATION_CONFIRMATION
-              value: SEND_998700_USDC_ARBITRUM_TO_BINANCE_VERIFY_20260730
+            - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
+              value: travel_rule
+            - name: ARBITRUM_PREFUNDING_LIVE_CONFIRMATION
+              value: PREFUND_ARBITRUM_M9
+            - name: ARBITRUM_PREFUNDING_MARKER_PATH
+              value: /var/lib/arb-bot/m9-prefunding-complete.json
           resources:
             requests:
               cpu: "1"

@@ -370,6 +370,11 @@ zero, simulates and journals the exact calldata before signing, and proves the
 receipt's exact ERC-20 credit. A restart may reconcile that same operation but
 cannot send a second transfer. This approval does not authorize an ESP
 withdrawal, trade, swap, bridge, allowance, or steady-state rebalance.
+The approved transfer completed on Arbitrum in transaction
+`0xff9bf15b5ddc745eb50c4c4e77d746b4ec1e9e84facfce6cd92e948c20c85c45`;
+receipt status and the exact `998700`-base-unit USDC credit were independently
+confirmed before the prefunding workflow was restored. That completed journal
+entry cannot be replayed by later rollouts.
 
 An ESP bootstrap or later rebalance must deliver ESP as ESP. A deterministic
 Travel Rule rejection cannot be converted into permission to use the standard
