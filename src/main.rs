@@ -860,7 +860,6 @@ async fn prefund_arbitrum_canary(
             )?,
             maximum_esp: rebalance_base_units_to_decimal(token_b_debit_cap, pair.token_b.decimals)?,
             operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
-            binance_withdrawal_api_mode: prefunding.withdrawal_api_mode.clone(),
         },
     )
     .await?;
@@ -871,7 +870,6 @@ async fn prefund_arbitrum_canary(
                 || active.intent.token_symbol == pair.token_b.symbol,
             "active prefunding operation has an unexpected token"
         );
-        executor.set_binance_withdrawal_api_mode(&prefunding.withdrawal_api_mode)?;
     }
     executor.log_active_operation_recovery_evidence().await?;
     let recovered = if recovery_only {
@@ -926,7 +924,6 @@ async fn prefund_arbitrum_canary(
             .transaction_hash
             .parse::<B256>()
             .context("approved manual ESP transaction hash is invalid")?;
-        executor.set_binance_withdrawal_api_mode(&prefunding.withdrawal_api_mode)?;
         Some(
             executor
                 .recover_approved_manual_direct_credit(
@@ -1037,7 +1034,6 @@ async fn prefund_arbitrum_canary(
     ];
     let mut transfer_count = 0_u16;
     for (token, target, fee_cap, debit_cap) in targets {
-        executor.set_binance_withdrawal_api_mode(&prefunding.withdrawal_api_mode)?;
         let contract = token
             .contract
             .parse::<Address>()
@@ -3062,7 +3058,6 @@ async fn run(
                 maximum_usdc: config.rebalance_max_usdc_amount,
                 maximum_esp: Decimal::ZERO,
                 operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
-                binance_withdrawal_api_mode: config.rebalance_binance_withdrawal_api_mode.clone(),
             },
         )
         .await?;

@@ -280,10 +280,9 @@ Startup validates both account views before opening the live executor:
 - the master view of the subaccount matches the trading-key view;
 - both credentials are restricted to the production egress IP.
 
-Every production withdrawal uses
-`REBALANCE_BINANCE_WITHDRAWAL_API_MODE=standard` and Binance
+Every production withdrawal is compile-time pinned to Binance
 `/sapi/v1/capital/withdraw/apply`, independent of asset, network, or amount.
-Configuration rejects `travel_rule` as a withdrawal mode. The exact wallet is
+There is no runtime withdrawal-mode setting. The exact wallet is
 also present in Binance's withdrawal-address list for Arbitrum with
 `whiteStatus=true`. The standard API selection is durably journaled before
 submission and cannot change after an ambiguous request. Local-entity
@@ -338,7 +337,7 @@ Production mutation requires all of the following:
 - `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE`;
 - positive `REBALANCE_MAX_WLD_AMOUNT` and `REBALANCE_MAX_USDC_AMOUNT`;
 - `REBALANCE_EXECUTOR_TIMEOUT_SECONDS` between 60 and 86,400;
-- `REBALANCE_BINANCE_WITHDRAWAL_API_MODE=standard`;
+- the compile-time-pinned standard Binance capital withdrawal endpoint;
 - the trading, treasury, subaccount, wallet, RPC, and journal configuration
   described above.
 

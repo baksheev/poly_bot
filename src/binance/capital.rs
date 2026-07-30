@@ -9,6 +9,8 @@ use serde_json::Value;
 use super::account::BinanceAccountClient;
 
 const DEPOSIT_ADDRESS_ENDPOINT: &str = "/sapi/v1/capital/deposit/address";
+const DEPOSIT_TRAVEL_RULE_ENDPOINT: &str = "/sapi/v2/localentity/deposit/provide-info";
+const STANDARD_WITHDRAWAL_ENDPOINT: &str = "/sapi/v1/capital/withdraw/apply";
 
 impl BinanceAccountClient {
     pub async fn all_coin_information(&self) -> anyhow::Result<Vec<CoinInformation>> {
@@ -143,7 +145,7 @@ impl BinanceAccountClient {
             ("recvWindow", "5000".to_owned()),
         ])?;
         self.signed_put(
-            "/sapi/v2/localentity/deposit/provide-info",
+            DEPOSIT_TRAVEL_RULE_ENDPOINT,
             &query,
             "Travel Rule deposit questionnaire",
         )
@@ -179,7 +181,7 @@ impl BinanceAccountClient {
         ])?;
         let submission: StandardWithdrawalSubmission = self
             .signed_post(
-                "/sapi/v1/capital/withdraw/apply",
+                STANDARD_WITHDRAWAL_ENDPOINT,
                 &query,
                 "standard withdrawal submission",
             )
@@ -883,8 +885,9 @@ mod tests {
     use alloy_primitives::{Address, B256};
 
     use super::{
-        AddressVerificationRecord, CoinInformation, DEPOSIT_ADDRESS_ENDPOINT, DepositAddressRecord,
-        DepositCreditState, DepositRecord, NetworkInformation, StandardWithdrawalSubmission,
+        AddressVerificationRecord, CoinInformation, DEPOSIT_ADDRESS_ENDPOINT,
+        DEPOSIT_TRAVEL_RULE_ENDPOINT, DepositAddressRecord, DepositCreditState, DepositRecord,
+        NetworkInformation, STANDARD_WITHDRAWAL_ENDPOINT, StandardWithdrawalSubmission,
         TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalAddressRecord,
         WithdrawalRecord, WithdrawalState, WithdrawalSubmission, matching_deposits,
         matching_withdrawals, parse_address_verification_list, select_capital_routes,
@@ -1212,6 +1215,41 @@ mod tests {
         );
         assert!(record.is_credited());
         assert!(record.questionnaire_required());
+    }
+
+    #[test]
+    fn deposit_travel_rule_is_driven_only_by_the_deposit_record() {
+        let mut record: DepositRecord = serde_json::from_str(
+            r#"{
+              "depositId":"1","amount":"0.1","network":"ARBITRUM","coin":"ESP",
+              "depositStatus":1,"travelRuleReqStatus":3,
+              "address":"0x64d62673799a8dc69825ff1cc0d624b1065dab39","addressTag":"",
+              "txId":"0x519f3a47cec440e3bff25d069785a8c3d07911d774316dcde0701b3dcd90c343",
+              "transferType":0,"confirmTimes":"1/1","requireQuestionnaire":false,
+              "insertTime":1765735358000
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!record.questionnaire_required());
+        record.require_questionnaire = true;
+        assert!(record.questionnaire_required());
+        record.travel_rule_req_status = Some(0);
+        assert!(!record.questionnaire_required());
+    }
+
+    #[test]
+    fn withdrawal_and_deposit_travel_rule_endpoints_are_distinct_invariants() {
+        assert_eq!(
+            STANDARD_WITHDRAWAL_ENDPOINT,
+            "/sapi/v1/capital/withdraw/apply"
+        );
+        assert_eq!(
+            DEPOSIT_TRAVEL_RULE_ENDPOINT,
+            "/sapi/v2/localentity/deposit/provide-info"
+        );
+        assert!(!STANDARD_WITHDRAWAL_ENDPOINT.contains("localentity"));
+        assert!(DEPOSIT_TRAVEL_RULE_ENDPOINT.contains("/deposit/"));
     }
 
     #[test]

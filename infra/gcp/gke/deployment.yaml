@@ -85,8 +85,6 @@ spec:
               value: disabled
             - name: REBALANCE_EXECUTION_MODE
               value: disabled
-            - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
-              value: standard
             - name: ARBITRUM_PREFUNDING_LIVE_CONFIRMATION
               value: PREFUND_ARBITRUM_M9
             - name: ARBITRUM_PREFUNDING_MARKER_PATH
@@ -152,8 +150,6 @@ spec:
               value: "__REBALANCE_MAX_USDC_AMOUNT__"
             - name: REBALANCE_LIVE_CONFIRMATION
               value: ENABLE_FULL_REBALANCE
-            - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
-              value: standard
           resources:
             requests:
               cpu: "6"

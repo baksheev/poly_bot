@@ -36,14 +36,9 @@ rebalance_execution_mode="$(metadata_or_default arb-bot-rebalance-execution-mode
 rebalance_live_confirmation="$(metadata_or_default arb-bot-rebalance-live-confirmation '')"
 rebalance_max_wld_amount="$(metadata_or_default arb-bot-rebalance-max-wld-amount 0)"
 rebalance_max_usdc_amount="$(metadata_or_default arb-bot-rebalance-max-usdc-amount 0)"
-rebalance_binance_withdrawal_api_mode="$(metadata_or_default arb-bot-rebalance-binance-withdrawal-api-mode standard)"
 
 if [[ ! "${rebalance_execution_mode}" =~ ^(disabled|full_live)$ ]]; then
   echo "invalid arb-bot-rebalance-execution-mode metadata" >&2
-  exit 1
-fi
-if [[ "${rebalance_binance_withdrawal_api_mode}" != standard ]]; then
-  echo "invalid arb-bot-rebalance-binance-withdrawal-api-mode metadata" >&2
   exit 1
 fi
 if [[ ! "${domain_config_path}" =~ ^config/strategies/[a-z0-9.-]+\.json$ ]]; then
@@ -124,7 +119,6 @@ umask 077
   printf 'REBALANCE_MAX_WLD_AMOUNT=%s\n' "${rebalance_max_wld_amount}"
   printf 'REBALANCE_MAX_USDC_AMOUNT=%s\n' "${rebalance_max_usdc_amount}"
   printf 'REBALANCE_LIVE_CONFIRMATION=%s\n' "${rebalance_live_confirmation}"
-  printf 'REBALANCE_BINANCE_WITHDRAWAL_API_MODE=%s\n' "${rebalance_binance_withdrawal_api_mode}"
   printf 'EVM_WALLET_JOURNAL_PATH=/var/lib/arb-bot/rebalance-wallet.jsonl\n'
   printf 'EVM_WALLET_ADDRESS=%s\n' "${wallet_address}"
   printf 'CLICKHOUSE_DATABASE=arb_bot_prod\n'

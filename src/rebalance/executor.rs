@@ -1423,7 +1423,7 @@ mod tests {
                 .advance(
                     &operation_id,
                     RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                        api_mode: "travel_rule".to_owned(),
+                        api_mode: "standard".to_owned(),
                         bridge_balance_before: U256::from(8_000_000_u64),
                     },
                 )
@@ -1443,6 +1443,59 @@ mod tests {
         assert!(matches!(
             journal.operations()[&operation_id].progress,
             RebalanceExecutionProgress::BinanceWithdrawalSubmitted { .. }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn restart_preserves_unknown_standard_withdrawal_without_resubmission_authority() {
+        let path = path("standard-withdrawal-unknown");
+        let operation_id;
+        {
+            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+            let operation = journal
+                .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+                .unwrap();
+            operation_id = operation.intent.operation_id.clone();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceTransferSubmitted {
+                        transaction_id: 42,
+                        bridge_balance_before: U256::ZERO,
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceTransferCompleted {
+                        transaction_id: 42,
+                        bridge_balance_before: U256::ZERO,
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "standard".to_owned(),
+                        bridge_balance_before: U256::ZERO,
+                    },
+                )
+                .unwrap();
+        }
+
+        let journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let active = journal.active_operation().unwrap().unwrap();
+        assert_eq!(active.intent.operation_id, operation_id);
+        assert!(matches!(
+            active.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                ref api_mode,
+                ..
+            } if api_mode == "standard"
         ));
         drop(journal);
         fs::remove_file(path).unwrap();

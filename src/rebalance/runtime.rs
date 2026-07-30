@@ -43,6 +43,7 @@ const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
 const GAS_LIMIT_MARGIN_DENOMINATOR: u64 = 100;
 const MAX_ERC20_GAS_LIMIT: u64 = 1_000_000;
 const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
+const BINANCE_WITHDRAWAL_API_MODE: &str = "standard";
 
 #[derive(Clone, Debug)]
 pub struct RebalanceRuntimeLimits {
@@ -50,7 +51,6 @@ pub struct RebalanceRuntimeLimits {
     pub maximum_usdc: Decimal,
     pub maximum_esp: Decimal,
     pub operation_timeout: Duration,
-    pub binance_withdrawal_api_mode: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,10 +445,6 @@ impl RebalanceExecutor {
             limits.operation_timeout <= Duration::from_secs(24 * 60 * 60),
             "rebalance timeout exceeds one day"
         );
-        ensure!(
-            limits.binance_withdrawal_api_mode == "standard",
-            "rebalance withdrawals must use the standard capital API"
-        );
         let owner = wallet.address();
         let (world_chain, optimism_chain) =
             tokio::try_join!(world.chain_id(), optimism.chain_id())?;
@@ -600,15 +596,6 @@ impl RebalanceExecutor {
 
     pub fn operations(&self) -> &std::collections::BTreeMap<String, RebalanceExecutionOperation> {
         self.execution_journal.operations()
-    }
-
-    pub fn set_binance_withdrawal_api_mode(&mut self, mode: &str) -> anyhow::Result<()> {
-        ensure!(
-            mode == "standard",
-            "rebalance withdrawals must use the standard capital API"
-        );
-        self.limits.binance_withdrawal_api_mode = mode.to_owned();
-        Ok(())
     }
 
     pub async fn log_active_operation_recovery_evidence(&self) -> anyhow::Result<()> {
@@ -867,10 +854,6 @@ impl RebalanceExecutor {
         chain_id: u64,
         transaction_hash: B256,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
-        ensure!(
-            self.limits.binance_withdrawal_api_mode == "standard",
-            "approved manual ESP credit must retain the standard withdrawal API"
-        );
         let operation = self
             .execution_journal
             .active_operation()?
@@ -1021,10 +1004,6 @@ impl RebalanceExecutor {
         network: &str,
         chain_id: u64,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
-        ensure!(
-            self.limits.binance_withdrawal_api_mode == "standard",
-            "approved ESP retry must use the standard withdrawal API"
-        );
         ensure!(
             self.execution_journal.active_operation()?.is_none(),
             "another rebalance operation is active"
@@ -2028,34 +2007,12 @@ impl RebalanceExecutor {
         } = &operation.progress
         {
             ensure!(
-                api_mode == &self.limits.binance_withdrawal_api_mode,
-                "journaled Binance withdrawal API mode differs from runtime"
+                api_mode == BINANCE_WITHDRAWAL_API_MODE,
+                "journaled Binance withdrawal API mode is not the standard capital API"
             );
-            if api_mode == "travel_rule" {
-                let travel_rule = self
-                    .treasury_binance
-                    .travel_rule_withdrawal_history_v2(
-                        &operation.intent.token_symbol,
-                        network,
-                        &operation.intent.withdraw_order_id,
-                    )
-                    .await?;
-                if let Some(record) = travel_rule.first() {
-                    ensure!(
-                        record.tr_id > 0,
-                        "indexed Travel Rule withdrawal has an invalid id"
-                    );
-                    record.tr_id.to_string()
-                } else {
-                    bail!(
-                        "journaled Binance withdrawal submission has no indexed outcome; operator review required"
-                    )
-                }
-            } else {
-                bail!(
-                    "journaled Binance withdrawal submission has no indexed outcome; operator review required"
-                )
-            }
+            bail!(
+                "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
+            )
         } else {
             ensure!(
                 submission_safe,
@@ -2064,7 +2021,7 @@ impl RebalanceExecutor {
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                    api_mode: self.limits.binance_withdrawal_api_mode.clone(),
+                    api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned(),
                     bridge_balance_before,
                 },
             )?;
@@ -2139,10 +2096,6 @@ impl RebalanceExecutor {
         amount: Decimal,
     ) -> anyhow::Result<String> {
         let address = format!("{:#x}", operation.intent.wallet_owner);
-        ensure!(
-            self.limits.binance_withdrawal_api_mode == "standard",
-            "rebalance withdrawals must use the standard capital API"
-        );
         let submission = self
             .treasury_binance
             .withdraw_standard(

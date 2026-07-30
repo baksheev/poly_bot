@@ -479,8 +479,6 @@ jobs:
             <<<"${deployment_json}")" = arb-bot,esp-market-data
           test "$(jq -r '.spec.template.spec.initContainers | map(.name) | join(",")' \
             <<<"${deployment_json}")" = prefund-arbitrum-m9
-          test "$(jq -r '.spec.template.spec.initContainers[] | select(.name == "prefund-arbitrum-m9") | .env[] | select(.name == "REBALANCE_BINANCE_WITHDRAWAL_API_MODE") | .value' \
-            <<<"${deployment_json}")" = standard
           test "$(jq -r '.spec.template.spec.containers[] | select(.name == "esp-market-data") | .args[0] | contains("collect-prices")' \
             <<<"${deployment_json}")" = true
           test "$(jq -r '.spec.template.spec.volumes[] | select(.name == "esp-market-data-secrets") | .csi.volumeAttributes.secretProviderClass' \
@@ -494,10 +492,6 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"
           test "${rebalance_mode}" = full_live
-          rebalance_withdrawal_api_mode="$(kubectl get deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_BINANCE_WITHDRAWAL_API_MODE")].value}')"
-          test "${rebalance_withdrawal_api_mode}" = standard
           rollout_succeeded=true
 
           while IFS= read -r pool; do

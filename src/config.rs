@@ -321,13 +321,6 @@ pub struct AppConfig {
     #[arg(long, env = "REBALANCE_LIVE_CONFIRMATION", default_value = "")]
     pub rebalance_live_confirmation: String,
 
-    #[arg(
-        long,
-        env = "REBALANCE_BINANCE_WITHDRAWAL_API_MODE",
-        default_value = "standard"
-    )]
-    pub rebalance_binance_withdrawal_api_mode: String,
-
     #[arg(long, env = "EVM_WALLET_ADDRESS", default_value = "")]
     pub evm_wallet_address: String,
 
@@ -418,10 +411,6 @@ impl AppConfig {
             self.rebalance_max_wld_amount >= rust_decimal::Decimal::ZERO
                 && self.rebalance_max_usdc_amount >= rust_decimal::Decimal::ZERO,
             "rebalance live amount limits must not be negative"
-        );
-        ensure!(
-            self.rebalance_binance_withdrawal_api_mode == "standard",
-            "REBALANCE_BINANCE_WITHDRAWAL_API_MODE must be standard; Travel Rule is conditional deposit handling"
         );
         if self.rebalance_execution_mode == "full_live" {
             ensure!(
@@ -599,7 +588,6 @@ mod tests {
             rebalance_max_wld_amount: rust_decimal::Decimal::ZERO,
             rebalance_max_usdc_amount: rust_decimal::Decimal::ZERO,
             rebalance_live_confirmation: String::new(),
-            rebalance_binance_withdrawal_api_mode: "standard".into(),
             evm_wallet_address: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "arb_bot".into(),
@@ -614,13 +602,6 @@ mod tests {
     #[test]
     fn default_shape_is_valid() {
         config().validate().unwrap();
-    }
-
-    #[test]
-    fn travel_rule_is_not_a_withdrawal_mode() {
-        let mut value = config();
-        value.rebalance_binance_withdrawal_api_mode = "travel_rule".into();
-        assert!(value.validate().is_err());
     }
 
     #[test]
