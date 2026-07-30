@@ -115,8 +115,8 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_concurrent_trades" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.rollout_duration_seconds" "${domain_config}")" = 900
           test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_mutations_enabled" "${domain_config}")" = false
-          test "$(jq -r "${esp} | .pairs[0].live_canary | has(\"prefunding_rebalance\")" "${domain_config}")" \
-            = false
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance == null" "${domain_config}")" \
+            = true
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
             = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \

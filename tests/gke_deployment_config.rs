@@ -164,7 +164,7 @@ fn gke_esp_incident_probe_is_read_only_and_stops_the_live_owner_first() {
     assert!(!DEPLOYMENT.contains("kind: Job"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
     assert!(!DEPLOY_WORKFLOW.contains("jobs.batch"));
-    assert!(DEPLOY_WORKFLOW.contains("has(\\\"prefunding_rebalance\\\")"));
+    assert!(DEPLOY_WORKFLOW.contains("live_canary.prefunding_rebalance == null"));
     assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
 }
