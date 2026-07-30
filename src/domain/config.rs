@@ -1663,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_esp_canary_requires_versioned_bidirectional_prefunding() {
+    fn committed_esp_canary_has_versioned_m10_approval_and_bounds() {
         let loaded = load(ESP_CANARY_CONFIG.as_bytes()).unwrap();
         let pair = &loaded.snapshot().pairs[0];
         let canary = pair.live_canary.as_ref().unwrap();
@@ -1705,14 +1705,35 @@ mod tests {
         let rebalance = canary.rebalance_live_canary.as_ref().unwrap();
         assert_eq!(
             rebalance.approval_gate,
-            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+            LiveCanaryApprovalGate::ExplicitProductionApproved
+        );
+        assert_eq!(
+            rebalance.production_approval_actor.as_deref(),
+            Some("operator")
+        );
+        assert_eq!(
+            rebalance.production_approval_recorded_at_utc.as_deref(),
+            Some("2026-07-30T23:26:16Z")
         );
         assert_eq!(rebalance.binance_network, "ARBITRUM");
         assert_eq!(rebalance.maximum_transfer_count, 2);
         assert_eq!(rebalance.maximum_concurrent_transfers, 1);
+        assert_eq!(rebalance.maximum_failed_transfers, 1);
+        assert_eq!(rebalance.maximum_token_a_debit_base_units, "25000000");
+        assert_eq!(
+            rebalance.maximum_token_b_debit_base_units,
+            "401200000000000000000"
+        );
+        assert_eq!(rebalance.maximum_token_a_fee_base_units, "5000000");
+        assert_eq!(
+            rebalance.maximum_token_b_fee_base_units,
+            "2000000000000000000"
+        );
+        assert_eq!(rebalance.rollout_duration_seconds, 900);
+        assert_eq!(rebalance.maximum_unknown_reconciliation_queries, 1);
         assert!(rebalance.direct_route_only);
         assert!(!rebalance.bridge_mutations_enabled);
-        assert!(!canary.rebalance_mutations_enabled);
+        assert!(canary.rebalance_mutations_enabled);
         let evm_recovery = prefunding
             .approved_evm_prebroadcast_rejection
             .as_ref()
@@ -1723,7 +1744,7 @@ mod tests {
             "0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977"
         );
         assert!(pair.execution_enabled);
-        assert!(!pair.rebalance.enabled);
+        assert!(pair.rebalance.enabled);
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["minimum_wallet_token_a_base_units"] =
@@ -1756,19 +1777,46 @@ mod tests {
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(true);
-        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(true);
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
+            Value::String("explicit_production_approval_required".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_actor"] =
+            Value::String(String::new());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(false);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(false);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["direct_route_only"] =
+            Value::Bool(false);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["bridge_mutations_enabled"] =
+            Value::Bool(true);
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
-            Value::String("explicit_production_approved".to_owned());
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_actor"] =
-            Value::String("operator".to_owned());
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_recorded_at_utc"] =
-            Value::String("2026-07-31T00:00:00Z".to_owned());
-        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(true);
-        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(true);
+            Value::String("explicit_production_approval_required".to_owned());
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("production_approval_actor");
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("production_approval_recorded_at_utc");
+        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(false);
+        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(false);
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_ok());
     }
 

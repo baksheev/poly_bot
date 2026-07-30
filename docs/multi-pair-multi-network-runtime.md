@@ -1919,17 +1919,21 @@ Binance-to-wallet transfers, gross debits of at most `30 USDC` and `500 ESP`,
 and withdrawal-fee caps of `5 USDC` and `100 ESP`. These are bootstrap and
 fee-risk limits, not relaxed trade admission limits.
 
-The bootstrap is not steady-state M10 rebalance authority. The GKE Deployment
-uses `Recreate`, so Kubernetes removes the sole old Pod and ends its wallet,
-Binance, journal, and PVC ownership before the new Pod's immutable-image
-`prefund-arbitrum-m9` init container can start. That container opens the
-existing durable rebalance and wallet journals, recovers the sole non-terminal
-saga if one exists, reads the current Binance withdrawal fee and Arbitrum
-balances, and transfers only the deficit plus that fee. A fee, minimum, integer
-multiple, route, or debit outside the versioned caps fails closed. It creates no
-order, DEX allowance, or wallet transaction and must finish before either M9
-application container can start. Failure triggers the existing Deployment
-rollback to the previous M8 owner.
+The bootstrap is not steady-state M10 rebalance authority. During M9 the GKE
+Deployment used `Recreate`, so Kubernetes removed the sole old Pod and ended
+its wallet, Binance, journal, and PVC ownership before the new Pod's
+immutable-image `prefund-arbitrum-m9` init container started. That container
+opened the existing durable rebalance and wallet journals, recovered the sole
+non-terminal saga if one existed, read the current Binance withdrawal fee and
+Arbitrum balances, and transferred only the deficit plus that fee. A fee,
+minimum, integer multiple, route, or debit outside the versioned caps failed
+closed. It created no order, DEX allowance, or wallet transaction.
+
+After the operator's explicit M10 approval at `2026-07-30T23:26:16Z`, the
+completed M9 init container is removed. Its executable intentionally requires
+steady-state rebalance authority to be disabled, so retaining it would reject
+an approved M10 artifact before application startup. `Recreate` ownership, the
+shared PVC, and the durable rebalance and wallet journals remain unchanged.
 
 On success the init container atomically fsyncs a version-, approval-, wallet-,
 snapshot-, and target-bound completion marker to the shared PVC. The recorded

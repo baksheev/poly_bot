@@ -134,7 +134,7 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
         DEPLOYMENT
             .matches("export ARBITRUM_RPC_URL=\"https://arb-mainnet.g.alchemy.com/v2/")
             .count(),
-        3
+        2
     );
     assert_eq!(
         DEPLOYMENT
@@ -155,26 +155,25 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
 }
 
 #[test]
-fn gke_prefunding_is_one_shot_bounded_and_stops_the_live_owner_first() {
+fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
-    assert!(DEPLOYMENT.contains("initContainers:"));
-    assert!(DEPLOYMENT.contains("name: prefund-arbitrum-m9"));
-    assert!(DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
-    assert!(DEPLOYMENT.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));
-    assert!(DEPLOYMENT.contains("value: PREFUND_ARBITRUM_M9"));
-    assert!(DEPLOYMENT.contains("ARBITRUM_PREFUNDING_MARKER_PATH"));
-    assert!(DEPLOYMENT.contains("/var/lib/arb-bot/m9-prefunding-complete.json"));
+    assert!(!DEPLOYMENT.contains("initContainers:"));
+    assert!(!DEPLOYMENT.contains("name: prefund-arbitrum-m9"));
+    assert!(!DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
+    assert!(!DEPLOYMENT.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));
+    assert!(!DEPLOYMENT.contains("ARBITRUM_PREFUNDING_MARKER_PATH"));
     assert!(!DEPLOYMENT.contains("exec arb_bot binance-esp-address-verification-transfer"));
     assert!(!DEPLOYMENT.contains("exec arb_bot diagnose-arbitrum-esp-withdrawal"));
-    assert!(DEPLOYMENT.contains("REBALANCE_EXECUTION_MODE"));
-    assert!(DEPLOYMENT.contains("value: disabled"));
     assert!(DEPLOYMENT.contains("claimName: arb-bot-state"));
     assert!(!DEPLOYMENT.contains("kind: Job"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
     assert!(!DEPLOY_WORKFLOW.contains("jobs.batch"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_token_a_withdrawal_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_token_b_withdrawal_fee_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers"));
+    assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers // []"));
+    assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.maximum_transfer_count"));
+    assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.direct_route_only"));
+    assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.bridge_mutations_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".status.containerStatuses"));
     assert!(DEPLOY_WORKFLOW.contains(".restartCount >= 2"));
     assert!(DEPLOY_WORKFLOW.contains("repeatedly failed startup"));

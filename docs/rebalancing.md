@@ -331,18 +331,25 @@ outcome.
 
 ## M10 Arbitrum rebalance canary
 
-The checked-in V4 artifact defines M10 authority but leaves it at
-`explicit_production_approval_required`, with both rebalance mutation flags
-off. A local compiler fixture constructs the separately approved form and
-proves that live authority appears only when the gate, actor, UTC timestamp,
-pair rebalance flag, and canary rebalance flag agree. The public collector
-projection clears all of that authority again.
+The operator explicitly approved the fixed M10 production canary on
+`2026-07-30T23:26:16Z`. The checked-in V4 artifact records that actor and UTC
+timestamp and enables both rebalance mutation flags. The compiler grants live
+allocator authority only when the gate, actor, timestamp, pair rebalance flag,
+and canary rebalance flag agree. A fully disabled projection remains valid,
+while every partial enable or revoke fails validation. The public collector
+projection clears all mutation authority and approval identity again.
 
 The reviewed canary is direct Arbitrum only: at most two transfers, one active
 transfer, one failed transfer, 15 minutes from the first durable M10 intent,
 25 USDC and 401.2 ESP cumulative source debit, and 5 USDC and 2 ESP cumulative
 fee authority. Optimism and Across remain available only to the existing World
 Chain rebalance authority and cannot be selected by an M10 request.
+
+The completed M9 `prefund-arbitrum-m9` init container is removed for M10. Its
+one-shot command deliberately rejects steady-state rebalance authority and
+would therefore make every approved M10 rollout fail before application
+startup. The shared PVC, durable rebalance journal, EVM nonce journal, and
+recovery rules remain mounted in the sole `Recreate` Deployment owner.
 
 One process-scoped capital allocator validates economic-asset identity,
 inventory availability, source-debit conservation, route, and remaining

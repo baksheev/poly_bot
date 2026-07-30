@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "c2cfbc2fca66360c965327f98b8a5286193932fe3f98b14791d26cf046ee5025",
+      "source_fingerprint_sha256": "27363a0e6e8765e8b65f67d953b670b83b775cff1fc0875938425881bbd1f228",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -49,7 +49,7 @@
               "max_failed_parent_trades": 1,
               "max_concurrent_trades": 1,
               "rollout_duration_seconds": 900,
-              "rebalance_mutations_enabled": false,
+              "rebalance_mutations_enabled": true,
               "arbitrum_max_fee_headroom_bps": 12000,
               "prefunding_rebalance": {
                 "approval_gate": "explicit_production_approved",
@@ -94,9 +94,9 @@
                 }
               },
               "rebalance_live_canary": {
-                "approval_gate": "explicit_production_approval_required",
-                "production_approval_actor": null,
-                "production_approval_recorded_at_utc": null,
+                "approval_gate": "explicit_production_approved",
+                "production_approval_actor": "operator",
+                "production_approval_recorded_at_utc": "2026-07-30T23:26:16Z",
                 "binance_network": "ARBITRUM",
                 "maximum_transfer_count": 2,
                 "maximum_concurrent_transfers": 1,
@@ -166,7 +166,7 @@
               "slippage_profit_share_bps": 5000
             },
             "rebalance": {
-              "enabled": false,
+              "enabled": true,
               "start_threshold_bps": 2500
             },
             "dex": {
@@ -726,6 +726,7 @@
       "owner_id": "owner:rebalance-saga",
       "kind": "rebalance_saga",
       "owned_ids": [
+        "strategy:arbitrum-usdc-esp",
         "strategy:world-chain-usdc-wld"
       ]
     },
@@ -770,7 +771,7 @@
       "observe": true,
       "plan": true,
       "execute": true,
-      "rebalance": false
+      "rebalance": true
     },
     {
       "strategy_id": "strategy:world-chain-usdc-wld",

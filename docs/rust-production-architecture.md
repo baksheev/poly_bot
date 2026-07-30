@@ -380,6 +380,19 @@ The init container must not create an ESP order, DEX allowance, wallet
 transaction, bridge, or ongoing route authority. General Arbitrum rebalance
 remains the separately reviewed M10 milestone.
 
+The operator explicitly approved the fixed M10 production canary at
+`2026-07-30T23:26:16Z`. Its versioned authority is direct Arbitrum only: at
+most two transfers, one concurrent transfer, one failed transfer, 15 minutes
+from the first durable intent, cumulative source debits of `25 USDC` and
+`401.2 ESP`, cumulative fee authority of `5 USDC` and `2 ESP`, and one
+unknown-outcome reconciliation query. Bridge mutations remain disabled. The
+pair flag, canary flag, approval actor, approval timestamp, and all limits must
+compile together; any partial enable or revoke fails closed, and the public
+collector projection scrubs the authority. M10 removes the completed M9
+prefunding init container because that executable intentionally rejects
+steady-state rebalance authority. The sole `Recreate` owner, shared PVC, saga
+journal, EVM nonce journal, and recovery obligations remain unchanged.
+
 The operator separately approved Binance's one-time Satoshi deposit test for
 the same wallet address. Its versioned artifact permits exactly one direct
 Arbitrum transfer of `998700` USDC base units from

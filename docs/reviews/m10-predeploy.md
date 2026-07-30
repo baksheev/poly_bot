@@ -58,22 +58,28 @@ contract error.
 
 ## Versioned artifact semantic diff
 
-- [x] M10 remains `explicit_production_approval_required` and externally
-  disabled until the separate release approval is recorded; the approved
-  projection is exercised locally without granting authority to the checked-in
-  artifact. Evidence: checked-in V4 artifact and
-  `explicit_m10_approval_is_required_to_compile_live_allocator_authority`.
+- [x] The operator's separate M10 approval is recorded in the checked-in V4
+  artifact as actor `operator` at `2026-07-30T23:26:16Z`; live authority is
+  absent from a fully disabled projection and every partial enable or revoke
+  fails validation. Evidence: checked-in V4 artifact and
+  `checked_in_m10_approval_compiles_live_authority_and_public_projection_scrubs_it`.
 - [x] The source artifact and compiled production bundle encode identical M10
   route, count, concurrency, failure, duration, value, fee, bridge, and unknown
   reconciliation limits. Evidence:
   `checked_in_bundle_is_exact_compiler_output`.
 - [x] Enabling M10 requires a separate audited actor/timestamp plus both the
   pair and canary rebalance flags; changing flags alone fails validation.
-  Evidence: `domain::config::tests::committed_esp_canary_requires_versioned_bidirectional_prefunding`.
+  Evidence:
+  `domain::config::tests::committed_esp_canary_has_versioned_m10_approval_and_bounds`.
 - [x] The exact compiled/public projections are regenerated and their semantic
   diff is reviewed, with secrets and approval data scrubbed where required.
   Evidence:
-  `explicit_m10_approval_is_required_to_compile_live_allocator_authority`.
+  `checked_in_m10_approval_compiles_live_authority_and_public_projection_scrubs_it`.
+- [x] The completed M9 prefunder is removed from the approved M10 Deployment.
+  Its command intentionally requires steady-state rebalance to be disabled and
+  would otherwise reject every approved M10 startup. The shared PVC and
+  durable saga/nonce journals remain mounted. Evidence:
+  `gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state`.
 
 ## Latency and resource observation plan
 
@@ -108,8 +114,13 @@ contract error.
   inventory because active operations held the balance. The typed reserve
   failure now classifies that case as rate-limited `INFO` without weakening
   real capital-shortfall or reservation-invariant errors.
-- [x] Run `scripts/quality.sh` once after the final edit.
+- [x] Run `scripts/quality.sh` once after the final approval edit. The first
+  security audit discovered `RUSTSEC-2026-0220` in transitive `ruint 1.19.0`;
+  the lockfile now selects fixed `ruint 1.20.0`, and the complete gate passes
+  with 431 library tests and only the three existing allowed unmaintained-crate
+  warnings.
 - [x] Confirm a clean fast-forward to current `origin/main`; after explicit
   approval, the next external action is one consolidated push/deploy of the
   reviewed M10 revision. Evidence: fetched `origin/main` at `94b61e81f5ff`;
-  it is an ancestor of the reviewed local branch.
+  it is an ancestor of the reviewed local branch. This is rechecked immediately
+  before the push.

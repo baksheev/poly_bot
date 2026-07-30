@@ -40,10 +40,12 @@
         "max_failed_parent_trades": 1,
         "max_concurrent_trades": 1,
         "rollout_duration_seconds": 900,
-        "rebalance_mutations_enabled": false,
+        "rebalance_mutations_enabled": true,
         "arbitrum_max_fee_headroom_bps": 12000,
         "rebalance_live_canary": {
-          "approval_gate": "explicit_production_approval_required",
+          "approval_gate": "explicit_production_approved",
+          "production_approval_actor": "operator",
+          "production_approval_recorded_at_utc": "2026-07-30T23:26:16Z",
           "binance_network": "ARBITRUM",
           "maximum_transfer_count": 2,
           "maximum_concurrent_transfers": 1,
@@ -152,7 +154,7 @@
         "slippage_profit_share_bps": 5000
       },
       "rebalance": {
-        "enabled": false,
+        "enabled": true,
         "start_threshold_bps": 2500
       },
       "dex": {

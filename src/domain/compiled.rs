@@ -2804,6 +2804,18 @@ mod tests {
             collector_canary.approval_gate,
             crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
         );
+        assert!(!collector_canary.rebalance_mutations_enabled);
+        assert!(
+            collector_canary
+                .rebalance_live_canary
+                .as_ref()
+                .is_some_and(|policy| {
+                    policy.approval_gate
+                        == crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+                        && policy.production_approval_actor.is_none()
+                        && policy.production_approval_recorded_at_utc.is_none()
+                })
+        );
         assert!(collector_canary.prefunding_rebalance.is_none());
         let live_networks = live.network_runtime.unwrap();
         assert_eq!(
@@ -2883,12 +2895,12 @@ mod tests {
         let portfolio = live.portfolio_runtime.unwrap();
         assert_eq!(
             portfolio.allocator_mode,
-            CompiledCapitalAllocatorMode::Shadow
+            CompiledCapitalAllocatorMode::LiveCanary
         );
         let capital_canary = portfolio.capital_canary.as_ref().unwrap();
         assert_eq!(capital_canary.network_id.as_str(), "eip155:42161");
         assert_eq!(capital_canary.maximum_transfer_count, 2);
-        assert!(!capital_canary.external_mutation_authorized);
+        assert!(capital_canary.external_mutation_authorized);
         assert!(capital_canary.direct_route_only);
         assert!(!capital_canary.bridge_mutations_enabled);
         assert_eq!(portfolio.live_rebalance_adapter, "world_chain_v12_parity");
@@ -2913,8 +2925,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_m10_approval_is_required_to_compile_live_allocator_authority() {
-        let (manifest, mut sources, _) = fixture();
+    fn checked_in_m10_approval_compiles_live_authority_and_public_projection_scrubs_it() {
+        let (manifest, sources, bundle) = fixture();
         let esp_index = sources
             .iter()
             .position(|source| {
@@ -2925,24 +2937,7 @@ mod tests {
                     .any(|pair| pair.id == "arbitrum-usdc-esp")
             })
             .unwrap();
-        let mut approved = serde_json::to_value(sources[esp_index].snapshot()).unwrap();
-        approved["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
-            serde_json::Value::String("explicit_production_approved".to_owned());
-        approved["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_actor"] =
-            serde_json::Value::String("operator".to_owned());
-        approved["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_recorded_at_utc"] =
-            serde_json::Value::String("2026-07-31T00:00:00Z".to_owned());
-        approved["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] =
-            serde_json::Value::Bool(true);
-        approved["pairs"][0]["rebalance"]["enabled"] = serde_json::Value::Bool(true);
-        sources[esp_index] = LoadedDomainConfig::from_bytes(
-            sources[esp_index].path(),
-            &serde_json::to_vec(&approved).unwrap(),
-        )
-        .unwrap();
-
-        let approved_bundle = compile_domain(&manifest, &sources).unwrap();
-        let graph = CompiledDomainGraph::from_bundle(approved_bundle).unwrap();
+        let graph = CompiledDomainGraph::from_bundle(bundle).unwrap();
         let projected = graph
             .project("approved-m10.json", CompatibilityRole::LiveRuntime, false)
             .unwrap();
@@ -2971,6 +2966,21 @@ mod tests {
             pair.live_canary
                 .as_ref()
                 .is_some_and(|canary| canary.rebalance_mutations_enabled)
+        );
+        let approved_policy = pair
+            .live_canary
+            .as_ref()
+            .and_then(|canary| canary.rebalance_live_canary.as_ref())
+            .unwrap();
+        assert_eq!(
+            approved_policy.production_approval_actor.as_deref(),
+            Some("operator")
+        );
+        assert_eq!(
+            approved_policy
+                .production_approval_recorded_at_utc
+                .as_deref(),
+            Some("2026-07-30T23:26:16Z")
         );
 
         let public = graph
@@ -3002,6 +3012,42 @@ mod tests {
                         && policy.production_approval_actor.is_none()
                         && policy.production_approval_recorded_at_utc.is_none()
                 })
+        );
+
+        let mut disabled = serde_json::to_value(sources[esp_index].snapshot()).unwrap();
+        disabled["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
+            serde_json::Value::String("explicit_production_approval_required".to_owned());
+        disabled["pairs"][0]["live_canary"]["rebalance_live_canary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("production_approval_actor");
+        disabled["pairs"][0]["live_canary"]["rebalance_live_canary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("production_approval_recorded_at_utc");
+        disabled["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] =
+            serde_json::Value::Bool(false);
+        disabled["pairs"][0]["rebalance"]["enabled"] = serde_json::Value::Bool(false);
+        let mut disabled_sources = sources;
+        disabled_sources[esp_index] = LoadedDomainConfig::from_bytes(
+            disabled_sources[esp_index].path(),
+            &serde_json::to_vec(&disabled).unwrap(),
+        )
+        .unwrap();
+        let disabled_bundle = compile_domain(&manifest, &disabled_sources).unwrap();
+        let disabled_projected = CompiledDomainGraph::from_bundle(disabled_bundle)
+            .unwrap()
+            .project("disabled-m10.json", CompatibilityRole::LiveRuntime, false)
+            .unwrap();
+        let disabled_portfolio = disabled_projected.portfolio_runtime.unwrap();
+        assert_eq!(
+            disabled_portfolio.allocator_mode,
+            CompiledCapitalAllocatorMode::Shadow
+        );
+        assert!(
+            disabled_portfolio
+                .capital_canary
+                .is_some_and(|policy| !policy.external_mutation_authorized)
         );
     }
 
