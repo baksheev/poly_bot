@@ -659,6 +659,7 @@ pub enum CompiledNetworkGasPolicy {
     ArbitrumOne {
         requires_fresh_rpc_gas_price: bool,
         max_priority_fee_per_gas_wei: u128,
+        max_fee_headroom_bps: u16,
         includes_l1_fee: bool,
     },
     ReadOnly,
@@ -1440,11 +1441,29 @@ impl CompiledDomainGraph {
                     fallback_gas_price_wei: 100_000,
                     includes_l1_fee: true,
                 },
-                (42_161, _, true) => CompiledNetworkGasPolicy::ArbitrumOne {
-                    requires_fresh_rpc_gas_price: true,
-                    max_priority_fee_per_gas_wei: 0,
-                    includes_l1_fee: false,
-                },
+                (42_161, _, true) => {
+                    let max_fee_headroom_bps = pairs
+                        .iter()
+                        .filter_map(|pair| pair.live_canary.as_ref())
+                        .map(|canary| canary.arbitrum_max_fee_headroom_bps)
+                        .next()
+                        .context("Arbitrum canary gas headroom is missing")?;
+                    ensure!(
+                        pairs
+                            .iter()
+                            .filter_map(|pair| pair.live_canary.as_ref())
+                            .all(|canary| canary.arbitrum_max_fee_headroom_bps
+                                == max_fee_headroom_bps),
+                        "network {} has inconsistent Arbitrum max-fee headroom",
+                        network.id.as_str()
+                    );
+                    CompiledNetworkGasPolicy::ArbitrumOne {
+                        requires_fresh_rpc_gas_price: true,
+                        max_priority_fee_per_gas_wei: 0,
+                        max_fee_headroom_bps,
+                        includes_l1_fee: false,
+                    }
+                }
                 (_, false, false) => CompiledNetworkGasPolicy::ReadOnly,
                 _ => anyhow::bail!(
                     "network {} has no reviewed live gas policy",
@@ -2709,6 +2728,7 @@ mod tests {
             CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 max_priority_fee_per_gas_wei: 0,
+                max_fee_headroom_bps: 12_000,
                 includes_l1_fee: false,
             }
         );

@@ -47,6 +47,10 @@ Fee construction and accounting remain Rails-compatible:
 - A zero or failed refresh publishes the Rails World Chain fallback
   `100,000 wei` into the same two-second cache. The next one-second background
   tick retries RPC without delaying execution.
+- Arbitrum has no fallback and no priority tip. Its reviewed M9 policy turns
+  the fresh RPC sample into a `12,000 bps` EIP-1559 maximum-fee envelope so a
+  small next-block base-fee move cannot invalidate an otherwise current
+  sample; the receipt still charges only its effective price.
 - Receipt cost is `gasUsed * effectiveGasPrice + l1Fee`. The OP Stack
   `l1Fee` is the L1 data-publication charge; it changes realized cost but
   cannot prevent or cause an EVM revert.
@@ -58,7 +62,8 @@ Fee construction and accounting remain Rails-compatible:
 Gas limits retain Rust safety ceilings. Immediately before signing, the live
 executor uses the at-most-two-second cached RPC or fallback sample plus the
 configured priority fee. Startup/manual mutation may refresh synchronously if
-the cache is unavailable. There is no admission-time or absolute fee cap.
+the cache is unavailable. Arbitrum fails closed instead. There is no
+admission-time or absolute economic fee cap.
 
 ## Single owner and safe outcomes
 

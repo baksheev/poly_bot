@@ -291,6 +291,8 @@ pub struct LiveCanaryConfig {
     pub max_concurrent_trades: u16,
     pub rollout_duration_seconds: u64,
     pub rebalance_mutations_enabled: bool,
+    #[serde(default = "default_arbitrum_max_fee_headroom_bps")]
+    pub arbitrum_max_fee_headroom_bps: u16,
     #[serde(default)]
     pub prefunding_rebalance: Option<LiveCanaryPrefundingRebalanceConfig>,
 }
@@ -411,6 +413,13 @@ impl LiveCanaryConfig {
             "pair {} live canary duration is outside 60..=3600 seconds",
             pair.id
         );
+        ensure!(
+            (10_000..=15_000).contains(&self.arbitrum_max_fee_headroom_bps)
+                && (self.approval_gate != LiveCanaryApprovalGate::ExplicitProductionApproved
+                    || self.arbitrum_max_fee_headroom_bps >= 11_000),
+            "pair {} Arbitrum maximum-fee headroom is outside the reviewed bounds",
+            pair.id
+        );
         Ok(())
     }
 }
@@ -434,6 +443,9 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub approved_travel_rule_recovery: Option<LiveCanaryTravelRuleRecoveryConfig>,
     #[serde(default)]
     pub approved_manual_token_b_credit: Option<LiveCanaryManualCreditRecoveryConfig>,
+    #[serde(default)]
+    pub approved_evm_prebroadcast_rejection:
+        Option<LiveCanaryEvmPrebroadcastRejectionRecoveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -460,6 +472,18 @@ pub struct LiveCanaryManualCreditRecoveryConfig {
     pub expected_fee_base_units: String,
     pub wallet_balance_before_base_units: String,
     pub transaction_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryEvmPrebroadcastRejectionRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub operation_id: String,
+    pub transaction_hash: String,
+    pub nonce: u64,
+    pub rpc_error_code: i64,
+    pub rpc_error_message: String,
 }
 
 impl LiveCanaryPrefundingRebalanceConfig {
@@ -519,9 +543,33 @@ impl LiveCanaryPrefundingRebalanceConfig {
         if let Some(recovery) = &self.approved_manual_token_b_credit {
             recovery.validate(pair, canary)?;
         }
+        if let Some(recovery) = &self.approved_evm_prebroadcast_rejection {
+            recovery.validate(pair)?;
+        }
         ensure!(
             !self.retry_after_verified_address || self.approved_travel_rule_recovery.is_some(),
             "pair {} cannot retry after address verification without the exact rejected incident",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+impl LiveCanaryEvmPrebroadcastRejectionRecoveryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        ensure!(
+            !self.production_approval_actor.trim().is_empty()
+                && self.production_approval_recorded_at_utc.ends_with('Z')
+                && pair.chain.chain_id == 42_161
+                && self.operation_id == "rustarb-m9-setup-v3-ESP.v3-router-approval"
+                && self.transaction_hash
+                    == "0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977"
+                && self.transaction_hash.parse::<B256>().is_ok()
+                && self.nonce == 1
+                && self.rpc_error_code == -32_000
+                && self.rpc_error_message
+                    == "max fee per gas less than block base fee: address 0x90D990C81320221D2882De32beeA78923c1e77A3, maxFeePerGas: 20102000 baseFee: 20148000",
+            "pair {} EVM pre-broadcast rejection recovery identity is invalid",
             pair.id
         );
         Ok(())
@@ -605,6 +653,10 @@ impl LiveCanaryTravelRuleRecoveryConfig {
 
 const fn default_live_canary_failure_limit() -> u16 {
     1
+}
+
+const fn default_arbitrum_max_fee_headroom_bps() -> u16 {
+    10_000
 }
 
 fn default_zero_base_units() -> String {
@@ -1514,6 +1566,16 @@ mod tests {
         assert_eq!(
             manual.transaction_hash,
             "0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b"
+        );
+        assert_eq!(canary.arbitrum_max_fee_headroom_bps, 12_000);
+        let evm_recovery = prefunding
+            .approved_evm_prebroadcast_rejection
+            .as_ref()
+            .unwrap();
+        assert_eq!(evm_recovery.nonce, 1);
+        assert_eq!(
+            evm_recovery.transaction_hash,
+            "0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977"
         );
         assert!(pair.execution_enabled);
         assert!(!pair.rebalance.enabled);

@@ -94,6 +94,9 @@ pub enum JournalStatus {
         transaction_hash: B256,
         block_number: u64,
     },
+    RejectedBeforeBroadcast {
+        transaction_hash: B256,
+    },
     CancelledBeforeSigning,
 }
 
@@ -115,6 +118,7 @@ impl JournalStatus {
             | Self::OutcomeUnknown {
                 transaction_hash, ..
             }
+            | Self::RejectedBeforeBroadcast { transaction_hash }
             | Self::MinedSuccess {
                 transaction_hash, ..
             }
@@ -393,6 +397,19 @@ impl TransactionJournal {
         self.append(identity, WireEvent::CancelledBeforeSigning)
     }
 
+    pub fn record_rejected_before_broadcast(
+        &mut self,
+        identity: &JournalOperationIdentity,
+        transaction_hash: B256,
+    ) -> anyhow::Result<()> {
+        self.append(
+            identity,
+            WireEvent::RejectedBeforeBroadcast {
+                transaction_hash: format!("{transaction_hash:#x}"),
+            },
+        )
+    }
+
     fn append(
         &mut self,
         identity: &JournalOperationIdentity,
@@ -506,6 +523,9 @@ enum WireEvent {
         transaction_hash: String,
         block_number: u64,
     },
+    RejectedBeforeBroadcast {
+        transaction_hash: String,
+    },
     CancelledBeforeSigning,
 }
 
@@ -539,7 +559,11 @@ fn apply_payload(
                     operation.intent.identity.chain_id == identity.chain_id
                         && operation.intent.identity.wallet == identity.wallet
                         && operation.intent.identity.nonce == identity.nonce
-                        && !matches!(operation.status, JournalStatus::CancelledBeforeSigning)
+                        && !matches!(
+                            operation.status,
+                            JournalStatus::CancelledBeforeSigning
+                                | JournalStatus::RejectedBeforeBroadcast { .. }
+                        )
                 }),
                 "journal nonce is already owned by another operation"
             );
@@ -624,6 +648,24 @@ fn apply_transition(operation: &mut JournalOperation, event: &WireEvent) -> anyh
             transaction_hash,
             block_number,
         } => mined_status(previous, transaction_hash, *block_number, false)?,
+        WireEvent::RejectedBeforeBroadcast { transaction_hash } => {
+            let hash = parse_hash(transaction_hash)?;
+            ensure_hash_transition(previous, hash, "pre-broadcast rejection")?;
+            ensure!(
+                matches!(
+                    previous,
+                    JournalStatus::Signed { .. }
+                        | JournalStatus::OutcomeUnknown {
+                            reason: UnknownOutcomeReason::BroadcastRejected,
+                            ..
+                        }
+                ),
+                "journal pre-broadcast rejection requires a signed transaction or reviewed RPC rejection"
+            );
+            JournalStatus::RejectedBeforeBroadcast {
+                transaction_hash: hash,
+            }
+        }
         WireEvent::CancelledBeforeSigning => {
             ensure!(
                 matches!(previous, JournalStatus::IntentRecorded),
@@ -934,6 +976,39 @@ mod tests {
             .record_cancelled_before_signing(&identity())
             .unwrap();
         journal.record_intent(&another).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reviewed_prebroadcast_rejection_is_terminal_and_releases_the_nonce() {
+        let path = journal_path("prebroadcast-rejection");
+        let mut journal = TransactionJournal::open(&path).unwrap();
+        let transaction_hash = B256::repeat_byte(0x42);
+        journal.record_intent(&intent()).unwrap();
+        journal
+            .record_signed(&identity(), transaction_hash)
+            .unwrap();
+        journal
+            .record_unknown_outcome(
+                &identity(),
+                transaction_hash,
+                UnknownOutcomeReason::BroadcastRejected,
+            )
+            .unwrap();
+        journal
+            .record_rejected_before_broadcast(&identity(), transaction_hash)
+            .unwrap();
+
+        assert!(journal.unresolved_for(480, identity().wallet).is_empty());
+        assert!(matches!(
+            journal.operation(&identity().operation_id).unwrap().status,
+            JournalStatus::RejectedBeforeBroadcast {
+                transaction_hash: hash
+            } if hash == transaction_hash
+        ));
+        let mut retry = intent();
+        retry.identity.operation_id = "rebalance:usdc:42.retry-1".to_owned();
+        journal.record_intent(&retry).unwrap();
         fs::remove_file(path).unwrap();
     }
 

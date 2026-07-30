@@ -103,8 +103,9 @@ use arb_bot::{
         TelemetryHandle, TelemetryWriter, execution_lane_id,
     },
     wallet::{
-        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest,
-        WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
+        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, ReviewedPrebroadcastRejection,
+        TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
+        recover_exact_rejected_before_broadcast,
     },
 };
 use clap::Parser;
@@ -559,6 +560,55 @@ async fn prefund_arbitrum_canary(
         wallet.address() == configured_wallet,
         "Arbitrum prefunding signer differs from EVM_WALLET_ADDRESS"
     );
+    let arbitrum_endpoint = std::env::var(&pair.chain.rpc_url_env).with_context(|| {
+        format!(
+            "required environment variable {} is not set",
+            pair.chain.rpc_url_env
+        )
+    })?;
+    let arbitrum_rpc = JsonRpcClient::new(arbitrum_endpoint)?;
+    ensure!(
+        arbitrum_rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
+        "prefunding RPC is not Arbitrum One"
+    );
+    if let Some(recovery) = &prefunding.approved_evm_prebroadcast_rejection {
+        let arbitrum_journal_path =
+            std::env::var(ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV).with_context(|| {
+                format!(
+                    "required environment variable {ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV} is not set"
+                )
+            })?;
+        let transaction_hash = recovery
+            .transaction_hash
+            .parse::<B256>()
+            .context("approved EVM rejection transaction hash is invalid")?;
+        let recovered = recover_exact_rejected_before_broadcast(
+            &arbitrum_rpc,
+            arbitrum_journal_path,
+            &ReviewedPrebroadcastRejection {
+                operation_id: recovery.operation_id.clone(),
+                chain_id: ARBITRUM_CHAIN_ID,
+                wallet: configured_wallet,
+                nonce: recovery.nonce,
+                transaction_hash,
+                scope: EvmJournalScope {
+                    schema_version: EvmJournalScope::SCHEMA_VERSION,
+                    network_id: "eip155:42161".to_owned(),
+                    wallet_id: "evm-wallet:primary".to_owned(),
+                    strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
+                },
+            },
+        )
+        .await?;
+        tracing::info!(
+            operation_id = recovery.operation_id,
+            transaction_hash = %transaction_hash,
+            nonce = recovery.nonce,
+            rpc_error_code = recovery.rpc_error_code,
+            recovered,
+            "reviewed Arbitrum fee-cap rejection is proven absent and closed before M9 startup"
+        );
+    }
     if validate_prefunding_marker(
         marker_path,
         source_domain.fingerprint_sha256(),
@@ -580,19 +630,8 @@ async fn prefund_arbitrum_canary(
     let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
         format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
     })?;
-    let arbitrum_endpoint = std::env::var(&pair.chain.rpc_url_env).with_context(|| {
-        format!(
-            "required environment variable {} is not set",
-            pair.chain.rpc_url_env
-        )
-    })?;
     let world_rpc = JsonRpcClient::new(world_endpoint)?;
     let optimism_rpc = JsonRpcClient::new(optimism_endpoint)?;
-    let arbitrum_rpc = JsonRpcClient::new(arbitrum_endpoint)?;
-    ensure!(
-        arbitrum_rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
-        "prefunding RPC is not Arbitrum One"
-    );
 
     let mut trading_binance = BinanceAccountClient::from_env(config)?;
     trading_binance.synchronize_clock().await?;
@@ -698,7 +737,6 @@ async fn prefund_arbitrum_canary(
     let transaction_journal_path = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
         format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
     })?;
-
     let token_a_target = U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10)
         .context("M9 token_a prefunding target is invalid")?;
     let token_b_target = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
@@ -1187,18 +1225,19 @@ fn validate_prefunding_marker(
     )
     .context("prefunding marker is invalid JSON")?;
     ensure!(
-        marker
-            == serde_json::json!({
-                "schema_version": 1,
-                "domain_fingerprint_sha256": domain_fingerprint,
-                "snapshot_id": snapshot_id,
-                "wallet": format!("{wallet:#x}"),
-                "token_a_target_base_units": token_a_target,
-                "token_b_target_base_units": token_b_target,
-                "approval_recorded_at_utc": approval_recorded_at_utc,
-                "completed": true,
-            }),
-        "prefunding marker differs from the approved M9 artifact"
+        !domain_fingerprint.is_empty()
+            && marker["schema_version"] == 1
+            && marker["domain_fingerprint_sha256"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && marker["snapshot_id"] == snapshot_id
+            && marker["wallet"] == format!("{wallet:#x}")
+            && marker["token_a_target_base_units"] == token_a_target
+            && marker["token_b_target_base_units"] == token_b_target
+            && marker["approval_recorded_at_utc"] == approval_recorded_at_utc
+            && marker["completed"] == true
+            && marker.as_object().is_some_and(|object| object.len() == 8),
+        "prefunding marker differs from the approved M9 funding identity"
     );
     Ok(true)
 }
@@ -2416,8 +2455,9 @@ async fn run(
                     CompiledNetworkGasPolicy::ArbitrumOne {
                         requires_fresh_rpc_gas_price: true,
                         max_priority_fee_per_gas_wei: 0,
+                        max_fee_headroom_bps,
                         includes_l1_fee: false,
-                    }
+                    } if *max_fee_headroom_bps >= 11_000
                 ),
             "Arbitrum M9 execution policy must be mutation-enabled with fail-closed gas pricing"
         );
@@ -3169,6 +3209,11 @@ async fn run(
             CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 max_priority_fee_per_gas_wei: 0,
+                max_fee_headroom_bps: m8_pair
+                    .live_canary
+                    .as_ref()
+                    .context("M9 canary policy is missing")?
+                    .arbitrum_max_fee_headroom_bps,
                 includes_l1_fee: false,
             },
         )
@@ -5330,6 +5375,18 @@ mod tests {
                 "snapshot",
                 wallet,
                 "25000000",
+                "400000000000000000000",
+                "2026-07-30T06:16:57Z",
+            )
+            .unwrap()
+        );
+        assert!(
+            validate_prefunding_marker(
+                &marker,
+                "another-fingerprint",
+                "snapshot",
+                wallet,
+                "26000000",
                 "400000000000000000000",
                 "2026-07-30T06:16:57Z",
             )

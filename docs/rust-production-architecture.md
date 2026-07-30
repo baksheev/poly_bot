@@ -318,10 +318,13 @@ candidate's exact reservation remain separate authorization controls.
    every second. World Chain signing preserves the reviewed at-most-two-second
    cached RPC or 100,000-wei Rails-fallback sample plus its configured priority
    fee. Arbitrum signing, once separately approved, requires a fresh
-   at-most-two-second `eth_gasPrice` sample, uses zero priority tip, and fails
-   closed when that sample is absent, zero, or stale; World Chain fallback
-   constants are forbidden on Arbitrum. There is no admission-time DEX fee cap
-   and no gas RPC in the live execution hot path.
+   at-most-two-second `eth_gasPrice` sample, uses zero priority tip, and applies
+   the versioned `12,000 bps` maximum-fee envelope so normal next-block base-fee
+   movement cannot invalidate the signed transaction. The envelope changes
+   only `maxFeePerGas`; receipts still charge the effective price. Missing,
+   zero, or stale samples fail closed, and World Chain fallback constants are
+   forbidden on Arbitrum. There is no admission-time DEX fee cap and no gas RPC
+   in the live execution hot path.
 6. The receipt's positional pool Swap is sufficient to apply this process's
    self-impact immediately to the local mirror. Already-queued DEX WebSocket
    events are drained without waiting first, then the affected prepared curves
@@ -354,8 +357,11 @@ network, token, target, and wallet bounds. The production `Recreate`
 Deployment must stop the current sole owner before running the journaled
 one-shot init container, restore the prior revision if it fails, and start M9
 only after both funding targets and an atomically fsynced completion marker are
-proven. A restart validates that marker and must never replenish inventory
-again. The init container must not create an ESP order, DEX allowance, wallet
+proven. A restart validates the marker's immutable snapshot, wallet, targets,
+and approval identity and must never replenish inventory again. Its recorded
+domain fingerprint is provenance, not a reason to replenish after a corrective
+code or gas-policy revision; changing a target or approval still fails closed.
+The init container must not create an ESP order, DEX allowance, wallet
 transaction, bridge, or ongoing route authority. General Arbitrum rebalance
 remains the separately reviewed M10 milestone.
 
@@ -401,6 +407,19 @@ fee. The M9 recovery is bound to that exact Binance history row, Arbitrum
 receipt, token, address, amount, fee, and zero pre-transfer wallet balance
 before it appends the terminal journal state. No duplicate transfer,
 withdrawal, bridge, or swap is permitted.
+
+The first M9 allowance attempt exposed a separate nonce-recovery edge. Arbitrum
+RPC rejected transaction
+`0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977`
+before broadcast because its `20,102,000 wei` maximum fee was below the next
+block's `20,148,000 wei` base fee. The journal correctly prevented blind nonce
+reuse, but the generic JSON-RPC classification made a proven pre-broadcast
+rejection look ambiguous. The active artifact now binds recovery to that exact
+operation, hash, wallet, chain, nonce, and RPC error. The init owner requires
+two observations with no transaction or receipt and unchanged
+`latest=pending=1` before appending the terminal rejection. Other unknown
+outcomes remain blocked. Future fee-cap rejects are classified narrowly,
+journaled terminally, and retry with deterministic child operation IDs.
 
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its

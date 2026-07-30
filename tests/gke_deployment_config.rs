@@ -146,6 +146,7 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.approval_gate"));
     assert!(DEPLOY_WORKFLOW.contains("explicit_production_approved"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.max_parent_trades"));
+    assert!(DEPLOY_WORKFLOW.contains("arbitrum_max_fee_headroom_bps"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.rebalance_mutations_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
@@ -172,6 +173,9 @@ fn gke_prefunding_is_one_shot_bounded_and_stops_the_live_owner_first() {
     assert!(DEPLOY_WORKFLOW.contains("maximum_token_a_withdrawal_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_token_b_withdrawal_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers"));
+    assert!(DEPLOY_WORKFLOW.contains(".status.containerStatuses"));
+    assert!(DEPLOY_WORKFLOW.contains(".restartCount >= 2"));
+    assert!(DEPLOY_WORKFLOW.contains("repeatedly failed startup"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
     assert!(DEPLOY_WORKFLOW.contains("binance-esp-address-verification.v1.json"));
     assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"amount_base_units\": \"998700\""));

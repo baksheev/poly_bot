@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -11,7 +12,7 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use crate::chain::rpc::{JsonRpcClient, RpcTransaction, TransactionReceipt};
 
 use super::{
-    EvmJournalScope, JournalIntent, JournalOperationIdentity, SignedTransaction,
+    EvmJournalScope, JournalIntent, JournalOperationIdentity, JournalStatus, SignedTransaction,
     TransactionJournal, UnknownOutcomeReason, WalletCall,
 };
 
@@ -184,6 +185,16 @@ impl NonceReconciliationOutcome {
 pub struct ReconciledNonceLane {
     pub lane: NonceLane,
     pub outcome: NonceReconciliationOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewedPrebroadcastRejection {
+    pub operation_id: String,
+    pub chain_id: u64,
+    pub wallet: Address,
+    pub nonce: u64,
+    pub transaction_hash: B256,
+    pub scope: EvmJournalScope,
 }
 
 impl NonceLane {
@@ -516,6 +527,106 @@ impl NonceLane {
         };
         Ok(())
     }
+
+    pub fn record_rejected_before_broadcast(
+        &mut self,
+        journal: &mut TransactionJournal,
+        transaction_hash: B256,
+    ) -> anyhow::Result<()> {
+        let identity = match &self.state {
+            NonceLaneState::Signed {
+                identity,
+                transaction_hash: expected,
+            }
+            | NonceLaneState::RecoveryRequired {
+                identity,
+                transaction_hash: Some(expected),
+            } => {
+                ensure!(
+                    *expected == transaction_hash,
+                    "pre-broadcast rejection hash does not match the signed transaction"
+                );
+                identity.clone()
+            }
+            _ => {
+                anyhow::bail!("pre-broadcast rejection requires a signed or recovery-blocked nonce")
+            }
+        };
+        journal.record_rejected_before_broadcast(&identity, transaction_hash)?;
+        self.state = NonceLaneState::Ready {
+            next_nonce: identity.nonce,
+        };
+        Ok(())
+    }
+}
+
+/// Closes one explicitly reviewed legacy RPC rejection only after two
+/// observations prove that the signed hash has no receipt, is absent from the
+/// provider, and its nonce remains unused. The exact identity comes from the
+/// versioned production artifact; no generic unknown outcome is unlocked.
+pub async fn recover_exact_rejected_before_broadcast(
+    rpc: &JsonRpcClient,
+    journal_path: impl AsRef<Path>,
+    expected: &ReviewedPrebroadcastRejection,
+) -> anyhow::Result<bool> {
+    expected.scope.validate()?;
+    ensure!(
+        expected.chain_id > 0 && expected.wallet != Address::ZERO,
+        "approved pre-broadcast recovery identity is invalid"
+    );
+    let mut journal = TransactionJournal::open(journal_path)?;
+    let operation = journal
+        .operation(&expected.operation_id)
+        .context("approved pre-broadcast recovery operation is absent")?
+        .clone();
+    ensure!(
+        operation.intent.identity.chain_id == expected.chain_id
+            && operation.intent.identity.wallet == expected.wallet
+            && operation.intent.identity.nonce == expected.nonce
+            && operation.intent.identity.scope.as_ref() == Some(&expected.scope),
+        "approved pre-broadcast recovery operation identity changed"
+    );
+    match operation.status {
+        JournalStatus::RejectedBeforeBroadcast { transaction_hash } => {
+            ensure!(
+                transaction_hash == expected.transaction_hash,
+                "completed pre-broadcast recovery transaction hash changed"
+            );
+            return Ok(false);
+        }
+        JournalStatus::OutcomeUnknown {
+            transaction_hash,
+            reason: UnknownOutcomeReason::BroadcastRejected,
+        } => ensure!(
+            transaction_hash == expected.transaction_hash,
+            "approved pre-broadcast recovery transaction hash changed"
+        ),
+        _ => anyhow::bail!("approved pre-broadcast recovery journal state changed"),
+    }
+
+    for observation in 0..2 {
+        let (latest_nonce, pending_nonce, receipt, transaction) = tokio::try_join!(
+            rpc.latest_nonce(expected.wallet),
+            rpc.pending_nonce(expected.wallet),
+            rpc.transaction_receipt(expected.transaction_hash),
+            rpc.transaction_by_hash(expected.transaction_hash),
+        )?;
+        ensure!(
+            latest_nonce == expected.nonce && pending_nonce == expected.nonce,
+            "approved pre-broadcast recovery nonce is no longer unused"
+        );
+        ensure!(
+            receipt.is_none() && transaction.is_none(),
+            "approved pre-broadcast recovery transaction appeared onchain"
+        );
+        if observation == 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    journal
+        .record_rejected_before_broadcast(&operation.intent.identity, expected.transaction_hash)?;
+    Ok(true)
 }
 
 fn outcome_for_non_recovery_state(

@@ -650,12 +650,21 @@ impl DexExecutor {
         journal_operation_id: &str,
         reason: String,
     ) -> DexExecutionServiceError {
-        let status = self
+        let mut status = self
             .journal
             .operation(journal_operation_id)
             .map(|operation| &operation.status);
+        for retry in 1..=3_u8 {
+            let child_operation_id = format!("{journal_operation_id}.retry-{retry}");
+            let Some(child) = self.journal.operation(&child_operation_id) else {
+                break;
+            };
+            status = Some(&child.status);
+        }
         match status {
-            None | Some(JournalStatus::CancelledBeforeSigning) => {
+            None
+            | Some(JournalStatus::CancelledBeforeSigning)
+            | Some(JournalStatus::RejectedBeforeBroadcast { .. }) => {
                 DexExecutionServiceError::FailedBeforeSubmission { reason }
             }
             Some(JournalStatus::MinedReverted {
@@ -825,7 +834,12 @@ impl DexExecutor {
         policy: ExecuteCallPolicy,
         enqueued_at: Option<Instant>,
     ) -> anyhow::Result<TransactionReceipt> {
-        if let Some(existing) = self.journal.operation(&operation_id) {
+        let base_operation_id = operation_id;
+        let mut operation_id = base_operation_id.clone();
+        for retry in 0..=3_u8 {
+            let Some(existing) = self.journal.operation(&operation_id) else {
+                break;
+            };
             ensure!(
                 existing.intent.identity.chain_id == self.nonce_lane.chain_id()
                     && existing.intent.identity.wallet == self.wallet.address()
@@ -848,6 +862,13 @@ impl DexExecutor {
                 }
                 JournalStatus::CancelledBeforeSigning => {
                     bail!("journaled DEX transaction was cancelled before signing")
+                }
+                JournalStatus::RejectedBeforeBroadcast { .. } if retry < 3 => {
+                    operation_id = format!("{base_operation_id}.retry-{}", retry + 1);
+                    continue;
+                }
+                JournalStatus::RejectedBeforeBroadcast { .. } => {
+                    bail!("journaled DEX transaction exhausted pre-broadcast retries")
                 }
                 _ => bail!("journaled DEX transaction requires recovery"),
             };
@@ -981,20 +1002,29 @@ impl DexExecutor {
         let submitted = match broadcast_result {
             Ok(Ok(hash)) => hash,
             Ok(Err(error)) => {
-                let reason = if error.to_string().starts_with("JSON-RPC error") {
-                    UnknownOutcomeReason::BroadcastRejected
+                if is_definitive_prebroadcast_rejection(&error) {
+                    self.nonce_lane
+                        .record_rejected_before_broadcast(&mut self.journal, signed.hash)?;
+                    tracing::warn!(
+                        operation_id,
+                        transaction_hash = %signed.hash,
+                        nonce = signed.nonce,
+                        error = %error,
+                        "DEX transaction was definitively rejected before broadcast and its nonce was released"
+                    );
                 } else {
-                    UnknownOutcomeReason::BroadcastTransport
-                };
-                self.nonce_lane
-                    .record_unknown_outcome(&mut self.journal, reason)?;
-                tracing::error!(
-                    operation_id,
-                    transaction_hash = %signed.hash,
-                    nonce = signed.nonce,
-                    error = %error,
-                    "DEX transaction broadcast outcome is unknown and was journaled"
-                );
+                    self.nonce_lane.record_unknown_outcome(
+                        &mut self.journal,
+                        UnknownOutcomeReason::BroadcastTransport,
+                    )?;
+                    tracing::error!(
+                        operation_id,
+                        transaction_hash = %signed.hash,
+                        nonce = signed.nonce,
+                        error = %error,
+                        "DEX transaction broadcast outcome is unknown and was journaled"
+                    );
+                }
                 return Err(error);
             }
             Err(_elapsed) => {
@@ -1223,18 +1253,35 @@ fn transaction_fees_for_policy(
         }
         CompiledNetworkGasPolicy::ArbitrumOne {
             max_priority_fee_per_gas_wei,
+            max_fee_headroom_bps,
             ..
         } => {
             ensure!(
                 *max_priority_fee_per_gas_wei == 0,
                 "reviewed Arbitrum sequencer policy does not permit a priority tip"
             );
-            Ok((gas_price, 0))
+            ensure!(
+                (10_000..=15_000).contains(max_fee_headroom_bps),
+                "Arbitrum maximum-fee headroom is outside the reviewed bounds"
+            );
+            let maximum = gas_price
+                .checked_mul(u128::from(*max_fee_headroom_bps))
+                .and_then(|scaled| scaled.checked_add(9_999))
+                .context("Arbitrum maximum fee headroom overflow")?
+                / 10_000;
+            Ok((maximum, 0))
         }
         CompiledNetworkGasPolicy::ReadOnly => {
             anyhow::bail!("read-only network cannot construct transaction fees")
         }
     }
+}
+
+fn is_definitive_prebroadcast_rejection(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.starts_with("json-rpc error")
+        && (message.contains("max fee per gas less than block base fee")
+            || message.contains("fee cap less than block base fee"))
 }
 
 fn settlement_log_for_route(
@@ -1624,8 +1671,8 @@ mod tests {
     use super::{
         DexExecutionService, DexExecutionServiceError, DexExecutor, ExactInputSwapRequest,
         GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, UniswapProtocol,
-        allowance_grant_for_policy, settlement_log_for_route, transaction_fees_for_policy,
-        wallet_transfer_totals,
+        allowance_grant_for_policy, is_definitive_prebroadcast_rejection, settlement_log_for_route,
+        transaction_fees_for_policy, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
@@ -1656,11 +1703,12 @@ mod tests {
         let policy = CompiledNetworkGasPolicy::ArbitrumOne {
             requires_fresh_rpc_gas_price: true,
             max_priority_fee_per_gas_wei: 0,
+            max_fee_headroom_bps: 12_000,
             includes_l1_fee: false,
         };
         assert_eq!(
             transaction_fees_for_policy(&policy, 12_345).unwrap(),
-            (12_345, 0)
+            (14_814, 0)
         );
         assert_eq!(
             allowance_grant_for_policy(&policy, U256::from(10_000_000_u64)),
@@ -1995,7 +2043,7 @@ mod tests {
                 .unwrap()
                 .status,
             JournalStatus::OutcomeUnknown {
-                reason: UnknownOutcomeReason::BroadcastRejected,
+                reason: UnknownOutcomeReason::BroadcastTransport,
                 ..
             }
         ));
@@ -2021,6 +2069,20 @@ mod tests {
         request.confirmation_timeout = Duration::from_secs(2);
         request.submission_policy = SwapSubmissionPolicy::Immediate;
         request
+    }
+
+    #[test]
+    fn only_an_explicit_fee_cap_error_is_a_definitive_prebroadcast_rejection() {
+        let definitive = anyhow::anyhow!(
+            "JSON-RPC error -32000: max fee per gas less than block base fee: maxFeePerGas: 20102000 baseFee: 20148000"
+        );
+        assert!(is_definitive_prebroadcast_rejection(&definitive));
+        assert!(!is_definitive_prebroadcast_rejection(&anyhow::anyhow!(
+            "JSON-RPC error -32000: already known"
+        )));
+        assert!(!is_definitive_prebroadcast_rejection(&anyhow::anyhow!(
+            "transport connection reset"
+        )));
     }
 
     fn journal_path(name: &str) -> PathBuf {

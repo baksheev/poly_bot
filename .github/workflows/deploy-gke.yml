@@ -115,6 +115,7 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_failed_parent_trades" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.max_concurrent_trades" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.rollout_duration_seconds" "${domain_config}")" = 900
+          test "$(jq -r "${esp} | .pairs[0].live_canary.arbitrum_max_fee_headroom_bps" "${domain_config}")" = 12000
           test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_mutations_enabled" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approval_gate" "${domain_config}")" \
             = explicit_production_approved
@@ -150,6 +151,12 @@ jobs:
             = 1200000000000000000
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_manual_token_b_credit.transaction_hash" "${domain_config}")" \
             = 0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.operation_id" "${domain_config}")" \
+            = rustarb-m9-setup-v3-ESP.v3-router-approval
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.transaction_hash" "${domain_config}")" \
+            = 0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.nonce" "${domain_config}")" = 1
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.rpc_error_code" "${domain_config}")" = -32000
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
             = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \
@@ -400,6 +407,27 @@ jobs:
             ' <<<"${pods_json}")"
             if [[ -n "${failed_init}" ]]; then
               echo "init container ${failed_init} failed; triggering audited rollback" >&2
+              exit 1
+            fi
+            failed_application="$(jq -r '
+              [
+                .items[]
+                | .metadata.name as $pod
+                | (.status.containerStatuses // [])[]
+                | select(
+                    (.ready | not)
+                    and .restartCount >= 2
+                    and (
+                      (.state.waiting.reason // "") == "CrashLoopBackOff"
+                      or (.lastState.terminated.exitCode // 0) != 0
+                    )
+                  )
+                | "\($pod)/\(.name)"
+              ]
+              | .[0] // empty
+            ' <<<"${pods_json}")"
+            if [[ -n "${failed_application}" ]]; then
+              echo "application container ${failed_application} repeatedly failed startup; triggering audited rollback" >&2
               exit 1
             fi
             if (( SECONDS >= rollout_deadline )); then

@@ -1894,6 +1894,11 @@ Implementation status:
 - Arbitrum allowances are bounded by the reviewed cumulative USDC cap and the
   funded ESP balance. Both token-funding minima are versioned readiness inputs;
   Arbitrum rebalance route mutation remains disabled;
+- Arbitrum's versioned fee policy uses the fresh RPC sample with zero priority
+  tip and a `12,000 bps` maximum-fee envelope. A narrowly recognized
+  next-block fee-cap rejection is terminal before broadcast and can reuse its
+  nonce through a deterministic child attempt; transport, timeout, and all
+  other ambiguous errors remain recovery-blocking;
 - `scripts/report-m9-live-canary START_UTC END_UTC` proves the startup
   authority, latest complete readiness, exact canary caps, unique parent
   admissions, cumulative bounds, zero rebalance mutations, and the inherited
@@ -1920,12 +1925,25 @@ order, DEX allowance, or wallet transaction and must finish before either M9
 application container can start. Failure triggers the existing Deployment
 rollback to the previous M8 owner.
 
-On success the init container atomically fsyncs a version-, domain-, approval-,
-wallet-, and target-bound completion marker to the shared PVC. A restart of the
-same revision validates that marker and refuses to fund again, even if later
-canary trades have reduced a token balance; normal M9 readiness then fails
-closed instead of silently replenishing inventory. Before the marker exists,
-partial or unknown outcomes resume through the deterministic journal identity.
+On success the init container atomically fsyncs a version-, approval-, wallet-,
+snapshot-, and target-bound completion marker to the shared PVC. The recorded
+domain fingerprint preserves provenance, but a corrective code/artifact
+revision with the same funding identity still validates the marker and refuses
+to fund again. A changed target, approval, wallet, or snapshot fails closed.
+This remains true even if later canary trades have reduced a token balance;
+normal M9 readiness then fails closed instead of silently replenishing
+inventory. Before the marker exists, partial or unknown outcomes resume through
+the deterministic journal identity.
+
+The first live M9 allowance was signed at nonce `1` with transaction hash
+`0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977`.
+Alchemy rejected it before mempool admission because `maxFeePerGas=20,102,000`
+was below `baseFee=20,148,000`. The corrected artifact authorizes only this
+recovery identity. The prefunding init owner verifies the same operation,
+Arbitrum wallet, chain, nonce, and hash, then performs two RPC observations
+proving that the transaction and receipt are absent and that both latest and
+pending nonce remain `1`. Only then may it terminate that journal record.
+Generic signed-but-absent or unknown-broadcast records are never unlocked.
 
 The first production bootstrap attempt transferred `25 USDC` to Arbitrum; the
 later approved Satoshi ownership test returned `0.9987 USDC` to Binance. The

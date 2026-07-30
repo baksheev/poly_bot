@@ -2388,7 +2388,8 @@ async fn execute_wallet_call(
             JournalStatus::MinedReverted { .. } => {
                 bail!("journaled rebalance transaction reverted")
             }
-            JournalStatus::CancelledBeforeSigning => {
+            JournalStatus::CancelledBeforeSigning
+            | JournalStatus::RejectedBeforeBroadcast { .. } => {
                 bail!("journaled rebalance transaction was cancelled")
             }
             _ => bail!("journaled rebalance transaction still requires recovery"),

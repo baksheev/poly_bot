@@ -656,6 +656,7 @@ mod tests {
             gas_policy: CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 max_priority_fee_per_gas_wei: 0,
+                max_fee_headroom_bps: 12_000,
                 includes_l1_fee: false,
             },
         };
@@ -674,6 +675,7 @@ mod tests {
             gas_policy: CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 max_priority_fee_per_gas_wei: 0,
+                max_fee_headroom_bps: 12_000,
                 includes_l1_fee: false,
             },
         };
