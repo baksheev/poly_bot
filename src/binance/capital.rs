@@ -579,7 +579,7 @@ pub struct TravelRuleWithdrawalRecord {
     #[serde(default)]
     pub coin: String,
     #[serde(default)]
-    pub withdrawal_status: i64,
+    pub withdrawal_status: Option<i64>,
     #[serde(default)]
     pub travel_rule_status: i64,
     #[serde(default)]
@@ -596,7 +596,15 @@ pub struct TravelRuleWithdrawalRecord {
 
 impl TravelRuleWithdrawalRecord {
     pub fn is_failed_without_broadcast(&self) -> bool {
-        self.travel_rule_status == 2 && self.withdrawal_status != 6 && self.tx_id.trim().is_empty()
+        self.travel_rule_status == 2
+            && self.withdrawal_status != Some(6)
+            && self.tx_id.trim().is_empty()
+    }
+
+    pub fn is_approved_without_withdrawal(&self) -> bool {
+        self.travel_rule_status == 4
+            && self.withdrawal_status.is_none()
+            && self.tx_id.trim().is_empty()
     }
 }
 
@@ -962,6 +970,17 @@ mod tests {
         )
         .unwrap();
         assert!(!completed.is_failed_without_broadcast());
+
+        let approved_without_withdrawal: TravelRuleWithdrawalRecord = serde_json::from_str(
+            r#"{
+              "trId":67181540,"coin":"ESP","amount":"400","transactionFee":"1.2",
+              "travelRuleStatus":4,"network":"ARBITRUM",
+              "withdrawOrderId":"rustwd5","txId":""
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(approved_without_withdrawal.withdrawal_status, None);
+        assert!(approved_without_withdrawal.is_approved_without_withdrawal());
     }
 
     #[test]
@@ -1045,7 +1064,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(travel_rule.tr_id, 65_865_740);
-        assert_eq!(travel_rule.withdrawal_status, 6);
+        assert_eq!(travel_rule.withdrawal_status, Some(6));
         assert_eq!(travel_rule.travel_rule_status, 4);
     }
 

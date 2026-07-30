@@ -86,7 +86,7 @@ spec:
             - name: REBALANCE_EXECUTION_MODE
               value: disabled
             - name: REBALANCE_BINANCE_WITHDRAWAL_API_MODE
-              value: travel_rule
+              value: standard
             - name: ARBITRUM_PREFUNDING_LIVE_CONFIRMATION
               value: PREFUND_ARBITRUM_M9
             - name: ARBITRUM_PREFUNDING_MARKER_PATH

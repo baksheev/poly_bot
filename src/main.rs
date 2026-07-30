@@ -714,6 +714,10 @@ async fn prefund_arbitrum_canary(
     let token_b_debit_cap = U256::from_str_radix(&prefunding.maximum_token_b_debit_base_units, 10)
         .context("M9 token_b debit cap is invalid")?;
     let approved_recovery = prefunding.approved_travel_rule_recovery.as_ref();
+    ensure!(
+        config.rebalance_binance_withdrawal_api_mode == prefunding.binance_withdrawal_api_mode,
+        "M9 prefunding withdrawal API mode differs from the approved domain artifact"
+    );
 
     let mut direct_networks = BTreeMap::new();
     for token in [&pair.token_a, &pair.token_b] {
@@ -1478,7 +1482,7 @@ fn log_travel_rule_withdrawal_record(record: &TravelRuleWithdrawalRecord) {
         network = %record.network,
         amount = %record.amount,
         transaction_fee = %record.transaction_fee,
-        withdrawal_status = record.withdrawal_status,
+        withdrawal_status = ?record.withdrawal_status,
         travel_rule_status = record.travel_rule_status,
         destination = %record.address,
         transaction_id = %record.tx_id,

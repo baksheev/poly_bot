@@ -376,28 +376,33 @@ receipt status and the exact `998700`-base-unit USDC credit were independently
 confirmed before the prefunding workflow was restored. That completed journal
 entry cannot be replayed by later rollouts.
 
-An ESP bootstrap or later rebalance must deliver ESP as ESP. A deterministic
-Travel Rule rejection cannot be converted into permission to use the standard
-withdrawal API, and a USDC-to-ESP DEX swap is not a substitute for the missing
-asset-transfer capability. The supported recovery choices are a direct ESP
-withdrawal whose account-specific questionnaire and history semantics are
-validated before submission, or a bounded ESP bridge with pinned
-source/destination token identities, calldata, receipts, minimum output,
-idempotency, and recovery. Until one is proven, ESP execution stays read-only
-while WLD v12 remains live.
+An ESP bootstrap or later rebalance must deliver ESP as ESP. A USDC-to-ESP DEX
+swap is not a substitute for the missing asset-transfer capability. Rails'
+original direct-withdrawal implementation and Binance's distinct APIs establish
+that the capital endpoint is the correct non-Travel-Rule route; the later Rails
+change `6520658` selected the local-entity endpoint globally. The live ESP
+probe proved that this global selection is invalid for ESP: Binance advertises
+the direct Arbitrum capital route but local-entity rejects the asset with
+`[031031] User does not own this currency.` The M9 bootstrap therefore pins
+`standard` in its versioned artifact and Kubernetes init environment. The
+long-lived WLD executor remains pinned to `travel_rule`; there is no automatic
+fallback between APIs after a submission. A bridge remains out of scope while
+the direct capital route is available.
 
 After the exact Binance ownership record becomes `VERIFIED`, the operator's
-separate direct-withdrawal approval permits one new retry through the same
-Travel Rule endpoint. Recovery first closes the earlier unbroadcast rejection
-against both Binance withdrawal histories. If Binance indexed the rejected
-request without its client ID, recovery requires exactly one failed record
-matching the ESP debit amount plus fee, Arbitrum wallet, network, and empty
-transaction hash. If the synchronous HTTP `400` / `-4024` validation rejection
-was not indexed at all, recovery instead requires no matching Travel Rule
-record, no capital withdrawal, the exact versioned rejection identity, and the
-durable successful subaccount-to-master transfer. An ambiguous, pending, or
-broadcast record fails closed. This does not authorize the standard withdrawal
-API, a bridge, a swap, or any retry before verification.
+separate direct-withdrawal approval permits one new submission through the
+standard capital endpoint. Recovery first closes the earlier unbroadcast
+local-entity rejection against both Binance withdrawal histories. The live v2
+record is `trId=67181540`, `travelRuleStatus=4`, with no
+`withdrawalStatus` and no transaction hash. Status `4` alone is never treated
+as success or failure: recovery refetches the exact `trId`, requires stable
+asset/network/address/amount/fee/client identity, no capital withdrawal, the
+durable successful subaccount-to-master transfer, and exactly `401.2 ESP`
+free/zero locked in master Spot. A status-2 failed record is accepted only
+without a completed withdrawal or transaction hash. An ambiguous, pending, or
+broadcast record fails closed. Only after that old operation is terminal may a
+new deterministic standard-endpoint operation be submitted; a bridge or swap
+remains unauthorized.
 
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its

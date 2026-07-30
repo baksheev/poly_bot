@@ -674,13 +674,26 @@ impl RebalanceExecutor {
                 })
                 .collect();
         }
+        if let [record] = travel_rule_history.as_mut_slice()
+            && record.withdrawal_status.is_none()
+        {
+            let detailed = self
+                .treasury_binance
+                .travel_rule_withdrawal_history(record.tr_id)
+                .await?;
+            ensure!(
+                detailed.len() == 1,
+                "approved Travel Rule rejection has no unique trId detail"
+            );
+            merge_travel_rule_withdrawal_detail(record, &detailed[0])?;
+        }
         for record in &travel_rule_history {
             tracing::info!(
                 operation_id = operation.intent.operation_id,
                 token = operation.intent.token_symbol,
                 travel_rule_record_id = record.tr_id,
                 travel_rule_status = record.travel_rule_status,
-                withdrawal_status = record.withdrawal_status,
+                withdrawal_status = ?record.withdrawal_status,
                 transaction_id_present = !record.tx_id.trim().is_empty(),
                 indexed_client_id_present = !record.withdraw_order_id.trim().is_empty(),
                 "hydrated an exact candidate for the approved Travel Rule rejection"
@@ -693,10 +706,35 @@ impl RebalanceExecutor {
                 token = operation.intent.token_symbol,
                 travel_rule_record_id = record.tr_id,
                 travel_rule_status = record.travel_rule_status,
-                withdrawal_status = record.withdrawal_status,
+                withdrawal_status = ?record.withdrawal_status,
                 transaction_broadcast = false,
-                "reconciled the indexed failed Travel Rule submission"
+                "reconciled the indexed unbroadcast Travel Rule submission"
             );
+            if record.is_approved_without_withdrawal() {
+                let requested = base_units_to_decimal(
+                    operation.intent.amount,
+                    operation.intent.token_decimals,
+                )?;
+                let account = self.treasury_binance.account_information().await?;
+                let balance = account
+                    .balances
+                    .iter()
+                    .find(|balance| balance.asset == operation.intent.token_symbol)
+                    .context(
+                        "approved Travel Rule rejection asset is absent from the master account",
+                    )?;
+                ensure!(
+                    balance.free == requested && balance.locked == Decimal::ZERO,
+                    "approved Travel Rule rejection did not preserve the exact master balance"
+                );
+                tracing::info!(
+                    operation_id = operation.intent.operation_id,
+                    token = operation.intent.token_symbol,
+                    master_free = %balance.free,
+                    master_locked = %balance.locked,
+                    "proved the approved-without-withdrawal Travel Rule rejection preserved master inventory"
+                );
+            }
         } else {
             tracing::info!(
                 operation_id = operation.intent.operation_id,
@@ -2388,6 +2426,81 @@ fn matches_travel_rule_record_identity_without_client_id(
         && (record.withdraw_order_id.is_empty() || record.withdraw_order_id == withdraw_order_id)
 }
 
+fn merge_travel_rule_withdrawal_detail(
+    record: &mut TravelRuleWithdrawalRecord,
+    detailed: &TravelRuleWithdrawalRecord,
+) -> anyhow::Result<()> {
+    ensure!(
+        record.tr_id == detailed.tr_id,
+        "Travel Rule trId detail changed identity"
+    );
+    ensure!(
+        record.coin == detailed.coin,
+        "Travel Rule trId detail changed asset"
+    );
+    ensure!(
+        record.network.is_empty()
+            || detailed.network.is_empty()
+            || record.network == detailed.network,
+        "Travel Rule trId detail changed network"
+    );
+    ensure!(
+        record.address.is_empty()
+            || detailed.address.is_empty()
+            || record.address.eq_ignore_ascii_case(&detailed.address),
+        "Travel Rule trId detail changed destination"
+    );
+    for (name, indexed, hydrated) in [
+        ("amount", &record.amount, &detailed.amount),
+        (
+            "transaction fee",
+            &record.transaction_fee,
+            &detailed.transaction_fee,
+        ),
+        (
+            "withdraw order id",
+            &record.withdraw_order_id,
+            &detailed.withdraw_order_id,
+        ),
+        ("transaction id", &record.tx_id, &detailed.tx_id),
+    ] {
+        ensure!(
+            indexed.is_empty() || hydrated.is_empty() || indexed == hydrated,
+            "Travel Rule trId detail changed {name}"
+        );
+    }
+    if record.id.is_empty() {
+        record.id.clone_from(&detailed.id);
+    }
+    if record.amount.is_empty() {
+        record.amount.clone_from(&detailed.amount);
+    }
+    if record.transaction_fee.is_empty() {
+        record.transaction_fee.clone_from(&detailed.transaction_fee);
+    }
+    if record.network.is_empty() {
+        record.network.clone_from(&detailed.network);
+    }
+    if record.address.is_empty() {
+        record.address.clone_from(&detailed.address);
+    }
+    if record.withdraw_order_id.is_empty() {
+        record
+            .withdraw_order_id
+            .clone_from(&detailed.withdraw_order_id);
+    }
+    if record.tx_id.is_empty() {
+        record.tx_id.clone_from(&detailed.tx_id);
+    }
+    if record.info.is_empty() {
+        record.info.clone_from(&detailed.info);
+    }
+    if record.withdrawal_status.is_none() {
+        record.withdrawal_status = detailed.withdrawal_status;
+    }
+    Ok(())
+}
+
 fn reconcile_approved_travel_rule_rejection(
     records: &[TravelRuleWithdrawalRecord],
 ) -> anyhow::Result<Option<&TravelRuleWithdrawalRecord>> {
@@ -2403,7 +2516,7 @@ fn reconcile_approved_travel_rule_rejection(
         return Ok(None);
     };
     ensure!(
-        record.is_failed_without_broadcast(),
+        record.is_failed_without_broadcast() || record.is_approved_without_withdrawal(),
         "approved Travel Rule rejection matches a non-failed or broadcast withdrawal"
     );
     Ok(Some(record))
@@ -2425,8 +2538,9 @@ mod tests {
         ARBITRUM_CHAIN_ID, BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID,
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
         decimal_to_base_units_floor, matches_travel_rule_record_identity_without_client_id,
-        plan_direct_prefunding, reconcile_approved_travel_rule_rejection,
-        validate_across_fill_receipt, validate_approved_asset, validate_direct_withdrawal_receipt,
+        merge_travel_rule_withdrawal_detail, plan_direct_prefunding,
+        reconcile_approved_travel_rule_rejection, validate_across_fill_receipt,
+        validate_approved_asset, validate_direct_withdrawal_receipt,
         withdrawal_received_base_units, withdrawal_requested_base_units,
     };
 
@@ -2489,7 +2603,7 @@ mod tests {
             amount: "400".to_owned(),
             transaction_fee: "1.2".to_owned(),
             coin: "ESP".to_owned(),
-            withdrawal_status: 3,
+            withdrawal_status: Some(3),
             travel_rule_status: 2,
             address: format!("{wallet:#x}"),
             tx_id: String::new(),
@@ -2528,7 +2642,7 @@ mod tests {
             amount: "400".to_owned(),
             transaction_fee: "1.2".to_owned(),
             coin: "ESP".to_owned(),
-            withdrawal_status: 6,
+            withdrawal_status: Some(6),
             travel_rule_status: 0,
             address: "0x1111111111111111111111111111111111111111".to_owned(),
             tx_id: "0xabc".to_owned(),
@@ -2537,6 +2651,73 @@ mod tests {
             info: String::new(),
         };
         assert!(reconcile_approved_travel_rule_rejection(&[broadcast]).is_err());
+    }
+
+    #[test]
+    fn approved_travel_rule_record_without_a_withdrawal_is_unbroadcast() {
+        let record = TravelRuleWithdrawalRecord {
+            id: String::new(),
+            tr_id: 67_181_540,
+            amount: "400".to_owned(),
+            transaction_fee: "1.2".to_owned(),
+            coin: "ESP".to_owned(),
+            withdrawal_status: None,
+            travel_rule_status: 4,
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            tx_id: String::new(),
+            network: "ARBITRUM".to_owned(),
+            withdraw_order_id: "rustwd5".to_owned(),
+            info: "[031031] User does not own this currency.".to_owned(),
+        };
+        assert!(record.is_approved_without_withdrawal());
+        assert!(
+            reconcile_approved_travel_rule_rejection(std::slice::from_ref(&record))
+                .unwrap()
+                .is_some()
+        );
+
+        let mut completed = record.clone();
+        completed.withdrawal_status = Some(6);
+        assert!(
+            reconcile_approved_travel_rule_rejection(std::slice::from_ref(&completed)).is_err()
+        );
+
+        let mut broadcast = record;
+        broadcast.tx_id = "0xabc".to_owned();
+        assert!(
+            reconcile_approved_travel_rule_rejection(std::slice::from_ref(&broadcast)).is_err()
+        );
+    }
+
+    #[test]
+    fn travel_rule_detail_only_fills_omitted_fields_and_preserves_identity() {
+        let mut indexed = TravelRuleWithdrawalRecord {
+            id: String::new(),
+            tr_id: 67_181_540,
+            amount: "400".to_owned(),
+            transaction_fee: "1.2".to_owned(),
+            coin: "ESP".to_owned(),
+            withdrawal_status: None,
+            travel_rule_status: 4,
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            tx_id: String::new(),
+            network: "ARBITRUM".to_owned(),
+            withdraw_order_id: "rustwd5".to_owned(),
+            info: String::new(),
+        };
+        let detailed = TravelRuleWithdrawalRecord {
+            id: "detail-id".to_owned(),
+            info: "[031031] User does not own this currency.".to_owned(),
+            ..indexed.clone()
+        };
+        merge_travel_rule_withdrawal_detail(&mut indexed, &detailed).unwrap();
+        assert_eq!(indexed.id, "detail-id");
+        assert_eq!(indexed.info, "[031031] User does not own this currency.");
+        assert_eq!(indexed.withdrawal_status, None);
+
+        let mut mismatched = detailed;
+        mismatched.address = "0x2222222222222222222222222222222222222222".to_owned();
+        assert!(merge_travel_rule_withdrawal_detail(&mut indexed, &mismatched).is_err());
     }
 
     #[test]

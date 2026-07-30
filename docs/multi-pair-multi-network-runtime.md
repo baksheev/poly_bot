@@ -1928,7 +1928,9 @@ closed instead of silently replenishing inventory. Before the marker exists,
 partial or unknown outcomes resume through the deterministic journal identity.
 
 The first production bootstrap attempt proved the USDC direct route and then
-failed closed on ESP. `25 USDC` arrived on Arbitrum. The exact `401.2 ESP`
+failed closed on ESP. `25 USDC` arrived on Arbitrum; the later approved Satoshi
+ownership test returned `0.9987 USDC` to Binance, so the current wallet balance
+is `24.0013 USDC`. The exact `401.2 ESP`
 subaccount-to-master transfer completed, but Binance's local-entity Travel Rule
 endpoint rejected the ESP withdrawal with HTTP `400`, code `-4024`, business
 detail `[031031] User does not own this currency.` No ESP withdrawal was
@@ -1953,13 +1955,24 @@ submitted two-field questionnaire was already the complete UAE self-wallet
 shape. The first probe appeared to expose a failed Travel Rule record, but the
 authoritative post-verification v2 queries returned no matching row, including
 when filtered only by ESP and Arbitrum. Binance's synchronous HTTP `400` /
-`-4024` validation rejection therefore did not produce a stable indexed
-withdrawal. Recovery accepts that absence only when capital history is also
-empty, the versioned rejection identity and durable successful master transfer
-match exactly, and no amount/address/network candidate is pending or broadcast.
-If a matching row exists it must instead be exactly one
-`travelRuleStatus=2` record with no transaction hash. The follow-up probe reads
-the exact wallet's address verification status before any direct-route retry.
+`-4024` validation rejection did not produce a capital withdrawal. A later
+exact v2 query exposed `trId=67181540`, `travelRuleStatus=4`, an omitted
+`withdrawalStatus`, and no transaction hash. Because Binance's status `4` is
+not an authorization boundary, recovery refetches that exact `trId`, requires
+stable identity, proves capital history empty, proves the durable internal
+transfer, and requires the master account to hold exactly `401.2 ESP` free and
+zero locked. Any completed status, transaction hash, identity mismatch, or
+balance mismatch fails closed.
+
+Rails originally used `/sapi/v1/capital/withdraw/apply`; commit `6520658`
+globally replaced it with `/sapi/v1/localentity/withdraw/apply`. That global
+choice works for assets requiring the account-specific questionnaire but is
+the source of ESP's `[031031]` rejection. With the exact wallet ownership
+record now `VERIFIED`, the separately approved M9 artifact pins only its
+one-shot USDC/ESP prefunding init to the standard capital endpoint. The normal
+WLD runtime stays on the Travel Rule endpoint, API selection cannot change
+after a submission, and no bridge or swap is authorized while direct Arbitrum
+withdrawal remains available.
 
 Deliver:
 

@@ -422,6 +422,7 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub production_approval_actor: String,
     pub production_approval_recorded_at_utc: String,
     pub binance_network: String,
+    pub binance_withdrawal_api_mode: String,
     pub maximum_transfer_count: u16,
     pub maximum_token_a_withdrawal_fee_base_units: String,
     pub maximum_token_b_withdrawal_fee_base_units: String,
@@ -453,6 +454,7 @@ impl LiveCanaryPrefundingRebalanceConfig {
                 && !self.production_approval_actor.trim().is_empty()
                 && self.production_approval_recorded_at_utc.ends_with('Z')
                 && self.binance_network == "ARBITRUM"
+                && self.binance_withdrawal_api_mode == "standard"
                 && pair.chain.chain_id == 42_161
                 && pair.chain.binance_network_name == self.binance_network
                 && self.maximum_transfer_count == 2,
@@ -1434,6 +1436,7 @@ mod tests {
         );
         let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
         assert_eq!(prefunding.binance_network, "ARBITRUM");
+        assert_eq!(prefunding.binance_withdrawal_api_mode, "standard");
         assert_eq!(prefunding.maximum_transfer_count, 2);
         assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
         assert_eq!(

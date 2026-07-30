@@ -280,9 +280,14 @@ Startup validates both account views before opening the live executor:
 - the master view of the subaccount matches the trading-key view;
 - both credentials are restricted to the production egress IP.
 
-Production uses `REBALANCE_BINANCE_WITHDRAWAL_API_MODE=travel_rule` and the
-Binance local-entity endpoint. A rejection from one withdrawal API is never
-interpreted as permission to retry through another API.
+The long-lived production executor uses
+`REBALANCE_BINANCE_WITHDRAWAL_API_MODE=travel_rule` and the Binance
+local-entity endpoint. The separately approved, one-shot M9 ESP/USDC
+prefunding init pins `standard` in both its versioned domain artifact and
+Kubernetes environment because ESP is advertised on the direct Arbitrum
+capital route but rejected by local-entity with `[031031]`. API selection is
+fixed before each operation; a rejection from one API is never interpreted as
+permission to retry that same operation through another API.
 
 Deposit reconciliation uses Travel Rule history. A deposit with a required
 questionnaire is submitted once and then polled until credited. A missing

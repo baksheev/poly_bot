@@ -134,6 +134,8 @@ jobs:
             = 500000000000000000000
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.retry_after_verified_address" "${domain_config}")" \
             = true
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.binance_withdrawal_api_mode" "${domain_config}")" \
+            = standard
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_symbol" "${domain_config}")" \
             = ESP
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_amount_base_units" "${domain_config}")" \
@@ -411,6 +413,8 @@ jobs:
             <<<"${deployment_json}")" = arb-bot,esp-market-data
           test "$(jq -r '.spec.template.spec.initContainers | map(.name) | join(",")' \
             <<<"${deployment_json}")" = prefund-arbitrum-m9
+          test "$(jq -r '.spec.template.spec.initContainers[] | select(.name == "prefund-arbitrum-m9") | .env[] | select(.name == "REBALANCE_BINANCE_WITHDRAWAL_API_MODE") | .value' \
+            <<<"${deployment_json}")" = standard
           test "$(jq -r '.spec.template.spec.containers[] | select(.name == "esp-market-data") | .args[0] | contains("collect-prices")' \
             <<<"${deployment_json}")" = true
           test "$(jq -r '.spec.template.spec.volumes[] | select(.name == "esp-market-data-secrets") | .csi.volumeAttributes.secretProviderClass' \
@@ -424,6 +428,10 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"
           test "${rebalance_mode}" = full_live
+          rebalance_withdrawal_api_mode="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_BINANCE_WITHDRAWAL_API_MODE")].value}')"
+          test "${rebalance_withdrawal_api_mode}" = travel_rule
           rollout_succeeded=true
 
           while IFS= read -r pool; do
