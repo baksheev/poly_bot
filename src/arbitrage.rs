@@ -847,8 +847,8 @@ struct EntryPreflightState {
     max_transport_silence_ms: BTreeMap<String, u64>,
     transport: BTreeMap<String, PreflightTransportState>,
     dex_max_head_age_ms: Option<u64>,
-    dex_head_received_at: Option<std::time::Instant>,
-    dex_pools: BTreeMap<usize, PreflightDexPool>,
+    dex_head_received_at: BTreeMap<String, std::time::Instant>,
+    dex_pools: BTreeMap<(String, usize), PreflightDexPool>,
 }
 
 #[derive(Clone, Debug)]
@@ -1001,15 +1001,15 @@ impl EntryPreflightHandle {
         state.dex_max_head_age_ms = Some(max_age_ms);
     }
 
-    pub fn update_dex_head(&self, received_at: std::time::Instant) {
+    pub fn update_dex_head(&self, pair_id: &str, received_at: std::time::Instant) {
         let Ok(mut state) = self.inner.write() else {
             return;
         };
-        if state
-            .dex_head_received_at
-            .is_none_or(|current| received_at >= current)
-        {
-            state.dex_head_received_at = Some(received_at);
+        let current = state.dex_head_received_at.get(pair_id);
+        if current.is_none_or(|current| received_at >= *current) {
+            state
+                .dex_head_received_at
+                .insert(pair_id.to_owned(), received_at);
         }
     }
 
@@ -1089,6 +1089,7 @@ impl EntryPreflightHandle {
 
     pub fn update_dex_pool(
         &self,
+        pair_id: &str,
         pool_index: usize,
         generation: u64,
         token_a_decimals: u8,
@@ -1099,7 +1100,7 @@ impl EntryPreflightHandle {
             return;
         };
         state.dex_pools.insert(
-            pool_index,
+            (pair_id.to_owned(), pool_index),
             PreflightDexPool {
                 generation,
                 token_a_decimals,
@@ -1144,18 +1145,25 @@ impl EntryPreflightHandle {
                 ),
             }));
         }
-        if state.dex_head_received_at.is_none_or(|received_at| {
-            state
-                .dex_max_head_age_ms
-                .is_none_or(|max_age_ms| received_at.elapsed() > Duration::from_millis(max_age_ms))
-        }) {
+        if state
+            .dex_head_received_at
+            .get(&opportunity.pair_id)
+            .is_none_or(|received_at| {
+                state.dex_max_head_age_ms.is_none_or(|max_age_ms| {
+                    received_at.elapsed() > Duration::from_millis(max_age_ms)
+                })
+            })
+        {
             return Ok(Some(EntryPreflightRejection {
                 reason: "preflight_price_not_fresh",
                 detail: "DEX head has no observation inside the configured freshness window"
                     .to_owned(),
             }));
         }
-        let Some(pool) = state.dex_pools.get(&opportunity.dex_pool_index) else {
+        let Some(pool) = state
+            .dex_pools
+            .get(&(opportunity.pair_id.clone(), opportunity.dex_pool_index))
+        else {
             return Ok(Some(EntryPreflightRejection {
                 reason: "preflight_price_not_fresh",
                 detail: format!(
@@ -1306,6 +1314,7 @@ pub enum PaperTradeEventState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperTradeEvent {
     pub plan_id: String,
+    pub pair_id: String,
     pub state: PaperTradeEventState,
     pub dex_filled: bool,
     pub dex_settlement_log: Option<ChainLog>,
@@ -1648,9 +1657,17 @@ impl PaperTradeTask {
         dex_filled: bool,
         dex_settlement_log: Option<ChainLog>,
     ) -> anyhow::Result<()> {
+        let pair_id = self
+            .coordinator
+            .operation(&plan_id)
+            .context("paper trade event operation is missing")?
+            .intent
+            .pair_id
+            .clone();
         self.event_sender
             .send(PaperTradeEvent {
                 plan_id,
+                pair_id,
                 state,
                 dex_filled,
                 dex_settlement_log,
@@ -1864,6 +1881,64 @@ impl PaperTradeCoordinator {
             }
         }
         Ok((realized_loss, recovery_loss))
+    }
+
+    pub fn canary_journal_risk(&self, strategy_id: &str) -> anyhow::Result<CanaryJournalRisk> {
+        let mut risk = CanaryJournalRisk::default();
+        for operation in self.journal.operations.values().filter(|operation| {
+            operation
+                .intent
+                .journal_scope
+                .as_ref()
+                .is_some_and(|scope| scope.strategy_id == strategy_id)
+        }) {
+            risk.admitted_parent_count = risk.admitted_parent_count.saturating_add(1);
+            risk.active_parent_count = risk.active_parent_count.saturating_add(usize::from(
+                !operation.stage.terminal()
+                    && !matches!(
+                        operation.stage,
+                        TradeStage::UnknownExposure | TradeStage::Halted
+                    ),
+            ));
+            risk.failed_parent_count =
+                risk.failed_parent_count
+                    .saturating_add(usize::from(matches!(
+                        operation.stage,
+                        TradeStage::BalancedLoss | TradeStage::UnknownExposure | TradeStage::Halted
+                    )));
+            let admitted_notional = operation
+                .intent
+                .expected_cost_token_a_base_units
+                .unsigned_abs();
+            risk.admitted_notional_token_a_base_units = risk
+                .admitted_notional_token_a_base_units
+                .checked_add(admitted_notional)
+                .context("cumulative canary admitted notional overflow")?;
+            if operation.intent.opportunity_received_unix_us > 0 {
+                risk.first_admitted_unix_us = Some(
+                    risk.first_admitted_unix_us
+                        .map_or(operation.intent.opportunity_received_unix_us, |current| {
+                            current.min(operation.intent.opportunity_received_unix_us)
+                        }),
+                );
+            }
+            if let Some(result) = &operation.result {
+                let comparable_profit = if result.comparable_profit_token_a_base_units != 0
+                    || result.residual_value_token_a_base_units != 0
+                {
+                    result.comparable_profit_token_a_base_units
+                } else {
+                    result.realized_profit_token_a_base_units
+                };
+                if comparable_profit < 0 {
+                    risk.realized_loss_token_a_base_units = risk
+                        .realized_loss_token_a_base_units
+                        .checked_add(comparable_profit.unsigned_abs())
+                        .context("cumulative canary realized loss overflow")?;
+                }
+            }
+        }
+        Ok(risk)
     }
 
     /// Reconstructs only a command whose dispatch ownership was already
@@ -2245,6 +2320,16 @@ impl PaperTradeCoordinator {
         operation.blocking_reason = None;
         self.journal.append(operation)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CanaryJournalRisk {
+    pub admitted_parent_count: usize,
+    pub active_parent_count: usize,
+    pub failed_parent_count: usize,
+    pub admitted_notional_token_a_base_units: u128,
+    pub realized_loss_token_a_base_units: u128,
+    pub first_admitted_unix_us: Option<u64>,
 }
 
 const fn dex_first_recovery_direction_is_valid(
@@ -3159,7 +3244,16 @@ mod tests {
         let path = path("cumulative-risk");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
-        let trade_intent = intent(ExecutionMode::DexFirst);
+        let mut trade_intent = intent(ExecutionMode::DexFirst);
+        trade_intent.journal_scope = Some(TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-spot:primary".to_owned(),
+            network_id: "eip155:42161".to_owned(),
+            chain_id: 42_161,
+            wallet_id: "eip155:42161:evm-wallet:primary".to_owned(),
+            strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
+            symbol: "ESPUSDC".to_owned(),
+        });
         let plan_id = trade_intent.plan_id.clone();
         coordinator.admit(trade_intent).unwrap();
         coordinator.take_commands(&plan_id).unwrap();
@@ -3174,10 +3268,25 @@ mod tests {
             .unwrap();
         coordinator.take_commands(&plan_id).unwrap();
         assert_eq!(coordinator.cumulative_terminal_risk().unwrap(), (30, 0));
+        let canary = coordinator
+            .canary_journal_risk("strategy:arbitrum-usdc-esp")
+            .unwrap();
+        assert_eq!(canary.admitted_parent_count, 1);
+        assert_eq!(canary.active_parent_count, 0);
+        assert_eq!(canary.failed_parent_count, 1);
+        assert_eq!(canary.admitted_notional_token_a_base_units, 1_000);
+        assert_eq!(canary.realized_loss_token_a_base_units, 30);
+        assert_eq!(canary.first_admitted_unix_us, Some(1_800_000_000_000_000));
         drop(coordinator);
 
         let recovered = PaperTradeCoordinator::open(&path).unwrap();
         assert_eq!(recovered.cumulative_terminal_risk().unwrap(), (30, 0));
+        assert_eq!(
+            recovered
+                .canary_journal_risk("strategy:arbitrum-usdc-esp")
+                .unwrap(),
+            canary
+        );
         drop(recovered);
         fs::remove_file(path).unwrap();
     }

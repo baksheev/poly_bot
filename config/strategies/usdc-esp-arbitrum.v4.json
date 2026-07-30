@@ -1,35 +1,38 @@
 {
   "schema_version": 1,
-  "snapshot_id": "arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary",
+  "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
   "source": {
     "repository": "baksheev/arb_bot",
     "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
     "rails_pair_candidate_id": 3144,
     "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
-    "captured_at_utc": "2026-07-29T21:15:00Z",
+    "captured_at_utc": "2026-07-30T03:45:21Z",
     "evidence": [
       "production PostgreSQL read-only PairCandidate export for ESPUSDC",
       "Binance Spot exchangeInfo and account commission filters for ESPUSDC",
       "Uniswap contracts deployment registry for Arbitrum One SwapRouter02 and QuoterV2",
       "block-pinned Arbitrum V3 local-curve and QuoterV2 parity validation",
-      "explicit M8 decision: bounded readiness artifact requires separate production approval and cannot mutate"
+      "M8 production readiness gate passed with funded native gas and zero mutation capability",
+      "operator explicitly approved the bounded M9 production canary in Codex task poly-bot-architecture-milestone-loop on 2026-07-30"
     ]
   },
-  "live_trading_enabled": false,
+  "live_trading_enabled": true,
   "pairs": [
     {
       "id": "arbitrum-usdc-esp",
       "market_data_enabled": true,
-      "execution_enabled": false,
+      "execution_enabled": true,
       "live_canary": {
-        "approval_gate": "explicit_production_approval_required",
+        "approval_gate": "explicit_production_approved",
+        "production_approval_actor": "operator",
+        "production_approval_recorded_at_utc": "2026-07-30T03:45:21Z",
         "max_trade_notional_token_a_base_units": "10000000",
         "max_total_notional_token_a_base_units": "20000000",
         "max_unhedged_notional_token_a_base_units": "10000000",
         "max_realized_loss_token_a_base_units": "1000000",
         "minimum_native_gas_wei": "1000000000000000",
-        "minimum_wallet_token_a_base_units": "0",
-        "minimum_wallet_token_b_base_units": "0",
+        "minimum_wallet_token_a_base_units": "25000000",
+        "minimum_wallet_token_b_base_units": "400000000000000000000",
         "max_parent_trades": 2,
         "max_failed_parent_trades": 1,
         "max_concurrent_trades": 1,
@@ -64,13 +67,16 @@
         "symbol": "ESPUSDC",
         "base_asset": "ESP",
         "quote_asset": "USDC",
+        "commission_asset": "BNB",
+        "commission_asset_decimals": 8,
+        "commission_price_binance_symbol": "BNBUSDT",
         "market_data_product": "spot",
         "execution_product": "spot",
         "step_size": "1.000000000000000",
         "tick_size": "0.000010000000000"
       },
       "quote_sizing": {
-        "token_a_base_units": "20000000",
+        "token_a_base_units": "10000000",
         "token_b": {
           "mode": "derive_from_binance_ask"
         }

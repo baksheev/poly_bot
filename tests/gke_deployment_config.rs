@@ -33,6 +33,9 @@ fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
             .contains("ARBITRAGE_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-wallet.jsonl")
     );
     assert!(RELEASE_PLATFORM.contains(
+        "ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-arbitrum-wallet.jsonl"
+    ));
+    assert!(RELEASE_PLATFORM.contains(
         "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-binance-orders.jsonl"
     ));
     assert!(
@@ -74,6 +77,8 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("min_expected_profit_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".adaptive_sizing.mode"));
     assert!(DEPLOY_WORKFLOW.contains("max_trade_notional_token_a_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("minimum_wallet_token_a_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("minimum_wallet_token_b_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_update_delta"));
     assert!(DEPLOY_WORKFLOW.contains("top_of_book_max_trade_notional_token_a_base_units"));
@@ -85,16 +90,16 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("hot_path_direct_binance_poll"));
     assert!(MAIN.contains("hot_path_dependency_index"));
     assert!(MAIN.contains("hot_path_sizing_policy"));
-    assert!(MAIN.contains("hot_path_shadow_external_mutation_authorized"));
+    assert!(MAIN.contains("canary_external_mutation_authorized"));
     assert!(MAIN.contains("portfolio_inventory_key"));
     assert!(MAIN.contains("portfolio_location_count"));
     assert!(MAIN.contains("portfolio_allocator_mode"));
     assert!(MAIN.contains("portfolio_external_mutation_authorized"));
     assert!(MAIN.contains("live_rebalance_adapter"));
-    assert!(MAIN.contains("M7 combined production shadow configured"));
-    assert!(MAIN.contains("background_immutable_decision_projection"));
-    assert!(MAIN.contains("pure_shadow_proposal"));
-    assert!(MAIN.contains("network_scoped_shadow_only"));
+    assert!(MAIN.contains("M9 bounded ESP production canary configured"));
+    assert!(MAIN.contains("shared_inventory_owner"));
+    assert!(MAIN.contains("shared_binance_order_owner"));
+    assert!(MAIN.contains("canary_rebalance_mutation_enabled"));
     assert!(MAIN.contains("report_strategy_dependency_faults"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
@@ -135,9 +140,9 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-readiness-usdc-esp-arbitrum-v3-bounded-canary"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.approval_gate"));
-    assert!(DEPLOY_WORKFLOW.contains("explicit_production_approval_required"));
+    assert!(DEPLOY_WORKFLOW.contains("explicit_production_approved"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.max_parent_trades"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.rebalance_mutations_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));

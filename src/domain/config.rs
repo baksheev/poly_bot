@@ -272,12 +272,22 @@ impl PairConfig {
 #[serde(deny_unknown_fields)]
 pub struct LiveCanaryConfig {
     pub approval_gate: LiveCanaryApprovalGate,
+    #[serde(default)]
+    pub production_approval_actor: Option<String>,
+    #[serde(default)]
+    pub production_approval_recorded_at_utc: Option<String>,
     pub max_trade_notional_token_a_base_units: String,
     pub max_total_notional_token_a_base_units: String,
     pub max_unhedged_notional_token_a_base_units: String,
     pub max_realized_loss_token_a_base_units: String,
     pub minimum_native_gas_wei: String,
+    #[serde(default = "default_zero_base_units")]
+    pub minimum_wallet_token_a_base_units: String,
+    #[serde(default = "default_zero_base_units")]
+    pub minimum_wallet_token_b_base_units: String,
     pub max_parent_trades: u16,
+    #[serde(default = "default_live_canary_failure_limit")]
+    pub max_failed_parent_trades: u16,
     pub max_concurrent_trades: u16,
     pub rollout_duration_seconds: u64,
     pub rebalance_mutations_enabled: bool,
@@ -307,16 +317,32 @@ impl LiveCanaryConfig {
                         .eq_ignore_ascii_case("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")),
             "live canary is restricted to the reviewed ESPUSDC Arbitrum contracts and SwapRouter02"
         );
-        ensure!(
-            self.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired,
-            "pair {} live canary is missing the explicit production approval gate",
-            pair.id
-        );
-        ensure!(
-            !pair.execution_enabled,
-            "pair {} readiness artifact cannot enable execution before explicit approval",
-            pair.id
-        );
+        match self.approval_gate {
+            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired => {
+                ensure!(
+                    !pair.execution_enabled
+                        && self.production_approval_actor.is_none()
+                        && self.production_approval_recorded_at_utc.is_none(),
+                    "pair {} readiness artifact cannot enable execution or record approval before explicit approval",
+                    pair.id
+                );
+            }
+            LiveCanaryApprovalGate::ExplicitProductionApproved => {
+                ensure!(
+                    pair.execution_enabled
+                        && self
+                            .production_approval_actor
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && self
+                            .production_approval_recorded_at_utc
+                            .as_deref()
+                            .is_some_and(|value| value.ends_with('Z')),
+                    "pair {} live canary requires an auditable explicit approval record",
+                    pair.id
+                );
+            }
+        }
         ensure!(
             !self.rebalance_mutations_enabled && !pair.rebalance.enabled,
             "pair {} readiness artifact cannot enable rebalance mutations",
@@ -342,6 +368,14 @@ impl LiveCanaryConfig {
             &self.minimum_native_gas_wei,
             "live_canary.minimum_native_gas_wei",
         )?;
+        let minimum_wallet_token_a = parse_base_units_u256(
+            &self.minimum_wallet_token_a_base_units,
+            "live_canary.minimum_wallet_token_a_base_units",
+        )?;
+        let minimum_wallet_token_b = parse_base_units_u256(
+            &self.minimum_wallet_token_b_base_units,
+            "live_canary.minimum_wallet_token_b_base_units",
+        )?;
         ensure!(
             !maximum_trade.is_zero()
                 && maximum_trade <= maximum_total
@@ -351,9 +385,18 @@ impl LiveCanaryConfig {
             "pair {} live canary monetary limits are inconsistent",
             pair.id
         );
+        if self.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved {
+            ensure!(
+                minimum_wallet_token_a >= maximum_total && !minimum_wallet_token_b.is_zero(),
+                "pair {} approved live canary requires prefunding for both trade directions",
+                pair.id
+            );
+        }
         ensure!(
             self.max_parent_trades > 0
                 && self.max_parent_trades <= 10
+                && self.max_failed_parent_trades > 0
+                && self.max_failed_parent_trades <= self.max_parent_trades
                 && self.max_concurrent_trades == 1,
             "pair {} live canary trade limits are outside the reviewed bounds",
             pair.id
@@ -367,10 +410,19 @@ impl LiveCanaryConfig {
     }
 }
 
+const fn default_live_canary_failure_limit() -> u16 {
+    1
+}
+
+fn default_zero_base_units() -> String {
+    "0".to_owned()
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveCanaryApprovalGate {
     ExplicitProductionApprovalRequired,
+    ExplicitProductionApproved,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -1141,6 +1193,8 @@ mod tests {
         include_str!("../../config/strategies/usdc-esp-arbitrum.v2.json");
     const ESP_READINESS_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v3.json");
+    const ESP_CANARY_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v4.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1228,6 +1282,30 @@ mod tests {
 
         let mut value: Value = serde_json::from_str(ESP_READINESS_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(true);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn committed_esp_canary_requires_versioned_bidirectional_prefunding() {
+        let loaded = load(ESP_CANARY_CONFIG.as_bytes()).unwrap();
+        let pair = &loaded.snapshot().pairs[0];
+        let canary = pair.live_canary.as_ref().unwrap();
+
+        assert_eq!(
+            canary.approval_gate,
+            LiveCanaryApprovalGate::ExplicitProductionApproved
+        );
+        assert_eq!(canary.minimum_wallet_token_a_base_units, "25000000");
+        assert_eq!(
+            canary.minimum_wallet_token_b_base_units,
+            "400000000000000000000"
+        );
+        assert!(pair.execution_enabled);
+        assert!(!pair.rebalance.enabled);
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["minimum_wallet_token_a_base_units"] =
+            Value::String("19999999".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 

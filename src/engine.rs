@@ -16,7 +16,7 @@ use crate::{
         PaperOpportunity, PaperTradeEvent, PaperTradeEventState, PaperTradeHandle,
         PaperTradeSubmitResult,
     },
-    balances::BalanceEvent,
+    balances::{BalanceEvent, BalanceSource},
     binance::{
         account::BinanceClockSync,
         depth::SpotDepthBook,
@@ -34,8 +34,8 @@ use crate::{
         channel as hot_telemetry_channel,
     },
     inventory::{
-        InventoryClaim, InventoryKey, InventoryLocation, InventoryReservations, ReservationPurpose,
-        ReservationRequest,
+        InventoryClaim, InventoryKey, InventoryLocation, ReservationPurpose, ReservationRequest,
+        SharedInventoryReservations,
     },
     market_data::{MarketEvent, alchemy::DexStreamEvent},
     opportunity::{
@@ -100,7 +100,7 @@ pub struct TradingEngine {
     telemetry: TelemetryHandle,
     hot_telemetry: HotTelemetryHandle,
     paper_trades: Option<PaperTradeHandle>,
-    inventory: InventoryReservations,
+    inventory: SharedInventoryReservations,
     portfolio_catalog: Arc<PortfolioCatalog>,
     capital_allocator: CapitalAllocatorShadowHandle,
     binance_asset_decimals: BTreeMap<String, u8>,
@@ -140,6 +140,7 @@ pub struct TradingExecutionHandles {
     pub entry_preflight: EntryPreflightHandle,
     pub binance_asset_decimals: BTreeMap<String, u8>,
     pub portfolio_catalog: Arc<PortfolioCatalog>,
+    pub inventory: SharedInventoryReservations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,7 +452,7 @@ const fn adaptive_trade_direction(direction: ArbitrageDirection) -> TradeDirecti
 }
 
 fn reservation_precheck(
-    inventory: &InventoryReservations,
+    inventory: &SharedInventoryReservations,
     request: &ReservationRequest,
 ) -> ReservationPrecheck {
     let Some(existing) = inventory.reservation(&request.operation_id) else {
@@ -498,6 +499,9 @@ impl TradingReadiness {
 }
 
 impl TradingEngine {
+    pub fn owns_arbitrage_plan(&self, plan_id: &str) -> bool {
+        self.arbitrage_plan_freshness.contains_key(plan_id)
+    }
     pub fn new(
         config: AppConfig,
         domain_config: Arc<LoadedDomainConfig>,
@@ -546,9 +550,16 @@ impl TradingEngine {
         execution
             .entry_preflight
             .configure_dex_max_head_age(config.dex_head_max_age_ms);
-        execution
-            .entry_preflight
-            .update_dex_head(dex.latest_head_received_at());
+        for pair in domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .filter(|pair| pair.market_data_enabled)
+        {
+            execution
+                .entry_preflight
+                .update_dex_head(&pair.id, dex.latest_head_received_at());
+        }
         for (pool_index, _) in opportunities.pool_generations() {
             let pool = dex.pool(pool_index)?;
             let pair = domain_config
@@ -561,6 +572,7 @@ impl TradingEngine {
                 .preflight_exact_input_curves(pool_index)?
                 .context("initial prepared DEX pool is unavailable for preflight")?;
             execution.entry_preflight.update_dex_pool(
+                &pool.pair_id,
                 pool_index,
                 opportunities.pool_generation(pool_index)?,
                 pair.token_a.decimals,
@@ -611,7 +623,7 @@ impl TradingEngine {
                 telemetry,
                 hot_telemetry,
                 paper_trades: execution.paper_trades,
-                inventory: InventoryReservations::default(),
+                inventory: execution.inventory,
                 capital_allocator,
                 portfolio_catalog,
                 binance_asset_decimals: execution.binance_asset_decimals,
@@ -702,6 +714,21 @@ impl TradingEngine {
         self.refresh_phase(Instant::now());
     }
 
+    pub fn on_shared_user_data_connected(&mut self) {
+        self.binance_user_data_connected = true;
+        self.refresh_phase(Instant::now());
+    }
+
+    pub fn on_shared_user_data_disconnected(&mut self) {
+        self.binance_user_data_connected = false;
+        self.refresh_phase(Instant::now());
+    }
+
+    pub fn on_shared_user_data_dirty(&mut self) {
+        self.binance_user_data_clean = false;
+        self.refresh_phase(Instant::now());
+    }
+
     pub fn on_user_data_event(&mut self, event: UserDataEvent) -> anyhow::Result<()> {
         match event {
             UserDataEvent::AccountPosition(position) => {
@@ -713,7 +740,6 @@ impl TradingEngine {
                     .inventory
                     .active_operation_ids()
                     .into_iter()
-                    .map(str::to_owned)
                     .collect::<Vec<_>>();
                 let mut balances = Vec::new();
                 let mut locked_assets = Vec::new();
@@ -883,8 +909,16 @@ impl TradingEngine {
                     self.hot_telemetry
                         .emit_dex_head(head.number, received_at.elapsed().as_micros());
                 }
-                self.entry_preflight
-                    .update_dex_head(self.dex.latest_head_received_at());
+                self.entry_preflight.update_dex_head(
+                    self.domain_config
+                        .snapshot()
+                        .pairs
+                        .first()
+                        .expect("validated engine has a pair")
+                        .id
+                        .as_str(),
+                    self.dex.latest_head_received_at(),
+                );
                 None
             }
         };
@@ -912,6 +946,7 @@ impl TradingEngine {
             .find(|pair| pair.id == pool.pair_id)
             .with_context(|| format!("DEX pool {} has no domain pair", pool.pair_id))?;
         self.entry_preflight.update_dex_pool(
+            &pool.pair_id,
             pool_index,
             self.opportunities.pool_generation(pool_index)?,
             pair.token_a.decimals,
@@ -1415,7 +1450,6 @@ impl TradingEngine {
             .inventory
             .active_operation_ids()
             .into_iter()
-            .map(str::to_owned)
             .collect::<Vec<_>>();
         match event {
             BalanceEvent::Binance(snapshot) => {
@@ -1598,6 +1632,25 @@ impl TradingEngine {
         self.reconcile_inventory_settlements(&reservations_before);
         self.evaluate_capital_allocator_shadow();
         self.evaluate_rebalance();
+        self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    /// Applies the shared account owner's Binance health snapshot to a
+    /// secondary strategy without publishing duplicate account telemetry or
+    /// updating the process-wide inventory a second time.
+    pub fn on_shared_binance_balance_event(&mut self, event: BalanceEvent) -> anyhow::Result<()> {
+        match event {
+            BalanceEvent::Binance(snapshot) => {
+                self.binance_user_data_clean = true;
+                self.state.balances.apply_binance(snapshot);
+            }
+            BalanceEvent::Failed {
+                source: BalanceSource::Binance,
+                ..
+            } => self.state.balances.record_failure(BalanceSource::Binance),
+            _ => anyhow::bail!("shared Binance balance publication received a non-Binance event"),
+        }
         self.refresh_phase(Instant::now());
         Ok(())
     }
@@ -2026,7 +2079,8 @@ impl TradingEngine {
     }
 
     fn evaluate_capital_allocator_shadow(&self) {
-        self.capital_allocator.submit(&self.inventory);
+        self.capital_allocator
+            .submit_snapshot(self.inventory.portfolio_snapshot());
     }
 
     fn on_binance_quote(
@@ -3770,8 +3824,8 @@ mod tests {
         arbitrage::ArbitrageDirection as TradeDirection,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
-            InventoryClaim, InventoryKey, InventoryLocation, InventoryReservations,
-            ReservationPurpose, ReservationRequest,
+            InventoryClaim, InventoryKey, InventoryLocation, ReservationPurpose,
+            ReservationRequest, SharedInventoryReservations,
         },
         opportunity::{ArbitrageDirection as SizingDirection, TradeEvaluation},
         rebalance::Direction,
@@ -3913,7 +3967,7 @@ mod tests {
 
     #[test]
     fn active_identical_reservation_is_a_duplicate_not_an_inventory_shortage() {
-        let mut inventory = InventoryReservations::default();
+        let inventory = SharedInventoryReservations::default();
         let location = InventoryLocation::binance("binance-spot:primary").unwrap();
         let asset = "binance-spot:primary:asset:USDC";
         inventory

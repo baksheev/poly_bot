@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 use alloy_primitives::U256;
 use anyhow::{Context, ensure};
@@ -118,6 +121,78 @@ pub struct InventoryReservations {
     location_generations: BTreeMap<InventoryLocation, u64>,
     reservations: BTreeMap<String, InventoryReservation>,
     reserved_totals: BTreeMap<InventoryKey, U256>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SharedInventoryReservations {
+    inner: Arc<Mutex<InventoryReservations>>,
+}
+
+impl SharedInventoryReservations {
+    fn lock(&self) -> std::sync::MutexGuard<'_, InventoryReservations> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn update_location(
+        &self,
+        location: InventoryLocation,
+        generation: u64,
+        balances: impl IntoIterator<Item = (String, U256)>,
+    ) -> anyhow::Result<bool> {
+        self.lock().update_location(location, generation, balances)
+    }
+
+    pub fn update_location_assets(
+        &self,
+        location: InventoryLocation,
+        generation: u64,
+        balances: impl IntoIterator<Item = (String, U256)>,
+    ) -> anyhow::Result<bool> {
+        self.lock()
+            .update_location_assets(location, generation, balances)
+    }
+
+    pub fn observed(&self, key: &InventoryKey) -> Option<U256> {
+        self.lock().observed(key)
+    }
+
+    pub fn reserved(&self, key: &InventoryKey) -> U256 {
+        self.lock().reserved(key)
+    }
+
+    pub fn available(&self, key: &InventoryKey) -> anyhow::Result<U256> {
+        self.lock().available(key)
+    }
+
+    pub fn reservation(&self, operation_id: &str) -> Option<InventoryReservation> {
+        self.lock().reservation(operation_id).cloned()
+    }
+
+    pub fn reserve(&self, request: ReservationRequest) -> anyhow::Result<()> {
+        self.lock().reserve(request)
+    }
+
+    pub fn mark_pending_settlement(&self, operation_id: &str) -> anyhow::Result<()> {
+        self.lock().mark_pending_settlement(operation_id)
+    }
+
+    pub fn release_unsubmitted(&self, operation_id: &str) -> anyhow::Result<()> {
+        self.lock().release_unsubmitted(operation_id)
+    }
+
+    pub fn portfolio_snapshot(&self) -> InventoryPortfolioSnapshot {
+        self.lock().portfolio_snapshot()
+    }
+
+    pub fn active_operation_ids(&self) -> Vec<String> {
+        self.lock()
+            .active_operation_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]

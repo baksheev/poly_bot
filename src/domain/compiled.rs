@@ -1058,13 +1058,12 @@ impl CompiledDomainGraph {
                     "live projection must preserve a live source artifact"
                 ),
                 CompatibilityRole::PublicPriceCollector => ensure!(
-                    !source.snapshot.live_trading_enabled
-                        && source
-                            .snapshot
-                            .pairs
-                            .iter()
-                            .all(|pair| !pair.execution_enabled && !pair.rebalance.enabled),
-                    "collector projection cannot have live capabilities"
+                    projection.pair_ids.iter().all(|pair_id| source
+                        .snapshot
+                        .pairs
+                        .iter()
+                        .any(|pair| &pair.id == pair_id && !pair.rebalance.enabled)),
+                    "collector projection cannot include rebalance capabilities"
                 ),
             }
         }
@@ -1151,6 +1150,17 @@ impl CompiledDomainGraph {
         snapshot
             .pairs
             .retain(|pair| selected.contains(pair.id.as_str()));
+        if role == CompatibilityRole::PublicPriceCollector {
+            for pair in &mut snapshot.pairs {
+                pair.execution_enabled = false;
+                if let Some(canary) = &mut pair.live_canary {
+                    canary.approval_gate =
+                        crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired;
+                    canary.production_approval_actor = None;
+                    canary.production_approval_recorded_at_utc = None;
+                }
+            }
+        }
         snapshot.live_trading_enabled = snapshot.pairs.iter().any(|pair| pair.execution_enabled);
         let config = LoadedDomainConfig::from_projected_snapshot(
             path.as_ref(),
@@ -1429,7 +1439,7 @@ impl CompiledDomainGraph {
                     fallback_gas_price_wei: 100_000,
                     includes_l1_fee: true,
                 },
-                (42_161, false, true) => CompiledNetworkGasPolicy::ArbitrumOne {
+                (42_161, _, true) => CompiledNetworkGasPolicy::ArbitrumOne {
                     requires_fresh_rpc_gas_price: true,
                     max_priority_fee_per_gas_wei: 0,
                     includes_l1_fee: false,
@@ -2185,27 +2195,24 @@ pub fn compile_domain(
 
     let live_source = compiled_sources
         .iter()
-        .find(|source| source.snapshot.live_trading_enabled)
-        .context("compiled domain requires one live compatibility source")?;
-    ensure!(
-        compiled_sources
-            .iter()
-            .filter(|source| source.snapshot.live_trading_enabled)
-            .count()
-            == 1,
-        "compiled domain requires exactly one live compatibility source"
-    );
+        .find(|source| {
+            source
+                .snapshot
+                .pairs
+                .iter()
+                .any(|pair| pair.id == "world-chain-usdc-wld" && pair.execution_enabled)
+        })
+        .context("compiled domain requires the reviewed WLD live compatibility source")?;
     let collector_source = compiled_sources
         .iter()
         .find(|source| {
-            !source.snapshot.live_trading_enabled
-                && source
-                    .snapshot
-                    .pairs
-                    .iter()
-                    .all(|pair| !pair.execution_enabled && !pair.rebalance.enabled)
+            source
+                .snapshot
+                .pairs
+                .iter()
+                .any(|pair| pair.id == "arbitrum-usdc-esp" && !pair.rebalance.enabled)
         })
-        .context("compiled domain requires one non-mutating collector source")?;
+        .context("compiled domain requires the reviewed ESP collector compatibility source")?;
     let compatibility_projections = vec![
         CompatibilityProjection {
             id: CompatibilityRole::LiveRuntime.projection_id().to_owned(),
@@ -2254,7 +2261,7 @@ pub fn compile_domain(
         {
             minimum.insert(pair.chain.rpc_url_env.clone());
             minimum.insert(pair.chain.ws_url_env.clone());
-            if pair.execution_enabled {
+            if pair.execution_enabled && projection.role == CompatibilityRole::LiveRuntime {
                 minimum.insert(account.order_api_key_env.clone());
                 minimum.insert(account.order_secret_key_env.clone());
                 minimum.insert(wallet.private_key_env.clone());
@@ -2504,7 +2511,7 @@ mod tests {
         assert_eq!(runtime.stream_shards[0].symbols, ["ESPUSDC", "WLDUSDC"]);
         assert_eq!(
             runtime.executable_symbols,
-            std::collections::BTreeSet::from(["WLDUSDC".to_owned()])
+            std::collections::BTreeSet::from(["ESPUSDC".to_owned(), "WLDUSDC".to_owned()])
         );
         assert!(runtime.asset_symbols.contains(&"BNB".to_owned()));
         assert!(runtime.asset_symbols.contains(&"ESP".to_owned()));
@@ -2590,14 +2597,30 @@ mod tests {
             .unwrap();
         let original_live = sources
             .iter()
-            .find(|source| source.snapshot().live_trading_enabled)
+            .find(|source| {
+                source
+                    .snapshot()
+                    .pairs
+                    .iter()
+                    .any(|pair| pair.id == "world-chain-usdc-wld")
+            })
             .unwrap();
         let original_collector = sources
             .iter()
-            .find(|source| !source.snapshot().live_trading_enabled)
+            .find(|source| {
+                source
+                    .snapshot()
+                    .pairs
+                    .iter()
+                    .any(|pair| pair.id == "arbitrum-usdc-esp")
+            })
             .unwrap();
         assert_eq!(live.config.snapshot(), original_live.snapshot());
-        assert_eq!(collector.config.snapshot(), original_collector.snapshot());
+        assert_eq!(
+            collector.config.snapshot().snapshot_id,
+            original_collector.snapshot().snapshot_id
+        );
+        assert!(!collector.config.snapshot().live_trading_enabled);
         let live_networks = live.network_runtime.unwrap();
         assert_eq!(
             live_networks
@@ -2625,7 +2648,7 @@ mod tests {
             .iter()
             .find(|network| network.chain_id == 42_161)
             .unwrap();
-        assert!(!arbitrum.execution_enabled);
+        assert!(arbitrum.execution_enabled);
         assert_eq!(
             arbitrum.gas_policy,
             CompiledNetworkGasPolicy::ArbitrumOne {
@@ -2664,16 +2687,10 @@ mod tests {
             .iter()
             .find(|strategy| strategy.symbol == "ESPUSDC")
             .unwrap();
-        assert!(esp.observe && esp.plan && !esp.execute);
+        assert!(esp.observe && esp.plan && esp.execute);
         assert_eq!(esp.network_id.as_str(), "eip155:42161");
         assert_eq!(esp.pool_ids.len(), 1);
-        assert!(
-            esp.domain_config
-                .snapshot()
-                .pairs
-                .iter()
-                .all(|pair| !pair.execution_enabled && !pair.rebalance.enabled)
-        );
+        assert!(esp.domain_config.snapshot().live_trading_enabled);
         assert_ne!(
             live.config.fingerprint_sha256(),
             original_live.fingerprint_sha256()

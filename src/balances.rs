@@ -81,7 +81,7 @@ pub struct WalletBalanceSnapshot {
     pub rpc_stats: RpcStats,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BalanceEvent {
     Binance(BinanceBalanceSnapshot),
     BinanceOpenOrders {
@@ -101,6 +101,12 @@ pub struct BalanceSync {
     pub wallet_heads: watch::Sender<CanonicalBlock>,
     pub binance_task: JoinHandle<anyhow::Result<()>>,
     pub wallet_task: JoinHandle<anyhow::Result<()>>,
+}
+
+pub struct WalletBalanceSync {
+    pub receiver: mpsc::Receiver<BalanceEvent>,
+    pub heads: watch::Sender<CanonicalBlock>,
+    pub task: JoinHandle<anyhow::Result<()>>,
 }
 
 #[derive(Clone)]
@@ -238,6 +244,43 @@ pub fn spawn_balance_sync(
         wallet_heads,
         binance_task,
         wallet_task,
+    }
+}
+
+pub fn spawn_wallet_balance_sync(
+    wallet_reads: WalletReadClient,
+    wallet_owner: Address,
+    wallet_chain_id: u64,
+    wallet_tokens: Vec<TokenBalanceRequest>,
+    initial_head: CanonicalBlock,
+    channel_capacity: usize,
+) -> WalletBalanceSync {
+    let (sender, receiver) = mpsc::channel(channel_capacity);
+    let (heads, mut head_receiver) = watch::channel(initial_head);
+    let task = tokio::spawn(async move {
+        while head_receiver.changed().await.is_ok() {
+            let head = *head_receiver.borrow_and_update();
+            let event = match wallet_reads
+                .fetch_snapshot(wallet_owner, wallet_chain_id, &wallet_tokens, head)
+                .await
+            {
+                Ok(snapshot) => BalanceEvent::Wallet(snapshot),
+                Err(error) => BalanceEvent::Failed {
+                    source: BalanceSource::Wallet,
+                    error: format!("{error:#}"),
+                    observed_at: Instant::now(),
+                },
+            };
+            if sender.send(event).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    });
+    WalletBalanceSync {
+        receiver,
+        heads,
+        task,
     }
 }
 

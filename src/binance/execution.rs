@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -190,6 +191,7 @@ struct BinanceExecutor {
     journal: BinanceOrderJournal,
     latency_telemetry: Option<ExecutionLatencyTelemetry>,
     journal_scope: Option<BinanceOrderJournalScope>,
+    journal_scopes: BTreeMap<String, BinanceOrderJournalScope>,
 }
 
 impl BinanceExecutor {
@@ -198,9 +200,20 @@ impl BinanceExecutor {
         journal_path: PathBuf,
         latency_telemetry: Option<ExecutionLatencyTelemetry>,
         journal_scope: Option<BinanceOrderJournalScope>,
+        journal_scopes: BTreeMap<String, BinanceOrderJournalScope>,
     ) -> anyhow::Result<Self> {
         if let Some(scope) = &journal_scope {
             scope.validate()?;
+        }
+        for (symbol, scope) in &journal_scopes {
+            scope.validate()?;
+            ensure!(
+                !symbol.is_empty()
+                    && symbol
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+                "Binance journal scope symbol is invalid"
+            );
         }
         let journal_started = Instant::now();
         let journal = BinanceOrderJournal::open(journal_path)?;
@@ -218,6 +231,7 @@ impl BinanceExecutor {
             journal,
             latency_telemetry,
             journal_scope,
+            journal_scopes,
         };
         let reconciliation_started = Instant::now();
         executor.reconcile_startup().await?;
@@ -296,7 +310,17 @@ impl BinanceExecutor {
         enqueued_at: Option<Instant>,
     ) -> anyhow::Result<BinanceOrderOutcome> {
         request.validate()?;
-        let request_intent = request.intent(self.journal_scope.as_ref());
+        let request_scope = if self.journal_scopes.is_empty() {
+            self.journal_scope.as_ref()
+        } else {
+            Some(self.journal_scopes.get(&request.symbol).with_context(|| {
+                format!(
+                    "Binance symbol {} has no reviewed journal scope",
+                    request.symbol
+                )
+            })?)
+        };
+        let request_intent = request.intent(request_scope);
         let client_order_id = request.client_order_id.clone();
         let symbol = request.symbol.clone();
         if let Some(existing) = self.journal.operations().get(&client_order_id).cloned() {
@@ -827,7 +851,7 @@ impl BinanceExecutionService {
         journal_path: PathBuf,
         capacity: usize,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(client, journal_path, capacity, None, None).await
+        Self::spawn_inner(client, journal_path, capacity, None, None, BTreeMap::new()).await
     }
 
     pub async fn spawn_instrumented(
@@ -842,6 +866,7 @@ impl BinanceExecutionService {
             capacity,
             Some(latency_telemetry),
             None,
+            BTreeMap::new(),
         )
         .await
     }
@@ -859,6 +884,29 @@ impl BinanceExecutionService {
             capacity,
             Some(latency_telemetry),
             Some(journal_scope),
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn spawn_multi_scoped_instrumented(
+        client: MultiplexedBinanceWsApi,
+        journal_path: PathBuf,
+        capacity: usize,
+        latency_telemetry: ExecutionLatencyTelemetry,
+        journal_scopes: BTreeMap<String, BinanceOrderJournalScope>,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            !journal_scopes.is_empty(),
+            "multi-symbol Binance execution requires journal scopes"
+        );
+        Self::spawn_inner(
+            client,
+            journal_path,
+            capacity,
+            Some(latency_telemetry),
+            None,
+            journal_scopes,
         )
         .await
     }
@@ -869,6 +917,7 @@ impl BinanceExecutionService {
         capacity: usize,
         latency_telemetry: Option<ExecutionLatencyTelemetry>,
         journal_scope: Option<BinanceOrderJournalScope>,
+        journal_scopes: BTreeMap<String, BinanceOrderJournalScope>,
     ) -> anyhow::Result<Self> {
         ensure!(capacity > 0, "Binance execution channel capacity is zero");
         let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity);
@@ -891,6 +940,7 @@ impl BinanceExecutionService {
                     journal_path,
                     latency_telemetry,
                     journal_scope,
+                    journal_scopes,
                 )) {
                     Ok(executor) => executor,
                     Err(error) => {

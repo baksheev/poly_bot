@@ -264,12 +264,9 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
                 .plan()
                 .strategies
                 .iter()
-                .filter(|strategy| strategy.observe)
-                .all(|strategy| {
-                    strategy.strategy_id == primary_strategy_id
-                        || indexed_shadows.contains_key(&strategy.strategy_id)
-                }),
-            "one or more observable strategies have no hot-path evaluator"
+                .filter(|strategy| strategy.observe && !strategy.execute)
+                .all(|strategy| { indexed_shadows.contains_key(&strategy.strategy_id) }),
+            "one or more non-executable observable strategies have no hot-path evaluator"
         );
         Ok(Self {
             primary_strategy_id,

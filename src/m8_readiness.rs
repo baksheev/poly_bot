@@ -144,7 +144,7 @@ pub fn validate_binance_readiness(
         validation_quantity: quantity,
         request_fingerprints,
         filters_ready: true,
-        external_mutation_authorized: false,
+        external_mutation_authorized: pair.execution_enabled,
     })
 }
 
@@ -156,6 +156,8 @@ pub struct M8ChainReadiness {
     pub token_code_present: bool,
     pub router_code_present: bool,
     pub native_gas_funded: bool,
+    pub token_a_funded: bool,
+    pub token_b_funded: bool,
     pub fresh_rpc_gas_price: bool,
     pub allowance_policy: &'static str,
     pub receipt_l1_fee_mode: &'static str,
@@ -170,6 +172,8 @@ pub enum M8ChainReadinessStatus {
         token_code_present: bool,
         router_code_present: bool,
         native_gas_funded: bool,
+        token_a_funded: bool,
+        token_b_funded: bool,
         fresh_rpc_gas_price: bool,
         ready: bool,
     },
@@ -183,6 +187,8 @@ impl M8ChainReadiness {
             token_code_present: self.token_code_present,
             router_code_present: self.router_code_present,
             native_gas_funded: self.native_gas_funded,
+            token_a_funded: self.token_a_funded,
+            token_b_funded: self.token_b_funded,
             fresh_rpc_gas_price: self.fresh_rpc_gas_price,
             ready: self.ready,
         }
@@ -287,14 +293,30 @@ async fn inspect_chain_readiness_at(
     )?;
     let minimum_native =
         U256::from_str_radix(&canary.minimum_native_gas_wei, 10).context("invalid gas minimum")?;
+    let minimum_token_a = U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10)
+        .context("invalid token_a funding minimum")?;
+    let minimum_token_b = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
+        .context("invalid token_b funding minimum")?;
     let token_code_present = !token_a_code.is_empty() && !token_b_code.is_empty();
     let router_code_present = !router_code.is_empty();
     let native_gas_funded = native_balance >= minimum_native;
+    let token_a_funded = snapshot.token_balances.iter().any(|balance| {
+        balance.symbol.as_ref() == pair.token_a.symbol
+            && balance.contract == token_a
+            && balance.base_units >= minimum_token_a
+    });
+    let token_b_funded = snapshot.token_balances.iter().any(|balance| {
+        balance.symbol.as_ref() == pair.token_b.symbol
+            && balance.contract == token_b
+            && balance.base_units >= minimum_token_b
+    });
     let fresh_rpc_gas_price = gas_price > 0;
     let ready = exact_token_contracts
         && token_code_present
         && router_code_present
         && native_gas_funded
+        && token_a_funded
+        && token_b_funded
         && fresh_rpc_gas_price;
     Ok(M8ChainReadiness {
         chain_id: ARBITRUM_CHAIN_ID,
@@ -303,10 +325,12 @@ async fn inspect_chain_readiness_at(
         token_code_present,
         router_code_present,
         native_gas_funded,
+        token_a_funded,
+        token_b_funded,
         fresh_rpc_gas_price,
         allowance_policy: "bounded_exact_canary_cap_then_locked",
         receipt_l1_fee_mode: "included_in_effective_gas_price_no_world_l1fee_addition",
-        external_mutation_authorized: false,
+        external_mutation_authorized: pair.execution_enabled,
         ready,
     })
 }
@@ -370,18 +394,20 @@ fn validate_readiness_pair(
                 .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
             && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
             && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
-            && !pair.execution_enabled
             && !pair.rebalance.enabled,
-        "M8 readiness pair identity or mutation gate differs from the reviewed artifact"
+        "Arbitrum canary pair identity or rebalance gate differs from the reviewed artifact"
     );
     let canary = pair
         .live_canary
         .as_ref()
         .context("M8 readiness artifact has no canary limits")?;
     ensure!(
-        canary.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-            && !canary.rebalance_mutations_enabled,
-        "M8 readiness artifact does not require explicit production approval"
+        matches!(
+            canary.approval_gate,
+            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+                | LiveCanaryApprovalGate::ExplicitProductionApproved
+        ) && !canary.rebalance_mutations_enabled,
+        "Arbitrum canary artifact has an invalid approval or rebalance gate"
     );
     Ok(canary)
 }
@@ -612,6 +638,8 @@ mod tests {
             token_code_present: true,
             router_code_present: true,
             native_gas_funded: false,
+            token_a_funded: true,
+            token_b_funded: true,
             fresh_rpc_gas_price: true,
             allowance_policy: "bounded_exact_canary_cap_then_locked",
             receipt_l1_fee_mode: "included_in_effective_gas_price_no_world_l1fee_addition",

@@ -359,6 +359,15 @@ impl CapitalAllocatorShadowHandle {
             queued_at: Instant::now(),
         }));
     }
+
+    pub fn submit_snapshot(&self, snapshot: InventoryPortfolioSnapshot) {
+        self.sender.send_replace(Some(QueuedPortfolioSnapshot {
+            snapshot,
+            portfolio_snapshot_us: 0,
+            reservation_snapshot_us: 0,
+            queued_at: Instant::now(),
+        }));
+    }
 }
 
 struct QueuedPortfolioSnapshot {

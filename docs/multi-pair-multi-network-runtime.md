@@ -1869,6 +1869,42 @@ rebalance mutation; M9 still requires the explicit production approval below.
 
 ### M9 — Bounded ESP/USDC live canary
 
+Implementation status:
+
+- the operator explicitly approved M9 at `2026-07-30T03:45:21Z`; immutable
+  artifact `usdc-esp-arbitrum.v4.json` records that approval and is the only
+  source allowed to project ESP execution capability;
+- one process-wide trade coordinator and one dispatch mailbox serialize WLD
+  and ESP parents, while a routed executor selects the already-owned World
+  Chain or Arbitrum nonce lane and the one shared Binance execution service;
+- both strategy engines use the same atomic inventory reservation owner.
+  Binance balance generations are applied once, wallet balances remain
+  network-scoped, and a competing candidate cannot reserve the same shared
+  USDC twice;
+- Arbitrum entry readiness is refreshed outside the decision owner. A stale
+  or incomplete token, router, gas, wallet, pool, or stream state stops only
+  new ESP entries; durable recovery and WLD execution remain available;
+- the durable trade journal is the authority for the canary counters across
+  restarts. Before every parent admission it enforces at most `10 USDC` per
+  parent, `20 USDC` cumulative, `10 USDC` unhedged, `1 USDC` realized loss,
+  two parents, one failed parent, one concurrent parent, and a 15-minute
+  window beginning at the first admitted parent;
+- Binance LIMIT IOC and bounded MARKET recovery share symbol-scoped journals
+  for WLDUSDC and ESPUSDC. A request for an unreviewed symbol fails closed;
+- Arbitrum allowances are bounded by the reviewed cumulative USDC cap and the
+  funded ESP balance. Both token-funding minima are versioned readiness inputs;
+  Arbitrum rebalance route mutation remains disabled;
+- `scripts/report-m9-live-canary START_UTC END_UTC` proves the startup
+  authority, latest complete readiness, exact canary caps, unique parent
+  admissions, cumulative bounds, zero rebalance mutations, and the inherited
+  M8 through M0 gates.
+
+Before the production rollout, the shared Binance account already held
+`10,000 ESP`, sufficient USDC and BNB, and the Arbitrum wallet held
+`0.04998 ETH`. The rollout remains held until the same reviewed Arbitrum
+wallet contains at least `25 USDC` and `400 ESP`; these are operational
+prefunding targets, not relaxed admission limits.
+
 Deliver:
 
 - enable ESP/USDC on the same Rust-owned Binance subaccount and the same

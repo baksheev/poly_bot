@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -17,8 +20,9 @@ use arb_bot::{
         TradeJournalScope, TradeStage, paper_trade_channel,
     },
     balances::{
-        BalanceEvent, BalanceSync, WalletBalanceSnapshot, WalletReadClient, binance_snapshot,
-        fetch_wallet_snapshot, fetch_wallet_snapshot_coordinated, spawn_balance_sync,
+        BalanceEvent, BalanceSource, BalanceSync, WalletBalanceSnapshot, WalletReadClient,
+        binance_snapshot, fetch_wallet_snapshot, fetch_wallet_snapshot_coordinated,
+        spawn_balance_sync, spawn_wallet_balance_sync,
     },
     binance::account::{BinanceAccountClient, BinanceAccountState, BinanceClockSync},
     binance::capital::{
@@ -29,7 +33,7 @@ use arb_bot::{
         execution::BinanceExecutionService,
         order_journal::{BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress},
         runtime::SharedBinanceRuntime,
-        user_data::UserDataStream,
+        user_data::{UserDataEvent, UserDataStream},
         validation::{BinanceCanaryKind, execute_order_round_trip},
         ws_api::BinanceWsApiClient,
     },
@@ -54,8 +58,10 @@ use arb_bot::{
     engine::{AdaptiveSizingJob, AdaptiveSizingTaskResult, BinanceFeeBps, TradingEngine},
     execution_accounting::{CommissionAssetValuation, binance_leg_result},
     hot_telemetry,
+    inventory::SharedInventoryReservations,
     live_execution::{
-        ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveRiskLimits, live_trade_channel,
+        ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveCanaryPolicy, LiveRiskLimits,
+        RoutedLiveLegExecutor, live_trade_channel,
     },
     m8_readiness::{
         M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessProbe,
@@ -80,8 +86,7 @@ use arb_bot::{
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
         CompiledStrategyDependencyIndex, HotPathDecisionOwner, LatestOnlySizingSlots,
-        ShadowSizingJob, ShadowSizingTaskResult, ShadowStrategyEvaluator, SizingSubmission,
-        StrategyDependencyFault, StrategyEvaluator, TelemetryCoordinatorShadowSink,
+        SizingSubmission, StrategyDependencyFault, StrategyEvaluator,
     },
     supervision::{DependencyFaultClass, DependencyScope, RootSupervisorPolicy, SupervisorAction},
     telemetry::{
@@ -101,6 +106,7 @@ use tokio::time::MissedTickBehavior;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const ARBITRAGE_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_WALLET_JOURNAL_PATH";
+const ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH";
 const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
 const BINANCE_CLOCK_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY: usize = 32;
@@ -1562,7 +1568,7 @@ async fn run(
         );
         let arbitrum = registry.get_by_chain_id(42_161)?;
         ensure!(
-            !arbitrum.execution().mutation_enabled()
+            arbitrum.execution().mutation_enabled()
                 && matches!(
                     arbitrum.execution().gas_policy(),
                     CompiledNetworkGasPolicy::ArbitrumOne {
@@ -1571,7 +1577,7 @@ async fn run(
                         includes_l1_fee: false,
                     }
                 ),
-            "Arbitrum M8 readiness policy must remain fail-closed and mutation-disabled"
+            "Arbitrum M9 execution policy must be mutation-enabled with fail-closed gas pricing"
         );
     }
     let shadow_strategy_plan = hot_path_dependencies.as_ref().and_then(|dependencies| {
@@ -1579,7 +1585,7 @@ async fn run(
             .plan()
             .strategies
             .iter()
-            .find(|strategy| strategy.observe && !strategy.execute)
+            .find(|strategy| strategy.symbol == "ESPUSDC")
             .cloned()
     });
     if let Some(dependencies) = hot_path_dependencies.as_ref() {
@@ -1590,8 +1596,8 @@ async fn run(
                 .iter()
                 .filter(|strategy| strategy.execute)
                 .count()
-                == 1,
-            "M4 production hot path requires exactly one executable compatibility strategy"
+                == 2,
+            "M9 production hot path requires exactly two executable strategies"
         );
         ensure!(
             dependencies
@@ -1600,8 +1606,8 @@ async fn run(
                 .iter()
                 .filter(|strategy| strategy.observe && !strategy.execute)
                 .count()
-                == 1,
-            "M4 production hot path requires exactly one non-mutating shadow strategy"
+                == 0,
+            "M9 production hot path cannot retain a non-mutating ESP shadow capability"
         );
         let executable = dependencies
             .plan()
@@ -1610,8 +1616,14 @@ async fn run(
             .filter(|strategy| strategy.execute)
             .collect::<Vec<_>>();
         ensure!(
-            executable.len() == 1 && executable[0].symbol == "WLDUSDC",
-            "M6 permits execution only for WLDUSDC"
+            executable.len() == 2
+                && executable
+                    .iter()
+                    .any(|strategy| strategy.symbol == "WLDUSDC")
+                && executable
+                    .iter()
+                    .any(|strategy| strategy.symbol == "ESPUSDC"),
+            "M9 permits execution only for WLDUSDC and ESPUSDC"
         );
         let account_id = compiled_binance_runtime
             .as_ref()
@@ -1631,7 +1643,7 @@ async fn run(
                 "account_id": account_id,
                 "strategy_count": dependencies.plan().strategies.len(),
                 "executable_strategy_count": executable.len(),
-                "executable_symbol": executable[0].symbol,
+                "executable_symbols": executable.iter().map(|strategy| &strategy.symbol).collect::<Vec<_>>(),
                 "evm_owner_count": evm_owner_count,
                 "candidate_policy": "latest_per_strategy_round_robin",
                 "portfolio_admission": "atomic_shared_owner",
@@ -1644,7 +1656,7 @@ async fn run(
         tracing::info!(
             account_id,
             strategy_count = dependencies.plan().strategies.len(),
-            executable_symbol = executable[0].symbol,
+            executable_symbols = ?executable.iter().map(|strategy| &strategy.symbol).collect::<Vec<_>>(),
             evm_owner_count,
             journal_schema_version = 2,
             candidate_policy = "latest_per_strategy_round_robin",
@@ -1711,9 +1723,10 @@ async fn run(
             "compiled Binance stream shard and account symbol registry differ"
         );
         ensure!(
-            runtime.executable_symbols.len() == 1
-                && runtime.executable_symbols.contains(&pair.binance.symbol),
-            "compiled Binance capabilities must enable only the reviewed WLD execution symbol"
+            runtime.executable_symbols.len() == 2
+                && runtime.executable_symbols.contains(&pair.binance.symbol)
+                && runtime.executable_symbols.contains("ESPUSDC"),
+            "compiled Binance capabilities must enable the reviewed WLD and ESP symbols"
         );
     }
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
@@ -1726,15 +1739,15 @@ async fn run(
     let m8_pair = shadow_strategy_plan
         .as_ref()
         .and_then(|strategy| strategy.domain_config.snapshot().pairs.first())
-        .context("compiled M8 shadow strategy has no readiness pair")?
+        .context("compiled M9 ESP strategy has no canary pair")?
         .clone();
     match shared_binance_account
         .symbol(&m8_pair.binance.symbol)
-        .context("shared Binance account omitted the M8 readiness symbol")
+        .context("shared Binance account omitted the M9 canary symbol")
         .and_then(|state| validate_binance_readiness(&m8_pair, state))
     {
         Ok(readiness) => telemetry.emit(
-            "m8_live_readiness",
+            "m9_live_readiness",
             serde_json::json!({
                 "engine_id": config.engine_id,
                 "stage": "binance_order_matrix",
@@ -1756,10 +1769,10 @@ async fn run(
             tracing::warn!(
                 pair_id = m8_pair.id,
                 error = %error,
-                "M8 Binance readiness validation is incomplete; WLD execution is unchanged"
+                "M9 Binance readiness validation is incomplete; ESP fails closed"
             );
             telemetry.emit(
-                "m8_live_readiness",
+                "m9_live_readiness",
                 serde_json::json!({
                     "engine_id": config.engine_id,
                     "stage": "binance_order_matrix",
@@ -1788,14 +1801,34 @@ async fn run(
         )?,
     };
     shared_binance_runtime.ensure_order_enabled(&pair.binance.symbol)?;
-    for symbol in &binance_symbols {
-        if symbol != &pair.binance.symbol {
-            ensure!(
-                shared_binance_runtime.ensure_order_enabled(symbol).is_err(),
-                "non-reviewed Binance symbol {symbol} unexpectedly permits orders"
-            );
-        }
-    }
+    shared_binance_runtime.ensure_order_enabled(&m8_pair.binance.symbol)?;
+    let esp_symbol_state = shared_binance_account
+        .symbol(&m8_pair.binance.symbol)
+        .context("shared Binance account omitted ESPUSDC")?;
+    let esp_buy_fee_bps = esp_symbol_state
+        .commission
+        .conservative_taker_fee_bps("BUY")?;
+    let esp_sell_fee_bps = esp_symbol_state
+        .commission
+        .conservative_taker_fee_bps("SELL")?;
+    ensure!(
+        esp_symbol_state.symbol_rules.base_asset == m8_pair.binance.base_asset
+            && esp_symbol_state.symbol_rules.quote_asset == m8_pair.binance.quote_asset,
+        "ESPUSDC exchangeInfo assets differ from the M9 domain artifact"
+    );
+    let esp_execution_symbol_rules = esp_symbol_state
+        .symbol_rules
+        .with_compatible_price_step(
+            Decimal::from_str(&m8_pair.binance.tick_size)
+                .context("M9 ESP Binance tick_size is invalid")?,
+        )
+        .context("M9 ESP tick_size is incompatible with live PRICE_FILTER")?;
+    ensure!(
+        esp_symbol_state.symbol_rules.lot_size.step
+            == Decimal::from_str(&m8_pair.binance.step_size)
+                .context("M9 ESP Binance step_size is invalid")?,
+        "M9 ESP step_size differs from live LOT_SIZE"
+    );
     let binance_account = shared_binance_account.into_symbol(&pair.binance.symbol)?;
     let binance_clock_sync_client = binance_account_client.clone();
     validate_binance_account(&binance_account)?;
@@ -1861,7 +1894,7 @@ async fn run(
         let coins = binance_account_client.all_coin_information().await?;
         match validate_rebalance_readiness(&m8_pair, &coins) {
             Ok(readiness) => telemetry.emit(
-                "m8_live_readiness",
+                "m9_live_readiness",
                 serde_json::json!({
                     "engine_id": config.engine_id,
                     "stage": "arbitrum_rebalance_routes",
@@ -1879,10 +1912,10 @@ async fn run(
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "M8 Arbitrum rebalance readiness is incomplete; mutations remain disabled"
+                    "M9 Arbitrum rebalance readiness is incomplete; rebalance remains disabled"
                 );
                 telemetry.emit(
-                    "m8_live_readiness",
+                    "m9_live_readiness",
                     serde_json::json!({
                         "engine_id": config.engine_id,
                         "stage": "arbitrum_rebalance_routes",
@@ -1962,7 +1995,7 @@ async fn run(
             let snapshot = portfolio_wallet_snapshots
                 .iter()
                 .find(|snapshot| snapshot.chain_id == 42_161)
-                .context("M8 Arbitrum wallet snapshot is missing")?;
+                .context("M9 Arbitrum wallet snapshot is missing")?;
             let probe = M8ChainReadinessProbe::new(&m8_pair, runtime, wallet_owner)?;
             match inspect_chain_readiness(&m8_pair, runtime, snapshot).await {
                 Ok(readiness) => {
@@ -1978,7 +2011,7 @@ async fn run(
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
-                        "M8 Arbitrum chain readiness is incomplete; mutations remain disabled"
+                        "M9 Arbitrum chain readiness is incomplete; ESP fails closed"
                     );
                     emit_m8_chain_readiness_failure(
                         &telemetry,
@@ -1993,6 +2026,11 @@ async fn run(
         } else {
             (None, None)
         };
+    let canary_execution_ready = Arc::new(AtomicBool::new(matches!(
+        initial_m8_chain_readiness_status,
+        Some(M8ChainReadinessStatus::Observed { ready: true, .. })
+    )));
+    let canary_market_data_ready = Arc::new(AtomicBool::new(true));
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -2125,44 +2163,65 @@ async fn run(
         &binance_assets,
         binance_account_snapshot_duration_us,
     );
+    let canary_initialized = shadow_initialized_dex
+        .as_ref()
+        .context("M9 ESP execution has no initialized Arbitrum DEX runtime")?;
+    let canary_wallet_rpc = canary_initialized.rpc.clone();
+    let canary_initial_head = canary_initialized.mirror.latest_head();
+    let (canary_receipt_heads, canary_receipt_head_receiver) =
+        tokio::sync::watch::channel(canary_initial_head);
+    let canary_initial_wallet_balances = portfolio_wallet_snapshots
+        .iter()
+        .find(|snapshot| snapshot.chain_id == 42_161)
+        .context("M9 ESP execution has no Arbitrum wallet snapshot")?
+        .clone();
     let entry_preflight = EntryPreflightHandle::default();
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
         ensure!(
-            domain_config.snapshot().live_trading_enabled && pair.execution_enabled,
-            "composed live arbitrage requires both versioned execution gates"
+            domain_config.snapshot().live_trading_enabled
+                && pair.execution_enabled
+                && m8_pair.execution_enabled,
+            "composed M9 live arbitrage requires both versioned execution gates"
         );
-        let trade_journal_scope = {
-            let account_id = compiled_binance_runtime
-                .as_ref()
-                .context("M6 live execution requires a compiled Binance account")?
-                .account_id
-                .as_str()
-                .to_owned();
-            let strategy = hot_path_dependencies
-                .as_ref()
-                .context("M6 live execution requires compiled strategy ownership")?
-                .plan()
-                .strategies
+        ensure!(
+            canary_execution_ready.load(Ordering::Acquire),
+            "M9 Arbitrum chain and prefunding readiness must pass before bounded allowance mutations"
+        );
+        let account_id = compiled_binance_runtime
+            .as_ref()
+            .context("M9 live execution requires a compiled Binance account")?
+            .account_id
+            .as_str()
+            .to_owned();
+        let strategy_plans = &hot_path_dependencies
+            .as_ref()
+            .context("M9 live execution requires compiled strategy ownership")?
+            .plan()
+            .strategies;
+        let scope_for = |symbol: &str| -> anyhow::Result<TradeJournalScope> {
+            let strategy = strategy_plans
                 .iter()
-                .find(|strategy| strategy.execute)
-                .context("M6 live execution has no executable strategy")?;
+                .find(|strategy| strategy.execute && strategy.symbol == symbol)
+                .with_context(|| format!("M9 live execution has no {symbol} strategy"))?;
             let network = network_registry
                 .as_ref()
-                .context("M6 live execution requires the network registry")?
+                .context("M9 live execution requires the network registry")?
                 .runtimes()
                 .find(|runtime| runtime.plan().network_id == strategy.network_id)
-                .context("M6 executable strategy has no EVM execution owner")?
+                .context("M9 executable strategy has no EVM execution owner")?
                 .plan();
-            TradeJournalScope {
+            Ok(TradeJournalScope {
                 schema_version: TradeJournalScope::SCHEMA_VERSION,
-                account_id,
+                account_id: account_id.clone(),
                 network_id: network.network_id.as_str().to_owned(),
                 chain_id: network.chain_id,
                 wallet_id: network.wallet_location_id.as_str().to_owned(),
                 strategy_id: strategy.strategy_id.as_str().to_owned(),
                 symbol: strategy.symbol.clone(),
-            }
+            })
         };
+        let trade_journal_scope = scope_for("WLDUSDC")?;
+        let canary_journal_scope = scope_for("ESPUSDC")?;
         let wallet = EvmWallet::from_env()?;
         ensure!(
             wallet.address() == wallet_owner,
@@ -2172,6 +2231,12 @@ async fn run(
             std::env::var(ARBITRAGE_WALLET_JOURNAL_PATH_ENV).with_context(|| {
                 format!(
                     "required environment variable {ARBITRAGE_WALLET_JOURNAL_PATH_ENV} is not set"
+                )
+            })?;
+        let canary_wallet_journal_path =
+            std::env::var(ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV).with_context(|| {
+                format!(
+                    "required environment variable {ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV} is not set"
                 )
             })?;
         let binance_journal_path = std::env::var(ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV)
@@ -2251,27 +2316,117 @@ async fn run(
             dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?;
-        let binance_service = BinanceExecutionService::spawn_scoped_instrumented(
+        let canary_evm_journal_started_at = Instant::now();
+        let mut canary_dex_executor = DexExecutor::hydrate_with_gas_policy(
+            canary_wallet_rpc.clone(),
+            EvmWallet::from_env()?,
+            42_161,
+            canary_wallet_journal_path.into(),
+            CompiledNetworkGasPolicy::ArbitrumOne {
+                requires_fresh_rpc_gas_price: true,
+                max_priority_fee_per_gas_wei: 0,
+                includes_l1_fee: false,
+            },
+        )
+        .await?;
+        canary_dex_executor.set_journal_scope(EvmJournalScope {
+            schema_version: EvmJournalScope::SCHEMA_VERSION,
+            network_id: canary_journal_scope.network_id.clone(),
+            wallet_id: canary_journal_scope.wallet_id.clone(),
+            strategy_id: canary_journal_scope.strategy_id.clone(),
+        })?;
+        canary_dex_executor.set_receipt_heads(canary_receipt_head_receiver.clone());
+        let canary_router = m8_pair
+            .chain
+            .uniswap_v3_router_address
+            .as_deref()
+            .context("M9 Arbitrum V3 router is missing")?
+            .parse()
+            .context("M9 Arbitrum V3 router is invalid")?;
+        let maximum_canary_usdc = m8_pair
+            .live_canary
+            .as_ref()
+            .context("M9 canary policy is missing")?
+            .max_total_notional_token_a_base_units
+            .parse::<u128>()
+            .context("M9 cumulative canary cap is invalid")?;
+        let canary_allowances = canary_initial_wallet_balances
+            .token_balances
+            .iter()
+            .map(|token| AllowanceRequirement {
+                operation_id: format!("rustarb-m9-setup-v3-{}", token.symbol),
+                protocol: UniswapProtocol::V3,
+                token: token.contract,
+                router: canary_router,
+                required: if token.symbol.as_ref() == m8_pair.token_a.symbol {
+                    token.base_units.min(U256::from(maximum_canary_usdc))
+                } else {
+                    token.base_units
+                },
+            })
+            .collect::<Vec<_>>();
+        canary_dex_executor
+            .prepare_and_lock_allowances(&canary_allowances)
+            .await?;
+        canary_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
+        let canary_dex_service = DexExecutionService::spawn(
+            canary_dex_executor,
+            config.arbitrage_leg_execution_channel_capacity,
+        )?;
+        telemetry.emit(
+            "runtime_journal_recovery",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "owner": "evm_execution",
+                "journal_scope": arb_bot::telemetry::execution_lane_id(42_161),
+                "network_id": arb_bot::telemetry::network_id(42_161),
+                "wallet_id": arb_bot::telemetry::PRIMARY_EVM_WALLET_ID,
+                "duration_us": canary_evm_journal_started_at.elapsed().as_micros(),
+                "outcome": "success",
+            }),
+        );
+        let binance_service = BinanceExecutionService::spawn_multi_scoped_instrumented(
             multiplexed_binance_api.clone(),
             binance_journal_path.into(),
             config.arbitrage_leg_execution_channel_capacity,
             execution_latency_telemetry,
-            BinanceOrderJournalScope {
-                schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
-                account_id: trade_journal_scope.account_id.clone(),
-                strategy_id: trade_journal_scope.strategy_id.clone(),
-            },
+            BTreeMap::from([
+                (
+                    trade_journal_scope.symbol.clone(),
+                    BinanceOrderJournalScope {
+                        schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                        account_id: trade_journal_scope.account_id.clone(),
+                        strategy_id: trade_journal_scope.strategy_id.clone(),
+                    },
+                ),
+                (
+                    canary_journal_scope.symbol.clone(),
+                    BinanceOrderJournalScope {
+                        schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                        account_id: canary_journal_scope.account_id.clone(),
+                        strategy_id: canary_journal_scope.strategy_id.clone(),
+                    },
+                ),
+            ]),
         )
         .await?;
+        let binance_service = Arc::new(binance_service);
         let (dex_revert_diagnostics, dex_revert_diagnostic_task) = dex_revert_diagnostic_channel(
             wallet_rpc.clone(),
             telemetry.clone(),
             config.engine_id.clone(),
             DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
         );
-        let executor = ComposedLiveLegExecutor::new(
+        let (canary_dex_revert_diagnostics, canary_dex_revert_diagnostic_task) =
+            dex_revert_diagnostic_channel(
+                canary_wallet_rpc.clone(),
+                telemetry.clone(),
+                config.engine_id.clone(),
+                DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
+            );
+        let primary_executor = Arc::new(ComposedLiveLegExecutor::new(
             dex_service,
-            binance_service,
+            Arc::clone(&binance_service),
             ComposedLiveLegExecutorConfig {
                 rules: execution_symbol_rules.clone(),
                 base_asset: pair.binance.base_asset.clone(),
@@ -2285,7 +2440,37 @@ async fn run(
                 telemetry: telemetry.clone(),
                 engine_id: config.engine_id.clone(),
             },
-        )?;
+        )?);
+        let canary_executor = Arc::new(ComposedLiveLegExecutor::new(
+            canary_dex_service,
+            Arc::clone(&binance_service),
+            ComposedLiveLegExecutorConfig {
+                rules: esp_execution_symbol_rules.clone(),
+                base_asset: m8_pair.binance.base_asset.clone(),
+                base_decimals: m8_pair.token_b.decimals,
+                quote_asset: m8_pair.binance.quote_asset.clone(),
+                quote_decimals: m8_pair.token_a.decimals,
+                commission_asset: commission_asset.clone(),
+                commission_price_symbol: commission_price_symbol.clone(),
+                market_state: entry_preflight.clone(),
+                dex_revert_diagnostics: canary_dex_revert_diagnostics,
+                telemetry: telemetry.clone(),
+                engine_id: config.engine_id.clone(),
+            },
+        )?);
+        let executor = RoutedLiveLegExecutor::new(BTreeMap::from([
+            (pair.id.clone(), primary_executor),
+            (m8_pair.id.clone(), canary_executor),
+        ]))?;
+        let m9_canary = m8_pair
+            .live_canary
+            .as_ref()
+            .context("M9 canary policy is missing")?;
+        let parse_canary_amount = |value: &str, label: &str| {
+            value
+                .parse::<u128>()
+                .with_context(|| format!("M9 {label} is invalid"))
+        };
         let (handle, task, events) = live_trade_channel(
             &config.arbitrage_trade_journal_path,
             executor,
@@ -2297,14 +2482,46 @@ async fn run(
                 binance_symbol: pair.binance.symbol.clone(),
                 binance_base_decimals: pair.token_b.decimals,
                 journal_scope: trade_journal_scope,
+                canary_policies: BTreeMap::from([(
+                    m8_pair.id.clone(),
+                    LiveCanaryPolicy {
+                        journal_scope: canary_journal_scope,
+                        maximum_trade_notional_token_a_base_units: parse_canary_amount(
+                            &m9_canary.max_trade_notional_token_a_base_units,
+                            "maximum trade notional",
+                        )?,
+                        maximum_total_notional_token_a_base_units: parse_canary_amount(
+                            &m9_canary.max_total_notional_token_a_base_units,
+                            "maximum total notional",
+                        )?,
+                        maximum_unhedged_notional_token_a_base_units: parse_canary_amount(
+                            &m9_canary.max_unhedged_notional_token_a_base_units,
+                            "maximum unhedged notional",
+                        )?,
+                        maximum_realized_loss_token_a_base_units: parse_canary_amount(
+                            &m9_canary.max_realized_loss_token_a_base_units,
+                            "maximum realized loss",
+                        )?,
+                        maximum_parent_trades: usize::from(m9_canary.max_parent_trades),
+                        maximum_failed_parent_trades: usize::from(
+                            m9_canary.max_failed_parent_trades,
+                        ),
+                        maximum_concurrent_trades: usize::from(m9_canary.max_concurrent_trades),
+                        rollout_duration: Duration::from_secs(m9_canary.rollout_duration_seconds),
+                        readiness: Arc::clone(&canary_execution_ready),
+                        market_data_readiness: Arc::clone(&canary_market_data_ready),
+                    },
+                )]),
             },
         )?;
-        Some((
-            handle,
-            tokio::spawn(task.run()),
-            events,
-            tokio::spawn(dex_revert_diagnostic_task.run()),
-        ))
+        let diagnostic_task = tokio::spawn(async move {
+            tokio::join!(
+                dex_revert_diagnostic_task.run(),
+                canary_dex_revert_diagnostic_task.run()
+            );
+            Ok::<(), anyhow::Error>(())
+        });
+        Some((handle, tokio::spawn(task.run()), events, diagnostic_task))
     } else {
         None
     };
@@ -2323,6 +2540,42 @@ async fn run(
         wallet_chain_id,
         wallet_tokens,
         initial_wallet_head,
+        config.balance_event_channel_capacity,
+    );
+    let canary_wallet_tokens = vec![
+        TokenBalanceRequest {
+            symbol: m8_pair.token_a.symbol.clone(),
+            contract: m8_pair
+                .token_a
+                .contract
+                .parse()
+                .context("M9 token_a address is invalid")?,
+        },
+        TokenBalanceRequest {
+            symbol: m8_pair.token_b.symbol.clone(),
+            contract: m8_pair
+                .token_b
+                .contract
+                .parse()
+                .context("M9 token_b address is invalid")?,
+        },
+    ];
+    let canary_wallet_reads = network_registry
+        .as_ref()
+        .context("M9 requires the Arbitrum network runtime")?
+        .get_by_chain_id(42_161)?
+        .reads()
+        .clone();
+    let arb_bot::balances::WalletBalanceSync {
+        receiver: mut canary_wallet_balance_receiver,
+        heads: canary_wallet_heads,
+        task: mut canary_wallet_balance_task,
+    } = spawn_wallet_balance_sync(
+        WalletReadClient::Coordinated(canary_wallet_reads),
+        wallet_owner,
+        42_161,
+        canary_wallet_tokens,
+        canary_initial_head,
         config.balance_event_channel_capacity,
     );
 
@@ -2353,6 +2606,7 @@ async fn run(
         let (_event_sender, events) = tokio::sync::mpsc::unbounded_channel();
         (None, None, events, None)
     };
+    let shared_inventory = SharedInventoryReservations::default();
     let (primary_engine, hot_telemetry, portfolio_allocator) = TradingEngine::new(
         config.clone(),
         Arc::clone(&domain_config),
@@ -2360,13 +2614,14 @@ async fn run(
         telemetry.clone(),
         V12RebalanceParityAdapter::new(rebalance_tracker),
         arb_bot::engine::TradingExecutionHandles {
-            paper_trades,
-            entry_preflight,
+            paper_trades: paper_trades.clone(),
+            entry_preflight: entry_preflight.clone(),
             binance_asset_decimals: compiled_binance_runtime
                 .as_ref()
                 .map(|runtime| runtime.asset_decimals.clone())
                 .unwrap_or_default(),
             portfolio_catalog: Arc::clone(&portfolio_catalog),
+            inventory: shared_inventory.clone(),
         },
         BinanceFeeBps {
             buy: binance_buy_fee_bps,
@@ -2376,28 +2631,41 @@ async fn run(
     let dependencies =
         hot_path_dependencies.context("run requires the compiled M4 hot-path runtime plan")?;
     let shadow_plan =
-        shadow_strategy_plan.context("compiled M4 hot path has no non-mutating shadow strategy")?;
+        shadow_strategy_plan.context("compiled M9 hot path has no ESP canary strategy")?;
     let InitializedDex {
         mirror: shadow_mirror,
         stream: shadow_stream,
         rpc: _shadow_wallet_rpc,
         timings: _shadow_dex_timings,
     } = shadow_initialized_dex
-        .context("compiled M4 shadow strategy has no initialized DEX runtime")?;
-    let shadow_opportunities =
-        OpportunityEngine::new(shadow_plan.domain_config.snapshot(), &shadow_mirror)?;
-    let (shadow_hot_telemetry, shadow_hot_telemetry_writer) = hot_telemetry::channel(
-        &config,
-        shadow_opportunities.pairs(),
-        &shadow_mirror,
-        telemetry.clone(),
-    )?;
+        .context("compiled M9 ESP strategy has no initialized DEX runtime")?;
     let shadow_pair = shadow_plan
         .domain_config
         .snapshot()
         .pairs
         .first()
-        .context("compiled M4 shadow strategy has no projected pair")?;
+        .context("compiled M9 ESP strategy has no projected pair")?;
+    let (mut canary_engine, canary_hot_telemetry, canary_portfolio_allocator) = TradingEngine::new(
+        config.clone(),
+        Arc::new(shadow_plan.domain_config.clone()),
+        shadow_mirror,
+        telemetry.clone(),
+        V12RebalanceParityAdapter::new(RebalanceTracker::disabled()),
+        arb_bot::engine::TradingExecutionHandles {
+            paper_trades,
+            entry_preflight: entry_preflight.clone(),
+            binance_asset_decimals: compiled_binance_runtime
+                .as_ref()
+                .map(|runtime| runtime.asset_decimals.clone())
+                .unwrap_or_default(),
+            portfolio_catalog: Arc::clone(&portfolio_catalog),
+            inventory: shared_inventory.clone(),
+        },
+        BinanceFeeBps {
+            buy: esp_buy_fee_bps,
+            sell: esp_sell_fee_bps,
+        },
+    )?;
     let root_supervisor = RootSupervisorPolicy::new(
         dependencies
             .plan()
@@ -2422,45 +2690,24 @@ async fn run(
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
     )?;
-    let shadow_evaluator = ShadowStrategyEvaluator::new(
-        shadow_plan.strategy_id.clone(),
-        shadow_plan.symbol.clone(),
-        shadow_plan.baseline_budget_us,
-        shadow_pair.strategy.max_transport_silence_ms(),
-        config.dex_head_max_age_ms,
-        shadow_mirror,
-        shadow_opportunities,
-        shadow_hot_telemetry,
-        Box::new(TelemetryCoordinatorShadowSink::new(
-            telemetry.clone(),
-            config.engine_id.clone(),
-            PRIMARY_BINANCE_ACCOUNT_ID.to_owned(),
-            shadow_plan.network_id.as_str().to_owned(),
-            execution_lane_id(shadow_pair.chain.chain_id),
-        )),
-    );
-    let mut engine = HotPathDecisionOwner::new(
-        primary_engine,
-        vec![Box::new(shadow_evaluator)],
-        dependencies,
-    )?;
+    let mut engine = HotPathDecisionOwner::new(primary_engine, Vec::new(), dependencies)?;
     tracing::info!(
         binance_account_id = PRIMARY_BINANCE_ACCOUNT_ID,
         live_strategy_id = %engine.strategy_id().as_str(),
-        shadow_strategy_id = %shadow_plan.strategy_id.as_str(),
-        shadow_network_id = %shadow_plan.network_id.as_str(),
-        shadow_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
-        old_baseline_comparison = "background_immutable_decision_projection",
-        shadow_reservation_mode = "pure_shadow_proposal",
-        shadow_rebalance_mode = "network_scoped_shadow_only",
-        shadow_external_mutation_authorized = false,
+        canary_strategy_id = %shadow_plan.strategy_id.as_str(),
+        canary_network_id = %shadow_plan.network_id.as_str(),
+        canary_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
+        shared_inventory_owner = true,
+        shared_binance_order_owner = true,
+        canary_rebalance_mutation_enabled = false,
+        canary_external_mutation_authorized = true,
         root_supervisor_policy = "dependency_scoped_v1",
-        "M7 combined production shadow configured"
+        "M9 bounded ESP production canary configured"
     );
     let m8_canary = m8_pair
         .live_canary
         .as_ref()
-        .context("M8 readiness pair has no bounded canary policy")?;
+        .context("M9 live pair has no bounded canary policy")?;
     tracing::info!(
         pair_id = m8_pair.id,
         strategy_id = %shadow_plan.strategy_id.as_str(),
@@ -2470,31 +2717,38 @@ async fn run(
             .chain
             .uniswap_v3_router_address
             .as_deref()
-            .context("M8 readiness router is missing")?,
-        approval_gate = "explicit_production_approval_required",
+            .context("M9 canary router is missing")?,
+        approval_gate = "explicit_production_approved",
         max_trade_notional_token_a_base_units =
             %m8_canary.max_trade_notional_token_a_base_units,
         max_total_notional_token_a_base_units =
             %m8_canary.max_total_notional_token_a_base_units,
+        minimum_wallet_token_a_base_units =
+            %m8_canary.minimum_wallet_token_a_base_units,
+        minimum_wallet_token_b_base_units =
+            %m8_canary.minimum_wallet_token_b_base_units,
         max_parent_trades = m8_canary.max_parent_trades,
+        max_failed_parent_trades = m8_canary.max_failed_parent_trades,
         max_concurrent_trades = m8_canary.max_concurrent_trades,
         rollout_duration_seconds = m8_canary.rollout_duration_seconds,
         gas_policy = "fresh_eth_gas_price_fail_closed_no_world_fallback",
         allowance_policy = "bounded_exact_canary_cap_then_locked",
         receipt_accounting = "effective_gas_price_includes_arbitrum_l1_component",
-        execution_enabled = false,
+        execution_enabled = true,
         rebalance_enabled = false,
-        external_mutation_authorized = false,
-        "M8 Arbitrum live readiness configured"
+        external_mutation_authorized = true,
+        "M9 Arbitrum live canary configured"
     );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
         task: mut shadow_dex_task,
     } = shadow_stream;
     engine.on_binance_clock_sync(binance_account.clock_sync);
+    canary_engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     let portfolio_allocator_task = tokio::spawn(portfolio_allocator.run());
-    let shadow_hot_telemetry_task = tokio::spawn(shadow_hot_telemetry_writer.run());
+    let canary_hot_telemetry_task = tokio::spawn(canary_hot_telemetry.run());
+    let canary_portfolio_allocator_task = tokio::spawn(canary_portfolio_allocator.run());
     let m8_chain_readiness_task = m8_chain_readiness_probe.map(|probe| {
         tokio::spawn(run_m8_chain_readiness_refresh(
             probe,
@@ -2502,6 +2756,7 @@ async fn run(
             config.engine_id.clone(),
             m8_pair.clone(),
             initial_m8_chain_readiness_status,
+            Arc::clone(&canary_execution_ready),
         ))
     });
     let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
@@ -2550,16 +2805,21 @@ async fn run(
     if let Some(operation) = rebalance_recovery_operation.as_ref() {
         engine.on_rebalance_recovery_started(operation)?;
     }
-    engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
+    engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances.clone()))?;
+    canary_engine
+        .on_shared_binance_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
     engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances))?;
+    canary_engine.on_balance_event(BalanceEvent::Wallet(canary_initial_wallet_balances.clone()))?;
     for snapshot in &portfolio_wallet_snapshots {
         if snapshot.chain_id != wallet_chain_id {
             engine.on_portfolio_wallet_snapshot(snapshot)?;
         }
     }
     engine.on_user_data_connected(user_data_subscription_id);
+    canary_engine.on_shared_user_data_connected();
     dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
     engine.start();
+    canary_engine.start();
     let mut first_ready_emitted = false;
     let mut longest_non_price_handler_us = 0_u128;
     let mut longest_non_price_handler = "none";
@@ -2575,31 +2835,24 @@ async fn run(
         .collect::<Vec<_>>();
     let mut adaptive_sizing_slots: LatestOnlySizingSlots<AdaptiveSizingJob> =
         LatestOnlySizingSlots::new(sizing_strategy_ids)?;
-    let mut shadow_sizing_tasks: tokio::task::JoinSet<ShadowSizingTaskResult> =
-        tokio::task::JoinSet::new();
-    let shadow_sizing_strategy_ids = engine
-        .dependencies()
-        .plan()
-        .strategies
-        .iter()
-        .filter(|strategy| strategy.observe && !strategy.execute)
-        .map(|strategy| strategy.strategy_id.clone())
-        .collect::<Vec<_>>();
-    let mut shadow_sizing_slots: LatestOnlySizingSlots<ShadowSizingJob> =
-        LatestOnlySizingSlots::new(shadow_sizing_strategy_ids)?;
     let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
     let (startup_primary_dex, startup_shadow_dex) = drain_startup_dex_backlog(
         &mut engine,
-        &shadow_plan.strategy_id,
+        &mut canary_engine,
         &mut pending_prepared_pool_builds,
         &mut dex_receiver,
         &mut shadow_dex_receiver,
         &wallet_heads,
         &receipt_heads,
+        &canary_wallet_heads,
+        &canary_receipt_heads,
     )?;
     report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
     if startup_primary_dex.pool_build_count > 0 {
         engine.evaluate_after_dex_refreshes()?;
+    }
+    if startup_shadow_dex.pool_build_count > 0 {
+        canary_engine.evaluate_after_dex_refreshes()?;
     }
     telemetry.emit(
         "startup_dex_backlog_drain",
@@ -2608,8 +2861,8 @@ async fn run(
             "primary_event_count": startup_primary_dex.event_count,
             "primary_pool_build_count": startup_primary_dex.pool_build_count,
             "primary_max_queue_age_us": startup_primary_dex.max_queue_age_us,
-            "shadow_event_count": startup_shadow_dex.event_count,
-            "shadow_max_queue_age_us": startup_shadow_dex.max_queue_age_us,
+            "canary_event_count": startup_shadow_dex.event_count,
+            "canary_max_queue_age_us": startup_shadow_dex.max_queue_age_us,
             "backlog_empty_before_ready": true,
         }),
     );
@@ -2644,8 +2897,9 @@ async fn run(
         hot_path_direct_binance_poll = true,
         hot_path_dependency_index = "compiled_exact_symbol_pool",
         hot_path_sizing_policy = "one_running_one_latest_pending_per_strategy",
-        hot_path_shadow_strategy_id = %shadow_plan.strategy_id.as_str(),
-        hot_path_shadow_external_mutation_authorized = false,
+        hot_path_canary_strategy_id = %shadow_plan.strategy_id.as_str(),
+        hot_path_canary_external_mutation_authorized = true,
+        hot_path_canary_rebalance_mutation_authorized = false,
         portfolio_inventory_key = "inventory_location+venue_asset_id",
         portfolio_location_count = portfolio_catalog.location_count(),
         portfolio_venue_asset_count = portfolio_catalog.asset_count(),
@@ -2774,18 +3028,26 @@ async fn run(
             event = shadow_dex_receiver.recv(), if shadow_dex_running => {
                 let handler_started_at = Instant::now();
                 let Some(event) = event else {
-                    engine.degrade_shadow_strategy(
-                        &shadow_plan.strategy_id,
-                        "network_ingestion",
-                        anyhow::anyhow!("Arbitrum shadow DEX stream stopped"),
-                    )?;
+                    canary_market_data_ready.store(false, Ordering::Release);
+                    tracing::error!(
+                        strategy_id = %shadow_plan.strategy_id.as_str(),
+                        "Arbitrum canary DEX stream stopped; new ESP entries are disabled"
+                    );
                     shadow_dex_running = false;
-                    report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
                     continue;
                 };
-                let _evaluation =
-                    engine.on_shadow_dex_event(&shadow_plan.strategy_id, event)?;
-                report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
+                let head = match &event {
+                    DexStreamEvent::Head { head, .. } => Some(*head),
+                    DexStreamEvent::Log { .. } => None,
+                };
+                if let Some(request) = canary_engine.on_dex_event(event)? {
+                    build_prepared_pool_inline(&mut canary_engine, request)?;
+                    canary_engine.evaluate_after_dex_refreshes()?;
+                }
+                if let Some(head) = head {
+                    canary_wallet_heads.send_replace(head);
+                    canary_receipt_heads.send_replace(head);
+                }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -2796,6 +3058,7 @@ async fn run(
             scheduled_at = health_tick.tick() => {
                 let loop_lag_us = scheduled_at.elapsed().as_micros();
                 engine.refresh_health();
+                canary_engine.refresh_health();
                 engine.record_owner_loop_health(
                     loop_lag_us,
                     longest_non_price_handler,
@@ -2807,7 +3070,9 @@ async fn run(
             event = &mut binance_market_event => {
                 drop(binance_market_event);
                 let event_symbol = market_event_symbol(&event);
-                if engine.dependencies().for_symbol(event_symbol).next().is_some() {
+                if event_symbol == shadow_plan.symbol {
+                    canary_engine.on_market_event(event, None)?;
+                } else if engine.dependencies().for_symbol(event_symbol).next().is_some() {
                     let _summary =
                         engine.on_market_event(event, binance_feed.depth_book())?;
                     report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
@@ -2827,7 +3092,8 @@ async fn run(
             event = &mut gas_market_event => {
                 let handler_started_at = Instant::now();
                 drop(gas_market_event);
-                engine.on_gas_market_event(event)?;
+                engine.on_gas_market_event(event.clone())?;
+                canary_engine.on_gas_market_event(event)?;
                 gas_market_event = Box::pin(gas_price_feed.next_event());
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -2839,7 +3105,8 @@ async fn run(
             event = &mut commission_market_event => {
                 let handler_started_at = Instant::now();
                 drop(commission_market_event);
-                engine.on_commission_market_event(event)?;
+                engine.on_commission_market_event(event.clone())?;
+                canary_engine.on_commission_market_event(event)?;
                 commission_market_event = Box::pin(commission_price_feed.next_event());
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -2850,7 +3117,34 @@ async fn run(
             },
             event = user_data_stream.next_event() => {
                 let handler_started_at = Instant::now();
-                engine.on_user_data_event(event?)?;
+                let event = event?;
+                match &event {
+                    UserDataEvent::ExecutionReport(report)
+                        if report.symbol == shadow_plan.symbol =>
+                    {
+                        canary_engine.on_user_data_event(event)?;
+                    }
+                    UserDataEvent::ExecutionReport(report)
+                        if report.symbol == pair.binance.symbol =>
+                    {
+                        engine.on_user_data_event(event)?;
+                    }
+                    UserDataEvent::AccountPosition(_) | UserDataEvent::BalanceUpdate(_) => {
+                        engine.on_user_data_event(event)?;
+                    }
+                    UserDataEvent::ExecutionReport(_) => {
+                        engine.on_user_data_event(event.clone())?;
+                        canary_engine.on_shared_user_data_dirty();
+                    }
+                    UserDataEvent::StreamTerminated { .. } => {
+                        engine.on_user_data_event(event)?;
+                        canary_engine.on_shared_user_data_disconnected();
+                    }
+                    UserDataEvent::Other { .. } => {
+                        engine.on_user_data_event(event)?;
+                        canary_engine.on_shared_user_data_dirty();
+                    }
+                }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -2861,11 +3155,20 @@ async fn run(
             observation = binance_clock_sync_receiver.recv(), if binance_clock_sync_running => {
                 let handler_started_at = Instant::now();
                 match observation {
-                    Some(Ok(clock_sync)) => engine.on_binance_clock_sync(clock_sync),
-                    Some(Err(error)) => engine.on_binance_clock_sync_failure(&error),
+                    Some(Ok(clock_sync)) => {
+                        engine.on_binance_clock_sync(clock_sync);
+                        canary_engine.on_binance_clock_sync(clock_sync);
+                    }
+                    Some(Err(error)) => {
+                        engine.on_binance_clock_sync_failure(&error);
+                        canary_engine.on_binance_clock_sync_failure(&error);
+                    }
                     None => {
                         binance_clock_sync_running = false;
                         engine.on_binance_clock_sync_failure(
+                            "background Binance clock synchronization task stopped",
+                        );
+                        canary_engine.on_binance_clock_sync_failure(
                             "background Binance clock synchronization task stopped",
                         );
                     }
@@ -2882,12 +3185,49 @@ async fn run(
                 let Some(event) = event else {
                     bail!("balance synchronization channel stopped unexpectedly");
                 };
-                engine.on_balance_event(event)?;
+                match event {
+                    BalanceEvent::Binance(snapshot) => {
+                        engine.on_balance_event(BalanceEvent::Binance(snapshot.clone()))?;
+                        canary_engine.on_shared_binance_balance_event(
+                            BalanceEvent::Binance(snapshot),
+                        )?;
+                    }
+                    BalanceEvent::Failed {
+                        source: BalanceSource::Binance,
+                        error,
+                        observed_at,
+                    } => {
+                        engine.on_balance_event(BalanceEvent::Failed {
+                            source: BalanceSource::Binance,
+                            error: error.clone(),
+                            observed_at,
+                        })?;
+                        canary_engine.on_shared_binance_balance_event(BalanceEvent::Failed {
+                            source: BalanceSource::Binance,
+                            error,
+                            observed_at,
+                        })?;
+                    }
+                    other => engine.on_balance_event(other)?,
+                }
                 dispatch_rebalance_execution(&mut engine, rebalance_sender.as_ref(), pair, wallet_owner)?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
                     "balance_publication",
+                    handler_started_at.elapsed(),
+                );
+            }
+            event = canary_wallet_balance_receiver.recv() => {
+                let handler_started_at = Instant::now();
+                let Some(event) = event else {
+                    bail!("Arbitrum wallet balance synchronization channel stopped unexpectedly");
+                };
+                canary_engine.on_balance_event(event)?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "arbitrum_balance_publication",
                     handler_started_at.elapsed(),
                 );
             }
@@ -2923,28 +3263,43 @@ async fn run(
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
-                drain_dex_events_inline(
-                    &mut engine,
-                    &mut pending_prepared_pool_builds,
-                    &mut dex_receiver,
-                    &wallet_heads,
-                    &receipt_heads,
-                )?;
-                let receipt_refresh = engine.apply_arbitrage_receipt_settlement(&event)?;
-                let receipt_applied = receipt_refresh.is_some();
-                if let Some(refresh) = receipt_refresh {
-                    pending_prepared_pool_builds.queue(refresh);
-                }
-                let (prepared_dex, _) = build_prepared_pools_interleaved(
-                    &mut engine,
-                    &mut pending_prepared_pool_builds,
-                    &mut dex_receiver,
-                    &wallet_heads,
-                    &receipt_heads,
-                )?;
-                engine.on_paper_trade_event(event)?;
-                if prepared_dex || receipt_applied {
-                    engine.evaluate_after_dex_refreshes()?;
+                if event.pair_id == m8_pair.id {
+                    while let Ok(dex_event) = shadow_dex_receiver.try_recv() {
+                        if let Some(request) = canary_engine.on_dex_event(dex_event)? {
+                            build_prepared_pool_inline(&mut canary_engine, request)?;
+                        }
+                    }
+                    if let Some(refresh) =
+                        canary_engine.apply_arbitrage_receipt_settlement(&event)?
+                    {
+                        build_prepared_pool_inline(&mut canary_engine, refresh)?;
+                    }
+                    canary_engine.on_paper_trade_event(event)?;
+                    canary_engine.evaluate_after_dex_refreshes()?;
+                } else {
+                    drain_dex_events_inline(
+                        &mut engine,
+                        &mut pending_prepared_pool_builds,
+                        &mut dex_receiver,
+                        &wallet_heads,
+                        &receipt_heads,
+                    )?;
+                    let receipt_refresh = engine.apply_arbitrage_receipt_settlement(&event)?;
+                    let receipt_applied = receipt_refresh.is_some();
+                    if let Some(refresh) = receipt_refresh {
+                        pending_prepared_pool_builds.queue(refresh);
+                    }
+                    let (prepared_dex, _) = build_prepared_pools_interleaved(
+                        &mut engine,
+                        &mut pending_prepared_pool_builds,
+                        &mut dex_receiver,
+                        &wallet_heads,
+                        &receipt_heads,
+                    )?;
+                    engine.on_paper_trade_event(event)?;
+                    if prepared_dex || receipt_applied {
+                        engine.evaluate_after_dex_refreshes()?;
+                    }
                 }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -2980,55 +3335,18 @@ async fn run(
                     handler_started_at.elapsed(),
                 );
             }
-            result = shadow_sizing_tasks.join_next(), if !shadow_sizing_tasks.is_empty() => {
-                let handler_started_at = Instant::now();
-                let result = result
-                    .context("shadow sizing worker join set stopped unexpectedly")?
-                    .context("shadow sizing worker panicked")?;
-                let strategy_id = result.strategy_id().clone();
-                let queue_time_us = result.queue_time_us();
-                let worker_time_us = result.worker_time_us();
-                let disposition = engine.on_shadow_sizing_result(result)?;
-                telemetry.emit(
-                    "strategy_sizing_task",
-                    serde_json::json!({
-                        "engine_id": config.engine_id,
-                        "strategy_id": strategy_id.as_str(),
-                        "work_class": "exhaustive_sizing",
-                        "queue_policy": "one_running_one_latest_pending_per_strategy",
-                        "queue_time_us": queue_time_us,
-                        "worker_time_us": worker_time_us,
-                        "disposition": disposition.as_str(),
-                    }),
-                );
-                if let Some(next) = shadow_sizing_slots.complete(&strategy_id)? {
-                    shadow_sizing_tasks.spawn_blocking(move || next.run());
-                }
-                record_longest_handler(
-                    &mut longest_non_price_handler_us,
-                    &mut longest_non_price_handler,
-                    "shadow_sizing_result",
-                    handler_started_at.elapsed(),
-                );
-            }
             result = &mut dex_task => {
                 result.context("Alchemy DEX connector task failed")??;
                 bail!("Alchemy DEX connector stopped; process restart will rehydrate state");
             }
             result = &mut shadow_dex_task, if shadow_dex_running => {
-                let error = match result {
-                    Ok(Ok(())) => anyhow::anyhow!("Arbitrum shadow DEX connector stopped"),
-                    Ok(Err(error)) => error.context("Arbitrum shadow DEX connector task failed"),
-                    Err(error) => anyhow::Error::new(error)
-                        .context("Arbitrum shadow DEX connector task panicked"),
-                };
-                engine.degrade_shadow_strategy(
-                    &shadow_plan.strategy_id,
-                    "network_ingestion",
-                    error,
-                )?;
+                canary_market_data_ready.store(false, Ordering::Release);
+                tracing::error!(
+                    strategy_id = %shadow_plan.strategy_id.as_str(),
+                    result = ?result,
+                    "Arbitrum canary DEX connector stopped; new ESP entries are disabled"
+                );
                 shadow_dex_running = false;
-                report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
             }
             result = &mut binance_balance_task => {
                 result.context("Binance balance synchronization task failed")??;
@@ -3037,6 +3355,10 @@ async fn run(
             result = &mut wallet_balance_task => {
                 result.context("wallet balance synchronization task failed")??;
                 bail!("wallet balance synchronization stopped unexpectedly");
+            }
+            result = &mut canary_wallet_balance_task => {
+                result.context("Arbitrum wallet balance synchronization task failed")??;
+                bail!("Arbitrum wallet balance synchronization stopped unexpectedly");
             }
         }
         if !first_ready_emitted && engine.phase() == RuntimePhase::Ready {
@@ -3058,21 +3380,6 @@ async fn run(
                 }
             }
         }
-        while let Some(job) = engine.take_next_shadow_sizing_job() {
-            let strategy_id = job.strategy_id().clone();
-            match shadow_sizing_slots.submit(&strategy_id, job)? {
-                SizingSubmission::Start(job) => {
-                    shadow_sizing_tasks.spawn_blocking(move || job.run());
-                }
-                SizingSubmission::Pending { replaced } => {
-                    engine.record_adaptive_sizing_overload(
-                        &strategy_id,
-                        replaced,
-                        shadow_sizing_slots.total_retained_work(),
-                    );
-                }
-            }
-        }
     }
 
     engine.shutdown();
@@ -3083,9 +3390,11 @@ async fn run(
     }
     binance_balance_task.abort();
     wallet_balance_task.abort();
+    canary_wallet_balance_task.abort();
     binance_clock_sync_task.abort();
     let _ = binance_balance_task.await;
     let _ = wallet_balance_task.await;
+    let _ = canary_wallet_balance_task.await;
     let _ = binance_clock_sync_task.await;
     dex_task.abort();
     let _ = dex_task.await;
@@ -3097,17 +3406,17 @@ async fn run(
     }
     adaptive_sizing_tasks.abort_all();
     while adaptive_sizing_tasks.join_next().await.is_some() {}
-    shadow_sizing_tasks.abort_all();
-    while shadow_sizing_tasks.join_next().await.is_some() {}
+    canary_engine.shutdown();
     drop(engine);
     if let Some(task) = paper_trade_task.take() {
         task.await??;
     }
     if let Some(task) = dex_revert_diagnostic_task.take() {
-        task.await?;
+        task.await??;
     }
     hot_telemetry_task.await??;
-    shadow_hot_telemetry_task.await??;
+    canary_hot_telemetry_task.await??;
+    canary_portfolio_allocator_task.await?;
     portfolio_allocator_task.await?;
     writer_task.await??;
     if let Some(path) = runtime_ready_file
@@ -3149,7 +3458,7 @@ fn emit_m8_chain_readiness(
     readiness_source: &'static str,
 ) {
     telemetry.emit(
-        "m8_live_readiness",
+        "m9_live_readiness",
         serde_json::json!({
             "engine_id": engine_id,
             "stage": "arbitrum_chain",
@@ -3161,6 +3470,8 @@ fn emit_m8_chain_readiness(
             "token_code_present": readiness.token_code_present,
             "router_code_present": readiness.router_code_present,
             "native_gas_funded": readiness.native_gas_funded,
+            "token_a_funded": readiness.token_a_funded,
+            "token_b_funded": readiness.token_b_funded,
             "fresh_rpc_gas_price": readiness.fresh_rpc_gas_price,
             "allowance_policy": readiness.allowance_policy,
             "receipt_l1_fee_mode": readiness.receipt_l1_fee_mode,
@@ -3179,7 +3490,7 @@ fn emit_m8_chain_readiness_failure(
     error: &anyhow::Error,
 ) {
     telemetry.emit(
-        "m8_live_readiness",
+        "m9_live_readiness",
         serde_json::json!({
             "engine_id": engine_id,
             "stage": "arbitrum_chain",
@@ -3199,6 +3510,7 @@ async fn run_m8_chain_readiness_refresh(
     engine_id: String,
     pair: arb_bot::domain::config::PairConfig,
     mut last_status: Option<M8ChainReadinessStatus>,
+    execution_ready: Arc<AtomicBool>,
 ) {
     let start = tokio::time::Instant::now() + M8_CHAIN_READINESS_REFRESH_INTERVAL;
     let mut interval = tokio::time::interval_at(start, M8_CHAIN_READINESS_REFRESH_INTERVAL);
@@ -3208,6 +3520,7 @@ async fn run_m8_chain_readiness_refresh(
         match probe.inspect().await {
             Ok(readiness) => {
                 let status = readiness.status();
+                execution_ready.store(readiness.ready, Ordering::Release);
                 if last_status == Some(status) {
                     continue;
                 }
@@ -3222,22 +3535,27 @@ async fn run_m8_chain_readiness_refresh(
                     tracing::info!(
                         pair_id = pair.id,
                         block_number = readiness.block_number,
-                        external_mutation_authorized = false,
-                        "M8 Arbitrum chain readiness became ready; mutations remain disabled"
+                        external_mutation_capability = readiness.external_mutation_authorized,
+                        new_entry_authorized = true,
+                        "M9 Arbitrum chain readiness became ready"
                     );
                 } else {
                     tracing::warn!(
                         pair_id = pair.id,
                         block_number = readiness.block_number,
                         native_gas_funded = readiness.native_gas_funded,
+                        token_a_funded = readiness.token_a_funded,
+                        token_b_funded = readiness.token_b_funded,
                         fresh_rpc_gas_price = readiness.fresh_rpc_gas_price,
-                        external_mutation_authorized = false,
-                        "M8 Arbitrum chain readiness degraded; mutations remain disabled"
+                        external_mutation_capability = readiness.external_mutation_authorized,
+                        new_entry_authorized = false,
+                        "M9 Arbitrum chain readiness degraded; ESP fails closed"
                     );
                 }
                 last_status = Some(status);
             }
             Err(error) => {
+                execution_ready.store(false, Ordering::Release);
                 if last_status == Some(M8ChainReadinessStatus::ProbeFailed) {
                     continue;
                 }
@@ -3245,7 +3563,7 @@ async fn run_m8_chain_readiness_refresh(
                     pair_id = pair.id,
                     error = %error,
                     external_mutation_authorized = false,
-                    "M8 Arbitrum chain-readiness probe failed; mutations remain disabled"
+                    "M9 Arbitrum chain-readiness probe failed; ESP fails closed"
                 );
                 emit_m8_chain_readiness_failure(
                     &telemetry,
@@ -3570,14 +3888,17 @@ impl StartupDexDrainStats {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_startup_dex_backlog(
     engine: &mut HotPathDecisionOwner<TradingEngine>,
-    shadow_strategy_id: &arb_bot::domain::compiled::StrategyId,
+    canary_engine: &mut TradingEngine,
     pending: &mut PreparedPoolBuildBatch,
     dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
     shadow_dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
     wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
     receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    canary_wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    canary_receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
 ) -> anyhow::Result<(StartupDexDrainStats, StartupDexDrainStats)> {
     let mut primary_total = StartupDexDrainStats::default();
     let mut shadow_total = StartupDexDrainStats::default();
@@ -3589,8 +3910,12 @@ fn drain_startup_dex_backlog(
             wallet_heads,
             receipt_heads,
         )?;
-        let shadow =
-            drain_startup_shadow_dex_backlog(engine, shadow_strategy_id, shadow_dex_receiver)?;
+        let shadow = drain_startup_canary_dex_backlog(
+            canary_engine,
+            shadow_dex_receiver,
+            canary_wallet_heads,
+            canary_receipt_heads,
+        )?;
         let drained_events = primary.event_count.saturating_add(shadow.event_count);
         primary_total.merge(primary);
         shadow_total.merge(shadow);
@@ -3637,15 +3962,27 @@ fn drain_startup_primary_dex_backlog(
     }
 }
 
-fn drain_startup_shadow_dex_backlog(
-    engine: &mut HotPathDecisionOwner<TradingEngine>,
-    shadow_strategy_id: &arb_bot::domain::compiled::StrategyId,
+fn drain_startup_canary_dex_backlog(
+    engine: &mut TradingEngine,
     shadow_dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
+    wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
 ) -> anyhow::Result<StartupDexDrainStats> {
     let mut stats = StartupDexDrainStats::default();
     while let Ok(event) = shadow_dex_receiver.try_recv() {
         stats.observe(&event);
-        let _evaluation = engine.on_shadow_startup_dex_event(shadow_strategy_id, event)?;
+        let head = match &event {
+            DexStreamEvent::Head { head, .. } => Some(*head),
+            DexStreamEvent::Log { .. } => None,
+        };
+        if let Some(request) = engine.on_startup_dex_event(event)? {
+            build_prepared_pool_inline(engine, request)?;
+            stats.pool_build_count = stats.pool_build_count.saturating_add(1);
+        }
+        if let Some(head) = head {
+            wallet_heads.send_replace(head);
+            receipt_heads.send_replace(head);
+        }
     }
     Ok(stats)
 }

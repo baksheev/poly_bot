@@ -20,6 +20,7 @@ data:
   ARBITRAGE_EXECUTION_MODE: full_live
   ARBITRAGE_TRADE_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-live-trades.jsonl
   ARBITRAGE_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-wallet.jsonl
+  ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-arbitrum-wallet.jsonl
   ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-binance-orders.jsonl
   ARBITRAGE_ENTRY_STOP_FILE: /var/lib/arb-bot/arbitrage-entry.stop
   REBALANCE_EXECUTION_MODE: full_live

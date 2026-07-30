@@ -5,7 +5,10 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -60,7 +63,7 @@ pub trait LiveLegExecutor: Send + Sync + 'static {
 
 pub struct ComposedLiveLegExecutor {
     dex: DexExecutionService,
-    binance: BinanceExecutionService,
+    binance: Arc<BinanceExecutionService>,
     rules: SymbolRules,
     base_asset: String,
     base_decimals: u8,
@@ -128,10 +131,47 @@ pub struct ComposedLiveLegExecutorConfig {
     pub engine_id: String,
 }
 
+pub struct RoutedLiveLegExecutor {
+    by_pair: BTreeMap<String, Arc<ComposedLiveLegExecutor>>,
+}
+
+impl RoutedLiveLegExecutor {
+    pub fn new(by_pair: BTreeMap<String, Arc<ComposedLiveLegExecutor>>) -> anyhow::Result<Self> {
+        ensure!(!by_pair.is_empty(), "live executor route table is empty");
+        ensure!(
+            by_pair.keys().all(|pair_id| !pair_id.trim().is_empty()),
+            "live executor route has an empty pair id"
+        );
+        Ok(Self { by_pair })
+    }
+}
+
+impl LiveLegExecutor for RoutedLiveLegExecutor {
+    fn execute<'a>(
+        &'a self,
+        intent: &'a TradeIntent,
+        command: &'a CoordinatorCommand,
+    ) -> LegFuture<'a> {
+        Box::pin(async move {
+            match self.by_pair.get(&intent.pair_id) {
+                Some(executor) => executor.execute_inner(intent, command).await,
+                None => failed(
+                    match command {
+                        CoordinatorCommand::DispatchDex { .. } => LegRole::Dex,
+                        CoordinatorCommand::DispatchCex { .. } => LegRole::Cex,
+                        CoordinatorCommand::RecoverCex { .. } => LegRole::RecoveryCex,
+                    },
+                    "live:no-executor-for-pair",
+                ),
+            }
+        })
+    }
+}
+
 impl ComposedLiveLegExecutor {
     pub fn new(
         dex: DexExecutionService,
-        binance: BinanceExecutionService,
+        binance: Arc<BinanceExecutionService>,
         config: ComposedLiveLegExecutorConfig,
     ) -> anyhow::Result<Self> {
         let ComposedLiveLegExecutorConfig {
@@ -1047,6 +1087,47 @@ pub struct LiveRiskLimits {
     pub binance_symbol: String,
     pub binance_base_decimals: u8,
     pub journal_scope: TradeJournalScope,
+    pub canary_policies: BTreeMap<String, LiveCanaryPolicy>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveCanaryPolicy {
+    pub journal_scope: TradeJournalScope,
+    pub maximum_trade_notional_token_a_base_units: u128,
+    pub maximum_total_notional_token_a_base_units: u128,
+    pub maximum_unhedged_notional_token_a_base_units: u128,
+    pub maximum_realized_loss_token_a_base_units: u128,
+    pub maximum_parent_trades: usize,
+    pub maximum_failed_parent_trades: usize,
+    pub maximum_concurrent_trades: usize,
+    pub rollout_duration: Duration,
+    pub readiness: Arc<AtomicBool>,
+    pub market_data_readiness: Arc<AtomicBool>,
+}
+
+impl LiveCanaryPolicy {
+    fn validate(&self, pair_id: &str) -> anyhow::Result<()> {
+        self.journal_scope.validate()?;
+        ensure!(
+            self.maximum_trade_notional_token_a_base_units > 0
+                && self.maximum_trade_notional_token_a_base_units
+                    <= self.maximum_total_notional_token_a_base_units
+                && self.maximum_unhedged_notional_token_a_base_units
+                    <= self.maximum_trade_notional_token_a_base_units
+                && self.maximum_realized_loss_token_a_base_units
+                    <= self.maximum_total_notional_token_a_base_units,
+            "live canary {pair_id} monetary limits are inconsistent"
+        );
+        ensure!(
+            self.maximum_parent_trades > 0
+                && self.maximum_failed_parent_trades > 0
+                && self.maximum_failed_parent_trades <= self.maximum_parent_trades
+                && self.maximum_concurrent_trades == 1
+                && self.rollout_duration >= Duration::from_secs(60),
+            "live canary {pair_id} operation limits are inconsistent"
+        );
+        Ok(())
+    }
 }
 
 impl LiveRiskLimits {
@@ -1072,6 +1153,13 @@ impl LiveRiskLimits {
             self.journal_scope.symbol == self.binance_symbol,
             "live journal scope symbol mismatch"
         );
+        for (pair_id, policy) in &self.canary_policies {
+            policy.validate(pair_id)?;
+            ensure!(
+                policy.journal_scope.symbol != self.binance_symbol,
+                "live canary symbol duplicates the primary symbol"
+            );
+        }
         Ok(())
     }
 }
@@ -1245,7 +1333,13 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         );
         preflight_result?;
         let mut intent = opportunity.intent(ExecutionMode::DexFirst);
-        intent.journal_scope = Some(self.risk_limits.journal_scope.clone());
+        intent.journal_scope = Some(
+            self.risk_limits
+                .canary_policies
+                .get(&opportunity.pair_id)
+                .map(|policy| policy.journal_scope.clone())
+                .unwrap_or_else(|| self.risk_limits.journal_scope.clone()),
+        );
         ensure!(
             intent.admission.is_some() && intent.dex_plan.is_some(),
             "live intent is incomplete"
@@ -1277,6 +1371,34 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             None,
         );
         admit_result?;
+        if let Some(policy) = self.risk_limits.canary_policies.get(&opportunity.pair_id) {
+            let risk = self
+                .coordinator
+                .canary_journal_risk(&policy.journal_scope.strategy_id)?;
+            self.telemetry.emit(
+                "m9_canary_gate",
+                serde_json::json!({
+                    "engine_id": self.engine_id,
+                    "plan_id": plan_id,
+                    "pair_id": opportunity.pair_id,
+                    "strategy_id": policy.journal_scope.strategy_id,
+                    "symbol": opportunity.symbol,
+                    "decision": "admit",
+                    "trade_notional_token_a_base_units":
+                        opportunity.cost_token_a_base_units.unsigned_abs().to_string(),
+                    "admitted_parent_count_after": risk.admitted_parent_count,
+                    "admitted_notional_token_a_base_units_after":
+                        risk.admitted_notional_token_a_base_units.to_string(),
+                    "realized_loss_token_a_base_units_before":
+                        risk.realized_loss_token_a_base_units.to_string(),
+                    "maximum_parent_trades": policy.maximum_parent_trades,
+                    "maximum_total_notional_token_a_base_units":
+                        policy.maximum_total_notional_token_a_base_units.to_string(),
+                    "durable_parent_fsync_complete": true,
+                    "external_mutation_authorized": true,
+                }),
+            );
+        }
         self.drive(&plan_id, false).await
     }
 
@@ -1305,6 +1427,93 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 detail: rejection.detail,
             }
             .into());
+        }
+        if let Some(policy) = self.risk_limits.canary_policies.get(&opportunity.pair_id) {
+            let canary_check = (|| -> anyhow::Result<_> {
+                ensure!(
+                    policy.readiness.load(Ordering::Acquire)
+                        && policy.market_data_readiness.load(Ordering::Acquire),
+                    "M9 canary chain, funding, or market-data readiness is not healthy"
+                );
+                let notional = opportunity.cost_token_a_base_units.unsigned_abs();
+                let risk = self
+                    .coordinator
+                    .canary_journal_risk(&policy.journal_scope.strategy_id)?;
+                ensure!(
+                    notional <= policy.maximum_trade_notional_token_a_base_units,
+                    "M9 canary per-trade notional limit reached"
+                );
+                ensure!(
+                    notional <= policy.maximum_unhedged_notional_token_a_base_units,
+                    "M9 canary unhedged notional limit reached"
+                );
+                ensure!(
+                    opportunity
+                        .admission
+                        .maximum_recovery_loss_token_a_base_units
+                        <= policy.maximum_realized_loss_token_a_base_units,
+                    "M9 canary recovery-loss envelope exceeds the realized-loss cap"
+                );
+                ensure!(
+                    risk.admitted_notional_token_a_base_units
+                        .checked_add(notional)
+                        .is_some_and(|total| {
+                            total <= policy.maximum_total_notional_token_a_base_units
+                        }),
+                    "M9 canary cumulative notional limit reached"
+                );
+                ensure!(
+                    risk.admitted_parent_count < policy.maximum_parent_trades,
+                    "M9 canary parent-trade limit reached"
+                );
+                ensure!(
+                    risk.failed_parent_count < policy.maximum_failed_parent_trades,
+                    "M9 canary failure limit reached"
+                );
+                ensure!(
+                    risk.active_parent_count < policy.maximum_concurrent_trades,
+                    "M9 canary concurrent-parent limit reached"
+                );
+                ensure!(
+                    risk.realized_loss_token_a_base_units
+                        < policy.maximum_realized_loss_token_a_base_units,
+                    "M9 canary realized-loss limit reached"
+                );
+                if let Some(first_admitted_unix_us) = risk.first_admitted_unix_us {
+                    ensure!(
+                        unix_micros().is_some_and(|now| {
+                            now.saturating_sub(first_admitted_unix_us)
+                                <= policy.rollout_duration.as_micros() as u64
+                        }),
+                        "M9 canary rollout window expired"
+                    );
+                }
+                Ok((notional, risk))
+            })();
+            let (_notional, _risk) = match canary_check {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    self.telemetry.emit(
+                        "m9_canary_gate",
+                        serde_json::json!({
+                            "engine_id": self.engine_id,
+                            "plan_id": opportunity.plan_id(),
+                            "pair_id": opportunity.pair_id,
+                            "strategy_id": policy.journal_scope.strategy_id,
+                            "symbol": opportunity.symbol,
+                            "decision": "reject",
+                            "reason": detail,
+                            "external_mutation_authorized": false,
+                        }),
+                    );
+                    return Err(ExpectedEntryPreflightRejection {
+                        reason: "m9_canary_stop_condition",
+                        detail,
+                    }
+                    .into());
+                }
+            };
         }
         Ok(())
     }
@@ -1579,9 +1788,17 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         dex_filled: bool,
         dex_settlement_log: Option<crate::chain::logs::ChainLog>,
     ) -> anyhow::Result<()> {
+        let pair_id = self
+            .coordinator
+            .operation(&plan_id)
+            .context("live trade event operation is missing")?
+            .intent
+            .pair_id
+            .clone();
         self.event_sender
             .send(PaperTradeEvent {
                 plan_id,
+                pair_id,
                 state,
                 dex_filled,
                 dex_settlement_log,
@@ -1849,9 +2066,27 @@ fn unix_seconds() -> Option<u64> {
         .into()
 }
 
+fn unix_micros() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_micros()
+        .try_into()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs, path::PathBuf, sync::Mutex};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     use alloy_primitives::U256;
     use rust_decimal::Decimal;
@@ -1867,8 +2102,9 @@ mod tests {
         dex::clmm::ClmmPool,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         live_execution::{
-            LegFuture, LiveLegExecutor, LiveRiskLimits, cap_dex_credit_to_execution_envelope,
-            failed, failed_with_gas, live_trade_channel, unknown,
+            LegFuture, LiveCanaryPolicy, LiveLegExecutor, LiveRiskLimits,
+            cap_dex_credit_to_execution_envelope, failed, failed_with_gas, live_trade_channel,
+            unknown,
         },
         telemetry::TelemetryHandle,
     };
@@ -1975,6 +2211,7 @@ mod tests {
             binance_symbol: "WLDUSDC".to_owned(),
             binance_base_decimals: 18,
             journal_scope: scope(),
+            canary_policies: BTreeMap::new(),
         }
     }
 
@@ -2001,8 +2238,8 @@ mod tests {
     fn configure_fresh_dex(handle: &EntryPreflightHandle, pool: ClmmPool) {
         handle.configure_max_transport_silence("WLDUSDC", 30_000);
         handle.configure_dex_max_head_age(30_000);
-        handle.update_dex_head(std::time::Instant::now());
-        handle.update_dex_pool(0, 1, 0, 0, preflight_curves(&pool));
+        handle.update_dex_head("world-chain-usdc-wld", std::time::Instant::now());
+        handle.update_dex_pool("world-chain-usdc-wld", 0, 1, 0, 0, preflight_curves(&pool));
     }
 
     fn preflight_pool(sqrt_price_x96: U256, tick: i32) -> ClmmPool {
@@ -2288,8 +2525,9 @@ mod tests {
         handle.update_quote(&quote);
         handle.configure_max_transport_silence("WLDUSDC", 1_000);
         handle.configure_dex_max_head_age(30_000);
-        handle.update_dex_head(std::time::Instant::now());
+        handle.update_dex_head("world-chain-usdc-wld", std::time::Instant::now());
         handle.update_dex_pool(
+            "world-chain-usdc-wld",
             0,
             1,
             0,
@@ -2323,8 +2561,12 @@ mod tests {
         ));
         handle.configure_max_transport_silence("WLDUSDC", 30_000);
         handle.configure_dex_max_head_age(1_000);
-        handle.update_dex_head(std::time::Instant::now() - std::time::Duration::from_millis(1_001));
+        handle.update_dex_head(
+            "world-chain-usdc-wld",
+            std::time::Instant::now() - std::time::Duration::from_millis(1_001),
+        );
         handle.update_dex_pool(
+            "world-chain-usdc-wld",
             0,
             1,
             0,
@@ -2341,6 +2583,7 @@ mod tests {
     fn entry_preflight_requotes_the_current_dex_pool() {
         let handle = default_preflight();
         handle.update_dex_pool(
+            "world-chain-usdc-wld",
             0,
             2,
             0,
@@ -2404,6 +2647,7 @@ mod tests {
         let handle = default_preflight();
         let pool = preflight_pool(U256::ONE << 96, 0);
         handle.update_dex_pool(
+            "world-chain-usdc-wld",
             0,
             1,
             0,
@@ -2479,11 +2723,107 @@ mod tests {
             binance_symbol: "WLDUSDC".to_owned(),
             binance_base_decimals: 18,
             journal_scope: scope(),
+            canary_policies: BTreeMap::new(),
         };
         valid.validate().unwrap();
         let mut invalid = valid;
         invalid.entry_stop_file = PathBuf::new();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn m9_canary_fails_closed_until_ready_and_enforces_the_parent_cap() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-m9-canary-authority-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+
+        let mut canary_opportunity = opportunity();
+        canary_opportunity.pair_id = "arbitrum-usdc-esp".to_owned();
+        canary_opportunity.symbol = "ESPUSDC".to_owned();
+        let preflight = EntryPreflightHandle::default();
+        let mut quote = preflight_quote(Decimal::new(101, 2), Decimal::new(102, 2), 7);
+        quote.symbol = Arc::from("ESPUSDC");
+        preflight.update_quote(&quote);
+        preflight.configure_max_transport_silence("ESPUSDC", 30_000);
+        preflight.configure_dex_max_head_age(30_000);
+        preflight.update_dex_head("arbitrum-usdc-esp", std::time::Instant::now());
+        preflight.update_dex_pool(
+            "arbitrum-usdc-esp",
+            0,
+            1,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
+
+        let readiness = Arc::new(AtomicBool::new(false));
+        let market_data_readiness = Arc::new(AtomicBool::new(true));
+        let canary_scope = TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-account-main".to_owned(),
+            network_id: "arbitrum-one".to_owned(),
+            chain_id: 42_161,
+            wallet_id: "arbitrum-one:wallet-primary".to_owned(),
+            strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
+            symbol: "ESPUSDC".to_owned(),
+        };
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            LiveRiskLimits {
+                entry_stop_file: stop_file.clone(),
+                entry_preflight: preflight,
+                binance_symbol: "WLDUSDC".to_owned(),
+                binance_base_decimals: 18,
+                journal_scope: scope(),
+                canary_policies: BTreeMap::from([(
+                    canary_opportunity.pair_id.clone(),
+                    LiveCanaryPolicy {
+                        journal_scope: canary_scope,
+                        maximum_trade_notional_token_a_base_units: 10_000_000,
+                        maximum_total_notional_token_a_base_units: 20_000_000,
+                        maximum_unhedged_notional_token_a_base_units: 10_000_000,
+                        maximum_realized_loss_token_a_base_units: 1_000_000,
+                        maximum_parent_trades: 2,
+                        maximum_failed_parent_trades: 1,
+                        maximum_concurrent_trades: 1,
+                        rollout_duration: Duration::from_secs(15 * 60),
+                        readiness: Arc::clone(&readiness),
+                        market_data_readiness: Arc::clone(&market_data_readiness),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        let error = task.authorize_entry(&canary_opportunity).unwrap_err();
+        assert!(format!("{error:#}").contains("readiness is not healthy"));
+
+        readiness.store(true, Ordering::Release);
+        task.authorize_entry(&canary_opportunity).unwrap();
+
+        market_data_readiness.store(false, Ordering::Release);
+        let error = task.authorize_entry(&canary_opportunity).unwrap_err();
+        assert!(format!("{error:#}").contains("market-data readiness"));
+
+        market_data_readiness.store(true, Ordering::Release);
+        canary_opportunity.cost_token_a_base_units = 10_000_001;
+        let error = task.authorize_entry(&canary_opportunity).unwrap_err();
+        assert!(format!("{error:#}").contains("per-trade notional limit"));
+
+        drop(task);
+        fs::remove_file(journal).unwrap();
+        let _ = fs::remove_file(stop_file);
     }
 
     #[tokio::test]
