@@ -985,13 +985,9 @@ impl RebalanceExecutor {
             "approved manual ESP wallet balance does not equal the exact receipt credit"
         );
         let master = self.treasury_binance.account_information().await?;
-        let master_balance = master
-            .balances
-            .iter()
-            .find(|balance| balance.asset == token_symbol)
-            .context("approved manual ESP asset is absent from the master account")?;
+        let (master_free, master_locked) = account_asset_balance_or_zero(&master, token_symbol);
         ensure!(
-            master_balance.free == Decimal::ZERO && master_balance.locked == Decimal::ZERO,
+            master_free == Decimal::ZERO && master_locked == Decimal::ZERO,
             "approved manual ESP withdrawal did not consume the exact master inventory"
         );
         let binance_balance_after = self.binance_balance(&operation).await?;
@@ -2701,15 +2697,10 @@ fn validate_master_subaccount_view(
     master_balances: &[SubAccountAssetBalance],
 ) -> anyhow::Result<()> {
     for asset in ["ESP", "USDC", "WLD"] {
-        let trading = trading_account
-            .balances
-            .iter()
-            .find(|balance| balance.asset == asset);
+        let (trading_free, trading_locked) = account_asset_balance_or_zero(trading_account, asset);
         let master = master_balances
             .iter()
             .find(|balance| balance.asset == asset);
-        let trading_free = trading.map_or(Decimal::ZERO, |balance| balance.free);
-        let trading_locked = trading.map_or(Decimal::ZERO, |balance| balance.locked);
         let master_free = master.map_or(Decimal::ZERO, |balance| balance.free);
         let master_locked = master.map_or(Decimal::ZERO, |balance| balance.locked);
         ensure!(
@@ -2718,6 +2709,16 @@ fn validate_master_subaccount_view(
         );
     }
     Ok(())
+}
+
+fn account_asset_balance_or_zero(account: &AccountInformation, asset: &str) -> (Decimal, Decimal) {
+    account
+        .balances
+        .iter()
+        .find(|balance| balance.asset == asset)
+        .map_or((Decimal::ZERO, Decimal::ZERO), |balance| {
+            (balance.free, balance.locked)
+        })
 }
 
 fn withdrawal_received_base_units(record: &WithdrawalRecord, decimals: u8) -> anyhow::Result<U256> {
@@ -2978,7 +2979,10 @@ mod tests {
     use rust_decimal::Decimal;
 
     use crate::{
-        binance::capital::{NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord},
+        binance::{
+            account::{AccountInformation, AssetBalance},
+            capital::{NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord},
+        },
         chain::rpc::{ReceiptLog, TransactionReceipt},
         rebalance::{
             Direction, RebalanceExecutionIntent, RebalanceExecutionOperation,
@@ -2988,11 +2992,11 @@ mod tests {
 
     use super::{
         ARBITRUM_CHAIN_ID, BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID,
-        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, matches_travel_rule_record_identity_without_client_id,
-        merge_travel_rule_withdrawal_detail, plan_direct_prefunding,
-        reconcile_approved_travel_rule_rejection, validate_across_fill_receipt,
-        validate_approved_asset, validate_direct_withdrawal_receipt,
+        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, account_asset_balance_or_zero, base_units_to_decimal,
+        decimal_to_base_units, decimal_to_base_units_floor,
+        matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
+        plan_direct_prefunding, reconcile_approved_travel_rule_rejection,
+        validate_across_fill_receipt, validate_approved_asset, validate_direct_withdrawal_receipt,
         validate_manual_prefunding_withdrawal_record, withdrawal_received_base_units,
         withdrawal_requested_base_units,
     };
@@ -3009,6 +3013,35 @@ mod tests {
             withdraw_max: Decimal::from_str_exact("1000000").unwrap(),
             withdraw_integer_multiple: Decimal::from_str_exact("0.01").unwrap(),
         }
+    }
+
+    #[test]
+    fn omitted_zero_master_asset_is_a_zero_balance() {
+        let mut account = AccountInformation {
+            can_trade: true,
+            can_withdraw: true,
+            can_deposit: true,
+            brokered: false,
+            require_self_trade_prevention: false,
+            update_time: 0,
+            account_type: "SPOT".to_owned(),
+            balances: Vec::new(),
+            permissions: vec!["SPOT".to_owned()],
+        };
+        assert_eq!(
+            account_asset_balance_or_zero(&account, "ESP"),
+            (Decimal::ZERO, Decimal::ZERO)
+        );
+
+        account.balances.push(AssetBalance {
+            asset: "ESP".to_owned(),
+            free: Decimal::from(1),
+            locked: Decimal::from(2),
+        });
+        assert_eq!(
+            account_asset_balance_or_zero(&account, "ESP"),
+            (Decimal::from(1), Decimal::from(2))
+        );
     }
 
     #[test]
