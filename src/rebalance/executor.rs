@@ -629,6 +629,15 @@ fn validate_transition(
             P::BinanceTransferCompleted { .. },
             P::BinanceWithdrawalSubmissionStarted { .. },
         ) => true,
+        // Journals written before the submission-intent state was introduced
+        // legitimately advanced straight to Submitted. New runtime code never
+        // emits this transition, but replay must remain backward compatible.
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::BinanceTransferCompleted { .. },
+            P::BinanceWithdrawalSubmitted { .. },
+        ) => true,
         (
             Route::Direct { .. },
             Direction::BinanceToWallet,
@@ -685,6 +694,13 @@ fn validate_transition(
             Direction::BinanceToWallet,
             P::BinanceTransferCompleted { .. },
             P::BinanceWithdrawalSubmissionStarted { .. },
+        ) => true,
+        // Legacy replay compatibility; new submissions persist Started first.
+        (
+            Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceTransferCompleted { .. },
+            P::BinanceWithdrawalSubmitted { .. },
         ) => true,
         (
             Route::Across { .. },
@@ -1105,6 +1121,52 @@ mod tests {
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted { .. }
         ));
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_direct_withdrawal_without_submission_intent_remains_replayable() {
+        let path = path("legacy-direct-withdrawal");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 17,
+                    bridge_balance_before: U256::from(8_000_000_u64),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: 17,
+                    bridge_balance_before: U256::from(8_000_000_u64),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                    submission_reference: "legacy-withdrawal".to_owned(),
+                    bridge_balance_before: U256::from(8_000_000_u64),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(matches!(
+            replayed.operations()[&operation_id].progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted { .. }
+        ));
+        drop(replayed);
         fs::remove_file(path).unwrap();
     }
 
