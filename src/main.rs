@@ -714,10 +714,7 @@ async fn prefund_arbitrum_canary(
     let token_b_debit_cap = U256::from_str_radix(&prefunding.maximum_token_b_debit_base_units, 10)
         .context("M9 token_b debit cap is invalid")?;
     let approved_recovery = prefunding.approved_travel_rule_recovery.as_ref();
-    ensure!(
-        config.rebalance_binance_withdrawal_api_mode == prefunding.binance_withdrawal_api_mode,
-        "M9 prefunding withdrawal API mode differs from the approved domain artifact"
-    );
+    let approved_standard_recovery = prefunding.approved_unindexed_standard_recovery.as_ref();
 
     let mut direct_networks = BTreeMap::new();
     for token in [&pair.token_a, &pair.token_b] {
@@ -765,11 +762,21 @@ async fn prefund_arbitrum_canary(
             )?,
             maximum_esp: rebalance_base_units_to_decimal(token_b_debit_cap, pair.token_b.decimals)?,
             operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
-            binance_withdrawal_api_mode: config.rebalance_binance_withdrawal_api_mode.clone(),
+            binance_withdrawal_api_mode: prefunding.token_a_withdrawal_api_mode.clone(),
         },
     )
     .await?;
     let active = executor.active_operation()?.cloned();
+    if let Some(active) = &active {
+        let active_mode = if active.intent.token_symbol == pair.token_a.symbol {
+            &prefunding.token_a_withdrawal_api_mode
+        } else if active.intent.token_symbol == pair.token_b.symbol {
+            &prefunding.token_b_withdrawal_api_mode
+        } else {
+            bail!("active prefunding operation has an unexpected token")
+        };
+        executor.set_binance_withdrawal_api_mode(active_mode)?;
+    }
     executor.log_active_operation_recovery_evidence().await?;
     let recovered = if recovery_only {
         match (approved_recovery, active) {
@@ -807,6 +814,35 @@ async fn prefund_arbitrum_canary(
             (Some(_), None) => None,
             (None, _) => bail!("versioned ESP incident recovery approval is absent"),
         }
+    } else if let (Some(recovery), Some(active)) = (approved_standard_recovery, active.as_ref())
+        && active.intent.operation_id == recovery.operation_id
+    {
+        let amount = U256::from_str_radix(&recovery.token_amount_base_units, 10)
+            .context("approved standard-withdrawal recovery amount is invalid")?;
+        ensure!(
+            recovery.capital_withdrawal_count == 0 && recovery.travel_rule_withdrawal_count == 0,
+            "approved standard-withdrawal recovery permits an indexed withdrawal"
+        );
+        ensure!(
+            active.intent.token_symbol == recovery.token_symbol && active.intent.amount == amount,
+            "active rebalance operation differs from the approved USDC incident"
+        );
+        executor.set_binance_withdrawal_api_mode(&prefunding.token_a_withdrawal_api_mode)?;
+        Some(
+            executor
+                .recover_approved_unindexed_standard_submission(
+                    &recovery.token_symbol,
+                    amount,
+                    configured_wallet,
+                    &arb_bot::rebalance::Route::Direct {
+                        binance_network: prefunding.binance_network.clone(),
+                        chain_id: ARBITRUM_CHAIN_ID,
+                    },
+                    &recovery.operation_id,
+                    recovery.transfer_transaction_id,
+                )
+                .await?,
+        )
     } else if let (Some(recovery), Some(active)) = (approved_recovery, active) {
         let rejected_amount = U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
             .context("approved Travel Rule rejected amount is invalid")?;
@@ -842,9 +878,7 @@ async fn prefund_arbitrum_canary(
                     .await?,
             )
         } else {
-            bail!(
-                "active rebalance operation is outside the exact approved Travel Rule incident; sanitised recovery evidence was logged"
-            )
+            executor.recover_active().await?
         }
     } else {
         executor.recover_active().await?
@@ -903,6 +937,12 @@ async fn prefund_arbitrum_canary(
     ];
     let mut transfer_count = 0_u16;
     for (token, target, fee_cap, debit_cap) in targets {
+        let withdrawal_api_mode = if token.symbol == pair.token_a.symbol {
+            &prefunding.token_a_withdrawal_api_mode
+        } else {
+            &prefunding.token_b_withdrawal_api_mode
+        };
+        executor.set_binance_withdrawal_api_mode(withdrawal_api_mode)?;
         let contract = token
             .contract
             .parse::<Address>()
@@ -938,6 +978,35 @@ async fn prefund_arbitrum_canary(
             );
             continue;
         };
+        if token.symbol == pair.token_b.symbol {
+            let recovery =
+                approved_recovery.context("approved ESP Travel Rule recovery is absent")?;
+            let rejected_amount =
+                U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
+                    .context("approved Travel Rule rejected amount is invalid")?;
+            let completed = executor
+                .retry_approved_failed_travel_rule_with_standard(
+                    &recovery.rejected_token_symbol,
+                    rejected_amount,
+                    configured_wallet,
+                    &prefunding.binance_network,
+                    ARBITRUM_CHAIN_ID,
+                )
+                .await?;
+            let wallet_after = match completed.progress {
+                arb_bot::rebalance::RebalanceExecutionProgress::Completed {
+                    wallet_balance_after,
+                    ..
+                } => wallet_balance_after,
+                _ => bail!("approved ESP retry did not reach a terminal completed state"),
+            };
+            ensure!(
+                wallet_after >= target,
+                "{} prefunding completed below the approved wallet target",
+                token.symbol
+            );
+            continue;
+        }
         ensure!(
             binance_before >= plan.requested_debit,
             "{} Binance free balance is below the approved prefunding debit",

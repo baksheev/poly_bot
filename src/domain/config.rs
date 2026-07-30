@@ -422,7 +422,8 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub production_approval_actor: String,
     pub production_approval_recorded_at_utc: String,
     pub binance_network: String,
-    pub binance_withdrawal_api_mode: String,
+    pub token_a_withdrawal_api_mode: String,
+    pub token_b_withdrawal_api_mode: String,
     pub maximum_transfer_count: u16,
     pub maximum_token_a_withdrawal_fee_base_units: String,
     pub maximum_token_b_withdrawal_fee_base_units: String,
@@ -432,6 +433,8 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     pub retry_after_verified_address: bool,
     #[serde(default)]
     pub approved_travel_rule_recovery: Option<LiveCanaryTravelRuleRecoveryConfig>,
+    #[serde(default)]
+    pub approved_unindexed_standard_recovery: Option<LiveCanaryUnindexedStandardRecoveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -446,6 +449,19 @@ pub struct LiveCanaryTravelRuleRecoveryConfig {
     pub rejected_error_message: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryUnindexedStandardRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub operation_id: String,
+    pub token_symbol: String,
+    pub token_amount_base_units: String,
+    pub transfer_transaction_id: u64,
+    pub capital_withdrawal_count: u16,
+    pub travel_rule_withdrawal_count: u16,
+}
+
 impl LiveCanaryPrefundingRebalanceConfig {
     fn validate(&self, pair: &PairConfig, canary: &LiveCanaryConfig) -> anyhow::Result<()> {
         ensure!(
@@ -454,7 +470,8 @@ impl LiveCanaryPrefundingRebalanceConfig {
                 && !self.production_approval_actor.trim().is_empty()
                 && self.production_approval_recorded_at_utc.ends_with('Z')
                 && self.binance_network == "ARBITRUM"
-                && self.binance_withdrawal_api_mode == "standard"
+                && self.token_a_withdrawal_api_mode == "travel_rule"
+                && self.token_b_withdrawal_api_mode == "standard"
                 && pair.chain.chain_id == 42_161
                 && pair.chain.binance_network_name == self.binance_network
                 && self.maximum_transfer_count == 2,
@@ -500,9 +517,37 @@ impl LiveCanaryPrefundingRebalanceConfig {
         if let Some(recovery) = &self.approved_travel_rule_recovery {
             recovery.validate(pair, canary, self)?;
         }
+        if let Some(recovery) = &self.approved_unindexed_standard_recovery {
+            recovery.validate(pair)?;
+        }
         ensure!(
             !self.retry_after_verified_address || self.approved_travel_rule_recovery.is_some(),
             "pair {} cannot retry after address verification without the exact rejected incident",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+impl LiveCanaryUnindexedStandardRecoveryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        ensure!(
+            !self.production_approval_actor.trim().is_empty()
+                && self.production_approval_recorded_at_utc.ends_with('Z')
+                && self.operation_id == "rebalance-272-c36484318ac04bca"
+                && self.token_symbol == pair.token_a.symbol
+                && self.transfer_transaction_id == 395_795_295_053
+                && self.capital_withdrawal_count == 0
+                && self.travel_rule_withdrawal_count == 0,
+            "pair {} unindexed standard-withdrawal recovery identity is invalid",
+            pair.id
+        );
+        ensure!(
+            parse_base_units_u256(
+                &self.token_amount_base_units,
+                "live_canary.prefunding_rebalance.approved_unindexed_standard_recovery.token_amount_base_units",
+            )? == U256::from(3_000_000_u64),
+            "pair {} unindexed standard-withdrawal recovery amount changed",
             pair.id
         );
         Ok(())
@@ -1436,7 +1481,8 @@ mod tests {
         );
         let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
         assert_eq!(prefunding.binance_network, "ARBITRUM");
-        assert_eq!(prefunding.binance_withdrawal_api_mode, "standard");
+        assert_eq!(prefunding.token_a_withdrawal_api_mode, "travel_rule");
+        assert_eq!(prefunding.token_b_withdrawal_api_mode, "standard");
         assert_eq!(prefunding.maximum_transfer_count, 2);
         assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
         assert_eq!(

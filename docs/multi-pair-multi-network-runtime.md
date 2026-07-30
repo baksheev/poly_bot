@@ -1966,13 +1966,18 @@ balance mismatch fails closed.
 
 Rails originally used `/sapi/v1/capital/withdraw/apply`; commit `6520658`
 globally replaced it with `/sapi/v1/localentity/withdraw/apply`. That global
-choice works for assets requiring the account-specific questionnaire but is
-the source of ESP's `[031031]` rejection. With the exact wallet ownership
-record now `VERIFIED`, the separately approved M9 artifact pins only its
-one-shot USDC/ESP prefunding init to the standard capital endpoint. The normal
-WLD runtime stays on the Travel Rule endpoint, API selection cannot change
-after a submission, and no bridge or swap is authorized while direct Arbitrum
-withdrawal remains available.
+choice works for USDC and WLD under the account's `AE` questionnaire but is
+the source of ESP's `[031031]` rejection. The exact address is now both
+ownership-`VERIFIED` and present in the capital withdrawal-address list for
+Arbitrum with `whiteStatus=true`. The separately approved M9 artifact
+therefore pins USDC to `travel_rule` and ESP to `standard`. A failed standard
+USDC probe is recovered only after both withdrawal histories remain empty,
+the exact internal transfer is `SUCCESS`, wallet balance is unchanged, and
+the whitelist record is live; the same durable operation then resumes through
+Travel Rule without another internal transfer. The prior ESP master inventory
+is likewise reused for the exact standard submission. API selection is
+journaled before the request, and no bridge or swap is authorized while
+direct Arbitrum withdrawal remains available.
 
 Deliver:
 

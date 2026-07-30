@@ -134,7 +134,9 @@ jobs:
             = 500000000000000000000
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.retry_after_verified_address" "${domain_config}")" \
             = true
-          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.binance_withdrawal_api_mode" "${domain_config}")" \
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.token_a_withdrawal_api_mode" "${domain_config}")" \
+            = travel_rule
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.token_b_withdrawal_api_mode" "${domain_config}")" \
             = standard
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_symbol" "${domain_config}")" \
             = ESP
@@ -142,6 +144,10 @@ jobs:
             = 401200000000000000000
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_error_code" "${domain_config}")" \
             = -4024
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_unindexed_standard_recovery.operation_id" "${domain_config}")" \
+            = rebalance-272-c36484318ac04bca
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_unindexed_standard_recovery.transfer_transaction_id" "${domain_config}")" \
+            = 395795295053
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
             = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \

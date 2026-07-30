@@ -605,6 +605,15 @@ impl RebalanceExecutor {
         self.execution_journal.operations()
     }
 
+    pub fn set_binance_withdrawal_api_mode(&mut self, mode: &str) -> anyhow::Result<()> {
+        ensure!(
+            matches!(mode, "standard" | "travel_rule"),
+            "rebalance Binance withdrawal API mode is invalid"
+        );
+        self.limits.binance_withdrawal_api_mode = mode.to_owned();
+        Ok(())
+    }
+
     pub async fn log_active_operation_recovery_evidence(&self) -> anyhow::Result<()> {
         let Some(operation) = self.execution_journal.active_operation()? else {
             tracing::info!("no active rebalance operation requires recovery");
@@ -845,6 +854,245 @@ impl RebalanceExecutor {
                 reason: incident_reason.to_owned(),
             },
         )
+    }
+
+    pub async fn recover_approved_unindexed_standard_submission(
+        &mut self,
+        token_symbol: &str,
+        amount: U256,
+        wallet_owner: Address,
+        route: &Route,
+        operation_id: &str,
+        transfer_transaction_id: u64,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        ensure!(
+            self.limits.binance_withdrawal_api_mode == "travel_rule",
+            "approved USDC recovery must switch to Travel Rule before submission"
+        );
+        let operation = self
+            .execution_journal
+            .active_operation()?
+            .cloned()
+            .context("approved standard-withdrawal recovery has no active operation")?;
+        let bridge_balance_before = match operation.progress {
+            RebalanceExecutionProgress::BinanceTransferCompleted {
+                transaction_id,
+                bridge_balance_before,
+            } => {
+                ensure!(
+                    transaction_id == transfer_transaction_id,
+                    "approved standard-withdrawal recovery transfer id changed"
+                );
+                bridge_balance_before
+            }
+            _ => bail!("approved standard-withdrawal recovery state changed"),
+        };
+        let Route::Direct {
+            binance_network: network,
+            chain_id,
+        } = route
+        else {
+            bail!("approved standard-withdrawal recovery route is not direct")
+        };
+        ensure!(
+            operation.intent.operation_id == operation_id
+                && operation.intent.token_symbol == token_symbol
+                && operation.intent.amount == amount
+                && operation.intent.wallet_owner == wallet_owner
+                && operation.intent.direction == Direction::BinanceToWallet
+                && &operation.intent.route == route,
+            "active operation does not match the approved standard-withdrawal incident"
+        );
+        ensure!(
+            self.treasury_binance
+                .withdrawal_history(token_symbol, &operation.intent.withdraw_order_id)
+                .await?
+                .is_empty(),
+            "approved standard-withdrawal recovery found an indexed capital withdrawal"
+        );
+        ensure!(
+            self.treasury_binance
+                .travel_rule_withdrawal_history_v2(
+                    token_symbol,
+                    network,
+                    &operation.intent.withdraw_order_id,
+                )
+                .await?
+                .is_empty(),
+            "approved standard-withdrawal recovery found an indexed Travel Rule withdrawal"
+        );
+        let transfer = self
+            .treasury_binance
+            .universal_transfer_history(&self.subaccount_email, &operation.intent.withdraw_order_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("approved standard-withdrawal recovery lost its master transfer")?;
+        validate_master_transfer_record(&operation, &self.subaccount_email, &transfer)?;
+        ensure!(
+            transfer.status == "SUCCESS" && transfer.transaction_id == transfer_transaction_id,
+            "approved standard-withdrawal recovery transfer evidence changed"
+        );
+        self.ensure_wallet_is_whitelisted(wallet_owner, network, token_symbol)
+            .await?;
+        let wallet_balance = self
+            .evm
+            .rpc(*chain_id)?
+            .erc20_balance(operation.intent.token_contract, wallet_owner)
+            .await?;
+        ensure!(
+            wallet_balance == bridge_balance_before,
+            "approved standard-withdrawal recovery wallet balance changed"
+        );
+        tracing::info!(
+            operation_id,
+            token = token_symbol,
+            amount_base_units = amount.to_string(),
+            capital_withdrawal_count = 0,
+            travel_rule_withdrawal_count = 0,
+            wallet_balance = wallet_balance.to_string(),
+            retry_api_mode = "travel_rule",
+            "proved the unindexed standard submission absent and resumed the same durable operation"
+        );
+        self.process(operation, true).await
+    }
+
+    pub async fn retry_approved_failed_travel_rule_with_standard(
+        &mut self,
+        token_symbol: &str,
+        amount: U256,
+        wallet_owner: Address,
+        network: &str,
+        chain_id: u64,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        ensure!(
+            self.limits.binance_withdrawal_api_mode == "standard",
+            "approved ESP retry must use the standard withdrawal API"
+        );
+        ensure!(
+            self.execution_journal.active_operation()?.is_none(),
+            "another rebalance operation is active"
+        );
+        let mut matching = self
+            .execution_journal
+            .operations()
+            .values()
+            .filter(|operation| {
+                operation.intent.token_symbol == token_symbol
+                    && operation.intent.amount == amount
+                    && operation.intent.wallet_owner == wallet_owner
+                    && operation.intent.direction == Direction::BinanceToWallet
+                    && operation.intent.route
+                        == Route::Direct {
+                            binance_network: network.to_owned(),
+                            chain_id,
+                        }
+                    && matches!(
+                        &operation.progress,
+                        RebalanceExecutionProgress::Failed { reason }
+                            if reason.contains("approved deterministic Travel Rule rejection")
+                    )
+            });
+        let operation = matching
+            .next()
+            .cloned()
+            .context("approved ESP retry lost the failed Travel Rule operation")?;
+        ensure!(
+            matching.next().is_none(),
+            "approved ESP retry matched multiple failed operations"
+        );
+        ensure!(
+            self.treasury_binance
+                .withdrawal_history(token_symbol, &operation.intent.withdraw_order_id)
+                .await?
+                .is_empty(),
+            "approved ESP retry found an indexed capital withdrawal"
+        );
+        let travel_rule = self
+            .treasury_binance
+            .travel_rule_withdrawal_history_v2(
+                token_symbol,
+                network,
+                &operation.intent.withdraw_order_id,
+            )
+            .await?;
+        reconcile_approved_travel_rule_rejection(&travel_rule)?;
+        let transfer = self
+            .treasury_binance
+            .universal_transfer_history(&self.subaccount_email, &operation.intent.withdraw_order_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("approved ESP retry lost its master transfer")?;
+        validate_master_transfer_record(&operation, &self.subaccount_email, &transfer)?;
+        ensure!(
+            transfer.status == "SUCCESS",
+            "approved ESP retry master transfer is not successful"
+        );
+        self.ensure_wallet_is_whitelisted(wallet_owner, network, token_symbol)
+            .await?;
+        let account = self.treasury_binance.account_information().await?;
+        let requested = base_units_to_decimal(amount, operation.intent.token_decimals)?;
+        let balance = account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == token_symbol)
+            .context("approved ESP retry asset is absent from the master account")?;
+        ensure!(
+            balance.free >= requested && balance.locked == Decimal::ZERO,
+            "approved ESP retry master inventory is unavailable"
+        );
+        let bridge_balance_before = self
+            .evm
+            .rpc(chain_id)?
+            .erc20_balance(operation.intent.token_contract, wallet_owner)
+            .await?;
+        let mut operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: "standard".to_owned(),
+                bridge_balance_before,
+            },
+        )?;
+        let submission_reference = self
+            .submit_binance_withdrawal(&operation, network, requested)
+            .await?;
+        operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                submission_reference,
+                bridge_balance_before,
+            },
+        )?;
+        tracing::info!(
+            operation_id = operation.intent.operation_id,
+            token = token_symbol,
+            amount_base_units = amount.to_string(),
+            api_mode = "standard",
+            reused_master_transfer_id = transfer.transaction_id,
+            "submitted the approved direct ESP withdrawal without another master transfer"
+        );
+        self.process(operation, false).await
+    }
+
+    async fn ensure_wallet_is_whitelisted(
+        &self,
+        wallet_owner: Address,
+        network: &str,
+        token_symbol: &str,
+    ) -> anyhow::Result<()> {
+        let wallet = format!("{wallet_owner:#x}");
+        let records = self.treasury_binance.withdrawal_address_list().await?;
+        ensure!(
+            records.iter().any(|record| {
+                record.address.eq_ignore_ascii_case(&wallet)
+                    && record.network == network
+                    && (record.coin.is_empty() || record.coin == token_symbol)
+                    && record.white_status
+            }),
+            "Binance withdrawal whitelist does not authorize the exact wallet, network and token"
+        );
+        Ok(())
     }
 
     pub async fn recover_active(&mut self) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
@@ -1693,16 +1941,20 @@ impl RebalanceExecutor {
 
     async fn begin_binance_withdrawal(
         &mut self,
-        operation: RebalanceExecutionOperation,
+        mut operation: RebalanceExecutionOperation,
         submission_safe: bool,
         network: &str,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
-        let RebalanceExecutionProgress::BinanceTransferCompleted {
-            bridge_balance_before,
-            ..
-        } = operation.progress
-        else {
-            return Ok(operation);
+        let bridge_balance_before = match &operation.progress {
+            RebalanceExecutionProgress::BinanceTransferCompleted {
+                bridge_balance_before,
+                ..
+            }
+            | RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                bridge_balance_before,
+                ..
+            } => *bridge_balance_before,
+            _ => return Ok(operation),
         };
         let existing = self
             .treasury_binance
@@ -1714,11 +1966,52 @@ impl RebalanceExecutor {
         let submission_reference = if let Some(record) = existing.first() {
             validate_withdrawal_record(&operation, record)?;
             record.id.clone()
+        } else if let RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+            api_mode,
+            ..
+        } = &operation.progress
+        {
+            ensure!(
+                api_mode == &self.limits.binance_withdrawal_api_mode,
+                "journaled Binance withdrawal API mode differs from runtime"
+            );
+            if api_mode == "travel_rule" {
+                let travel_rule = self
+                    .treasury_binance
+                    .travel_rule_withdrawal_history_v2(
+                        &operation.intent.token_symbol,
+                        network,
+                        &operation.intent.withdraw_order_id,
+                    )
+                    .await?;
+                if let Some(record) = travel_rule.first() {
+                    ensure!(
+                        record.tr_id > 0,
+                        "indexed Travel Rule withdrawal has an invalid id"
+                    );
+                    record.tr_id.to_string()
+                } else {
+                    bail!(
+                        "journaled Binance withdrawal submission has no indexed outcome; operator review required"
+                    )
+                }
+            } else {
+                bail!(
+                    "journaled Binance withdrawal submission has no indexed outcome; operator review required"
+                )
+            }
         } else {
             ensure!(
                 submission_safe,
                 "master transfer completed but no Binance withdrawal is indexed; operator review required"
             );
+            operation = self.execution_journal.advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: self.limits.binance_withdrawal_api_mode.clone(),
+                    bridge_balance_before,
+                },
+            )?;
             let amount =
                 base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
             self.submit_binance_withdrawal(&operation, network, amount)

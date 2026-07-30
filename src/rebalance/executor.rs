@@ -94,6 +94,11 @@ pub enum RebalanceExecutionProgress {
         #[serde(with = "u256_serde")]
         bridge_balance_before: U256,
     },
+    BinanceWithdrawalSubmissionStarted {
+        api_mode: String,
+        #[serde(with = "u256_serde")]
+        bridge_balance_before: U256,
+    },
     BinanceWithdrawalSubmitted {
         submission_reference: String,
         #[serde(with = "u256_serde")]
@@ -586,8 +591,19 @@ fn validate_transition(
     previous: &RebalanceExecutionProgress,
     next: &RebalanceExecutionProgress,
 ) -> anyhow::Result<()> {
+    let approved_terminal_retry = matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Failed { reason },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                ..
+            },
+        ) if reason.contains("approved deterministic Travel Rule rejection")
+            && api_mode == "standard"
+    );
     ensure!(
-        !previous.terminal(),
+        !previous.terminal() || approved_terminal_retry,
         "rebalance operation is already terminal"
     );
     if matches!(next, RebalanceExecutionProgress::Failed { .. }) {
@@ -611,8 +627,23 @@ fn validate_transition(
             Route::Direct { .. },
             Direction::BinanceToWallet,
             P::BinanceTransferCompleted { .. },
+            P::BinanceWithdrawalSubmissionStarted { .. },
+        ) => true,
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::BinanceWithdrawalSubmissionStarted { .. },
             P::BinanceWithdrawalSubmitted { .. },
         ) => true,
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::Failed { reason },
+            P::BinanceWithdrawalSubmissionStarted { api_mode, .. },
+        ) => {
+            reason.contains("approved deterministic Travel Rule rejection")
+                && api_mode == "standard"
+        }
         (
             Route::Direct { .. },
             Direction::BinanceToWallet,
@@ -653,6 +684,12 @@ fn validate_transition(
             Route::Across { .. },
             Direction::BinanceToWallet,
             P::BinanceTransferCompleted { .. },
+            P::BinanceWithdrawalSubmissionStarted { .. },
+        ) => true,
+        (
+            Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceWithdrawalSubmissionStarted { .. },
             P::BinanceWithdrawalSubmitted { .. },
         ) => true,
         (
@@ -740,6 +777,10 @@ fn validate_progress_evidence(
         | P::BinanceTransferCompleted { transaction_id, .. } => {
             ensure!(*transaction_id > 0, "rebalance Binance transfer id is zero")
         }
+        P::BinanceWithdrawalSubmissionStarted { api_mode, .. } => ensure!(
+            matches!(api_mode.as_str(), "standard" | "travel_rule"),
+            "rebalance Binance withdrawal submission API mode is invalid"
+        ),
         P::BinanceWithdrawalSubmitted {
             submission_reference,
             ..
@@ -1026,6 +1067,47 @@ mod tests {
         }
     }
 
+    fn direct_arbitrum() -> Route {
+        Route::Direct {
+            binance_network: "ARBITRUM".to_owned(),
+            chain_id: 42_161,
+        }
+    }
+
+    #[test]
+    fn only_approved_travel_rule_failure_can_reopen_into_standard_submission_intent() {
+        let path = path("approved-standard-retry");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: "approved deterministic Travel Rule rejection HTTP 400 code -4024"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::ZERO,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            journal.operations()[&operation_id].progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted { .. }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn legacy_approval_recovers_with_an_unset_input_amount() {
         let progress: RebalanceExecutionProgress = serde_json::from_value(serde_json::json!({
@@ -1261,6 +1343,15 @@ mod tests {
                     &operation_id,
                     RebalanceExecutionProgress::BinanceTransferCompleted {
                         transaction_id: 42,
+                        bridge_balance_before: U256::from(8_000_000_u64),
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "travel_rule".to_owned(),
                         bridge_balance_before: U256::from(8_000_000_u64),
                     },
                 )

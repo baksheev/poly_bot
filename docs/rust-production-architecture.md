@@ -390,19 +390,21 @@ fallback between APIs after a submission. A bridge remains out of scope while
 the direct capital route is available.
 
 After the exact Binance ownership record becomes `VERIFIED`, the operator's
-separate direct-withdrawal approval permits one new submission through the
-standard capital endpoint. Recovery first closes the earlier unbroadcast
-local-entity rejection against both Binance withdrawal histories. The live v2
-record is `trId=67181540`, `travelRuleStatus=4`, with no
+separate direct-withdrawal approval permits one ESP submission through the
+standard capital endpoint. USDC remains on Travel Rule. Recovery first closes
+the earlier unbroadcast local-entity rejection against both Binance withdrawal
+histories and requires the exact Arbitrum address-list record to have
+`whiteStatus=true`. The live v2 record is `trId=67181540`,
+`travelRuleStatus=4`, with no
 `withdrawalStatus` and no transaction hash. Status `4` alone is never treated
 as success or failure: recovery refetches the exact `trId`, requires stable
 asset/network/address/amount/fee/client identity, no capital withdrawal, the
 durable successful subaccount-to-master transfer, and exactly `401.2 ESP`
 free/zero locked in master Spot. A status-2 failed record is accepted only
 without a completed withdrawal or transaction hash. An ambiguous, pending, or
-broadcast record fails closed. Only after that old operation is terminal may a
-new deterministic standard-endpoint operation be submitted; a bridge or swap
-remains unauthorized.
+broadcast record fails closed. The API mode is persisted before the external
+request. The old ESP master transfer is reused, so no duplicate internal
+transfer is allowed; a bridge or swap remains unauthorized.
 
 The non-mutating Arbitrum chain-readiness probe runs in its own bounded
 background read class every 60 seconds and publishes telemetry only when its
