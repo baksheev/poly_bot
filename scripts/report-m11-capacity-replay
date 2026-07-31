@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+binary="${M11_REPLAY_BINARY:-${repo_root}/target/release/arb_bot}"
+artifact="${M11_REPLAY_ARTIFACT:-${repo_root}/config/capacity/m11-maximum-pair-replay.v1.json}"
+p99_hard_ns="${M11_DECISION_OWNER_P99_HARD_NS:-25000}"
+require_linux_rss="${M11_REQUIRE_LINUX_RSS:-false}"
+report_path="$(mktemp)"
+trap 'rm -f "${report_path}"' EXIT
+
+test -x "${binary}"
+test -f "${artifact}"
+[[ "${p99_hard_ns}" =~ ^[1-9][0-9]*$ ]]
+test "${require_linux_rss}" = true || test "${require_linux_rss}" = false
+
+(
+  cd "${repo_root}"
+  "${binary}" replay-m11-capacity --artifact "${artifact}"
+) >"${report_path}"
+
+jq -e \
+  --argjson p99_hard_ns "${p99_hard_ns}" \
+  '
+    .schema_version == 1
+    and .artifact_id == "m11-maximum-pair-replay-v1"
+    and .mode == "capacity_replay_only"
+    and .pair_count == 20
+    and .pool_count == 23
+    and .frames_per_pair >= 100000
+    and .total_strategy_frames == (.pair_count * .frames_per_pair)
+    and .reconnect_bursts >= 4
+    and .total_reconnect_events == (.pair_count * .reconnect_bursts * 2)
+    and .exact_single_strategy_routes
+      == (.total_strategy_frames + .total_reconnect_events)
+    and .route_failures == 0
+    and .dependency_faults == 0
+    and (.evaluations_by_symbol | length) == .pair_count
+    and ([.evaluations_by_symbol[] == .frames_per_pair] | all)
+    and .decision_owner_latency.samples == .total_strategy_frames
+    and .decision_owner_latency.p99_ns <= $p99_hard_ns
+    and .fairness.maximum_workers == 4
+    and .fairness.maximum_observed_running <= .fairness.maximum_workers
+    and .fairness.unique_strategies_before_noisy_repeat == .pair_count
+    and .fairness.maximum_retained_work
+      <= (.pair_count + .fairness.maximum_workers)
+    and .rehydration.cycles == (.reconnect_bursts + 1)
+    and .rehydration.pool_publications >= 100
+    and .rehydration.partial_batches_rejected == 1
+    and .rehydration.captured_batch_materialization_latency.p99_ns <= 25000
+    and .rehydration.decode_latency.p99_ns <= 25000
+    and .rehydration.pool_build_latency.p99_ns <= 200000
+    and .rehydration.publication_latency.p99_ns <= 25000
+    and .network_io_performed == false
+    and .external_mutations == 0
+    and .gate == "local_replay_ready_target_c4_required"
+  ' "${report_path}" >/dev/null
+
+if [[ "${require_linux_rss}" = true ]]; then
+  jq -e '
+    (.rss_before_bytes | type) == "number"
+    and (.rss_after_bytes | type) == "number"
+    and (.rss_high_water_bytes | type) == "number"
+  ' "${report_path}" >/dev/null
+fi
+
+cat "${report_path}"

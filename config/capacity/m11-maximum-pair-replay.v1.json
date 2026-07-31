@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "artifact_id": "m11-maximum-pair-replay-v1",
+  "mode": "capacity_replay_only",
+  "network_io_enabled": false,
+  "external_mutation_authorized": false,
+  "source": {
+    "kind": "rails_monitoring_snapshot",
+    "run_id": 4,
+    "captured_at": "2026-07-05T00:00:00Z",
+    "warning": "Stale capacity-shape input only. Empty scores and transfer capabilities make this artifact ineligible for live strategy selection."
+  },
+  "frames_per_pair": 100000,
+  "reconnect_bursts": 4,
+  "maximum_sizing_workers": 4,
+  "rehydration_fixture": {
+    "source": "Alchemy World Chain archival eth_call captured at block hash 0x8a5e7109a09bb06e8f6aceaaf4194d48113c6d2ebaedae4c646c248388b37a90",
+    "fee_pips": 3000,
+    "slot0": "0x000000000000000000000000000000000000000000000ab5d2274c6aa0f31de4fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffba58b00000000000000000000000000000000000000000000000000000000000003320000000000000000000000000000000000000000000000000000000000000438000000000000000000000000000000000000000000000000000000000000043800000000000000000000000000000000000000000000000000000000000000660000000000000000000000000000000000000000000000000000000000000001",
+    "liquidity": "0x000000000000000000000000000000000000000000000000041714170463c0ac",
+    "tick_spacing": "0x000000000000000000000000000000000000000000000000000000000000003c"
+  },
+  "pairs": [
+    {
+      "pair_id": "capacity-world-chain-wld-usdc",
+      "symbol": "WLDUSDC",
+      "network_id": "eip155:480",
+      "candidate_ids": [3167, 3168, 3177],
+      "pool_count": 3
+    },
+    {
+      "pair_id": "capacity-arbitrum-esp-usdc",
+      "symbol": "ESPUSDC",
+      "network_id": "eip155:42161",
+      "candidate_ids": [3164],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-arbitrum-chip-usdc",
+      "symbol": "CHIPUSDC",
+      "network_id": "eip155:42161",
+      "candidate_ids": [3163],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-arbitrum-pendle-usdc",
+      "symbol": "PENDLEUSDC",
+      "network_id": "eip155:42161",
+      "candidate_ids": [3173],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-arbitrum-gmx-usdc",
+      "symbol": "GMXUSDC",
+      "network_id": "eip155:42161",
+      "candidate_ids": [3187],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-arbitrum-usde-usdc",
+      "symbol": "USDEUSDC",
+      "network_id": "eip155:42161",
+      "candidate_ids": [3190],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-base-virtual-usdc",
+      "symbol": "VIRTUALUSDC",
+      "network_id": "eip155:8453",
+      "candidate_ids": [3162],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-base-morpho-usdc",
+      "symbol": "MORPHOUSDC",
+      "network_id": "eip155:8453",
+      "candidate_ids": [3169],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-base-aixbt-usdc",
+      "symbol": "AIXBTUSDC",
+      "network_id": "eip155:8453",
+      "candidate_ids": [3182],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-polygon-aave-usdc",
+      "symbol": "AAVEUSDC",
+      "network_id": "eip155:137",
+      "candidate_ids": [3166],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-polygon-link-usdc",
+      "symbol": "LINKUSDC",
+      "network_id": "eip155:137",
+      "candidate_ids": [3178, 3183],
+      "pool_count": 2
+    },
+    {
+      "pair_id": "capacity-bsc-usd1-usdt",
+      "symbol": "USD1USDT",
+      "network_id": "eip155:56",
+      "candidate_ids": [3165],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-cake-usdc",
+      "symbol": "CAKEUSDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3171],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-btc-usdc",
+      "symbol": "BTCUSDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3172],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-aster-usdc",
+      "symbol": "ASTERUSDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3174],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-wlfi-usdc",
+      "symbol": "WLFIUSDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3175],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-zkp-usdc",
+      "symbol": "ZKPUSDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3176],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-genius-usdc",
+      "symbol": "GENIUSUSDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3179],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-xpl-usdt",
+      "symbol": "XPLUSDT",
+      "network_id": "eip155:56",
+      "candidate_ids": [3180],
+      "pool_count": 1
+    },
+    {
+      "pair_id": "capacity-bsc-usd1-usdc",
+      "symbol": "USD1USDC",
+      "network_id": "eip155:56",
+      "candidate_ids": [3184],
+      "pool_count": 1
+    }
+  ]
+}

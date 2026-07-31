@@ -28,6 +28,31 @@ pub struct HydratedPool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedV3CoreHead {
+    pub sqrt_price_x96: U256,
+    pub tick: i32,
+    pub liquidity: u128,
+    pub tick_spacing: i32,
+}
+
+pub(crate) fn decode_v3_core_head(outputs: &[Vec<u8>]) -> anyhow::Result<DecodedV3CoreHead> {
+    ensure!(
+        outputs.len() == 3,
+        "partial V3 core batch cannot be published"
+    );
+    let sqrt_price_x96 = decode_u256(&outputs[0], 0)?;
+    let tick = decode_i24(&outputs[0], 1)?;
+    let liquidity = decode_u128(&outputs[1], 0)?;
+    let tick_spacing = decode_i24(&outputs[2], 0)?;
+    Ok(DecodedV3CoreHead {
+        sqrt_price_x96,
+        tick,
+        liquidity,
+        tick_spacing,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolIdentity {
     V3 { address: Address, fee_pips: u32 },
     V4 { pool_id: B256, fee_pips: u32 },
@@ -206,7 +231,8 @@ impl<'client> DexHydrator<'client> {
                     block,
                 )
                 .await?;
-            let sqrt_price_x96 = decode_u256(&head[0], 0)?;
+            let decoded = decode_v3_core_head(&head)?;
+            let sqrt_price_x96 = decoded.sqrt_price_x96;
             if sqrt_price_x96.is_zero() {
                 unavailable.push(UnavailablePool {
                     pair_id: pair.id.clone(),
@@ -218,8 +244,8 @@ impl<'client> DexHydrator<'client> {
                 });
                 continue;
             }
-            let tick = decode_i24(&head[0], 1)?;
-            let liquidity = decode_u128(&head[1], 0)?;
+            let tick = decoded.tick;
+            let liquidity = decoded.liquidity;
             if liquidity == 0 {
                 unavailable.push(UnavailablePool {
                     pair_id: pair.id.clone(),
@@ -231,7 +257,7 @@ impl<'client> DexHydrator<'client> {
                 });
                 continue;
             }
-            let tick_spacing = decode_i24(&head[2], 0)?;
+            let tick_spacing = decoded.tick_spacing;
             ensure!(tick_spacing > 0, "V3 pool returned invalid tick spacing");
 
             let ticks = self.hydrate_v3_ticks(address, tick_spacing, block).await?;
@@ -588,8 +614,8 @@ mod tests {
     use alloy_primitives::{Address, U256, address, b256};
 
     use super::{
-        decode_i24, decode_i128, decode_u128, encode_call, initialized_ticks, word_address,
-        word_b256, word_i32, word_positions, word_u32,
+        decode_i24, decode_i128, decode_u128, decode_v3_core_head, encode_call, initialized_ticks,
+        word_address, word_b256, word_i32, word_positions, word_u32,
     };
 
     #[test]
@@ -654,6 +680,25 @@ mod tests {
         data[32..64].fill(0);
         data[48..64].copy_from_slice(&123_u128.to_be_bytes());
         assert_eq!(decode_u128(&data, 1).unwrap(), 123);
+    }
+
+    #[test]
+    fn v3_core_batch_rejects_partial_data_without_changing_unavailable_pool_semantics() {
+        let slot0 = vec![0_u8; 64];
+        let liquidity = vec![0_u8; 32];
+        let mut tick_spacing = vec![0_u8; 32];
+        tick_spacing[31] = 60;
+
+        assert!(
+            decode_v3_core_head(&[slot0.clone(), liquidity.clone()])
+                .unwrap_err()
+                .to_string()
+                .contains("partial V3 core batch")
+        );
+        let decoded = decode_v3_core_head(&[slot0, liquidity, tick_spacing]).unwrap();
+        assert!(decoded.sqrt_price_x96.is_zero());
+        assert_eq!(decoded.liquidity, 0);
+        assert_eq!(decoded.tick_spacing, 60);
     }
 
     #[test]

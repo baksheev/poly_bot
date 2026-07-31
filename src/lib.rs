@@ -3,6 +3,7 @@ pub mod admission;
 pub mod arbitrage;
 pub mod balances;
 pub mod binance;
+pub mod capacity_replay;
 pub mod chain;
 pub mod config;
 pub mod dex;

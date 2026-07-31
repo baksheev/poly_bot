@@ -648,4 +648,90 @@ mod tests {
         drop(recovered);
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn maximum_pair_restart_preserves_several_known_and_unknown_operations() {
+        let path = path("m11-maximum-pair-restart");
+        let _ = fs::remove_file(&path);
+        let symbols = [
+            "WLDUSDC",
+            "ESPUSDC",
+            "CHIPUSDC",
+            "PENDLEUSDC",
+            "GMXUSDC",
+            "USDEUSDC",
+            "VIRTUALUSDC",
+            "MORPHOUSDC",
+            "AIXBTUSDC",
+            "AAVEUSDC",
+            "LINKUSDC",
+            "USD1USDT",
+            "CAKEUSDC",
+            "BTCUSDC",
+            "ASTERUSDC",
+            "WLFIUSDC",
+            "ZKPUSDC",
+            "GENIUSUSDC",
+            "XPLUSDT",
+            "USD1USDC",
+        ];
+        let intents = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, symbol)| {
+                let mut value = intent();
+                value.scope = Some(BinanceOrderJournalScope {
+                    schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                    account_id: "binance-spot:primary".to_owned(),
+                    strategy_id: format!("strategy:m11:{index:02}"),
+                });
+                value.operation_id = format!("rustarb-m11-operation-{index:02}");
+                value.client_order_id = format!("rustarbm11order{index:02}");
+                value.symbol = (*symbol).to_owned();
+                value
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut journal = BinanceOrderJournal::open(&path).unwrap();
+            for (index, value) in intents.iter().enumerate() {
+                journal.record_intent(value.clone()).unwrap();
+                let progress = match index % 4 {
+                    0 => BinanceOrderProgress::Terminal {
+                        order_id: index as u64 + 1,
+                        status: "FILLED".to_owned(),
+                        executed_quantity: "26.1".to_owned(),
+                        cumulative_quote_quantity: "9.9702".to_owned(),
+                        order: None,
+                    },
+                    1 => BinanceOrderProgress::OutcomeUnknown {
+                        reason: "injected timeout before restart".to_owned(),
+                    },
+                    2 => BinanceOrderProgress::Submitted {
+                        order_id: index as u64 + 1,
+                        status: "NEW".to_owned(),
+                        executed_quantity: "0".to_owned(),
+                        cumulative_quote_quantity: "0".to_owned(),
+                        order: None,
+                    },
+                    _ => BinanceOrderProgress::Rejected {
+                        status: 400,
+                        code: -2013,
+                        reason: "injected confirmed absence".to_owned(),
+                    },
+                };
+                journal.advance(&value.client_order_id, progress).unwrap();
+            }
+        }
+
+        let recovered = BinanceOrderJournal::open(&path).unwrap();
+        assert_eq!(recovered.operations().len(), 20);
+        assert_eq!(recovered.active_operations().len(), 10);
+        for (index, value) in intents.iter().enumerate() {
+            let operation = &recovered.operations()[&value.client_order_id];
+            assert_eq!(operation.intent, *value);
+            assert_eq!(operation.progress.terminal(), matches!(index % 4, 0 | 3));
+        }
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
 }

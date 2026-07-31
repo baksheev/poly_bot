@@ -321,6 +321,145 @@ jobs:
           namespace: ${{ env.GKE_NAMESPACE }}
           use_dns_based_endpoint: true
 
+      - name: Gate exact image with M11 maximum-pair replay on target C4
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -Eeuo pipefail
+          test "$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.replicas}')" = 1
+          node_pool="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+          test -n "${node_pool}"
+          machine_type="$(gcloud container node-pools describe "${node_pool}" \
+            --project="${GCP_PROJECT_ID}" \
+            --cluster="${GKE_CLUSTER}" \
+            --zone="${GKE_ZONE}" \
+            --format='value(config.machineType)')"
+          test "${machine_type}" = c4-highcpu-8
+
+          replay_job="arb-bot-m11-replay-${SOURCE_SHA:0:12}"
+          cleanup_replay() {
+            kubectl delete job "${replay_job}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --ignore-not-found \
+              --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup_replay EXIT
+          kubectl delete job "${replay_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --ignore-not-found \
+            --wait=true \
+            --timeout=60s >/dev/null
+
+          job_json="$(kubectl create job "${replay_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --image="${IMAGE}" \
+            --dry-run=client \
+            -o json \
+            -- /bin/sh -ec \
+              'report="$(arb_bot replay-m11-capacity --target-cpu-class c4-highcpu-8)"; printf "%s\n" "${report}" | tee /dev/termination-log')"
+          jq \
+            --arg node_pool "${node_pool}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            '
+              .metadata.labels["app.kubernetes.io/name"] = "arb-bot-m11-replay"
+              | .metadata.labels["arb-bot/source-revision"] = $source_sha
+              | .spec.backoffLimit = 0
+              | .spec.activeDeadlineSeconds = 300
+              | .spec.ttlSecondsAfterFinished = 300
+              | .spec.template.metadata.labels["app.kubernetes.io/name"] = "arb-bot-m11-replay"
+              | .spec.template.metadata.labels["arb-bot/source-revision"] = $source_sha
+              | .spec.template.spec.automountServiceAccountToken = false
+              | .spec.template.spec.nodeSelector = {
+                  "cloud.google.com/gke-nodepool": $node_pool
+                }
+              | .spec.template.spec.securityContext = {
+                  "runAsNonRoot": true,
+                  "runAsUser": 65532,
+                  "runAsGroup": 65532,
+                  "seccompProfile": {"type": "RuntimeDefault"}
+                }
+              | .spec.template.spec.containers[0].resources = {
+                  "requests": {"cpu": "1", "memory": "128Mi"},
+                  "limits": {"cpu": "1", "memory": "256Mi"}
+                }
+              | .spec.template.spec.containers[0].securityContext = {
+                  "allowPrivilegeEscalation": false,
+                  "readOnlyRootFilesystem": true,
+                  "capabilities": {"drop": ["ALL"]}
+                }
+            ' <<<"${job_json}" \
+            | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+
+          if ! kubectl wait \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=complete \
+            "job/${replay_job}" \
+            --timeout=300s; then
+            kubectl describe job "${replay_job}" --namespace "${GKE_NAMESPACE}" || true
+            kubectl get pods \
+              --namespace "${GKE_NAMESPACE}" \
+              --selector="job-name=${replay_job}" \
+              -o json || true
+            exit 1
+          fi
+          replay_pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="job-name=${replay_job}" \
+            -o jsonpath='{.items[0].metadata.name}')"
+          replay_node="$(kubectl get pod "${replay_pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.nodeName}')"
+          test "$(kubectl get node "${replay_node}" \
+            -o jsonpath='{.metadata.labels.cloud\.google\.com/gke-nodepool}')" = "${node_pool}"
+          test "$(kubectl get node "${replay_node}" \
+            -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')" = c4-highcpu-8
+
+          replay_report="$(kubectl get pod "${replay_pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json \
+            | jq -r '.status.containerStatuses[0].state.terminated.message')"
+          jq -e '
+            .artifact_id == "m11-maximum-pair-replay-v1"
+            and .mode == "capacity_replay_only"
+            and .pair_count == 20
+            and .pool_count == 23
+            and .frames_per_pair == 100000
+            and .total_strategy_frames == 2000000
+            and .reconnect_bursts == 4
+            and .total_reconnect_events == 160
+            and .exact_single_strategy_routes == 2000160
+            and .route_failures == 0
+            and .dependency_faults == 0
+            and (.evaluations_by_symbol | length) == 20
+            and ([.evaluations_by_symbol[] == 100000] | all)
+            and .decision_owner_latency.samples == 2000000
+            and .decision_owner_latency.p99_ns <= 25000
+            and .fairness.maximum_workers == 4
+            and .fairness.maximum_observed_running <= 4
+            and .fairness.unique_strategies_before_noisy_repeat == 20
+            and .fairness.maximum_retained_work <= 24
+            and .rehydration.cycles == 5
+            and .rehydration.pool_publications == 115
+            and .rehydration.partial_batches_rejected == 1
+            and .rehydration.captured_batch_materialization_latency.p99_ns <= 25000
+            and .rehydration.decode_latency.p99_ns <= 25000
+            and .rehydration.pool_build_latency.p99_ns <= 200000
+            and .rehydration.publication_latency.p99_ns <= 25000
+            and .network_io_performed == false
+            and .external_mutations == 0
+            and .target_cpu_class == "c4-highcpu-8"
+            and (.rss_before_bytes | type) == "number"
+            and (.rss_after_bytes | type) == "number"
+            and (.rss_high_water_bytes | type) == "number"
+            and .gate == "target_c4_replay_ready"
+          ' <<<"${replay_report}" >/dev/null
+          echo "${replay_report}"
+
       - name: Roll out on the fixed node
         id: rollout
         env:

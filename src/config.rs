@@ -28,6 +28,20 @@ pub enum Command {
         )]
         output: PathBuf,
     },
+    /// Replay the immutable maximum-pair M11 workload without network I/O or mutations.
+    ReplayM11Capacity {
+        #[arg(
+            long,
+            default_value = "config/capacity/m11-maximum-pair-replay.v1.json"
+        )]
+        artifact: PathBuf,
+        /// Optional local smoke override; target-node evidence uses the artifact value.
+        #[arg(long)]
+        frames_per_pair: Option<u64>,
+        /// Audited node-pool machine type; only the reviewed C4 class can produce a target gate.
+        #[arg(long)]
+        target_cpu_class: Option<String>,
+    },
     /// Run the read-only market-data shadow service.
     Run,
     /// Collect public Binance and DEX prices without trading or signing credentials.

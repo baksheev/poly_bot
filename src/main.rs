@@ -95,8 +95,8 @@ use arb_bot::{
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
-        CompiledStrategyDependencyIndex, HotPathDecisionOwner, LatestOnlySizingSlots,
-        SizingSubmission, StrategyDependencyFault, StrategyEvaluator,
+        CompiledStrategyDependencyIndex, FairLatestOnlySizingScheduler, HotPathDecisionOwner,
+        StrategyDependencyFault, StrategyEvaluator,
     },
     supervision::{DependencyFaultClass, DependencyScope, RootSupervisorPolicy, SupervisorAction},
     telemetry::{
@@ -121,6 +121,7 @@ const ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV: &str = "ARBITRAGE_ARBITRUM_WAL
 const ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV: &str = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH";
 const BINANCE_CLOCK_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY: usize = 32;
+const MAXIMUM_CONCURRENT_ADAPTIVE_SIZING_WORKERS: usize = 4;
 const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
@@ -342,6 +343,23 @@ async fn main() -> anyhow::Result<()> {
                 output_path = %output.display(),
                 domain_config_sha256 = %fingerprint,
                 "compiled canonical multi-pair domain bundle"
+            );
+            Ok(())
+        }
+        Command::ReplayM11Capacity {
+            artifact,
+            frames_per_pair,
+            target_cpu_class,
+        } => {
+            let report = arb_bot::capacity_replay::run_m11_capacity_replay(
+                artifact,
+                frames_per_pair,
+                target_cpu_class.as_deref(),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .context("failed to serialize M11 capacity replay report")?
             );
             Ok(())
         }
@@ -4203,8 +4221,10 @@ async fn run(
         .filter(|strategy| strategy.execute)
         .map(|strategy| strategy.strategy_id.clone())
         .collect::<Vec<_>>();
-    let mut adaptive_sizing_slots: LatestOnlySizingSlots<AdaptiveSizingJob> =
-        LatestOnlySizingSlots::new(sizing_strategy_ids)?;
+    let maximum_adaptive_sizing_workers =
+        MAXIMUM_CONCURRENT_ADAPTIVE_SIZING_WORKERS.min(sizing_strategy_ids.len());
+    let mut adaptive_sizing_slots: FairLatestOnlySizingScheduler<AdaptiveSizingJob> =
+        FairLatestOnlySizingScheduler::new(sizing_strategy_ids, maximum_adaptive_sizing_workers)?;
     let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
     let (startup_primary_dex, startup_shadow_dex) = drain_startup_dex_backlog(
         &mut engine,
@@ -4266,7 +4286,9 @@ async fn run(
         hot_path_strategy_count = hot_path_strategy_ids.len(),
         hot_path_direct_binance_poll = true,
         hot_path_dependency_index = "compiled_exact_symbol_pool",
-        hot_path_sizing_policy = "one_running_one_latest_pending_per_strategy",
+        hot_path_sizing_policy =
+            "globally_bounded_round_robin_one_running_one_latest_pending_per_strategy",
+        hot_path_maximum_adaptive_sizing_workers = maximum_adaptive_sizing_workers,
         hot_path_canary_strategy_id = %shadow_plan.strategy_id.as_str(),
         hot_path_canary_external_mutation_authorized = true,
         hot_path_canary_rebalance_mutation_authorized =
@@ -4796,7 +4818,8 @@ async fn run(
                     engine.evaluate_after_dex_refreshes()?;
                 }
                 engine.on_adaptive_sizing_result(result)?;
-                if let Some(next) = adaptive_sizing_slots.complete(&completed_strategy_id)? {
+                adaptive_sizing_slots.complete(&completed_strategy_id)?;
+                while let Some((_, next)) = adaptive_sizing_slots.take_ready() {
                     adaptive_sizing_tasks.spawn_blocking(move || next.run());
                 }
                 record_longest_handler(
@@ -4838,18 +4861,17 @@ async fn run(
         }
         for job in engine.take_adaptive_sizing_jobs() {
             let strategy_id = job.strategy_id()?;
-            match adaptive_sizing_slots.submit(&strategy_id, job)? {
-                SizingSubmission::Start(job) => {
-                    adaptive_sizing_tasks.spawn_blocking(move || job.run());
-                }
-                SizingSubmission::Pending { replaced } => {
-                    engine.record_adaptive_sizing_overload(
-                        &strategy_id,
-                        replaced,
-                        adaptive_sizing_slots.total_retained_work(),
-                    );
-                }
+            let submission = adaptive_sizing_slots.submit(&strategy_id, job)?;
+            if submission.replaced || submission.queued_behind_running {
+                engine.record_adaptive_sizing_overload(
+                    &strategy_id,
+                    submission.replaced,
+                    adaptive_sizing_slots.total_retained_work(),
+                );
             }
+        }
+        while let Some((_, job)) = adaptive_sizing_slots.take_ready() {
+            adaptive_sizing_tasks.spawn_blocking(move || job.run());
         }
     }
 

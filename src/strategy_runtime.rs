@@ -1134,10 +1134,161 @@ pub struct LatestOnlySizingSlots<S> {
     slots: BTreeMap<StrategyId, SizingSlot<S>>,
 }
 
+#[derive(Debug)]
+struct FairSizingSlot<S> {
+    running: bool,
+    pending: Option<S>,
+    replacements: u64,
+}
+
+/// Globally bounded latest-only work with deterministic round-robin dispatch.
+///
+/// M11 can retain at most one running and one pending snapshot per strategy
+/// without allowing a continuously updated symbol to reacquire the next free
+/// worker ahead of quieter strategies.
+#[derive(Debug)]
+pub struct FairLatestOnlySizingScheduler<S> {
+    strategy_ids: Vec<StrategyId>,
+    index_by_strategy: BTreeMap<StrategyId, usize>,
+    slots: Vec<FairSizingSlot<S>>,
+    next_index: usize,
+    running: usize,
+    maximum_running: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FairSizingSubmission {
+    pub replaced: bool,
+    pub queued_behind_running: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SizingSubmission<S> {
     Start(S),
     Pending { replaced: bool },
+}
+
+impl<S> FairLatestOnlySizingScheduler<S> {
+    pub fn new(
+        strategy_ids: impl IntoIterator<Item = StrategyId>,
+        maximum_running: usize,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            maximum_running > 0,
+            "fair sizing scheduler worker limit must be positive"
+        );
+        let mut ordered = strategy_ids.into_iter().collect::<Vec<_>>();
+        ensure!(!ordered.is_empty(), "fair sizing scheduler is empty");
+        ordered.sort();
+        let mut index_by_strategy = BTreeMap::new();
+        for (index, strategy_id) in ordered.iter().enumerate() {
+            ensure!(
+                index_by_strategy
+                    .insert(strategy_id.clone(), index)
+                    .is_none(),
+                "duplicate fair sizing strategy {}",
+                strategy_id.as_str()
+            );
+        }
+        ensure!(
+            maximum_running <= ordered.len(),
+            "fair sizing worker limit exceeds the strategy count"
+        );
+        let slots = ordered
+            .iter()
+            .map(|_| FairSizingSlot {
+                running: false,
+                pending: None,
+                replacements: 0,
+            })
+            .collect();
+        Ok(Self {
+            strategy_ids: ordered,
+            index_by_strategy,
+            slots,
+            next_index: 0,
+            running: 0,
+            maximum_running,
+        })
+    }
+
+    pub fn submit(
+        &mut self,
+        strategy_id: &StrategyId,
+        snapshot: S,
+    ) -> anyhow::Result<FairSizingSubmission> {
+        let index = *self
+            .index_by_strategy
+            .get(strategy_id)
+            .with_context(|| format!("unknown fair sizing strategy {}", strategy_id.as_str()))?;
+        let slot = &mut self.slots[index];
+        let queued_behind_running = slot.running;
+        let replaced = slot.pending.replace(snapshot).is_some();
+        if replaced {
+            slot.replacements = slot.replacements.saturating_add(1);
+        }
+        Ok(FairSizingSubmission {
+            replaced,
+            queued_behind_running,
+        })
+    }
+
+    pub fn take_ready(&mut self) -> Option<(StrategyId, S)> {
+        if self.running >= self.maximum_running {
+            return None;
+        }
+        for offset in 0..self.slots.len() {
+            let index = (self.next_index + offset) % self.slots.len();
+            let slot = &mut self.slots[index];
+            if slot.running {
+                continue;
+            }
+            let Some(snapshot) = slot.pending.take() else {
+                continue;
+            };
+            slot.running = true;
+            self.running += 1;
+            self.next_index = (index + 1) % self.slots.len();
+            return Some((self.strategy_ids[index].clone(), snapshot));
+        }
+        None
+    }
+
+    pub fn complete(&mut self, strategy_id: &StrategyId) -> anyhow::Result<()> {
+        let index = *self
+            .index_by_strategy
+            .get(strategy_id)
+            .with_context(|| format!("unknown fair sizing strategy {}", strategy_id.as_str()))?;
+        let slot = &mut self.slots[index];
+        ensure!(
+            slot.running,
+            "fair sizing slot completed without running work"
+        );
+        slot.running = false;
+        self.running = self
+            .running
+            .checked_sub(1)
+            .context("fair sizing running count underflow")?;
+        Ok(())
+    }
+
+    pub fn replacements(&self, strategy_id: &StrategyId) -> anyhow::Result<u64> {
+        self.index_by_strategy
+            .get(strategy_id)
+            .map(|index| self.slots[*index].replacements)
+            .with_context(|| format!("unknown fair sizing strategy {}", strategy_id.as_str()))
+    }
+
+    pub fn running(&self) -> usize {
+        self.running
+    }
+
+    pub fn total_retained_work(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|slot| usize::from(slot.running) + usize::from(slot.pending.is_some()))
+            .sum()
+    }
 }
 
 impl<S> LatestOnlySizingSlots<S> {
@@ -1416,6 +1567,46 @@ mod tests {
         assert_eq!(slots.complete(&esp).unwrap(), Some(10_000));
         assert_eq!(slots.complete(&wld).unwrap(), None);
         assert_eq!(slots.replacements(&esp).unwrap(), 9_998);
+    }
+
+    #[test]
+    fn fair_latest_only_scheduler_bounds_workers_and_prevents_noisy_starvation() {
+        let strategies = (0..20)
+            .map(|index| StrategyId::new(format!("strategy:m11-{index:02}")).unwrap())
+            .collect::<Vec<_>>();
+        let noisy = strategies[0].clone();
+        let mut scheduler = FairLatestOnlySizingScheduler::new(strategies.clone(), 1).unwrap();
+        for (index, strategy_id) in strategies.iter().enumerate() {
+            let submission = scheduler.submit(strategy_id, index).unwrap();
+            assert!(!submission.replaced);
+            assert!(!submission.queued_behind_running);
+        }
+
+        let (first, _) = scheduler.take_ready().unwrap();
+        assert_eq!(first, noisy);
+        assert_eq!(scheduler.running(), 1);
+        for replacement in 1..=10_000 {
+            let submission = scheduler.submit(&noisy, replacement).unwrap();
+            assert!(submission.queued_behind_running);
+            assert_eq!(submission.replaced, replacement > 1);
+        }
+        assert_eq!(scheduler.total_retained_work(), 21);
+
+        let mut dispatched = vec![first];
+        while dispatched.len() < strategies.len() {
+            let completed = dispatched.last().unwrap().clone();
+            scheduler.complete(&completed).unwrap();
+            let (strategy_id, _) = scheduler.take_ready().unwrap();
+            dispatched.push(strategy_id);
+        }
+        assert_eq!(dispatched, strategies);
+        assert_eq!(scheduler.replacements(&noisy).unwrap(), 9_999);
+        assert_eq!(scheduler.total_retained_work(), 2);
+
+        scheduler.complete(dispatched.last().unwrap()).unwrap();
+        let (next, snapshot) = scheduler.take_ready().unwrap();
+        assert_eq!(next, noisy);
+        assert_eq!(snapshot, 10_000);
     }
 
     #[test]
