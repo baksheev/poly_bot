@@ -679,11 +679,15 @@ Every trading-path change must answer:
 - If production behavior changes, is delivery through the reviewed GKE workflow
   on `main` and is the equal-window observation plan explicit?
 
-Every production mutation change must encode its authority, side effects,
-unknown-outcome behavior, restart boundary, and source-versus-compiled semantic
-contract in versioned configuration and automated tests. `scripts/quality.sh`
-must pass before delivery. CI and rollout verification confirm the exact
-revision; they are not substitutes for local contract coverage.
+Every milestone that adds or changes an external mutation must also have a
+completed versioned artifact under `docs/reviews/`. Before the final quality
+run, `scripts/predeploy-review` checks that artifact and reruns the endpoint,
+allocator, durable-recovery, route, and all-target compilation contracts. The
+artifact must include the complete external-side-effect matrix, every
+unknown-outcome/restart boundary, the source-versus-compiled semantic diff, the
+production observation plan, and a review of the entire diff from
+`origin/main`. A passing CI/deploy cycle is not a substitute for this local
+review and is never used to discover contract errors that the matrix can catch.
 
 ## Supporting documents
 

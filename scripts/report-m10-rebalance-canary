@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+start_utc="${1:-}"
+end_utc="${2:-}"
+namespace="${GKE_NAMESPACE:-arb-bot}"
+
+if [[ ! "${start_utc}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ \
+  || ! "${end_utc}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+  echo "usage: scripts/report-m10-rebalance-canary START_UTC END_UTC" >&2
+  exit 1
+fi
+test -f "${env_file}"
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+: "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required}"
+: "${CLICKHOUSE_URL:?CLICKHOUSE_URL is required}"
+: "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required}"
+clickhouse_user="${CLICKHOUSE_USER:-default}"
+clickhouse_database="${CLICKHOUSE_DATABASE:-arb_bot_prod}"
+if [[ ! "${clickhouse_database}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  echo "CLICKHOUSE_DATABASE is not a safe identifier" >&2
+  exit 1
+fi
+
+startup_filter="resource.type=\"k8s_container\"
+AND resource.labels.namespace_name=\"${namespace}\"
+AND resource.labels.container_name=\"arb-bot\"
+AND jsonPayload.fields.message=\"M10 Arbitrum rebalance live canary configured\"
+AND timestamp>=\"${start_utc}\"
+AND timestamp<\"${end_utc}\""
+
+echo $'timestamp\tpod\tpair\tapproval\tapproval_session\tallocator\tnetwork\ttransfers\tconcurrent\tfailures\tusdc_debit\tesp_debit\tusdc_fee\tesp_fee\tduration\tunknown_queries\tdirect\tbridge\tshared_nonce_owner\tmutation'
+"${repo_root}/scripts/gcloud-local" logging read "${startup_filter}" \
+  --project="${GCP_PROJECT_ID}" \
+  --limit=100 \
+  --order=asc \
+  --format=json \
+  | jq -r '
+      .[]
+      | .jsonPayload.fields as $f
+      | [
+          .timestamp,
+          .resource.labels.pod_name,
+          $f.pair_id,
+          $f.approval_gate,
+          $f.approval_session_id,
+          $f.allocator_mode,
+          $f.binance_network,
+          $f.maximum_transfer_count,
+          $f.maximum_concurrent_transfers,
+          $f.maximum_failed_transfers,
+          $f.maximum_token_a_debit_base_units,
+          $f.maximum_token_b_debit_base_units,
+          $f.maximum_token_a_fee_base_units,
+          $f.maximum_token_b_fee_base_units,
+          $f.rollout_duration_seconds,
+          $f.maximum_unknown_reconciliation_queries,
+          $f.direct_route_only,
+          $f.bridge_mutations_enabled,
+          $f.shared_arbitrum_evm_owner,
+          $f.external_mutation_authorized
+        ]
+      | @tsv
+    '
+
+query_url="${CLICKHOUSE_URL}?database=${clickhouse_database}&param_start_utc=${start_utc}&param_end_utc=${end_utc}"
+echo "query=m10_rebalance_canary"
+curl --fail --silent --show-error \
+  --user "${clickhouse_user}:${CLICKHOUSE_PASSWORD}" \
+  --data-binary "@${repo_root}/scripts/sql/m10_rebalance_canary.sql" \
+  "${query_url}"

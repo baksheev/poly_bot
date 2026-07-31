@@ -2131,7 +2131,7 @@ Historical records without a session field retain their legacy recovery scope.
 The executor keeps one global active-operation lane, so an incomplete older
 saga must recover before any new mutation.
 
-### Current permanent ESP/USDC operation
+### M13 — Permanent ESP/USDC full-live operation
 
 After the bounded trading, rebalance canary, and full calculated M12 transfer
 completed without unresolved exposure, the operator approved permanent
@@ -2156,7 +2156,9 @@ Historical V5 and older artifacts remain checked in for exact journal replay.
 An incomplete historical saga must recover through the same single execution
 owner before V6 can admit new work. Current authority and safety bounds are
 defined by the V6 artifact and enforced by the compiled-domain, execution,
-rebalancing, and deployment tests.
+rebalancing, and deployment tests. The complete authority, side-effect,
+restart, rollback, and observation review is recorded in
+`docs/reviews/m13-predeploy.md`.
 
 ## Future multi-wallet extension
 
