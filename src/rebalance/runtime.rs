@@ -81,6 +81,23 @@ pub struct ApprovedAbsentStandardWithdrawalRecovery {
     pub reconciliation_queries: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedAbsentMasterTransferRecovery {
+    pub operation_id: String,
+    pub fingerprint: String,
+    pub withdraw_order_id: String,
+    pub token_symbol: String,
+    pub amount: U256,
+    pub wallet_owner: Address,
+    pub binance_network: String,
+    pub bridge_chain_id: u64,
+    pub wallet_chain_id: u64,
+    pub binance_balance_before: U256,
+    pub wallet_balance_before: U256,
+    pub first_absent_observed_at: SystemTime,
+    pub minimum_evidence_age: Duration,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BinanceAddressVerificationTransferArtifact {
@@ -1085,6 +1102,55 @@ impl RebalanceExecutor {
             &operation.intent.operation_id,
             RebalanceExecutionProgress::Failed {
                 reason: "operator-confirmed absent standard withdrawal after one empty history query and unchanged Optimism balance".to_owned(),
+            },
+        )
+    }
+
+    /// Closes the exact crash-created intent only after the operator confirmed
+    /// that Binance has no withdrawal and a second, delayed read proves that
+    /// the prerequisite master transfer was never indexed. This method is
+    /// deliberately read-only until it advances the local durable journal.
+    pub async fn close_operator_confirmed_absent_master_transfer(
+        &mut self,
+        recovery: &ApprovedAbsentMasterTransferRecovery,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let operation = self
+            .execution_journal
+            .active_operation()?
+            .cloned()
+            .context("operator-confirmed absent master transfer has no active operation")?;
+        ensure!(
+            SystemTime::now()
+                .duration_since(recovery.first_absent_observed_at)
+                .is_ok_and(|age| age >= recovery.minimum_evidence_age),
+            "absent master-transfer evidence is not old enough"
+        );
+        let transfer_records = self
+            .treasury_binance
+            .universal_transfer_history(&self.subaccount_email, &recovery.withdraw_order_id)
+            .await?;
+        ensure!(
+            transfer_records.is_empty(),
+            "operator-confirmed absent master transfer is now indexed"
+        );
+        validate_operator_confirmed_absent_master_transfer(&operation, recovery)?;
+
+        tracing::info!(
+            operation_id = operation.intent.operation_id,
+            withdraw_order_id = operation.intent.withdraw_order_id,
+            token = operation.intent.token_symbol,
+            amount_base_units = operation.intent.amount.to_string(),
+            delayed_master_transfer_matches = transfer_records.len(),
+            evidence_age_seconds = SystemTime::now()
+                .duration_since(recovery.first_absent_observed_at)
+                .map_or(0, |age| age.as_secs()),
+            external_mutation = false,
+            "operator-confirmed absent master transfer passed exact delayed recovery evidence"
+        );
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::Failed {
+                reason: "operator-confirmed absent withdrawal and delayed-empty prerequisite master-transfer history after pre-transfer crash".to_owned(),
             },
         )
     }
@@ -3226,6 +3292,57 @@ fn validate_operator_confirmed_absent_standard_withdrawal(
     Ok(())
 }
 
+fn validate_operator_confirmed_absent_master_transfer(
+    operation: &RebalanceExecutionOperation,
+    recovery: &ApprovedAbsentMasterTransferRecovery,
+) -> anyhow::Result<()> {
+    let scope = operation
+        .intent
+        .scope
+        .as_ref()
+        .context("operator-confirmed absent master transfer lacks durable scope")?;
+    ensure!(
+        recovery.operation_id == "rebalance-294-96fd53e70c1ab390"
+            && recovery.fingerprint
+                == "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
+            && recovery.withdraw_order_id == "rb96fd53e70c1ab390ae3e62eb434cd1"
+            && recovery.token_symbol == "USDC"
+            && recovery.amount == U256::from(1_197_503_244_u64)
+            && recovery.wallet_owner
+                == Address::from_str("0x90D990C81320221D2882De32beeA78923c1e77A3")?
+            && recovery.binance_network == "OPTIMISM"
+            && recovery.bridge_chain_id == OPTIMISM_CHAIN_ID
+            && recovery.wallet_chain_id == WORLD_CHAIN_CHAIN_ID
+            && recovery.binance_balance_before == U256::from(3_075_000_679_u64)
+            && recovery.wallet_balance_before == U256::from(679_994_191_u64)
+            && recovery.minimum_evidence_age == Duration::from_secs(300)
+            && operation.intent.operation_id == recovery.operation_id
+            && operation.intent.fingerprint == recovery.fingerprint
+            && operation.intent.withdraw_order_id == recovery.withdraw_order_id
+            && operation.intent.token_symbol == recovery.token_symbol
+            && operation.intent.token_decimals == 6
+            && operation.intent.token_contract == WORLD_CHAIN_USDC
+            && operation.intent.wallet_owner == recovery.wallet_owner
+            && operation.intent.direction == Direction::BinanceToWallet
+            && operation.intent.route
+                == Route::Across {
+                    binance_network: recovery.binance_network.clone(),
+                    bridge_chain_id: recovery.bridge_chain_id,
+                    wallet_chain_id: recovery.wallet_chain_id,
+                }
+            && operation.intent.amount == recovery.amount
+            && operation.intent.binance_balance_before == recovery.binance_balance_before
+            && operation.intent.wallet_balance_before == recovery.wallet_balance_before
+            && operation.progress == RebalanceExecutionProgress::IntentRecorded
+            && scope.schema_version == 2
+            && scope.account_id == "binance:trading-subaccount"
+            && scope.network_id == "chain:10"
+            && scope.strategy_id == "rebalance-world-chain-v12",
+        "operator-confirmed absent master-transfer evidence changed"
+    );
+    Ok(())
+}
+
 fn account_asset_balance_or_zero(account: &AccountInformation, asset: &str) -> (Decimal, Decimal) {
     account
         .balances
@@ -3488,7 +3605,10 @@ fn reconcile_approved_travel_rule_rejection(
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, time::Duration};
+    use std::{
+        str::FromStr,
+        time::{Duration, SystemTime},
+    };
 
     use alloy_primitives::{Address, B256, U256, keccak256};
     use rust_decimal::Decimal;
@@ -3507,14 +3627,15 @@ mod tests {
     };
 
     use super::{
-        ARBITRUM_CHAIN_ID, ApprovedAbsentStandardWithdrawalRecovery,
-        BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
-        WORLD_CHAIN_WLD, account_asset_balance_or_zero, base_units_to_decimal,
-        decimal_to_base_units, decimal_to_base_units_floor,
+        ARBITRUM_CHAIN_ID, ApprovedAbsentMasterTransferRecovery,
+        ApprovedAbsentStandardWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
+        WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, account_asset_balance_or_zero,
+        base_units_to_decimal, decimal_to_base_units, decimal_to_base_units_floor,
         matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
         plan_direct_prefunding, reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
         shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
         validate_direct_withdrawal_receipt, validate_manual_prefunding_withdrawal_record,
+        validate_operator_confirmed_absent_master_transfer,
         validate_operator_confirmed_absent_standard_withdrawal, withdrawal_received_base_units,
         withdrawal_requested_base_units,
     };
@@ -3624,6 +3745,63 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn operator_absence_closes_only_the_exact_pretransfer_crash_intent() {
+        let wallet = Address::from_str("0x90D990C81320221D2882De32beeA78923c1e77A3").unwrap();
+        let operation = RebalanceExecutionOperation {
+            intent: RebalanceExecutionIntent {
+                scope: Some(RebalanceJournalScope {
+                    schema_version: 2,
+                    account_id: "binance:trading-subaccount".to_owned(),
+                    network_id: "chain:10".to_owned(),
+                    strategy_id: "rebalance-world-chain-v12".to_owned(),
+                }),
+                operation_id: "rebalance-294-96fd53e70c1ab390".to_owned(),
+                fingerprint: "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
+                    .to_owned(),
+                withdraw_order_id: "rb96fd53e70c1ab390ae3e62eb434cd1".to_owned(),
+                token_symbol: "USDC".to_owned(),
+                token_decimals: 6,
+                token_contract: WORLD_CHAIN_USDC,
+                wallet_owner: wallet,
+                direction: Direction::BinanceToWallet,
+                route: Route::Across {
+                    binance_network: "OPTIMISM".to_owned(),
+                    bridge_chain_id: 10,
+                    wallet_chain_id: 480,
+                },
+                amount: U256::from(1_197_503_244_u64),
+                binance_balance_before: U256::from(3_075_000_679_u64),
+                wallet_balance_before: U256::from(679_994_191_u64),
+                canary_maximum_fee_base_units: None,
+            },
+            progress: RebalanceExecutionProgress::IntentRecorded,
+        };
+        let recovery = ApprovedAbsentMasterTransferRecovery {
+            operation_id: operation.intent.operation_id.clone(),
+            fingerprint: operation.intent.fingerprint.clone(),
+            withdraw_order_id: operation.intent.withdraw_order_id.clone(),
+            token_symbol: "USDC".to_owned(),
+            amount: operation.intent.amount,
+            wallet_owner: wallet,
+            binance_network: "OPTIMISM".to_owned(),
+            bridge_chain_id: 10,
+            wallet_chain_id: 480,
+            binance_balance_before: operation.intent.binance_balance_before,
+            wallet_balance_before: operation.intent.wallet_balance_before,
+            first_absent_observed_at: SystemTime::UNIX_EPOCH,
+            minimum_evidence_age: Duration::from_secs(300),
+        };
+
+        validate_operator_confirmed_absent_master_transfer(&operation, &recovery).unwrap();
+        let mut changed = operation;
+        changed.progress = RebalanceExecutionProgress::BinanceTransferSubmitted {
+            transaction_id: 1,
+            bridge_balance_before: U256::ZERO,
+        };
+        assert!(validate_operator_confirmed_absent_master_transfer(&changed, &recovery).is_err());
     }
 
     #[test]

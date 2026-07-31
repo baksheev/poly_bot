@@ -123,3 +123,22 @@ fn operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal() {
     assert!(!recovery.contains(".withdraw_standard("));
     assert!(!recovery.contains(".withdraw_travel_rule("));
 }
+
+#[test]
+fn pretransfer_crash_recovery_is_read_only_and_cannot_create_capital_work() {
+    let start = REBALANCE_RUNTIME
+        .find("pub async fn close_operator_confirmed_absent_master_transfer(")
+        .unwrap();
+    let end = REBALANCE_RUNTIME[start..]
+        .find("pub async fn recover_approved_manual_direct_credit(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let recovery = &REBALANCE_RUNTIME[start..end];
+
+    assert!(recovery.contains(".universal_transfer_history("));
+    assert!(recovery.contains("transfer_records.is_empty()"));
+    assert!(!recovery.contains(".universal_transfer("));
+    assert!(!recovery.contains(".withdrawal_history("));
+    assert!(!recovery.contains(".withdraw_standard("));
+    assert!(!recovery.contains(".withdraw_travel_rule("));
+}

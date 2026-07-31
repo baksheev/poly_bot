@@ -581,6 +581,8 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     #[serde(default)]
     pub approved_absent_standard_withdrawal:
         Option<LiveCanaryAbsentStandardWithdrawalRecoveryConfig>,
+    #[serde(default)]
+    pub approved_absent_master_transfer: Option<LiveCanaryAbsentMasterTransferRecoveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -637,6 +639,26 @@ pub struct LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
     pub bridge_balance_before_base_units: String,
     pub master_transfer_transaction_id: u64,
     pub reconciliation_queries: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryAbsentMasterTransferRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub operation_id: String,
+    pub fingerprint: String,
+    pub withdraw_order_id: String,
+    pub token_symbol: String,
+    pub amount_base_units: String,
+    pub wallet_address: String,
+    pub binance_network: String,
+    pub bridge_chain_id: u64,
+    pub wallet_chain_id: u64,
+    pub binance_balance_before_base_units: String,
+    pub wallet_balance_before_base_units: String,
+    pub first_absent_observed_at_utc: String,
+    pub minimum_evidence_age_seconds: u64,
 }
 
 impl LiveCanaryPrefundingRebalanceConfig {
@@ -702,9 +724,54 @@ impl LiveCanaryPrefundingRebalanceConfig {
         if let Some(recovery) = &self.approved_absent_standard_withdrawal {
             recovery.validate(pair)?;
         }
+        if let Some(recovery) = &self.approved_absent_master_transfer {
+            recovery.validate(pair)?;
+        }
         ensure!(
             !self.retry_after_verified_address || self.approved_travel_rule_recovery.is_some(),
             "pair {} cannot retry after address verification without the exact rejected incident",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+impl LiveCanaryAbsentMasterTransferRecoveryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        let amount = parse_base_units_u256(
+            &self.amount_base_units,
+            "live_canary.prefunding_rebalance.approved_absent_master_transfer.amount_base_units",
+        )?;
+        let binance_balance_before = parse_base_units_u256(
+            &self.binance_balance_before_base_units,
+            "live_canary.prefunding_rebalance.approved_absent_master_transfer.binance_balance_before_base_units",
+        )?;
+        let wallet_balance_before = parse_base_units_u256(
+            &self.wallet_balance_before_base_units,
+            "live_canary.prefunding_rebalance.approved_absent_master_transfer.wallet_balance_before_base_units",
+        )?;
+        ensure!(
+            self.production_approval_actor == "operator"
+                && self.production_approval_recorded_at_utc == "2026-07-31T02:18:00Z"
+                && self.operation_id == "rebalance-294-96fd53e70c1ab390"
+                && self.fingerprint
+                    == "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
+                && self.withdraw_order_id == "rb96fd53e70c1ab390ae3e62eb434cd1"
+                && self.token_symbol == "USDC"
+                && amount == U256::from(1_197_503_244_u64)
+                && self
+                    .wallet_address
+                    .eq_ignore_ascii_case("0x90D990C81320221D2882De32beeA78923c1e77A3")
+                && self.wallet_address.parse::<Address>().is_ok()
+                && self.binance_network == "OPTIMISM"
+                && self.bridge_chain_id == 10
+                && self.wallet_chain_id == 480
+                && binance_balance_before == U256::from(3_075_000_679_u64)
+                && wallet_balance_before == U256::from(679_994_191_u64)
+                && self.first_absent_observed_at_utc == "2026-07-31T02:13:53Z"
+                && self.minimum_evidence_age_seconds == 300
+                && pair.chain.chain_id == 42_161,
+            "pair {} absent master-transfer recovery identity is invalid",
             pair.id
         );
         Ok(())
@@ -1821,6 +1888,21 @@ mod tests {
             395_824_828_151
         );
         assert_eq!(absent_withdrawal.reconciliation_queries, 1);
+        let absent_master_transfer = prefunding.approved_absent_master_transfer.as_ref().unwrap();
+        assert_eq!(
+            absent_master_transfer.operation_id,
+            "rebalance-294-96fd53e70c1ab390"
+        );
+        assert_eq!(
+            absent_master_transfer.fingerprint,
+            "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
+        );
+        assert_eq!(
+            absent_master_transfer.withdraw_order_id,
+            "rb96fd53e70c1ab390ae3e62eb434cd1"
+        );
+        assert_eq!(absent_master_transfer.amount_base_units, "1197503244");
+        assert_eq!(absent_master_transfer.minimum_evidence_age_seconds, 300);
         assert!(pair.execution_enabled);
         assert!(pair.rebalance.enabled);
 

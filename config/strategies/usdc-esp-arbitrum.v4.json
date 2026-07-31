@@ -114,6 +114,23 @@
             "bridge_balance_before_base_units": "508",
             "master_transfer_transaction_id": 395824828151,
             "reconciliation_queries": 1
+          },
+          "approved_absent_master_transfer": {
+            "production_approval_actor": "operator",
+            "production_approval_recorded_at_utc": "2026-07-31T02:18:00Z",
+            "operation_id": "rebalance-294-96fd53e70c1ab390",
+            "fingerprint": "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50",
+            "withdraw_order_id": "rb96fd53e70c1ab390ae3e62eb434cd1",
+            "token_symbol": "USDC",
+            "amount_base_units": "1197503244",
+            "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
+            "binance_network": "OPTIMISM",
+            "bridge_chain_id": 10,
+            "wallet_chain_id": 480,
+            "binance_balance_before_base_units": "3075000679",
+            "wallet_balance_before_base_units": "679994191",
+            "first_absent_observed_at_utc": "2026-07-31T02:13:53Z",
+            "minimum_evidence_age_seconds": 300
           }
         }
       },

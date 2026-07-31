@@ -55,6 +55,18 @@ contract error.
   mutation. Evidence:
   `operator_absence_closes_only_the_exact_exhausted_standard_withdrawal` and
   `operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal`.
+- [x] The first M10 rollout closed that older operation read-only, then exposed
+  a separate pre-transfer crash intent
+  `rebalance-294-96fd53e70c1ab390` for 1,197.503244 USDC. The process crashed
+  four milliseconds after the durable `intent_recorded` row, exact
+  deterministic master-transfer history was empty after restart, and the
+  operator separately verified that Binance contains no withdrawal for that
+  amount. The versioned corrective recovery waits at least 300 seconds from
+  the first empty observation, repeats only the exact master-transfer history
+  query, requires the full immutable operation fingerprint/route/balances and
+  closes the local journal without transfer or withdrawal calls. Evidence:
+  `operator_absence_closes_only_the_exact_pretransfer_crash_intent` and
+  `pretransfer_crash_recovery_is_read_only_and_cannot_create_capital_work`.
 - [x] Restart before, during, and after an Arbitrum wallet child uses the same
   operation ID and transaction journal; mined success is reused and unknown
   nonce state cannot submit another transaction. Evidence:
@@ -145,13 +157,24 @@ contract error.
   inventory because active operations held the balance. The typed reserve
   failure now classifies that case as rate-limited `INFO` without weakening
   real capital-shortfall or reservation-invariant errors.
-- [x] Run `scripts/quality.sh` once after the final approval edit. The first
+- [x] Treat the first `b2d77da` rollout as diagnostic, not authoritative:
+  Pod `arb-bot-7d9c9db47f-7rlvp` restarted once and no M10 external mutation
+  occurred. The consolidated corrective diff fixes every observed common
+  cause before another deploy: reservation IDs include pair identity, the
+  shared rebalance executor has one explicit busy lane with primary priority,
+  expected inventory contention keeps pending work instead of terminating the
+  process, process start removes a stale readiness marker before its first
+  await, and a rejected canary result no longer immediately re-evaluates an
+  unchanged DEX generation.
+  Evidence: `rebalance_reservations_are_unique_across_pair_engines`,
+  `process_start_removes_a_stale_runtime_readiness_marker`, plus the trade
+  result dispatch and inventory source diff.
+- [x] Run `scripts/quality.sh` once after the final corrective edit. The first
   security audit discovered `RUSTSEC-2026-0220` in transitive `ruint 1.19.0`;
   the lockfile now selects fixed `ruint 1.20.0`, and the complete gate passes
-  with 434 library tests and only the three existing allowed unmaintained-crate
-  warnings.
-- [x] Confirm a clean fast-forward to current `origin/main`; after explicit
-  approval, the next external action is one consolidated push/deploy of the
-  reviewed M10 revision. Evidence: fetched `origin/main` at `94b61e81f5ff`;
-  it is an ancestor of the reviewed local branch. This is rechecked immediately
-  before the push.
+  with 436 library tests, 6 main tests, all deployment/reporting/monitoring
+  contracts, and only the three existing allowed unmaintained-crate warnings.
+- [x] Confirm a clean fast-forward to current `origin/main`; after the full
+  corrective gate, the next external action is one consolidated push/deploy.
+  Evidence: fetched `origin/main` at `b2d77da9ccf`; it exactly equals the
+  current branch HEAD before this corrective commit.

@@ -85,13 +85,13 @@ use arb_bot::{
     },
     portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_m10_rebalance_authority},
     rebalance::{
-        ApprovedAbsentStandardWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
-        RebalanceCanaryRisk, RebalanceExecutionAuthority, RebalanceExecutionOperation,
-        RebalanceExecutionProgress, RebalanceExecutionRequest, RebalanceExecutor,
-        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
-        execute_binance_address_verification_transfer, plan_direct_prefunding,
-        rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
-        route_candidates_from_capital,
+        ApprovedAbsentMasterTransferRecovery, ApprovedAbsentStandardWithdrawalRecovery,
+        BinanceAddressVerificationTransferArtifact, RebalanceCanaryRisk,
+        RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionProgress,
+        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
+        V12RebalanceParityAdapter, execute_binance_address_verification_transfer,
+        plan_direct_prefunding, rebalance_base_units_to_decimal,
+        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -199,10 +199,12 @@ enum RebalanceExecutorEvent {
     Recovery {
         target: RebalanceExecutionTarget,
         result: Result<RebalanceExecutionOperation, String>,
+        active_operation_after: bool,
     },
     Execution {
         target: RebalanceExecutionTarget,
         result: Result<RebalanceExecutionOperation, String>,
+        active_operation_after: bool,
     },
 }
 
@@ -314,6 +316,18 @@ fn log_compiled_graph(summary: Option<&CompiledGraphSummary>) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let process_started_at = Instant::now();
+    // RUNTIME_READY_FILE is supplied by the production environment, so clear
+    // an emptyDir marker left by a crashed process before configuration,
+    // tracing, domain validation, or the first await.
+    let runtime_ready_path = runtime_ready_marker_path()?;
+    let mut runtime_ready_marked = runtime_ready_path
+        .as_ref()
+        .is_some_and(|path| path.exists());
+    sync_runtime_ready_marker(
+        runtime_ready_path.as_deref(),
+        &mut runtime_ready_marked,
+        false,
+    )?;
     load_dotenv()?;
     init_tracing();
 
@@ -3246,6 +3260,44 @@ async fn run(
                 .close_operator_confirmed_absent_standard_withdrawal(&recovery)
                 .await?;
         }
+        if let Some(recovery) = m8_pair
+            .live_canary
+            .as_ref()
+            .and_then(|canary| canary.prefunding_rebalance.as_ref())
+            .and_then(|prefunding| prefunding.approved_absent_master_transfer.as_ref())
+            && executor
+                .active_operation()?
+                .is_some_and(|operation| operation.intent.operation_id == recovery.operation_id)
+        {
+            let recovery = ApprovedAbsentMasterTransferRecovery {
+                operation_id: recovery.operation_id.clone(),
+                fingerprint: recovery.fingerprint.clone(),
+                withdraw_order_id: recovery.withdraw_order_id.clone(),
+                token_symbol: recovery.token_symbol.clone(),
+                amount: U256::from_str_radix(&recovery.amount_base_units, 10)
+                    .context("approved absent master-transfer amount is invalid")?,
+                wallet_owner: Address::from_str(&recovery.wallet_address)
+                    .context("approved absent master-transfer wallet is invalid")?,
+                binance_network: recovery.binance_network.clone(),
+                bridge_chain_id: recovery.bridge_chain_id,
+                wallet_chain_id: recovery.wallet_chain_id,
+                binance_balance_before: U256::from_str_radix(
+                    &recovery.binance_balance_before_base_units,
+                    10,
+                )
+                .context("approved absent master-transfer Binance balance is invalid")?,
+                wallet_balance_before: U256::from_str_radix(
+                    &recovery.wallet_balance_before_base_units,
+                    10,
+                )
+                .context("approved absent master-transfer wallet balance is invalid")?,
+                first_absent_observed_at: UNIX_EPOCH + Duration::from_secs(1_785_464_033),
+                minimum_evidence_age: Duration::from_secs(recovery.minimum_evidence_age_seconds),
+            };
+            executor
+                .close_operator_confirmed_absent_master_transfer(&recovery)
+                .await?;
+        }
         executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
         telemetry.emit(
             "runtime_journal_recovery",
@@ -4026,10 +4078,12 @@ async fn run(
                     );
                     emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                     risk_sender.send_replace(executor.m10_canary_risk()?);
+                    let active_operation_after = executor.active_operation()?.is_some();
                     if result_sender
                         .send(RebalanceExecutorEvent::Recovery {
                             target: recovery_target,
                             result,
+                            active_operation_after,
                         })
                         .await
                         .is_err()
@@ -4051,8 +4105,13 @@ async fn run(
                     );
                     emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                     risk_sender.send_replace(executor.m10_canary_risk()?);
+                    let active_operation_after = executor.active_operation()?.is_some();
                     if result_sender
-                        .send(RebalanceExecutorEvent::Execution { target, result })
+                        .send(RebalanceExecutorEvent::Execution {
+                            target,
+                            result,
+                            active_operation_after,
+                        })
                         .await
                         .is_err()
                     {
@@ -4098,26 +4157,33 @@ async fn run(
     }
     engine.on_user_data_connected(user_data_subscription_id);
     canary_engine.on_shared_user_data_connected();
-    dispatch_rebalance_execution(
-        &mut engine,
-        rebalance_sender.as_ref(),
-        pair,
-        wallet_owner,
-        RebalanceExecutionTarget::Primary,
-        None,
-        None,
-    )
-    .await?;
-    dispatch_rebalance_execution(
-        &mut canary_engine,
-        rebalance_sender.as_ref(),
-        &m8_pair,
-        wallet_owner,
-        RebalanceExecutionTarget::ArbitrumCanary,
-        portfolio_catalog.capital_canary(),
-        Some(&m10_risk_receiver),
-    )
-    .await?;
+    // The executor and its durable journal are a single process-wide mutation
+    // lane. Recovery owns that lane until it publishes a terminal result.
+    let mut rebalance_lane_busy = rebalance_recovery_operation.is_some();
+    if !rebalance_lane_busy {
+        rebalance_lane_busy = dispatch_rebalance_execution(
+            &mut engine,
+            rebalance_sender.as_ref(),
+            pair,
+            wallet_owner,
+            RebalanceExecutionTarget::Primary,
+            None,
+            None,
+        )
+        .await?;
+    }
+    if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
+        rebalance_lane_busy = dispatch_rebalance_execution(
+            &mut canary_engine,
+            rebalance_sender.as_ref(),
+            &m8_pair,
+            wallet_owner,
+            RebalanceExecutionTarget::ArbitrumCanary,
+            portfolio_catalog.capital_canary(),
+            Some(&m10_risk_receiver),
+        )
+        .await?;
+    }
     engine.start();
     canary_engine.start();
     let mut first_ready_emitted = false;
@@ -4513,26 +4579,30 @@ async fn run(
                     }
                     other => engine.on_balance_event(other)?,
                 }
-                dispatch_rebalance_execution(
-                    &mut engine,
-                    rebalance_sender.as_ref(),
-                    pair,
-                    wallet_owner,
-                    RebalanceExecutionTarget::Primary,
-                    None,
-                    None,
-                )
-                .await?;
-                dispatch_rebalance_execution(
-                    &mut canary_engine,
-                    rebalance_sender.as_ref(),
-                    &m8_pair,
-                    wallet_owner,
-                    RebalanceExecutionTarget::ArbitrumCanary,
-                    portfolio_catalog.capital_canary(),
-                    Some(&m10_risk_receiver),
-                )
-                .await?;
+                if !rebalance_lane_busy {
+                    rebalance_lane_busy = dispatch_rebalance_execution(
+                        &mut engine,
+                        rebalance_sender.as_ref(),
+                        pair,
+                        wallet_owner,
+                        RebalanceExecutionTarget::Primary,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
+                if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
+                    rebalance_lane_busy = dispatch_rebalance_execution(
+                        &mut canary_engine,
+                        rebalance_sender.as_ref(),
+                        &m8_pair,
+                        wallet_owner,
+                        RebalanceExecutionTarget::ArbitrumCanary,
+                        portfolio_catalog.capital_canary(),
+                        Some(&m10_risk_receiver),
+                    )
+                    .await?;
+                }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4546,16 +4616,18 @@ async fn run(
                     bail!("Arbitrum wallet balance synchronization channel stopped unexpectedly");
                 };
                 canary_engine.on_balance_event(event)?;
-                dispatch_rebalance_execution(
-                    &mut canary_engine,
-                    rebalance_sender.as_ref(),
-                    &m8_pair,
-                    wallet_owner,
-                    RebalanceExecutionTarget::ArbitrumCanary,
-                    portfolio_catalog.capital_canary(),
-                    Some(&m10_risk_receiver),
-                )
-                .await?;
+                if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
+                    rebalance_lane_busy = dispatch_rebalance_execution(
+                        &mut canary_engine,
+                        rebalance_sender.as_ref(),
+                        &m8_pair,
+                        wallet_owner,
+                        RebalanceExecutionTarget::ArbitrumCanary,
+                        portfolio_catalog.capital_canary(),
+                        Some(&m10_risk_receiver),
+                    )
+                    .await?;
+                }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4568,8 +4640,22 @@ async fn run(
                 let Some(result) = result else {
                     bail!("rebalance executor result channel stopped unexpectedly");
                 };
+                let active_operation_after = match &result {
+                    RebalanceExecutorEvent::Recovery {
+                        active_operation_after,
+                        ..
+                    }
+                    | RebalanceExecutorEvent::Execution {
+                        active_operation_after,
+                        ..
+                    } => *active_operation_after,
+                };
                 match result {
-                    RebalanceExecutorEvent::Recovery { target, result } => match (target, result) {
+                    RebalanceExecutorEvent::Recovery {
+                        target,
+                        result,
+                        ..
+                    } => match (target, result) {
                         (RebalanceExecutionTarget::Primary, Ok(operation)) => {
                             engine.on_rebalance_recovery_result(Ok(&operation))?
                         }
@@ -4583,7 +4669,11 @@ async fn run(
                             canary_engine.on_rebalance_recovery_result(Err(&error))?
                         }
                     },
-                    RebalanceExecutorEvent::Execution { target, result } => match (target, result) {
+                    RebalanceExecutorEvent::Execution {
+                        target,
+                        result,
+                        ..
+                    } => match (target, result) {
                         (RebalanceExecutionTarget::Primary, Ok(operation)) => {
                             engine.on_rebalance_execution_result(Ok(&operation))?
                         }
@@ -4598,26 +4688,31 @@ async fn run(
                         }
                     },
                 }
-                dispatch_rebalance_execution(
-                    &mut engine,
-                    rebalance_sender.as_ref(),
-                    pair,
-                    wallet_owner,
-                    RebalanceExecutionTarget::Primary,
-                    None,
-                    None,
-                )
-                .await?;
-                dispatch_rebalance_execution(
-                    &mut canary_engine,
-                    rebalance_sender.as_ref(),
-                    &m8_pair,
-                    wallet_owner,
-                    RebalanceExecutionTarget::ArbitrumCanary,
-                    portfolio_catalog.capital_canary(),
-                    Some(&m10_risk_receiver),
-                )
-                .await?;
+                rebalance_lane_busy = active_operation_after;
+                if !rebalance_lane_busy {
+                    rebalance_lane_busy = dispatch_rebalance_execution(
+                        &mut engine,
+                        rebalance_sender.as_ref(),
+                        pair,
+                        wallet_owner,
+                        RebalanceExecutionTarget::Primary,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
+                if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
+                    rebalance_lane_busy = dispatch_rebalance_execution(
+                        &mut canary_engine,
+                        rebalance_sender.as_ref(),
+                        &m8_pair,
+                        wallet_owner,
+                        RebalanceExecutionTarget::ArbitrumCanary,
+                        portfolio_catalog.capital_canary(),
+                        Some(&m10_risk_receiver),
+                    )
+                    .await?;
+                }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4631,18 +4726,23 @@ async fn run(
                     bail!("paper trade event channel stopped unexpectedly");
                 };
                 if event.pair_id == m8_pair.id {
+                    let mut prepared_dex = false;
                     while let Ok(dex_event) = shadow_dex_receiver.try_recv() {
                         if let Some(request) = canary_engine.on_dex_event(dex_event)? {
                             build_prepared_pool_inline(&mut canary_engine, request)?;
+                            prepared_dex = true;
                         }
                     }
-                    if let Some(refresh) =
-                        canary_engine.apply_arbitrage_receipt_settlement(&event)?
-                    {
+                    let receipt_refresh =
+                        canary_engine.apply_arbitrage_receipt_settlement(&event)?;
+                    let receipt_applied = receipt_refresh.is_some();
+                    if let Some(refresh) = receipt_refresh {
                         build_prepared_pool_inline(&mut canary_engine, refresh)?;
                     }
                     canary_engine.on_paper_trade_event(event)?;
-                    canary_engine.evaluate_after_dex_refreshes()?;
+                    if prepared_dex || receipt_applied {
+                        canary_engine.evaluate_after_dex_refreshes()?;
+                    }
                 } else {
                     drain_dex_events_inline(
                         &mut engine,
@@ -5021,10 +5121,10 @@ async fn dispatch_rebalance_execution(
     target: RebalanceExecutionTarget,
     capital_policy: Option<&CompiledCapitalCanaryPolicy>,
     m10_risk: Option<&tokio::sync::watch::Receiver<RebalanceCanaryRisk>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let m10_remaining = if target == RebalanceExecutionTarget::ArbitrumCanary {
         let Some(evaluation) = engine.pending_rebalance_execution() else {
-            return Ok(());
+            return Ok(false);
         };
         let action = evaluation
             .plan
@@ -5053,7 +5153,7 @@ async fn dispatch_rebalance_execution(
             engine.stop_pending_rebalance_creation(
                 "M10 durable count, failure, concurrency, duration, value, or fee limit reached",
             );
-            return Ok(());
+            return Ok(false);
         };
         engine.cap_pending_rebalance_amount(remaining.maximum_source_debit)?;
         Some(remaining)
@@ -5061,7 +5161,7 @@ async fn dispatch_rebalance_execution(
         None
     };
     let Some(pending) = engine.pending_rebalance_execution().cloned() else {
-        return Ok(());
+        return Ok(false);
     };
     let action = pending
         .plan
@@ -5111,14 +5211,14 @@ async fn dispatch_rebalance_execution(
     let sender = sender.context("rebalance engine produced live work without an executor")?;
     let permit = match sender.try_reserve() {
         Ok(permit) => permit,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => return Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => return Ok(false),
         Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
             bail!("rebalance executor queue is closed")
         }
     };
-    let evaluation = engine
-        .take_rebalance_execution()?
-        .context("pending rebalance disappeared after capital allocation")?;
+    let Some(evaluation) = engine.take_rebalance_execution()? else {
+        return Ok(false);
+    };
     ensure!(
         evaluation == pending,
         "pending rebalance changed during capital allocation"
@@ -5150,7 +5250,7 @@ async fn dispatch_rebalance_execution(
             canary_maximum_fee,
         },
     ));
-    Ok(())
+    Ok(true)
 }
 
 fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
@@ -5907,8 +6007,8 @@ mod tests {
 
     use super::{
         StartupDexDrainStats, m9_allowance_operation_id, m9_canary_allowance_requirements,
-        m9_canary_evm_journal_scope, rebalance_quote_retry_delay, validate_prefunding_marker,
-        write_prefunding_marker,
+        m9_canary_evm_journal_scope, rebalance_quote_retry_delay, sync_runtime_ready_marker,
+        validate_prefunding_marker, write_prefunding_marker,
     };
 
     #[test]
@@ -5937,6 +6037,25 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.network_id.as_str(), scope.network_id);
         assert_eq!(runtime.wallet_location_id.as_str(), scope.wallet_id);
+    }
+
+    #[test]
+    fn process_start_removes_a_stale_runtime_readiness_marker() {
+        let path = std::env::temp_dir().join(format!(
+            "arb-bot-stale-ready-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"ready\n").unwrap();
+        let mut marked = true;
+
+        sync_runtime_ready_marker(Some(&path), &mut marked, false).unwrap();
+
+        assert!(!marked);
+        assert!(!path.exists());
     }
 
     #[test]

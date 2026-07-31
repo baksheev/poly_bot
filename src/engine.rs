@@ -1655,7 +1655,7 @@ impl TradingEngine {
     }
 
     pub fn take_rebalance_execution(&mut self) -> anyhow::Result<Option<RebalanceEvaluation>> {
-        let Some(evaluation) = self.pending_rebalance.take() else {
+        let Some(evaluation) = self.pending_rebalance.clone() else {
             return Ok(None);
         };
         ensure!(
@@ -1667,27 +1667,26 @@ impl TradingEngine {
             .action
             .as_ref()
             .context("rebalance execution has no action")?;
-        let pair_chain_id = self
-            .domain_config
-            .snapshot()
+        let domain_snapshot = self.domain_config.snapshot();
+        let executable_pair = domain_snapshot
             .pairs
             .iter()
             .find(|pair| pair.execution_enabled)
-            .context("rebalance requires one executable pair")?
-            .chain
-            .chain_id;
+            .context("rebalance requires one executable pair")?;
+        let pair_chain_id = executable_pair.chain.chain_id;
         let binance_location = self.binance_inventory_location()?;
         let wallet_location = self.wallet_inventory_location(pair_chain_id)?;
         let source_location = match action.direction {
             Direction::BinanceToWallet => binance_location.clone(),
             Direction::WalletToBinance => wallet_location.clone(),
         };
-        let reservation_id = format!("rebalance-reservation-{}", self.next_inventory_reservation);
-        self.next_inventory_reservation = self
+        let reservation_id =
+            rebalance_reservation_id(&executable_pair.id, self.next_inventory_reservation);
+        let next_inventory_reservation = self
             .next_inventory_reservation
             .checked_add(1)
             .context("inventory reservation sequence overflow")?;
-        self.inventory.reserve(ReservationRequest {
+        let request = ReservationRequest {
             operation_id: reservation_id.clone(),
             purpose: ReservationPurpose::Rebalance,
             claims: vec![InventoryClaim {
@@ -1695,7 +1694,34 @@ impl TradingEngine {
                 amount: action.amount,
             }],
             settlement_locations: [binance_location, wallet_location].into_iter().collect(),
-        })?;
+        };
+        if let Err(error) = self.inventory.reserve(request) {
+            let failure_kind = classify_inventory_admission_failure(&error);
+            if failure_kind == InventoryAdmissionFailureKind::InvariantViolation {
+                return Err(error);
+            }
+            tracing::info!(
+                engine_id = %self.config.engine_id,
+                pair_id = executable_pair.id,
+                reservation_id,
+                reason = failure_kind.telemetry_reason(),
+                error = %format!("{error:#}"),
+                "rebalance inventory reservation deferred"
+            );
+            self.telemetry.emit(
+                "rebalance_inventory_deferred",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": executable_pair.id,
+                    "operation_id": reservation_id,
+                    "reason": failure_kind.telemetry_reason(),
+                    "error": format!("{error:#}"),
+                }),
+            );
+            return Ok(None);
+        }
+        self.next_inventory_reservation = next_inventory_reservation;
+        self.pending_rebalance = None;
         self.rebalance_inventory_reservation = Some(reservation_id.clone());
         self.telemetry.emit(
             "inventory_reserved",
@@ -3827,6 +3853,10 @@ fn classify_inventory_admission_failure(error: &anyhow::Error) -> InventoryAdmis
     }
 }
 
+fn rebalance_reservation_id(pair_id: &str, sequence: u64) -> String {
+    format!("rebalance-reservation-{pair_id}-{sequence}")
+}
+
 fn requires_depth_for_runtime_phase(arbitrage_execution_mode: &str) -> bool {
     matches!(arbitrage_execution_mode, "paper_concurrent_hedged")
 }
@@ -4045,7 +4075,7 @@ mod tests {
         classify_depth_health, classify_inventory_admission_failure, clock_sync_estimate_valid,
         estimate_exchange_event_to_socket_us, exact_execution_envelope_amounts,
         is_bounded_canary_pair, mark_sequence_matched_update, rebalance_health_state,
-        requires_depth_for_runtime_phase, reservation_precheck,
+        rebalance_reservation_id, requires_depth_for_runtime_phase, reservation_precheck,
     };
 
     #[test]
@@ -4053,6 +4083,18 @@ mod tests {
         assert!(!clock_sync_estimate_valid(None));
         assert!(clock_sync_estimate_valid(Some(180_000)));
         assert!(!clock_sync_estimate_valid(Some(180_001)));
+    }
+
+    #[test]
+    fn rebalance_reservations_are_unique_across_pair_engines() {
+        assert_ne!(
+            rebalance_reservation_id("world-chain-usdc-wld", 0),
+            rebalance_reservation_id("arbitrum-usdc-esp", 0)
+        );
+        assert_eq!(
+            rebalance_reservation_id("arbitrum-usdc-esp", 7),
+            "rebalance-reservation-arbitrum-usdc-esp-7"
+        );
     }
 
     #[test]
