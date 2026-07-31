@@ -192,3 +192,29 @@ contract error.
   corrective gate, the next external action is one consolidated push/deploy.
   Evidence: fetched `origin/main` at `b2d77da9ccf`; it exactly equals the
   current branch HEAD before this corrective commit.
+
+## Production outcome
+
+The final corrective release was tested against the byte-exact production
+journal suffix before deployment. Revision
+`243aa47ca72399b169641f41cc9a19eb9ddef144` passed CI `30602739221` and Deploy
+GKE `30602981046`; immutable digest
+`sha256:967744e99d82f3d14214ef126acd7a0406d8b31006598743254e81e8b52808c5`
+started sole Pod `arb-bot-6549d944b9-bnp7j` at
+`2026-07-31T04:07:02Z`.
+
+The runtime closed the exhausted historical standard-withdrawal recovery
+without mutation, then completed exactly one approved direct Arbitrum
+operation, `rebalance-302-4d88f5b3efc955fd`. Binance debited `25 USDC`; the
+wallet received `24.8 USDC` after a `0.2 USDC` fee. The 15-minute report ended
+with `m10_gate=canary_observed`, no active or failed saga, no limit breach,
+zero production `ERROR`, no hot-telemetry drop, and no post-window intent.
+Both containers remained Ready with zero restarts, throttling and memory
+pressure remained zero, and GCE remained `TERMINATED`.
+
+The extended WLD cohort reached the required fee-500 sample size instead of
+treating one early `154 µs` receive maximum as a regression. Receive
+`n=116` settled at p99/max `127/154 µs`; prepared build and total reached
+`n=107`, complete timing `107/107`, and p99/max `21/30 µs` and `35/37 µs`.
+WLD socket/parse p99 were `47/8 µs`. These values remain within the frozen
+relative and hard production budgets.
