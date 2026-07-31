@@ -49,7 +49,9 @@ complete current plan but not an erroneous unit-scaled or duplicate debit.
 - [x] A withdrawal submission with an unknown result performs at most one
   deterministic reconciliation query and never authorizes resubmission.
 - [x] A standard `-4104` history row and a later local-entity row may share the
-  deterministic ID. Restart recovery validates all rows, ignores only explicit
+  economic identity even when Binance omits `withdrawOrderId` on one row.
+  Exact manual recovery selects the two versioned trIds from network history.
+  Restart recovery validates all matching rows, ignores only explicit
   unbroadcast failures, accepts at most one viable submission, and never
   replays an ambiguous POST.
 - [x] The failed R2 ESP operation may reopen only when operation ID,

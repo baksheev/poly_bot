@@ -1269,14 +1269,27 @@ impl RebalanceExecutor {
                 .is_empty(),
             "approved manual ESP credit found an indexed bot capital withdrawal"
         );
-        let travel_rule = self
-            .treasury_binance
-            .travel_rule_withdrawal_history_v2(
-                token_symbol,
-                network,
-                &operation.intent.withdraw_order_id,
-            )
-            .await?;
+        let travel_rule = if let (Some(local_entity_tr_id), Some(standard_tr_id)) = (
+            expected_rejected_local_entity_travel_rule_id,
+            expected_rejected_standard_travel_rule_id,
+        ) {
+            self.treasury_binance
+                .travel_rule_withdrawal_history_v2_for_network(token_symbol, network)
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    record.tr_id == local_entity_tr_id || record.tr_id == standard_tr_id
+                })
+                .collect()
+        } else {
+            self.treasury_binance
+                .travel_rule_withdrawal_history_v2(
+                    token_symbol,
+                    network,
+                    &operation.intent.withdraw_order_id,
+                )
+                .await?
+        };
         validate_manual_recovery_travel_rule_rejections(
             &operation,
             &travel_rule,
@@ -4361,7 +4374,11 @@ mod tests {
             address: format!("{:#x}", operation.intent.wallet_owner),
             tx_id: String::new(),
             network: "ARBITRUM".to_owned(),
-            withdraw_order_id: operation.intent.withdraw_order_id.clone(),
+            withdraw_order_id: if tr_id == 67_298_920 {
+                String::new()
+            } else {
+                operation.intent.withdraw_order_id.clone()
+            },
             info: String::new(),
         };
         let exact = vec![record(67_294_348, 4), record(67_298_920, 2)];

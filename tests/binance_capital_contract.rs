@@ -232,6 +232,9 @@ fn manual_m12_recovery_requires_both_unbroadcast_bot_attempts_and_the_exact_rece
     let recovery = &REBALANCE_RUNTIME[start..end];
 
     assert!(recovery.contains("validate_manual_recovery_travel_rule_rejections"));
+    assert!(recovery.contains("travel_rule_withdrawal_history_v2_for_network"));
+    assert!(recovery.contains("record.tr_id == local_entity_tr_id"));
+    assert!(recovery.contains("record.tr_id == standard_tr_id"));
     assert!(recovery.contains("withdrawal_history_for_coin(token_symbol)"));
     assert!(recovery.contains("expected_withdrawal_id"));
     assert!(recovery.contains("expected_master_transfer_transaction_id"));
