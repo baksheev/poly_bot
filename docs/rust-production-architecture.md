@@ -412,17 +412,16 @@ entry cannot be replayed by later rollouts.
 
 An ESP bootstrap or later rebalance must deliver ESP as ESP. A USDC-to-ESP DEX
 swap is not a substitute for the missing asset-transfer capability. The
-authoritative Rails flow before commit `6520658` and the successful manual ESP
-withdrawal establish one withdrawal rule for every asset and amount:
-`/sapi/v1/capital/withdraw/apply`. Travel Rule belongs to the opposite
-direction. After a wallet-to-Binance transfer, the deposit-history response
-decides whether `deposit/provide-info` is required through
-`requireQuestionnaire` and `travelRuleReqStatus`; the runtime does not infer
-that decision from a hard-coded amount threshold. The later Rails commit
-`6520658` incorrectly replaced the withdrawal endpoint globally. Rust exposes
-no withdrawal-mode configuration and pins the standard endpoint in code,
-while retaining local-entity withdrawal history only as evidence for the
-already journaled legacy incident.
+authoritative Rails `BinanceService#withdraw` and its request spec establish one
+withdrawal rule for every asset and amount:
+`/sapi/v1/localentity/withdraw/apply`, with the inline self-wallet questionnaire
+`{"isAddressOwner":1,"sendTo":1}`. This is one withdrawal request, not a
+separate post-withdrawal Travel Rule step. After a wallet-to-Binance transfer,
+the deposit-history response independently decides whether
+`deposit/provide-info` is required through `requireQuestionnaire` and
+`travelRuleReqStatus`; the runtime does not infer that decision from a hard-coded
+amount threshold. Rust exposes no withdrawal-mode environment setting and pins
+the Rails-compatible local-entity endpoint in code.
 
 The rejected legacy request is `trId=67181540`, `travelRuleStatus=4`, with no
 `withdrawalStatus` and no transaction hash. Recovery refetches the exact row,

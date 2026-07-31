@@ -9,9 +9,10 @@ contract error.
 
 ## External mutation matrix
 
-- [x] Binance-to-wallet USDC and ESP use only
-  `POST /sapi/v1/capital/withdraw/apply`; asset, network, and amount cannot
-  select a different withdrawal endpoint. Evidence:
+- [x] Binance-to-wallet USDC and ESP use only Rails-compatible
+  `POST /sapi/v1/localentity/withdraw/apply` with the inline self-wallet
+  questionnaire; asset, network, and amount cannot select a different
+  withdrawal endpoint. Evidence:
   `tests/binance_capital_contract.rs`.
 - [x] Wallet-to-Binance first obtains the exact Binance deposit address, sends
   the ERC-20 transfer on the pinned route chain, then reads deposit history.
@@ -43,18 +44,12 @@ contract error.
 - [x] Binance withdrawal intent is durable before the request; an unindexed
   unknown submission fails closed after the single allowed reconciliation
   query and cannot resubmit. Evidence:
-  `restart_preserves_unknown_standard_withdrawal_without_resubmission_authority`.
+  `restart_preserves_unknown_local_entity_withdrawal_without_resubmission_authority`.
 - [x] The pre-existing World Chain USDC operation
-  `rebalance-288-18c185631ae867dd` exhausted that one query without an indexed
-  withdrawal. The operator separately confirmed that Binance contains no
-  withdrawal for 1,285.195255 USDC, while a read-only Optimism balance check
-  remained exactly 508 base units. Its versioned recovery also requires the
-  exact successful master-transfer ID `395824828151`, full durable
-  operation/route identity, and the returned master balance; it terminally
-  closes the old saga without another withdrawal-history query or any external
-  mutation. Evidence:
-  `operator_absence_closes_only_the_exact_exhausted_standard_withdrawal` and
-  `operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal`.
+  `rebalance-288-18c185631ae867dd` was previously closed read-only after its
+  standard-endpoint attempt remained unindexed and the operator confirmed
+  absence. That historical recovery is no longer selected by the active
+  artifact.
 - [x] The first M10 rollout closed that older operation read-only, then exposed
   a separate pre-transfer crash intent
   `rebalance-294-96fd53e70c1ab390` for 1,197.503244 USDC. The process crashed
@@ -67,6 +62,16 @@ contract error.
   closes the local journal without transfer or withdrawal calls. Evidence:
   `operator_absence_closes_only_the_exact_pretransfer_crash_intent` and
   `pretransfer_crash_recovery_is_read_only_and_cannot_create_capital_work`.
+- [x] The corrective rollout reused that deterministic identity, completed the
+  exact master transfer `395924104268`, and then received synchronous HTTP 400 /
+  `-4104` from the incorrect standard endpoint before Binance created a
+  withdrawal. The operator confirmed that no withdrawal exists. Active recovery
+  binds operation `rebalance-296-96fd53e70c1ab390`, full fingerprint, client ID,
+  amount, route, transfer ID, response code/message, and unchanged Optimism
+  balance; it cannot query or submit another withdrawal. All subsequent
+  withdrawals use the Rails-compatible local-entity endpoint. Evidence:
+  `operator_absence_closes_only_the_exact_synchronously_rejected_standard_withdrawal`
+  and `operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal`.
 - [x] Restart before, during, and after an Arbitrum wallet child uses the same
   operation ID and transaction journal; mined success is reused and unknown
   nonce state cannot submit another transaction. Evidence:

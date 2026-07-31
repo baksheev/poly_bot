@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "e88e8e04f0648684a0bfe2c1563a289dc0253f88eb0914e175f840d4c3627a8e",
+      "source_fingerprint_sha256": "10a8d3dc8578340db33e176e44826e0288e20a3edd1e2a663da650b94490b9a3",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -56,7 +56,7 @@
                 "production_approval_actor": "operator",
                 "production_approval_recorded_at_utc": "2026-07-30T11:42:36Z",
                 "binance_network": "ARBITRUM",
-                "withdrawal_api_mode": "standard",
+                "withdrawal_api_mode": "local_entity",
                 "maximum_transfer_count": 2,
                 "maximum_token_a_withdrawal_fee_base_units": "5000000",
                 "maximum_token_b_withdrawal_fee_base_units": "100000000000000000000",
@@ -94,18 +94,22 @@
                 },
                 "approved_absent_standard_withdrawal": {
                   "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-31T01:46:08Z",
-                  "operation_id": "rebalance-288-18c185631ae867dd",
-                  "withdraw_order_id": "rb18c185631ae867ddaa4f5acda5704e",
+                  "production_approval_recorded_at_utc": "2026-07-31T03:03:36Z",
+                  "operation_id": "rebalance-296-96fd53e70c1ab390",
+                  "fingerprint": "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50",
+                  "withdraw_order_id": "rb96fd53e70c1ab390ae3e62eb434cd1",
                   "token_symbol": "USDC",
-                  "amount_base_units": "1285195255",
+                  "amount_base_units": "1197503244",
                   "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
                   "binance_network": "OPTIMISM",
                   "bridge_chain_id": 10,
                   "wallet_chain_id": 480,
                   "bridge_balance_before_base_units": "508",
-                  "master_transfer_transaction_id": 395824828151,
-                  "reconciliation_queries": 1
+                  "master_transfer_transaction_id": 395924104268,
+                  "reconciliation_queries": 0,
+                  "rejected_http_status": 400,
+                  "rejected_error_code": -4104,
+                  "rejected_error_message": "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
                 },
                 "approved_absent_master_transfer": {
                   "production_approval_actor": "operator",

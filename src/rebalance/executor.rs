@@ -789,7 +789,7 @@ fn validate_transition(
                 ..
             },
         ) if reason.contains("approved deterministic Travel Rule rejection")
-            && api_mode == "standard"
+            && api_mode == "local_entity"
     );
     ensure!(
         !previous.terminal() || approved_terminal_retry,
@@ -862,7 +862,7 @@ fn validate_transition(
             P::BinanceWithdrawalSubmissionStarted { api_mode, .. },
         ) => {
             reason.contains("approved deterministic Travel Rule rejection")
-                && api_mode == "standard"
+                && api_mode == "local_entity"
         }
         (
             Route::Direct { .. },
@@ -1054,7 +1054,10 @@ fn validate_progress_evidence(
             ..
         } => {
             ensure!(
-                matches!(api_mode.as_str(), "standard" | "travel_rule"),
+                matches!(
+                    api_mode.as_str(),
+                    "local_entity" | "standard" | "travel_rule"
+                ),
                 "rebalance Binance withdrawal submission API mode is invalid"
             );
             ensure!(
@@ -1380,8 +1383,8 @@ mod tests {
     }
 
     #[test]
-    fn only_approved_travel_rule_failure_can_reopen_into_standard_submission_intent() {
-        let path = path("approved-standard-retry");
+    fn only_approved_travel_rule_failure_can_reopen_into_local_entity_submission_intent() {
+        let path = path("approved-local-entity-retry");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
             .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
@@ -1400,7 +1403,7 @@ mod tests {
             .advance(
                 &operation_id,
                 RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                    api_mode: "standard".to_owned(),
+                    api_mode: "local_entity".to_owned(),
                     bridge_balance_before: U256::ZERO,
                     reconciliation_queries: 0,
                 },
@@ -1787,7 +1790,7 @@ mod tests {
                 .advance(
                     &operation_id,
                     RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                        api_mode: "standard".to_owned(),
+                        api_mode: "local_entity".to_owned(),
                         bridge_balance_before: U256::from(8_000_000_u64),
                         reconciliation_queries: 0,
                     },
@@ -1814,8 +1817,8 @@ mod tests {
     }
 
     #[test]
-    fn restart_preserves_unknown_standard_withdrawal_without_resubmission_authority() {
-        let path = path("standard-withdrawal-unknown");
+    fn restart_preserves_unknown_local_entity_withdrawal_without_resubmission_authority() {
+        let path = path("local-entity-withdrawal-unknown");
         let operation_id;
         {
             let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
@@ -1845,7 +1848,7 @@ mod tests {
                 .advance(
                     &operation_id,
                     RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                        api_mode: "standard".to_owned(),
+                        api_mode: "local_entity".to_owned(),
                         bridge_balance_before: U256::ZERO,
                         reconciliation_queries: 0,
                     },
@@ -1855,7 +1858,7 @@ mod tests {
                 .advance(
                     &operation_id,
                     RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                        api_mode: "standard".to_owned(),
+                        api_mode: "local_entity".to_owned(),
                         bridge_balance_before: U256::ZERO,
                         reconciliation_queries: 1,
                     },
@@ -1866,7 +1869,7 @@ mod tests {
                     .advance(
                         &operation_id,
                         RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                            api_mode: "standard".to_owned(),
+                            api_mode: "local_entity".to_owned(),
                             bridge_balance_before: U256::ZERO,
                             reconciliation_queries: 2,
                         },
@@ -1884,7 +1887,7 @@ mod tests {
                 ref api_mode,
                 reconciliation_queries: 1,
                 ..
-            } if api_mode == "standard"
+            } if api_mode == "local_entity"
         ));
         drop(journal);
         fs::remove_file(path).unwrap();

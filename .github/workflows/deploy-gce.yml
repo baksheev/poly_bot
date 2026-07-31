@@ -123,7 +123,7 @@ jobs:
           gcloud compute instances add-metadata "${GCE_INSTANCE}" \
             --zone="${GCE_ZONE}" \
             --project="${GCP_PROJECT_ID}" \
-            --metadata="arb-bot-image=${IMAGE},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v6.json,arb-bot-rebalance-execution-mode=full_live,arb-bot-rebalance-live-confirmation=ENABLE_FULL_REBALANCE,arb-bot-rebalance-max-wld-amount=${REBALANCE_MAX_WLD_AMOUNT},arb-bot-rebalance-max-usdc-amount=${REBALANCE_MAX_USDC_AMOUNT},arb-bot-rebalance-binance-withdrawal-api-mode=standard" \
+            --metadata="arb-bot-image=${IMAGE},arb-bot-engine-id=${engine_id},arb-bot-region=${GCP_REGION},arb-bot-wallet-address=${EVM_WALLET_ADDRESS},arb-bot-domain-config-path=config/strategies/usdc-wld-world-chain.v6.json,arb-bot-rebalance-execution-mode=full_live,arb-bot-rebalance-live-confirmation=ENABLE_FULL_REBALANCE,arb-bot-rebalance-max-wld-amount=${REBALANCE_MAX_WLD_AMOUNT},arb-bot-rebalance-max-usdc-amount=${REBALANCE_MAX_USDC_AMOUNT}" \
             --metadata-from-file="startup-script=infra/gcp/gce-startup.sh"
           gcloud compute instances add-labels "${GCE_INSTANCE}" \
             --zone="${GCE_ZONE}" \

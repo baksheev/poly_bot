@@ -281,13 +281,12 @@ Startup validates both account views before opening the live executor:
 - both credentials are restricted to the production egress IP.
 
 Every production withdrawal is compile-time pinned to Binance
-`/sapi/v1/capital/withdraw/apply`, independent of asset, network, or amount.
-There is no runtime withdrawal-mode setting. The exact wallet is
-also present in Binance's withdrawal-address list for Arbitrum with
-`whiteStatus=true`. The standard API selection is durably journaled before
-submission and cannot change after an ambiguous request. Local-entity
-withdrawal history is queried only to reconcile the already persisted legacy
-incident created by the incorrect endpoint; it is never a routing input.
+`/sapi/v1/localentity/withdraw/apply`, independent of asset, network, or amount,
+and includes Rails' inline self-wallet questionnaire. There is no runtime
+withdrawal-mode setting. The exact wallet is also present in Binance's
+withdrawal-address list for Arbitrum with `whiteStatus=true`. The local-entity
+API selection is durably journaled before submission and cannot change after an
+ambiguous request.
 
 Travel Rule is conditional deposit handling. After a wallet-to-Binance transfer,
 Rust reads the exact deposit-history row and submits `deposit/provide-info`
@@ -356,7 +355,7 @@ inventory availability, source-debit conservation, route, and remaining
 durable authority before the engine reserves inventory. All Arbitrum wallet
 children use the same execution owner, nonce lane, signer, gas policy, and
 transaction journal as ESP trades and allowances. Binance withdrawal intent
-is fsynced before submission; after an ambiguous standard withdrawal the one
+is fsynced before submission; after an ambiguous local-entity withdrawal the one
 exact history reconciliation query can only discover the existing result and
 never authorize a second withdrawal. Wallet deposits persist the exact
 deposit/questionnaire identity before conditional Travel Rule submission.
@@ -374,7 +373,8 @@ Production mutation requires all of the following:
 - `REBALANCE_LIVE_CONFIRMATION=ENABLE_FULL_REBALANCE`;
 - positive `REBALANCE_MAX_WLD_AMOUNT` and `REBALANCE_MAX_USDC_AMOUNT`;
 - `REBALANCE_EXECUTOR_TIMEOUT_SECONDS` between 60 and 86,400;
-- the compile-time-pinned standard Binance capital withdrawal endpoint;
+- the compile-time-pinned Rails-compatible Binance local-entity withdrawal
+  endpoint and inline self-wallet questionnaire;
 - the trading, treasury, subaccount, wallet, RPC, and journal configuration
   described above.
 

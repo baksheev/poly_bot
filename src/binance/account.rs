@@ -823,10 +823,46 @@ struct ServerTime {
 }
 
 #[derive(Deserialize)]
-struct BinanceError {
+struct BinanceErrorBody {
     code: i64,
     msg: String,
 }
+
+#[derive(Debug)]
+pub struct BinanceApiError {
+    operation: String,
+    status: StatusCode,
+    code: Option<i64>,
+    message: Option<String>,
+}
+
+impl BinanceApiError {
+    pub fn is_known_pre_submission_withdrawal_rejection(&self) -> bool {
+        self.status.is_client_error()
+            && self
+                .code
+                .is_some_and(|code| matches!(code, -4104 | -4024 | -1002))
+    }
+}
+
+impl fmt::Display for BinanceApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Binance {} failed with HTTP {}",
+            self.operation, self.status
+        )?;
+        if let Some(code) = self.code {
+            write!(formatter, ", code {code}")?;
+        }
+        if let Some(message) = &self.message {
+            write!(formatter, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BinanceApiError {}
 
 async fn decode_response<T>(response: reqwest::Response, operation: &str) -> anyhow::Result<T>
 where
@@ -847,14 +883,14 @@ async fn decode_response_body(
         .await
         .with_context(|| format!("failed to read Binance {operation} response"))?;
     if status != StatusCode::OK {
-        if let Ok(error) = serde_json::from_slice::<BinanceError>(&body) {
-            bail!(
-                "Binance {operation} failed with HTTP {status}, code {}: {}",
-                error.code,
-                error.msg
-            );
+        let parsed = serde_json::from_slice::<BinanceErrorBody>(&body).ok();
+        return Err(BinanceApiError {
+            operation: operation.to_owned(),
+            status,
+            code: parsed.as_ref().map(|error| error.code),
+            message: parsed.map(|error| error.msg),
         }
-        bail!("Binance {operation} failed with HTTP {status}");
+        .into());
     }
     Ok(body.to_vec())
 }
@@ -965,11 +1001,12 @@ fn apply_clock_offset(timestamp: u64, offset: i64) -> anyhow::Result<u64> {
 mod tests {
     use std::time::Instant;
 
+    use reqwest::StatusCode;
     use rust_decimal::Decimal;
 
     use super::{
-        ApiKeyPermissions, BinanceAccountClient, BinanceClockSync, BinanceCredentials,
-        CommissionRates, ExchangeInformation, apply_clock_offset, sign_hex,
+        ApiKeyPermissions, BinanceAccountClient, BinanceApiError, BinanceClockSync,
+        BinanceCredentials, CommissionRates, ExchangeInformation, apply_clock_offset, sign_hex,
     };
 
     #[test]
@@ -983,6 +1020,37 @@ mod tests {
 
         assert_eq!(sync.midpoint_uncertainty_us(), 3);
         assert!(sync.age_ms() <= 1);
+    }
+
+    #[test]
+    fn classifies_only_reviewed_http_4xx_codes_as_terminal_withdrawal_rejections() {
+        let rejected = BinanceApiError {
+            operation: "local-entity withdrawal submission".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            code: Some(-4104),
+            message: Some("travel rule restrictions".to_owned()),
+        };
+        assert!(rejected.is_known_pre_submission_withdrawal_rejection());
+        assert_eq!(
+            rejected.to_string(),
+            "Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4104: travel rule restrictions"
+        );
+
+        let unavailable = BinanceApiError {
+            operation: "local-entity withdrawal submission".to_owned(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: None,
+        };
+        assert!(!unavailable.is_known_pre_submission_withdrawal_rejection());
+
+        let unknown_bad_request = BinanceApiError {
+            operation: "local-entity withdrawal submission".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            code: Some(-9999),
+            message: Some("unreviewed rejection".to_owned()),
+        };
+        assert!(!unknown_bad_request.is_known_pre_submission_withdrawal_rejection());
     }
 
     #[test]

@@ -629,6 +629,7 @@ pub struct LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
     pub production_approval_actor: String,
     pub production_approval_recorded_at_utc: String,
     pub operation_id: String,
+    pub fingerprint: String,
     pub withdraw_order_id: String,
     pub token_symbol: String,
     pub amount_base_units: String,
@@ -639,6 +640,9 @@ pub struct LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
     pub bridge_balance_before_base_units: String,
     pub master_transfer_transaction_id: u64,
     pub reconciliation_queries: u16,
+    pub rejected_http_status: u16,
+    pub rejected_error_code: i64,
+    pub rejected_error_message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -669,7 +673,7 @@ impl LiveCanaryPrefundingRebalanceConfig {
                 && !self.production_approval_actor.trim().is_empty()
                 && self.production_approval_recorded_at_utc.ends_with('Z')
                 && self.binance_network == "ARBITRUM"
-                && self.withdrawal_api_mode == "standard"
+                && self.withdrawal_api_mode == "local_entity"
                 && pair.chain.chain_id == 42_161
                 && pair.chain.binance_network_name == self.binance_network
                 && self.maximum_transfer_count == 2,
@@ -790,11 +794,13 @@ impl LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
         )?;
         ensure!(
             self.production_approval_actor == "operator"
-                && self.production_approval_recorded_at_utc == "2026-07-31T01:46:08Z"
-                && self.operation_id == "rebalance-288-18c185631ae867dd"
-                && self.withdraw_order_id == "rb18c185631ae867ddaa4f5acda5704e"
+                && self.production_approval_recorded_at_utc == "2026-07-31T03:03:36Z"
+                && self.operation_id == "rebalance-296-96fd53e70c1ab390"
+                && self.fingerprint
+                    == "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
+                && self.withdraw_order_id == "rb96fd53e70c1ab390ae3e62eb434cd1"
                 && self.token_symbol == "USDC"
-                && amount == U256::from(1_285_195_255_u64)
+                && amount == U256::from(1_197_503_244_u64)
                 && self
                     .wallet_address
                     .eq_ignore_ascii_case("0x90D990C81320221D2882De32beeA78923c1e77A3")
@@ -803,8 +809,12 @@ impl LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
                 && self.bridge_chain_id == 10
                 && self.wallet_chain_id == 480
                 && bridge_balance_before == U256::from(508_u64)
-                && self.master_transfer_transaction_id == 395_824_828_151
-                && self.reconciliation_queries == 1
+                && self.master_transfer_transaction_id == 395_924_104_268
+                && self.reconciliation_queries == 0
+                && self.rejected_http_status == 400
+                && self.rejected_error_code == -4104
+                && self.rejected_error_message
+                    == "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
                 && pair.chain.chain_id == 42_161,
             "pair {} absent standard-withdrawal recovery identity is invalid",
             pair.id
@@ -1807,7 +1817,7 @@ mod tests {
         assert_eq!(canary.runtime_wallet_token_b_minimum(), "1");
         let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
         assert_eq!(prefunding.binance_network, "ARBITRUM");
-        assert_eq!(prefunding.withdrawal_api_mode, "standard");
+        assert_eq!(prefunding.withdrawal_api_mode, "local_entity");
         assert_eq!(prefunding.maximum_transfer_count, 2);
         assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
         assert_eq!(
@@ -1875,19 +1885,21 @@ mod tests {
             .unwrap();
         assert_eq!(
             absent_withdrawal.operation_id,
-            "rebalance-288-18c185631ae867dd"
+            "rebalance-296-96fd53e70c1ab390"
         );
         assert_eq!(
             absent_withdrawal.withdraw_order_id,
-            "rb18c185631ae867ddaa4f5acda5704e"
+            "rb96fd53e70c1ab390ae3e62eb434cd1"
         );
-        assert_eq!(absent_withdrawal.amount_base_units, "1285195255");
+        assert_eq!(absent_withdrawal.amount_base_units, "1197503244");
         assert_eq!(absent_withdrawal.binance_network, "OPTIMISM");
         assert_eq!(
             absent_withdrawal.master_transfer_transaction_id,
-            395_824_828_151
+            395_924_104_268
         );
-        assert_eq!(absent_withdrawal.reconciliation_queries, 1);
+        assert_eq!(absent_withdrawal.reconciliation_queries, 0);
+        assert_eq!(absent_withdrawal.rejected_http_status, 400);
+        assert_eq!(absent_withdrawal.rejected_error_code, -4104);
         let absent_master_transfer = prefunding.approved_absent_master_transfer.as_ref().unwrap();
         assert_eq!(
             absent_master_transfer.operation_id,
@@ -1933,7 +1945,7 @@ mod tests {
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["prefunding_rebalance"]["withdrawal_api_mode"] =
-            Value::String("travel_rule".to_owned());
+            Value::String("standard".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();

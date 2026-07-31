@@ -1989,11 +1989,11 @@ transfer, and requires the master account to hold exactly `401.2 ESP` free and
 zero locked. Any completed status, transaction hash, identity mismatch, or
 balance mismatch fails closed.
 
-Rails originally used `/sapi/v1/capital/withdraw/apply`; commit `6520658`
-globally replaced it with `/sapi/v1/localentity/withdraw/apply`. That replacement
-mixed two independent flows. Withdrawals always use the standard capital
-endpoint, independent of asset, network, or amount. Travel Rule handling starts
-only after a wallet-to-Binance transfer: the deposit-history row's
+Rails `BinanceService#withdraw` and its request spec use
+`/sapi/v1/localentity/withdraw/apply` with
+`{"isAddressOwner":1,"sendTo":1}` inline for every withdrawal, independent of
+asset, network, or amount. Deposit Travel Rule handling is a separate flow:
+after a wallet-to-Binance transfer, the deposit-history row's
 `requireQuestionnaire` and `travelRuleReqStatus` fields determine whether Rust
 submits `deposit/provide-info`. No local amount threshold selects an endpoint.
 The exact Arbitrum address is ownership-`VERIFIED` and present in the withdrawal

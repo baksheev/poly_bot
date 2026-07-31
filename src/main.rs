@@ -1183,7 +1183,7 @@ async fn prefund_arbitrum_canary(
                 U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
                     .context("approved Travel Rule rejected amount is invalid")?;
             let completed = executor
-                .retry_approved_failed_travel_rule_with_standard(
+                .retry_approved_failed_travel_rule_with_local_entity(
                     &recovery.rejected_token_symbol,
                     rejected_amount,
                     configured_wallet,
@@ -3239,6 +3239,7 @@ async fn run(
         {
             let recovery = ApprovedAbsentStandardWithdrawalRecovery {
                 operation_id: recovery.operation_id.clone(),
+                fingerprint: recovery.fingerprint.clone(),
                 withdraw_order_id: recovery.withdraw_order_id.clone(),
                 token_symbol: recovery.token_symbol.clone(),
                 amount: U256::from_str_radix(&recovery.amount_base_units, 10)
@@ -3255,6 +3256,9 @@ async fn run(
                 .context("approved absent withdrawal bridge balance is invalid")?,
                 master_transfer_transaction_id: recovery.master_transfer_transaction_id,
                 reconciliation_queries: recovery.reconciliation_queries,
+                rejected_http_status: recovery.rejected_http_status,
+                rejected_error_code: recovery.rejected_error_code,
+                rejected_error_message: recovery.rejected_error_message.clone(),
             };
             executor
                 .close_operator_confirmed_absent_standard_withdrawal(&recovery)

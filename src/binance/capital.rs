@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use alloy_primitives::{Address, B256};
 use anyhow::{Context, bail, ensure};
@@ -10,7 +10,7 @@ use super::account::BinanceAccountClient;
 
 const DEPOSIT_ADDRESS_ENDPOINT: &str = "/sapi/v1/capital/deposit/address";
 const DEPOSIT_TRAVEL_RULE_ENDPOINT: &str = "/sapi/v2/localentity/deposit/provide-info";
-const STANDARD_WITHDRAWAL_ENDPOINT: &str = "/sapi/v1/capital/withdraw/apply";
+const LOCAL_ENTITY_WITHDRAWAL_ENDPOINT: &str = "/sapi/v1/localentity/withdraw/apply";
 
 impl BinanceAccountClient {
     pub async fn all_coin_information(&self) -> anyhow::Result<Vec<CoinInformation>> {
@@ -152,14 +152,14 @@ impl BinanceAccountClient {
         .await
     }
 
-    pub async fn withdraw_standard(
+    pub async fn withdraw_local_entity(
         &self,
         coin: &str,
         network: &str,
         address: &str,
         amount: Decimal,
         withdraw_order_id: &str,
-    ) -> anyhow::Result<StandardWithdrawalSubmission> {
+    ) -> anyhow::Result<LocalEntityWithdrawalSubmission> {
         validate_symbol("coin", coin)?;
         validate_symbol("network", network)?;
         ensure!(
@@ -174,21 +174,41 @@ impl BinanceAccountClient {
             ("coin", coin.to_owned()),
             ("address", address.to_owned()),
             ("amount", amount.normalize().to_string()),
-            ("withdrawOrderId", withdraw_order_id.to_owned()),
             ("network", network.to_owned()),
             ("walletType", "0".to_owned()),
+            (
+                "questionnaire",
+                serde_json::json!({
+                    "isAddressOwner": 1,
+                    "sendTo": 1,
+                })
+                .to_string(),
+            ),
+            ("withdrawOrderId", withdraw_order_id.to_owned()),
             ("recvWindow", "5000".to_owned()),
         ])?;
-        let submission: StandardWithdrawalSubmission = self
+        let submission: LocalEntityWithdrawalSubmission = self
             .signed_post(
-                STANDARD_WITHDRAWAL_ENDPOINT,
+                LOCAL_ENTITY_WITHDRAWAL_ENDPOINT,
                 &query,
-                "standard withdrawal submission",
+                "local-entity withdrawal submission",
             )
             .await?;
+        if !submission.accepted {
+            return Err(BinanceWithdrawalRejected {
+                tr_id: submission.tr_id,
+                info: submission.info,
+            }
+            .into());
+        }
         ensure!(
-            !submission.id.trim().is_empty(),
-            "Binance standard withdrawal returned an empty id"
+            !submission.tr_id.is_empty()
+                && submission.tr_id.len() <= 128
+                && submission
+                    .tr_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "Binance local-entity withdrawal returned an invalid trId"
         );
         Ok(submission)
     }
@@ -552,9 +572,32 @@ pub struct WithdrawalSubmission {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct StandardWithdrawalSubmission {
-    pub id: String,
+#[serde(rename_all = "camelCase")]
+pub struct LocalEntityWithdrawalSubmission {
+    #[serde(deserialize_with = "deserialize_opaque_id")]
+    pub tr_id: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub info: String,
 }
+
+#[derive(Debug)]
+pub struct BinanceWithdrawalRejected {
+    tr_id: String,
+    info: String,
+}
+
+impl fmt::Display for BinanceWithdrawalRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Binance local-entity withdrawal was not accepted (trId={}): {}",
+            self.tr_id, self.info
+        )
+    }
+}
+
+impl std::error::Error for BinanceWithdrawalRejected {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -880,18 +923,37 @@ where
     Decimal::from_str(&value).map_err(serde::de::Error::custom)
 }
 
+fn deserialize_opaque_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OpaqueId {
+        String(String),
+        Signed(i64),
+        Unsigned(u64),
+    }
+
+    Ok(match OpaqueId::deserialize(deserializer)? {
+        OpaqueId::String(value) => value,
+        OpaqueId::Signed(value) => value.to_string(),
+        OpaqueId::Unsigned(value) => value.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, B256};
 
     use super::{
-        AddressVerificationRecord, CoinInformation, DEPOSIT_ADDRESS_ENDPOINT,
-        DEPOSIT_TRAVEL_RULE_ENDPOINT, DepositAddressRecord, DepositCreditState, DepositRecord,
-        NetworkInformation, STANDARD_WITHDRAWAL_ENDPOINT, StandardWithdrawalSubmission,
-        TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalAddressRecord,
-        WithdrawalRecord, WithdrawalState, WithdrawalSubmission, matching_deposits,
-        matching_withdrawals, parse_address_verification_list, select_capital_routes,
-        select_evm_deposit_address,
+        AddressVerificationRecord, BinanceWithdrawalRejected, CoinInformation,
+        DEPOSIT_ADDRESS_ENDPOINT, DEPOSIT_TRAVEL_RULE_ENDPOINT, DepositAddressRecord,
+        DepositCreditState, DepositRecord, LOCAL_ENTITY_WITHDRAWAL_ENDPOINT,
+        LocalEntityWithdrawalSubmission, NetworkInformation, TravelRuleQuestionnaireRequirements,
+        TravelRuleWithdrawalRecord, WithdrawalAddressRecord, WithdrawalRecord, WithdrawalState,
+        WithdrawalSubmission, matching_deposits, matching_withdrawals,
+        parse_address_verification_list, select_capital_routes, select_evm_deposit_address,
     };
 
     const WLD: &str = r#"{
@@ -933,6 +995,33 @@ mod tests {
 
         assert_eq!(submission.tr_id, 65_865_740);
         assert!(submission.accepted);
+    }
+
+    #[test]
+    fn rejected_local_entity_response_has_a_typed_terminal_error() {
+        let error = BinanceWithdrawalRejected {
+            tr_id: "67181540".to_owned(),
+            info: "Rejected".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Binance local-entity withdrawal was not accepted (trId=67181540): Rejected"
+        );
+    }
+
+    #[test]
+    fn local_entity_withdrawal_accepts_uuid_and_numeric_tr_ids_as_opaque_strings() {
+        let uuid: LocalEntityWithdrawalSubmission = serde_json::from_str(
+            r#"{"trId":"b8a6b2c3-5f4d-4e3b-8a1c-9d8e7f6a5b4c","accepted":true,"info":"Withdrawal request accepted"}"#,
+        )
+        .unwrap();
+        assert_eq!(uuid.tr_id, "b8a6b2c3-5f4d-4e3b-8a1c-9d8e7f6a5b4c");
+
+        let numeric: LocalEntityWithdrawalSubmission = serde_json::from_str(
+            r#"{"trId":65865740,"accepted":true,"info":"Withdrawal request accepted"}"#,
+        )
+        .unwrap();
+        assert_eq!(numeric.tr_id, "65865740");
     }
 
     #[test]
@@ -1034,14 +1123,6 @@ mod tests {
             }))
             .is_err()
         );
-    }
-
-    #[test]
-    fn parses_standard_withdrawal_submission_id() {
-        let submission: StandardWithdrawalSubmission =
-            serde_json::from_str(r#"{"id":"7213fea8e94b4a5593d507237e5a555b"}"#).unwrap();
-
-        assert_eq!(submission.id, "7213fea8e94b4a5593d507237e5a555b");
     }
 
     #[test]
@@ -1239,16 +1320,16 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_and_deposit_travel_rule_endpoints_are_distinct_invariants() {
+    fn rails_compatible_withdrawal_and_conditional_deposit_endpoints_are_pinned() {
         assert_eq!(
-            STANDARD_WITHDRAWAL_ENDPOINT,
-            "/sapi/v1/capital/withdraw/apply"
+            LOCAL_ENTITY_WITHDRAWAL_ENDPOINT,
+            "/sapi/v1/localentity/withdraw/apply"
         );
         assert_eq!(
             DEPOSIT_TRAVEL_RULE_ENDPOINT,
             "/sapi/v2/localentity/deposit/provide-info"
         );
-        assert!(!STANDARD_WITHDRAWAL_ENDPOINT.contains("localentity"));
+        assert!(LOCAL_ENTITY_WITHDRAWAL_ENDPOINT.contains("/localentity/withdraw/"));
         assert!(DEPOSIT_TRAVEL_RULE_ENDPOINT.contains("/deposit/"));
     }
 

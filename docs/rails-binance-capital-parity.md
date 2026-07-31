@@ -14,6 +14,7 @@ rebalance fix history in `/Users/baksheev/code/arb_bot`.
 |---|---|---|
 | Deposit history uses the on-chain `txId` | Crediting an unrelated Binance deposit | Parse an EVM hash, compare it case-insensitively, and reject duplicate matches |
 | Withdrawal recovery searches `withdrawOrderId` | Confusing the numeric Travel Rule `trId`, Binance UUID, and client id | Fetch capital history and match the deterministic client id locally |
+| `withdraw` always posts to `sapi/v1/localentity/withdraw/apply` with `{"isAddressOwner":1,"sendTo":1}` | Treating the account's inline withdrawal questionnaire as an asset- or amount-selected second flow | Pin the same endpoint and questionnaire for every new withdrawal; expose no runtime selector |
 | Deposit statuses `1` and `6` are credited | Waiting forever after funds are already credited but temporarily locked for withdrawal | Expose `Credited` and `CreditedWithdrawalLocked` as separate typed states |
 | Empty history causes another observation | Treating Binance indexing lag as a failed transfer and resubmitting | Return an empty matching set; absence never authorizes a retry |
 | Travel Rule questionnaire state is retained | Declaring a restricted deposit fully usable | Preserve `requireQuestionnaire` and `travelRuleReqStatus` separately from credit state |

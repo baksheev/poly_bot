@@ -168,7 +168,7 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.retry_after_verified_address" "${domain_config}")" \
             = true
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.withdrawal_api_mode" "${domain_config}")" \
-            = standard
+            = local_entity
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_symbol" "${domain_config}")" \
             = ESP
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_amount_base_units" "${domain_config}")" \
@@ -190,18 +190,22 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.nonce" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.rpc_error_code" "${domain_config}")" = -32000
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.operation_id" "${domain_config}")" \
-            = rebalance-288-18c185631ae867dd
+            = rebalance-296-96fd53e70c1ab390
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.fingerprint" "${domain_config}")" \
+            = 96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.withdraw_order_id" "${domain_config}")" \
-            = rb18c185631ae867ddaa4f5acda5704e
+            = rb96fd53e70c1ab390ae3e62eb434cd1
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.amount_base_units" "${domain_config}")" \
-            = 1285195255
+            = 1197503244
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.binance_network" "${domain_config}")" \
             = OPTIMISM
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.bridge_balance_before_base_units" "${domain_config}")" \
             = 508
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.master_transfer_transaction_id" "${domain_config}")" \
-            = 395824828151
-          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.reconciliation_queries" "${domain_config}")" = 1
+            = 395924104268
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.reconciliation_queries" "${domain_config}")" = 0
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.rejected_http_status" "${domain_config}")" = 400
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.rejected_error_code" "${domain_config}")" = -4104
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_master_transfer.operation_id" "${domain_config}")" \
             = rebalance-294-96fd53e70c1ab390
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_master_transfer.fingerprint" "${domain_config}")" \
