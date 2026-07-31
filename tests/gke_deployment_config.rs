@@ -87,7 +87,10 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_update_delta"));
     assert!(DEPLOY_WORKFLOW.contains("top_of_book_max_trade_notional_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("balance_safety_multiplier"));
-    assert!(DEPLOY_WORKFLOW.contains("previous_runtime_config"));
+    assert!(DEPLOY_WORKFLOW.contains("previous_runtime_data"));
+    assert!(DEPLOY_WORKFLOW.contains("runtime_rollback_patch"));
+    assert!(DEPLOY_WORKFLOW.contains("kubectl patch configmap arb-bot-runtime"));
+    assert!(DEPLOY_WORKFLOW.contains("--type=json"));
     assert!(MAIN.contains("network_runtime_count"));
     assert!(MAIN.contains("binance_strategy_max_transport_silence_ms"));
     assert!(MAIN.contains("hot_path_strategy_count"));
@@ -157,7 +160,7 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
 #[test]
 fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
-    assert!(!DEPLOYMENT.contains("initContainers:"));
+    assert!(DEPLOYMENT.contains("initContainers: []"));
     assert!(!DEPLOYMENT.contains("name: prefund-arbitrum-m9"));
     assert!(!DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
     assert!(!DEPLOYMENT.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));

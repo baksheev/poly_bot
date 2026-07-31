@@ -13,6 +13,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 use super::{Direction, Location, PendingTransfer, RebalanceAction, Route};
@@ -312,21 +313,23 @@ impl RebalanceExecutionJournal {
                 "rebalance executor journal ends with a partial record"
             );
             line.pop();
-            let record: WireRecord = serde_json::from_slice(&line)
+            let record: RawWireRecord<'_> = serde_json::from_slice(&line)
                 .context("rebalance executor journal contains invalid JSON")?;
             record.validate_checksum()?;
+            let payload: WirePayload = serde_json::from_str(record.payload.get())
+                .context("rebalance executor journal payload is invalid")?;
             ensure!(
-                record.payload.version == VERSION,
+                payload.version == VERSION,
                 "unsupported rebalance executor journal version"
             );
             ensure!(
-                record.payload.sequence == expected_sequence,
+                payload.sequence == expected_sequence,
                 "rebalance executor journal sequence mismatch"
             );
             operation_started_at_unix_ms
-                .entry(record.payload.operation.intent.operation_id.clone())
-                .or_insert(record.payload.recorded_at_unix_ms);
-            apply_snapshot(&mut operations, &record.payload.operation)?;
+                .entry(payload.operation.intent.operation_id.clone())
+                .or_insert(payload.recorded_at_unix_ms);
+            apply_snapshot(&mut operations, &payload.operation)?;
             expected_sequence = expected_sequence
                 .checked_add(1)
                 .context("rebalance executor journal sequence overflow")?;
@@ -562,7 +565,7 @@ struct WirePayload {
     operation: RebalanceExecutionOperation,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 struct WireRecord {
     payload: WirePayload,
     checksum_sha256: String,
@@ -576,10 +579,19 @@ impl WireRecord {
             checksum_sha256,
         })
     }
+}
 
+#[derive(Debug, Deserialize)]
+struct RawWireRecord<'a> {
+    #[serde(borrow)]
+    payload: &'a RawValue,
+    checksum_sha256: String,
+}
+
+impl RawWireRecord<'_> {
     fn validate_checksum(&self) -> anyhow::Result<()> {
         ensure!(
-            self.checksum_sha256 == checksum(&self.payload)?,
+            self.checksum_sha256 == checksum_bytes(self.payload.get().as_bytes()),
             "rebalance executor journal checksum mismatch"
         );
         Ok(())
@@ -1190,10 +1202,11 @@ fn request_fingerprint(request: &RebalanceExecutionRequest) -> anyhow::Result<St
 }
 
 fn checksum(payload: &WirePayload) -> anyhow::Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(payload)?)
-    ))
+    Ok(checksum_bytes(&serde_json::to_vec(payload)?))
+}
+
+fn checksum_bytes(payload: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(payload))
 }
 
 fn validate_hash_text(value: &str) -> anyhow::Result<()> {
@@ -1444,6 +1457,80 @@ mod tests {
             RebalanceExecutionProgress::BinanceWithdrawalSubmitted { .. }
         ));
         drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_defaulted_progress_field_validates_the_stored_payload_bytes() {
+        let path = path("legacy-defaulted-progress-checksum");
+        let operation_id;
+        {
+            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+            let operation = journal
+                .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+                .unwrap();
+            operation_id = operation.intent.operation_id;
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceTransferSubmitted {
+                        transaction_id: 17,
+                        bridge_balance_before: U256::ZERO,
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceTransferCompleted {
+                        transaction_id: 17,
+                        bridge_balance_before: U256::ZERO,
+                    },
+                )
+                .unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "standard".to_owned(),
+                        bridge_balance_before: U256::ZERO,
+                        reconciliation_queries: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut legacy_record: serde_json::Value =
+            serde_json::from_str(lines.last().unwrap()).unwrap();
+        legacy_record["payload"]["operation"]["progress"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reconciliation_queries");
+        let legacy_payload = serde_json::to_string(&legacy_record["payload"]).unwrap();
+        legacy_record["checksum_sha256"] =
+            serde_json::Value::String(super::checksum_bytes(legacy_payload.as_bytes()));
+        lines.pop();
+        lines.push(serde_json::to_string(&legacy_record).unwrap());
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(matches!(
+            replayed.operations()[&operation_id].progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                reconciliation_queries: 0,
+                ..
+            }
+        ));
+        drop(replayed);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        fs::write(&path, contents.replace("\"standard\"", "\"travel_rule\"")).unwrap();
+        assert!(RebalanceExecutionJournal::open(&path).is_err());
         fs::remove_file(path).unwrap();
     }
 

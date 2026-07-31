@@ -52,6 +52,9 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      # Keep this explicit: client-side apply cannot infer deletion when an
+      # older live Deployment still owns the completed M9 prefunder field.
+      initContainers: []
       containers:
         - name: arb-bot
           image: __IMAGE__

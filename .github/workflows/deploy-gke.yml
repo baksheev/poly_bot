@@ -304,7 +304,7 @@ jobs:
           new_pool="${NODE_POOL_PREFIX}-${release_id}"
           had_previous=false
           previous_pool=""
-          previous_runtime_config=""
+          previous_runtime_data="null"
           rollout_applied=false
           rollout_succeeded=false
 
@@ -315,9 +315,9 @@ jobs:
               -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
             test -n "${previous_pool}"
             new_pool="${previous_pool}"
-            previous_runtime_config="$(kubectl get configmap arb-bot-runtime \
+            previous_runtime_data="$(kubectl get configmap arb-bot-runtime \
               --namespace "${GKE_NAMESPACE}" \
-              -o yaml)"
+              -o json | jq -c '.data')"
           fi
 
           restore_on_failure() {
@@ -334,8 +334,13 @@ jobs:
               -o wide || true
             if [[ "${rollout_applied}" == true ]]; then
               if [[ "${had_previous}" == true ]]; then
-                printf '%s\n' "${previous_runtime_config}" \
-                  | kubectl replace --namespace "${GKE_NAMESPACE}" -f - || true
+                runtime_rollback_patch="$(jq -cn \
+                  --argjson data "${previous_runtime_data}" \
+                  '[{"op":"replace","path":"/data","value":$data}]')"
+                kubectl patch configmap arb-bot-runtime \
+                  --namespace "${GKE_NAMESPACE}" \
+                  --type=json \
+                  --patch "${runtime_rollback_patch}" || true
                 kubectl rollout undo deployment/arb-bot --namespace "${GKE_NAMESPACE}" || true
                 kubectl rollout status deployment/arb-bot \
                   --namespace "${GKE_NAMESPACE}" \

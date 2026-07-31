@@ -85,6 +85,17 @@ contract error.
   projection. Missing either enable flag or enabling bridge mutation fails
   closed. Evidence:
   `approved_m10_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail`.
+- [x] Durable rebalance checksums are verified against the byte-exact stored
+  payload before schema-default deserialization. The production M9
+  `binance_withdrawal_submission_started` record without
+  `reconciliation_queries` replays as zero while a payload mutation still
+  fails closed. Evidence:
+  `legacy_defaulted_progress_field_validates_the_stored_payload_bytes`.
+- [x] The M10 Deployment explicitly applies `initContainers: []`, so the
+  completed M9 prefunder cannot survive client-side apply field ownership.
+  Rollback restores ConfigMap data with a conflict-free JSON patch before
+  undoing the Deployment revision. Evidence:
+  `gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state`.
 
 ## Latency and resource observation plan
 
