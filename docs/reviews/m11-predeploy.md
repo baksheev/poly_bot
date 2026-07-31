@@ -101,6 +101,23 @@ node-pool selector, and independently verifies that selected pool is
 token, secrets, PVC, or mutation authority. The failed attempt did not change
 the application Deployment or the production owner.
 
+The second exact-image attempt (`30608750760`) also stopped before rollout.
+Kubernetes admission rejects `activeDeadlineSeconds` inside a Deployment's
+ReplicaSet Pod template even though client-side `kubectl` dry-run accepts the
+generic PodSpec field. The field was redundant with the 300-second inert hold
+and workflow cleanup, so it was removed. The corrected exact manifest must
+pass server-side dry-run against the production API before another commit is
+pushed; this validates admission, schema, and caller RBAC without persisting an
+object.
+
+The corrected manifest then passed server-side dry-run against the production
+API using exact image digest
+`sha256:80a42387370ea6e08560b5f265648198ea28f4eae9685b36db717818108bad54`.
+A follow-up get confirmed that no dry-run Deployment was persisted. The
+termination report is 2,194 bytes, below Kubernetes' 4,096-byte termination
+message limit, and the runtime image contains the Debian `/bin/sh`, `sleep`,
+and `tee` commands used by the bounded wrapper.
+
 ## Target-C4 gate
 
 M11 cannot exit on workstation evidence. The exact release binary and fixture

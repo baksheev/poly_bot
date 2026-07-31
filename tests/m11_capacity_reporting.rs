@@ -57,4 +57,5 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(!DEPLOY_WORKFLOW.contains("kubectl delete job"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl delete deployment \"${replay_deployment}\""));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl get node "));
+    assert!(!DEPLOY_WORKFLOW.contains(".spec.template.spec.activeDeadlineSeconds"));
 }

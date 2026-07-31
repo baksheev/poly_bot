@@ -376,7 +376,6 @@ jobs:
               | .spec.template.metadata.labels["arb-bot/source-revision"] = $source_sha
               | .spec.template.metadata.labels["arb-bot/replay-instance"] = $replay_instance
               | .spec.template.spec.automountServiceAccountToken = false
-              | .spec.template.spec.activeDeadlineSeconds = 300
               | .spec.template.spec.nodeSelector = {
                   "cloud.google.com/gke-nodepool": $node_pool
                 }
