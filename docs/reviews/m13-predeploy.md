@@ -1,7 +1,7 @@
 # M13 pre-deploy review: permanent ESP/USDC full-live
 
-Status: implementation reviewed locally; production has not been mutated by
-this revision.
+Status: implementation reviewed locally and authoritative production cohort
+verified for revision `06d913c9e6c05edbdd4df5fa0bb707fabbc1be72`.
 
 The operator approved immediate permanent ESP/USDC trading and rebalancing.
 V6 removes rollout-only cumulative/count/window stops after M9–M12 completed,
@@ -93,3 +93,26 @@ while retaining per-parent trading and per-operation capital safety envelopes.
 - [x] `scripts/quality.sh` passes on the same final diff.
 - [x] The final diff is clean, fast-forwardable from `origin/main`, and will be
   delivered as one reviewed push before a single exact-revision deployment.
+
+## Production review result
+
+- [x] CI `30628511615` and Deploy GKE `30628862643` succeeded for exact
+  revision `06d913c9e6c05edbdd4df5fa0bb707fabbc1be72`; immutable image digest
+  `sha256:f894135b29ecb708458e51ec09ac1c64ab43d931eaf97c8d288b0c097243e08f`
+  ran as the sole GKE owner while GCE remained `TERMINATED`.
+- [x] Both max-uint256 router approvals were mined before readiness, the
+  running allowance policy was locked, and no duplicate withdrawal, order,
+  transfer saga, or nonce mutation appeared.
+- [x] In `[2026-07-31T12:06:07Z, 2026-07-31T12:21:30Z)`, M13 was `armed`:
+  four successful rebalance evaluations, zero actions because inventory was
+  already within the 25% threshold, `4,395` allocator audits with zero
+  failures, and no active/failed transfer or limit breach.
+- [x] WLD parse/socket p99 was `8/49 μs`; fee-500 receive/build/total p99 was
+  `112/159/170 μs`, hot telemetry drops and production `ERROR` were zero,
+  both containers stayed Ready with zero restarts, CPU max was `0.017536`
+  core, memory peak was `60,354,560` bytes, and throttling/OOM counters were
+  zero.
+- [x] The production cohort exposed and corrected a reporting-only mismatch:
+  M13 now joins the actual `rebalance_plan_evaluated` mutation planner and the
+  `portfolio_capital_allocator_evaluated` audit stream. The correction changes
+  no runtime authority and requires no application redeploy.

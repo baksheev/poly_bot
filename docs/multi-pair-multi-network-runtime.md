@@ -2160,6 +2160,56 @@ rebalancing, and deployment tests. The complete authority, side-effect,
 restart, rollback, and observation review is recorded in
 `docs/reviews/m13-predeploy.md`.
 
+#### Authoritative M13 production evidence
+
+The permanent full-live release is revision
+`06d913c9e6c05edbdd4df5fa0bb707fabbc1be72`. CI run `30628511615` and Deploy
+GKE run `30628862643` both completed successfully; the deployed immutable
+image is
+`sha256:f894135b29ecb708458e51ec09ac1c64ab43d931eaf97c8d288b0c097243e08f`.
+The sole Pod was `arb-bot-6b785f9b49-7qnqm`: the trading container started at
+`2026-07-31T12:06:07Z`, the public ESP collector at `12:06:08Z`, runtime
+readiness was published at `12:06:19Z`, and both containers remained Ready
+with zero restarts. The GCE rollback owner remained `TERMINATED`.
+
+The authoritative half-open cohort was
+`[2026-07-31T12:06:07Z, 2026-07-31T12:21:30Z)`. Startup submitted exactly the
+two required max-uint256 SwapRouter02 approvals: USDC transaction
+`0xb5b5ddf7d366fc7ed8a246d4edc96eebc4b80f27cb141d237f8affe8bd847b3a`
+at nonce `4` and ESP transaction
+`0xdf425b78b670d8c72701c9002baf12ba07938f28ea0fd4e7bb6e98f78f20192b`
+at nonce `5`; both were mined before readiness. The running process then
+reported `max_uint256_then_locked`, direct `ARBITRUM`, bridge disabled, one
+shared nonce owner, per-trade `200 USDC`, and per-rebalance-operation
+`2,600 USDC` / `10,000 ESP` debit ceilings.
+
+The corrected M13 report used the actual compatibility mutation planner event
+`rebalance_plan_evaluated`, rather than the audit-only allocator request kind.
+It reported four successful rebalance evaluations, zero action plans, zero
+planning failures, and `4,395` full-live allocator audits with zero failures.
+Planner calculation p99/max was `4/4 μs`; allocator queue p99/max was
+`90/888 μs` and calculation p99/max was `14/31 μs`. No action was correct:
+the captured ESP inventory was already nearly 50/50 after the operator's
+manual transfer (`4,999.86181945 ESP` on Binance and
+`4,998.761819437482447575 ESP` in the wallet), while USDC was
+`705.834222` and `727.080322`. M13 therefore remained `armed` with zero
+active/failed transfers, sagas, capital children, or limit breaches. The ESP
+owner processed `2,234` strategy evaluations and `76` opportunities, but no
+market state cleared admission, so no trade was forced for validation.
+
+WLD/USDC retained zero hot-path telemetry drops. Parse and
+socket-to-decision p99 were `8 μs` and `49 μs`. The fee-500 pool receive,
+prepared-build, and total p99 were `112 μs`, `159 μs`, and `170 μs`; total
+remained below the `175.2 μs` relative and `200 μs` hard gates. CPU max was
+`0.017536` core, cgroup memory peak was `60,354,560` bytes, and CPU
+throttling plus memory high/max/OOM counters were zero. Production emitted no
+`ERROR`. There were `3,995` successful pinned wallet batches versus `37`
+transient provider `header not found` failures (`0.92%`), with fresh successful
+World Chain and Arbitrum snapshots at the end of the window. A single
+background-only telemetry backpressure burst dropped `1,168` records; it did
+not recur, did not drop hot records, and was smaller than the `3,006` and
+`10,883` bursts observed on earlier production Pods.
+
 ## Future multi-wallet extension
 
 Multi-wallet support adds more `WalletId` values and execution lanes; it must

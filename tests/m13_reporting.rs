@@ -1,6 +1,7 @@
 use std::fs;
 
 const MAIN: &str = include_str!("../src/main.rs");
+const ENGINE: &str = include_str!("../src/engine.rs");
 
 #[test]
 fn m13_report_proves_per_operation_full_live_authority() {
@@ -14,7 +15,11 @@ fn m13_report_proves_per_operation_full_live_authority() {
     assert!(report.contains("maximum_unknown_reconciliation_queries"));
     assert!(report.contains("shared_arbitrum_evm_owner"));
     assert!(query.contains("esp-usdc-arbitrum-full-live"));
-    assert!(query.contains("allocator_mode') = 'full_live'"));
+    assert!(ENGINE.contains("\"rebalance_plan_evaluated\""));
+    assert!(query.contains("kind IN ('rebalance_plan_evaluated', 'rebalance_plan_failed')"));
+    assert!(query.contains("rebalance_action_plans"));
+    assert!(query.contains("kind = 'portfolio_capital_allocator_evaluated'"));
+    assert!(!query.contains("kind = 'portfolio_capital_allocator_planned'"));
     assert!(query.contains("active_transfer_count > 1"));
     assert!(query.contains("per_operation_limit_breaches"));
     assert!(query.contains("toUInt256('2600000000')"));

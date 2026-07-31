@@ -26,17 +26,41 @@ latest AS
     FROM risk
     GROUP BY engine_id
 ),
-allocator AS
+rebalance_planner AS
 (
     SELECT
         JSONExtractString(payload_json, 'engine_id') AS engine_id,
-        count() AS allocator_plans,
-        countIf(JSONExtractString(payload_json, 'allocator_mode') = 'full_live')
-            AS full_live_allocator_plans,
-        countIf(JSONExtractBool(payload_json, 'external_mutation_authorized'))
-            AS authorized_allocator_plans,
+        countIf(kind = 'rebalance_plan_evaluated') AS rebalance_evaluations,
+        countIf(
+            kind = 'rebalance_plan_evaluated'
+            AND notEmpty(JSONExtractString(payload_json, 'action_amount_base_units'))
+        ) AS rebalance_action_plans,
+        countIf(kind = 'rebalance_plan_failed') AS rebalance_planning_failures,
+        quantileExact(0.99)(
+            if(
+                kind = 'rebalance_plan_evaluated',
+                JSONExtractUInt(payload_json, 'calculation_validation_us'),
+                0
+            )
+        ) AS rebalance_calculation_p99_us,
+        maxIf(
+            JSONExtractUInt(payload_json, 'calculation_validation_us'),
+            kind = 'rebalance_plan_evaluated'
+        ) AS rebalance_calculation_max_us
+    FROM runtime_telemetry
+    WHERE kind IN ('rebalance_plan_evaluated', 'rebalance_plan_failed')
+      AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
+      AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
+      AND JSONExtractString(payload_json, 'mode') = 'full_live'
+    GROUP BY engine_id
+),
+allocator_audit AS
+(
+    SELECT
+        JSONExtractString(payload_json, 'engine_id') AS engine_id,
+        count() AS allocator_audits,
         countIf(JSONExtractString(payload_json, 'outcome') != 'success')
-            AS allocator_failures,
+            AS allocator_audit_failures,
         quantileExact(0.99)(JSONExtractUInt(payload_json, 'scheduler_queue_us'))
             AS allocator_queue_p99_us,
         max(JSONExtractUInt(payload_json, 'scheduler_queue_us'))
@@ -47,9 +71,10 @@ allocator AS
         max(JSONExtractUInt(payload_json, 'allocator_calculation_validation_us'))
             AS allocator_calculation_max_us
     FROM runtime_telemetry
-    WHERE kind = 'portfolio_capital_allocator_planned'
+    WHERE kind = 'portfolio_capital_allocator_evaluated'
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
+      AND JSONExtractString(payload_json, 'allocator_mode') = 'full_live'
     GROUP BY engine_id
 ),
 sagas AS
@@ -115,14 +140,22 @@ SELECT
     active_transfer_count,
     failed_transfer_count,
     risk_snapshot_failures,
-    ifNull(allocator.allocator_plans, 0) AS allocator_plans,
-    ifNull(allocator.full_live_allocator_plans, 0) AS full_live_allocator_plans,
-    ifNull(allocator.authorized_allocator_plans, 0) AS authorized_allocator_plans,
-    ifNull(allocator.allocator_failures, 0) AS allocator_failures,
-    ifNull(allocator.allocator_queue_p99_us, 0) AS allocator_queue_p99_us,
-    ifNull(allocator.allocator_queue_max_us, 0) AS allocator_queue_max_us,
-    ifNull(allocator.allocator_calculation_p99_us, 0) AS allocator_calculation_p99_us,
-    ifNull(allocator.allocator_calculation_max_us, 0) AS allocator_calculation_max_us,
+    ifNull(rebalance_planner.rebalance_evaluations, 0) AS rebalance_evaluations,
+    ifNull(rebalance_planner.rebalance_action_plans, 0) AS rebalance_action_plans,
+    ifNull(rebalance_planner.rebalance_planning_failures, 0)
+        AS rebalance_planning_failures,
+    ifNull(rebalance_planner.rebalance_calculation_p99_us, 0)
+        AS rebalance_calculation_p99_us,
+    ifNull(rebalance_planner.rebalance_calculation_max_us, 0)
+        AS rebalance_calculation_max_us,
+    ifNull(allocator_audit.allocator_audits, 0) AS allocator_audits,
+    ifNull(allocator_audit.allocator_audit_failures, 0) AS allocator_audit_failures,
+    ifNull(allocator_audit.allocator_queue_p99_us, 0) AS allocator_queue_p99_us,
+    ifNull(allocator_audit.allocator_queue_max_us, 0) AS allocator_queue_max_us,
+    ifNull(allocator_audit.allocator_calculation_p99_us, 0)
+        AS allocator_calculation_p99_us,
+    ifNull(allocator_audit.allocator_calculation_max_us, 0)
+        AS allocator_calculation_max_us,
     ifNull(sagas.saga_count, 0) AS saga_count,
     ifNull(sagas.saga_failures, 0) AS saga_failures,
     ifNull(sagas.per_operation_limit_breaches, 0) AS per_operation_limit_breaches,
@@ -138,7 +171,8 @@ SELECT
     multiIf(
         risk_snapshot_failures != 0
             OR active_transfer_count > 1
-            OR allocator_failures != 0
+            OR rebalance_planning_failures != 0
+            OR allocator_audit_failures != 0
             OR saga_failures != 0
             OR per_operation_limit_breaches != 0
             OR binance_capital_child_failures != 0,
@@ -150,7 +184,8 @@ SELECT
         'full_live_observed'
     ) AS m13_gate
 FROM latest
-LEFT JOIN allocator USING (engine_id)
+LEFT JOIN rebalance_planner USING (engine_id)
+LEFT JOIN allocator_audit USING (engine_id)
 LEFT JOIN sagas USING (engine_id)
 LEFT JOIN children USING (engine_id)
 ORDER BY engine_id
