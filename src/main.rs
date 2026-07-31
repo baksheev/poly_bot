@@ -1,19 +1,14 @@
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    io::Write,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
@@ -21,8 +16,8 @@ use arb_bot::{
         WORLD_CHAIN_USDC, is_retryable_quote_error, validate_quote,
     },
     arbitrage::{
-        CanaryJournalRisk, EntryPreflightHandle, ExecutionMode, LegRole, LegStatus,
-        PaperTradeCoordinator, TradeJournalScope, TradeStage, paper_trade_channel,
+        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator,
+        TradeJournalScope, TradeStage, paper_trade_channel,
     },
     balances::{
         BalanceEvent, BalanceSource, BalanceSync, WalletBalanceSnapshot, WalletReadClient,
@@ -55,24 +50,24 @@ use arb_bot::{
     domain::{
         compiled::{
             CompatibilityRole, CompiledBinanceRuntimePlan, CompiledCapitalAllocatorMode,
-            CompiledCapitalCanaryPolicy, CompiledGraphSummary, CompiledHotPathRuntimePlan,
+            CompiledCapitalPolicy, CompiledGraphSummary, CompiledHotPathRuntimePlan,
             CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan, CompiledPortfolioRuntimePlan,
-            compile_manifest_to_path, load_compatibility_domain, load_source_domain_for_pair,
+            compile_manifest_to_path, load_compatibility_domain,
         },
-        config::{DexProvider, LiveCanaryConfig, LoadedDomainConfig},
+        config::{DexProvider, LoadedDomainConfig},
     },
     engine::{AdaptiveSizingJob, AdaptiveSizingTaskResult, BinanceFeeBps, TradingEngine},
     execution_accounting::{CommissionAssetValuation, binance_leg_result},
     hot_telemetry,
     inventory::SharedInventoryReservations,
     live_execution::{
-        ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LiveCanaryPolicy, LiveRiskLimits,
+        ComposedLiveLegExecutor, ComposedLiveLegExecutorConfig, LivePairPolicy, LiveRiskLimits,
         RoutedLiveLegExecutor, live_trade_channel,
     },
-    m8_readiness::{
-        ARBITRUM_CHAIN_ID, M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness,
-        M8ChainReadinessProbe, M8ChainReadinessStatus, inspect_chain_readiness,
-        validate_binance_readiness, validate_rebalance_readiness,
+    live_readiness::{
+        ARBITRUM_CHAIN_ID, CHAIN_READINESS_REFRESH_INTERVAL, ChainReadiness, ChainReadinessProbe,
+        ChainReadinessStatus, inspect_chain_readiness, validate_binance_readiness,
+        validate_rebalance_readiness,
     },
     market_data::{
         MarketEvent,
@@ -83,17 +78,11 @@ use arb_bot::{
     opportunity::{
         ArbitrageDirection, OpportunityEngine, PreparedPoolBuildBatch, PreparedPoolBuildRequest,
     },
-    portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_m10_rebalance_authority},
+    portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_rebalance_authority},
     rebalance::{
-        ApprovedAbsentMasterTransferRecovery, ApprovedAbsentStandardWithdrawalRecovery,
-        ApprovedLocalEntityWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
-        RebalanceCanaryRisk, RebalanceExecutionAuthority, RebalanceExecutionOperation,
-        RebalanceExecutionProgress, RebalanceExecutionRequest, RebalanceExecutor,
-        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
-        execute_binance_address_verification_transfer,
-        is_approved_local_entity_withdrawal_recovery_pending, plan_direct_prefunding,
-        rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
-        route_candidates_from_capital,
+        RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionRequest,
+        RebalanceExecutor, RebalanceRisk, RebalanceRuntimeLimits, RebalanceTracker,
+        V12RebalanceParityAdapter, rebalance_base_units_to_decimal, route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -106,9 +95,8 @@ use arb_bot::{
         TelemetryHandle, TelemetryWriter, execution_lane_id,
     },
     wallet::{
-        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, ReviewedPrebroadcastRejection,
-        TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
-        recover_exact_rejected_before_broadcast,
+        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest,
+        WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
     },
 };
 use clap::Parser;
@@ -127,7 +115,7 @@ const MAXIMUM_CONCURRENT_ADAPTIVE_SIZING_WORKERS: usize = 4;
 const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
-fn m9_canary_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
+fn esp_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
     let network_id = format!("eip155:{chain_id}");
     EvmJournalScope {
         schema_version: EvmJournalScope::SCHEMA_VERSION,
@@ -137,65 +125,14 @@ fn m9_canary_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
     }
 }
 
-fn m9_canary_allowance_requirements(
-    canary: &LiveCanaryConfig,
-    risk: CanaryJournalRisk,
-    token_a_balance: U256,
-    token_b_balance: U256,
-    now_unix_us: u64,
-) -> anyhow::Result<Option<(U256, U256)>> {
-    let maximum_total = canary
-        .max_total_notional_token_a_base_units
-        .parse::<u128>()
-        .context("M9 cumulative canary cap is invalid")?;
-    let maximum_loss = canary
-        .max_realized_loss_token_a_base_units
-        .parse::<u128>()
-        .context("M9 realized-loss cap is invalid")?;
-    ensure!(
-        risk.admitted_parent_count <= usize::from(canary.max_parent_trades)
-            && risk.failed_parent_count <= usize::from(canary.max_failed_parent_trades)
-            && risk.active_parent_count <= usize::from(canary.max_concurrent_trades)
-            && risk.admitted_notional_token_a_base_units <= maximum_total
-            && risk.realized_loss_token_a_base_units <= maximum_loss,
-        "durable M9 risk exceeds the reviewed canary limits"
-    );
-    let remaining_notional = maximum_total
-        .checked_sub(risk.admitted_notional_token_a_base_units)
-        .context("durable M9 notional exceeds the reviewed canary cap")?;
-    let rollout_window_open = risk.first_admitted_unix_us.is_none_or(|first| {
-        now_unix_us.saturating_sub(first)
-            <= canary.rollout_duration_seconds.saturating_mul(1_000_000)
-    });
-    let new_parent_authorized = remaining_notional > 0
-        && risk.admitted_parent_count < usize::from(canary.max_parent_trades)
-        && risk.failed_parent_count < usize::from(canary.max_failed_parent_trades)
-        && risk.active_parent_count < usize::from(canary.max_concurrent_trades)
-        && risk.realized_loss_token_a_base_units < maximum_loss
-        && rollout_window_open;
-    if !new_parent_authorized {
-        return Ok(None);
-    }
-
-    let bootstrap_token_b = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
-        .context("M9 ESP bootstrap target is invalid")?;
-    let token_a_required = token_a_balance.min(U256::from(remaining_notional));
-    let token_b_required = token_b_balance.min(bootstrap_token_b);
-    ensure!(
-        !token_a_required.is_zero() && !token_b_required.is_zero(),
-        "M9 remaining allowance authority requires both wallet tokens"
-    );
-    Ok(Some((token_a_required, token_b_required)))
-}
-
-fn m9_allowance_operation_id(symbol: &str, required: U256) -> String {
-    format!("rustarb-m9-setup-v3-{symbol}.v2-{required}")
+fn allowance_operation_id(symbol: &str) -> String {
+    format!("rustarb-esp-full-live-{symbol}-max-allowance")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RebalanceExecutionTarget {
     Primary,
-    ArbitrumCanary,
+    Arbitrum,
 }
 
 enum RebalanceExecutorEvent {
@@ -216,26 +153,22 @@ fn rebalance_target(operation: &RebalanceExecutionOperation) -> RebalanceExecuti
         .intent
         .scope
         .as_ref()
-        .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10")
+        .is_some_and(|scope| scope.network_id == "chain:42161")
     {
-        RebalanceExecutionTarget::ArbitrumCanary
+        RebalanceExecutionTarget::Arbitrum
     } else {
         RebalanceExecutionTarget::Primary
     }
 }
 
-fn emit_m10_rebalance_risk(
-    telemetry: &TelemetryHandle,
-    engine_id: &str,
-    executor: &RebalanceExecutor,
-) {
-    match executor.m10_canary_risk() {
+fn emit_rebalance_risk(telemetry: &TelemetryHandle, engine_id: &str, executor: &RebalanceExecutor) {
+    match executor.rebalance_risk() {
         Ok(risk) => telemetry.emit(
-            "m10_rebalance_risk_snapshot",
+            "rebalance_risk_snapshot",
             serde_json::json!({
                 "engine_id": engine_id,
                 "approval_session_id": executor
-                    .m10_approval_session_id()
+                    .approval_session_id()
                     .unwrap_or("unconfigured"),
                 "transfer_count": risk.transfer_count,
                 "active_transfer_count": risk.active_transfer_count,
@@ -249,11 +182,11 @@ fn emit_m10_rebalance_risk(
             }),
         ),
         Err(error) => telemetry.emit(
-            "m10_rebalance_risk_snapshot",
+            "rebalance_risk_snapshot",
             serde_json::json!({
                 "engine_id": engine_id,
                 "approval_session_id": executor
-                    .m10_approval_session_id()
+                    .approval_session_id()
                     .unwrap_or("unconfigured"),
                 "outcome": "failed",
                 "error": format!("{error:#}"),
@@ -262,7 +195,7 @@ fn emit_m10_rebalance_risk(
     }
 }
 
-fn emit_m10_rebalance_saga(
+fn emit_rebalance_saga(
     telemetry: &TelemetryHandle,
     engine_id: &str,
     target: RebalanceExecutionTarget,
@@ -271,28 +204,28 @@ fn emit_m10_rebalance_saga(
     started_at: Instant,
     recovered: bool,
 ) {
-    if target != RebalanceExecutionTarget::ArbitrumCanary {
+    if target != RebalanceExecutionTarget::Arbitrum {
         return;
     }
     let operation = result
         .as_ref()
         .ok()
         .or_else(|| executor.active_operation().ok().flatten())
-        .or_else(|| executor.latest_m10_operation());
+        .or_else(|| executor.latest_rebalance_operation());
     let saga_duration_us = started_at.elapsed().as_micros();
     telemetry.emit(
-        "m10_rebalance_saga",
+        "rebalance_saga",
         serde_json::json!({
             "engine_id": engine_id,
-            "strategy_id": "rebalance-arbitrum-usdc-esp-m10",
+            "strategy_id": "rebalance-arbitrum-usdc-esp",
             "approval_session_id": executor
-                .m10_approval_session_id()
+                .approval_session_id()
                 .unwrap_or("unconfigured"),
             "operation_id": operation.map(|operation| &operation.intent.operation_id),
             "token": operation.map(|operation| &operation.intent.token_symbol),
             "amount_base_units": operation.map(|operation| operation.intent.amount.to_string()),
             "maximum_fee_base_units": operation.and_then(|operation| {
-                operation.intent.canary_maximum_fee_base_units.as_deref()
+                operation.intent.maximum_fee_base_units.as_deref()
             }),
             "direction": operation.map(|operation| format!("{:?}", operation.intent.direction)),
             "progress": operation.map(|operation| format!("{:?}", operation.progress)),
@@ -361,12 +294,12 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::ReplayM11Capacity {
+        Command::ReplayCapacity {
             artifact,
             frames_per_pair,
             target_cpu_class,
         } => {
-            let report = arb_bot::capacity_replay::run_m11_capacity_replay(
+            let report = arb_bot::capacity_replay::run_capacity_replay(
                 artifact,
                 frames_per_pair,
                 target_cpu_class.as_deref(),
@@ -374,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report)
-                    .context("failed to serialize M11 capacity replay report")?
+                    .context("failed to serialize capacity capacity replay report")?
             );
             Ok(())
         }
@@ -535,42 +468,6 @@ async fn main() -> anyhow::Result<()> {
         Command::BinanceTravelRuleWithdrawalStatus { tr_id } => {
             binance_travel_rule_withdrawal_status(&cli.config, tr_id).await
         }
-        Command::PrefundArbitrumCanary {
-            live_confirmation,
-            marker_path,
-        } => {
-            prefund_arbitrum_canary(&cli.config, &live_confirmation, &marker_path, None, false)
-                .await
-        }
-        Command::DiagnoseArbitrumEspWithdrawal { confirmation } => {
-            ensure!(
-                confirmation == "DIAGNOSE_ESP_031031",
-                "ESP diagnostic requires ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION=DIAGNOSE_ESP_031031"
-            );
-            prefund_arbitrum_canary(
-                &cli.config,
-                "PREFUND_ARBITRUM_M9",
-                std::path::Path::new("/var/lib/arb-bot/m9-prefunding-complete.json"),
-                Some(std::path::Path::new(
-                    "config/strategies/usdc-esp-arbitrum.v4.json",
-                )),
-                true,
-            )
-            .await
-        }
-        Command::BinanceEspAddressVerificationTransfer {
-            artifact,
-            confirmation,
-            journal_path,
-        } => {
-            binance_esp_address_verification_transfer(
-                &cli.config,
-                &artifact,
-                &confirmation,
-                journal_path,
-            )
-            .await
-        }
         Command::ArbitrageReconcileCex {
             plan_id,
             order_journal_path,
@@ -674,839 +571,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-async fn binance_esp_address_verification_transfer(
-    config: &config::AppConfig,
-    artifact_path: &std::path::Path,
-    confirmation: &str,
-    journal_path: PathBuf,
-) -> anyhow::Result<()> {
-    ensure!(
-        confirmation == "SEND_998700_USDC_ARBITRUM_TO_BINANCE_VERIFY_20260730",
-        "Binance ESP address verification transfer requires the exact production confirmation"
-    );
-    let artifact = BinanceAddressVerificationTransferArtifact::load(artifact_path)?;
-    let wallet = EvmWallet::from_env()?;
-    let configured_wallet = config
-        .evm_wallet_address
-        .parse::<Address>()
-        .context("EVM_WALLET_ADDRESS is invalid")?;
-    ensure!(
-        wallet.address() == configured_wallet,
-        "Binance address verification signer differs from EVM_WALLET_ADDRESS"
-    );
-    let arbitrum_endpoint = std::env::var("ARBITRUM_RPC_URL")
-        .context("ARBITRUM_RPC_URL is required for Binance address verification")?;
-    let outcome = execute_binance_address_verification_transfer(
-        &artifact,
-        JsonRpcClient::new(arbitrum_endpoint)?,
-        wallet,
-        journal_path,
-        Duration::from_secs(10 * 60),
-    )
-    .await?;
-    tracing::info!(
-        operation_id = %outcome.operation_id,
-        network = "ARBITRUM",
-        token = "USDC",
-        amount_base_units = %outcome.amount,
-        recipient = %outcome.recipient,
-        transaction_hash = %outcome.transaction_hash,
-        bridge_used = false,
-        "exact Binance ESP address verification deposit test completed"
-    );
-    Ok(())
-}
-
-async fn prefund_arbitrum_canary(
-    config: &config::AppConfig,
-    live_confirmation: &str,
-    marker_path: &std::path::Path,
-    source_config_override: Option<&std::path::Path>,
-    recovery_only: bool,
-) -> anyhow::Result<()> {
-    ensure!(
-        live_confirmation == "PREFUND_ARBITRUM_M9",
-        "Arbitrum prefunding requires ARBITRUM_PREFUNDING_LIVE_CONFIRMATION=PREFUND_ARBITRUM_M9"
-    );
-    let source_domain = load_source_domain_for_pair(
-        source_config_override.unwrap_or(&config.domain_config_path),
-        "arbitrum-usdc-esp",
-    )?;
-    let pair = source_domain
-        .snapshot()
-        .pairs
-        .iter()
-        .find(|pair| pair.id == "arbitrum-usdc-esp")
-        .context("compiled domain omitted the approved Arbitrum ESP pair")?;
-    let canary = pair
-        .live_canary
-        .as_ref()
-        .context("Arbitrum ESP pair omitted the live canary policy")?;
-    let prefunding = canary
-        .prefunding_rebalance
-        .as_ref()
-        .context("versioned artifact does not approve one-shot Arbitrum prefunding")?;
-    ensure!(
-        !canary.rebalance_mutations_enabled
-            && !pair.rebalance.enabled
-            && prefunding.binance_network == "ARBITRUM"
-            && prefunding.maximum_transfer_count == 2,
-        "one-shot prefunding cannot enable steady-state Arbitrum rebalance"
-    );
-
-    let wallet = EvmWallet::from_env()?;
-    let configured_wallet = config
-        .evm_wallet_address
-        .parse::<Address>()
-        .context("EVM_WALLET_ADDRESS is invalid")?;
-    ensure!(
-        wallet.address() == configured_wallet,
-        "Arbitrum prefunding signer differs from EVM_WALLET_ADDRESS"
-    );
-    let arbitrum_endpoint = std::env::var(&pair.chain.rpc_url_env).with_context(|| {
-        format!(
-            "required environment variable {} is not set",
-            pair.chain.rpc_url_env
-        )
-    })?;
-    let arbitrum_rpc = JsonRpcClient::new(arbitrum_endpoint)?;
-    ensure!(
-        arbitrum_rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
-        "prefunding RPC is not Arbitrum One"
-    );
-    if let Some(recovery) = &prefunding.approved_evm_prebroadcast_rejection {
-        let arbitrum_journal_path =
-            std::env::var(ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV).with_context(|| {
-                format!(
-                    "required environment variable {ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV} is not set"
-                )
-            })?;
-        let transaction_hash = recovery
-            .transaction_hash
-            .parse::<B256>()
-            .context("approved EVM rejection transaction hash is invalid")?;
-        let recovered = recover_exact_rejected_before_broadcast(
-            &arbitrum_rpc,
-            arbitrum_journal_path,
-            &ReviewedPrebroadcastRejection {
-                operation_id: recovery.operation_id.clone(),
-                chain_id: ARBITRUM_CHAIN_ID,
-                wallet: configured_wallet,
-                nonce: recovery.nonce,
-                transaction_hash,
-                scope: m9_canary_evm_journal_scope(ARBITRUM_CHAIN_ID),
-            },
-        )
-        .await?;
-        tracing::info!(
-            operation_id = recovery.operation_id,
-            transaction_hash = %transaction_hash,
-            nonce = recovery.nonce,
-            rpc_error_code = recovery.rpc_error_code,
-            recovered,
-            "reviewed Arbitrum fee-cap rejection is proven absent and closed before M9 startup"
-        );
-    }
-    if validate_prefunding_marker(
-        marker_path,
-        source_domain.fingerprint_sha256(),
-        &source_domain.snapshot().snapshot_id,
-        configured_wallet,
-        &canary.minimum_wallet_token_a_base_units,
-        &canary.minimum_wallet_token_b_base_units,
-        &prefunding.production_approval_recorded_at_utc,
-    )? {
-        tracing::info!(
-            marker_path = %marker_path.display(),
-            wallet = %configured_wallet,
-            "durable Arbitrum prefunding marker already exists; refusing to fund again"
-        );
-        return Ok(());
-    }
-    let world_endpoint = std::env::var("ALCHEMY_WORLDCHAIN_RPC_URL")
-        .context("ALCHEMY_WORLDCHAIN_RPC_URL is required for journal recovery")?;
-    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
-        format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
-    })?;
-    let world_rpc = JsonRpcClient::new(world_endpoint)?;
-    let optimism_rpc = JsonRpcClient::new(optimism_endpoint)?;
-
-    let mut trading_binance = BinanceAccountClient::from_env(config)?;
-    trading_binance.synchronize_clock().await?;
-    let coins = trading_binance.all_coin_information().await?;
-    let trading_account = trading_binance.account_information().await?;
-    let mut treasury_binance = BinanceAccountClient::from_treasury_env(config)?;
-    let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
-        .context("Arbitrum prefunding requires BINANCE_SUBACCOUNT_EMAIL")?;
-    treasury_binance.synchronize_clock().await?;
-    if !recovery_only {
-        wait_for_binance_address_verification(
-            &treasury_binance,
-            configured_wallet,
-            Duration::from_secs(10 * 60),
-        )
-        .await?;
-    }
-    if recovery_only {
-        let questionnaire = treasury_binance
-            .travel_rule_questionnaire_requirements()
-            .await?;
-        let address_verifications = treasury_binance.address_verification_list().await?;
-        let master_account = treasury_binance.account_information().await?;
-        let master_subaccount = treasury_binance
-            .subaccount_spot_assets(&subaccount_email)
-            .await?;
-        for symbol in [&pair.token_a.symbol, &pair.token_b.symbol] {
-            let capital = coins
-                .iter()
-                .find(|coin| coin.coin == *symbol)
-                .with_context(|| format!("Binance omitted {symbol} capital state"))?;
-            let trading_free = trading_account
-                .balances
-                .iter()
-                .find(|balance| balance.asset == *symbol)
-                .map_or(Decimal::ZERO, |balance| balance.free);
-            let master_free = master_account
-                .balances
-                .iter()
-                .find(|balance| balance.asset == *symbol)
-                .map_or(Decimal::ZERO, |balance| balance.free);
-            let master_view_subaccount_free = master_subaccount
-                .balances
-                .iter()
-                .find(|balance| balance.asset == *symbol)
-                .map_or(Decimal::ZERO, |balance| balance.free);
-            tracing::info!(
-                token = symbol,
-                questionnaire_country_code = questionnaire
-                    .questionnaire_country_code
-                    .as_deref()
-                    .unwrap_or("none"),
-                trading_subaccount_free = %trading_free,
-                master_spot_free = %master_free,
-                master_view_subaccount_free = %master_view_subaccount_free,
-                deposit_all_enabled = capital.deposit_all_enable,
-                withdrawal_all_enabled = capital.withdraw_all_enable,
-                "read-only ESP prefunding account and Travel Rule capability probe"
-            );
-            for network in &capital.network_list {
-                tracing::info!(
-                    token = symbol,
-                    network = network.network,
-                    network_name = network.name,
-                    deposit_enabled = network.deposit_enable,
-                    withdrawal_enabled = network.withdraw_enable,
-                    busy = network.busy,
-                    withdrawal_fee = %network.withdraw_fee,
-                    withdrawal_minimum = %network.withdraw_min,
-                    withdrawal_maximum = %network.withdraw_max,
-                    withdrawal_multiple = %network.withdraw_integer_multiple,
-                    "read-only Binance capital network capability"
-                );
-            }
-        }
-        let matching_address_verifications = address_verifications
-            .iter()
-            .filter(|record| {
-                record
-                    .wallet_address
-                    .eq_ignore_ascii_case(&format!("{configured_wallet:#x}"))
-            })
-            .collect::<Vec<_>>();
-        tracing::info!(
-            wallet = %configured_wallet,
-            matching_records = matching_address_verifications.len(),
-            "read-only Binance address verification probe"
-        );
-        for record in matching_address_verifications {
-            tracing::info!(
-                wallet = %configured_wallet,
-                token = record.token,
-                network = record.network,
-                status = record.status,
-                send_to = ?record.address_questionnaire.send_to,
-                is_address_owner = ?record.address_questionnaire.is_address_owner,
-                verify_method = ?record.address_questionnaire.verify_method,
-                satoshi_token = record.address_questionnaire.satoshi_token,
-                "read-only matching Binance address verification record"
-            );
-        }
-    }
-    let transaction_journal_path = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
-        format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
-    })?;
-    let token_a_target = U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10)
-        .context("M9 token_a prefunding target is invalid")?;
-    let token_b_target = U256::from_str_radix(&canary.minimum_wallet_token_b_base_units, 10)
-        .context("M9 token_b prefunding target is invalid")?;
-    let token_a_fee_cap =
-        U256::from_str_radix(&prefunding.maximum_token_a_withdrawal_fee_base_units, 10)
-            .context("M9 token_a withdrawal fee cap is invalid")?;
-    let token_b_fee_cap =
-        U256::from_str_radix(&prefunding.maximum_token_b_withdrawal_fee_base_units, 10)
-            .context("M9 token_b withdrawal fee cap is invalid")?;
-    let token_a_debit_cap = U256::from_str_radix(&prefunding.maximum_token_a_debit_base_units, 10)
-        .context("M9 token_a debit cap is invalid")?;
-    let token_b_debit_cap = U256::from_str_radix(&prefunding.maximum_token_b_debit_base_units, 10)
-        .context("M9 token_b debit cap is invalid")?;
-    let approved_recovery = prefunding.approved_travel_rule_recovery.as_ref();
-    let approved_manual_credit = prefunding.approved_manual_token_b_credit.as_ref();
-
-    let mut direct_networks = BTreeMap::new();
-    for token in [&pair.token_a, &pair.token_b] {
-        let capital = select_capital_routes(
-            &coins,
-            &token.symbol,
-            &prefunding.binance_network,
-            "OPTIMISM",
-        )?;
-        let network = capital
-            .direct
-            .filter(|network| network.network == prefunding.binance_network)
-            .with_context(|| {
-                format!(
-                    "{} direct Arbitrum withdrawal route is absent",
-                    token.symbol
-                )
-            })?;
-        ensure!(
-            capital.withdrawal_all_enabled && network.withdrawal_available(),
-            "{} direct Arbitrum withdrawal is not live",
-            token.symbol
-        );
-        direct_networks.insert(token.symbol.clone(), network);
-    }
-
-    let mut direct_read_rpcs = BTreeMap::new();
-    direct_read_rpcs.insert(ARBITRUM_CHAIN_ID, arbitrum_rpc.clone());
-    let mut executor = RebalanceExecutor::hydrate(
-        trading_binance,
-        treasury_binance,
-        subaccount_email,
-        AcrossClient::new(config)?,
-        world_rpc,
-        optimism_rpc,
-        direct_read_rpcs,
-        wallet,
-        config.rebalance_executor_journal_path.clone(),
-        transaction_journal_path.into(),
-        RebalanceRuntimeLimits {
-            maximum_wld: config.rebalance_max_wld_amount,
-            maximum_usdc: rebalance_base_units_to_decimal(
-                token_a_debit_cap,
-                pair.token_a.decimals,
-            )?,
-            maximum_esp: rebalance_base_units_to_decimal(token_b_debit_cap, pair.token_b.decimals)?,
-            operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
-        },
-    )
-    .await?;
-    let active = executor.active_operation()?.cloned();
-    if let Some(active) = &active {
-        ensure!(
-            active.intent.token_symbol == pair.token_a.symbol
-                || active.intent.token_symbol == pair.token_b.symbol,
-            "active prefunding operation has an unexpected token"
-        );
-    }
-    executor.log_active_operation_recovery_evidence().await?;
-    let recovered = if recovery_only {
-        match (approved_recovery, active) {
-            (Some(recovery), Some(active))
-                if active.intent.token_symbol == recovery.rejected_token_symbol
-                    && matches!(
-                        active.progress,
-                        RebalanceExecutionProgress::BinanceTransferCompleted { .. }
-                    ) =>
-            {
-                let rejected_amount =
-                    U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
-                        .context("approved Travel Rule rejected amount is invalid")?;
-                Some(
-                    executor
-                        .close_approved_travel_rule_rejection(
-                            &recovery.rejected_token_symbol,
-                            rejected_amount,
-                            configured_wallet,
-                            &prefunding.binance_network,
-                            ARBITRUM_CHAIN_ID,
-                            &format!(
-                                "approved deterministic Travel Rule rejection HTTP {} code {}: {}",
-                                recovery.rejected_http_status,
-                                recovery.rejected_error_code,
-                                recovery.rejected_error_message
-                            ),
-                        )
-                        .await?,
-                )
-            }
-            (Some(_), Some(_)) => {
-                bail!("active rebalance operation differs from the approved ESP incident")
-            }
-            (Some(_), None) => None,
-            (None, _) => bail!("versioned ESP incident recovery approval is absent"),
-        }
-    } else if let (Some(recovery), Some(active)) = (approved_manual_credit, active.as_ref())
-        && active.intent.operation_id == recovery.operation_id
-    {
-        let gross_debit = U256::from_str_radix(&recovery.gross_debit_base_units, 10)
-            .context("approved manual ESP gross debit is invalid")?;
-        let expected_credit = U256::from_str_radix(&recovery.expected_credit_base_units, 10)
-            .context("approved manual ESP credit is invalid")?;
-        let expected_fee = U256::from_str_radix(&recovery.expected_fee_base_units, 10)
-            .context("approved manual ESP fee is invalid")?;
-        let wallet_balance_before =
-            U256::from_str_radix(&recovery.wallet_balance_before_base_units, 10)
-                .context("approved manual ESP wallet balance is invalid")?;
-        let transaction_hash = recovery
-            .transaction_hash
-            .parse::<B256>()
-            .context("approved manual ESP transaction hash is invalid")?;
-        Some(
-            executor
-                .recover_approved_manual_direct_credit(
-                    &recovery.operation_id,
-                    &recovery.token_symbol,
-                    gross_debit,
-                    expected_credit,
-                    expected_fee,
-                    wallet_balance_before,
-                    configured_wallet,
-                    &prefunding.binance_network,
-                    ARBITRUM_CHAIN_ID,
-                    transaction_hash,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await?,
-        )
-    } else if let (Some(recovery), Some(active)) = (approved_recovery, active) {
-        let rejected_amount = U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
-            .context("approved Travel Rule rejected amount is invalid")?;
-        if active.intent.token_symbol == recovery.rejected_token_symbol
-            && active.intent.amount == rejected_amount
-            && active.intent.wallet_owner == configured_wallet
-            && active.intent.direction == arb_bot::rebalance::Direction::BinanceToWallet
-            && active.intent.route
-                == (arb_bot::rebalance::Route::Direct {
-                    binance_network: prefunding.binance_network.clone(),
-                    chain_id: ARBITRUM_CHAIN_ID,
-                })
-            && matches!(
-                active.progress,
-                RebalanceExecutionProgress::BinanceTransferCompleted { .. }
-            )
-        {
-            Some(
-                executor
-                    .close_approved_travel_rule_rejection(
-                        &recovery.rejected_token_symbol,
-                        rejected_amount,
-                        configured_wallet,
-                        &prefunding.binance_network,
-                        ARBITRUM_CHAIN_ID,
-                        &format!(
-                            "approved deterministic Travel Rule rejection HTTP {} code {}: {}",
-                            recovery.rejected_http_status,
-                            recovery.rejected_error_code,
-                            recovery.rejected_error_message
-                        ),
-                    )
-                    .await?,
-            )
-        } else {
-            executor.recover_active().await?
-        }
-    } else {
-        executor.recover_active().await?
-    };
-    if let Some(recovered) = recovered {
-        tracing::info!(
-            operation_id = %recovered.intent.operation_id,
-            progress = ?recovered.progress,
-            "recovered the sole durable rebalance operation before Arbitrum prefunding"
-        );
-    }
-    if recovery_only {
-        let recovery = approved_recovery.context("approved ESP incident recovery is absent")?;
-        let rejected_amount = U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
-            .context("approved Travel Rule rejected amount is invalid")?;
-        let closed = executor.operations().values().any(|operation| {
-            operation.intent.token_symbol == recovery.rejected_token_symbol
-                && operation.intent.amount == rejected_amount
-                && operation.intent.wallet_owner == configured_wallet
-                && matches!(
-                    &operation.progress,
-                    RebalanceExecutionProgress::Failed { reason }
-                        if reason.contains("approved deterministic Travel Rule rejection")
-                )
-        });
-        ensure!(
-            closed,
-            "approved ESP incident was not closed in the durable rebalance journal"
-        );
-        tracing::info!(
-            token = recovery.rejected_token_symbol,
-            rejected_error_code = recovery.rejected_error_code,
-            new_withdrawal_submitted = false,
-            "ESP Travel Rule incident closed after capital history and failed unbroadcast Travel Rule history proved no withdrawal"
-        );
-        return Ok(());
-    }
-    ensure!(
-        approved_recovery.is_none() || prefunding.retry_after_verified_address,
-        "ESP Travel Rule incident was closed without an approved retry after address verification"
-    );
-
-    let targets = [
-        (
-            &pair.token_a,
-            token_a_target,
-            token_a_fee_cap,
-            token_a_debit_cap,
-        ),
-        (
-            &pair.token_b,
-            token_b_target,
-            token_b_fee_cap,
-            token_b_debit_cap,
-        ),
-    ];
-    let mut transfer_count = 0_u16;
-    for (token, target, fee_cap, debit_cap) in targets {
-        let contract = token
-            .contract
-            .parse::<Address>()
-            .with_context(|| format!("{} contract is invalid", token.symbol))?;
-        let wallet_before = arbitrum_rpc
-            .erc20_balance(contract, configured_wallet)
-            .await?;
-        let binance_before_decimal = trading_account
-            .balances
-            .iter()
-            .find(|balance| balance.asset == token.symbol)
-            .map_or(Decimal::ZERO, |balance| balance.free);
-        let binance_before =
-            rebalance_decimal_to_base_units_floor(binance_before_decimal, token.decimals)?;
-        let network = direct_networks
-            .get(&token.symbol)
-            .with_context(|| format!("{} Arbitrum route disappeared", token.symbol))?;
-        let Some(plan) = plan_direct_prefunding(
-            target,
-            wallet_before,
-            token.decimals,
-            network,
-            ARBITRUM_CHAIN_ID,
-            fee_cap,
-            debit_cap,
-        )?
-        else {
-            tracing::info!(
-                token = token.symbol,
-                wallet_balance = wallet_before.to_string(),
-                target = target.to_string(),
-                "Arbitrum canary prefunding target already satisfied"
-            );
-            continue;
-        };
-        if token.symbol == pair.token_b.symbol {
-            let recovery =
-                approved_recovery.context("approved ESP Travel Rule recovery is absent")?;
-            let rejected_amount =
-                U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
-                    .context("approved Travel Rule rejected amount is invalid")?;
-            let completed = executor
-                .retry_approved_failed_travel_rule_with_standard(
-                    &recovery.rejected_token_symbol,
-                    rejected_amount,
-                    configured_wallet,
-                    &prefunding.binance_network,
-                    ARBITRUM_CHAIN_ID,
-                )
-                .await?;
-            let wallet_after = match completed.progress {
-                arb_bot::rebalance::RebalanceExecutionProgress::Completed {
-                    wallet_balance_after,
-                    ..
-                } => wallet_balance_after,
-                _ => bail!("approved ESP retry did not reach a terminal completed state"),
-            };
-            ensure!(
-                wallet_after >= target,
-                "{} prefunding completed below the approved wallet target",
-                token.symbol
-            );
-            continue;
-        }
-        ensure!(
-            binance_before >= plan.requested_debit,
-            "{} Binance free balance is below the approved prefunding debit",
-            token.symbol
-        );
-        transfer_count = transfer_count
-            .checked_add(1)
-            .context("prefunding transfer count overflow")?;
-        ensure!(
-            transfer_count <= prefunding.maximum_transfer_count,
-            "prefunding would exceed the approved transfer count"
-        );
-        tracing::info!(
-            token = token.symbol,
-            wallet_balance_before = wallet_before.to_string(),
-            target = target.to_string(),
-            requested_debit = plan.requested_debit.to_string(),
-            expected_credit = plan.expected_credit.to_string(),
-            withdrawal_fee = plan.withdrawal_fee.to_string(),
-            transfer_number = transfer_count,
-            "executing approved one-shot Arbitrum canary prefunding transfer"
-        );
-        let completed = executor
-            .execute(RebalanceExecutionRequest {
-                authority: RebalanceExecutionAuthority::ArbitrumM9Prefunding,
-                token_symbol: token.symbol.clone(),
-                token_decimals: token.decimals,
-                token_contract: contract,
-                wallet_owner: configured_wallet,
-                action: plan.action,
-                binance_balance_before: binance_before,
-                wallet_balance_before: wallet_before,
-                canary_maximum_fee: None,
-                canary_approval_session_id: None,
-            })
-            .await?;
-        let wallet_after = match completed.progress {
-            arb_bot::rebalance::RebalanceExecutionProgress::Completed {
-                wallet_balance_after,
-                ..
-            } => wallet_balance_after,
-            _ => bail!("prefunding rebalance did not reach a terminal completed state"),
-        };
-        ensure!(
-            wallet_after >= target,
-            "{} prefunding completed below the approved wallet target",
-            token.symbol
-        );
-    }
-    let final_usdc = arbitrum_rpc
-        .erc20_balance(
-            pair.token_a
-                .contract
-                .parse()
-                .context("Arbitrum USDC contract is invalid")?,
-            configured_wallet,
-        )
-        .await?;
-    let final_esp = arbitrum_rpc
-        .erc20_balance(
-            pair.token_b
-                .contract
-                .parse()
-                .context("Arbitrum ESP contract is invalid")?,
-            configured_wallet,
-        )
-        .await?;
-    ensure!(
-        final_usdc >= token_a_target && final_esp >= token_b_target,
-        "Arbitrum prefunding final balances are below the versioned M9 targets"
-    );
-    write_prefunding_marker(
-        marker_path,
-        source_domain.fingerprint_sha256(),
-        &source_domain.snapshot().snapshot_id,
-        configured_wallet,
-        &canary.minimum_wallet_token_a_base_units,
-        &canary.minimum_wallet_token_b_base_units,
-        &prefunding.production_approval_recorded_at_utc,
-    )?;
-    tracing::info!(
-        wallet = %configured_wallet,
-        usdc_base_units = final_usdc.to_string(),
-        esp_base_units = final_esp.to_string(),
-        transfer_count,
-        steady_state_rebalance_enabled = false,
-        "approved one-shot Arbitrum canary prefunding completed"
-    );
-    Ok(())
-}
-
-async fn wait_for_binance_address_verification(
-    treasury_binance: &BinanceAccountClient,
-    wallet: Address,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    ensure!(
-        timeout >= Duration::from_secs(60) && timeout <= Duration::from_secs(15 * 60),
-        "Binance address verification wait is outside the reviewed bounds"
-    );
-    let started_at = Instant::now();
-    let mut last_status = None;
-    loop {
-        let records = treasury_binance.address_verification_list().await?;
-        let matching = records
-            .iter()
-            .filter(|record| {
-                record
-                    .wallet_address
-                    .eq_ignore_ascii_case(&format!("{wallet:#x}"))
-                    && record.network == "ARBITRUM"
-                    && record.token == "USDC"
-            })
-            .collect::<Vec<_>>();
-        ensure!(
-            matching.len() <= 1,
-            "Binance returned multiple USDC Arbitrum verification records for the production wallet"
-        );
-        let status = matching
-            .first()
-            .map_or("MISSING", |record| record.status.as_str());
-        if last_status.as_deref() != Some(status) {
-            tracing::info!(
-                wallet = %wallet,
-                token = "USDC",
-                network = "ARBITRUM",
-                status,
-                "waiting for the approved Binance address verification before direct ESP prefunding"
-            );
-            last_status = Some(status.to_owned());
-        }
-        if let Some(record) = matching.first()
-            && record.status == "VERIFIED"
-        {
-            ensure!(
-                record.address_questionnaire.is_address_owner == Some(1)
-                    && record.address_questionnaire.verify_method == Some(1)
-                    && record.address_questionnaire.satoshi_token == "USDC",
-                "verified Binance address record differs from the approved Satoshi ownership test"
-            );
-            tracing::info!(
-                wallet = %wallet,
-                token = record.token,
-                network = record.network,
-                status = record.status,
-                "Binance address ownership verification completed before direct ESP prefunding"
-            );
-            return Ok(());
-        }
-        ensure!(
-            status == "MISSING" || status == "PENDING",
-            "Binance address verification entered an unsupported terminal state"
-        );
-        ensure!(
-            started_at.elapsed() < timeout,
-            "Binance address verification did not complete within the reviewed wait"
-        );
-        tokio::time::sleep(Duration::from_secs(15)).await;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_prefunding_marker(
-    path: &std::path::Path,
-    domain_fingerprint: &str,
-    snapshot_id: &str,
-    wallet: Address,
-    token_a_target: &str,
-    token_b_target: &str,
-    approval_recorded_at_utc: &str,
-) -> anyhow::Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect prefunding marker {}", path.display()))?;
-    ensure!(
-        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-        "prefunding marker is not a regular file"
-    );
-    let marker: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(path)
-            .with_context(|| format!("failed to read prefunding marker {}", path.display()))?,
-    )
-    .context("prefunding marker is invalid JSON")?;
-    ensure!(
-        !domain_fingerprint.is_empty()
-            && marker["schema_version"] == 1
-            && marker["domain_fingerprint_sha256"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-            && marker["snapshot_id"] == snapshot_id
-            && marker["wallet"] == format!("{wallet:#x}")
-            && marker["token_a_target_base_units"] == token_a_target
-            && marker["token_b_target_base_units"] == token_b_target
-            && marker["approval_recorded_at_utc"] == approval_recorded_at_utc
-            && marker["completed"] == true
-            && marker.as_object().is_some_and(|object| object.len() == 8),
-        "prefunding marker differs from the approved M9 funding identity"
-    );
-    Ok(true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_prefunding_marker(
-    path: &std::path::Path,
-    domain_fingerprint: &str,
-    snapshot_id: &str,
-    wallet: Address,
-    token_a_target: &str,
-    token_b_target: &str,
-    approval_recorded_at_utc: &str,
-) -> anyhow::Result<()> {
-    ensure!(
-        !path.as_os_str().is_empty() && path.file_name().is_some(),
-        "prefunding marker path is invalid"
-    );
-    let parent = path
-        .parent()
-        .context("prefunding marker has no parent directory")?;
-    ensure!(
-        parent.is_dir(),
-        "prefunding marker parent directory does not exist"
-    );
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_nanos();
-    let temp_path = path.with_extension(format!("tmp-{suffix}"));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&temp_path)
-        .with_context(|| format!("failed to create prefunding marker {}", temp_path.display()))?;
-    let mut bytes = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "domain_fingerprint_sha256": domain_fingerprint,
-        "snapshot_id": snapshot_id,
-        "wallet": format!("{wallet:#x}"),
-        "token_a_target_base_units": token_a_target,
-        "token_b_target_base_units": token_b_target,
-        "approval_recorded_at_utc": approval_recorded_at_utc,
-        "completed": true,
-    }))?;
-    bytes.push(b'\n');
-    file.write_all(&bytes)
-        .context("failed to write prefunding marker")?;
-    file.sync_all()
-        .context("failed to fsync prefunding marker")?;
-    drop(file);
-    std::fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to atomically install prefunding marker {}",
-            path.display()
-        )
-    })?;
-    OpenOptions::new()
-        .read(true)
-        .open(parent)
-        .context("failed to open prefunding marker directory")?
-        .sync_all()
-        .context("failed to fsync prefunding marker directory")?;
-    Ok(())
 }
 
 async fn arbitrage_emit_result(
@@ -2662,7 +1726,7 @@ async fn run(
                         includes_l1_fee: false,
                     } if *max_fee_headroom_bps >= 11_000
                 ),
-            "Arbitrum M9 execution policy must be mutation-enabled with fail-closed gas pricing"
+            "Arbitrum ESP execution policy must be mutation-enabled with fail-closed gas pricing"
         );
     }
     let shadow_strategy_plan = hot_path_dependencies.as_ref().and_then(|dependencies| {
@@ -2682,7 +1746,7 @@ async fn run(
                 .filter(|strategy| strategy.execute)
                 .count()
                 == 2,
-            "M9 production hot path requires exactly two executable strategies"
+            "ESP production hot path requires exactly two executable strategies"
         );
         ensure!(
             dependencies
@@ -2692,7 +1756,7 @@ async fn run(
                 .filter(|strategy| strategy.observe && !strategy.execute)
                 .count()
                 == 0,
-            "M9 production hot path cannot retain a non-mutating ESP shadow capability"
+            "ESP production hot path cannot retain a non-mutating ESP shadow capability"
         );
         let executable = dependencies
             .plan()
@@ -2708,16 +1772,16 @@ async fn run(
                 && executable
                     .iter()
                     .any(|strategy| strategy.symbol == "ESPUSDC"),
-            "M9 permits execution only for WLDUSDC and ESPUSDC"
+            "ESP permits execution only for WLDUSDC and ESPUSDC"
         );
         let account_id = compiled_binance_runtime
             .as_ref()
-            .context("M6 ownership graph requires one Binance account")?
+            .context("scoped ownership graph requires one Binance account")?
             .account_id
             .as_str();
         let evm_owner_count = network_registry
             .as_ref()
-            .context("M6 ownership graph requires network runtimes")?
+            .context("scoped ownership graph requires network runtimes")?
             .runtimes()
             .count();
         telemetry.emit(
@@ -2746,7 +1810,7 @@ async fn run(
             journal_schema_version = 2,
             candidate_policy = "latest_per_strategy_round_robin",
             global_trade_serialization = true,
-            "M6 execution ownership graph validated"
+            "scoped execution ownership graph validated"
         );
     }
     let (initialized_dex, shadow_initialized_dex) =
@@ -2821,22 +1885,22 @@ async fn run(
     let shared_binance_account = binance_account_client
         .hydrate_symbols_after_subscription(binance_symbols.clone(), startup_binance_clock_sync)
         .await?;
-    let m8_pair = shadow_strategy_plan
+    let esp_pair = shadow_strategy_plan
         .as_ref()
         .and_then(|strategy| strategy.domain_config.snapshot().pairs.first())
-        .context("compiled M9 ESP strategy has no canary pair")?
+        .context("compiled ESP ESP strategy has no esp pair")?
         .clone();
     match shared_binance_account
-        .symbol(&m8_pair.binance.symbol)
-        .context("shared Binance account omitted the M9 canary symbol")
-        .and_then(|state| validate_binance_readiness(&m8_pair, state))
+        .symbol(&esp_pair.binance.symbol)
+        .context("shared Binance account omitted the ESP esp symbol")
+        .and_then(|state| validate_binance_readiness(&esp_pair, state))
     {
         Ok(readiness) => telemetry.emit(
-            "m9_live_readiness",
+            "live_readiness",
             serde_json::json!({
                 "engine_id": config.engine_id,
                 "stage": "binance_order_matrix",
-                "pair_id": m8_pair.id,
+                "pair_id": esp_pair.id,
                 "network_id": "eip155:42161",
                 "symbol": readiness.symbol,
                 "buy_fee_bps": readiness.buy_fee_bps,
@@ -2852,18 +1916,18 @@ async fn run(
         ),
         Err(error) => {
             tracing::warn!(
-                pair_id = m8_pair.id,
+                pair_id = esp_pair.id,
                 error = %error,
-                "M9 Binance readiness validation is incomplete; ESP fails closed"
+                "ESP Binance readiness validation is incomplete; ESP fails closed"
             );
             telemetry.emit(
-                "m9_live_readiness",
+                "live_readiness",
                 serde_json::json!({
                     "engine_id": config.engine_id,
                     "stage": "binance_order_matrix",
-                    "pair_id": m8_pair.id,
+                    "pair_id": esp_pair.id,
                     "network_id": "eip155:42161",
-                    "symbol": m8_pair.binance.symbol,
+                    "symbol": esp_pair.binance.symbol,
                     "external_mutation_authorized": false,
                     "ready": false,
                 }),
@@ -2886,9 +1950,9 @@ async fn run(
         )?,
     };
     shared_binance_runtime.ensure_order_enabled(&pair.binance.symbol)?;
-    shared_binance_runtime.ensure_order_enabled(&m8_pair.binance.symbol)?;
+    shared_binance_runtime.ensure_order_enabled(&esp_pair.binance.symbol)?;
     let esp_symbol_state = shared_binance_account
-        .symbol(&m8_pair.binance.symbol)
+        .symbol(&esp_pair.binance.symbol)
         .context("shared Binance account omitted ESPUSDC")?;
     let esp_buy_fee_bps = esp_symbol_state
         .commission
@@ -2897,22 +1961,22 @@ async fn run(
         .commission
         .conservative_taker_fee_bps("SELL")?;
     ensure!(
-        esp_symbol_state.symbol_rules.base_asset == m8_pair.binance.base_asset
-            && esp_symbol_state.symbol_rules.quote_asset == m8_pair.binance.quote_asset,
-        "ESPUSDC exchangeInfo assets differ from the M9 domain artifact"
+        esp_symbol_state.symbol_rules.base_asset == esp_pair.binance.base_asset
+            && esp_symbol_state.symbol_rules.quote_asset == esp_pair.binance.quote_asset,
+        "ESPUSDC exchangeInfo assets differ from the ESP domain artifact"
     );
     let esp_execution_symbol_rules = esp_symbol_state
         .symbol_rules
         .with_compatible_price_step(
-            Decimal::from_str(&m8_pair.binance.tick_size)
-                .context("M9 ESP Binance tick_size is invalid")?,
+            Decimal::from_str(&esp_pair.binance.tick_size)
+                .context("ESP ESP Binance tick_size is invalid")?,
         )
-        .context("M9 ESP tick_size is incompatible with live PRICE_FILTER")?;
+        .context("ESP ESP tick_size is incompatible with live PRICE_FILTER")?;
     ensure!(
         esp_symbol_state.symbol_rules.lot_size.step
-            == Decimal::from_str(&m8_pair.binance.step_size)
-                .context("M9 ESP Binance step_size is invalid")?,
-        "M9 ESP step_size differs from live LOT_SIZE"
+            == Decimal::from_str(&esp_pair.binance.step_size)
+                .context("ESP ESP Binance step_size is invalid")?,
+        "ESP ESP step_size differs from live LOT_SIZE"
     );
     let binance_account = shared_binance_account.into_symbol(&pair.binance.symbol)?;
     let binance_clock_sync_client = binance_account_client.clone();
@@ -2977,13 +2041,13 @@ async fn run(
     let mut commission_price_feed = BookTickerFeed::new(&config, commission_price_symbol.clone());
     let capital_coins = binance_account_client.all_coin_information().await?;
     let rebalance_tracker = if pair.rebalance.enabled {
-        match validate_rebalance_readiness(&m8_pair, &capital_coins) {
+        match validate_rebalance_readiness(&esp_pair, &capital_coins) {
             Ok(readiness) => telemetry.emit(
-                "m9_live_readiness",
+                "live_readiness",
                 serde_json::json!({
                     "engine_id": config.engine_id,
                     "stage": "arbitrum_rebalance_routes",
-                    "pair_id": m8_pair.id,
+                    "pair_id": esp_pair.id,
                     "network_id": "eip155:42161",
                     "binance_network": readiness.network,
                     "asset_count": readiness.asset_count,
@@ -2997,14 +2061,14 @@ async fn run(
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "M9 Arbitrum rebalance readiness is incomplete; rebalance remains disabled"
+                    "ESP Arbitrum rebalance readiness is incomplete; rebalance remains disabled"
                 );
                 telemetry.emit(
-                    "m9_live_readiness",
+                    "live_readiness",
                     serde_json::json!({
                         "engine_id": config.engine_id,
                         "stage": "arbitrum_rebalance_routes",
-                        "pair_id": m8_pair.id,
+                        "pair_id": esp_pair.id,
                         "network_id": "eip155:42161",
                         "external_mutation_authorized": false,
                         "ready": false,
@@ -3030,59 +2094,57 @@ async fn run(
         RebalanceTracker::disabled()
     };
     let portfolio_runtime = compiled_portfolio_runtime
-        .context("run requires the compiled M5 portfolio runtime plan")?;
+        .context("run requires the compiled portfolio portfolio runtime plan")?;
     let portfolio_catalog = Arc::new(PortfolioCatalog::from_compiled(&portfolio_runtime)?);
     ensure!(
         portfolio_catalog.live_rebalance_adapter() == "world_chain_v12_parity",
         "live WLD rebalance is not behind the reviewed v12 parity adapter"
     );
-    let canary_rebalance_tracker = if matches!(
-        portfolio_catalog.allocator_mode(),
-        CompiledCapitalAllocatorMode::LiveCanary | CompiledCapitalAllocatorMode::FullLive
-    ) {
-        ensure!(
-            m8_pair.rebalance.enabled,
-            "live M10 allocator requires the ESP pair rebalance policy"
-        );
-        let mut routes = BTreeMap::new();
-        for token in [&m8_pair.token_a, &m8_pair.token_b] {
-            let capital = select_capital_routes(
-                &capital_coins,
-                &token.symbol,
-                &m8_pair.chain.binance_network_name,
-                "OPTIMISM",
-            )?;
-            let direct = capital
-                .direct
-                .as_ref()
-                .filter(|route| route.network == m8_pair.chain.binance_network_name)
-                .context("M10 direct Arbitrum capital route is absent")?;
+    let esp_rebalance_tracker =
+        if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive {
             ensure!(
-                capital.deposit_all_enabled
-                    && capital.withdrawal_all_enabled
-                    && direct.deposit_available()
-                    && direct.withdrawal_available(),
-                "M10 direct Arbitrum capital route is not fully available"
+                esp_pair.rebalance.enabled,
+                "live rebalance allocator requires the ESP pair rebalance policy"
             );
-            routes.insert(
-                token.symbol.clone(),
-                route_candidates_from_capital(
-                    &CapitalRouteState {
-                        coin: capital.coin.clone(),
-                        deposit_all_enabled: capital.deposit_all_enabled,
-                        withdrawal_all_enabled: capital.withdrawal_all_enabled,
-                        direct: Some(direct.clone()),
-                        fallback: None,
-                    },
-                    token.decimals,
-                    ARBITRUM_CHAIN_ID,
-                )?,
-            );
-        }
-        RebalanceTracker::new(&m8_pair, routes)?
-    } else {
-        RebalanceTracker::disabled()
-    };
+            let mut routes = BTreeMap::new();
+            for token in [&esp_pair.token_a, &esp_pair.token_b] {
+                let capital = select_capital_routes(
+                    &capital_coins,
+                    &token.symbol,
+                    &esp_pair.chain.binance_network_name,
+                    "OPTIMISM",
+                )?;
+                let direct = capital
+                    .direct
+                    .as_ref()
+                    .filter(|route| route.network == esp_pair.chain.binance_network_name)
+                    .context("rebalance direct Arbitrum capital route is absent")?;
+                ensure!(
+                    capital.deposit_all_enabled
+                        && capital.withdrawal_all_enabled
+                        && direct.deposit_available()
+                        && direct.withdrawal_available(),
+                    "rebalance direct Arbitrum capital route is not fully available"
+                );
+                routes.insert(
+                    token.symbol.clone(),
+                    route_candidates_from_capital(
+                        &CapitalRouteState {
+                            coin: capital.coin.clone(),
+                            deposit_all_enabled: capital.deposit_all_enabled,
+                            withdrawal_all_enabled: capital.withdrawal_all_enabled,
+                            direct: Some(direct.clone()),
+                            fallback: None,
+                        },
+                        token.decimals,
+                        ARBITRUM_CHAIN_ID,
+                    )?,
+                );
+            }
+            RebalanceTracker::new(&esp_pair, routes)?
+        } else {
+            RebalanceTracker::disabled()
+        };
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -3121,20 +2183,20 @@ async fn run(
     } else {
         Vec::new()
     };
-    let (m8_chain_readiness_probe, initial_m8_chain_readiness_status) =
+    let (live_chain_readiness_probe, initial_chain_readiness_status) =
         if let Some(registry) = network_registry.as_ref() {
             let runtime = registry.get_by_chain_id(42_161)?;
             let snapshot = portfolio_wallet_snapshots
                 .iter()
                 .find(|snapshot| snapshot.chain_id == 42_161)
-                .context("M9 Arbitrum wallet snapshot is missing")?;
-            let probe = M8ChainReadinessProbe::new(&m8_pair, runtime, wallet_owner)?;
-            match inspect_chain_readiness(&m8_pair, runtime, snapshot).await {
+                .context("ESP Arbitrum wallet snapshot is missing")?;
+            let probe = ChainReadinessProbe::new(&esp_pair, runtime, wallet_owner)?;
+            match inspect_chain_readiness(&esp_pair, runtime, snapshot).await {
                 Ok(readiness) => {
-                    emit_m8_chain_readiness(
+                    emit_chain_readiness(
                         &telemetry,
                         &config.engine_id,
-                        &m8_pair,
+                        &esp_pair,
                         &readiness,
                         "startup",
                     );
@@ -3143,26 +2205,26 @@ async fn run(
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
-                        "M9 Arbitrum chain readiness is incomplete; ESP fails closed"
+                        "ESP Arbitrum chain readiness is incomplete; ESP fails closed"
                     );
-                    emit_m8_chain_readiness_failure(
+                    emit_chain_readiness_failure(
                         &telemetry,
                         &config.engine_id,
-                        &m8_pair,
+                        &esp_pair,
                         "startup",
                         &error,
                     );
-                    (Some(probe), Some(M8ChainReadinessStatus::ProbeFailed))
+                    (Some(probe), Some(ChainReadinessStatus::ProbeFailed))
                 }
             }
         } else {
             (None, None)
         };
-    let canary_execution_ready = Arc::new(AtomicBool::new(matches!(
-        initial_m8_chain_readiness_status,
-        Some(M8ChainReadinessStatus::Observed { ready: true, .. })
+    let esp_execution_ready = Arc::new(AtomicBool::new(matches!(
+        initial_chain_readiness_status,
+        Some(ChainReadinessStatus::Observed { ready: true, .. })
     )));
-    let canary_market_data_ready = Arc::new(AtomicBool::new(true));
+    let esp_market_data_ready = Arc::new(AtomicBool::new(true));
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -3236,14 +2298,14 @@ async fn run(
             .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
         let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
         let rebalance_journal_started_at = Instant::now();
-        let m10_capital_policy = portfolio_catalog.capital_canary().cloned();
-        let maximum_esp = m10_capital_policy
+        let capital_policy = portfolio_catalog.capital_policy().cloned();
+        let maximum_esp = capital_policy
             .as_ref()
             .filter(|policy| policy.external_mutation_authorized)
             .map(|policy| {
                 rebalance_base_units_to_decimal(
                     policy.maximum_token_b_debit,
-                    m8_pair.token_b.decimals,
+                    esp_pair.token_b.decimals,
                 )
             })
             .transpose()?
@@ -3267,81 +2329,7 @@ async fn run(
             },
         )
         .await?;
-        executor.set_capital_canary_policy(m10_capital_policy)?;
-        if let Some(recovery) = m8_pair
-            .live_canary
-            .as_ref()
-            .and_then(|canary| canary.prefunding_rebalance.as_ref())
-            .and_then(|prefunding| prefunding.approved_absent_standard_withdrawal.as_ref())
-            && executor
-                .active_operation()?
-                .is_some_and(|operation| operation.intent.operation_id == recovery.operation_id)
-        {
-            let recovery = ApprovedAbsentStandardWithdrawalRecovery {
-                operation_id: recovery.operation_id.clone(),
-                fingerprint: recovery.fingerprint.clone(),
-                withdraw_order_id: recovery.withdraw_order_id.clone(),
-                token_symbol: recovery.token_symbol.clone(),
-                amount: U256::from_str_radix(&recovery.amount_base_units, 10)
-                    .context("approved absent withdrawal amount is invalid")?,
-                wallet_owner: Address::from_str(&recovery.wallet_address)
-                    .context("approved absent withdrawal wallet is invalid")?,
-                binance_network: recovery.binance_network.clone(),
-                bridge_chain_id: recovery.bridge_chain_id,
-                wallet_chain_id: recovery.wallet_chain_id,
-                bridge_balance_before: U256::from_str_radix(
-                    &recovery.bridge_balance_before_base_units,
-                    10,
-                )
-                .context("approved absent withdrawal bridge balance is invalid")?,
-                master_transfer_transaction_id: recovery.master_transfer_transaction_id,
-                reconciliation_queries: recovery.reconciliation_queries,
-                rejected_http_status: recovery.rejected_http_status,
-                rejected_error_code: recovery.rejected_error_code,
-                rejected_error_message: recovery.rejected_error_message.clone(),
-            };
-            executor
-                .close_operator_confirmed_absent_standard_withdrawal(&recovery)
-                .await?;
-        }
-        if let Some(recovery) = m8_pair
-            .live_canary
-            .as_ref()
-            .and_then(|canary| canary.prefunding_rebalance.as_ref())
-            .and_then(|prefunding| prefunding.approved_absent_master_transfer.as_ref())
-            && executor
-                .active_operation()?
-                .is_some_and(|operation| operation.intent.operation_id == recovery.operation_id)
-        {
-            let recovery = ApprovedAbsentMasterTransferRecovery {
-                operation_id: recovery.operation_id.clone(),
-                fingerprint: recovery.fingerprint.clone(),
-                withdraw_order_id: recovery.withdraw_order_id.clone(),
-                token_symbol: recovery.token_symbol.clone(),
-                amount: U256::from_str_radix(&recovery.amount_base_units, 10)
-                    .context("approved absent master-transfer amount is invalid")?,
-                wallet_owner: Address::from_str(&recovery.wallet_address)
-                    .context("approved absent master-transfer wallet is invalid")?,
-                binance_network: recovery.binance_network.clone(),
-                bridge_chain_id: recovery.bridge_chain_id,
-                wallet_chain_id: recovery.wallet_chain_id,
-                binance_balance_before: U256::from_str_radix(
-                    &recovery.binance_balance_before_base_units,
-                    10,
-                )
-                .context("approved absent master-transfer Binance balance is invalid")?,
-                wallet_balance_before: U256::from_str_radix(
-                    &recovery.wallet_balance_before_base_units,
-                    10,
-                )
-                .context("approved absent master-transfer wallet balance is invalid")?,
-                first_absent_observed_at: UNIX_EPOCH + Duration::from_secs(1_785_464_033),
-                minimum_evidence_age: Duration::from_secs(recovery.minimum_evidence_age_seconds),
-            };
-            executor
-                .close_operator_confirmed_absent_master_transfer(&recovery)
-                .await?;
-        }
+        executor.set_capital_policy(capital_policy)?;
         executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
         telemetry.emit(
             "runtime_journal_recovery",
@@ -3366,66 +2354,6 @@ async fn run(
     } else {
         (None, None)
     };
-    let approved_endpoint_recovery = m8_pair
-        .live_canary
-        .as_ref()
-        .and_then(|canary| canary.rebalance_live_canary.as_ref())
-        .and_then(|rebalance| rebalance.approved_standard_withdrawal_recovery.as_ref())
-        .map(|recovery| {
-            Ok::<_, anyhow::Error>(ApprovedLocalEntityWithdrawalRecovery {
-                operation_id: recovery.operation_id.clone(),
-                fingerprint: recovery.fingerprint.clone(),
-                withdraw_order_id: recovery.withdraw_order_id.clone(),
-                token_symbol: recovery.token_symbol.clone(),
-                amount: U256::from_str_radix(&recovery.amount_base_units, 10)
-                    .context("approved endpoint recovery amount is invalid")?,
-                wallet_owner: Address::from_str(&recovery.wallet_address)
-                    .context("approved endpoint recovery wallet is invalid")?,
-                binance_network: recovery.binance_network.clone(),
-                master_transfer_transaction_id: recovery.master_transfer_transaction_id,
-                rejected_http_status: recovery.rejected_http_status,
-                rejected_error_code: recovery.rejected_error_code,
-                rejected_error_message: recovery.rejected_error_message.clone(),
-                capital_history_match_count: recovery.capital_history_match_count,
-            })
-        })
-        .transpose()?;
-    let approved_endpoint_recovery = match approved_endpoint_recovery {
-        Some(recovery) => {
-            let executor = full_rebalance_executor
-                .as_ref()
-                .context("approved endpoint recovery has no full rebalance executor")?;
-            let operation = executor
-                .operations()
-                .get(&recovery.operation_id)
-                .context("approved endpoint recovery operation is absent from the journal")?;
-            if is_approved_local_entity_withdrawal_recovery_pending(operation) {
-                Some(recovery)
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
-    let approved_manual_withdrawal_recovery = m8_pair
-        .live_canary
-        .as_ref()
-        .and_then(|canary| canary.rebalance_live_canary.as_ref())
-        .and_then(|rebalance| rebalance.approved_manual_withdrawal_recovery.as_ref())
-        .cloned()
-        .filter(|recovery| {
-            full_rebalance_executor
-                .as_ref()
-                .and_then(|executor| executor.operations().get(&recovery.operation_id))
-                .is_some_and(|operation| {
-                    operation.intent.fingerprint == recovery.fingerprint
-                        && matches!(
-                            &operation.progress,
-                            RebalanceExecutionProgress::Failed { reason }
-                                if reason == "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
-                        )
-                })
-        });
     let user_data_subscription_id = user_data_stream.subscription_id();
     let multiplexed_binance_api = user_data_stream.api();
     tracing::info!(
@@ -3444,17 +2372,17 @@ async fn run(
         &binance_assets,
         binance_account_snapshot_duration_us,
     );
-    let canary_initialized = shadow_initialized_dex
+    let esp_initialized = shadow_initialized_dex
         .as_ref()
-        .context("M9 ESP execution has no initialized Arbitrum DEX runtime")?;
-    let canary_wallet_rpc = canary_initialized.rpc.clone();
-    let canary_initial_head = canary_initialized.mirror.latest_head();
-    let (canary_receipt_heads, canary_receipt_head_receiver) =
-        tokio::sync::watch::channel(canary_initial_head);
-    let canary_initial_wallet_balances = portfolio_wallet_snapshots
+        .context("ESP ESP execution has no initialized Arbitrum DEX runtime")?;
+    let esp_wallet_rpc = esp_initialized.rpc.clone();
+    let esp_initial_head = esp_initialized.mirror.latest_head();
+    let (esp_receipt_heads, esp_receipt_head_receiver) =
+        tokio::sync::watch::channel(esp_initial_head);
+    let esp_initial_wallet_balances = portfolio_wallet_snapshots
         .iter()
         .find(|snapshot| snapshot.chain_id == 42_161)
-        .context("M9 ESP execution has no Arbitrum wallet snapshot")?
+        .context("ESP ESP execution has no Arbitrum wallet snapshot")?
         .clone();
     let entry_preflight = EntryPreflightHandle::default();
     let mut shared_arbitrum_rebalance_owner_attached = false;
@@ -3462,35 +2390,35 @@ async fn run(
         ensure!(
             domain_config.snapshot().live_trading_enabled
                 && pair.execution_enabled
-                && m8_pair.execution_enabled,
-            "composed M9 live arbitrage requires both versioned execution gates"
+                && esp_pair.execution_enabled,
+            "composed ESP live arbitrage requires both versioned execution gates"
         );
         ensure!(
-            canary_execution_ready.load(Ordering::Acquire),
-            "M9 Arbitrum chain and prefunding readiness must pass before bounded allowance mutations"
+            esp_execution_ready.load(Ordering::Acquire),
+            "ESP Arbitrum chain readiness must pass before allowance mutations"
         );
         let account_id = compiled_binance_runtime
             .as_ref()
-            .context("M9 live execution requires a compiled Binance account")?
+            .context("ESP live execution requires a compiled Binance account")?
             .account_id
             .as_str()
             .to_owned();
         let strategy_plans = &hot_path_dependencies
             .as_ref()
-            .context("M9 live execution requires compiled strategy ownership")?
+            .context("ESP live execution requires compiled strategy ownership")?
             .plan()
             .strategies;
         let scope_for = |symbol: &str| -> anyhow::Result<TradeJournalScope> {
             let strategy = strategy_plans
                 .iter()
                 .find(|strategy| strategy.execute && strategy.symbol == symbol)
-                .with_context(|| format!("M9 live execution has no {symbol} strategy"))?;
+                .with_context(|| format!("ESP live execution has no {symbol} strategy"))?;
             let network = network_registry
                 .as_ref()
-                .context("M9 live execution requires the network registry")?
+                .context("ESP live execution requires the network registry")?
                 .runtimes()
                 .find(|runtime| runtime.plan().network_id == strategy.network_id)
-                .context("M9 executable strategy has no EVM execution owner")?
+                .context("ESP executable strategy has no EVM execution owner")?
                 .plan();
             Ok(TradeJournalScope {
                 schema_version: TradeJournalScope::SCHEMA_VERSION,
@@ -3503,15 +2431,15 @@ async fn run(
             })
         };
         let trade_journal_scope = scope_for("WLDUSDC")?;
-        let canary_journal_scope = scope_for("ESPUSDC")?;
+        let esp_journal_scope = scope_for("ESPUSDC")?;
         ensure!(
             EvmJournalScope {
                 schema_version: EvmJournalScope::SCHEMA_VERSION,
-                network_id: canary_journal_scope.network_id.clone(),
-                wallet_id: canary_journal_scope.wallet_id.clone(),
-                strategy_id: canary_journal_scope.strategy_id.clone(),
-            } == m9_canary_evm_journal_scope(ARBITRUM_CHAIN_ID),
-            "compiled M9 journal identity differs from the prefunding recovery identity"
+                network_id: esp_journal_scope.network_id.clone(),
+                wallet_id: esp_journal_scope.wallet_id.clone(),
+                strategy_id: esp_journal_scope.strategy_id.clone(),
+            } == esp_evm_journal_scope(ARBITRUM_CHAIN_ID),
+            "compiled ESP journal identity differs from the production rebalance identity"
         );
         let wallet = EvmWallet::from_env()?;
         ensure!(
@@ -3524,7 +2452,7 @@ async fn run(
                     "required environment variable {ARBITRAGE_WALLET_JOURNAL_PATH_ENV} is not set"
                 )
             })?;
-        let canary_wallet_journal_path =
+        let esp_wallet_journal_path =
             std::env::var(ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV).with_context(|| {
                 format!(
                     "required environment variable {ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV} is not set"
@@ -3607,23 +2535,17 @@ async fn run(
             dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?;
-        let canary_evm_journal_started_at = Instant::now();
-        let arbitrum_max_fee_headroom_bps = m8_pair
+        let esp_evm_journal_started_at = Instant::now();
+        let arbitrum_max_fee_headroom_bps = esp_pair
             .full_live_policy
             .as_ref()
             .map(|policy| policy.arbitrum_max_fee_headroom_bps)
-            .or_else(|| {
-                m8_pair
-                    .live_canary
-                    .as_ref()
-                    .map(|policy| policy.arbitrum_max_fee_headroom_bps)
-            })
             .context("Arbitrum gas policy is missing")?;
-        let mut canary_dex_executor = DexExecutor::hydrate_with_gas_policy(
-            canary_wallet_rpc.clone(),
+        let mut esp_dex_executor = DexExecutor::hydrate_with_gas_policy(
+            esp_wallet_rpc.clone(),
             EvmWallet::from_env()?,
             42_161,
-            canary_wallet_journal_path.into(),
+            esp_wallet_journal_path.into(),
             CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 max_priority_fee_per_gas_wei: 0,
@@ -3632,88 +2554,55 @@ async fn run(
             },
         )
         .await?;
-        canary_dex_executor.set_journal_scope(EvmJournalScope {
+        esp_dex_executor.set_journal_scope(EvmJournalScope {
             schema_version: EvmJournalScope::SCHEMA_VERSION,
-            network_id: canary_journal_scope.network_id.clone(),
-            wallet_id: canary_journal_scope.wallet_id.clone(),
-            strategy_id: canary_journal_scope.strategy_id.clone(),
+            network_id: esp_journal_scope.network_id.clone(),
+            wallet_id: esp_journal_scope.wallet_id.clone(),
+            strategy_id: esp_journal_scope.strategy_id.clone(),
         })?;
-        canary_dex_executor.set_receipt_heads(canary_receipt_head_receiver.clone());
-        let canary_router = m8_pair
+        esp_dex_executor.set_receipt_heads(esp_receipt_head_receiver.clone());
+        let esp_router = esp_pair
             .chain
             .uniswap_v3_router_address
             .as_deref()
-            .context("M9 Arbitrum V3 router is missing")?
+            .context("ESP Arbitrum V3 router is missing")?
             .parse()
-            .context("M9 Arbitrum V3 router is invalid")?;
-        let legacy_canary = m8_pair.live_canary.as_ref();
-        let token_a = canary_initial_wallet_balances
+            .context("ESP Arbitrum V3 router is invalid")?;
+        let token_a = esp_initial_wallet_balances
             .token_balances
             .iter()
-            .find(|token| token.symbol.as_ref() == m8_pair.token_a.symbol)
-            .context("M9 startup wallet snapshot is missing token_a")?;
-        let token_b = canary_initial_wallet_balances
+            .find(|token| token.symbol.as_ref() == esp_pair.token_a.symbol)
+            .context("ESP startup wallet snapshot is missing token_a")?;
+        let token_b = esp_initial_wallet_balances
             .token_balances
             .iter()
-            .find(|token| token.symbol.as_ref() == m8_pair.token_b.symbol)
-            .context("M9 startup wallet snapshot is missing token_b")?;
-        let canary_risk = PaperTradeCoordinator::open(&config.arbitrage_trade_journal_path)?
-            .canary_journal_risk(&canary_journal_scope.strategy_id)?;
-        let now_unix_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_micros()
-            .try_into()
-            .context("current Unix timestamp exceeds u64")?;
-        let allowance_requirements = if m8_pair.full_live {
-            Some((U256::MAX, U256::MAX))
-        } else {
-            m9_canary_allowance_requirements(
-                legacy_canary.context("legacy canary policy is missing")?,
-                canary_risk,
-                token_a.base_units,
-                token_b.base_units,
-                now_unix_us,
-            )?
-        };
-        if let Some((token_a_required, token_b_required)) = allowance_requirements {
-            let canary_allowances = [(token_a, token_a_required), (token_b, token_b_required)]
+            .find(|token| token.symbol.as_ref() == esp_pair.token_b.symbol)
+            .context("ESP startup wallet snapshot is missing token_b")?;
+        {
+            let esp_allowances = [(token_a, U256::MAX), (token_b, U256::MAX)]
                 .into_iter()
                 .map(|(token, required)| AllowanceRequirement {
-                    operation_id: m9_allowance_operation_id(token.symbol.as_ref(), required),
+                    operation_id: allowance_operation_id(token.symbol.as_ref()),
                     protocol: UniswapProtocol::V3,
                     token: token.contract,
-                    router: canary_router,
+                    router: esp_router,
                     required,
                 })
                 .collect::<Vec<_>>();
-            canary_dex_executor
-                .prepare_and_lock_allowances(&canary_allowances)
+            esp_dex_executor
+                .prepare_and_lock_allowances(&esp_allowances)
                 .await?;
-        } else {
-            canary_dex_executor.lock_allowance_mutations_without_preparation()?;
-            tracing::info!(
-                pair_id = %m8_pair.id,
-                admitted_parent_count = canary_risk.admitted_parent_count,
-                failed_parent_count = canary_risk.failed_parent_count,
-                active_parent_count = canary_risk.active_parent_count,
-                admitted_notional_token_a_base_units =
-                    canary_risk.admitted_notional_token_a_base_units,
-                realized_loss_token_a_base_units =
-                    canary_risk.realized_loss_token_a_base_units,
-                "durable M9 stop condition locked allowance mutations without a new approval"
-            );
         }
-        canary_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
-        let canary_dex_service = DexExecutionService::spawn(
-            canary_dex_executor,
+        esp_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
+        let esp_dex_service = DexExecutionService::spawn(
+            esp_dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?;
         if let Some(executor) = full_rebalance_executor.as_mut() {
             executor
                 .attach_arbitrum_execution_owner(
-                    canary_dex_service.evm_execution_owner(),
-                    canary_wallet_rpc.clone(),
+                    esp_dex_service.evm_execution_owner(),
+                    esp_wallet_rpc.clone(),
                 )
                 .await?;
             shared_arbitrum_rebalance_owner_attached = true;
@@ -3726,7 +2615,7 @@ async fn run(
                 "journal_scope": arb_bot::telemetry::execution_lane_id(42_161),
                 "network_id": arb_bot::telemetry::network_id(42_161),
                 "wallet_id": arb_bot::telemetry::PRIMARY_EVM_WALLET_ID,
-                "duration_us": canary_evm_journal_started_at.elapsed().as_micros(),
+                "duration_us": esp_evm_journal_started_at.elapsed().as_micros(),
                 "outcome": "success",
             }),
         );
@@ -3745,11 +2634,11 @@ async fn run(
                     },
                 ),
                 (
-                    canary_journal_scope.symbol.clone(),
+                    esp_journal_scope.symbol.clone(),
                     BinanceOrderJournalScope {
                         schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
-                        account_id: canary_journal_scope.account_id.clone(),
-                        strategy_id: canary_journal_scope.strategy_id.clone(),
+                        account_id: esp_journal_scope.account_id.clone(),
+                        strategy_id: esp_journal_scope.strategy_id.clone(),
                     },
                 ),
             ]),
@@ -3762,9 +2651,9 @@ async fn run(
             config.engine_id.clone(),
             DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
         );
-        let (canary_dex_revert_diagnostics, canary_dex_revert_diagnostic_task) =
+        let (esp_dex_revert_diagnostics, esp_dex_revert_diagnostic_task) =
             dex_revert_diagnostic_channel(
-                canary_wallet_rpc.clone(),
+                esp_wallet_rpc.clone(),
                 telemetry.clone(),
                 config.engine_id.clone(),
                 DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
@@ -3786,38 +2675,32 @@ async fn run(
                 engine_id: config.engine_id.clone(),
             },
         )?);
-        let canary_executor = Arc::new(ComposedLiveLegExecutor::new(
-            canary_dex_service,
+        let esp_executor = Arc::new(ComposedLiveLegExecutor::new(
+            esp_dex_service,
             Arc::clone(&binance_service),
             ComposedLiveLegExecutorConfig {
                 rules: esp_execution_symbol_rules.clone(),
-                base_asset: m8_pair.binance.base_asset.clone(),
-                base_decimals: m8_pair.token_b.decimals,
-                quote_asset: m8_pair.binance.quote_asset.clone(),
-                quote_decimals: m8_pair.token_a.decimals,
+                base_asset: esp_pair.binance.base_asset.clone(),
+                base_decimals: esp_pair.token_b.decimals,
+                quote_asset: esp_pair.binance.quote_asset.clone(),
+                quote_decimals: esp_pair.token_a.decimals,
                 commission_asset: commission_asset.clone(),
                 commission_price_symbol: commission_price_symbol.clone(),
                 market_state: entry_preflight.clone(),
-                dex_revert_diagnostics: canary_dex_revert_diagnostics,
+                dex_revert_diagnostics: esp_dex_revert_diagnostics,
                 telemetry: telemetry.clone(),
                 engine_id: config.engine_id.clone(),
             },
         )?);
         let executor = RoutedLiveLegExecutor::new(BTreeMap::from([
             (pair.id.clone(), primary_executor),
-            (m8_pair.id.clone(), canary_executor),
+            (esp_pair.id.clone(), esp_executor),
         ]))?;
-        let legacy_canary = m8_pair.live_canary.as_ref();
-        let full_live_sizing = m8_pair
-            .full_live
-            .then(|| {
-                m8_pair
-                    .adaptive_sizing
-                    .limits()
-                    .context("full-live adaptive sizing limits are missing")
-            })
-            .transpose()?;
-        let parse_canary_amount = |value: &str, label: &str| {
+        let full_live_sizing = esp_pair
+            .adaptive_sizing
+            .limits()
+            .context("full-live adaptive sizing limits are missing")?;
+        let parse_live_amount = |value: &str, label: &str| {
             value
                 .parse::<u128>()
                 .with_context(|| format!("ESP {label} is invalid"))
@@ -3833,82 +2716,25 @@ async fn run(
                 binance_symbol: pair.binance.symbol.clone(),
                 binance_base_decimals: pair.token_b.decimals,
                 journal_scope: trade_journal_scope,
-                canary_policies: BTreeMap::from([(
-                    m8_pair.id.clone(),
-                    LiveCanaryPolicy {
-                        full_live: m8_pair.full_live,
-                        journal_scope: canary_journal_scope,
-                        maximum_trade_notional_token_a_base_units: legacy_canary
-                            .map(|policy| {
-                                parse_canary_amount(
-                                    &policy.max_trade_notional_token_a_base_units,
-                                    "maximum trade notional",
-                                )
-                            })
-                            .transpose()?
-                            .or(full_live_sizing
-                                .map(|limits| {
-                                    parse_canary_amount(
-                                        limits.max_trade_notional,
-                                        "full-live maximum trade notional",
-                                    )
-                                })
-                                .transpose()?)
-                            .context("pair trade-notional policy is missing")?,
-                        maximum_total_notional_token_a_base_units: legacy_canary
-                            .map(|policy| {
-                                parse_canary_amount(
-                                    &policy.max_total_notional_token_a_base_units,
-                                    "maximum total notional",
-                                )
-                            })
-                            .transpose()?
-                            .unwrap_or_default(),
-                        maximum_unhedged_notional_token_a_base_units: legacy_canary
-                            .map(|policy| {
-                                parse_canary_amount(
-                                    &policy.max_unhedged_notional_token_a_base_units,
-                                    "maximum unhedged notional",
-                                )
-                            })
-                            .transpose()?
-                            .or(full_live_sizing
-                                .map(|limits| {
-                                    parse_canary_amount(
-                                        limits.max_unhedged_notional,
-                                        "full-live maximum unhedged notional",
-                                    )
-                                })
-                                .transpose()?)
-                            .context("pair unhedged-notional policy is missing")?,
-                        maximum_realized_loss_token_a_base_units: legacy_canary
-                            .map(|policy| {
-                                parse_canary_amount(
-                                    &policy.max_realized_loss_token_a_base_units,
-                                    "maximum realized loss",
-                                )
-                            })
-                            .transpose()?
-                            .or(full_live_sizing
-                                .map(|limits| {
-                                    parse_canary_amount(
-                                        limits.max_recovery_loss,
-                                        "full-live maximum recovery loss",
-                                    )
-                                })
-                                .transpose()?)
-                            .context("pair recovery-loss policy is missing")?,
-                        maximum_parent_trades: legacy_canary
-                            .map_or(0, |policy| usize::from(policy.max_parent_trades)),
-                        maximum_failed_parent_trades: legacy_canary
-                            .map_or(0, |policy| usize::from(policy.max_failed_parent_trades)),
-                        maximum_concurrent_trades: legacy_canary
-                            .map_or(1, |policy| usize::from(policy.max_concurrent_trades)),
-                        rollout_duration: Duration::from_secs(
-                            legacy_canary.map_or(0, |policy| policy.rollout_duration_seconds),
-                        ),
-                        readiness: Arc::clone(&canary_execution_ready),
-                        market_data_readiness: Arc::clone(&canary_market_data_ready),
+                pair_policies: BTreeMap::from([(
+                    esp_pair.id.clone(),
+                    LivePairPolicy {
+                        journal_scope: esp_journal_scope,
+                        maximum_trade_notional_token_a_base_units: parse_live_amount(
+                            full_live_sizing.max_trade_notional,
+                            "maximum trade notional",
+                        )?,
+                        maximum_unhedged_notional_token_a_base_units: parse_live_amount(
+                            full_live_sizing.max_unhedged_notional,
+                            "maximum unhedged notional",
+                        )?,
+                        maximum_realized_loss_token_a_base_units: parse_live_amount(
+                            full_live_sizing.max_recovery_loss,
+                            "maximum recovery loss",
+                        )?,
+                        maximum_concurrent_trades: 1,
+                        readiness: Arc::clone(&esp_execution_ready),
+                        market_data_readiness: Arc::clone(&esp_market_data_ready),
                     },
                 )]),
             },
@@ -3916,7 +2742,7 @@ async fn run(
         let diagnostic_task = tokio::spawn(async move {
             tokio::join!(
                 dex_revert_diagnostic_task.run(),
-                canary_dex_revert_diagnostic_task.run()
+                esp_dex_revert_diagnostic_task.run()
             );
             Ok::<(), anyhow::Error>(())
         });
@@ -3941,40 +2767,40 @@ async fn run(
         initial_wallet_head,
         config.balance_event_channel_capacity,
     );
-    let canary_wallet_tokens = vec![
+    let esp_wallet_tokens = vec![
         TokenBalanceRequest {
-            symbol: m8_pair.token_a.symbol.clone(),
-            contract: m8_pair
+            symbol: esp_pair.token_a.symbol.clone(),
+            contract: esp_pair
                 .token_a
                 .contract
                 .parse()
-                .context("M9 token_a address is invalid")?,
+                .context("ESP token_a address is invalid")?,
         },
         TokenBalanceRequest {
-            symbol: m8_pair.token_b.symbol.clone(),
-            contract: m8_pair
+            symbol: esp_pair.token_b.symbol.clone(),
+            contract: esp_pair
                 .token_b
                 .contract
                 .parse()
-                .context("M9 token_b address is invalid")?,
+                .context("ESP token_b address is invalid")?,
         },
     ];
-    let canary_wallet_reads = network_registry
+    let esp_wallet_reads = network_registry
         .as_ref()
-        .context("M9 requires the Arbitrum network runtime")?
+        .context("ESP requires the Arbitrum network runtime")?
         .get_by_chain_id(42_161)?
         .reads()
         .clone();
     let arb_bot::balances::WalletBalanceSync {
-        receiver: mut canary_wallet_balance_receiver,
-        heads: canary_wallet_heads,
-        task: mut canary_wallet_balance_task,
+        receiver: mut esp_wallet_balance_receiver,
+        heads: esp_wallet_heads,
+        task: mut esp_wallet_balance_task,
     } = spawn_wallet_balance_sync(
-        WalletReadClient::Coordinated(canary_wallet_reads),
+        WalletReadClient::Coordinated(esp_wallet_reads),
         wallet_owner,
         42_161,
-        canary_wallet_tokens,
-        canary_initial_head,
+        esp_wallet_tokens,
+        esp_initial_head,
         config.balance_event_channel_capacity,
     );
 
@@ -4033,29 +2859,29 @@ async fn run(
             sell: binance_sell_fee_bps,
         },
     )?;
-    let dependencies =
-        hot_path_dependencies.context("run requires the compiled M4 hot-path runtime plan")?;
+    let dependencies = hot_path_dependencies
+        .context("run requires the compiled hot-path hot-path runtime plan")?;
     let shadow_plan =
-        shadow_strategy_plan.context("compiled M9 hot path has no ESP canary strategy")?;
+        shadow_strategy_plan.context("compiled ESP hot path has no ESP esp strategy")?;
     let InitializedDex {
         mirror: shadow_mirror,
         stream: shadow_stream,
         rpc: _shadow_wallet_rpc,
         timings: _shadow_dex_timings,
     } = shadow_initialized_dex
-        .context("compiled M9 ESP strategy has no initialized DEX runtime")?;
+        .context("compiled ESP ESP strategy has no initialized DEX runtime")?;
     let shadow_pair = shadow_plan
         .domain_config
         .snapshot()
         .pairs
         .first()
-        .context("compiled M9 ESP strategy has no projected pair")?;
-    let (mut canary_engine, canary_hot_telemetry) = TradingEngine::new(
+        .context("compiled ESP ESP strategy has no projected pair")?;
+    let (mut esp_engine, esp_hot_telemetry) = TradingEngine::new(
         config.clone(),
         Arc::new(shadow_plan.domain_config.clone()),
         shadow_mirror,
         telemetry.clone(),
-        V12RebalanceParityAdapter::new(canary_rebalance_tracker),
+        V12RebalanceParityAdapter::new(esp_rebalance_tracker),
         arb_bot::engine::TradingExecutionHandles {
             paper_trades,
             entry_preflight: entry_preflight.clone(),
@@ -4100,39 +2926,35 @@ async fn run(
     tracing::info!(
         binance_account_id = PRIMARY_BINANCE_ACCOUNT_ID,
         live_strategy_id = %engine.strategy_id().as_str(),
-        canary_strategy_id = %shadow_plan.strategy_id.as_str(),
-        canary_network_id = %shadow_plan.network_id.as_str(),
-        canary_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
+        esp_strategy_id = %shadow_plan.strategy_id.as_str(),
+        esp_network_id = %shadow_plan.network_id.as_str(),
+        esp_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
         shared_inventory_owner = true,
         shared_binance_order_owner = true,
-        canary_rebalance_mutation_enabled =
-            matches!(
-                portfolio_catalog.allocator_mode(),
-                CompiledCapitalAllocatorMode::LiveCanary
-                    | CompiledCapitalAllocatorMode::FullLive
-            ),
-        canary_external_mutation_authorized = true,
+        esp_rebalance_mutation_enabled =
+            portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive,
+        esp_external_mutation_authorized = true,
         root_supervisor_policy = "dependency_scoped_v1",
         "ESP full-live production strategy configured"
     );
-    if matches!(
-        portfolio_catalog.allocator_mode(),
-        CompiledCapitalAllocatorMode::LiveCanary | CompiledCapitalAllocatorMode::FullLive
-    ) {
+    if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive {
         ensure!(
             shared_arbitrum_rebalance_owner_attached && full_rebalance_executor.is_some(),
             "live ESP rebalance has no shared Arbitrum EVM execution owner"
         );
     }
-    if let Some(policy) = m8_pair.full_live_policy.as_ref() {
-        tracing::info!(
-            pair_id = m8_pair.id,
+    let policy = esp_pair
+        .full_live_policy
+        .as_ref()
+        .context("ESP full-live policy is missing")?;
+    tracing::info!(
+            pair_id = esp_pair.id,
             strategy_id = %shadow_plan.strategy_id.as_str(),
             network_id = %shadow_plan.network_id.as_str(),
-            chain_id = m8_pair.chain.chain_id,
+            chain_id = esp_pair.chain.chain_id,
             production_approval_actor = policy.production_approval_actor,
             production_approval_recorded_at_utc = policy.production_approval_recorded_at_utc,
-            max_trade_notional_token_a_base_units = m8_pair
+            max_trade_notional_token_a_base_units = esp_pair
                 .adaptive_sizing
                 .limits()
                 .map(|limits| limits.max_trade_notional),
@@ -4157,100 +2979,24 @@ async fn run(
             shared_arbitrum_evm_owner = shared_arbitrum_rebalance_owner_attached,
             external_mutation_authorized = true,
             "ESP Arbitrum full-live execution configured"
-        );
-    } else {
-        let m8_canary = m8_pair
-            .live_canary
-            .as_ref()
-            .context("legacy live pair has no bounded canary policy")?;
-        tracing::info!(
-        pair_id = m8_pair.id,
-        strategy_id = %shadow_plan.strategy_id.as_str(),
-        network_id = %shadow_plan.network_id.as_str(),
-        chain_id = m8_pair.chain.chain_id,
-        router = %m8_pair
-            .chain
-            .uniswap_v3_router_address
-            .as_deref()
-            .context("M9 canary router is missing")?,
-        approval_gate = "explicit_production_approved",
-        max_trade_notional_token_a_base_units =
-            %m8_canary.max_trade_notional_token_a_base_units,
-        max_total_notional_token_a_base_units =
-            %m8_canary.max_total_notional_token_a_base_units,
-        minimum_wallet_token_a_base_units =
-            %m8_canary.minimum_wallet_token_a_base_units,
-        minimum_wallet_token_b_base_units =
-            %m8_canary.minimum_wallet_token_b_base_units,
-        minimum_runtime_wallet_token_a_base_units =
-            %m8_canary.runtime_wallet_token_a_minimum(),
-        minimum_runtime_wallet_token_b_base_units =
-            %m8_canary.runtime_wallet_token_b_minimum(),
-        max_parent_trades = m8_canary.max_parent_trades,
-        max_failed_parent_trades = m8_canary.max_failed_parent_trades,
-        max_concurrent_trades = m8_canary.max_concurrent_trades,
-        rollout_duration_seconds = m8_canary.rollout_duration_seconds,
-        gas_policy = "fresh_eth_gas_price_fail_closed_no_world_fallback",
-        allowance_policy = "bounded_exact_canary_cap_then_locked",
-        receipt_accounting = "effective_gas_price_includes_arbitrum_l1_component",
-        execution_enabled = true,
-        rebalance_enabled = m8_pair.rebalance.enabled,
-        external_mutation_authorized = true,
-        "ESP Arbitrum full-live execution configured"
-        );
-        let m10_policy = m8_canary
-            .rebalance_live_canary
-            .as_ref()
-            .context("M10 rebalance policy is missing")?;
-        tracing::info!(
-        pair_id = m8_pair.id,
-        strategy_id = "rebalance-arbitrum-usdc-esp-m10",
-        network_id = "eip155:42161",
-        approval_gate = ?m10_policy.approval_gate,
-        production_approval_actor = ?m10_policy.production_approval_actor,
-        production_approval_recorded_at_utc =
-            ?m10_policy.production_approval_recorded_at_utc,
-        approval_session_id = m10_policy.approval_session_id,
-        allocator_mode = ?portfolio_catalog.allocator_mode(),
-        binance_network = m10_policy.binance_network,
-        maximum_transfer_count = m10_policy.maximum_transfer_count,
-        maximum_concurrent_transfers = m10_policy.maximum_concurrent_transfers,
-        maximum_failed_transfers = m10_policy.maximum_failed_transfers,
-        maximum_token_a_debit_base_units =
-            m10_policy.maximum_token_a_debit_base_units,
-        maximum_token_b_debit_base_units =
-            m10_policy.maximum_token_b_debit_base_units,
-        maximum_token_a_fee_base_units = m10_policy.maximum_token_a_fee_base_units,
-        maximum_token_b_fee_base_units = m10_policy.maximum_token_b_fee_base_units,
-        rollout_duration_seconds = m10_policy.rollout_duration_seconds,
-        maximum_unknown_reconciliation_queries =
-            m10_policy.maximum_unknown_reconciliation_queries,
-        direct_route_only = m10_policy.direct_route_only,
-        bridge_mutations_enabled = m10_policy.bridge_mutations_enabled,
-        shared_arbitrum_evm_owner = shared_arbitrum_rebalance_owner_attached,
-        external_mutation_authorized = portfolio_catalog
-            .capital_canary()
-            .is_some_and(|policy| policy.external_mutation_authorized),
-        "M10 Arbitrum rebalance live canary configured"
-        );
-    }
+    );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
         task: mut shadow_dex_task,
     } = shadow_stream;
     engine.on_binance_clock_sync(binance_account.clock_sync);
-    canary_engine.on_binance_clock_sync(binance_account.clock_sync);
+    esp_engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     let portfolio_allocator_task = tokio::spawn(portfolio_allocator_task.run());
-    let canary_hot_telemetry_task = tokio::spawn(canary_hot_telemetry.run());
-    let m8_chain_readiness_task = m8_chain_readiness_probe.map(|probe| {
-        tokio::spawn(run_m8_chain_readiness_refresh(
+    let esp_hot_telemetry_task = tokio::spawn(esp_hot_telemetry.run());
+    let live_chain_readiness_task = live_chain_readiness_probe.map(|probe| {
+        tokio::spawn(run_chain_readiness_refresh(
             probe,
             telemetry.clone(),
             config.engine_id.clone(),
-            m8_pair.clone(),
-            initial_m8_chain_readiness_status,
-            Arc::clone(&canary_execution_ready),
+            esp_pair.clone(),
+            initial_chain_readiness_status,
+            Arc::clone(&esp_execution_ready),
         ))
     });
     let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
@@ -4260,80 +3006,25 @@ async fn run(
         binance_clock_sync_sender,
     ));
     let mut binance_clock_sync_running = true;
-    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task, m10_risk_receiver) =
+    let (rebalance_sender, mut rebalance_receiver, mut rebalance_task, rebalance_risk_receiver) =
         if let Some(mut executor) = full_rebalance_executor.take() {
-            let recover_on_start = rebalance_recovery_operation.is_some()
-                || approved_endpoint_recovery.is_some()
-                || approved_manual_withdrawal_recovery.is_some();
-            let recovery_target = if approved_endpoint_recovery.is_some()
-                || approved_manual_withdrawal_recovery.is_some()
-            {
-                RebalanceExecutionTarget::ArbitrumCanary
-            } else {
-                rebalance_recovery_operation
-                    .as_ref()
-                    .map(rebalance_target)
-                    .unwrap_or(RebalanceExecutionTarget::Primary)
-            };
+            let recover_on_start = rebalance_recovery_operation.is_some();
+            let recovery_target = rebalance_recovery_operation
+                .as_ref()
+                .map(rebalance_target)
+                .unwrap_or(RebalanceExecutionTarget::Primary);
             let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
             let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
             let (risk_sender, risk_receiver) =
-                tokio::sync::watch::channel(executor.m10_canary_risk()?);
+                tokio::sync::watch::channel(executor.rebalance_risk()?);
             let rebalance_telemetry = telemetry.clone();
             let rebalance_engine_id = config.engine_id.clone();
             let task = tokio::spawn(async move {
-                emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
+                emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                 if recover_on_start {
                     let saga_started_at = Instant::now();
-                    let result = if let Some(recovery) =
-                        approved_manual_withdrawal_recovery.as_ref()
-                    {
-                        let gross_debit =
-                            U256::from_str_radix(&recovery.gross_debit_base_units, 10)
-                                .context("approved manual M12 gross debit is invalid")?;
-                        let expected_credit =
-                            U256::from_str_radix(&recovery.expected_credit_base_units, 10)
-                                .context("approved manual M12 credit is invalid")?;
-                        let expected_fee =
-                            U256::from_str_radix(&recovery.expected_fee_base_units, 10)
-                                .context("approved manual M12 fee is invalid")?;
-                        let wallet_balance_before =
-                            U256::from_str_radix(&recovery.wallet_balance_before_base_units, 10)
-                                .context("approved manual M12 wallet balance is invalid")?;
-                        let wallet_owner = Address::from_str(&recovery.wallet_address)
-                            .context("approved manual M12 wallet is invalid")?;
-                        let transaction_hash = recovery
-                            .transaction_hash
-                            .parse::<B256>()
-                            .context("approved manual M12 transaction hash is invalid")?;
-                        executor
-                            .recover_approved_manual_direct_credit(
-                                &recovery.operation_id,
-                                &recovery.token_symbol,
-                                gross_debit,
-                                expected_credit,
-                                expected_fee,
-                                wallet_balance_before,
-                                wallet_owner,
-                                &recovery.binance_network,
-                                ARBITRUM_CHAIN_ID,
-                                transaction_hash,
-                                Some(&recovery.withdrawal_id),
-                                Some(recovery.master_transfer_transaction_id),
-                                Some(recovery.rejected_local_entity_travel_rule_id),
-                                Some(recovery.rejected_standard_travel_rule_id),
-                            )
-                            .await
-                            .map_err(|error| format!("{error:#}"))
-                    } else if let Some(recovery) = approved_endpoint_recovery.as_ref() {
-                        executor
-                            .retry_approved_failed_local_entity_with_standard(recovery)
-                            .await
-                            .map_err(|error| format!("{error:#}"))
-                    } else {
-                        recover_rebalance_with_quote_retries(&mut executor).await
-                    };
-                    emit_m10_rebalance_saga(
+                    let result = recover_rebalance_with_quote_retries(&mut executor).await;
+                    emit_rebalance_saga(
                         &rebalance_telemetry,
                         &rebalance_engine_id,
                         recovery_target,
@@ -4342,8 +3033,8 @@ async fn run(
                         saga_started_at,
                         true,
                     );
-                    emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
-                    risk_sender.send_replace(executor.m10_canary_risk()?);
+                    emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
+                    risk_sender.send_replace(executor.rebalance_risk()?);
                     let active_operation_after = executor.active_operation()?.is_some();
                     if result_sender
                         .send(RebalanceExecutorEvent::Recovery {
@@ -4360,7 +3051,7 @@ async fn run(
                 while let Some((target, request)) = request_receiver.recv().await {
                     let saga_started_at = Instant::now();
                     let result = execute_rebalance_with_quote_retries(&mut executor, request).await;
-                    emit_m10_rebalance_saga(
+                    emit_rebalance_saga(
                         &rebalance_telemetry,
                         &rebalance_engine_id,
                         target,
@@ -4369,8 +3060,8 @@ async fn run(
                         saga_started_at,
                         false,
                     );
-                    emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
-                    risk_sender.send_replace(executor.m10_canary_risk()?);
+                    emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
+                    risk_sender.send_replace(executor.rebalance_risk()?);
                     let active_operation_after = executor.active_operation()?.is_some();
                     if result_sender
                         .send(RebalanceExecutorEvent::Execution {
@@ -4400,29 +3091,28 @@ async fn run(
             let (_result_sender, result_receiver) =
                 tokio::sync::mpsc::channel::<RebalanceExecutorEvent>(1);
             let (_risk_sender, risk_receiver) =
-                tokio::sync::watch::channel(RebalanceCanaryRisk::default());
+                tokio::sync::watch::channel(RebalanceRisk::default());
             (None, result_receiver, None, risk_receiver)
         };
     if let Some(operation) = rebalance_recovery_operation.as_ref() {
         match rebalance_target(operation) {
             RebalanceExecutionTarget::Primary => engine.on_rebalance_recovery_started(operation)?,
-            RebalanceExecutionTarget::ArbitrumCanary => {
-                canary_engine.on_rebalance_recovery_started(operation)?
+            RebalanceExecutionTarget::Arbitrum => {
+                esp_engine.on_rebalance_recovery_started(operation)?
             }
         }
     }
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances.clone()))?;
-    canary_engine
-        .on_shared_binance_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
+    esp_engine.on_shared_binance_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
     engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances))?;
-    canary_engine.on_balance_event(BalanceEvent::Wallet(canary_initial_wallet_balances.clone()))?;
+    esp_engine.on_balance_event(BalanceEvent::Wallet(esp_initial_wallet_balances.clone()))?;
     for snapshot in &portfolio_wallet_snapshots {
         if snapshot.chain_id != wallet_chain_id {
             engine.on_portfolio_wallet_snapshot(snapshot)?;
         }
     }
     engine.on_user_data_connected(user_data_subscription_id);
-    canary_engine.on_shared_user_data_connected();
+    esp_engine.on_shared_user_data_connected();
     // The executor and its durable journal are a single process-wide mutation
     // lane. Recovery owns that lane until it publishes a terminal result.
     let mut rebalance_lane_busy = rebalance_recovery_operation.is_some();
@@ -4440,18 +3130,18 @@ async fn run(
     }
     if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
         rebalance_lane_busy = dispatch_rebalance_execution(
-            &mut canary_engine,
+            &mut esp_engine,
             rebalance_sender.as_ref(),
-            &m8_pair,
+            &esp_pair,
             wallet_owner,
-            RebalanceExecutionTarget::ArbitrumCanary,
-            portfolio_catalog.capital_canary(),
-            Some(&m10_risk_receiver),
+            RebalanceExecutionTarget::Arbitrum,
+            portfolio_catalog.capital_policy(),
+            Some(&rebalance_risk_receiver),
         )
         .await?;
     }
     engine.start();
-    canary_engine.start();
+    esp_engine.start();
     let mut first_ready_emitted = false;
     let mut longest_non_price_handler_us = 0_u128;
     let mut longest_non_price_handler = "none";
@@ -4472,21 +3162,21 @@ async fn run(
     let mut pending_prepared_pool_builds = PreparedPoolBuildBatch::default();
     let (startup_primary_dex, startup_shadow_dex) = drain_startup_dex_backlog(
         &mut engine,
-        &mut canary_engine,
+        &mut esp_engine,
         &mut pending_prepared_pool_builds,
         &mut dex_receiver,
         &mut shadow_dex_receiver,
         &wallet_heads,
         &receipt_heads,
-        &canary_wallet_heads,
-        &canary_receipt_heads,
+        &esp_wallet_heads,
+        &esp_receipt_heads,
     )?;
     report_strategy_dependency_faults(&mut engine, &root_supervisor)?;
     if startup_primary_dex.pool_build_count > 0 {
         engine.evaluate_after_dex_refreshes()?;
     }
     if startup_shadow_dex.pool_build_count > 0 {
-        canary_engine.evaluate_after_dex_refreshes()?;
+        esp_engine.evaluate_after_dex_refreshes()?;
     }
     telemetry.emit(
         "startup_dex_backlog_drain",
@@ -4495,8 +3185,8 @@ async fn run(
             "primary_event_count": startup_primary_dex.event_count,
             "primary_pool_build_count": startup_primary_dex.pool_build_count,
             "primary_max_queue_age_us": startup_primary_dex.max_queue_age_us,
-            "canary_event_count": startup_shadow_dex.event_count,
-            "canary_max_queue_age_us": startup_shadow_dex.max_queue_age_us,
+            "esp_event_count": startup_shadow_dex.event_count,
+            "esp_max_queue_age_us": startup_shadow_dex.max_queue_age_us,
             "backlog_empty_before_ready": true,
         }),
     );
@@ -4533,21 +3223,17 @@ async fn run(
         hot_path_sizing_policy =
             "globally_bounded_round_robin_one_running_one_latest_pending_per_strategy",
         hot_path_maximum_adaptive_sizing_workers = maximum_adaptive_sizing_workers,
-        hot_path_canary_strategy_id = %shadow_plan.strategy_id.as_str(),
-        hot_path_canary_external_mutation_authorized = true,
-        hot_path_canary_rebalance_mutation_authorized =
-            matches!(
-                portfolio_catalog.allocator_mode(),
-                CompiledCapitalAllocatorMode::LiveCanary
-                    | CompiledCapitalAllocatorMode::FullLive
-            ),
+        secondary_hot_path_strategy_id = %shadow_plan.strategy_id.as_str(),
+        secondary_hot_path_external_mutation_authorized = true,
+        secondary_hot_path_rebalance_mutation_authorized =
+            portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive,
         portfolio_inventory_key = "inventory_location+venue_asset_id",
         portfolio_location_count = portfolio_catalog.location_count(),
         portfolio_venue_asset_count = portfolio_catalog.asset_count(),
         portfolio_economic_asset_count = portfolio_catalog.economic_asset_count(),
         portfolio_allocator_mode = ?portfolio_catalog.allocator_mode(),
         portfolio_external_mutation_authorized = portfolio_catalog
-            .capital_canary()
+            .capital_policy()
             .is_some_and(|policy| policy.external_mutation_authorized),
         live_rebalance_adapter = portfolio_catalog.live_rebalance_adapter(),
         arbitrum_execution_enabled = network_registry
@@ -4671,10 +3357,10 @@ async fn run(
             event = shadow_dex_receiver.recv(), if shadow_dex_running => {
                 let handler_started_at = Instant::now();
                 let Some(event) = event else {
-                    canary_market_data_ready.store(false, Ordering::Release);
+                    esp_market_data_ready.store(false, Ordering::Release);
                     tracing::error!(
                         strategy_id = %shadow_plan.strategy_id.as_str(),
-                        "Arbitrum canary DEX stream stopped; new ESP entries are disabled"
+                        "Arbitrum esp DEX stream stopped; new ESP entries are disabled"
                     );
                     shadow_dex_running = false;
                     continue;
@@ -4683,13 +3369,13 @@ async fn run(
                     DexStreamEvent::Head { head, .. } => Some(*head),
                     DexStreamEvent::Log { .. } => None,
                 };
-                if let Some(request) = canary_engine.on_dex_event(event)? {
-                    build_prepared_pool_inline(&mut canary_engine, request)?;
-                    canary_engine.evaluate_after_dex_refreshes()?;
+                if let Some(request) = esp_engine.on_dex_event(event)? {
+                    build_prepared_pool_inline(&mut esp_engine, request)?;
+                    esp_engine.evaluate_after_dex_refreshes()?;
                 }
                 if let Some(head) = head {
-                    canary_wallet_heads.send_replace(head);
-                    canary_receipt_heads.send_replace(head);
+                    esp_wallet_heads.send_replace(head);
+                    esp_receipt_heads.send_replace(head);
                 }
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -4701,7 +3387,7 @@ async fn run(
             scheduled_at = health_tick.tick() => {
                 let loop_lag_us = scheduled_at.elapsed().as_micros();
                 engine.refresh_health();
-                canary_engine.refresh_health();
+                esp_engine.refresh_health();
                 engine.record_owner_loop_health(
                     loop_lag_us,
                     longest_non_price_handler,
@@ -4714,7 +3400,7 @@ async fn run(
                 drop(binance_market_event);
                 let event_symbol = market_event_symbol(&event);
                 if event_symbol == shadow_plan.symbol {
-                    canary_engine.on_market_event(event, None)?;
+                    esp_engine.on_market_event(event, None)?;
                 } else if engine.dependencies().for_symbol(event_symbol).next().is_some() {
                     let _summary =
                         engine.on_market_event(event, binance_feed.depth_book())?;
@@ -4736,7 +3422,7 @@ async fn run(
                 let handler_started_at = Instant::now();
                 drop(gas_market_event);
                 engine.on_gas_market_event(event.clone())?;
-                canary_engine.on_gas_market_event(event)?;
+                esp_engine.on_gas_market_event(event)?;
                 gas_market_event = Box::pin(gas_price_feed.next_event());
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -4749,7 +3435,7 @@ async fn run(
                 let handler_started_at = Instant::now();
                 drop(commission_market_event);
                 engine.on_commission_market_event(event.clone())?;
-                canary_engine.on_commission_market_event(event)?;
+                esp_engine.on_commission_market_event(event)?;
                 commission_market_event = Box::pin(commission_price_feed.next_event());
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -4765,7 +3451,7 @@ async fn run(
                     UserDataEvent::ExecutionReport(report)
                         if report.symbol == shadow_plan.symbol =>
                     {
-                        canary_engine.on_user_data_event(event)?;
+                        esp_engine.on_user_data_event(event)?;
                     }
                     UserDataEvent::ExecutionReport(report)
                         if report.symbol == pair.binance.symbol =>
@@ -4777,15 +3463,15 @@ async fn run(
                     }
                     UserDataEvent::ExecutionReport(_) => {
                         engine.on_user_data_event(event.clone())?;
-                        canary_engine.on_shared_user_data_dirty();
+                        esp_engine.on_shared_user_data_dirty();
                     }
                     UserDataEvent::StreamTerminated { .. } => {
                         engine.on_user_data_event(event)?;
-                        canary_engine.on_shared_user_data_disconnected();
+                        esp_engine.on_shared_user_data_disconnected();
                     }
                     UserDataEvent::Other { .. } => {
                         engine.on_user_data_event(event)?;
-                        canary_engine.on_shared_user_data_dirty();
+                        esp_engine.on_shared_user_data_dirty();
                     }
                 }
                 record_longest_handler(
@@ -4800,18 +3486,18 @@ async fn run(
                 match observation {
                     Some(Ok(clock_sync)) => {
                         engine.on_binance_clock_sync(clock_sync);
-                        canary_engine.on_binance_clock_sync(clock_sync);
+                        esp_engine.on_binance_clock_sync(clock_sync);
                     }
                     Some(Err(error)) => {
                         engine.on_binance_clock_sync_failure(&error);
-                        canary_engine.on_binance_clock_sync_failure(&error);
+                        esp_engine.on_binance_clock_sync_failure(&error);
                     }
                     None => {
                         binance_clock_sync_running = false;
                         engine.on_binance_clock_sync_failure(
                             "background Binance clock synchronization task stopped",
                         );
-                        canary_engine.on_binance_clock_sync_failure(
+                        esp_engine.on_binance_clock_sync_failure(
                             "background Binance clock synchronization task stopped",
                         );
                     }
@@ -4831,7 +3517,7 @@ async fn run(
                 match event {
                     BalanceEvent::Binance(snapshot) => {
                         engine.on_balance_event(BalanceEvent::Binance(snapshot.clone()))?;
-                        canary_engine.on_shared_binance_balance_event(
+                        esp_engine.on_shared_binance_balance_event(
                             BalanceEvent::Binance(snapshot),
                         )?;
                     }
@@ -4845,7 +3531,7 @@ async fn run(
                             error: error.clone(),
                             observed_at,
                         })?;
-                        canary_engine.on_shared_binance_balance_event(BalanceEvent::Failed {
+                        esp_engine.on_shared_binance_balance_event(BalanceEvent::Failed {
                             source: BalanceSource::Binance,
                             error,
                             observed_at,
@@ -4867,13 +3553,13 @@ async fn run(
                 }
                 if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
                     rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut canary_engine,
+                        &mut esp_engine,
                         rebalance_sender.as_ref(),
-                        &m8_pair,
+                        &esp_pair,
                         wallet_owner,
-                        RebalanceExecutionTarget::ArbitrumCanary,
-                        portfolio_catalog.capital_canary(),
-                        Some(&m10_risk_receiver),
+                        RebalanceExecutionTarget::Arbitrum,
+                        portfolio_catalog.capital_policy(),
+                        Some(&rebalance_risk_receiver),
                     )
                     .await?;
                 }
@@ -4884,21 +3570,21 @@ async fn run(
                     handler_started_at.elapsed(),
                 );
             }
-            event = canary_wallet_balance_receiver.recv() => {
+            event = esp_wallet_balance_receiver.recv() => {
                 let handler_started_at = Instant::now();
                 let Some(event) = event else {
                     bail!("Arbitrum wallet balance synchronization channel stopped unexpectedly");
                 };
-                canary_engine.on_balance_event(event)?;
+                esp_engine.on_balance_event(event)?;
                 if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
                     rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut canary_engine,
+                        &mut esp_engine,
                         rebalance_sender.as_ref(),
-                        &m8_pair,
+                        &esp_pair,
                         wallet_owner,
-                        RebalanceExecutionTarget::ArbitrumCanary,
-                        portfolio_catalog.capital_canary(),
-                        Some(&m10_risk_receiver),
+                        RebalanceExecutionTarget::Arbitrum,
+                        portfolio_catalog.capital_policy(),
+                        Some(&rebalance_risk_receiver),
                     )
                     .await?;
                 }
@@ -4936,11 +3622,11 @@ async fn run(
                         (RebalanceExecutionTarget::Primary, Err(error)) => {
                             engine.on_rebalance_recovery_result(Err(&error))?
                         }
-                        (RebalanceExecutionTarget::ArbitrumCanary, Ok(operation)) => {
-                            canary_engine.on_rebalance_recovery_result(Ok(&operation))?
+                        (RebalanceExecutionTarget::Arbitrum, Ok(operation)) => {
+                            esp_engine.on_rebalance_recovery_result(Ok(&operation))?
                         }
-                        (RebalanceExecutionTarget::ArbitrumCanary, Err(error)) => {
-                            canary_engine.on_rebalance_recovery_result(Err(&error))?
+                        (RebalanceExecutionTarget::Arbitrum, Err(error)) => {
+                            esp_engine.on_rebalance_recovery_result(Err(&error))?
                         }
                     },
                     RebalanceExecutorEvent::Execution {
@@ -4954,11 +3640,11 @@ async fn run(
                         (RebalanceExecutionTarget::Primary, Err(error)) => {
                             engine.on_rebalance_execution_result(Err(&error))?
                         }
-                        (RebalanceExecutionTarget::ArbitrumCanary, Ok(operation)) => {
-                            canary_engine.on_rebalance_execution_result(Ok(&operation))?
+                        (RebalanceExecutionTarget::Arbitrum, Ok(operation)) => {
+                            esp_engine.on_rebalance_execution_result(Ok(&operation))?
                         }
-                        (RebalanceExecutionTarget::ArbitrumCanary, Err(error)) => {
-                            canary_engine.on_rebalance_execution_result(Err(&error))?
+                        (RebalanceExecutionTarget::Arbitrum, Err(error)) => {
+                            esp_engine.on_rebalance_execution_result(Err(&error))?
                         }
                     },
                 }
@@ -4977,13 +3663,13 @@ async fn run(
                 }
                 if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
                     rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut canary_engine,
+                        &mut esp_engine,
                         rebalance_sender.as_ref(),
-                        &m8_pair,
+                        &esp_pair,
                         wallet_owner,
-                        RebalanceExecutionTarget::ArbitrumCanary,
-                        portfolio_catalog.capital_canary(),
-                        Some(&m10_risk_receiver),
+                        RebalanceExecutionTarget::Arbitrum,
+                        portfolio_catalog.capital_policy(),
+                        Some(&rebalance_risk_receiver),
                     )
                     .await?;
                 }
@@ -4999,23 +3685,23 @@ async fn run(
                 let Some(event) = event else {
                     bail!("paper trade event channel stopped unexpectedly");
                 };
-                if event.pair_id == m8_pair.id {
+                if event.pair_id == esp_pair.id {
                     let mut prepared_dex = false;
                     while let Ok(dex_event) = shadow_dex_receiver.try_recv() {
-                        if let Some(request) = canary_engine.on_dex_event(dex_event)? {
-                            build_prepared_pool_inline(&mut canary_engine, request)?;
+                        if let Some(request) = esp_engine.on_dex_event(dex_event)? {
+                            build_prepared_pool_inline(&mut esp_engine, request)?;
                             prepared_dex = true;
                         }
                     }
                     let receipt_refresh =
-                        canary_engine.apply_arbitrage_receipt_settlement(&event)?;
+                        esp_engine.apply_arbitrage_receipt_settlement(&event)?;
                     let receipt_applied = receipt_refresh.is_some();
                     if let Some(refresh) = receipt_refresh {
-                        build_prepared_pool_inline(&mut canary_engine, refresh)?;
+                        build_prepared_pool_inline(&mut esp_engine, refresh)?;
                     }
-                    canary_engine.on_paper_trade_event(event)?;
+                    esp_engine.on_paper_trade_event(event)?;
                     if prepared_dex || receipt_applied {
-                        canary_engine.evaluate_after_dex_refreshes()?;
+                        esp_engine.evaluate_after_dex_refreshes()?;
                     }
                 } else {
                     drain_dex_events_inline(
@@ -5082,11 +3768,11 @@ async fn run(
                 bail!("Alchemy DEX connector stopped; process restart will rehydrate state");
             }
             result = &mut shadow_dex_task, if shadow_dex_running => {
-                canary_market_data_ready.store(false, Ordering::Release);
+                esp_market_data_ready.store(false, Ordering::Release);
                 tracing::error!(
                     strategy_id = %shadow_plan.strategy_id.as_str(),
                     result = ?result,
-                    "Arbitrum canary DEX connector stopped; new ESP entries are disabled"
+                    "Arbitrum esp DEX connector stopped; new ESP entries are disabled"
                 );
                 shadow_dex_running = false;
             }
@@ -5098,7 +3784,7 @@ async fn run(
                 result.context("wallet balance synchronization task failed")??;
                 bail!("wallet balance synchronization stopped unexpectedly");
             }
-            result = &mut canary_wallet_balance_task => {
+            result = &mut esp_wallet_balance_task => {
                 result.context("Arbitrum wallet balance synchronization task failed")??;
                 bail!("Arbitrum wallet balance synchronization stopped unexpectedly");
             }
@@ -5131,25 +3817,25 @@ async fn run(
     }
     binance_balance_task.abort();
     wallet_balance_task.abort();
-    canary_wallet_balance_task.abort();
+    esp_wallet_balance_task.abort();
     binance_clock_sync_task.abort();
     let _ = binance_balance_task.await;
     let _ = wallet_balance_task.await;
-    let _ = canary_wallet_balance_task.await;
+    let _ = esp_wallet_balance_task.await;
     let _ = binance_clock_sync_task.await;
     dex_task.abort();
     let _ = dex_task.await;
     shadow_dex_task.abort();
     let _ = shadow_dex_task.await;
-    if let Some(task) = m8_chain_readiness_task {
+    if let Some(task) = live_chain_readiness_task {
         task.abort();
         let _ = task.await;
     }
     adaptive_sizing_tasks.abort_all();
     while adaptive_sizing_tasks.join_next().await.is_some() {}
-    canary_engine.shutdown();
+    esp_engine.shutdown();
     drop(engine);
-    drop(canary_engine);
+    drop(esp_engine);
     if let Some(task) = paper_trade_task.take() {
         task.await??;
     }
@@ -5157,7 +3843,7 @@ async fn run(
         task.await??;
     }
     hot_telemetry_task.await??;
-    canary_hot_telemetry_task.await??;
+    esp_hot_telemetry_task.await??;
     portfolio_allocator_task.await?;
     writer_task.await??;
     if let Some(path) = runtime_ready_file
@@ -5191,15 +3877,15 @@ async fn run_binance_clock_sync(
     }
 }
 
-fn emit_m8_chain_readiness(
+fn emit_chain_readiness(
     telemetry: &TelemetryHandle,
     engine_id: &str,
     pair: &arb_bot::domain::config::PairConfig,
-    readiness: &M8ChainReadiness,
+    readiness: &ChainReadiness,
     readiness_source: &'static str,
 ) {
     telemetry.emit(
-        "m9_live_readiness",
+        "live_readiness",
         serde_json::json!({
             "engine_id": engine_id,
             "stage": "arbitrum_chain",
@@ -5223,7 +3909,7 @@ fn emit_m8_chain_readiness(
     );
 }
 
-fn emit_m8_chain_readiness_failure(
+fn emit_chain_readiness_failure(
     telemetry: &TelemetryHandle,
     engine_id: &str,
     pair: &arb_bot::domain::config::PairConfig,
@@ -5231,7 +3917,7 @@ fn emit_m8_chain_readiness_failure(
     error: &anyhow::Error,
 ) {
     telemetry.emit(
-        "m9_live_readiness",
+        "live_readiness",
         serde_json::json!({
             "engine_id": engine_id,
             "stage": "arbitrum_chain",
@@ -5245,16 +3931,16 @@ fn emit_m8_chain_readiness_failure(
     );
 }
 
-async fn run_m8_chain_readiness_refresh(
-    probe: M8ChainReadinessProbe,
+async fn run_chain_readiness_refresh(
+    probe: ChainReadinessProbe,
     telemetry: TelemetryHandle,
     engine_id: String,
     pair: arb_bot::domain::config::PairConfig,
-    mut last_status: Option<M8ChainReadinessStatus>,
+    mut last_status: Option<ChainReadinessStatus>,
     execution_ready: Arc<AtomicBool>,
 ) {
-    let start = tokio::time::Instant::now() + M8_CHAIN_READINESS_REFRESH_INTERVAL;
-    let mut interval = tokio::time::interval_at(start, M8_CHAIN_READINESS_REFRESH_INTERVAL);
+    let start = tokio::time::Instant::now() + CHAIN_READINESS_REFRESH_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, CHAIN_READINESS_REFRESH_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
@@ -5265,7 +3951,7 @@ async fn run_m8_chain_readiness_refresh(
                 if last_status == Some(status) {
                     continue;
                 }
-                emit_m8_chain_readiness(
+                emit_chain_readiness(
                     &telemetry,
                     &engine_id,
                     &pair,
@@ -5278,7 +3964,7 @@ async fn run_m8_chain_readiness_refresh(
                         block_number = readiness.block_number,
                         external_mutation_capability = readiness.external_mutation_authorized,
                         new_entry_authorized = true,
-                        "M9 Arbitrum chain readiness became ready"
+                        "ESP Arbitrum chain readiness became ready"
                     );
                 } else {
                     tracing::warn!(
@@ -5290,30 +3976,30 @@ async fn run_m8_chain_readiness_refresh(
                         fresh_rpc_gas_price = readiness.fresh_rpc_gas_price,
                         external_mutation_capability = readiness.external_mutation_authorized,
                         new_entry_authorized = false,
-                        "M9 Arbitrum chain readiness degraded; ESP fails closed"
+                        "ESP Arbitrum chain readiness degraded; ESP fails closed"
                     );
                 }
                 last_status = Some(status);
             }
             Err(error) => {
                 execution_ready.store(false, Ordering::Release);
-                if last_status == Some(M8ChainReadinessStatus::ProbeFailed) {
+                if last_status == Some(ChainReadinessStatus::ProbeFailed) {
                     continue;
                 }
                 tracing::warn!(
                     pair_id = pair.id,
                     error = %error,
                     external_mutation_authorized = false,
-                    "M9 Arbitrum chain-readiness probe failed; ESP fails closed"
+                    "ESP Arbitrum chain-readiness probe failed; ESP fails closed"
                 );
-                emit_m8_chain_readiness_failure(
+                emit_chain_readiness_failure(
                     &telemetry,
                     &engine_id,
                     &pair,
                     "background_transition",
                     &error,
                 );
-                last_status = Some(M8ChainReadinessStatus::ProbeFailed);
+                last_status = Some(ChainReadinessStatus::ProbeFailed);
             }
         }
     }
@@ -5393,10 +4079,10 @@ async fn dispatch_rebalance_execution(
     pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
     target: RebalanceExecutionTarget,
-    capital_policy: Option<&CompiledCapitalCanaryPolicy>,
-    m10_risk: Option<&tokio::sync::watch::Receiver<RebalanceCanaryRisk>>,
+    capital_policy: Option<&CompiledCapitalPolicy>,
+    rebalance_risk: Option<&tokio::sync::watch::Receiver<RebalanceRisk>>,
 ) -> anyhow::Result<bool> {
-    let m10_remaining = if target == RebalanceExecutionTarget::ArbitrumCanary {
+    let rebalance_remaining = if target == RebalanceExecutionTarget::Arbitrum {
         let Some(evaluation) = engine.pending_rebalance_execution() else {
             return Ok(false);
         };
@@ -5404,28 +4090,21 @@ async fn dispatch_rebalance_execution(
             .plan
             .action
             .as_ref()
-            .context("M10 pending rebalance evaluation has no action")?;
-        let policy = capital_policy.context("M10 dispatch has no compiled capital policy")?;
-        let risk = m10_risk
-            .context("M10 dispatch has no durable risk publication")?
+            .context("rebalance pending rebalance evaluation has no action")?;
+        let policy = capital_policy.context("rebalance dispatch has no compiled capital policy")?;
+        let risk = rebalance_risk
+            .context("rebalance dispatch has no durable risk publication")?
             .borrow()
             .clone();
-        let now_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_millis()
-            .try_into()
-            .context("current Unix timestamp exceeds u64")?;
-        let Some(remaining) = remaining_m10_rebalance_authority(
+        let Some(remaining) = remaining_rebalance_authority(
             policy,
             &risk,
             &evaluation.token_symbol,
             action.direction,
-            now_unix_ms,
         )?
         else {
             engine.stop_pending_rebalance_creation(
-                "M10 durable count, failure, concurrency, duration, value, or fee limit reached",
+                "rebalance concurrency, value, or fee limit reached",
             );
             return Ok(false);
         };
@@ -5442,45 +4121,44 @@ async fn dispatch_rebalance_execution(
         .action
         .clone()
         .context("rebalance execution evaluation has no action")?;
-    let canary_maximum_fee = if target == RebalanceExecutionTarget::ArbitrumCanary {
-        let policy = capital_policy.context("M10 dispatch has no compiled capital policy")?;
+    let maximum_fee = if target == RebalanceExecutionTarget::Arbitrum {
+        let policy = capital_policy.context("rebalance dispatch has no compiled capital policy")?;
         ensure!(
             policy.external_mutation_authorized,
-            "M10 dispatch has no external mutation authority"
+            "rebalance dispatch has no external mutation authority"
         );
-        let remaining_fee = m10_remaining
-            .context("M10 dispatch lost its durable remaining authority")?
+        let remaining_fee = rebalance_remaining
+            .context("rebalance dispatch lost its durable remaining authority")?
             .maximum_fee;
         let authorized_fee = if action.direction == arb_bot::rebalance::Direction::WalletToBinance {
             U256::ZERO
         } else {
-            let maximum_with_positive_credit = action
-                .amount
-                .checked_sub(U256::ONE)
-                .context("M10 Binance withdrawal cannot preserve positive destination credit")?;
+            let maximum_with_positive_credit = action.amount.checked_sub(U256::ONE).context(
+                "rebalance Binance withdrawal cannot preserve positive destination credit",
+            )?;
             let bounded = remaining_fee.min(maximum_with_positive_credit);
             ensure!(
                 !bounded.is_zero(),
-                "M10 Binance withdrawal has no remaining positive fee authority"
+                "rebalance Binance withdrawal has no remaining positive fee authority"
             );
             bounded
         };
         let proposal = engine
             .authorize_pending_rebalance_allocation(authorized_fee)
             .await?
-            .context("M10 capital allocator returned no proposal")?;
+            .context("rebalance capital allocator returned no proposal")?;
         ensure!(
             proposal.external_mutation_authorized
                 && proposal.source_debit == action.amount
                 && proposal.fee == authorized_fee,
-            "M10 capital allocator proposal differs from the pending rebalance"
+            "rebalance capital allocator proposal differs from the pending rebalance"
         );
         Some(authorized_fee)
     } else {
         None
     };
     // Capital planning is asynchronous and must not reserve the sole
-    // execution queue slot while it waits. In particular, an M10 allocator
+    // execution queue slot while it waits. In particular, an rebalance allocator
     // observation cannot head-of-line block an already eligible WLD rebalance.
     let sender = sender.context("rebalance engine produced live work without an executor")?;
     let permit = match sender.try_reserve() {
@@ -5510,12 +4188,12 @@ async fn dispatch_rebalance_execution(
         RebalanceExecutionRequest {
             authority: match target {
                 RebalanceExecutionTarget::Primary => RebalanceExecutionAuthority::WorldChainV12,
-                RebalanceExecutionTarget::ArbitrumCanary => {
-                    if capital_policy.is_some_and(|policy| policy.full_live) {
-                        RebalanceExecutionAuthority::ArbitrumFullLive
-                    } else {
-                        RebalanceExecutionAuthority::ArbitrumM10Canary
-                    }
+                RebalanceExecutionTarget::Arbitrum => {
+                    ensure!(
+                        capital_policy.is_some(),
+                        "Arbitrum rebalance requires the permanent full-live capital policy"
+                    );
+                    RebalanceExecutionAuthority::ArbitrumFullLive
                 }
             },
             token_symbol: evaluation.token_symbol,
@@ -5525,11 +4203,11 @@ async fn dispatch_rebalance_execution(
             action,
             binance_balance_before: evaluation.plan.projected.binance,
             wallet_balance_before: evaluation.plan.projected.wallet,
-            canary_maximum_fee,
-            canary_approval_session_id: if target == RebalanceExecutionTarget::ArbitrumCanary {
+            maximum_fee,
+            approval_session_id: if target == RebalanceExecutionTarget::Arbitrum {
                 Some(
                     capital_policy
-                        .context("M10 dispatch has no compiled capital policy")?
+                        .context("rebalance dispatch has no compiled capital policy")?
                         .approval_session_id
                         .clone(),
                 )
@@ -5751,14 +4429,14 @@ impl StartupDexDrainStats {
 #[allow(clippy::too_many_arguments)]
 fn drain_startup_dex_backlog(
     engine: &mut HotPathDecisionOwner<TradingEngine>,
-    canary_engine: &mut TradingEngine,
+    esp_engine: &mut TradingEngine,
     pending: &mut PreparedPoolBuildBatch,
     dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
     shadow_dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
     wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
     receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
-    canary_wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
-    canary_receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    esp_wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
+    esp_receipt_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
 ) -> anyhow::Result<(StartupDexDrainStats, StartupDexDrainStats)> {
     let mut primary_total = StartupDexDrainStats::default();
     let mut shadow_total = StartupDexDrainStats::default();
@@ -5770,11 +4448,11 @@ fn drain_startup_dex_backlog(
             wallet_heads,
             receipt_heads,
         )?;
-        let shadow = drain_startup_canary_dex_backlog(
-            canary_engine,
+        let shadow = drain_startup_secondary_dex_backlog(
+            esp_engine,
             shadow_dex_receiver,
-            canary_wallet_heads,
-            canary_receipt_heads,
+            esp_wallet_heads,
+            esp_receipt_heads,
         )?;
         let drained_events = primary.event_count.saturating_add(shadow.event_count);
         primary_total.merge(primary);
@@ -5822,7 +4500,7 @@ fn drain_startup_primary_dex_backlog(
     }
 }
 
-fn drain_startup_canary_dex_backlog(
+fn drain_startup_secondary_dex_backlog(
     engine: &mut TradingEngine,
     shadow_dex_receiver: &mut tokio::sync::mpsc::Receiver<DexStreamEvent>,
     wallet_heads: &tokio::sync::watch::Sender<CanonicalBlock>,
@@ -6284,24 +4962,21 @@ fn init_tracing() {
 mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::B256;
     use arb_bot::{
-        arbitrage::CanaryJournalRisk,
         chain::rpc::CanonicalBlock,
         domain::compiled::{CompatibilityRole, load_compatibility_domain},
-        domain::config::LoadedDomainConfig,
         market_data::alchemy::DexStreamEvent,
     };
 
     use super::{
-        StartupDexDrainStats, m9_allowance_operation_id, m9_canary_allowance_requirements,
-        m9_canary_evm_journal_scope, rebalance_quote_retry_delay, sync_runtime_ready_marker,
-        validate_prefunding_marker, write_prefunding_marker,
+        StartupDexDrainStats, esp_evm_journal_scope, rebalance_quote_retry_delay,
+        sync_runtime_ready_marker,
     };
 
     #[test]
-    fn m9_recovery_scope_matches_the_production_runtime_journal_identity() {
-        let scope = m9_canary_evm_journal_scope(42_161);
+    fn esp_scope_matches_the_production_runtime_journal_identity() {
+        let scope = esp_evm_journal_scope(42_161);
         assert_eq!(scope.schema_version, 2);
         assert_eq!(scope.network_id, "eip155:42161");
         assert_eq!(
@@ -6344,157 +5019,6 @@ mod tests {
 
         assert!(!marked);
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn m9_post_first_parent_restart_uses_durable_remaining_allowance_authority() {
-        let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
-        let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
-        let first_admitted_unix_us = 1_785_426_526_104_975_u64;
-        let post_trade_usdc = U256::from(16_860_785_u64);
-        let post_trade_esp = U256::from_str_radix("534000000000000000000", 10).unwrap();
-        let mut risk = CanaryJournalRisk {
-            admitted_parent_count: 1,
-            active_parent_count: 0,
-            failed_parent_count: 0,
-            admitted_notional_token_a_base_units: 9_940_515,
-            realized_loss_token_a_base_units: 0,
-            first_admitted_unix_us: Some(first_admitted_unix_us),
-        };
-
-        let (usdc_required, esp_required) = m9_canary_allowance_requirements(
-            canary,
-            risk,
-            post_trade_usdc,
-            post_trade_esp,
-            first_admitted_unix_us + 60_000_000,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(usdc_required, U256::from(10_059_485_u64));
-        assert_eq!(
-            esp_required,
-            U256::from_str_radix("400000000000000000000", 10).unwrap()
-        );
-        assert_ne!(
-            m9_allowance_operation_id("USDC", usdc_required),
-            m9_allowance_operation_id("USDC", post_trade_usdc)
-        );
-
-        risk.failed_parent_count = 1;
-        assert_eq!(
-            m9_canary_allowance_requirements(
-                canary,
-                risk,
-                post_trade_usdc,
-                post_trade_esp,
-                first_admitted_unix_us + 60_000_000,
-            )
-            .unwrap(),
-            None
-        );
-
-        risk.failed_parent_count = 0;
-        risk.admitted_parent_count = 2;
-        assert_eq!(
-            m9_canary_allowance_requirements(
-                canary,
-                risk,
-                post_trade_usdc,
-                post_trade_esp,
-                first_admitted_unix_us + 60_000_000,
-            )
-            .unwrap(),
-            None
-        );
-
-        risk.admitted_parent_count = 1;
-        assert_eq!(
-            m9_canary_allowance_requirements(
-                canary,
-                risk,
-                post_trade_usdc,
-                post_trade_esp,
-                first_admitted_unix_us + 901_000_000,
-            )
-            .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn prefunding_marker_is_atomic_exact_and_prevents_a_second_funding_run() {
-        let directory = std::env::temp_dir().join(format!(
-            "arb-bot-prefunding-marker-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let marker = directory.join("m9-prefunding.json");
-        let wallet = Address::repeat_byte(7);
-        assert!(
-            !validate_prefunding_marker(
-                &marker,
-                "fingerprint",
-                "snapshot",
-                wallet,
-                "25000000",
-                "400000000000000000000",
-                "2026-07-30T06:16:57Z",
-            )
-            .unwrap()
-        );
-        write_prefunding_marker(
-            &marker,
-            "fingerprint",
-            "snapshot",
-            wallet,
-            "25000000",
-            "400000000000000000000",
-            "2026-07-30T06:16:57Z",
-        )
-        .unwrap();
-        assert!(
-            validate_prefunding_marker(
-                &marker,
-                "fingerprint",
-                "snapshot",
-                wallet,
-                "25000000",
-                "400000000000000000000",
-                "2026-07-30T06:16:57Z",
-            )
-            .unwrap()
-        );
-        assert!(
-            validate_prefunding_marker(
-                &marker,
-                "another-fingerprint",
-                "snapshot",
-                wallet,
-                "25000000",
-                "400000000000000000000",
-                "2026-07-30T06:16:57Z",
-            )
-            .unwrap()
-        );
-        assert!(
-            validate_prefunding_marker(
-                &marker,
-                "another-fingerprint",
-                "snapshot",
-                wallet,
-                "26000000",
-                "400000000000000000000",
-                "2026-07-30T06:16:57Z",
-            )
-            .is_err()
-        );
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::{
         },
     },
     chain::rpc::{CanonicalBlock, JsonRpcClient},
-    domain::config::{LiveCanaryApprovalGate, LiveCanaryConfig, PairConfig},
+    domain::config::PairConfig,
     network_runtime::{NetworkReadCoordinator, NetworkRuntime},
     rebalance::route_candidates_from_capital,
     wallet::TokenBalanceRequest,
@@ -26,10 +26,10 @@ pub const ARBITRUM_CHAIN_ID: u64 = 42_161;
 pub const ARBITRUM_SWAP_ROUTER_02: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
 pub const ARBITRUM_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 pub const ARBITRUM_ESP: &str = "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1";
-pub const M8_CHAIN_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub const CHAIN_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct M8BinanceReadiness {
+pub struct BinanceReadiness {
     pub symbol: String,
     pub buy_fee_bps: u16,
     pub sell_fee_bps: u16,
@@ -43,8 +43,8 @@ pub struct M8BinanceReadiness {
 pub fn validate_binance_readiness(
     pair: &PairConfig,
     state: &BinanceSymbolState,
-) -> anyhow::Result<M8BinanceReadiness> {
-    let canary = validate_readiness_pair(pair)?;
+) -> anyhow::Result<BinanceReadiness> {
+    validate_readiness_pair(pair)?;
     let rules = &state.symbol_rules;
     ensure!(
         rules.symbol == pair.binance.symbol
@@ -58,23 +58,20 @@ pub fn validate_binance_readiness(
             && rules.price.step == Decimal::from_str(&pair.binance.tick_size)?,
         "live Binance ESPUSDC increments differ from the readiness artifact"
     );
-    let maximum_notional_base_units = if let Some(policy) = canary {
-        &policy.max_trade_notional_token_a_base_units
-    } else {
-        pair.adaptive_sizing
-            .limits()
-            .context("full-live ESP sizing limits are missing")?
-            .max_trade_notional
-    };
+    let maximum_notional_base_units = pair
+        .adaptive_sizing
+        .limits()
+        .context("full-live ESP sizing limits are missing")?
+        .max_trade_notional;
     let maximum_notional = decimal_from_base_units(
         U256::from_str_radix(maximum_notional_base_units, 10)?
             .try_into()
-            .context("M8 maximum trade notional exceeds u128")?,
+            .context("maximum trade notional exceeds u128")?,
         pair.token_a.decimals,
     )?;
     ensure!(
         rules.min_notional > Decimal::ZERO && rules.min_notional <= maximum_notional,
-        "Binance minimum notional exceeds the bounded ESP canary"
+        "Binance minimum notional exceeds the ESP trade envelope"
     );
 
     let validation_price = aligned_validation_price(rules)?;
@@ -95,8 +92,8 @@ pub fn validate_binance_readiness(
         i128::try_from(absolute_base_units).context("ESP validation quantity exceeds i128")?;
 
     let buy_ioc = plan_limit_ioc(
-        "rustarb-m8-esp-buy-ioc".to_owned(),
-        "rustarbm8espbuy".to_owned(),
+        "rustarb-esp-readiness-buy-ioc".to_owned(),
+        "rustarbespreadbuy".to_owned(),
         absolute_base_units,
         pair.token_b.decimals,
         validation_price,
@@ -104,8 +101,8 @@ pub fn validate_binance_readiness(
     )?
     .context("bounded ESP BUY IOC rounded to dust")?;
     let sell_ioc = plan_limit_ioc(
-        "rustarb-m8-esp-sell-ioc".to_owned(),
-        "rustarbm8espsell".to_owned(),
+        "rustarb-esp-readiness-sell-ioc".to_owned(),
+        "rustarbespreadsell".to_owned(),
         -absolute_base_units,
         pair.token_b.decimals,
         validation_price,
@@ -114,8 +111,8 @@ pub fn validate_binance_readiness(
     .context("bounded ESP SELL IOC rounded to dust")?;
     let buy_market = submitted_market(
         plan_market_order(
-            "rustarb-m8-esp-buy-recovery".to_owned(),
-            "rustarbm8espbuyr1".to_owned(),
+            "rustarb-esp-readiness-buy-recovery".to_owned(),
+            "rustarbespreadbuyr1".to_owned(),
             absolute_base_units,
             pair.token_b.decimals,
             validation_price,
@@ -125,8 +122,8 @@ pub fn validate_binance_readiness(
     )?;
     let sell_market = submitted_market(
         plan_market_order(
-            "rustarb-m8-esp-sell-recovery".to_owned(),
-            "rustarbm8espsellr1".to_owned(),
+            "rustarb-esp-readiness-sell-recovery".to_owned(),
+            "rustarbespreadsellr1".to_owned(),
             -absolute_base_units,
             pair.token_b.decimals,
             validation_price,
@@ -141,10 +138,10 @@ pub fn validate_binance_readiness(
         .collect::<anyhow::Result<Vec<_>>>()?;
     ensure!(
         request_fingerprints.len() == 4,
-        "M8 Binance request matrix is incomplete"
+        "Binance request matrix is incomplete"
     );
 
-    Ok(M8BinanceReadiness {
+    Ok(BinanceReadiness {
         symbol: rules.symbol.clone(),
         buy_fee_bps: state.commission.conservative_taker_fee_bps("BUY")?,
         sell_fee_bps: state.commission.conservative_taker_fee_bps("SELL")?,
@@ -157,7 +154,7 @@ pub fn validate_binance_readiness(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct M8ChainReadiness {
+pub struct ChainReadiness {
     pub chain_id: u64,
     pub block_number: u64,
     pub exact_token_contracts: bool,
@@ -174,7 +171,7 @@ pub struct M8ChainReadiness {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum M8ChainReadinessStatus {
+pub enum ChainReadinessStatus {
     Observed {
         exact_token_contracts: bool,
         token_code_present: bool,
@@ -188,9 +185,9 @@ pub enum M8ChainReadinessStatus {
     ProbeFailed,
 }
 
-impl M8ChainReadiness {
-    pub const fn status(&self) -> M8ChainReadinessStatus {
-        M8ChainReadinessStatus::Observed {
+impl ChainReadiness {
+    pub const fn status(&self) -> ChainReadinessStatus {
+        ChainReadinessStatus::Observed {
             exact_token_contracts: self.exact_token_contracts,
             token_code_present: self.token_code_present,
             router_code_present: self.router_code_present,
@@ -204,13 +201,13 @@ impl M8ChainReadiness {
 }
 
 #[derive(Clone)]
-pub struct M8ChainReadinessProbe {
+pub struct ChainReadinessProbe {
     pair: PairConfig,
     reads: NetworkReadCoordinator,
     owner: Address,
 }
 
-impl M8ChainReadinessProbe {
+impl ChainReadinessProbe {
     pub fn new(
         pair: &PairConfig,
         runtime: &NetworkRuntime,
@@ -219,7 +216,7 @@ impl M8ChainReadinessProbe {
         validate_readiness_pair(pair)?;
         ensure!(
             runtime.plan().chain_id == ARBITRUM_CHAIN_ID,
-            "M8 chain-readiness probe requires the Arbitrum runtime"
+            "chain-readiness probe requires the Arbitrum runtime"
         );
         Ok(Self {
             pair: pair.clone(),
@@ -228,7 +225,7 @@ impl M8ChainReadinessProbe {
         })
     }
 
-    pub async fn inspect(&self) -> anyhow::Result<M8ChainReadiness> {
+    pub async fn inspect(&self) -> anyhow::Result<ChainReadiness> {
         let block = self.reads.rpc().latest_block().await?;
         let tokens = [
             (&self.pair.token_a.symbol, &self.pair.token_a.contract),
@@ -240,7 +237,7 @@ impl M8ChainReadinessProbe {
                 symbol: symbol.clone(),
                 contract: contract
                     .parse()
-                    .with_context(|| format!("M8 token {symbol} has an invalid contract"))?,
+                    .with_context(|| format!("token {symbol} has an invalid contract"))?,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -260,7 +257,7 @@ pub async fn inspect_chain_readiness(
     pair: &PairConfig,
     runtime: &NetworkRuntime,
     snapshot: &WalletBalanceSnapshot,
-) -> anyhow::Result<M8ChainReadiness> {
+) -> anyhow::Result<ChainReadiness> {
     inspect_chain_readiness_at(pair, runtime.rpc(), runtime.initial_head(), snapshot).await
 }
 
@@ -269,11 +266,11 @@ async fn inspect_chain_readiness_at(
     rpc: &JsonRpcClient,
     block: CanonicalBlock,
     snapshot: &WalletBalanceSnapshot,
-) -> anyhow::Result<M8ChainReadiness> {
-    let canary = validate_readiness_pair(pair)?;
+) -> anyhow::Result<ChainReadiness> {
+    validate_readiness_pair(pair)?;
     ensure!(
         snapshot.chain_id == ARBITRUM_CHAIN_ID && snapshot.batch_complete,
-        "M8 chain readiness requires one complete Arbitrum wallet batch"
+        "chain readiness requires one complete Arbitrum wallet batch"
     );
     let token_a = Address::from_str(&pair.token_a.contract)?;
     let token_b = Address::from_str(&pair.token_b.contract)?;
@@ -281,7 +278,7 @@ async fn inspect_chain_readiness_at(
         pair.chain
             .uniswap_v3_router_address
             .as_deref()
-            .context("M8 Arbitrum router is missing")?,
+            .context("Arbitrum router is missing")?,
     )?;
     let exact_token_contracts = snapshot.token_balances.iter().any(|balance| {
         balance.symbol.as_ref() == pair.token_a.symbol && balance.contract == token_a
@@ -290,7 +287,7 @@ async fn inspect_chain_readiness_at(
     });
     ensure!(
         block.number == snapshot.block_number && block.hash == snapshot.block_hash,
-        "M8 wallet and contract-code reads are not pinned to the same block"
+        "wallet and contract-code reads are not pinned to the same block"
     );
     let (token_a_code, token_b_code, router_code, native_balance, gas_price) = tokio::try_join!(
         rpc.contract_code_at(token_a, block),
@@ -310,14 +307,8 @@ async fn inspect_chain_readiness_at(
         (balance.symbol.as_ref() == pair.token_b.symbol && balance.contract == token_b)
             .then_some(balance.base_units)
     });
-    let (token_a_funded, token_b_funded) = if let Some(canary) = canary {
-        runtime_wallet_tokens_funded(canary, token_a_balance, token_b_balance)?
-    } else {
-        (
-            token_a_balance.is_some_and(|balance| !balance.is_zero()),
-            token_b_balance.is_some_and(|balance| !balance.is_zero()),
-        )
-    };
+    let token_a_funded = token_a_balance.is_some_and(|balance| !balance.is_zero());
+    let token_b_funded = token_b_balance.is_some_and(|balance| !balance.is_zero());
     let fresh_rpc_gas_price = gas_price > 0;
     let ready = exact_token_contracts
         && token_code_present
@@ -325,7 +316,7 @@ async fn inspect_chain_readiness_at(
         && token_a_funded
         && token_b_funded
         && fresh_rpc_gas_price;
-    Ok(M8ChainReadiness {
+    Ok(ChainReadiness {
         chain_id: ARBITRUM_CHAIN_ID,
         block_number: block.number,
         exact_token_contracts,
@@ -335,34 +326,15 @@ async fn inspect_chain_readiness_at(
         token_a_funded,
         token_b_funded,
         fresh_rpc_gas_price,
-        allowance_policy: if pair.full_live {
-            "max_uint256_then_locked"
-        } else {
-            "bounded_exact_canary_cap_then_locked"
-        },
+        allowance_policy: "max_uint256_then_locked",
         receipt_l1_fee_mode: "included_in_effective_gas_price_no_world_l1fee_addition",
         external_mutation_authorized: pair.execution_enabled,
         ready,
     })
 }
 
-fn runtime_wallet_tokens_funded(
-    canary: &LiveCanaryConfig,
-    token_a_balance: Option<U256>,
-    token_b_balance: Option<U256>,
-) -> anyhow::Result<(bool, bool)> {
-    let minimum_token_a = U256::from_str_radix(canary.runtime_wallet_token_a_minimum(), 10)
-        .context("invalid token_a runtime minimum")?;
-    let minimum_token_b = U256::from_str_radix(canary.runtime_wallet_token_b_minimum(), 10)
-        .context("invalid token_b runtime minimum")?;
-    Ok((
-        token_a_balance.is_some_and(|balance| balance >= minimum_token_a),
-        token_b_balance.is_some_and(|balance| balance >= minimum_token_b),
-    ))
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct M8RebalanceReadiness {
+pub struct RebalanceReadiness {
     pub network: String,
     pub asset_count: usize,
     pub direct_route_count: usize,
@@ -375,7 +347,7 @@ pub struct M8RebalanceReadiness {
 pub fn validate_rebalance_readiness(
     pair: &PairConfig,
     coins: &[CoinInformation],
-) -> anyhow::Result<M8RebalanceReadiness> {
+) -> anyhow::Result<RebalanceReadiness> {
     validate_readiness_pair(pair)?;
     let mut direct_route_count = 0;
     let mut deposit_enabled_assets = 0;
@@ -396,60 +368,22 @@ pub fn validate_rebalance_readiness(
         deposit_enabled_assets += usize::from(direct.binance_deposit_enabled);
         withdrawal_enabled_assets += usize::from(direct.binance_withdrawal_enabled);
     }
-    Ok(M8RebalanceReadiness {
+    Ok(RebalanceReadiness {
         network: pair.chain.binance_network_name.clone(),
         asset_count: 2,
         direct_route_count,
         deposit_enabled_assets,
         withdrawal_enabled_assets,
-        external_mutation_authorized: false,
+        external_mutation_authorized: pair.rebalance.enabled,
         ready: direct_route_count == 2,
     })
 }
 
-fn validate_readiness_pair(
-    pair: &PairConfig,
-) -> anyhow::Result<Option<&crate::domain::config::LiveCanaryConfig>> {
-    let canary = pair.live_canary.as_ref();
-    if let Some(policy) = pair.full_live_policy.as_ref() {
-        ensure!(
-            pair.full_live
-                && pair.rebalance.enabled
-                && policy.rebalance_binance_network == "ARBITRUM"
-                && policy.direct_route_only
-                && !policy.bridge_mutations_enabled,
-            "Arbitrum full-live pair identity or rebalance policy is invalid"
-        );
-    }
-    let rebalance_gate_valid = if pair.full_live_policy.is_some() {
-        true
-    } else {
-        let legacy_canary = canary.context("legacy readiness artifact has no canary limits")?;
-        match legacy_canary.rebalance_live_canary.as_ref() {
-            Some(policy)
-                if policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved =>
-            {
-                pair.rebalance.enabled
-                    && legacy_canary.rebalance_mutations_enabled
-                    && policy.production_approval_actor.as_deref() == Some("operator")
-                    && policy
-                        .production_approval_recorded_at_utc
-                        .as_deref()
-                        .is_some_and(|value| value.ends_with('Z'))
-                    && policy.binance_network == "ARBITRUM"
-                    && policy.direct_route_only
-                    && !policy.bridge_mutations_enabled
-            }
-            Some(policy) => {
-                policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-                    && !pair.rebalance.enabled
-                    && !legacy_canary.rebalance_mutations_enabled
-                    && policy.production_approval_actor.is_none()
-                    && policy.production_approval_recorded_at_utc.is_none()
-            }
-            None => !pair.rebalance.enabled && !legacy_canary.rebalance_mutations_enabled,
-        }
-    };
+fn validate_readiness_pair(pair: &PairConfig) -> anyhow::Result<()> {
+    let policy = pair
+        .full_live_policy
+        .as_ref()
+        .context("Arbitrum full-live pair has no production policy")?;
     ensure!(
         pair.id == "arbitrum-usdc-esp"
             && pair.chain.chain_id == ARBITRUM_CHAIN_ID
@@ -460,21 +394,15 @@ fn validate_readiness_pair(
                 .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
             && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
             && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
-            && rebalance_gate_valid
-            && (pair.full_live_policy.is_some() || canary.is_some()),
-        "Arbitrum canary pair identity or rebalance gate differs from the reviewed artifact"
+            && pair.full_live
+            && pair.execution_enabled
+            && pair.rebalance.enabled
+            && policy.rebalance_binance_network == "ARBITRUM"
+            && policy.direct_route_only
+            && !policy.bridge_mutations_enabled,
+        "Arbitrum pair identity or rebalance policy differs from the production artifact"
     );
-    if let Some(canary) = canary {
-        ensure!(
-            matches!(
-                canary.approval_gate,
-                LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-                    | LiveCanaryApprovalGate::ExplicitProductionApproved
-            ),
-            "Arbitrum canary artifact has an invalid approval or rebalance gate"
-        );
-    }
-    Ok(canary)
+    Ok(())
 }
 
 fn aligned_validation_price(
@@ -518,7 +446,7 @@ fn request_fingerprint(request: &BinanceOrderRequest) -> anyhow::Result<String> 
             format!("market_buy_quantity:{quantity}")
         }
         BinanceOrderRequestKind::MarketSell { quantity } => format!("market_sell:{quantity}"),
-        _ => anyhow::bail!("M8 request matrix contains an unreviewed Binance order shape"),
+        _ => anyhow::bail!("request matrix contains an unreviewed Binance order shape"),
     };
     Ok(format!(
         "{}:{}:{}:{shape}",
@@ -527,7 +455,7 @@ fn request_fingerprint(request: &BinanceOrderRequest) -> anyhow::Result<String> 
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum M8InjectedFailure {
+pub enum InjectedFailure {
     DexRevert,
     DexUnknownBroadcast,
     BinanceRejection,
@@ -537,30 +465,28 @@ pub enum M8InjectedFailure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct M8FailureDisposition {
+pub struct FailureDisposition {
     pub exposure_known: bool,
     pub retry_authorized: bool,
     pub maximum_market_attempts: u8,
 }
 
-pub const fn injected_failure_disposition(failure: M8InjectedFailure) -> M8FailureDisposition {
+pub const fn injected_failure_disposition(failure: InjectedFailure) -> FailureDisposition {
     match failure {
-        M8InjectedFailure::DexRevert | M8InjectedFailure::BinanceRejection => {
-            M8FailureDisposition {
-                exposure_known: true,
-                retry_authorized: false,
-                maximum_market_attempts: 0,
-            }
-        }
-        M8InjectedFailure::DexUnknownBroadcast | M8InjectedFailure::BinanceUnknownPlacement => {
-            M8FailureDisposition {
+        InjectedFailure::DexRevert | InjectedFailure::BinanceRejection => FailureDisposition {
+            exposure_known: true,
+            retry_authorized: false,
+            maximum_market_attempts: 0,
+        },
+        InjectedFailure::DexUnknownBroadcast | InjectedFailure::BinanceUnknownPlacement => {
+            FailureDisposition {
                 exposure_known: false,
                 retry_authorized: false,
                 maximum_market_attempts: 0,
             }
         }
-        M8InjectedFailure::BinancePartialIoc | M8InjectedFailure::BinanceZeroFillRecovery => {
-            M8FailureDisposition {
+        InjectedFailure::BinancePartialIoc | InjectedFailure::BinanceZeroFillRecovery => {
+            FailureDisposition {
                 exposure_known: true,
                 retry_authorized: true,
                 maximum_market_attempts: 3,
@@ -573,7 +499,6 @@ pub const fn injected_failure_disposition(failure: M8InjectedFailure) -> M8Failu
 mod tests {
     use std::time::Duration;
 
-    use alloy_primitives::U256;
     use rust_decimal::Decimal;
 
     use crate::{
@@ -588,9 +513,8 @@ mod tests {
     };
 
     use super::{
-        M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessStatus,
-        M8InjectedFailure, injected_failure_disposition, runtime_wallet_tokens_funded,
-        validate_binance_readiness, validate_readiness_pair,
+        CHAIN_READINESS_REFRESH_INTERVAL, ChainReadiness, ChainReadinessStatus, InjectedFailure,
+        injected_failure_disposition, validate_binance_readiness, validate_readiness_pair,
     };
 
     fn rates() -> CommissionSideRates {
@@ -654,15 +578,15 @@ mod tests {
     }
 
     #[test]
-    fn esp_binance_primary_and_recovery_matrix_is_deterministic_and_non_mutating() {
+    fn esp_binance_primary_and_recovery_matrix_is_deterministic() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v3.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json").unwrap();
         let first = validate_binance_readiness(&domain.snapshot().pairs[0], &state()).unwrap();
         let second = validate_binance_readiness(&domain.snapshot().pairs[0], &state()).unwrap();
 
         assert_eq!(first, second);
         assert!(first.filters_ready);
-        assert!(!first.external_mutation_authorized);
+        assert!(first.external_mutation_authorized);
         assert_eq!(first.request_fingerprints.len(), 4);
         assert!(first.request_fingerprints[0].contains("limit_ioc:BUY"));
         assert!(first.request_fingerprints[1].contains("limit_ioc:SELL"));
@@ -673,8 +597,8 @@ mod tests {
     #[test]
     fn failure_injection_matrix_never_retries_an_unknown_outcome() {
         for failure in [
-            M8InjectedFailure::DexUnknownBroadcast,
-            M8InjectedFailure::BinanceUnknownPlacement,
+            InjectedFailure::DexUnknownBroadcast,
+            InjectedFailure::BinanceUnknownPlacement,
         ] {
             let disposition = injected_failure_disposition(failure);
             assert!(!disposition.exposure_known);
@@ -682,23 +606,21 @@ mod tests {
             assert_eq!(disposition.maximum_market_attempts, 0);
         }
         for failure in [
-            M8InjectedFailure::BinancePartialIoc,
-            M8InjectedFailure::BinanceZeroFillRecovery,
+            InjectedFailure::BinancePartialIoc,
+            InjectedFailure::BinanceZeroFillRecovery,
         ] {
             let disposition = injected_failure_disposition(failure);
             assert!(disposition.exposure_known);
             assert!(disposition.retry_authorized);
             assert_eq!(disposition.maximum_market_attempts, 3);
         }
-        assert!(!injected_failure_disposition(M8InjectedFailure::DexRevert).retry_authorized);
-        assert!(
-            !injected_failure_disposition(M8InjectedFailure::BinanceRejection).retry_authorized
-        );
+        assert!(!injected_failure_disposition(InjectedFailure::DexRevert).retry_authorized);
+        assert!(!injected_failure_disposition(InjectedFailure::BinanceRejection).retry_authorized);
     }
 
     #[test]
     fn chain_readiness_transition_ignores_block_height_and_detects_funding() {
-        let readiness = M8ChainReadiness {
+        let readiness = ChainReadiness {
             chain_id: super::ARBITRUM_CHAIN_ID,
             block_number: 1,
             exact_token_contracts: true,
@@ -708,9 +630,9 @@ mod tests {
             token_a_funded: true,
             token_b_funded: true,
             fresh_rpc_gas_price: true,
-            allowance_policy: "bounded_exact_canary_cap_then_locked",
+            allowance_policy: "max_uint256_then_locked",
             receipt_l1_fee_mode: "included_in_effective_gas_price_no_world_l1fee_addition",
-            external_mutation_authorized: false,
+            external_mutation_authorized: true,
             ready: false,
         };
         let mut later = readiness.clone();
@@ -722,40 +644,13 @@ mod tests {
         assert_ne!(readiness.status(), later.status());
         assert!(matches!(
             later.status(),
-            M8ChainReadinessStatus::Observed {
+            ChainReadinessStatus::Observed {
                 native_gas_funded: true,
                 ready: true,
                 ..
             }
         ));
-        assert!(M8_CHAIN_READINESS_REFRESH_INTERVAL >= Duration::from_secs(30));
-    }
-
-    #[test]
-    fn post_first_parent_balance_uses_runtime_presence_not_bootstrap_target() {
-        let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
-        let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
-        let post_trade_usdc = U256::from(16_860_785_u64);
-        let remaining_esp = U256::from(266_u64) * U256::from(10_u64).pow(U256::from(18_u64));
-
-        assert!(
-            post_trade_usdc
-                < U256::from_str_radix(&canary.minimum_wallet_token_a_base_units, 10).unwrap()
-        );
-        assert_eq!(
-            runtime_wallet_tokens_funded(canary, Some(post_trade_usdc), Some(remaining_esp))
-                .unwrap(),
-            (true, true)
-        );
-        assert_eq!(
-            runtime_wallet_tokens_funded(canary, Some(U256::ZERO), Some(remaining_esp)).unwrap(),
-            (false, true)
-        );
-        assert_eq!(
-            runtime_wallet_tokens_funded(canary, Some(post_trade_usdc), None).unwrap(),
-            (true, false)
-        );
+        assert!(CHAIN_READINESS_REFRESH_INTERVAL >= Duration::from_secs(30));
     }
 
     #[test]

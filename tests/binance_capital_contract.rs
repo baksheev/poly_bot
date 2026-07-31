@@ -37,7 +37,6 @@ fn withdrawal_endpoint_cannot_be_selected_by_asset_network_or_local_config() {
     }
 
     let domain: serde_json::Value = serde_json::from_str(ESP_DOMAIN).unwrap();
-    assert!(domain["pairs"][0].get("live_canary").is_none());
     assert!(
         domain["pairs"][0]["full_live_policy"]
             .get("withdrawal_api_mode")
@@ -131,80 +130,6 @@ fn withdrawal_unknown_outcome_and_live_fee_recheck_are_fail_closed() {
 }
 
 #[test]
-fn operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal() {
-    let start = REBALANCE_RUNTIME
-        .find("pub async fn close_operator_confirmed_absent_standard_withdrawal(")
-        .unwrap();
-    let end = REBALANCE_RUNTIME[start..]
-        .find("pub async fn recover_approved_manual_direct_credit(")
-        .map(|offset| start + offset)
-        .unwrap();
-    let recovery = &REBALANCE_RUNTIME[start..end];
-
-    assert!(recovery.contains(".universal_transfer_history("));
-    assert!(recovery.contains(".account_information()"));
-    assert!(recovery.contains(".erc20_balance("));
-    assert!(!recovery.contains(".withdrawal_history("));
-    assert!(!recovery.contains(".withdraw_local_entity("));
-    assert!(!recovery.contains(".withdraw_standard("));
-    assert!(!recovery.contains(".withdraw_travel_rule_ae_self_owned("));
-}
-
-#[test]
-fn approved_endpoint_correction_reuses_the_exact_master_transfer_and_submits_once() {
-    let start = REBALANCE_RUNTIME
-        .find("pub async fn retry_approved_failed_local_entity_with_standard(")
-        .unwrap();
-    let end = REBALANCE_RUNTIME[start..]
-        .find("async fn ensure_wallet_is_whitelisted(")
-        .map(|offset| start + offset)
-        .unwrap();
-    let recovery = &REBALANCE_RUNTIME[start..end];
-
-    assert!(REBALANCE_RUNTIME.contains("operation.intent.fingerprint == recovery.fingerprint"));
-    assert!(
-        REBALANCE_RUNTIME
-            .contains("operation.intent.withdraw_order_id == recovery.withdraw_order_id")
-    );
-    assert!(recovery.contains(".withdrawal_history("));
-    assert!(recovery.contains("withdrawals.is_empty()"));
-    assert!(recovery.contains(".universal_transfer_history("));
-    assert!(recovery.contains("transfers.len() == 1"));
-    assert!(
-        recovery.contains("transfer.transaction_id == recovery.master_transfer_transaction_id")
-    );
-    assert!(recovery.contains(".verify_route(&operation, true)"));
-    assert!(!recovery.contains(".universal_transfer("));
-    assert_eq!(
-        recovery
-            .matches(".submit_standard_binance_withdrawal(")
-            .count(),
-        1
-    );
-    assert!(recovery.contains("api_mode: STANDARD_BINANCE_WITHDRAWAL_API_MODE.to_owned()"));
-}
-
-#[test]
-fn pretransfer_crash_recovery_is_read_only_and_cannot_create_capital_work() {
-    let start = REBALANCE_RUNTIME
-        .find("pub async fn close_operator_confirmed_absent_master_transfer(")
-        .unwrap();
-    let end = REBALANCE_RUNTIME[start..]
-        .find("pub async fn recover_approved_manual_direct_credit(")
-        .map(|offset| start + offset)
-        .unwrap();
-    let recovery = &REBALANCE_RUNTIME[start..end];
-
-    assert!(recovery.contains(".universal_transfer_history("));
-    assert!(recovery.contains("transfer_records.is_empty()"));
-    assert!(!recovery.contains(".universal_transfer("));
-    assert!(!recovery.contains(".withdrawal_history("));
-    assert!(!recovery.contains(".withdraw_local_entity("));
-    assert!(!recovery.contains(".withdraw_standard("));
-    assert!(!recovery.contains(".withdraw_travel_rule_ae_self_owned("));
-}
-
-#[test]
 fn verified_address_metadata_is_forwarded_into_the_travel_rule_questionnaire() {
     let start = REBALANCE_RUNTIME
         .find("async fn ensure_travel_rule_ae_self_owned(")
@@ -222,36 +147,6 @@ fn verified_address_metadata_is_forwarded_into_the_travel_rule_questionnaire() {
     assert!(proof.contains("record.token == record.address_questionnaire.satoshi_token"));
     assert!(CAPITAL.contains("\"satoshiToken\": ownership_proof.satoshi_token.as_str()"));
     assert!(CAPITAL.contains("\"verifyMethod\": ownership_proof.verify_method"));
-}
-
-#[test]
-fn manual_m12_recovery_requires_both_unbroadcast_bot_attempts_and_the_exact_receipt() {
-    let start = REBALANCE_RUNTIME
-        .find("pub async fn recover_approved_manual_direct_credit(")
-        .unwrap();
-    let end = REBALANCE_RUNTIME[start..]
-        .find("pub async fn retry_approved_failed_local_entity_with_standard(")
-        .map(|offset| start + offset)
-        .unwrap();
-    let recovery = &REBALANCE_RUNTIME[start..end];
-
-    assert!(recovery.contains("validate_manual_recovery_travel_rule_rejections"));
-    assert!(recovery.contains("travel_rule_withdrawal_history_v2_for_network"));
-    assert!(recovery.contains("record.tr_id == local_entity_tr_id"));
-    assert!(recovery.contains("record.tr_id == standard_tr_id"));
-    assert!(recovery.contains("withdrawal_history_for_coin(token_symbol)"));
-    assert!(recovery.contains("expected_withdrawal_id"));
-    assert!(recovery.contains("expected_master_transfer_transaction_id"));
-    assert!(recovery.contains("transaction_receipt(transaction_hash)"));
-    assert!(recovery.contains("erc20_credit_from_receipt"));
-    assert!(recovery.contains(".checked_add(expected_credit)"));
-    assert!(!recovery.contains(".withdraw_standard("));
-    assert!(!recovery.contains(".withdraw_travel_rule_ae_self_owned("));
-    assert!(!recovery.contains(".universal_transfer("));
-
-    assert!(REBALANCE_RUNTIME.contains("records.len() == 2"));
-    assert!(REBALANCE_RUNTIME.contains("local_entity.is_approved_without_withdrawal()"));
-    assert!(REBALANCE_RUNTIME.contains("standard.is_failed_without_broadcast()"));
 }
 
 #[test]

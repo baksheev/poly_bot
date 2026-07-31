@@ -2,7 +2,7 @@
   "bundle_kind": "compiled_multi_pair_domain",
   "schema_version": 1,
   "bundle_id": "arb-bot-production-multi-pair-v1",
-  "compiler_version": "m1-v1",
+  "compiler_version": "production-v1",
   "sources": [
     {
       "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",

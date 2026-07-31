@@ -882,8 +882,8 @@ mod tests {
     }
 
     #[test]
-    fn m6_network_wallet_and_strategy_scope_survives_evm_fsync() {
-        let path = journal_path("m6-scope");
+    fn network_wallet_and_strategy_scope_survives_evm_fsync() {
+        let path = journal_path("scoped-scope");
         let mut scoped = intent();
         scoped.identity.scope = Some(EvmJournalScope {
             schema_version: EvmJournalScope::SCHEMA_VERSION,

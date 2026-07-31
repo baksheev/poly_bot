@@ -60,7 +60,7 @@ pub struct TradeIntent {
     pub plan_id: String,
     pub source_revision: String,
     pub pair_id: String,
-    /// Explicit M6 ownership scope. Historical v1 records omit this field and
+    /// Explicit scoped ownership scope. Historical v1 records omit this field and
     /// remain readable; every newly admitted live parent carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_scope: Option<TradeJournalScope>,
@@ -1883,8 +1883,8 @@ impl PaperTradeCoordinator {
         Ok((realized_loss, recovery_loss))
     }
 
-    pub fn canary_journal_risk(&self, strategy_id: &str) -> anyhow::Result<CanaryJournalRisk> {
-        let mut risk = CanaryJournalRisk::default();
+    pub fn strategy_journal_risk(&self, strategy_id: &str) -> anyhow::Result<StrategyJournalRisk> {
+        let mut risk = StrategyJournalRisk::default();
         for operation in self.journal.operations.values().filter(|operation| {
             operation
                 .intent
@@ -2323,7 +2323,7 @@ impl PaperTradeCoordinator {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CanaryJournalRisk {
+pub struct StrategyJournalRisk {
     pub admitted_parent_count: usize,
     pub active_parent_count: usize,
     pub failed_parent_count: usize,
@@ -2956,8 +2956,8 @@ mod tests {
     }
 
     #[test]
-    fn m6_trade_parent_scope_survives_parent_fsync_and_restart() {
-        let path = path("m6-scoped-parent");
+    fn trade_parent_scope_survives_parent_fsync_and_restart() {
+        let path = path("scoped-scoped-parent");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
         let mut scoped = intent(ExecutionMode::DexFirst);
@@ -3269,7 +3269,7 @@ mod tests {
         coordinator.take_commands(&plan_id).unwrap();
         assert_eq!(coordinator.cumulative_terminal_risk().unwrap(), (30, 0));
         let canary = coordinator
-            .canary_journal_risk("strategy:arbitrum-usdc-esp")
+            .strategy_journal_risk("strategy:arbitrum-usdc-esp")
             .unwrap();
         assert_eq!(canary.admitted_parent_count, 1);
         assert_eq!(canary.active_parent_count, 0);
@@ -3283,7 +3283,7 @@ mod tests {
         assert_eq!(recovered.cumulative_terminal_risk().unwrap(), (30, 0));
         assert_eq!(
             recovered
-                .canary_journal_risk("strategy:arbitrum-usdc-esp")
+                .strategy_journal_risk("strategy:arbitrum-usdc-esp")
                 .unwrap(),
             canary
         );

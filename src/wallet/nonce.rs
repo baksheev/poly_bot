@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m6_trade_and_rebalance_lanes_share_the_advanced_nonce() {
+    async fn trade_and_rebalance_lanes_share_the_advanced_nonce() {
         let wallet = Address::repeat_byte(0x71);
         let mut first = super::acquire_process_nonce_lock(480, wallet, 7)
             .await
@@ -997,7 +997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m6_process_nonce_owner_isolated_by_chain_for_the_same_wallet() {
+    async fn process_nonce_owner_isolated_by_chain_for_the_same_wallet() {
         let wallet = Address::repeat_byte(0x72);
         let world = super::acquire_process_nonce_lock(480, wallet, 11)
             .await

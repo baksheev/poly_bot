@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "bundle_id": "arb-bot-production-multi-pair-v1",
-  "compiler_version": "m1-v1",
+  "compiler_version": "production-v1",
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v12.json",
     "config/strategies/usdc-esp-arbitrum.v6.json"

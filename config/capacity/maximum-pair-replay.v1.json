@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "artifact_id": "m11-maximum-pair-replay-v1",
+  "artifact_id": "maximum-pair-replay-v1",
   "mode": "capacity_replay_only",
   "network_io_enabled": false,
   "external_mutation_authorized": false,

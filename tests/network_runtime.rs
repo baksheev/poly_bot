@@ -27,10 +27,10 @@ fn repository_root() -> PathBuf {
 
 #[test]
 fn captured_pinned_batch_matches_individual_reads_exactly() {
-    let bytes = fs::read(repository_root().join("tests/fixtures/m3-world-v3-batch-pinned.v1.json"))
-        .expect("captured M3 fixture must be readable");
+    let bytes = fs::read(repository_root().join("tests/fixtures/world-v3-batch-pinned.v1.json"))
+        .expect("captured network fixture must be readable");
     let fixture: BatchFixture =
-        serde_json::from_slice(&bytes).expect("captured M3 fixture must be valid");
+        serde_json::from_slice(&bytes).expect("captured network fixture must be valid");
 
     assert_eq!(fixture.fixture_version, 1);
     assert!(fixture.source.contains("captured"));

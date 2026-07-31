@@ -4,11 +4,11 @@ const MAIN: &str = include_str!("../src/main.rs");
 const ENGINE: &str = include_str!("../src/engine.rs");
 
 #[test]
-fn m13_report_proves_per_operation_full_live_authority() {
-    let report =
-        fs::read_to_string("scripts/report-m13-full-live").expect("M13 report must be readable");
-    let query =
-        fs::read_to_string("scripts/sql/m13_full_live.sql").expect("M13 query must be readable");
+fn production_report_proves_per_operation_full_live_authority() {
+    let report = fs::read_to_string("scripts/report-production-runtime")
+        .expect("production report must be readable");
+    let query = fs::read_to_string("scripts/sql/production_runtime.sql")
+        .expect("production query must be readable");
 
     assert!(report.contains("ESP Arbitrum full-live execution configured"));
     assert!(report.contains("max_uint256_then_locked"));

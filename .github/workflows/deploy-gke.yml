@@ -130,7 +130,6 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].full_live_policy.maximum_unknown_reconciliation_queries" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].full_live_policy.direct_route_only" "${domain_config}")" = true
           test "$(jq -r "${esp} | .pairs[0].full_live_policy.bridge_mutations_enabled" "${domain_config}")" = false
-          test "$(jq -r "${esp} | .pairs[0] | has(\"live_canary\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
             = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \
@@ -209,7 +208,7 @@ jobs:
           namespace: ${{ env.GKE_NAMESPACE }}
           use_dns_based_endpoint: true
 
-      - name: Gate exact image with M11 maximum-pair replay on target C4
+      - name: Gate exact image with capacity maximum-pair replay on target C4
         env:
           IMAGE: ${{ steps.image.outputs.image }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -229,7 +228,7 @@ jobs:
             --format='value(config.machineType)')"
           test "${machine_type}" = c4-highcpu-8
 
-          replay_deployment="arb-bot-m11-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          replay_deployment="arb-bot-capacity-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup_replay() {
             kubectl delete deployment "${replay_deployment}" \
               --namespace "${GKE_NAMESPACE}" \
@@ -250,17 +249,17 @@ jobs:
             --arg replay_instance "${replay_deployment}" \
             --arg image "${IMAGE}" \
             '
-              .metadata.labels["app.kubernetes.io/name"] = "arb-bot-m11-replay"
+              .metadata.labels["app.kubernetes.io/name"] = "arb-bot-capacity-replay"
               | .metadata.labels["arb-bot/source-revision"] = $source_sha
               | .metadata.labels["arb-bot/replay-instance"] = $replay_instance
               | .spec.replicas = 1
               | .spec.revisionHistoryLimit = 0
               | .spec.strategy = {"type": "Recreate"}
               | .spec.selector.matchLabels = {
-                  "app.kubernetes.io/name": "arb-bot-m11-replay",
+                  "app.kubernetes.io/name": "arb-bot-capacity-replay",
                   "arb-bot/replay-instance": $replay_instance
                 }
-              | .spec.template.metadata.labels["app.kubernetes.io/name"] = "arb-bot-m11-replay"
+              | .spec.template.metadata.labels["app.kubernetes.io/name"] = "arb-bot-capacity-replay"
               | .spec.template.metadata.labels["arb-bot/source-revision"] = $source_sha
               | .spec.template.metadata.labels["arb-bot/replay-instance"] = $replay_instance
               | .spec.template.spec.automountServiceAccountToken = false
@@ -289,7 +288,7 @@ jobs:
                   "imagePullPolicy": "IfNotPresent",
                   "command": ["/bin/sh", "-ec"],
                   "args": [
-                    "report=\"$(arb_bot replay-m11-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
+                    "report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
                   ],
                   "resources": {
                     "requests": {"cpu": "250m", "memory": "128Mi"},
@@ -358,7 +357,7 @@ jobs:
             -o json \
             | jq -r '.status.initContainerStatuses[0].state.terminated.message')"
           jq -e '
-            .artifact_id == "m11-maximum-pair-replay-v1"
+            .artifact_id == "maximum-pair-replay-v1"
             and .mode == "capacity_replay_only"
             and .pair_count == 20
             and .pool_count == 23

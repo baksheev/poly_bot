@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "usage: scripts/predeploy-review docs/reviews/<milestone>.md [base-ref]" >&2
+  echo "usage: scripts/predeploy-review docs/reviews/<release>.md [base-ref]" >&2
   exit 2
 fi
 
@@ -32,14 +32,13 @@ for required in \
 done
 
 cargo test --test binance_capital_contract
-cargo test --test m10_reporting
 cargo test domain::config::tests --lib
 cargo test domain::compiled::tests --lib
-cargo test m8_readiness::tests::full_live_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail --lib
+cargo test live_readiness::tests::full_live_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail --lib
 cargo test portfolio::tests --lib
 cargo test live_execution::tests::full_live_policy_keeps_per_parent_and_single_concurrency_envelopes --lib
 cargo test rebalance::executor::tests::full_live_authority_retains_the_stable_esp_owner_and_session_scoped_risk --lib
-cargo test --test m13_reporting
+cargo test --test production_reporting
 cargo test dex::execution::tests::capital_handle_uses_the_same_nonce_journal_and_cannot_keep_service_alive --lib
 cargo test rebalance::executor::tests --lib
 cargo test rebalance::runtime::tests --lib

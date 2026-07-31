@@ -1143,7 +1143,7 @@ struct FairSizingSlot<S> {
 
 /// Globally bounded latest-only work with deterministic round-robin dispatch.
 ///
-/// M11 can retain at most one running and one pending snapshot per strategy
+/// capacity can retain at most one running and one pending snapshot per strategy
 /// without allowing a continuously updated symbol to reacquire the next free
 /// worker ahead of quieter strategies.
 #[derive(Debug)]
@@ -1572,7 +1572,7 @@ mod tests {
     #[test]
     fn fair_latest_only_scheduler_bounds_workers_and_prevents_noisy_starvation() {
         let strategies = (0..20)
-            .map(|index| StrategyId::new(format!("strategy:m11-{index:02}")).unwrap())
+            .map(|index| StrategyId::new(format!("strategy:capacity-{index:02}")).unwrap())
             .collect::<Vec<_>>();
         let noisy = strategies[0].clone();
         let mut scheduler = FairLatestOnlySizingScheduler::new(strategies.clone(), 1).unwrap();

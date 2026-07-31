@@ -21,7 +21,7 @@ const MAX_REASON_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BinanceOrderIntent {
-    /// M6 owner scope. Omitted only in compatible v1 journal records.
+    /// scoped owner scope. Omitted only in compatible v1 journal records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<BinanceOrderJournalScope>,
     pub operation_id: String,
@@ -540,8 +540,8 @@ mod tests {
     }
 
     #[test]
-    fn m6_account_and_strategy_scope_survives_order_fsync() {
-        let path = path("m6-scope");
+    fn account_and_strategy_scope_survives_order_fsync() {
+        let path = path("scoped-scope");
         let _ = fs::remove_file(&path);
         let mut scoped = intent();
         scoped.scope = Some(BinanceOrderJournalScope {
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn maximum_pair_restart_preserves_several_known_and_unknown_operations() {
-        let path = path("m11-maximum-pair-restart");
+        let path = path("capacity-maximum-pair-restart");
         let _ = fs::remove_file(&path);
         let symbols = [
             "WLDUSDC",
@@ -683,10 +683,10 @@ mod tests {
                 value.scope = Some(BinanceOrderJournalScope {
                     schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
                     account_id: "binance-spot:primary".to_owned(),
-                    strategy_id: format!("strategy:m11:{index:02}"),
+                    strategy_id: format!("strategy:capacity:{index:02}"),
                 });
-                value.operation_id = format!("rustarb-m11-operation-{index:02}");
-                value.client_order_id = format!("rustarbm11order{index:02}");
+                value.operation_id = format!("rustarb-capacity-operation-{index:02}");
+                value.client_order_id = format!("rustarborder{index:02}");
                 value.symbol = (*symbol).to_owned();
                 value
             })

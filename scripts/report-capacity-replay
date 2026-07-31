@@ -2,10 +2,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-binary="${M11_REPLAY_BINARY:-${repo_root}/target/release/arb_bot}"
-artifact="${M11_REPLAY_ARTIFACT:-${repo_root}/config/capacity/m11-maximum-pair-replay.v1.json}"
-p99_hard_ns="${M11_DECISION_OWNER_P99_HARD_NS:-25000}"
-require_linux_rss="${M11_REQUIRE_LINUX_RSS:-false}"
+binary="${CAPACITY_REPLAY_BINARY:-${repo_root}/target/release/arb_bot}"
+artifact="${CAPACITY_REPLAY_ARTIFACT:-${repo_root}/config/capacity/maximum-pair-replay.v1.json}"
+p99_hard_ns="${DECISION_OWNER_P99_HARD_NS:-25000}"
+require_linux_rss="${REQUIRE_LINUX_RSS:-false}"
 report_path="$(mktemp)"
 trap 'rm -f "${report_path}"' EXIT
 
@@ -16,14 +16,14 @@ test "${require_linux_rss}" = true || test "${require_linux_rss}" = false
 
 (
   cd "${repo_root}"
-  "${binary}" replay-m11-capacity --artifact "${artifact}"
+  "${binary}" replay-capacity --artifact "${artifact}"
 ) >"${report_path}"
 
 jq -e \
   --argjson p99_hard_ns "${p99_hard_ns}" \
   '
     .schema_version == 1
-    and .artifact_id == "m11-maximum-pair-replay-v1"
+    and .artifact_id == "maximum-pair-replay-v1"
     and .mode == "capacity_replay_only"
     and .pair_count == 20
     and .pool_count == 23

@@ -14,7 +14,7 @@ pub mod execution_plan;
 pub mod hot_telemetry;
 pub mod inventory;
 pub mod live_execution;
-pub mod m8_readiness;
+pub mod live_readiness;
 pub mod market_data;
 pub mod network_runtime;
 pub mod opportunity;

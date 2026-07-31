@@ -42,7 +42,7 @@ pub struct RebalanceTracker {
     balanced: bool,
 }
 
-/// Explicit compatibility boundary for the only live M5 rebalance strategy.
+/// Explicit compatibility boundary for the only live portfolio rebalance strategy.
 /// It delegates byte-for-byte to the frozen v12 tracker until allocator replay
 /// has proved a separately reviewed replacement.
 #[derive(Debug)]

@@ -27,9 +27,7 @@ use crate::{
         events::{PoolUpdate, decode_pool_event},
         mirror::{DexMirror, LogApplyResult},
     },
-    domain::config::{
-        AdaptiveSizingConfig, DexProvider, LiveCanaryApprovalGate, LoadedDomainConfig,
-    },
+    domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
     execution_plan::{DEX_PLAN_TTL_SECONDS, DexSwapPlan},
     hot_telemetry::{
         HotTelemetryHandle, HotTelemetryTask, SharedStreamEventKind,
@@ -3235,19 +3233,6 @@ impl TradingEngine {
             );
             return;
         }
-        if failure_kind == InventoryAdmissionFailureKind::CapitalShortfall
-            && is_bounded_canary_pair(&self.domain_config, pair_id)
-        {
-            tracing::info!(
-                engine_id = %self.config.engine_id,
-                pair_id,
-                pair_symbol,
-                plan_id,
-                claims = %claims,
-                "bounded canary admission skipped by insufficient inventory"
-            );
-            return;
-        }
         if failure_kind == InventoryAdmissionFailureKind::InvariantViolation {
             tracing::error!(
                 engine_id = %self.config.engine_id,
@@ -3815,17 +3800,6 @@ impl TradingEngine {
     }
 }
 
-fn is_bounded_canary_pair(domain_config: &LoadedDomainConfig, pair_id: &str) -> bool {
-    domain_config.snapshot().pairs.iter().any(|pair| {
-        pair.id == pair_id
-            && pair.execution_enabled
-            && !pair.full_live
-            && pair.live_canary.as_ref().is_some_and(|canary| {
-                canary.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
-            })
-    })
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InventoryAdmissionFailureKind {
     ReservationContention,
@@ -4057,7 +4031,6 @@ mod tests {
 
     use crate::{
         arbitrage::ArbitrageDirection as TradeDirection,
-        domain::config::LoadedDomainConfig,
         execution_plan::{DexRoutePlan, DexSwapPlan},
         inventory::{
             InsufficientAvailableInventory, InventoryClaim, InventoryKey, InventoryLocation,
@@ -4075,8 +4048,8 @@ mod tests {
         TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
         classify_depth_health, classify_inventory_admission_failure, clock_sync_estimate_valid,
         estimate_exchange_event_to_socket_us, exact_execution_envelope_amounts,
-        is_bounded_canary_pair, mark_sequence_matched_update, rebalance_health_state,
-        rebalance_reservation_id, requires_depth_for_runtime_phase, reservation_precheck,
+        mark_sequence_matched_update, rebalance_health_state, rebalance_reservation_id,
+        requires_depth_for_runtime_phase, reservation_precheck,
     };
 
     #[test]
@@ -4132,16 +4105,6 @@ mod tests {
         assert!(!requires_depth_for_runtime_phase("full_live"));
         assert!(!requires_depth_for_runtime_phase("paper_dex_first"));
         assert!(requires_depth_for_runtime_phase("paper_concurrent_hedged"));
-    }
-
-    #[test]
-    fn promoted_esp_inventory_exhaustion_is_actionable() {
-        let config =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json").unwrap();
-
-        assert!(!is_bounded_canary_pair(&config, "arbitrum-usdc-esp"));
-        assert!(!is_bounded_canary_pair(&config, "world-chain-usdc-wld"));
-        assert!(!is_bounded_canary_pair(&config, "unknown-pair"));
     }
 
     #[test]

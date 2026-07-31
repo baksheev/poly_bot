@@ -3,11 +3,11 @@ use std::fs;
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
 
 #[test]
-fn m11_report_enforces_the_full_read_only_capacity_gate() {
-    let report = fs::read_to_string("scripts/report-m11-capacity-replay")
-        .expect("M11 capacity report must be readable");
-    let artifact = fs::read_to_string("config/capacity/m11-maximum-pair-replay.v1.json")
-        .expect("M11 capacity artifact must be readable");
+fn report_enforces_the_full_read_only_capacity_gate() {
+    let report = fs::read_to_string("scripts/report-capacity-replay")
+        .expect("capacity report must be readable");
+    let artifact = fs::read_to_string("config/capacity/maximum-pair-replay.v1.json")
+        .expect("capacity artifact must be readable");
 
     assert!(report.contains(".pair_count == 20"));
     assert!(report.contains(".frames_per_pair >= 100000"));
@@ -21,7 +21,7 @@ fn m11_report_enforces_the_full_read_only_capacity_gate() {
     assert!(report.contains(".rehydration.pool_build_latency.p99_ns <= 200000"));
     assert!(report.contains(".network_io_performed == false"));
     assert!(report.contains(".external_mutations == 0"));
-    assert!(report.contains("M11_REQUIRE_LINUX_RSS"));
+    assert!(report.contains("REQUIRE_LINUX_RSS"));
 
     assert!(artifact.contains("\"mode\": \"capacity_replay_only\""));
     assert!(artifact.contains("\"network_io_enabled\": false"));
@@ -32,8 +32,8 @@ fn m11_report_enforces_the_full_read_only_capacity_gate() {
 #[test]
 fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     let gate = DEPLOY_WORKFLOW
-        .find("Gate exact image with M11 maximum-pair replay on target C4")
-        .expect("M11 target gate must exist");
+        .find("Gate exact image with capacity maximum-pair replay on target C4")
+        .expect("capacity target gate must exist");
     let rollout = DEPLOY_WORKFLOW
         .find("Roll out on the fixed node")
         .expect("rollout step must exist");
@@ -52,7 +52,7 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(DEPLOY_WORKFLOW.contains("\"requests\": {\"cpu\": \"250m\", \"memory\": \"128Mi\"}"));
     assert!(DEPLOY_WORKFLOW.contains(".gate == \"target_c4_replay_ready\""));
     assert!(DEPLOY_WORKFLOW.contains(
-        "replay_deployment=\"arb-bot-m11-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\""
+        "replay_deployment=\"arb-bot-capacity-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\""
     ));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl delete job"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl delete deployment \"${replay_deployment}\""));

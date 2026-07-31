@@ -39,23 +39,23 @@ const MAXIMUM_PAIR_COUNT: usize = 20;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct M11CapacityReplayArtifact {
+pub struct CapacityReplayArtifact {
     pub schema_version: u32,
     pub artifact_id: String,
     pub mode: String,
     pub network_io_enabled: bool,
     pub external_mutation_authorized: bool,
-    pub source: M11CapacitySource,
+    pub source: CapacitySource,
     pub frames_per_pair: u64,
     pub reconnect_bursts: u32,
     pub maximum_sizing_workers: usize,
-    pub rehydration_fixture: M11RehydrationFixture,
-    pub pairs: Vec<M11CapacityPair>,
+    pub rehydration_fixture: RehydrationFixture,
+    pub pairs: Vec<CapacityPair>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct M11CapacitySource {
+pub struct CapacitySource {
     pub kind: String,
     pub run_id: u64,
     pub captured_at: String,
@@ -64,7 +64,7 @@ pub struct M11CapacitySource {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct M11CapacityPair {
+pub struct CapacityPair {
     pub pair_id: String,
     pub symbol: String,
     pub network_id: String,
@@ -74,7 +74,7 @@ pub struct M11CapacityPair {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct M11RehydrationFixture {
+pub struct RehydrationFixture {
     pub source: String,
     pub fee_pips: u32,
     pub slot0: String,
@@ -82,62 +82,67 @@ pub struct M11RehydrationFixture {
     pub tick_spacing: String,
 }
 
-impl M11CapacityReplayArtifact {
+impl CapacityReplayArtifact {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read M11 replay artifact {}", path.display()))?;
-        let artifact = serde_json::from_slice::<Self>(&bytes)
-            .with_context(|| format!("failed to parse M11 replay artifact {}", path.display()))?;
+        let bytes = fs::read(path).with_context(|| {
+            format!("failed to read capacity replay artifact {}", path.display())
+        })?;
+        let artifact = serde_json::from_slice::<Self>(&bytes).with_context(|| {
+            format!(
+                "failed to parse capacity replay artifact {}",
+                path.display()
+            )
+        })?;
         artifact
             .validate()
-            .with_context(|| format!("invalid M11 replay artifact {}", path.display()))?;
+            .with_context(|| format!("invalid capacity replay artifact {}", path.display()))?;
         Ok(artifact)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             self.schema_version == SUPPORTED_SCHEMA_VERSION,
-            "unsupported M11 replay schema_version {}",
+            "unsupported capacity replay schema_version {}",
             self.schema_version
         );
         ensure!(
             self.mode == REQUIRED_MODE,
-            "M11 replay mode must be {REQUIRED_MODE}"
+            "capacity replay mode must be {REQUIRED_MODE}"
         );
         ensure!(
             !self.network_io_enabled,
-            "M11 capacity replay must not enable network I/O"
+            "capacity capacity replay must not enable network I/O"
         );
         ensure!(
             !self.external_mutation_authorized,
-            "M11 capacity replay must not authorize external mutation"
+            "capacity capacity replay must not authorize external mutation"
         );
         ensure!(
             (MINIMUM_PAIR_COUNT..=MAXIMUM_PAIR_COUNT).contains(&self.pairs.len()),
-            "M11 capacity replay requires {MINIMUM_PAIR_COUNT}..={MAXIMUM_PAIR_COUNT} pairs"
+            "capacity capacity replay requires {MINIMUM_PAIR_COUNT}..={MAXIMUM_PAIR_COUNT} pairs"
         );
         ensure!(
             self.frames_per_pair > 0,
-            "M11 frames_per_pair must be positive"
+            "capacity frames_per_pair must be positive"
         );
         ensure!(
             self.reconnect_bursts > 0,
-            "M11 reconnect_bursts must be positive"
+            "capacity reconnect_bursts must be positive"
         );
         ensure!(
             self.maximum_sizing_workers > 0 && self.maximum_sizing_workers <= self.pairs.len(),
-            "M11 maximum_sizing_workers is outside the pair bound"
+            "capacity maximum_sizing_workers is outside the pair bound"
         );
         ensure!(
             !self.source.kind.is_empty()
                 && !self.source.captured_at.is_empty()
                 && !self.source.warning.is_empty(),
-            "M11 capacity source provenance is incomplete"
+            "capacity capacity source provenance is incomplete"
         );
         ensure!(
             !self.rehydration_fixture.source.is_empty() && self.rehydration_fixture.fee_pips > 0,
-            "M11 rehydration fixture provenance is incomplete"
+            "capacity rehydration fixture provenance is incomplete"
         );
         for (name, value) in [
             ("slot0", &self.rehydration_fixture.slot0),
@@ -153,7 +158,7 @@ impl M11CapacityReplayArtifact {
         for pair in &self.pairs {
             ensure!(
                 pair_ids.insert(pair.pair_id.clone()),
-                "duplicate M11 pair_id {}",
+                "duplicate capacity pair_id {}",
                 pair.pair_id
             );
             ensure!(
@@ -162,24 +167,24 @@ impl M11CapacityReplayArtifact {
                         .symbol
                         .bytes()
                         .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
-                "invalid M11 symbol {}",
+                "invalid capacity symbol {}",
                 pair.symbol
             );
             ensure!(
                 symbols.insert(pair.symbol.clone()),
-                "duplicate M11 symbol {}",
+                "duplicate capacity symbol {}",
                 pair.symbol
             );
             NetworkId::new(pair.network_id.clone())?;
-            ensure!(pair.pool_count > 0, "M11 pair has no pools");
+            ensure!(pair.pool_count > 0, "capacity pair has no pools");
             ensure!(
                 !pair.candidate_ids.is_empty(),
-                "M11 pair has no source candidate ids"
+                "capacity pair has no source candidate ids"
             );
             for candidate_id in &pair.candidate_ids {
                 ensure!(
                     candidate_ids.insert(*candidate_id),
-                    "duplicate M11 source candidate id {candidate_id}"
+                    "duplicate capacity source candidate id {candidate_id}"
                 );
             }
         }
@@ -188,7 +193,7 @@ impl M11CapacityReplayArtifact {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct M11LatencySummary {
+pub struct LatencySummary {
     pub samples: usize,
     pub p50_ns: u64,
     pub p95_ns: u64,
@@ -197,7 +202,7 @@ pub struct M11LatencySummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct M11FairnessSummary {
+pub struct FairnessSummary {
     pub maximum_workers: usize,
     pub maximum_observed_running: usize,
     pub maximum_retained_work: usize,
@@ -206,18 +211,18 @@ pub struct M11FairnessSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct M11RehydrationSummary {
+pub struct RehydrationSummary {
     pub cycles: u32,
     pub pool_publications: usize,
     pub partial_batches_rejected: u64,
-    pub captured_batch_materialization_latency: M11LatencySummary,
-    pub decode_latency: M11LatencySummary,
-    pub pool_build_latency: M11LatencySummary,
-    pub publication_latency: M11LatencySummary,
+    pub captured_batch_materialization_latency: LatencySummary,
+    pub decode_latency: LatencySummary,
+    pub pool_build_latency: LatencySummary,
+    pub publication_latency: LatencySummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct M11CapacityReplayReport {
+pub struct CapacityReplayReport {
     pub schema_version: u32,
     pub artifact_id: String,
     pub mode: String,
@@ -231,15 +236,15 @@ pub struct M11CapacityReplayReport {
     pub route_failures: u64,
     pub dependency_faults: usize,
     pub evaluations_by_symbol: BTreeMap<String, u64>,
-    pub decision_owner_latency: M11LatencySummary,
+    pub decision_owner_latency: LatencySummary,
     pub elapsed_ns: u64,
     pub frames_per_second: u64,
     pub rss_before_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
     pub rss_high_water_bytes: Option<u64>,
     pub target_cpu_class: Option<String>,
-    pub fairness: M11FairnessSummary,
-    pub rehydration: M11RehydrationSummary,
+    pub fairness: FairnessSummary,
+    pub rehydration: RehydrationSummary,
     pub network_io_performed: bool,
     pub external_mutations: u64,
     pub gate: String,
@@ -279,16 +284,16 @@ impl StrategyEvaluator for ReplayEvaluator {
     }
 }
 
-pub fn run_m11_capacity_replay(
+pub fn run_capacity_replay(
     artifact_path: impl AsRef<Path>,
     frames_per_pair_override: Option<u64>,
     target_cpu_class: Option<&str>,
-) -> anyhow::Result<M11CapacityReplayReport> {
-    let mut artifact = M11CapacityReplayArtifact::load(artifact_path)?;
+) -> anyhow::Result<CapacityReplayReport> {
+    let mut artifact = CapacityReplayArtifact::load(artifact_path)?;
     if let Some(frames_per_pair) = frames_per_pair_override {
         ensure!(
             frames_per_pair > 0,
-            "M11 frames-per-pair override must be positive"
+            "capacity frames-per-pair override must be positive"
         );
         artifact.frames_per_pair = frames_per_pair;
     }
@@ -298,7 +303,7 @@ pub fn run_m11_capacity_replay(
     let mut counters = BTreeMap::new();
     let mut evaluators = Vec::with_capacity(artifact.pairs.len());
     for (pair_index, pair) in artifact.pairs.iter().enumerate() {
-        let strategy_id = StrategyId::new(format!("strategy:m11:{}", pair.pair_id))?;
+        let strategy_id = StrategyId::new(format!("strategy:capacity:{}", pair.pair_id))?;
         let evaluations = Arc::new(AtomicU64::new(0));
         counters.insert(pair.symbol.clone(), Arc::clone(&evaluations));
         let evaluator = ReplayEvaluator {
@@ -307,13 +312,13 @@ pub fn run_m11_capacity_replay(
             evaluations,
         };
         let pool_ids = (0..pair.pool_count)
-            .map(|pool_index| PoolId::new(format!("pool:m11:{}:{pool_index}", pair.pair_id)))
+            .map(|pool_index| PoolId::new(format!("pool:capacity:{}:{pool_index}", pair.pair_id)))
             .collect::<anyhow::Result<Vec<_>>>()?;
         strategies.push(CompiledHotPathStrategyPlan {
             strategy_id,
             pair_id: pair.pair_id.clone(),
             instrument_id: InstrumentId::new(format!(
-                "instrument:m11:{}",
+                "instrument:capacity:{}",
                 pair.symbol.to_ascii_lowercase()
             ))?,
             symbol: pair.symbol.clone(),
@@ -343,13 +348,13 @@ pub fn run_m11_capacity_replay(
     let expected_frames = artifact
         .frames_per_pair
         .checked_mul(artifact.pairs.len() as u64)
-        .context("M11 frame count overflow")?;
+        .context("capacity frame count overflow")?;
     let expected_reconnect_events = u64::from(artifact.reconnect_bursts)
         .checked_mul(2)
         .and_then(|events| events.checked_mul(artifact.pairs.len() as u64))
-        .context("M11 reconnect event count overflow")?;
+        .context("capacity reconnect event count overflow")?;
     let mut latencies = Vec::with_capacity(
-        usize::try_from(expected_frames).context("M11 frame count exceeds address space")?,
+        usize::try_from(expected_frames).context("capacity frame count exceeds address space")?,
     );
     let mut exact_single_strategy_routes = 0_u64;
     let mut route_failures = 0_u64;
@@ -363,7 +368,7 @@ pub fn run_m11_capacity_replay(
                 MarketEvent::FeedDisconnected {
                     symbol: Arc::clone(&symbol),
                     generation,
-                    reason: "m11_capacity_replay".to_owned(),
+                    reason: "capacity_replay".to_owned(),
                     observed_at: Instant::now(),
                 },
                 MarketEvent::FeedConnected {
@@ -419,13 +424,13 @@ pub fn run_m11_capacity_replay(
         evaluations_by_symbol
             .values()
             .all(|evaluations| *evaluations == artifact.frames_per_pair),
-        "M11 evaluator counts differ from the exact per-pair frame count"
+        "capacity evaluator counts differ from the exact per-pair frame count"
     );
-    ensure!(route_failures == 0, "M11 replay had route failures");
+    ensure!(route_failures == 0, "capacity replay had route failures");
     let dependency_faults = owner.take_dependency_faults().len();
     ensure!(
         dependency_faults == 0,
-        "M11 replay degraded one or more strategy dependencies"
+        "capacity replay degraded one or more strategy dependencies"
     );
     let fairness = exercise_fairness(&owner, &artifact)?;
     let rehydration = exercise_rehydration(&artifact)?;
@@ -445,20 +450,20 @@ pub fn run_m11_capacity_replay(
         Some(cpu_class) => {
             ensure!(
                 cpu_class == "c4-highcpu-8",
-                "M11 target evidence requires c4-highcpu-8"
+                "capacity target evidence requires c4-highcpu-8"
             );
             ensure!(
                 rss_before_bytes.is_some()
                     && rss_after_bytes.is_some()
                     && rss_high_water_bytes.is_some(),
-                "M11 target evidence requires Linux RSS and high-water metrics"
+                "capacity target evidence requires Linux RSS and high-water metrics"
             );
             "target_c4_replay_ready"
         }
         None => "local_replay_ready_target_c4_required",
     };
 
-    Ok(M11CapacityReplayReport {
+    Ok(CapacityReplayReport {
         schema_version: SUPPORTED_SCHEMA_VERSION,
         artifact_id: artifact.artifact_id,
         mode: artifact.mode,
@@ -487,9 +492,7 @@ pub fn run_m11_capacity_replay(
     })
 }
 
-fn exercise_rehydration(
-    artifact: &M11CapacityReplayArtifact,
-) -> anyhow::Result<M11RehydrationSummary> {
+fn exercise_rehydration(artifact: &CapacityReplayArtifact) -> anyhow::Result<RehydrationSummary> {
     let captured = [
         decode_hex("slot0", &artifact.rehydration_fixture.slot0)?,
         decode_hex("liquidity", &artifact.rehydration_fixture.liquidity)?,
@@ -497,7 +500,7 @@ fn exercise_rehydration(
     ];
     ensure!(
         decode_v3_core_head(&captured[..2]).is_err(),
-        "partial M11 hydration batch was unexpectedly publishable"
+        "partial capacity hydration batch was unexpectedly publishable"
     );
 
     let cycles = artifact.reconnect_bursts.saturating_add(1);
@@ -508,7 +511,7 @@ fn exercise_rehydration(
         .sum::<usize>();
     let sample_count = pool_count
         .checked_mul(cycles as usize)
-        .context("M11 hydration sample count overflow")?;
+        .context("capacity hydration sample count overflow")?;
     let mut materialization_latencies = Vec::with_capacity(sample_count);
     let mut decode_latencies = Vec::with_capacity(sample_count);
     let mut build_latencies = Vec::with_capacity(sample_count);
@@ -530,7 +533,7 @@ fn exercise_rehydration(
                 !decoded.sqrt_price_x96.is_zero()
                     && decoded.liquidity > 0
                     && decoded.tick_spacing > 0,
-                "captured M11 hydration batch is not quotable"
+                "captured capacity hydration batch is not quotable"
             );
 
             let started = Instant::now();
@@ -550,20 +553,20 @@ fn exercise_rehydration(
         }
         ensure!(
             published.len() == pool_count,
-            "partial M11 hydration cycle cannot become ready"
+            "partial capacity hydration cycle cannot become ready"
         );
         pool_publications += published.len();
     }
     ensure!(
         pool_publications == sample_count,
-        "M11 hydration publication count is incomplete"
+        "capacity hydration publication count is incomplete"
     );
     ensure!(
         pool_publications >= 100,
-        "M11 hydration percentile cohort must contain at least 100 pools"
+        "capacity hydration percentile cohort must contain at least 100 pools"
     );
 
-    Ok(M11RehydrationSummary {
+    Ok(RehydrationSummary {
         cycles,
         pool_publications,
         partial_batches_rejected: 1,
@@ -576,8 +579,8 @@ fn exercise_rehydration(
 
 fn exercise_fairness(
     owner: &HotPathDecisionOwner<ReplayEvaluator>,
-    artifact: &M11CapacityReplayArtifact,
-) -> anyhow::Result<M11FairnessSummary> {
+    artifact: &CapacityReplayArtifact,
+) -> anyhow::Result<FairnessSummary> {
     let mut strategy_ids = owner
         .dependencies()
         .plan()
@@ -598,7 +601,7 @@ fn exercise_fairness(
     while running.len() < artifact.maximum_sizing_workers {
         let (strategy_id, _) = scheduler
             .take_ready()
-            .context("M11 scheduler did not fill its worker bound")?;
+            .context("capacity scheduler did not fill its worker bound")?;
         running.push(strategy_id);
         maximum_observed_running = maximum_observed_running.max(scheduler.running());
     }
@@ -632,18 +635,18 @@ fn exercise_fairness(
 
     ensure!(
         unique_before_noisy_repeat.len() == strategy_ids.len(),
-        "noisy M11 strategy repeated before every quiet strategy was dispatched"
+        "noisy capacity strategy repeated before every quiet strategy was dispatched"
     );
     ensure!(
         maximum_observed_running <= artifact.maximum_sizing_workers,
-        "M11 scheduler exceeded its worker bound"
+        "capacity scheduler exceeded its worker bound"
     );
     ensure!(
         maximum_retained_work <= strategy_ids.len() + artifact.maximum_sizing_workers,
-        "M11 scheduler exceeded one running plus one pending item per strategy"
+        "capacity scheduler exceeded one running plus one pending item per strategy"
     );
 
-    Ok(M11FairnessSummary {
+    Ok(FairnessSummary {
         maximum_workers: artifact.maximum_sizing_workers,
         maximum_observed_running,
         maximum_retained_work,
@@ -652,10 +655,10 @@ fn exercise_fairness(
     })
 }
 
-fn latency_summary(samples: &mut [u64]) -> anyhow::Result<M11LatencySummary> {
-    ensure!(!samples.is_empty(), "M11 latency sample is empty");
+fn latency_summary(samples: &mut [u64]) -> anyhow::Result<LatencySummary> {
+    ensure!(!samples.is_empty(), "capacity latency sample is empty");
     samples.sort_unstable();
-    Ok(M11LatencySummary {
+    Ok(LatencySummary {
         samples: samples.len(),
         p50_ns: percentile(samples, 50),
         p95_ns: percentile(samples, 95),
@@ -690,20 +693,20 @@ fn linux_status_bytes(field: &str) -> Option<u64> {
 fn decode_hex(name: &str, value: &str) -> anyhow::Result<Vec<u8>> {
     let encoded = value
         .strip_prefix("0x")
-        .with_context(|| format!("M11 {name} is missing 0x prefix"))?;
-    ensure!(encoded.len() % 2 == 0, "M11 {name} has odd hex length");
-    hex::decode(encoded).with_context(|| format!("M11 {name} contains invalid hex"))
+        .with_context(|| format!("capacity {name} is missing 0x prefix"))?;
+    ensure!(encoded.len() % 2 == 0, "capacity {name} has odd hex length");
+    hex::decode(encoded).with_context(|| format!("capacity {name} contains invalid hex"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ARTIFACT: &str = "config/capacity/m11-maximum-pair-replay.v1.json";
+    const ARTIFACT: &str = "config/capacity/maximum-pair-replay.v1.json";
 
     #[test]
     fn artifact_is_exactly_maximum_size_and_strictly_read_only() {
-        let artifact = M11CapacityReplayArtifact::load(ARTIFACT).unwrap();
+        let artifact = CapacityReplayArtifact::load(ARTIFACT).unwrap();
         assert_eq!(artifact.pairs.len(), MAXIMUM_PAIR_COUNT);
         assert_eq!(artifact.frames_per_pair, 100_000);
         assert!(!artifact.network_io_enabled);
@@ -712,7 +715,7 @@ mod tests {
 
     #[test]
     fn replay_routes_exactly_and_noisy_pair_cannot_starve_quiet_pairs() {
-        let report = run_m11_capacity_replay(ARTIFACT, Some(1_000), None).unwrap();
+        let report = run_capacity_replay(ARTIFACT, Some(1_000), None).unwrap();
         assert_eq!(report.total_strategy_frames, 20_000);
         assert_eq!(report.route_failures, 0);
         assert_eq!(report.dependency_faults, 0);
@@ -726,7 +729,7 @@ mod tests {
 
     #[test]
     fn artifact_rejects_any_network_or_mutation_authority() {
-        let mut artifact = M11CapacityReplayArtifact::load(ARTIFACT).unwrap();
+        let mut artifact = CapacityReplayArtifact::load(ARTIFACT).unwrap();
         artifact.network_io_enabled = true;
         assert!(
             artifact
@@ -749,17 +752,17 @@ mod tests {
 
     #[test]
     fn artifact_rejects_ambiguous_routes_and_unbounded_workers() {
-        let mut artifact = M11CapacityReplayArtifact::load(ARTIFACT).unwrap();
+        let mut artifact = CapacityReplayArtifact::load(ARTIFACT).unwrap();
         artifact.pairs[1].symbol = artifact.pairs[0].symbol.clone();
         assert!(
             artifact
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("duplicate M11 symbol")
+                .contains("duplicate capacity symbol")
         );
 
-        let mut artifact = M11CapacityReplayArtifact::load(ARTIFACT).unwrap();
+        let mut artifact = CapacityReplayArtifact::load(ARTIFACT).unwrap();
         artifact.maximum_sizing_workers = artifact.pairs.len() + 1;
         assert!(
             artifact

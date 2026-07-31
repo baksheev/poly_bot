@@ -28,12 +28,9 @@ pub enum Command {
         )]
         output: PathBuf,
     },
-    /// Replay the immutable maximum-pair M11 workload without network I/O or mutations.
-    ReplayM11Capacity {
-        #[arg(
-            long,
-            default_value = "config/capacity/m11-maximum-pair-replay.v1.json"
-        )]
+    /// Replay the immutable maximum-pair capacity workload without network I/O or mutations.
+    ReplayCapacity {
+        #[arg(long, default_value = "config/capacity/maximum-pair-replay.v1.json")]
         artifact: PathBuf,
         /// Optional local smoke override; target-node evidence uses the artifact value.
         #[arg(long)]
@@ -101,48 +98,6 @@ pub enum Command {
     BinanceTravelRuleWithdrawalStatus {
         #[arg(long)]
         tr_id: i64,
-    },
-    /// One-shot, journaled Binance-to-Arbitrum prefunding for the approved ESP canary.
-    PrefundArbitrumCanary {
-        /// Explicit acknowledgement for the bounded production transfer.
-        #[arg(
-            long,
-            env = "ARBITRUM_PREFUNDING_LIVE_CONFIRMATION",
-            default_value = ""
-        )]
-        live_confirmation: String,
-        /// Durable marker preventing a later restart from prefunding again.
-        #[arg(
-            long,
-            env = "ARBITRUM_PREFUNDING_MARKER_PATH",
-            default_value = "/var/lib/arb-bot/m9-prefunding-complete.json"
-        )]
-        marker_path: PathBuf,
-    },
-    /// Close the exact ESP Travel Rule -4024 incident and emit read-only route diagnostics.
-    DiagnoseArbitrumEspWithdrawal {
-        /// Explicit acknowledgement for the versioned incident-journal transition.
-        #[arg(long, env = "ARBITRUM_ESP_DIAGNOSTIC_CONFIRMATION", default_value = "")]
-        confirmation: String,
-    },
-    /// Send the one approved Arbitrum USDC deposit test that verifies the ESP wallet address.
-    BinanceEspAddressVerificationTransfer {
-        /// Versioned exact amount, recipient, token, wallet, network, and expiry.
-        #[arg(
-            long,
-            default_value = "config/operations/binance-esp-address-verification.v1.json"
-        )]
-        artifact: PathBuf,
-        /// Explicit acknowledgement for the exact one-shot production transfer.
-        #[arg(
-            long,
-            env = "BINANCE_ESP_ADDRESS_VERIFICATION_CONFIRMATION",
-            default_value = ""
-        )]
-        confirmation: String,
-        /// Shared Arbitrum journal used by the later ESP execution owner.
-        #[arg(long, env = "ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH")]
-        journal_path: PathBuf,
     },
     /// Reconcile a live arbitrage CEX unknown outcome from the Binance order journal.
     ArbitrageReconcileCex {
@@ -628,13 +583,6 @@ mod tests {
         value.rebalance_max_wld_amount = rust_decimal::Decimal::ONE;
         value.rebalance_max_usdc_amount = rust_decimal::Decimal::from(100);
         value.validate().unwrap();
-    }
-
-    #[test]
-    fn retired_canary_execution_mode_is_rejected() {
-        let mut value = config();
-        value.rebalance_execution_mode = "direct_wld_canary".into();
-        assert!(value.validate().is_err());
     }
 
     #[test]

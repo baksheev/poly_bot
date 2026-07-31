@@ -32,16 +32,14 @@ pub struct RebalanceExecutionRequest {
     pub action: RebalanceAction,
     pub binance_balance_before: U256,
     pub wallet_balance_before: U256,
-    pub canary_maximum_fee: Option<U256>,
-    pub canary_approval_session_id: Option<String>,
+    pub maximum_fee: Option<U256>,
+    pub approval_session_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RebalanceExecutionAuthority {
     WorldChainV12,
-    ArbitrumM9Prefunding,
-    ArbitrumM10Canary,
     ArbitrumFullLive,
 }
 
@@ -49,8 +47,7 @@ impl RebalanceExecutionAuthority {
     fn strategy_id(self) -> &'static str {
         match self {
             Self::WorldChainV12 => "rebalance-world-chain-v12",
-            Self::ArbitrumM9Prefunding => "prefund-arbitrum-usdc-esp-m9",
-            Self::ArbitrumM10Canary | Self::ArbitrumFullLive => "rebalance-arbitrum-usdc-esp-m10",
+            Self::ArbitrumFullLive => "rebalance-arbitrum-usdc-esp",
         }
     }
 }
@@ -76,10 +73,18 @@ pub struct RebalanceExecutionIntent {
     pub binance_balance_before: U256,
     #[serde(with = "u256_serde")]
     pub wallet_balance_before: U256,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canary_maximum_fee_base_units: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canary_approval_session_id: Option<String>,
+    #[serde(
+        default,
+        alias = "canary_maximum_fee_base_units",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub maximum_fee_base_units: Option<String>,
+    #[serde(
+        default,
+        alias = "canary_approval_session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub approval_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -370,28 +375,20 @@ impl RebalanceExecutionJournal {
         Ok(operation)
     }
 
-    pub fn m10_canary_risk(
-        &self,
-        approval_session_id: &str,
-    ) -> anyhow::Result<RebalanceCanaryRisk> {
-        let mut risk = RebalanceCanaryRisk::default();
+    pub fn rebalance_risk(&self, approval_session_id: &str) -> anyhow::Result<RebalanceRisk> {
+        let mut risk = RebalanceRisk::default();
         for operation in self.operations.values().filter(|operation| {
             operation
                 .intent
                 .scope
                 .as_ref()
-                .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10")
-                && operation
-                    .intent
-                    .canary_approval_session_id
-                    .as_deref()
-                    .unwrap_or("esp-usdc-arbitrum-rebalance-20260730-r1")
-                    == approval_session_id
+                .is_some_and(|scope| scope.network_id == "chain:42161")
+                && operation.intent.approval_session_id.as_deref() == Some(approval_session_id)
         }) {
             risk.transfer_count = risk
                 .transfer_count
                 .checked_add(1)
-                .context("M10 transfer count overflow")?;
+                .context("rebalance transfer count overflow")?;
             risk.active_transfer_count += usize::from(!operation.progress.terminal());
             risk.failed_transfer_count += usize::from(matches!(
                 operation.progress,
@@ -400,18 +397,18 @@ impl RebalanceExecutionJournal {
             let total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_debit,
                 "ESP" => &mut risk.token_b_debit,
-                _ => anyhow::bail!("M10 journal contains an unapproved asset"),
+                _ => anyhow::bail!("rebalance journal contains an unapproved asset"),
             };
             *total = total
                 .checked_add(operation.intent.amount)
-                .context("M10 cumulative debit overflow")?;
+                .context("rebalance cumulative debit overflow")?;
             let maximum_fee = operation
                 .intent
-                .canary_maximum_fee_base_units
+                .maximum_fee_base_units
                 .as_deref()
-                .context("M10 journal operation has no fee authority")
+                .context("rebalance journal operation has no fee authority")
                 .and_then(|value| {
-                    U256::from_str(value).context("M10 fee authority is not a uint256")
+                    U256::from_str(value).context("rebalance fee authority is not a uint256")
                 })?;
             let fee_total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_maximum_fee,
@@ -420,12 +417,12 @@ impl RebalanceExecutionJournal {
             };
             *fee_total = fee_total
                 .checked_add(maximum_fee)
-                .context("M10 cumulative fee authority overflow")?;
+                .context("rebalance cumulative fee authority overflow")?;
             let started_at = self
                 .operation_started_at_unix_ms
                 .get(&operation.intent.operation_id)
                 .copied()
-                .context("M10 operation has no durable start timestamp")?;
+                .context("rebalance operation has no durable start timestamp")?;
             risk.first_started_at_unix_ms = Some(
                 risk.first_started_at_unix_ms
                     .map_or(started_at, |current| current.min(started_at)),
@@ -434,7 +431,7 @@ impl RebalanceExecutionJournal {
         Ok(risk)
     }
 
-    pub fn latest_m10_operation(
+    pub fn latest_rebalance_operation(
         &self,
         approval_session_id: &str,
     ) -> Option<&RebalanceExecutionOperation> {
@@ -445,13 +442,8 @@ impl RebalanceExecutionJournal {
                     .intent
                     .scope
                     .as_ref()
-                    .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10")
-                    && operation
-                        .intent
-                        .canary_approval_session_id
-                        .as_deref()
-                        .unwrap_or("esp-usdc-arbitrum-rebalance-20260730-r1")
-                        == approval_session_id
+                    .is_some_and(|scope| scope.network_id == "chain:42161")
+                    && operation.intent.approval_session_id.as_deref() == Some(approval_session_id)
             })
             .max_by_key(|operation| {
                 (
@@ -501,10 +493,8 @@ impl RebalanceExecutionJournal {
                 amount: request.action.amount,
                 binance_balance_before: request.binance_balance_before,
                 wallet_balance_before: request.wallet_balance_before,
-                canary_maximum_fee_base_units: request
-                    .canary_maximum_fee
-                    .map(|value| value.to_string()),
-                canary_approval_session_id: request.canary_approval_session_id.clone(),
+                maximum_fee_base_units: request.maximum_fee.map(|value| value.to_string()),
+                approval_session_id: request.approval_session_id.clone(),
             },
             progress: RebalanceExecutionProgress::IntentRecorded,
         };
@@ -582,7 +572,7 @@ impl RebalanceExecutionJournal {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RebalanceCanaryRisk {
+pub struct RebalanceRisk {
     pub transfer_count: u16,
     pub active_transfer_count: usize,
     pub failed_transfer_count: usize,
@@ -701,9 +691,7 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
             },
         ) => true,
         (
-            RebalanceExecutionAuthority::ArbitrumM9Prefunding
-            | RebalanceExecutionAuthority::ArbitrumM10Canary
-            | RebalanceExecutionAuthority::ArbitrumFullLive,
+            RebalanceExecutionAuthority::ArbitrumFullLive,
             Route::Direct {
                 chain_id: 42_161,
                 binance_network,
@@ -716,25 +704,19 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
         "rebalance execution authority does not own the selected route"
     );
     ensure!(
-        matches!(
-            request.authority,
-            RebalanceExecutionAuthority::ArbitrumM10Canary
-                | RebalanceExecutionAuthority::ArbitrumFullLive
-        ) == (request.canary_maximum_fee.is_some() && request.canary_approval_session_id.is_some()),
-        "only M10 rebalance requests carry canary fee and approval-session authority"
+        (request.authority == RebalanceExecutionAuthority::ArbitrumFullLive)
+            == (request.maximum_fee.is_some() && request.approval_session_id.is_some()),
+        "only Arbitrum production rebalance requests carry fee and approval-session authority"
     );
     ensure!(
-        matches!(
-            request.authority,
-            RebalanceExecutionAuthority::ArbitrumM10Canary
-                | RebalanceExecutionAuthority::ArbitrumFullLive
-        ) || (request.canary_maximum_fee.is_none() && request.canary_approval_session_id.is_none()),
-        "non-M10 rebalance request carries canary authority"
+        request.authority == RebalanceExecutionAuthority::ArbitrumFullLive
+            || (request.maximum_fee.is_none() && request.approval_session_id.is_none()),
+        "non-Arbitrum rebalance request carries Arbitrum production authority"
     );
-    if let Some(maximum_fee) = request.canary_maximum_fee {
+    if let Some(maximum_fee) = request.maximum_fee {
         ensure!(
             request.action.direction == Direction::WalletToBinance || !maximum_fee.is_zero(),
-            "M10 Binance withdrawal maximum fee is zero"
+            "rebalance Binance withdrawal maximum fee is zero"
         );
     }
     match request.action.direction {
@@ -810,7 +792,7 @@ fn validate_operation(operation: &RebalanceExecutionOperation) -> anyhow::Result
             "rebalance failure reason is invalid"
         );
     }
-    if let Some(maximum_fee) = &intent.canary_maximum_fee_base_units {
+    if let Some(maximum_fee) = &intent.maximum_fee_base_units {
         let maximum_fee =
             U256::from_str(maximum_fee).context("rebalance canary maximum fee is not a uint256")?;
         ensure!(
@@ -821,26 +803,21 @@ fn validate_operation(operation: &RebalanceExecutionOperation) -> anyhow::Result
             intent
                 .scope
                 .as_ref()
-                .is_some_and(|scope| scope.strategy_id == "rebalance-arbitrum-usdc-esp-m10"),
-            "rebalance canary fee authority has the wrong journal scope"
+                .is_some_and(|scope| scope.network_id == "chain:42161"),
+            "Arbitrum rebalance fee authority has the wrong journal scope"
         );
-        let approval_session_id = intent
-            .canary_approval_session_id
-            .as_deref()
-            // Operations written by the completed R1 runtime predate the
-            // explicit session field. Their byte-exact checksummed journal
-            // records remain recoverable and are assigned only to R1.
-            .unwrap_or("esp-usdc-arbitrum-rebalance-20260730-r1");
-        ensure!(
-            (8..=64).contains(&approval_session_id.len())
-                && approval_session_id.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
-                }),
-            "rebalance canary approval session id is invalid"
-        );
+        if let Some(approval_session_id) = intent.approval_session_id.as_deref() {
+            ensure!(
+                (8..=64).contains(&approval_session_id.len())
+                    && approval_session_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+                    }),
+                "rebalance approval session id is invalid"
+            );
+        }
     } else {
         ensure!(
-            intent.canary_approval_session_id.is_none(),
+            intent.approval_session_id.is_none(),
             "rebalance intent has an approval session without canary fee authority"
         );
     }
@@ -1318,8 +1295,8 @@ fn request_fingerprint(request: &RebalanceExecutionRequest) -> anyhow::Result<St
         "amount": request.action.amount.to_string(),
         "binance_before": request.binance_balance_before.to_string(),
         "wallet_before": request.wallet_balance_before.to_string(),
-        "canary_maximum_fee": request.canary_maximum_fee.map(|value| value.to_string()),
-        "canary_approval_session_id": request.canary_approval_session_id,
+        "maximum_fee": request.maximum_fee.map(|value| value.to_string()),
+        "approval_session_id": request.approval_session_id,
     }))?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
@@ -1450,12 +1427,18 @@ mod tests {
     }
 
     fn request(direction: Direction, route: Route) -> RebalanceExecutionRequest {
+        let is_arbitrum = matches!(
+            &route,
+            Route::Direct {
+                chain_id: 42_161,
+                ..
+            }
+        );
         RebalanceExecutionRequest {
-            authority: match &route {
-                Route::Direct {
-                    chain_id: 42_161, ..
-                } => RebalanceExecutionAuthority::ArbitrumM9Prefunding,
-                _ => RebalanceExecutionAuthority::WorldChainV12,
+            authority: if is_arbitrum {
+                RebalanceExecutionAuthority::ArbitrumFullLive
+            } else {
+                RebalanceExecutionAuthority::WorldChainV12
             },
             token_symbol: "USDC".to_owned(),
             token_decimals: 6,
@@ -1468,8 +1451,8 @@ mod tests {
             },
             binance_balance_before: U256::from(8_000_000_u64),
             wallet_balance_before: U256::from(8_000_000_u64),
-            canary_maximum_fee: None,
-            canary_approval_session_id: None,
+            maximum_fee: is_arbitrum.then(|| U256::from(100_000_u64)),
+            approval_session_id: is_arbitrum.then(|| "esp-usdc-arbitrum-full-live".to_owned()),
         }
     }
 
@@ -1495,8 +1478,8 @@ mod tests {
     }
 
     #[test]
-    fn m6_rebalance_parent_is_account_network_and_strategy_scoped() {
-        let path = path("m6-scope");
+    fn rebalance_parent_is_account_network_and_strategy_scoped() {
+        let path = path("scoped-scope");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
             .reserve(&request(Direction::WalletToBinance, across()))
@@ -1675,8 +1658,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_m12_standard_failure_can_close_only_with_manual_receipt_completion() {
-        let path = path("m12-manual-receipt-completion");
+    fn terminal_standard_failure_can_close_only_with_proven_receipt_completion() {
+        let path = path("manual_recovery-manual-receipt-completion");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
             .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
@@ -1771,8 +1754,8 @@ mod tests {
     }
 
     #[test]
-    fn production_derived_m10_journal_suffix_replays_before_deploy() {
-        let path = path("production-derived-m10-replay");
+    fn production_derived_journal_suffix_replays_before_deploy() {
+        let path = path("production-derived-rebalance-replay");
         let wallet: Address = "0x90D990C81320221D2882De32beeA78923c1e77A3"
             .parse()
             .unwrap();
@@ -1781,7 +1764,7 @@ mod tests {
                 schema_version: 2,
                 account_id: "binance:trading-subaccount".to_owned(),
                 network_id: "chain:42161".to_owned(),
-                strategy_id: "prefund-arbitrum-usdc-esp-m9".to_owned(),
+                strategy_id: "rebalance-arbitrum-usdc-esp".to_owned(),
             }),
             operation_id: "rebalance-268-15f59bc55dcaed54".to_owned(),
             fingerprint: "15f59bc55dcaed549afe3267c3988827e838a58bf900ec6b522333f8b07e3e8f"
@@ -1799,8 +1782,8 @@ mod tests {
             binance_balance_before: U256::from(10_000_u64)
                 * U256::from(10_u64).pow(U256::from(18_u64)),
             wallet_balance_before: U256::ZERO,
-            canary_maximum_fee_base_units: None,
-            canary_approval_session_id: None,
+            maximum_fee_base_units: None,
+            approval_session_id: None,
         };
         let usdc_intent = super::RebalanceExecutionIntent {
             scope: Some(super::RebalanceJournalScope {
@@ -1824,8 +1807,8 @@ mod tests {
             amount: U256::from(1_197_503_244_u64),
             binance_balance_before: U256::from(3_075_000_679_u64),
             wallet_balance_before: U256::from(679_994_191_u64),
-            canary_maximum_fee_base_units: None,
-            canary_approval_session_id: None,
+            maximum_fee_base_units: None,
+            approval_session_id: None,
         };
         let operation = |intent: &super::RebalanceExecutionIntent, progress| {
             super::RebalanceExecutionOperation {
@@ -2404,21 +2387,20 @@ mod tests {
     }
 
     #[test]
-    fn m10_cumulative_risk_is_derived_from_the_durable_saga_after_restart() {
-        let path = path("m10-risk");
+    fn cumulative_risk_is_derived_from_the_durable_saga_after_restart() {
+        let path = path("rebalance-risk");
         let operation_id;
         {
             let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
             let mut request = request(Direction::BinanceToWallet, direct_arbitrum());
-            request.authority = RebalanceExecutionAuthority::ArbitrumM10Canary;
+            request.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
             request.action.amount = U256::from(900_000_u64);
             request.binance_balance_before = U256::from(1_000_000_u64);
-            request.canary_maximum_fee = Some(U256::from(100_000_u64));
-            request.canary_approval_session_id =
-                Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned());
+            request.maximum_fee = Some(U256::from(100_000_u64));
+            request.approval_session_id = Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned());
             operation_id = journal.reserve(&request).unwrap().intent.operation_id;
             let risk = journal
-                .m10_canary_risk("esp-usdc-arbitrum-rebalance-test-r2")
+                .rebalance_risk("esp-usdc-arbitrum-rebalance-test-r2")
                 .unwrap();
             assert_eq!(risk.transfer_count, 1);
             assert_eq!(risk.active_transfer_count, 1);
@@ -2437,7 +2419,7 @@ mod tests {
 
         let journal = RebalanceExecutionJournal::open(&path).unwrap();
         let risk = journal
-            .m10_canary_risk("esp-usdc-arbitrum-rebalance-test-r2")
+            .rebalance_risk("esp-usdc-arbitrum-rebalance-test-r2")
             .unwrap();
         assert_eq!(risk.transfer_count, 1);
         assert_eq!(risk.active_transfer_count, 0);
@@ -2445,7 +2427,7 @@ mod tests {
         assert!(journal.active_operation().unwrap().is_none());
         assert_eq!(
             journal
-                .latest_m10_operation("esp-usdc-arbitrum-rebalance-test-r2")
+                .latest_rebalance_operation("esp-usdc-arbitrum-rebalance-test-r2")
                 .unwrap()
                 .intent
                 .operation_id,
@@ -2456,133 +2438,19 @@ mod tests {
     }
 
     #[test]
-    fn renewed_m10_session_ignores_terminal_r1_risk_but_preserves_global_recovery() {
-        const R1: &str = "esp-usdc-arbitrum-rebalance-20260730-r1";
-        const R2: &str = "esp-usdc-arbitrum-rebalance-20260731-r2";
-        let path = path("m10-renewed-session");
-        let r2_operation_id;
-        {
-            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
-            let mut r1 = request(Direction::BinanceToWallet, direct_arbitrum());
-            r1.authority = RebalanceExecutionAuthority::ArbitrumM10Canary;
-            r1.token_symbol = "ESP".to_owned();
-            r1.token_decimals = 18;
-            r1.action.amount = U256::from(401_200_000_000_000_000_000_u128);
-            r1.binance_balance_before =
-                U256::from(10_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
-            r1.canary_maximum_fee = Some(U256::from(2_000_000_000_000_000_000_u128));
-            r1.canary_approval_session_id = Some(R1.to_owned());
-            let r1_operation_id = journal.reserve(&r1).unwrap().intent.operation_id;
-
-            let mut r2 = r1.clone();
-            r2.action.amount =
-                U256::from(4_464_938_180_550_u64) * U256::from(10_u64).pow(U256::from(9_u64));
-            r2.canary_approval_session_id = Some(R2.to_owned());
-            assert!(
-                journal.reserve(&r2).is_err(),
-                "an active prior session must still own the one global mutation lane"
-            );
-
-            journal
-                .advance(
-                    &r1_operation_id,
-                    RebalanceExecutionProgress::Failed {
-                        reason: "historical reviewed terminal outcome".to_owned(),
-                    },
-                )
-                .unwrap();
-            assert_eq!(journal.m10_canary_risk(R1).unwrap().transfer_count, 1);
-            assert_eq!(
-                journal.m10_canary_risk(R2).unwrap(),
-                super::RebalanceCanaryRisk::default()
-            );
-
-            r2_operation_id = journal.reserve(&r2).unwrap().intent.operation_id;
-            let r2_risk = journal.m10_canary_risk(R2).unwrap();
-            assert_eq!(r2_risk.transfer_count, 1);
-            assert_eq!(r2_risk.active_transfer_count, 1);
-            assert_eq!(r2_risk.token_b_debit, r2.action.amount);
-            assert_eq!(
-                journal
-                    .latest_m10_operation(R2)
-                    .unwrap()
-                    .intent
-                    .canary_approval_session_id
-                    .as_deref(),
-                Some(R2)
-            );
-        }
-
-        let journal = RebalanceExecutionJournal::open(&path).unwrap();
-        assert_eq!(
-            journal
-                .active_operation()
-                .unwrap()
-                .unwrap()
-                .intent
-                .operation_id,
-            r2_operation_id
-        );
-        assert_eq!(journal.m10_canary_risk(R1).unwrap().transfer_count, 1);
-        assert_eq!(journal.m10_canary_risk(R2).unwrap().transfer_count, 1);
-        drop(journal);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn legacy_m10_intent_without_session_is_recoverable_only_as_r1() {
-        let operation = super::RebalanceExecutionOperation {
-            intent: super::RebalanceExecutionIntent {
-                scope: Some(super::RebalanceJournalScope {
-                    schema_version: 2,
-                    account_id: "binance:trading-subaccount".to_owned(),
-                    network_id: "chain:42161".to_owned(),
-                    strategy_id: "rebalance-arbitrum-usdc-esp-m10".to_owned(),
-                }),
-                operation_id: "rebalance-legacy-r1".to_owned(),
-                fingerprint: "1".repeat(64),
-                withdraw_order_id: "rblegacyr1".to_owned(),
-                token_symbol: "ESP".to_owned(),
-                token_decimals: 18,
-                token_contract: Address::repeat_byte(0x11),
-                wallet_owner: Address::repeat_byte(0x22),
-                direction: Direction::BinanceToWallet,
-                route: direct_arbitrum(),
-                amount: U256::from(401_200_000_000_000_000_000_u128),
-                binance_balance_before: U256::from(10_000_u64)
-                    * U256::from(10_u64).pow(U256::from(18_u64)),
-                wallet_balance_before: U256::ZERO,
-                canary_maximum_fee_base_units: Some(
-                    U256::from(2_000_000_000_000_000_000_u128).to_string(),
-                ),
-                canary_approval_session_id: None,
-            },
-            progress: RebalanceExecutionProgress::Failed {
-                reason: "historical terminal result".to_owned(),
-            },
-        };
-        super::validate_operation(&operation).unwrap();
-
-        let mut request = request(Direction::BinanceToWallet, direct_arbitrum());
-        request.authority = RebalanceExecutionAuthority::ArbitrumM10Canary;
-        request.canary_maximum_fee = Some(U256::from(100_000_u64));
-        assert!(super::validate_request(&request).is_err());
-    }
-
-    #[test]
-    fn m10_wallet_deposit_has_zero_token_fee_but_still_consumes_transfer_authority() {
-        let path = path("m10-wallet-deposit");
+    fn wallet_deposit_has_zero_token_fee_but_still_consumes_transfer_authority() {
+        let path = path("rebalance-wallet-deposit");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let mut request = request(Direction::WalletToBinance, direct_arbitrum());
-        request.authority = RebalanceExecutionAuthority::ArbitrumM10Canary;
+        request.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
         request.action.amount = U256::from(900_000_u64);
         request.wallet_balance_before = U256::from(1_000_000_u64);
-        request.canary_maximum_fee = Some(U256::ZERO);
-        request.canary_approval_session_id = Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned());
+        request.maximum_fee = Some(U256::ZERO);
+        request.approval_session_id = Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned());
         journal.reserve(&request).unwrap();
 
         let risk = journal
-            .m10_canary_risk("esp-usdc-arbitrum-rebalance-test-r2")
+            .rebalance_risk("esp-usdc-arbitrum-rebalance-test-r2")
             .unwrap();
         assert_eq!(risk.transfer_count, 1);
         assert_eq!(risk.active_transfer_count, 1);
@@ -2598,16 +2466,16 @@ mod tests {
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let mut request = request(Direction::BinanceToWallet, direct_arbitrum());
         request.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
-        request.canary_maximum_fee = Some(U256::from(100_000_u64));
-        request.canary_approval_session_id = Some("esp-usdc-arbitrum-full-live".to_owned());
+        request.maximum_fee = Some(U256::from(100_000_u64));
+        request.approval_session_id = Some("esp-usdc-arbitrum-full-live".to_owned());
         let operation = journal.reserve(&request).unwrap();
 
         assert_eq!(
             operation.intent.scope.as_ref().unwrap().strategy_id,
-            "rebalance-arbitrum-usdc-esp-m10"
+            "rebalance-arbitrum-usdc-esp"
         );
         let risk = journal
-            .m10_canary_risk("esp-usdc-arbitrum-full-live")
+            .rebalance_risk("esp-usdc-arbitrum-full-live")
             .unwrap();
         assert_eq!(risk.transfer_count, 1);
         assert_eq!(risk.active_transfer_count, 1);
@@ -2616,18 +2484,18 @@ mod tests {
     }
 
     #[test]
-    fn m10_authority_cannot_select_a_bridge_or_another_network() {
-        let path = path("m10-direct-only");
+    fn production_authority_cannot_select_a_bridge_or_another_network() {
+        let path = path("rebalance-direct-only");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let mut bridged = request(Direction::BinanceToWallet, across());
-        bridged.authority = RebalanceExecutionAuthority::ArbitrumM10Canary;
-        bridged.canary_maximum_fee = Some(U256::from(100_000_u64));
-        bridged.canary_approval_session_id = Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned());
+        bridged.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
+        bridged.maximum_fee = Some(U256::from(100_000_u64));
+        bridged.approval_session_id = Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned());
         assert!(journal.reserve(&bridged).is_err());
 
         let mut wrong_network = request(Direction::BinanceToWallet, direct_arbitrum());
-        wrong_network.authority = RebalanceExecutionAuthority::ArbitrumM10Canary;
-        wrong_network.canary_maximum_fee = Some(U256::from(100_000_u64));
+        wrong_network.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
+        wrong_network.maximum_fee = Some(U256::from(100_000_u64));
         let Route::Direct {
             binance_network, ..
         } = &mut wrong_network.action.route

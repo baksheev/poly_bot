@@ -8,7 +8,7 @@ WITH risk AS
         JSONExtractUInt(payload_json, 'failed_transfer_count') AS failed_transfer_count,
         JSONExtractString(payload_json, 'outcome') AS outcome
     FROM runtime_telemetry
-    WHERE kind = 'm10_rebalance_risk_snapshot'
+    WHERE kind = 'rebalance_risk_snapshot'
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND startsWith(JSONExtractString(payload_json, 'engine_id'), 'arb-bot-rust-shadow-gke-')
@@ -104,11 +104,11 @@ sagas AS
             AS saga_p99_us,
         max(JSONExtractUInt(payload_json, 'saga_duration_us')) AS saga_max_us
     FROM runtime_telemetry
-    WHERE kind = 'm10_rebalance_saga'
+    WHERE kind = 'rebalance_saga'
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND JSONExtractString(payload_json, 'strategy_id')
-          = 'rebalance-arbitrum-usdc-esp-m10'
+          = 'rebalance-arbitrum-usdc-esp'
       AND JSONExtractString(payload_json, 'approval_session_id')
           = 'esp-usdc-arbitrum-full-live'
     GROUP BY engine_id
@@ -125,11 +125,11 @@ children AS
         max(JSONExtractUInt(payload_json, 'duration_us'))
             AS binance_capital_child_max_us
     FROM runtime_telemetry
-    WHERE kind = 'm10_rebalance_child'
+    WHERE kind = 'rebalance_child'
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND JSONExtractString(payload_json, 'strategy_id')
-          = 'rebalance-arbitrum-usdc-esp-m10'
+          = 'rebalance-arbitrum-usdc-esp'
       AND JSONExtractString(payload_json, 'approval_session_id')
           = 'esp-usdc-arbitrum-full-live'
     GROUP BY engine_id
@@ -182,7 +182,7 @@ SELECT
         saga_count = 0,
         'armed',
         'full_live_observed'
-    ) AS m13_gate
+    ) AS production_gate
 FROM latest
 LEFT JOIN rebalance_planner USING (engine_id)
 LEFT JOIN allocator_audit USING (engine_id)

@@ -91,7 +91,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("hot_path_direct_binance_poll"));
     assert!(MAIN.contains("hot_path_dependency_index"));
     assert!(MAIN.contains("hot_path_sizing_policy"));
-    assert!(MAIN.contains("canary_external_mutation_authorized"));
+    assert!(MAIN.contains("secondary_hot_path_external_mutation_authorized"));
     assert!(MAIN.contains("portfolio_inventory_key"));
     assert!(MAIN.contains("portfolio_location_count"));
     assert!(MAIN.contains("portfolio_allocator_mode"));
@@ -100,7 +100,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("ESP full-live production strategy configured"));
     assert!(MAIN.contains("shared_inventory_owner"));
     assert!(MAIN.contains("shared_binance_order_owner"));
-    assert!(MAIN.contains("canary_rebalance_mutation_enabled"));
+    assert!(MAIN.contains("secondary_hot_path_rebalance_mutation_authorized"));
     assert!(MAIN.contains("report_strategy_dependency_faults"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
@@ -147,23 +147,16 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOY_WORKFLOW.contains("router_allowance_mode"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_a_debit_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_b_debit_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("has(\\\"live_canary\\\")"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].full_live"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
 }
 
 #[test]
-fn gke_full_live_runtime_has_no_one_shot_prefunder_and_keeps_durable_state() {
+fn gke_full_live_runtime_keeps_durable_state_and_safe_rollback_guards() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
     assert!(DEPLOYMENT.contains("arb-bot/durable-state-schema-version: \"2\""));
     assert!(!DEPLOYMENT.contains("initContainers:"));
-    assert!(!DEPLOYMENT.contains("name: prefund-arbitrum-m9"));
-    assert!(!DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
-    assert!(!DEPLOYMENT.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));
-    assert!(!DEPLOYMENT.contains("ARBITRUM_PREFUNDING_MARKER_PATH"));
-    assert!(!DEPLOYMENT.contains("exec arb_bot binance-esp-address-verification-transfer"));
-    assert!(!DEPLOYMENT.contains("exec arb_bot diagnose-arbitrum-esp-withdrawal"));
     assert!(DEPLOYMENT.contains("claimName: arb-bot-state"));
     assert!(!DEPLOYMENT.contains("kind: Job"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
