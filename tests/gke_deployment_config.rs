@@ -102,6 +102,10 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("shared_binance_order_owner"));
     assert!(MAIN.contains("secondary_hot_path_rebalance_mutation_authorized"));
     assert!(MAIN.contains("report_strategy_dependency_faults"));
+    assert!(MAIN.contains("engine.take_adaptive_sizing_jobs()"));
+    assert!(MAIN.contains("esp_engine.take_adaptive_sizing_jobs()"));
+    assert!(MAIN.contains("engine.on_adaptive_sizing_result(result)"));
+    assert!(MAIN.contains("esp_engine.on_adaptive_sizing_result(result)"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
         .expect("startup DEX backlog drain is wired");

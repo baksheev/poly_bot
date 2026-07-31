@@ -3741,17 +3741,44 @@ async fn run(
                     .context("adaptive sizing worker join set stopped unexpectedly")?
                     .context("adaptive sizing worker panicked")?;
                 let completed_strategy_id = result.strategy_id().clone();
-                let (prepared_dex, _) = build_prepared_pools_interleaved(
-                    &mut engine,
-                    &mut pending_prepared_pool_builds,
-                    &mut dex_receiver,
-                    &wallet_heads,
-                    &receipt_heads,
-                )?;
-                if prepared_dex {
-                    engine.evaluate_after_dex_refreshes()?;
+                if completed_strategy_id == shadow_plan.strategy_id {
+                    let mut prepared_dex = false;
+                    while let Ok(dex_event) = shadow_dex_receiver.try_recv() {
+                        let head = match &dex_event {
+                            DexStreamEvent::Head { head, .. } => Some(*head),
+                            DexStreamEvent::Log { .. } => None,
+                        };
+                        if let Some(request) = esp_engine.on_dex_event(dex_event)? {
+                            build_prepared_pool_inline(&mut esp_engine, request)?;
+                            prepared_dex = true;
+                        }
+                        if let Some(head) = head {
+                            esp_wallet_heads.send_replace(head);
+                            esp_receipt_heads.send_replace(head);
+                        }
+                    }
+                    if prepared_dex {
+                        esp_engine.evaluate_after_dex_refreshes()?;
+                    }
+                    esp_engine.on_adaptive_sizing_result(result)?;
+                } else if completed_strategy_id == engine.strategy_id() {
+                    let (prepared_dex, _) = build_prepared_pools_interleaved(
+                        &mut engine,
+                        &mut pending_prepared_pool_builds,
+                        &mut dex_receiver,
+                        &wallet_heads,
+                        &receipt_heads,
+                    )?;
+                    if prepared_dex {
+                        engine.evaluate_after_dex_refreshes()?;
+                    }
+                    engine.on_adaptive_sizing_result(result)?;
+                } else {
+                    bail!(
+                        "adaptive sizing result belongs to unknown executable strategy {}",
+                        completed_strategy_id.as_str()
+                    );
                 }
-                engine.on_adaptive_sizing_result(result)?;
                 adaptive_sizing_slots.complete(&completed_strategy_id)?;
                 while let Some((_, next)) = adaptive_sizing_slots.take_ready() {
                     adaptive_sizing_tasks.spawn_blocking(move || next.run());
@@ -3793,15 +3820,27 @@ async fn run(
             engine.record_runtime_first_ready(bootstrap.process_started_at.elapsed());
             first_ready_emitted = true;
         }
-        for job in engine.take_adaptive_sizing_jobs() {
+        let adaptive_sizing_jobs = engine
+            .take_adaptive_sizing_jobs()
+            .into_iter()
+            .chain(esp_engine.take_adaptive_sizing_jobs());
+        for job in adaptive_sizing_jobs {
             let strategy_id = job.strategy_id()?;
             let submission = adaptive_sizing_slots.submit(&strategy_id, job)?;
             if submission.replaced || submission.queued_behind_running {
-                engine.record_adaptive_sizing_overload(
-                    &strategy_id,
-                    submission.replaced,
-                    adaptive_sizing_slots.total_retained_work(),
-                );
+                if strategy_id == shadow_plan.strategy_id {
+                    esp_engine.record_adaptive_sizing_overload(
+                        &strategy_id,
+                        submission.replaced,
+                        adaptive_sizing_slots.total_retained_work(),
+                    );
+                } else {
+                    engine.record_adaptive_sizing_overload(
+                        &strategy_id,
+                        submission.replaced,
+                        adaptive_sizing_slots.total_retained_work(),
+                    );
+                }
             }
         }
         while let Some((_, job)) = adaptive_sizing_slots.take_ready() {
