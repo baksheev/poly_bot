@@ -14,9 +14,10 @@ pub use planner::{
 };
 pub use runtime::{
     ApprovedAbsentMasterTransferRecovery, ApprovedAbsentStandardWithdrawalRecovery,
-    BinanceAddressVerificationTransferArtifact, BinanceAddressVerificationTransferOutcome,
-    DirectPrefundingPlan, RebalanceExecutor, RebalanceRuntimeLimits,
-    execute_binance_address_verification_transfer, plan_direct_prefunding,
+    ApprovedLocalEntityWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
+    BinanceAddressVerificationTransferOutcome, DirectPrefundingPlan, RebalanceExecutor,
+    RebalanceRuntimeLimits, execute_binance_address_verification_transfer,
+    is_approved_local_entity_withdrawal_recovery_pending, plan_direct_prefunding,
     rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
 };
 pub use tracker::{

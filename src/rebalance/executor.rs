@@ -862,10 +862,21 @@ fn validate_transition(
                 api_mode,
                 ..
             },
-        ) if reason.contains("approved deterministic Travel Rule rejection")
-            && (api_mode == "local_entity"
-                || (origin == TransitionOrigin::JournalReplay
-                    && matches!(api_mode.as_str(), "standard" | "travel_rule")))
+        ) if
+            (
+                reason.contains("approved deterministic Travel Rule rejection")
+                    && (
+                        api_mode == "standard"
+                            || (
+                                origin == TransitionOrigin::JournalReplay
+                                    && matches!(api_mode.as_str(), "local_entity" | "travel_rule")
+                            )
+                    )
+            )
+            || (
+                reason == "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency."
+                    && api_mode == "standard"
+            )
     );
     ensure!(
         !previous.terminal() || approved_terminal_retry,
@@ -1480,8 +1491,8 @@ mod tests {
     }
 
     #[test]
-    fn only_approved_travel_rule_failure_can_reopen_into_local_entity_submission_intent() {
-        let path = path("approved-local-entity-retry");
+    fn only_approved_travel_rule_failure_can_reopen_into_standard_submission_intent() {
+        let path = path("approved-standard-retry");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
             .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
@@ -1500,7 +1511,7 @@ mod tests {
             .advance(
                 &operation_id,
                 RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                    api_mode: "local_entity".to_owned(),
+                    api_mode: "standard".to_owned(),
                     bridge_balance_before: U256::ZERO,
                     reconciliation_queries: 0,
                 },
@@ -1515,8 +1526,50 @@ mod tests {
     }
 
     #[test]
+    fn exact_local_entity_031031_failure_can_reopen_only_into_standard_submission() {
+        let path = path("approved-031031-standard-retry");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency.".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "local_entity".to_owned(),
+                        bridge_balance_before: U256::ZERO,
+                        reconciliation_queries: 0,
+                    },
+                )
+                .is_err()
+        );
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::ZERO,
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn legacy_approved_terminal_retry_modes_are_replay_only() {
-        for legacy_api_mode in ["standard", "travel_rule"] {
+        for legacy_api_mode in ["local_entity", "travel_rule"] {
             let path = path(&format!("legacy-approved-retry-{legacy_api_mode}"));
             let legacy_operation;
             {

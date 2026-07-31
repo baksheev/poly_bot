@@ -149,6 +149,11 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
     assert!(DEPLOY_WORKFLOW.contains("arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance"));
     assert!(DEPLOY_WORKFLOW.contains("esp-usdc-arbitrum-rebalance-20260731-r2"));
+    assert!(DEPLOY_WORKFLOW.contains("approved_standard_withdrawal_recovery.operation_id"));
+    assert!(DEPLOY_WORKFLOW.contains("rebalance-324-8b62a7c14f4ef643"));
+    assert!(DEPLOY_WORKFLOW.contains("rb8b62a7c14f4ef6434a88c384bbb83c"));
+    assert!(DEPLOY_WORKFLOW.contains("396036135710"));
+    assert!(DEPLOY_WORKFLOW.contains("capital_history_match_count"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.approval_gate"));
     assert!(DEPLOY_WORKFLOW.contains("explicit_production_approved"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.max_parent_trades"));

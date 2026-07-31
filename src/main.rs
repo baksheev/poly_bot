@@ -86,12 +86,14 @@ use arb_bot::{
     portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_m10_rebalance_authority},
     rebalance::{
         ApprovedAbsentMasterTransferRecovery, ApprovedAbsentStandardWithdrawalRecovery,
-        BinanceAddressVerificationTransferArtifact, RebalanceCanaryRisk,
-        RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionProgress,
-        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
-        V12RebalanceParityAdapter, execute_binance_address_verification_transfer,
-        plan_direct_prefunding, rebalance_base_units_to_decimal,
-        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
+        ApprovedLocalEntityWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
+        RebalanceCanaryRisk, RebalanceExecutionAuthority, RebalanceExecutionOperation,
+        RebalanceExecutionProgress, RebalanceExecutionRequest, RebalanceExecutor,
+        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
+        execute_binance_address_verification_transfer,
+        is_approved_local_entity_withdrawal_recovery_pending, plan_direct_prefunding,
+        rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
+        route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -1210,7 +1212,7 @@ async fn prefund_arbitrum_canary(
                 U256::from_str_radix(&recovery.rejected_token_amount_base_units, 10)
                     .context("approved Travel Rule rejected amount is invalid")?;
             let completed = executor
-                .retry_approved_failed_travel_rule_with_local_entity(
+                .retry_approved_failed_travel_rule_with_standard(
                     &recovery.rejected_token_symbol,
                     rejected_amount,
                     configured_wallet,
@@ -3354,6 +3356,47 @@ async fn run(
     } else {
         (None, None)
     };
+    let approved_endpoint_recovery = m8_pair
+        .live_canary
+        .as_ref()
+        .and_then(|canary| canary.rebalance_live_canary.as_ref())
+        .and_then(|rebalance| rebalance.approved_standard_withdrawal_recovery.as_ref())
+        .map(|recovery| {
+            Ok::<_, anyhow::Error>(ApprovedLocalEntityWithdrawalRecovery {
+                operation_id: recovery.operation_id.clone(),
+                fingerprint: recovery.fingerprint.clone(),
+                withdraw_order_id: recovery.withdraw_order_id.clone(),
+                token_symbol: recovery.token_symbol.clone(),
+                amount: U256::from_str_radix(&recovery.amount_base_units, 10)
+                    .context("approved endpoint recovery amount is invalid")?,
+                wallet_owner: Address::from_str(&recovery.wallet_address)
+                    .context("approved endpoint recovery wallet is invalid")?,
+                binance_network: recovery.binance_network.clone(),
+                master_transfer_transaction_id: recovery.master_transfer_transaction_id,
+                rejected_http_status: recovery.rejected_http_status,
+                rejected_error_code: recovery.rejected_error_code,
+                rejected_error_message: recovery.rejected_error_message.clone(),
+                capital_history_match_count: recovery.capital_history_match_count,
+            })
+        })
+        .transpose()?;
+    let approved_endpoint_recovery = match approved_endpoint_recovery {
+        Some(recovery) => {
+            let executor = full_rebalance_executor
+                .as_ref()
+                .context("approved endpoint recovery has no full rebalance executor")?;
+            let operation = executor
+                .operations()
+                .get(&recovery.operation_id)
+                .context("approved endpoint recovery operation is absent from the journal")?;
+            if is_approved_local_entity_withdrawal_recovery_pending(operation) {
+                Some(recovery)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     let user_data_subscription_id = user_data_stream.subscription_id();
     let multiplexed_binance_api = user_data_stream.api();
     tracing::info!(
@@ -4084,11 +4127,16 @@ async fn run(
     let mut binance_clock_sync_running = true;
     let (rebalance_sender, mut rebalance_receiver, mut rebalance_task, m10_risk_receiver) =
         if let Some(mut executor) = full_rebalance_executor.take() {
-            let recover_on_start = rebalance_recovery_operation.is_some();
-            let recovery_target = rebalance_recovery_operation
-                .as_ref()
-                .map(rebalance_target)
-                .unwrap_or(RebalanceExecutionTarget::Primary);
+            let recover_on_start =
+                rebalance_recovery_operation.is_some() || approved_endpoint_recovery.is_some();
+            let recovery_target = if approved_endpoint_recovery.is_some() {
+                RebalanceExecutionTarget::ArbitrumCanary
+            } else {
+                rebalance_recovery_operation
+                    .as_ref()
+                    .map(rebalance_target)
+                    .unwrap_or(RebalanceExecutionTarget::Primary)
+            };
             let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(1);
             let (result_sender, result_receiver) = tokio::sync::mpsc::channel(1);
             let (risk_sender, risk_receiver) =
@@ -4099,7 +4147,14 @@ async fn run(
                 emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                 if recover_on_start {
                     let saga_started_at = Instant::now();
-                    let result = recover_rebalance_with_quote_retries(&mut executor).await;
+                    let result = if let Some(recovery) = approved_endpoint_recovery.as_ref() {
+                        executor
+                            .retry_approved_failed_local_entity_with_standard(recovery)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    } else {
+                        recover_rebalance_with_quote_retries(&mut executor).await
+                    };
                     emit_m10_rebalance_saga(
                         &rebalance_telemetry,
                         &rebalance_engine_id,

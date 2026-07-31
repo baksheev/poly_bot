@@ -170,7 +170,25 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.retry_after_verified_address" "${domain_config}")" \
             = true
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.withdrawal_api_mode" "${domain_config}")" \
+            = standard
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.operation_id" "${domain_config}")" \
+            = rebalance-324-8b62a7c14f4ef643
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.fingerprint" "${domain_config}")" \
+            = 8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.withdraw_order_id" "${domain_config}")" \
+            = rb8b62a7c14f4ef6434a88c384bbb83c
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.amount_base_units" "${domain_config}")" \
+            = 4464938180550000000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.master_transfer_transaction_id" "${domain_config}")" \
+            = 396036135710
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.rejected_api_mode" "${domain_config}")" \
             = local_entity
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.retry_api_mode" "${domain_config}")" \
+            = standard
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.rejected_error_code" "${domain_config}")" = -4024
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.capital_history_match_count" "${domain_config}")" = 0
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.capital_history_checked_at_utc" "${domain_config}")" \
+            = 2026-07-31T09:02:15Z
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_symbol" "${domain_config}")" \
             = ESP
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_amount_base_units" "${domain_config}")" \

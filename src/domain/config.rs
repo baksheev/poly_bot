@@ -482,6 +482,30 @@ pub struct LiveCanaryRebalanceConfig {
     pub maximum_unknown_reconciliation_queries: u16,
     pub direct_route_only: bool,
     pub bridge_mutations_enabled: bool,
+    #[serde(default)]
+    pub approved_standard_withdrawal_recovery: Option<LiveCanaryStandardWithdrawalRecoveryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryStandardWithdrawalRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub operation_id: String,
+    pub fingerprint: String,
+    pub withdraw_order_id: String,
+    pub token_symbol: String,
+    pub amount_base_units: String,
+    pub wallet_address: String,
+    pub binance_network: String,
+    pub master_transfer_transaction_id: u64,
+    pub rejected_api_mode: String,
+    pub retry_api_mode: String,
+    pub rejected_http_status: u16,
+    pub rejected_error_code: i64,
+    pub rejected_error_message: String,
+    pub capital_history_match_count: u16,
+    pub capital_history_checked_at_utc: String,
 }
 
 impl LiveCanaryRebalanceConfig {
@@ -553,14 +577,28 @@ impl LiveCanaryRebalanceConfig {
             "live_canary.rebalance_live_canary.maximum_token_b_fee_base_units",
         )?;
         let reviewed_caps = match self.approval_session_id.as_str() {
-            "esp-usdc-arbitrum-rebalance-20260730-r1" => (
-                U256::from(25_000_000_u64),
-                U256::from(401_200_000_000_000_000_000_u128),
-            ),
-            "esp-usdc-arbitrum-rebalance-20260731-r2" => (
-                U256::from(2_600_000_000_u64),
-                U256::from(10_000_u64) * U256::from(10_u64).pow(U256::from(18_u64)),
-            ),
+            "esp-usdc-arbitrum-rebalance-20260730-r1" => {
+                ensure!(
+                    self.approved_standard_withdrawal_recovery.is_none(),
+                    "pair {} R1 cannot approve a later endpoint recovery",
+                    pair.id
+                );
+                (
+                    U256::from(25_000_000_u64),
+                    U256::from(401_200_000_000_000_000_000_u128),
+                )
+            }
+            "esp-usdc-arbitrum-rebalance-20260731-r2" => {
+                let recovery = self
+                    .approved_standard_withdrawal_recovery
+                    .as_ref()
+                    .context("R2 requires the exact approved standard-withdrawal recovery")?;
+                recovery.validate(pair)?;
+                (
+                    U256::from(2_600_000_000_u64),
+                    U256::from(10_000_u64) * U256::from(10_u64).pow(U256::from(18_u64)),
+                )
+            }
             _ => {
                 anyhow::bail!(
                     "pair {} M10 approval session is not a reviewed production session",
@@ -576,6 +614,36 @@ impl LiveCanaryRebalanceConfig {
                 && token_a_fee < token_a_debit
                 && token_b_fee < token_b_debit,
             "pair {} M10 value or fee caps differ from the reviewed approval session",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+impl LiveCanaryStandardWithdrawalRecoveryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        ensure!(
+            self.production_approval_actor == "operator"
+                && self.production_approval_recorded_at_utc == "2026-07-31T09:01:31Z"
+                && self.operation_id == "rebalance-324-8b62a7c14f4ef643"
+                && self.fingerprint
+                    == "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a"
+                && self.withdraw_order_id == "rb8b62a7c14f4ef6434a88c384bbb83c"
+                && self.token_symbol == "ESP"
+                && self.amount_base_units == "4464938180550000000000"
+                && self
+                    .wallet_address
+                    .eq_ignore_ascii_case("0x90D990C81320221D2882De32beeA78923c1e77A3")
+                && self.binance_network == "ARBITRUM"
+                && self.master_transfer_transaction_id == 396_036_135_710
+                && self.rejected_api_mode == "local_entity"
+                && self.retry_api_mode == "standard"
+                && self.rejected_http_status == 400
+                && self.rejected_error_code == -4024
+                && self.rejected_error_message == "[031031] User does not own this currency."
+                && self.capital_history_match_count == 0
+                && self.capital_history_checked_at_utc == "2026-07-31T09:02:15Z",
+            "pair {} standard-withdrawal recovery differs from the exact reviewed incident",
             pair.id
         );
         Ok(())
@@ -697,13 +765,25 @@ pub struct LiveCanaryAbsentMasterTransferRecoveryConfig {
 
 impl LiveCanaryPrefundingRebalanceConfig {
     fn validate(&self, pair: &PairConfig, canary: &LiveCanaryConfig) -> anyhow::Result<()> {
+        let expected_withdrawal_api_mode =
+            if canary
+                .rebalance_live_canary
+                .as_ref()
+                .is_some_and(|rebalance| {
+                    rebalance.approval_session_id == "esp-usdc-arbitrum-rebalance-20260731-r2"
+                })
+            {
+                "standard"
+            } else {
+                "local_entity"
+            };
         ensure!(
             self.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
                 && canary.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
                 && !self.production_approval_actor.trim().is_empty()
                 && self.production_approval_recorded_at_utc.ends_with('Z')
                 && self.binance_network == "ARBITRUM"
-                && self.withdrawal_api_mode == "local_entity"
+                && self.withdrawal_api_mode == expected_withdrawal_api_mode
                 && pair.chain.chain_id == 42_161
                 && pair.chain.binance_network_name == self.binance_network
                 && self.maximum_transfer_count == 2,
@@ -1847,7 +1927,7 @@ mod tests {
         assert_eq!(canary.runtime_wallet_token_b_minimum(), "1");
         let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
         assert_eq!(prefunding.binance_network, "ARBITRUM");
-        assert_eq!(prefunding.withdrawal_api_mode, "local_entity");
+        assert_eq!(prefunding.withdrawal_api_mode, "standard");
         assert_eq!(prefunding.maximum_transfer_count, 2);
         assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
         assert_eq!(
@@ -1903,6 +1983,24 @@ mod tests {
         assert_eq!(rebalance.maximum_unknown_reconciliation_queries, 1);
         assert!(rebalance.direct_route_only);
         assert!(!rebalance.bridge_mutations_enabled);
+        let endpoint_recovery = rebalance
+            .approved_standard_withdrawal_recovery
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            endpoint_recovery.operation_id,
+            "rebalance-324-8b62a7c14f4ef643"
+        );
+        assert_eq!(
+            endpoint_recovery.withdraw_order_id,
+            "rb8b62a7c14f4ef6434a88c384bbb83c"
+        );
+        assert_eq!(
+            endpoint_recovery.amount_base_units,
+            "4464938180550000000000"
+        );
+        assert_eq!(endpoint_recovery.retry_api_mode, "standard");
+        assert_eq!(endpoint_recovery.capital_history_match_count, 0);
         assert!(canary.rebalance_mutations_enabled);
         let evm_recovery = prefunding
             .approved_evm_prebroadcast_rejection
@@ -1979,7 +2077,12 @@ mod tests {
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["prefunding_rebalance"]["withdrawal_api_mode"] =
-            Value::String("standard".to_owned());
+            Value::String("local_entity".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_standard_withdrawal_recovery"]
+            ["withdraw_order_id"] = Value::String("rbwrong".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();

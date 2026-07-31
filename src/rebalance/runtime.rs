@@ -20,8 +20,8 @@ use crate::{
     binance::{
         account::{AccountInformation, BinanceAccountClient, BinanceApiError},
         capital::{
-            BinanceWithdrawalRejected, DepositRecord, NetworkInformation,
-            TravelRuleWithdrawalRecord, WithdrawalRecord, select_capital_routes,
+            DepositRecord, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
+            select_capital_routes,
         },
         sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
@@ -47,7 +47,7 @@ const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
 const GAS_LIMIT_MARGIN_DENOMINATOR: u64 = 100;
 const MAX_ERC20_GAS_LIMIT: u64 = 1_000_000;
 const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
-const BINANCE_WITHDRAWAL_API_MODE: &str = "local_entity";
+const BINANCE_WITHDRAWAL_API_MODE: &str = "standard";
 const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
@@ -83,6 +83,22 @@ pub struct ApprovedAbsentStandardWithdrawalRecovery {
     pub rejected_http_status: u16,
     pub rejected_error_code: i64,
     pub rejected_error_message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedLocalEntityWithdrawalRecovery {
+    pub operation_id: String,
+    pub fingerprint: String,
+    pub withdraw_order_id: String,
+    pub token_symbol: String,
+    pub amount: U256,
+    pub wallet_owner: Address,
+    pub binance_network: String,
+    pub master_transfer_transaction_id: u64,
+    pub rejected_http_status: u16,
+    pub rejected_error_code: i64,
+    pub rejected_error_message: String,
+    pub capital_history_match_count: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1342,7 +1358,7 @@ impl RebalanceExecutor {
         Ok(completed)
     }
 
-    pub async fn retry_approved_failed_travel_rule_with_local_entity(
+    pub async fn retry_approved_failed_travel_rule_with_standard(
         &mut self,
         token_symbol: &str,
         amount: U256,
@@ -1453,6 +1469,120 @@ impl RebalanceExecutor {
             api_mode = BINANCE_WITHDRAWAL_API_MODE,
             reused_master_transfer_id = transfer.transaction_id,
             "submitted the approved direct ESP withdrawal without another master transfer"
+        );
+        self.process(operation, false).await
+    }
+
+    pub async fn retry_approved_failed_local_entity_with_standard(
+        &mut self,
+        recovery: &ApprovedLocalEntityWithdrawalRecovery,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        ensure!(
+            self.execution_journal.active_operation()?.is_none(),
+            "another rebalance operation is active"
+        );
+        let operation = self
+            .execution_journal
+            .operations()
+            .get(&recovery.operation_id)
+            .cloned()
+            .context("approved endpoint recovery lost the exact failed operation")?;
+        validate_approved_local_entity_withdrawal_recovery(&operation, recovery)?;
+        let withdrawals = self
+            .treasury_binance
+            .withdrawal_history(
+                &operation.intent.token_symbol,
+                &operation.intent.withdraw_order_id,
+            )
+            .await?;
+        ensure!(
+            withdrawals.is_empty(),
+            "approved endpoint recovery found an indexed withdrawal"
+        );
+        let transfers = self
+            .treasury_binance
+            .universal_transfer_history(&self.subaccount_email, &operation.intent.withdraw_order_id)
+            .await?;
+        ensure!(
+            transfers.len() == 1,
+            "approved endpoint recovery requires exactly one master transfer"
+        );
+        let transfer = &transfers[0];
+        validate_master_transfer_record(&operation, &self.subaccount_email, transfer)?;
+        ensure!(
+            transfer.transaction_id == recovery.master_transfer_transaction_id
+                && transfer.status == "SUCCESS",
+            "approved endpoint recovery master transfer differs or is not successful"
+        );
+        self.ensure_wallet_is_whitelisted(
+            operation.intent.wallet_owner,
+            &recovery.binance_network,
+            &operation.intent.token_symbol,
+        )
+        .await?;
+        self.verify_route(&operation, true).await?;
+        let requested =
+            base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+        let account = self.treasury_binance.account_information().await?;
+        let balance = account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == operation.intent.token_symbol)
+            .context("approved endpoint recovery asset is absent from the master account")?;
+        ensure!(
+            balance.free >= requested && balance.locked == Decimal::ZERO,
+            "approved endpoint recovery master inventory is unavailable"
+        );
+        let bridge_balance_before = self
+            .evm
+            .rpc(ARBITRUM_CHAIN_ID)?
+            .erc20_balance(
+                operation.intent.token_contract,
+                operation.intent.wallet_owner,
+            )
+            .await?;
+        let mut operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                bridge_balance_before,
+                reconciliation_queries: 0,
+            },
+        )?;
+        let submission_reference = match self
+            .submit_binance_withdrawal(&operation, &recovery.binance_network, requested)
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
+                self.execution_journal.advance(
+                    &operation.intent.operation_id,
+                    RebalanceExecutionProgress::Failed {
+                        reason: format!(
+                            "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: {error}"
+                        ),
+                    },
+                )?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                submission_reference,
+                bridge_balance_before,
+            },
+        )?;
+        tracing::info!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            amount_base_units = operation.intent.amount.to_string(),
+            withdraw_order_id = operation.intent.withdraw_order_id,
+            api_mode = BINANCE_WITHDRAWAL_API_MODE,
+            reused_master_transfer_id = transfer.transaction_id,
+            capital_history_match_count = withdrawals.len(),
+            "submitted the exact approved standard ESP withdrawal without another master transfer"
         );
         self.process(operation, false).await
     }
@@ -2497,11 +2627,11 @@ impl RebalanceExecutor {
         {
             ensure!(
                 api_mode == BINANCE_WITHDRAWAL_API_MODE,
-                "journaled Binance withdrawal API mode is not the Rails-compatible local-entity API"
+                "journaled Binance withdrawal API mode is not the standard capital API"
             );
             ensure!(
                 *reconciliation_queries == 0,
-                "journaled local-entity Binance withdrawal exhausted its one reconciliation query; operator review required"
+                "journaled standard Binance withdrawal exhausted its one reconciliation query; operator review required"
             );
         }
         let bridge_balance_before = match &operation.progress {
@@ -2533,11 +2663,11 @@ impl RebalanceExecutor {
         {
             ensure!(
                 api_mode == BINANCE_WITHDRAWAL_API_MODE,
-                "journaled Binance withdrawal API mode is not the Rails-compatible local-entity API"
+                "journaled Binance withdrawal API mode is not the standard capital API"
             );
             ensure!(
                 *reconciliation_queries == 0,
-                "journaled local-entity Binance withdrawal exceeded its reconciliation query authority"
+                "journaled standard Binance withdrawal exceeded its reconciliation query authority"
             );
             self.execution_journal.advance(
                 &operation.intent.operation_id,
@@ -2548,7 +2678,7 @@ impl RebalanceExecutor {
                 },
             )?;
             bail!(
-                "journaled local-entity Binance withdrawal submission has no indexed outcome; operator review required"
+                "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
             )
         } else {
             ensure!(
@@ -2571,8 +2701,7 @@ impl RebalanceExecutor {
             {
                 Ok(reference) => reference,
                 Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
-                    let reason =
-                        format!("terminal Binance local-entity withdrawal rejection: {error}");
+                    let reason = format!("terminal Binance standard withdrawal rejection: {error}");
                     self.execution_journal.advance(
                         &operation.intent.operation_id,
                         RebalanceExecutionProgress::Failed { reason },
@@ -2650,7 +2779,7 @@ impl RebalanceExecutor {
         let address = format!("{:#x}", operation.intent.wallet_owner);
         let submission = self
             .treasury_binance
-            .withdraw_local_entity(
+            .withdraw_standard(
                 &operation.intent.token_symbol,
                 network,
                 &address,
@@ -2658,7 +2787,7 @@ impl RebalanceExecutor {
                 &operation.intent.withdraw_order_id,
             )
             .await?;
-        Ok(submission.tr_id)
+        Ok(submission.id)
     }
 
     async fn wait_withdrawal(
@@ -3398,7 +3527,51 @@ fn is_terminal_binance_withdrawal_rejection(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<BinanceApiError>()
         .is_some_and(BinanceApiError::is_known_pre_submission_withdrawal_rejection)
-        || error.downcast_ref::<BinanceWithdrawalRejected>().is_some()
+}
+
+fn validate_approved_local_entity_withdrawal_recovery(
+    operation: &RebalanceExecutionOperation,
+    recovery: &ApprovedLocalEntityWithdrawalRecovery,
+) -> anyhow::Result<()> {
+    let expected_reason = format!(
+        "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP {} Bad Request, code {}: {}",
+        recovery.rejected_http_status,
+        recovery.rejected_error_code,
+        recovery.rejected_error_message
+    );
+    ensure!(
+        recovery.capital_history_match_count == 0
+            && operation.intent.operation_id == recovery.operation_id
+            && operation.intent.fingerprint == recovery.fingerprint
+            && operation.intent.withdraw_order_id == recovery.withdraw_order_id
+            && operation.intent.token_symbol == recovery.token_symbol
+            && operation.intent.amount == recovery.amount
+            && operation.intent.wallet_owner == recovery.wallet_owner
+            && operation.intent.direction == Direction::BinanceToWallet
+            && operation.intent.route
+                == Route::Direct {
+                    binance_network: recovery.binance_network.clone(),
+                    chain_id: ARBITRUM_CHAIN_ID,
+                }
+            && operation.intent.canary_approval_session_id.as_deref()
+                == Some("esp-usdc-arbitrum-rebalance-20260731-r2")
+            && matches!(
+                &operation.progress,
+                RebalanceExecutionProgress::Failed { reason } if reason == &expected_reason
+            ),
+        "approved endpoint recovery differs from the exact failed ESP operation"
+    );
+    Ok(())
+}
+
+pub fn is_approved_local_entity_withdrawal_recovery_pending(
+    operation: &RebalanceExecutionOperation,
+) -> bool {
+    matches!(
+        &operation.progress,
+        RebalanceExecutionProgress::Failed { reason }
+            if reason == "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency."
+    )
 }
 
 fn account_asset_balance_or_zero(account: &AccountInformation, asset: &str) -> (Decimal, Decimal) {
@@ -3685,14 +3858,16 @@ mod tests {
     };
 
     use super::{
-        ARBITRUM_CHAIN_ID, ApprovedAbsentMasterTransferRecovery,
-        ApprovedAbsentStandardWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
-        WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, account_asset_balance_or_zero,
-        base_units_to_decimal, decimal_to_base_units, decimal_to_base_units_floor,
+        ARBITRUM_CHAIN_ID, ARBITRUM_ESP, ApprovedAbsentMasterTransferRecovery,
+        ApprovedAbsentStandardWithdrawalRecovery, ApprovedLocalEntityWithdrawalRecovery,
+        BinanceAddressVerificationTransferArtifact, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
+        WORLD_CHAIN_WLD, account_asset_balance_or_zero, base_units_to_decimal,
+        decimal_to_base_units, decimal_to_base_units_floor,
         matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
         plan_direct_prefunding, reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
         shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
-        validate_direct_withdrawal_receipt, validate_manual_prefunding_withdrawal_record,
+        validate_approved_local_entity_withdrawal_recovery, validate_direct_withdrawal_receipt,
+        validate_manual_prefunding_withdrawal_record,
         validate_operator_confirmed_absent_master_transfer,
         validate_operator_confirmed_absent_standard_withdrawal, withdrawal_received_base_units,
         withdrawal_requested_base_units,
@@ -3758,6 +3933,102 @@ mod tests {
                 rejected_error_message: "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.".to_owned(),
             },
         )
+    }
+
+    #[test]
+    fn endpoint_recovery_accepts_only_the_exact_production_esp_failure() {
+        let wallet = Address::from_str("0x90D990C81320221D2882De32beeA78923c1e77A3").unwrap();
+        let operation = RebalanceExecutionOperation {
+            intent: RebalanceExecutionIntent {
+                scope: Some(RebalanceJournalScope {
+                    schema_version: 2,
+                    account_id: "binance:trading-subaccount".to_owned(),
+                    network_id: "chain:42161".to_owned(),
+                    strategy_id: "rebalance-arbitrum-usdc-esp-m10".to_owned(),
+                }),
+                operation_id: "rebalance-324-8b62a7c14f4ef643".to_owned(),
+                fingerprint:
+                    "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a"
+                        .to_owned(),
+                withdraw_order_id: "rb8b62a7c14f4ef6434a88c384bbb83c".to_owned(),
+                token_symbol: "ESP".to_owned(),
+                token_decimals: 18,
+                token_contract: Address::from_str(ARBITRUM_ESP).unwrap(),
+                wallet_owner: wallet,
+                direction: Direction::BinanceToWallet,
+                route: Route::Direct {
+                    binance_network: "ARBITRUM".to_owned(),
+                    chain_id: ARBITRUM_CHAIN_ID,
+                },
+                amount: U256::from(4_464_938_180_550_u64)
+                    * U256::from(1_000_000_000_u64),
+                binance_balance_before: U256::from(9_464_800_u64)
+                    * U256::from(1_000_000_000_000_000_u64),
+                wallet_balance_before: U256::from_str(
+                    "534923638887482447575",
+                )
+                .unwrap(),
+                canary_maximum_fee_base_units: Some("2000000000000000000".to_owned()),
+                canary_approval_session_id: Some(
+                    "esp-usdc-arbitrum-rebalance-20260731-r2".to_owned(),
+                ),
+            },
+            progress: RebalanceExecutionProgress::Failed {
+                reason: "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency.".to_owned(),
+            },
+        };
+        let recovery = ApprovedLocalEntityWithdrawalRecovery {
+            operation_id: operation.intent.operation_id.clone(),
+            fingerprint: operation.intent.fingerprint.clone(),
+            withdraw_order_id: operation.intent.withdraw_order_id.clone(),
+            token_symbol: operation.intent.token_symbol.clone(),
+            amount: operation.intent.amount,
+            wallet_owner: wallet,
+            binance_network: "ARBITRUM".to_owned(),
+            master_transfer_transaction_id: 396_036_135_710,
+            rejected_http_status: 400,
+            rejected_error_code: -4024,
+            rejected_error_message: "[031031] User does not own this currency.".to_owned(),
+            capital_history_match_count: 0,
+        };
+        validate_approved_local_entity_withdrawal_recovery(&operation, &recovery).unwrap();
+        assert!(super::is_approved_local_entity_withdrawal_recovery_pending(
+            &operation
+        ));
+
+        for changed in [
+            {
+                let mut value = recovery.clone();
+                value.fingerprint.push('0');
+                value
+            },
+            {
+                let mut value = recovery.clone();
+                value.withdraw_order_id.push('0');
+                value
+            },
+            {
+                let mut value = recovery.clone();
+                value.amount += U256::ONE;
+                value
+            },
+            {
+                let mut value = recovery.clone();
+                value.capital_history_match_count = 1;
+                value
+            },
+        ] {
+            assert!(
+                validate_approved_local_entity_withdrawal_recovery(&operation, &changed).is_err()
+            );
+        }
+        let mut submitted = operation;
+        submitted.progress = RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+            api_mode: "standard".to_owned(),
+            bridge_balance_before: U256::ZERO,
+            reconciliation_queries: 0,
+        };
+        assert!(!super::is_approved_local_entity_withdrawal_recovery_pending(&submitted));
     }
 
     #[test]

@@ -3,18 +3,18 @@ const REBALANCE_RUNTIME: &str = include_str!("../src/rebalance/runtime.rs");
 const APP_CONFIG: &str = include_str!("../src/config.rs");
 const GKE_DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
 const GCE_STARTUP: &str = include_str!("../infra/gcp/gce-startup.sh");
-const ESP_DOMAIN: &str = include_str!("../config/strategies/usdc-esp-arbitrum.v4.json");
+const ESP_DOMAIN: &str = include_str!("../config/strategies/usdc-esp-arbitrum.v5.json");
 
 #[test]
-fn every_new_withdrawal_is_compile_time_pinned_to_the_rails_local_entity_api() {
+fn every_new_withdrawal_is_compile_time_pinned_to_the_standard_capital_api() {
     assert!(CAPITAL.contains(
-        "const LOCAL_ENTITY_WITHDRAWAL_ENDPOINT: &str = \"/sapi/v1/localentity/withdraw/apply\";"
+        "const STANDARD_WITHDRAWAL_ENDPOINT: &str = \"/sapi/v1/capital/withdraw/apply\";"
     ));
-    assert!(CAPITAL.contains(".signed_post(\n                LOCAL_ENTITY_WITHDRAWAL_ENDPOINT,"));
-    assert!(!CAPITAL.contains("/sapi/v1/capital/withdraw/apply"));
-    assert!(CAPITAL.contains("\"isAddressOwner\": 1"));
-    assert!(CAPITAL.contains("\"sendTo\": 1"));
-    assert!(REBALANCE_RUNTIME.contains(".withdraw_local_entity("));
+    assert!(CAPITAL.contains(".signed_post(\n                STANDARD_WITHDRAWAL_ENDPOINT,"));
+    assert!(!CAPITAL.contains("/sapi/v1/localentity/withdraw/apply"));
+    assert!(!CAPITAL.contains("\"isAddressOwner\": 1"));
+    assert!(!CAPITAL.contains("\"sendTo\": 1"));
+    assert!(REBALANCE_RUNTIME.contains(".withdraw_standard("));
     assert!(!REBALANCE_RUNTIME.contains("withdraw_travel_rule("));
     assert!(!REBALANCE_RUNTIME.contains("api_mode == \"travel_rule\""));
 }
@@ -28,11 +28,11 @@ fn withdrawal_endpoint_cannot_be_selected_by_asset_network_or_amount_at_runtime(
 
     let domain: serde_json::Value = serde_json::from_str(ESP_DOMAIN).unwrap();
     let prefunding = &domain["pairs"][0]["live_canary"]["prefunding_rebalance"];
-    assert_eq!(prefunding["withdrawal_api_mode"], "local_entity");
+    assert_eq!(prefunding["withdrawal_api_mode"], "standard");
 }
 
 #[test]
-fn deposit_questionnaire_remains_conditional_and_separate_from_inline_withdrawal_questionnaire() {
+fn deposit_questionnaire_remains_conditional_and_separate_from_withdrawal() {
     assert!(CAPITAL.contains(
         "const DEPOSIT_TRAVEL_RULE_ENDPOINT: &str = \"/sapi/v2/localentity/deposit/provide-info\";"
     ));
@@ -41,7 +41,8 @@ fn deposit_questionnaire_remains_conditional_and_separate_from_inline_withdrawal
         CAPITAL.contains("self.require_questionnaire && self.travel_rule_req_status != Some(0)")
     );
 
-    assert!(CAPITAL.contains("/sapi/v1/localentity/withdraw/apply"));
+    assert!(CAPITAL.contains("/sapi/v1/capital/withdraw/apply"));
+    assert!(!CAPITAL.contains("/sapi/v1/localentity/withdraw/apply"));
     assert!(CAPITAL.contains("/sapi/v2/localentity/withdraw/history"));
     assert!(!REBALANCE_RUNTIME.contains(".signed_post("));
 }
@@ -103,14 +104,14 @@ fn withdrawal_unknown_outcome_and_live_fee_recheck_are_fail_closed() {
     assert!(begin.contains("*reconciliation_queries == 0"));
     assert!(begin.contains("reconciliation_queries: 1"));
     assert!(begin.contains(
-        "journaled local-entity Binance withdrawal submission has no indexed outcome; operator review required"
+        "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
     ));
     assert!(begin.contains("is_terminal_binance_withdrawal_rejection(&error)"));
     assert!(begin.contains("RebalanceExecutionProgress::Failed { reason }"));
     assert!(
         REBALANCE_RUNTIME.contains("BinanceApiError::is_known_pre_submission_withdrawal_rejection")
     );
-    assert!(REBALANCE_RUNTIME.contains("BinanceWithdrawalRejected"));
+    assert!(!REBALANCE_RUNTIME.contains("BinanceWithdrawalRejected"));
 }
 
 #[test]
@@ -129,7 +130,37 @@ fn operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal() {
     assert!(recovery.contains(".erc20_balance("));
     assert!(!recovery.contains(".withdrawal_history("));
     assert!(!recovery.contains(".withdraw_local_entity("));
+    assert!(!recovery.contains(".withdraw_standard("));
     assert!(!recovery.contains(".withdraw_travel_rule("));
+}
+
+#[test]
+fn approved_endpoint_correction_reuses_the_exact_master_transfer_and_submits_once() {
+    let start = REBALANCE_RUNTIME
+        .find("pub async fn retry_approved_failed_local_entity_with_standard(")
+        .unwrap();
+    let end = REBALANCE_RUNTIME[start..]
+        .find("async fn ensure_wallet_is_whitelisted(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let recovery = &REBALANCE_RUNTIME[start..end];
+
+    assert!(REBALANCE_RUNTIME.contains("operation.intent.fingerprint == recovery.fingerprint"));
+    assert!(
+        REBALANCE_RUNTIME
+            .contains("operation.intent.withdraw_order_id == recovery.withdraw_order_id")
+    );
+    assert!(recovery.contains(".withdrawal_history("));
+    assert!(recovery.contains("withdrawals.is_empty()"));
+    assert!(recovery.contains(".universal_transfer_history("));
+    assert!(recovery.contains("transfers.len() == 1"));
+    assert!(
+        recovery.contains("transfer.transaction_id == recovery.master_transfer_transaction_id")
+    );
+    assert!(recovery.contains(".verify_route(&operation, true)"));
+    assert!(!recovery.contains(".universal_transfer("));
+    assert_eq!(recovery.matches(".submit_binance_withdrawal(").count(), 1);
+    assert!(recovery.contains("api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned()"));
 }
 
 #[test]
@@ -148,5 +179,6 @@ fn pretransfer_crash_recovery_is_read_only_and_cannot_create_capital_work() {
     assert!(!recovery.contains(".universal_transfer("));
     assert!(!recovery.contains(".withdrawal_history("));
     assert!(!recovery.contains(".withdraw_local_entity("));
+    assert!(!recovery.contains(".withdraw_standard("));
     assert!(!recovery.contains(".withdraw_travel_rule("));
 }
