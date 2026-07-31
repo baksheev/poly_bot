@@ -51,6 +51,10 @@ complete current plan but not an erroneous unit-scaled or duplicate debit.
 - [x] A standard `-4104` history row and a later local-entity row may share the
   economic identity even when Binance omits `withdrawOrderId` on one row.
   Exact manual recovery selects the two versioned trIds from network history.
+  Both reviewed unbroadcast rows carry the full gross debit in `amount` and an
+  empty `transactionFee`; an empty fee is accepted only when `amount` already
+  equals the durable gross debit. Net amounts still require an exact numeric
+  fee before they can match.
   Restart recovery validates all matching rows, ignores only explicit
   unbroadcast failures, accepts at most one viable submission, and never
   replays an ambiguous POST.

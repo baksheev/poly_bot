@@ -4008,13 +4008,13 @@ fn matches_travel_rule_record_identity_without_client_id(
     withdraw_order_id: &str,
 ) -> bool {
     let amount = Decimal::from_str(&record.amount).ok();
-    let fee = Decimal::from_str(&record.transaction_fee).ok();
-    let exact_debit = match (amount, fee) {
-        (Some(amount), Some(fee)) => {
-            amount == requested || amount.checked_add(fee) == Some(requested)
-        }
-        _ => false,
-    };
+    let exact_debit = amount.is_some_and(|amount| {
+        amount == requested
+            || Decimal::from_str(&record.transaction_fee)
+                .ok()
+                .and_then(|fee| amount.checked_add(fee))
+                == Some(requested)
+    });
     exact_debit
         && record
             .address
@@ -4366,8 +4366,8 @@ mod tests {
         let record = |tr_id, travel_rule_status| TravelRuleWithdrawalRecord {
             id: String::new(),
             tr_id,
-            amount: "4463.83818055".to_owned(),
-            transaction_fee: "1.1".to_owned(),
+            amount: "4464.93818055".to_owned(),
+            transaction_fee: String::new(),
             coin: "ESP".to_owned(),
             withdrawal_status: None,
             travel_rule_status,
@@ -4643,6 +4643,25 @@ mod tests {
         };
         assert!(matches_travel_rule_record_identity_without_client_id(
             &record,
+            Decimal::from_str_exact("401.2").unwrap(),
+            wallet,
+            "rust-rebalance-client-id",
+        ));
+
+        let mut exact_gross_without_fee = record.clone();
+        exact_gross_without_fee.amount = "401.2".to_owned();
+        exact_gross_without_fee.transaction_fee = String::new();
+        assert!(matches_travel_rule_record_identity_without_client_id(
+            &exact_gross_without_fee,
+            Decimal::from_str_exact("401.2").unwrap(),
+            wallet,
+            "rust-rebalance-client-id",
+        ));
+
+        let mut net_without_fee = record.clone();
+        net_without_fee.transaction_fee = String::new();
+        assert!(!matches_travel_rule_record_identity_without_client_id(
+            &net_without_fee,
             Decimal::from_str_exact("401.2").unwrap(),
             wallet,
             "rust-rebalance-client-id",
