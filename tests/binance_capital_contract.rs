@@ -104,3 +104,22 @@ fn withdrawal_unknown_outcome_and_live_fee_recheck_are_fail_closed() {
         "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
     ));
 }
+
+#[test]
+fn operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal() {
+    let start = REBALANCE_RUNTIME
+        .find("pub async fn close_operator_confirmed_absent_standard_withdrawal(")
+        .unwrap();
+    let end = REBALANCE_RUNTIME[start..]
+        .find("pub async fn recover_approved_manual_direct_credit(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let recovery = &REBALANCE_RUNTIME[start..end];
+
+    assert!(recovery.contains(".universal_transfer_history("));
+    assert!(recovery.contains(".account_information()"));
+    assert!(recovery.contains(".erc20_balance("));
+    assert!(!recovery.contains(".withdrawal_history("));
+    assert!(!recovery.contains(".withdraw_standard("));
+    assert!(!recovery.contains(".withdraw_travel_rule("));
+}

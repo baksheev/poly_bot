@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "27363a0e6e8765e8b65f67d953b670b83b775cff1fc0875938425881bbd1f228",
+      "source_fingerprint_sha256": "27e806fed225c5980a1618149fff81e93dd5162f444bcf1304d27a650c38a9ae",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -91,6 +91,21 @@
                   "nonce": 1,
                   "rpc_error_code": -32000,
                   "rpc_error_message": "max fee per gas less than block base fee: address 0x90D990C81320221D2882De32beeA78923c1e77A3, maxFeePerGas: 20102000 baseFee: 20148000"
+                },
+                "approved_absent_standard_withdrawal": {
+                  "production_approval_actor": "operator",
+                  "production_approval_recorded_at_utc": "2026-07-31T01:46:08Z",
+                  "operation_id": "rebalance-288-18c185631ae867dd",
+                  "withdraw_order_id": "rb18c185631ae867ddaa4f5acda5704e",
+                  "token_symbol": "USDC",
+                  "amount_base_units": "1285195255",
+                  "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
+                  "binance_network": "OPTIMISM",
+                  "bridge_chain_id": 10,
+                  "wallet_chain_id": 480,
+                  "bridge_balance_before_base_units": "508",
+                  "master_transfer_transaction_id": 395824828151,
+                  "reconciliation_queries": 1
                 }
               },
               "rebalance_live_canary": {

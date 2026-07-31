@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -578,6 +578,9 @@ pub struct LiveCanaryPrefundingRebalanceConfig {
     #[serde(default)]
     pub approved_evm_prebroadcast_rejection:
         Option<LiveCanaryEvmPrebroadcastRejectionRecoveryConfig>,
+    #[serde(default)]
+    pub approved_absent_standard_withdrawal:
+        Option<LiveCanaryAbsentStandardWithdrawalRecoveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -616,6 +619,24 @@ pub struct LiveCanaryEvmPrebroadcastRejectionRecoveryConfig {
     pub nonce: u64,
     pub rpc_error_code: i64,
     pub rpc_error_message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub operation_id: String,
+    pub withdraw_order_id: String,
+    pub token_symbol: String,
+    pub amount_base_units: String,
+    pub wallet_address: String,
+    pub binance_network: String,
+    pub bridge_chain_id: u64,
+    pub wallet_chain_id: u64,
+    pub bridge_balance_before_base_units: String,
+    pub master_transfer_transaction_id: u64,
+    pub reconciliation_queries: u16,
 }
 
 impl LiveCanaryPrefundingRebalanceConfig {
@@ -678,9 +699,47 @@ impl LiveCanaryPrefundingRebalanceConfig {
         if let Some(recovery) = &self.approved_evm_prebroadcast_rejection {
             recovery.validate(pair)?;
         }
+        if let Some(recovery) = &self.approved_absent_standard_withdrawal {
+            recovery.validate(pair)?;
+        }
         ensure!(
             !self.retry_after_verified_address || self.approved_travel_rule_recovery.is_some(),
             "pair {} cannot retry after address verification without the exact rejected incident",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+impl LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        let amount = parse_base_units_u256(
+            &self.amount_base_units,
+            "live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.amount_base_units",
+        )?;
+        let bridge_balance_before = parse_base_units_u256(
+            &self.bridge_balance_before_base_units,
+            "live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.bridge_balance_before_base_units",
+        )?;
+        ensure!(
+            self.production_approval_actor == "operator"
+                && self.production_approval_recorded_at_utc == "2026-07-31T01:46:08Z"
+                && self.operation_id == "rebalance-288-18c185631ae867dd"
+                && self.withdraw_order_id == "rb18c185631ae867ddaa4f5acda5704e"
+                && self.token_symbol == "USDC"
+                && amount == U256::from(1_285_195_255_u64)
+                && self
+                    .wallet_address
+                    .eq_ignore_ascii_case("0x90D990C81320221D2882De32beeA78923c1e77A3")
+                && self.wallet_address.parse::<Address>().is_ok()
+                && self.binance_network == "OPTIMISM"
+                && self.bridge_chain_id == 10
+                && self.wallet_chain_id == 480
+                && bridge_balance_before == U256::from(508_u64)
+                && self.master_transfer_transaction_id == 395_824_828_151
+                && self.reconciliation_queries == 1
+                && pair.chain.chain_id == 42_161,
+            "pair {} absent standard-withdrawal recovery identity is invalid",
             pair.id
         );
         Ok(())
@@ -1743,6 +1802,25 @@ mod tests {
             evm_recovery.transaction_hash,
             "0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977"
         );
+        let absent_withdrawal = prefunding
+            .approved_absent_standard_withdrawal
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            absent_withdrawal.operation_id,
+            "rebalance-288-18c185631ae867dd"
+        );
+        assert_eq!(
+            absent_withdrawal.withdraw_order_id,
+            "rb18c185631ae867ddaa4f5acda5704e"
+        );
+        assert_eq!(absent_withdrawal.amount_base_units, "1285195255");
+        assert_eq!(absent_withdrawal.binance_network, "OPTIMISM");
+        assert_eq!(
+            absent_withdrawal.master_transfer_transaction_id,
+            395_824_828_151
+        );
+        assert_eq!(absent_withdrawal.reconciliation_queries, 1);
         assert!(pair.execution_enabled);
         assert!(pair.rebalance.enabled);
 

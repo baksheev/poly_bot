@@ -44,6 +44,17 @@ contract error.
   unknown submission fails closed after the single allowed reconciliation
   query and cannot resubmit. Evidence:
   `restart_preserves_unknown_standard_withdrawal_without_resubmission_authority`.
+- [x] The pre-existing World Chain USDC operation
+  `rebalance-288-18c185631ae867dd` exhausted that one query without an indexed
+  withdrawal. The operator separately confirmed that Binance contains no
+  withdrawal for 1,285.195255 USDC, while a read-only Optimism balance check
+  remained exactly 508 base units. Its versioned recovery also requires the
+  exact successful master-transfer ID `395824828151`, full durable
+  operation/route identity, and the returned master balance; it terminally
+  closes the old saga without another withdrawal-history query or any external
+  mutation. Evidence:
+  `operator_absence_closes_only_the_exact_exhausted_standard_withdrawal` and
+  `operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal`.
 - [x] Restart before, during, and after an Arbitrum wallet child uses the same
   operation ID and transaction journal; mined success is reused and unknown
   nonce state cannot submit another transaction. Evidence:
@@ -137,7 +148,7 @@ contract error.
 - [x] Run `scripts/quality.sh` once after the final approval edit. The first
   security audit discovered `RUSTSEC-2026-0220` in transitive `ruint 1.19.0`;
   the lockfile now selects fixed `ruint 1.20.0`, and the complete gate passes
-  with 431 library tests and only the three existing allowed unmaintained-crate
+  with 434 library tests and only the three existing allowed unmaintained-crate
   warnings.
 - [x] Confirm a clean fast-forward to current `origin/main`; after explicit
   approval, the next external action is one consolidated push/deploy of the

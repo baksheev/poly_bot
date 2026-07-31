@@ -99,6 +99,21 @@
             "nonce": 1,
             "rpc_error_code": -32000,
             "rpc_error_message": "max fee per gas less than block base fee: address 0x90D990C81320221D2882De32beeA78923c1e77A3, maxFeePerGas: 20102000 baseFee: 20148000"
+          },
+          "approved_absent_standard_withdrawal": {
+            "production_approval_actor": "operator",
+            "production_approval_recorded_at_utc": "2026-07-31T01:46:08Z",
+            "operation_id": "rebalance-288-18c185631ae867dd",
+            "withdraw_order_id": "rb18c185631ae867ddaa4f5acda5704e",
+            "token_symbol": "USDC",
+            "amount_base_units": "1285195255",
+            "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
+            "binance_network": "OPTIMISM",
+            "bridge_chain_id": 10,
+            "wallet_chain_id": 480,
+            "bridge_balance_before_base_units": "508",
+            "master_transfer_transaction_id": 395824828151,
+            "reconciliation_queries": 1
           }
         }
       },

@@ -189,6 +189,19 @@ jobs:
             = 0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.nonce" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_evm_prebroadcast_rejection.rpc_error_code" "${domain_config}")" = -32000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.operation_id" "${domain_config}")" \
+            = rebalance-288-18c185631ae867dd
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.withdraw_order_id" "${domain_config}")" \
+            = rb18c185631ae867ddaa4f5acda5704e
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.amount_base_units" "${domain_config}")" \
+            = 1285195255
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.binance_network" "${domain_config}")" \
+            = OPTIMISM
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.bridge_balance_before_base_units" "${domain_config}")" \
+            = 508
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.master_transfer_transaction_id" "${domain_config}")" \
+            = 395824828151
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.reconciliation_queries" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_router_address" "${domain_config}")" \
             = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
           test "$(jq -r "${esp} | .pairs[0].chain.uniswap_v3_quoter_address" "${domain_config}")" \

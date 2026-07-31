@@ -85,12 +85,13 @@ use arb_bot::{
     },
     portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_m10_rebalance_authority},
     rebalance::{
-        BinanceAddressVerificationTransferArtifact, RebalanceCanaryRisk,
-        RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionProgress,
-        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRuntimeLimits, RebalanceTracker,
-        V12RebalanceParityAdapter, execute_binance_address_verification_transfer,
-        plan_direct_prefunding, rebalance_base_units_to_decimal,
-        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
+        ApprovedAbsentStandardWithdrawalRecovery, BinanceAddressVerificationTransferArtifact,
+        RebalanceCanaryRisk, RebalanceExecutionAuthority, RebalanceExecutionOperation,
+        RebalanceExecutionProgress, RebalanceExecutionRequest, RebalanceExecutor,
+        RebalanceRuntimeLimits, RebalanceTracker, V12RebalanceParityAdapter,
+        execute_binance_address_verification_transfer, plan_direct_prefunding,
+        rebalance_base_units_to_decimal, rebalance_decimal_to_base_units_floor,
+        route_candidates_from_capital,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
@@ -3213,6 +3214,38 @@ async fn run(
         )
         .await?;
         executor.set_capital_canary_policy(m10_capital_policy)?;
+        if let Some(recovery) = m8_pair
+            .live_canary
+            .as_ref()
+            .and_then(|canary| canary.prefunding_rebalance.as_ref())
+            .and_then(|prefunding| prefunding.approved_absent_standard_withdrawal.as_ref())
+            && executor
+                .active_operation()?
+                .is_some_and(|operation| operation.intent.operation_id == recovery.operation_id)
+        {
+            let recovery = ApprovedAbsentStandardWithdrawalRecovery {
+                operation_id: recovery.operation_id.clone(),
+                withdraw_order_id: recovery.withdraw_order_id.clone(),
+                token_symbol: recovery.token_symbol.clone(),
+                amount: U256::from_str_radix(&recovery.amount_base_units, 10)
+                    .context("approved absent withdrawal amount is invalid")?,
+                wallet_owner: Address::from_str(&recovery.wallet_address)
+                    .context("approved absent withdrawal wallet is invalid")?,
+                binance_network: recovery.binance_network.clone(),
+                bridge_chain_id: recovery.bridge_chain_id,
+                wallet_chain_id: recovery.wallet_chain_id,
+                bridge_balance_before: U256::from_str_radix(
+                    &recovery.bridge_balance_before_base_units,
+                    10,
+                )
+                .context("approved absent withdrawal bridge balance is invalid")?,
+                master_transfer_transaction_id: recovery.master_transfer_transaction_id,
+                reconciliation_queries: recovery.reconciliation_queries,
+            };
+            executor
+                .close_operator_confirmed_absent_standard_withdrawal(&recovery)
+                .await?;
+        }
         executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
         telemetry.emit(
             "runtime_journal_recovery",
