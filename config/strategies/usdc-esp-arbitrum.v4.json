@@ -114,7 +114,7 @@
             "wallet_chain_id": 480,
             "bridge_balance_before_base_units": "508",
             "master_transfer_transaction_id": 395924104268,
-            "reconciliation_queries": 0,
+            "reconciliation_queries": 1,
             "rejected_http_status": 400,
             "rejected_error_code": -4104,
             "rejected_error_message": "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."

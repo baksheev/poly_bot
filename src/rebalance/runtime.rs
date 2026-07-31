@@ -3285,7 +3285,7 @@ fn validate_operator_confirmed_absent_standard_withdrawal(
             && recovery.wallet_chain_id == WORLD_CHAIN_CHAIN_ID
             && recovery.bridge_balance_before == U256::from(508_u64)
             && recovery.master_transfer_transaction_id == 395_924_104_268
-            && recovery.reconciliation_queries == 0
+            && recovery.reconciliation_queries == 1
             && recovery.rejected_http_status == 400
             && recovery.rejected_error_code == -4104
             && recovery.rejected_error_message
@@ -3713,7 +3713,7 @@ mod tests {
                 progress: RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                     api_mode: "standard".to_owned(),
                     bridge_balance_before: U256::from(508_u64),
-                    reconciliation_queries: 0,
+                    reconciliation_queries: 1,
                 },
             },
             ApprovedAbsentStandardWithdrawalRecovery {
@@ -3730,7 +3730,7 @@ mod tests {
                 wallet_chain_id: 480,
                 bridge_balance_before: U256::from(508_u64),
                 master_transfer_transaction_id: 395_924_104_268,
-                reconciliation_queries: 0,
+                reconciliation_queries: 1,
                 rejected_http_status: 400,
                 rejected_error_code: -4104,
                 rejected_error_message: "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.".to_owned(),
@@ -3756,7 +3756,7 @@ mod tests {
             ..
         } = &mut unexpected_history_query.progress
         {
-            *reconciliation_queries = 1;
+            *reconciliation_queries = 0;
         }
         assert!(
             validate_operator_confirmed_absent_standard_withdrawal(

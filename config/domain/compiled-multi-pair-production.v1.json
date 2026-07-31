@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "10a8d3dc8578340db33e176e44826e0288e20a3edd1e2a663da650b94490b9a3",
+      "source_fingerprint_sha256": "008841bbc05a5568f85b0470983b448763bae37ef751a73873f03e718dd92f1e",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
@@ -106,7 +106,7 @@
                   "wallet_chain_id": 480,
                   "bridge_balance_before_base_units": "508",
                   "master_transfer_transaction_id": 395924104268,
-                  "reconciliation_queries": 0,
+                  "reconciliation_queries": 1,
                   "rejected_http_status": 400,
                   "rejected_error_code": -4104,
                   "rejected_error_message": "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."

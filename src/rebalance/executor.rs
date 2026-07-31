@@ -329,7 +329,11 @@ impl RebalanceExecutionJournal {
             operation_started_at_unix_ms
                 .entry(payload.operation.intent.operation_id.clone())
                 .or_insert(payload.recorded_at_unix_ms);
-            apply_snapshot(&mut operations, &payload.operation)?;
+            apply_snapshot(
+                &mut operations,
+                &payload.operation,
+                TransitionOrigin::JournalReplay,
+            )?;
             expected_sequence = expected_sequence
                 .checked_add(1)
                 .context("rebalance executor journal sequence overflow")?;
@@ -494,7 +498,12 @@ impl RebalanceExecutionJournal {
             .operations
             .get(operation_id)
             .with_context(|| format!("unknown rebalance operation {operation_id}"))?;
-        validate_transition(&current.intent, &current.progress, &progress)?;
+        validate_transition(
+            &current.intent,
+            &current.progress,
+            &progress,
+            TransitionOrigin::LiveAppend,
+        )?;
         let next = RebalanceExecutionOperation {
             intent: current.intent.clone(),
             progress,
@@ -513,7 +522,11 @@ impl RebalanceExecutionJournal {
             operation,
         };
         let mut next_operations = self.operations.clone();
-        apply_snapshot(&mut next_operations, &payload.operation)?;
+        apply_snapshot(
+            &mut next_operations,
+            &payload.operation,
+            TransitionOrigin::LiveAppend,
+        )?;
         let mut next_started_at = self.operation_started_at_unix_ms.clone();
         next_started_at
             .entry(payload.operation.intent.operation_id.clone())
@@ -601,6 +614,7 @@ impl RawWireRecord<'_> {
 fn apply_snapshot(
     operations: &mut BTreeMap<String, RebalanceExecutionOperation>,
     operation: &RebalanceExecutionOperation,
+    origin: TransitionOrigin,
 ) -> anyhow::Result<()> {
     validate_operation(operation)?;
     match operations.get(&operation.intent.operation_id) {
@@ -609,7 +623,12 @@ fn apply_snapshot(
                 previous.intent == operation.intent,
                 "rebalance operation intent changed"
             );
-            validate_transition(&operation.intent, &previous.progress, &operation.progress)?;
+            validate_transition(
+                &operation.intent,
+                &previous.progress,
+                &operation.progress,
+                origin,
+            )?;
         }
         None => ensure!(
             matches!(
@@ -774,11 +793,18 @@ fn validate_operation(operation: &RebalanceExecutionOperation) -> anyhow::Result
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionOrigin {
+    JournalReplay,
+    LiveAppend,
+}
+
 #[allow(clippy::match_like_matches_macro)]
 fn validate_transition(
     intent: &RebalanceExecutionIntent,
     previous: &RebalanceExecutionProgress,
     next: &RebalanceExecutionProgress,
+    origin: TransitionOrigin,
 ) -> anyhow::Result<()> {
     let approved_terminal_retry = matches!(
         (previous, next),
@@ -789,7 +815,9 @@ fn validate_transition(
                 ..
             },
         ) if reason.contains("approved deterministic Travel Rule rejection")
-            && api_mode == "local_entity"
+            && (api_mode == "local_entity"
+                || (origin == TransitionOrigin::JournalReplay
+                    && matches!(api_mode.as_str(), "standard" | "travel_rule")))
     );
     ensure!(
         !previous.terminal() || approved_terminal_retry,
@@ -858,12 +886,9 @@ fn validate_transition(
         (
             Route::Direct { .. },
             Direction::BinanceToWallet,
-            P::Failed { reason },
-            P::BinanceWithdrawalSubmissionStarted { api_mode, .. },
-        ) => {
-            reason.contains("approved deterministic Travel Rule rejection")
-                && api_mode == "local_entity"
-        }
+            P::Failed { .. },
+            P::BinanceWithdrawalSubmissionStarted { .. },
+        ) => approved_terminal_retry,
         (
             Route::Direct { .. },
             Direction::BinanceToWallet,
@@ -1305,7 +1330,8 @@ mod b256_serde {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs::{self, OpenOptions},
+        io::Write,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1313,7 +1339,7 @@ mod tests {
 
     use super::{
         RebalanceExecutionAuthority, RebalanceExecutionJournal, RebalanceExecutionProgress,
-        RebalanceExecutionRequest,
+        RebalanceExecutionRequest, WirePayload, WireRecord,
     };
     use crate::rebalance::{Direction, RebalanceAction, Route};
 
@@ -1349,6 +1375,27 @@ mod tests {
             wallet_balance_before: U256::from(8_000_000_u64),
             canary_maximum_fee: None,
         }
+    }
+
+    fn write_replay_fixture(
+        path: &std::path::Path,
+        operations: Vec<super::RebalanceExecutionOperation>,
+    ) {
+        drop(RebalanceExecutionJournal::open(path).unwrap());
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        for (sequence, operation) in operations.into_iter().enumerate() {
+            let record = WireRecord::new(WirePayload {
+                version: super::VERSION,
+                sequence: u64::try_from(sequence).unwrap(),
+                recorded_at_unix_ms: u64::try_from(sequence + 1).unwrap(),
+                operation,
+            })
+            .unwrap();
+            let mut encoded = serde_json::to_vec(&record).unwrap();
+            encoded.push(b'\n');
+            file.write_all(&encoded).unwrap();
+        }
+        file.sync_all().unwrap();
     }
 
     #[test]
@@ -1412,6 +1459,228 @@ mod tests {
         assert!(matches!(
             journal.operations()[&operation_id].progress,
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted { .. }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_approved_terminal_retry_modes_are_replay_only() {
+        for legacy_api_mode in ["standard", "travel_rule"] {
+            let path = path(&format!("legacy-approved-retry-{legacy_api_mode}"));
+            let legacy_operation;
+            {
+                let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+                let operation = journal
+                    .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+                    .unwrap();
+                let operation_id = operation.intent.operation_id;
+                journal
+                    .advance(
+                        &operation_id,
+                        RebalanceExecutionProgress::Failed {
+                            reason:
+                                "approved deterministic Travel Rule rejection HTTP 400 code -4024"
+                                    .to_owned(),
+                        },
+                    )
+                    .unwrap();
+                let legacy_progress =
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: legacy_api_mode.to_owned(),
+                        bridge_balance_before: U256::ZERO,
+                        reconciliation_queries: 0,
+                    };
+                assert!(
+                    journal
+                        .advance(&operation_id, legacy_progress.clone())
+                        .is_err(),
+                    "live append unexpectedly accepted legacy mode {legacy_api_mode}"
+                );
+                legacy_operation = super::RebalanceExecutionOperation {
+                    intent: journal.operations()[&operation_id].intent.clone(),
+                    progress: legacy_progress,
+                };
+            }
+
+            let record = WireRecord::new(WirePayload {
+                version: super::VERSION,
+                sequence: 2,
+                recorded_at_unix_ms: 3,
+                operation: legacy_operation,
+            })
+            .unwrap();
+            let mut encoded = serde_json::to_vec(&record).unwrap();
+            encoded.push(b'\n');
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&encoded).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+
+            let journal = RebalanceExecutionJournal::open(&path).unwrap();
+            assert!(matches!(
+                &journal.operations().values().next().unwrap().progress,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode,
+                    reconciliation_queries: 0,
+                    ..
+                } if api_mode == legacy_api_mode
+            ));
+            drop(journal);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn production_derived_m10_journal_suffix_replays_before_deploy() {
+        let path = path("production-derived-m10-replay");
+        let wallet: Address = "0x90D990C81320221D2882De32beeA78923c1e77A3"
+            .parse()
+            .unwrap();
+        let esp_intent = super::RebalanceExecutionIntent {
+            scope: Some(super::RebalanceJournalScope {
+                schema_version: 2,
+                account_id: "binance:trading-subaccount".to_owned(),
+                network_id: "chain:42161".to_owned(),
+                strategy_id: "prefund-arbitrum-usdc-esp-m9".to_owned(),
+            }),
+            operation_id: "rebalance-268-15f59bc55dcaed54".to_owned(),
+            fingerprint: "15f59bc55dcaed549afe3267c3988827e838a58bf900ec6b522333f8b07e3e8f"
+                .to_owned(),
+            withdraw_order_id: "rb15f59bc55dcaed549afe3267c39888".to_owned(),
+            token_symbol: "ESP".to_owned(),
+            token_decimals: 18,
+            token_contract: "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1"
+                .parse()
+                .unwrap(),
+            wallet_owner: wallet,
+            direction: Direction::BinanceToWallet,
+            route: direct_arbitrum(),
+            amount: U256::from(401_200_u64) * U256::from(10_u64).pow(U256::from(15_u64)),
+            binance_balance_before: U256::from(10_000_u64)
+                * U256::from(10_u64).pow(U256::from(18_u64)),
+            wallet_balance_before: U256::ZERO,
+            canary_maximum_fee_base_units: None,
+        };
+        let usdc_intent = super::RebalanceExecutionIntent {
+            scope: Some(super::RebalanceJournalScope {
+                schema_version: 2,
+                account_id: "binance:trading-subaccount".to_owned(),
+                network_id: "chain:10".to_owned(),
+                strategy_id: "rebalance-world-chain-v12".to_owned(),
+            }),
+            operation_id: "rebalance-296-96fd53e70c1ab390".to_owned(),
+            fingerprint: "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
+                .to_owned(),
+            withdraw_order_id: "rb96fd53e70c1ab390ae3e62eb434cd1".to_owned(),
+            token_symbol: "USDC".to_owned(),
+            token_decimals: 6,
+            token_contract: "0x79a02482a880bce3f13e09da970dc34db4cd24d1"
+                .parse()
+                .unwrap(),
+            wallet_owner: wallet,
+            direction: Direction::BinanceToWallet,
+            route: across(),
+            amount: U256::from(1_197_503_244_u64),
+            binance_balance_before: U256::from(3_075_000_679_u64),
+            wallet_balance_before: U256::from(679_994_191_u64),
+            canary_maximum_fee_base_units: None,
+        };
+        let operation = |intent: &super::RebalanceExecutionIntent, progress| {
+            super::RebalanceExecutionOperation {
+                intent: intent.clone(),
+                progress,
+            }
+        };
+        write_replay_fixture(
+            &path,
+            vec![
+                operation(&esp_intent, RebalanceExecutionProgress::IntentRecorded),
+                operation(
+                    &esp_intent,
+                    RebalanceExecutionProgress::BinanceTransferSubmitted {
+                        transaction_id: 395_702_159_719,
+                        bridge_balance_before: U256::ZERO,
+                    },
+                ),
+                operation(
+                    &esp_intent,
+                    RebalanceExecutionProgress::BinanceTransferCompleted {
+                        transaction_id: 395_702_159_719,
+                        bridge_balance_before: U256::ZERO,
+                    },
+                ),
+                operation(
+                    &esp_intent,
+                    RebalanceExecutionProgress::Failed {
+                        reason: "approved deterministic Travel Rule rejection HTTP 400 code -4024: [031031] User does not own this currency.".to_owned(),
+                    },
+                ),
+                operation(
+                    &esp_intent,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "standard".to_owned(),
+                        bridge_balance_before: U256::ZERO,
+                        reconciliation_queries: 0,
+                    },
+                ),
+                operation(
+                    &esp_intent,
+                    RebalanceExecutionProgress::Completed {
+                        binance_balance_after: U256::from(9_598_800_u64)
+                            * U256::from(10_u64).pow(U256::from(15_u64)),
+                        wallet_balance_after: U256::from(400_u64)
+                            * U256::from(10_u64).pow(U256::from(18_u64)),
+                    },
+                ),
+                operation(&usdc_intent, RebalanceExecutionProgress::IntentRecorded),
+                operation(
+                    &usdc_intent,
+                    RebalanceExecutionProgress::BinanceTransferSubmitted {
+                        transaction_id: 395_924_104_268,
+                        bridge_balance_before: U256::from(508_u64),
+                    },
+                ),
+                operation(
+                    &usdc_intent,
+                    RebalanceExecutionProgress::BinanceTransferCompleted {
+                        transaction_id: 395_924_104_268,
+                        bridge_balance_before: U256::from(508_u64),
+                    },
+                ),
+                operation(
+                    &usdc_intent,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "standard".to_owned(),
+                        bridge_balance_before: U256::from(508_u64),
+                        reconciliation_queries: 0,
+                    },
+                ),
+                operation(
+                    &usdc_intent,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "standard".to_owned(),
+                        bridge_balance_before: U256::from(508_u64),
+                        reconciliation_queries: 1,
+                    },
+                ),
+            ],
+        );
+
+        let journal = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(matches!(
+            journal.operations()[&esp_intent.operation_id].progress,
+            RebalanceExecutionProgress::Completed { .. }
+        ));
+        let active = journal.active_operation().unwrap().unwrap();
+        assert_eq!(active.intent, usdc_intent);
+        assert!(matches!(
+            &active.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                reconciliation_queries: 1,
+                bridge_balance_before,
+            } if api_mode == "standard" && *bridge_balance_before == U256::from(508_u64)
         ));
         drop(journal);
         fs::remove_file(path).unwrap();

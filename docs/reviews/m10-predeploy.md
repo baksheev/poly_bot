@@ -67,11 +67,20 @@ contract error.
   `-4104` from the incorrect standard endpoint before Binance created a
   withdrawal. The operator confirmed that no withdrawal exists. Active recovery
   binds operation `rebalance-296-96fd53e70c1ab390`, full fingerprint, client ID,
-  amount, route, transfer ID, response code/message, and unchanged Optimism
-  balance; it cannot query or submit another withdrawal. All subsequent
-  withdrawals use the Rails-compatible local-entity endpoint. Evidence:
+  amount, route, transfer ID, response code/message, the exhausted sole empty
+  capital-history reconciliation query, and unchanged Optimism balance; it
+  cannot query or submit another withdrawal. All subsequent withdrawals use
+  the Rails-compatible local-entity endpoint. Evidence:
   `operator_absence_closes_only_the_exact_synchronously_rejected_standard_withdrawal`
   and `operator_absence_recovery_cannot_query_or_submit_a_second_withdrawal`.
+- [x] The production journal contains one reviewed historical ESP transition
+  from a terminal Travel Rule rejection into the old `standard` submission
+  intent. Replay accepts historical `standard` and `travel_rule` values only
+  for that exact approved terminal transition; a live append can create only
+  `local_entity`. The production-derived replay fixture also includes the
+  current USDC operation at reconciliation query one. Evidence:
+  `legacy_approved_terminal_retry_modes_are_replay_only` and
+  `production_derived_m10_journal_suffix_replays_before_deploy`.
 - [x] Restart before, during, and after an Arbitrum wallet child uses the same
   operation ID and transaction journal; mined success is reused and unknown
   nonce state cannot submit another transaction. Evidence:

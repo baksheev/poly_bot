@@ -203,7 +203,7 @@ jobs:
             = 508
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.master_transfer_transaction_id" "${domain_config}")" \
             = 395924104268
-          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.reconciliation_queries" "${domain_config}")" = 0
+          test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.reconciliation_queries" "${domain_config}")" = 1
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.rejected_http_status" "${domain_config}")" = 400
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_standard_withdrawal.rejected_error_code" "${domain_config}")" = -4104
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_absent_master_transfer.operation_id" "${domain_config}")" \

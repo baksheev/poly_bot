@@ -810,7 +810,7 @@ impl LiveCanaryAbsentStandardWithdrawalRecoveryConfig {
                 && self.wallet_chain_id == 480
                 && bridge_balance_before == U256::from(508_u64)
                 && self.master_transfer_transaction_id == 395_924_104_268
-                && self.reconciliation_queries == 0
+                && self.reconciliation_queries == 1
                 && self.rejected_http_status == 400
                 && self.rejected_error_code == -4104
                 && self.rejected_error_message
@@ -1897,7 +1897,7 @@ mod tests {
             absent_withdrawal.master_transfer_transaction_id,
             395_924_104_268
         );
-        assert_eq!(absent_withdrawal.reconciliation_queries, 0);
+        assert_eq!(absent_withdrawal.reconciliation_queries, 1);
         assert_eq!(absent_withdrawal.rejected_http_status, 400);
         assert_eq!(absent_withdrawal.rejected_error_code, -4104);
         let absent_master_transfer = prefunding.approved_absent_master_transfer.as_ref().unwrap();
