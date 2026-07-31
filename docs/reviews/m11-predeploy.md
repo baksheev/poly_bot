@@ -118,6 +118,19 @@ termination report is 2,194 bytes, below Kubernetes' 4,096-byte termination
 message limit, and the runtime image contains the Debian `/bin/sh`, `sleep`,
 and `tee` commands used by the bounded wrapper.
 
+The third exact-image attempt (`30609557844`) passed admission but remained
+Pending and therefore also stopped before rollout. The fixed node had 7,910m
+allocatable CPU and 7,241m requested, leaving 669m; the replay's original
+1,000m request could not be scheduled even though the live process was using
+only about 0.01 core. The replay now requests 250m and retains its one-core CPU
+limit, so it fits the measured request budget and may burst to one otherwise
+idle C4 core. This changes scheduling reservation only, not the measured CPU
+class or mutation authority. The polling loop now treats an explicit
+`Unschedulable` condition as an immediate gate failure instead of waiting for
+the full bounded execution timeout. The final 250m manifest passed production
+API server-side dry-run, and the failed 1,000m Deployment was removed by the
+workflow cleanup trap.
+
 ## Target-C4 gate
 
 M11 cannot exit on workstation evidence. The exact release binary and fixture

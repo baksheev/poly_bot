@@ -404,7 +404,7 @@ jobs:
                     "report=\"$(arb_bot replay-m11-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
                   ],
                   "resources": {
-                    "requests": {"cpu": "1", "memory": "128Mi"},
+                    "requests": {"cpu": "250m", "memory": "128Mi"},
                     "limits": {"cpu": "1", "memory": "256Mi"}
                   },
                   "securityContext": {
@@ -435,6 +435,10 @@ jobs:
               --namespace "${GKE_NAMESPACE}" \
               -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' \
               2>/dev/null || true)"
+            replay_scheduling_reason="$(kubectl get pod "${replay_pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].reason}' \
+              2>/dev/null || true)"
             case "${replay_reason}" in
               Completed) break ;;
               Error)
@@ -442,6 +446,10 @@ jobs:
                 exit 1
                 ;;
             esac
+            if test "${replay_scheduling_reason}" = Unschedulable; then
+              kubectl describe pod "${replay_pod}" --namespace "${GKE_NAMESPACE}" || true
+              exit 1
+            fi
             sleep 2
           done
           if test "${replay_reason}" != Completed; then
