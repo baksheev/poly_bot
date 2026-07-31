@@ -48,6 +48,13 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(DEPLOY_WORKFLOW.contains(".route_failures == 0"));
     assert!(DEPLOY_WORKFLOW.contains(".external_mutations == 0"));
     assert!(DEPLOY_WORKFLOW.contains("automountServiceAccountToken = false"));
+    assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers"));
     assert!(DEPLOY_WORKFLOW.contains("\"requests\": {\"cpu\": \"1\", \"memory\": \"128Mi\"}"));
     assert!(DEPLOY_WORKFLOW.contains(".gate == \"target_c4_replay_ready\""));
+    assert!(DEPLOY_WORKFLOW.contains(
+        "replay_deployment=\"arb-bot-m11-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\""
+    ));
+    assert!(!DEPLOY_WORKFLOW.contains("kubectl delete job"));
+    assert!(DEPLOY_WORKFLOW.contains("kubectl delete deployment \"${replay_deployment}\""));
+    assert!(!DEPLOY_WORKFLOW.contains("kubectl get node "));
 }

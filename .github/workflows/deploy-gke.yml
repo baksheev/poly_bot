@@ -341,39 +341,42 @@ jobs:
             --format='value(config.machineType)')"
           test "${machine_type}" = c4-highcpu-8
 
-          replay_job="arb-bot-m11-replay-${SOURCE_SHA:0:12}"
+          replay_deployment="arb-bot-m11-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup_replay() {
-            kubectl delete job "${replay_job}" \
+            kubectl delete deployment "${replay_deployment}" \
               --namespace "${GKE_NAMESPACE}" \
               --ignore-not-found \
               --wait=false >/dev/null 2>&1 || true
           }
           trap cleanup_replay EXIT
-          kubectl delete job "${replay_job}" \
-            --namespace "${GKE_NAMESPACE}" \
-            --ignore-not-found \
-            --wait=true \
-            --timeout=60s >/dev/null
 
-          job_json="$(kubectl create job "${replay_job}" \
+          deployment_json="$(kubectl create deployment "${replay_deployment}" \
             --namespace "${GKE_NAMESPACE}" \
             --image="${IMAGE}" \
             --dry-run=client \
             -o json \
-            -- /bin/sh -ec \
-              'report="$(arb_bot replay-m11-capacity --target-cpu-class c4-highcpu-8)"; printf "%s\n" "${report}" | tee /dev/termination-log')"
+            -- /bin/sh -ec 'sleep 300')"
           jq \
             --arg node_pool "${node_pool}" \
             --arg source_sha "${SOURCE_SHA}" \
+            --arg replay_instance "${replay_deployment}" \
+            --arg image "${IMAGE}" \
             '
               .metadata.labels["app.kubernetes.io/name"] = "arb-bot-m11-replay"
               | .metadata.labels["arb-bot/source-revision"] = $source_sha
-              | .spec.backoffLimit = 0
-              | .spec.activeDeadlineSeconds = 300
-              | .spec.ttlSecondsAfterFinished = 300
+              | .metadata.labels["arb-bot/replay-instance"] = $replay_instance
+              | .spec.replicas = 1
+              | .spec.revisionHistoryLimit = 0
+              | .spec.strategy = {"type": "Recreate"}
+              | .spec.selector.matchLabels = {
+                  "app.kubernetes.io/name": "arb-bot-m11-replay",
+                  "arb-bot/replay-instance": $replay_instance
+                }
               | .spec.template.metadata.labels["app.kubernetes.io/name"] = "arb-bot-m11-replay"
               | .spec.template.metadata.labels["arb-bot/source-revision"] = $source_sha
+              | .spec.template.metadata.labels["arb-bot/replay-instance"] = $replay_instance
               | .spec.template.spec.automountServiceAccountToken = false
+              | .spec.template.spec.activeDeadlineSeconds = 300
               | .spec.template.spec.nodeSelector = {
                   "cloud.google.com/gke-nodepool": $node_pool
                 }
@@ -383,46 +386,82 @@ jobs:
                   "runAsGroup": 65532,
                   "seccompProfile": {"type": "RuntimeDefault"}
                 }
+              | .spec.template.spec.containers[0].name = "hold"
               | .spec.template.spec.containers[0].resources = {
-                  "requests": {"cpu": "1", "memory": "128Mi"},
-                  "limits": {"cpu": "1", "memory": "256Mi"}
+                  "requests": {"cpu": "5m", "memory": "8Mi"},
+                  "limits": {"cpu": "20m", "memory": "16Mi"}
                 }
               | .spec.template.spec.containers[0].securityContext = {
                   "allowPrivilegeEscalation": false,
                   "readOnlyRootFilesystem": true,
                   "capabilities": {"drop": ["ALL"]}
                 }
-            ' <<<"${job_json}" \
+              | .spec.template.spec.initContainers = [{
+                  "name": "replay",
+                  "image": $image,
+                  "imagePullPolicy": "IfNotPresent",
+                  "command": ["/bin/sh", "-ec"],
+                  "args": [
+                    "report=\"$(arb_bot replay-m11-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
+                  ],
+                  "resources": {
+                    "requests": {"cpu": "1", "memory": "128Mi"},
+                    "limits": {"cpu": "1", "memory": "256Mi"}
+                  },
+                  "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": {"drop": ["ALL"]}
+                  },
+                  "terminationMessagePath": "/dev/termination-log",
+                  "terminationMessagePolicy": "File"
+                }]
+            ' <<<"${deployment_json}" \
             | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
 
-          if ! kubectl wait \
-            --namespace "${GKE_NAMESPACE}" \
-            --for=condition=complete \
-            "job/${replay_job}" \
-            --timeout=300s; then
-            kubectl describe job "${replay_job}" --namespace "${GKE_NAMESPACE}" || true
-            kubectl get pods \
+          replay_pod=
+          for _ in {1..60}; do
+            replay_pod="$(kubectl get pods \
               --namespace "${GKE_NAMESPACE}" \
-              --selector="job-name=${replay_job}" \
-              -o json || true
+              --selector="arb-bot/replay-instance=${replay_deployment}" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            test -z "${replay_pod}" || break
+            sleep 2
+          done
+          test -n "${replay_pod}"
+
+          replay_reason=
+          for _ in {1..150}; do
+            replay_reason="$(kubectl get pod "${replay_pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' \
+              2>/dev/null || true)"
+            case "${replay_reason}" in
+              Completed) break ;;
+              Error)
+                kubectl describe pod "${replay_pod}" --namespace "${GKE_NAMESPACE}" || true
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+          if test "${replay_reason}" != Completed; then
+            kubectl describe pod "${replay_pod}" --namespace "${GKE_NAMESPACE}" || true
             exit 1
           fi
-          replay_pod="$(kubectl get pods \
-            --namespace "${GKE_NAMESPACE}" \
-            --selector="job-name=${replay_job}" \
-            -o jsonpath='{.items[0].metadata.name}')"
+
           replay_node="$(kubectl get pod "${replay_pod}" \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.nodeName}')"
-          test "$(kubectl get node "${replay_node}" \
-            -o jsonpath='{.metadata.labels.cloud\.google\.com/gke-nodepool}')" = "${node_pool}"
-          test "$(kubectl get node "${replay_node}" \
-            -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')" = c4-highcpu-8
+          test -n "${replay_node}"
+          test "$(kubectl get pod "${replay_pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')" = "${node_pool}"
 
           replay_report="$(kubectl get pod "${replay_pod}" \
             --namespace "${GKE_NAMESPACE}" \
             -o json \
-            | jq -r '.status.containerStatuses[0].state.terminated.message')"
+            | jq -r '.status.initContainerStatuses[0].state.terminated.message')"
           jq -e '
             .artifact_id == "m11-maximum-pair-replay-v1"
             and .mode == "capacity_replay_only"

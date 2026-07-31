@@ -83,6 +83,24 @@ deployment/reporting/monitoring integration tests, formatting, clippy with
 warnings denied, and the dependency audit with the same three allowed
 unmaintained-transitive warnings.
 
+The first exact-image workflow attempt (`30607789568`) stopped before rollout:
+the deploy identity cannot create or delete Jobs. The original idempotency path
+tried an eager `kubectl delete job --ignore-not-found`, which Kubernetes
+authorizes before it checks whether the named object exists. A read-only RBAC
+review then confirmed the complete allowed surface before another deployment:
+the identity may create/get/delete Deployments and get/list/watch Pods. The
+corrected gate therefore uses a unique temporary Deployment whose init
+container runs the bounded replay and exposes the report through its
+termination message; an inert container holds the Pod only long enough for the
+workflow to inspect that message. The temporary Deployment is deleted through
+an already-authorized verb. The same review found that the identity cannot read
+Node objects, so the gate does not attempt that unnecessary operation: it
+requires a non-empty scheduled `nodeName`, verifies the Pod's immutable
+node-pool selector, and independently verifies that selected pool is
+`c4-highcpu-8` through the already-authorized GKE API. It has no service-account
+token, secrets, PVC, or mutation authority. The failed attempt did not change
+the application Deployment or the production owner.
+
 ## Target-C4 gate
 
 M11 cannot exit on workstation evidence. The exact release binary and fixture
