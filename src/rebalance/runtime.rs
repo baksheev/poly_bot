@@ -20,8 +20,8 @@ use crate::{
     binance::{
         account::{AccountInformation, BinanceAccountClient, BinanceApiError},
         capital::{
-            DepositRecord, NetworkInformation, TravelRuleWithdrawalRecord, WithdrawalRecord,
-            select_capital_routes,
+            DepositRecord, NetworkInformation, TravelRuleAddressOwnershipProof,
+            TravelRuleWithdrawalRecord, WithdrawalRecord, select_capital_routes,
         },
         sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
@@ -47,7 +47,9 @@ const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
 const GAS_LIMIT_MARGIN_DENOMINATOR: u64 = 100;
 const MAX_ERC20_GAS_LIMIT: u64 = 1_000_000;
 const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
-const BINANCE_WITHDRAWAL_API_MODE: &str = "standard";
+const STANDARD_BINANCE_WITHDRAWAL_API_MODE: &str = "standard";
+const TRAVEL_RULE_REQUIRED_API_MODE: &str = "travel_rule_required_after_standard_-4104";
+const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned";
 const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
@@ -1214,12 +1216,17 @@ impl RebalanceExecutor {
         network: &str,
         chain_id: u64,
         transaction_hash: B256,
+        expected_withdrawal_id: Option<&str>,
+        expected_master_transfer_transaction_id: Option<u64>,
+        expected_rejected_local_entity_travel_rule_id: Option<i64>,
+        expected_rejected_standard_travel_rule_id: Option<i64>,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
         let operation = self
             .execution_journal
-            .active_operation()?
+            .operations()
+            .get(operation_id)
             .cloned()
-            .context("approved manual ESP credit has no active operation")?;
+            .context("approved manual ESP credit operation is absent")?;
         let journaled_balance_before = match &operation.progress {
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                 api_mode,
@@ -1231,6 +1238,12 @@ impl RebalanceExecutor {
                     "approved manual ESP credit changed the journaled API mode"
                 );
                 *bridge_balance_before
+            }
+            RebalanceExecutionProgress::Failed { reason }
+                if reason
+                    == "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation." =>
+            {
+                operation.intent.wallet_balance_before
             }
             _ => bail!("approved manual ESP credit state changed"),
         };
@@ -1264,7 +1277,12 @@ impl RebalanceExecutor {
                 &operation.intent.withdraw_order_id,
             )
             .await?;
-        reconcile_approved_travel_rule_rejection(&travel_rule)?;
+        validate_manual_recovery_travel_rule_rejections(
+            &operation,
+            &travel_rule,
+            expected_rejected_local_entity_travel_rule_id,
+            expected_rejected_standard_travel_rule_id,
+        )?;
         let transfer = self
             .treasury_binance
             .universal_transfer_history(&self.subaccount_email, &operation.intent.withdraw_order_id)
@@ -1274,7 +1292,9 @@ impl RebalanceExecutor {
             .context("approved manual ESP credit lost its master transfer")?;
         validate_master_transfer_record(&operation, &self.subaccount_email, &transfer)?;
         ensure!(
-            transfer.status == "SUCCESS",
+            transfer.status == "SUCCESS"
+                && expected_master_transfer_transaction_id
+                    .is_none_or(|expected| transfer.transaction_id == expected),
             "approved manual ESP credit master transfer is not successful"
         );
 
@@ -1291,6 +1311,10 @@ impl RebalanceExecutor {
         ensure!(
             matching.next().is_none(),
             "approved manual ESP transaction matched multiple Binance withdrawals"
+        );
+        ensure!(
+            expected_withdrawal_id.is_none_or(|expected| withdrawal.id == expected),
+            "approved manual ESP withdrawal id differs from the reviewed receipt"
         );
         validate_manual_prefunding_withdrawal_record(
             &operation,
@@ -1447,13 +1471,13 @@ impl RebalanceExecutor {
         let mut operation = self.execution_journal.advance(
             &operation.intent.operation_id,
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                api_mode: STANDARD_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
                 bridge_balance_before,
                 reconciliation_queries: 0,
             },
         )?;
         let submission_reference = self
-            .submit_binance_withdrawal(&operation, network, requested)
+            .submit_standard_binance_withdrawal(&operation, network, requested)
             .await?;
         operation = self.execution_journal.advance(
             &operation.intent.operation_id,
@@ -1466,7 +1490,7 @@ impl RebalanceExecutor {
             operation_id = operation.intent.operation_id,
             token = token_symbol,
             amount_base_units = amount.to_string(),
-            api_mode = BINANCE_WITHDRAWAL_API_MODE,
+            api_mode = STANDARD_BINANCE_WITHDRAWAL_API_MODE,
             reused_master_transfer_id = transfer.transaction_id,
             "submitted the approved direct ESP withdrawal without another master transfer"
         );
@@ -1544,13 +1568,13 @@ impl RebalanceExecutor {
         let mut operation = self.execution_journal.advance(
             &operation.intent.operation_id,
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                api_mode: STANDARD_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
                 bridge_balance_before,
                 reconciliation_queries: 0,
             },
         )?;
         let submission_reference = match self
-            .submit_binance_withdrawal(&operation, &recovery.binance_network, requested)
+            .submit_standard_binance_withdrawal(&operation, &recovery.binance_network, requested)
             .await
         {
             Ok(reference) => reference,
@@ -1579,7 +1603,7 @@ impl RebalanceExecutor {
             token = operation.intent.token_symbol,
             amount_base_units = operation.intent.amount.to_string(),
             withdraw_order_id = operation.intent.withdraw_order_id,
-            api_mode = BINANCE_WITHDRAWAL_API_MODE,
+            api_mode = STANDARD_BINANCE_WITHDRAWAL_API_MODE,
             reused_master_transfer_id = transfer.transaction_id,
             capital_history_match_count = withdrawals.len(),
             "submitted the exact approved standard ESP withdrawal without another master transfer"
@@ -2625,8 +2649,82 @@ impl RebalanceExecutor {
             ..
         } = &operation.progress
         {
+            if api_mode == TRAVEL_RULE_REQUIRED_API_MODE {
+                ensure!(
+                    *reconciliation_queries == 0,
+                    "Travel Rule-required withdrawal cannot carry reconciliation queries"
+                );
+                return self
+                    .submit_required_travel_rule_withdrawal(operation, network)
+                    .await;
+            }
+            if api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE {
+                ensure!(
+                    *reconciliation_queries == 0,
+                    "journaled Travel Rule withdrawal exhausted its one reconciliation query; operator review required"
+                );
+                let requested = base_units_to_decimal(
+                    operation.intent.amount,
+                    operation.intent.token_decimals,
+                )?;
+                let existing = self
+                    .treasury_binance
+                    .travel_rule_withdrawal_history_v2(
+                        &operation.intent.token_symbol,
+                        network,
+                        &operation.intent.withdraw_order_id,
+                    )
+                    .await?;
+                for record in &existing {
+                    validate_travel_rule_withdrawal_record(&operation, record, requested)?;
+                }
+                let viable = existing
+                    .iter()
+                    .filter(|record| {
+                        !record.is_failed_without_broadcast()
+                            && !record.is_approved_without_withdrawal()
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    viable.len() <= 1,
+                    "journaled Travel Rule withdrawal matched multiple viable submissions"
+                );
+                if let Some(record) = viable.first() {
+                    return self.execution_journal.advance(
+                        &operation.intent.operation_id,
+                        RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                            submission_reference: record.tr_id.to_string(),
+                            bridge_balance_before: match operation.progress {
+                                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                                    bridge_balance_before,
+                                    ..
+                                } => bridge_balance_before,
+                                _ => unreachable!("the Travel Rule state was matched above"),
+                            },
+                        },
+                    );
+                }
+                let bridge_balance_before = match operation.progress {
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        bridge_balance_before,
+                        ..
+                    } => bridge_balance_before,
+                    _ => unreachable!("the Travel Rule state was matched above"),
+                };
+                self.execution_journal.advance(
+                    &operation.intent.operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                        bridge_balance_before,
+                        reconciliation_queries: 1,
+                    },
+                )?;
+                bail!(
+                    "journaled Travel Rule Binance withdrawal submission has no indexed outcome; operator review required"
+                )
+            }
             ensure!(
-                api_mode == BINANCE_WITHDRAWAL_API_MODE,
+                api_mode == STANDARD_BINANCE_WITHDRAWAL_API_MODE,
                 "journaled Binance withdrawal API mode is not the standard capital API"
             );
             ensure!(
@@ -2662,7 +2760,7 @@ impl RebalanceExecutor {
         } = &operation.progress
         {
             ensure!(
-                api_mode == BINANCE_WITHDRAWAL_API_MODE,
+                api_mode == STANDARD_BINANCE_WITHDRAWAL_API_MODE,
                 "journaled Binance withdrawal API mode is not the standard capital API"
             );
             ensure!(
@@ -2688,7 +2786,7 @@ impl RebalanceExecutor {
             operation = self.execution_journal.advance(
                 &operation.intent.operation_id,
                 RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                    api_mode: BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                    api_mode: STANDARD_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
                     bridge_balance_before,
                     reconciliation_queries: 0,
                 },
@@ -2696,10 +2794,23 @@ impl RebalanceExecutor {
             let amount =
                 base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
             match self
-                .submit_binance_withdrawal(&operation, network, amount)
+                .submit_standard_binance_withdrawal(&operation, network, amount)
                 .await
             {
                 Ok(reference) => reference,
+                Err(error) if is_travel_rule_required_rejection(&error) => {
+                    operation = self.execution_journal.advance(
+                        &operation.intent.operation_id,
+                        RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                            api_mode: TRAVEL_RULE_REQUIRED_API_MODE.to_owned(),
+                            bridge_balance_before,
+                            reconciliation_queries: 0,
+                        },
+                    )?;
+                    return self
+                        .submit_required_travel_rule_withdrawal(operation, network)
+                        .await;
+                }
                 Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
                     let reason = format!("terminal Binance standard withdrawal rejection: {error}");
                     self.execution_journal.advance(
@@ -2718,6 +2829,108 @@ impl RebalanceExecutor {
                 bridge_balance_before,
             },
         )
+    }
+
+    async fn submit_required_travel_rule_withdrawal(
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
+        network: &str,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        ensure!(
+            matches!(
+                &operation.progress,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode,
+                    reconciliation_queries: 0,
+                    ..
+                } if api_mode == TRAVEL_RULE_REQUIRED_API_MODE
+            ),
+            "Travel Rule submission lacks the durable standard -4104 routing decision"
+        );
+        let ownership_proof = self
+            .ensure_travel_rule_ae_self_owned(&operation, network)
+            .await?;
+        self.verify_route(&operation, true).await?;
+        let bridge_balance_before = match operation.progress {
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                bridge_balance_before,
+                ..
+            } => bridge_balance_before,
+            _ => unreachable!("the Travel Rule-required state was validated above"),
+        };
+        operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                bridge_balance_before,
+                reconciliation_queries: 0,
+            },
+        )?;
+        let amount =
+            base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+        let submission_reference = match self
+            .submit_travel_rule_binance_withdrawal(&operation, network, amount, &ownership_proof)
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
+                let reason = format!("terminal Binance Travel Rule withdrawal rejection: {error}");
+                self.execution_journal.advance(
+                    &operation.intent.operation_id,
+                    RebalanceExecutionProgress::Failed { reason },
+                )?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                submission_reference,
+                bridge_balance_before,
+            },
+        )
+    }
+
+    async fn ensure_travel_rule_ae_self_owned(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        network: &str,
+    ) -> anyhow::Result<TravelRuleAddressOwnershipProof> {
+        let (requirements, records) = tokio::try_join!(
+            self.treasury_binance
+                .travel_rule_questionnaire_requirements(),
+            self.treasury_binance.address_verification_list(),
+        )?;
+        ensure!(
+            requirements.questionnaire_country_code.as_deref() == Some("AE"),
+            "Binance Travel Rule questionnaire is not the reviewed AE self-owned-wallet form"
+        );
+        let wallet = format!("{:#x}", operation.intent.wallet_owner);
+        let matching = records
+            .iter()
+            .filter(|record| {
+                record.wallet_address.eq_ignore_ascii_case(&wallet)
+                    && record.network == network
+                    && record.status == "VERIFIED"
+                    && record.address_questionnaire.is_address_owner == Some(1)
+                    && record.address_questionnaire.verify_method == Some(1)
+                    && !record.address_questionnaire.satoshi_token.is_empty()
+                    && record.token == record.address_questionnaire.satoshi_token
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() == 1,
+            "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+        );
+        let record = matching[0];
+        Ok(TravelRuleAddressOwnershipProof {
+            satoshi_token: record.address_questionnaire.satoshi_token.clone(),
+            verify_method: record
+                .address_questionnaire
+                .verify_method
+                .expect("the matching verified record requires method 1"),
+        })
     }
 
     async fn wait_master_transfer(
@@ -2770,7 +2983,7 @@ impl RebalanceExecutor {
         }
     }
 
-    async fn submit_binance_withdrawal(
+    async fn submit_standard_binance_withdrawal(
         &self,
         operation: &RebalanceExecutionOperation,
         network: &str,
@@ -2788,6 +3001,28 @@ impl RebalanceExecutor {
             )
             .await?;
         Ok(submission.id)
+    }
+
+    async fn submit_travel_rule_binance_withdrawal(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        network: &str,
+        amount: Decimal,
+        ownership_proof: &TravelRuleAddressOwnershipProof,
+    ) -> anyhow::Result<String> {
+        let address = format!("{:#x}", operation.intent.wallet_owner);
+        let submission = self
+            .treasury_binance
+            .withdraw_travel_rule_ae_self_owned(
+                &operation.intent.token_symbol,
+                network,
+                &address,
+                amount,
+                &operation.intent.withdraw_order_id,
+                ownership_proof,
+            )
+            .await?;
+        Ok(submission.tr_id)
     }
 
     async fn wait_withdrawal(
@@ -3529,6 +3764,42 @@ fn is_terminal_binance_withdrawal_rejection(error: &anyhow::Error) -> bool {
         .is_some_and(BinanceApiError::is_known_pre_submission_withdrawal_rejection)
 }
 
+fn is_travel_rule_required_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BinanceApiError>()
+        .is_some_and(BinanceApiError::is_travel_rule_required_withdrawal_rejection)
+}
+
+fn validate_travel_rule_withdrawal_record(
+    operation: &RebalanceExecutionOperation,
+    record: &TravelRuleWithdrawalRecord,
+    requested: Decimal,
+) -> anyhow::Result<()> {
+    ensure!(
+        record.tr_id > 0
+            && record.coin == operation.intent.token_symbol
+            && (record.network.is_empty()
+                || matches!(
+                    &operation.intent.route,
+                    Route::Direct {
+                        binance_network,
+                        ..
+                    } | Route::Across {
+                        binance_network,
+                        ..
+                    } if record.network == *binance_network
+                ))
+            && matches_travel_rule_record_identity_without_client_id(
+                record,
+                requested,
+                operation.intent.wallet_owner,
+                &operation.intent.withdraw_order_id,
+            ),
+        "Binance Travel Rule withdrawal record differs from the durable intent"
+    );
+    Ok(())
+}
+
 fn validate_approved_local_entity_withdrawal_recovery(
     operation: &RebalanceExecutionOperation,
     recovery: &ApprovedLocalEntityWithdrawalRecovery,
@@ -3834,6 +4105,48 @@ fn reconcile_approved_travel_rule_rejection(
     Ok(Some(record))
 }
 
+fn validate_manual_recovery_travel_rule_rejections(
+    operation: &RebalanceExecutionOperation,
+    records: &[TravelRuleWithdrawalRecord],
+    expected_local_entity_tr_id: Option<i64>,
+    expected_standard_tr_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let (Some(expected_local_entity_tr_id), Some(expected_standard_tr_id)) =
+        (expected_local_entity_tr_id, expected_standard_tr_id)
+    else {
+        return reconcile_approved_travel_rule_rejection(records).map(|_| ());
+    };
+    ensure!(
+        expected_local_entity_tr_id > 0
+            && expected_standard_tr_id > 0
+            && expected_local_entity_tr_id != expected_standard_tr_id
+            && records.len() == 2,
+        "approved manual ESP recovery Travel Rule evidence count changed"
+    );
+    let requested =
+        base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+    for record in records {
+        validate_travel_rule_withdrawal_record(operation, record, requested)?;
+        ensure!(
+            record.tx_id.trim().is_empty(),
+            "approved manual ESP recovery found a bot Travel Rule broadcast"
+        );
+    }
+    let local_entity = records
+        .iter()
+        .find(|record| record.tr_id == expected_local_entity_tr_id)
+        .context("approved manual ESP recovery lost the local-entity Travel Rule row")?;
+    let standard = records
+        .iter()
+        .find(|record| record.tr_id == expected_standard_tr_id)
+        .context("approved manual ESP recovery lost the standard Travel Rule row")?;
+    ensure!(
+        local_entity.is_approved_without_withdrawal() && standard.is_failed_without_broadcast(),
+        "approved manual ESP recovery Travel Rule statuses changed"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3868,6 +4181,7 @@ mod tests {
         shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
         validate_approved_local_entity_withdrawal_recovery, validate_direct_withdrawal_receipt,
         validate_manual_prefunding_withdrawal_record,
+        validate_manual_recovery_travel_rule_rejections,
         validate_operator_confirmed_absent_master_transfer,
         validate_operator_confirmed_absent_standard_withdrawal, withdrawal_received_base_units,
         withdrawal_requested_base_units,
@@ -3935,10 +4249,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn endpoint_recovery_accepts_only_the_exact_production_esp_failure() {
-        let wallet = Address::from_str("0x90D990C81320221D2882De32beeA78923c1e77A3").unwrap();
-        let operation = RebalanceExecutionOperation {
+    fn m12_operation(progress: RebalanceExecutionProgress) -> RebalanceExecutionOperation {
+        RebalanceExecutionOperation {
             intent: RebalanceExecutionIntent {
                 scope: Some(RebalanceJournalScope {
                     schema_version: 2,
@@ -3947,36 +4259,38 @@ mod tests {
                     strategy_id: "rebalance-arbitrum-usdc-esp-m10".to_owned(),
                 }),
                 operation_id: "rebalance-324-8b62a7c14f4ef643".to_owned(),
-                fingerprint:
-                    "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a"
-                        .to_owned(),
+                fingerprint: "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a"
+                    .to_owned(),
                 withdraw_order_id: "rb8b62a7c14f4ef6434a88c384bbb83c".to_owned(),
                 token_symbol: "ESP".to_owned(),
                 token_decimals: 18,
                 token_contract: Address::from_str(ARBITRUM_ESP).unwrap(),
-                wallet_owner: wallet,
+                wallet_owner: Address::from_str("0x90D990C81320221D2882De32beeA78923c1e77A3")
+                    .unwrap(),
                 direction: Direction::BinanceToWallet,
                 route: Route::Direct {
                     binance_network: "ARBITRUM".to_owned(),
                     chain_id: ARBITRUM_CHAIN_ID,
                 },
-                amount: U256::from(4_464_938_180_550_u64)
-                    * U256::from(1_000_000_000_u64),
+                amount: U256::from(4_464_938_180_550_u64) * U256::from(1_000_000_000_u64),
                 binance_balance_before: U256::from(9_464_800_u64)
                     * U256::from(1_000_000_000_000_000_u64),
-                wallet_balance_before: U256::from_str(
-                    "534923638887482447575",
-                )
-                .unwrap(),
+                wallet_balance_before: U256::from_str("534923638887482447575").unwrap(),
                 canary_maximum_fee_base_units: Some("2000000000000000000".to_owned()),
                 canary_approval_session_id: Some(
                     "esp-usdc-arbitrum-rebalance-20260731-r2".to_owned(),
                 ),
             },
-            progress: RebalanceExecutionProgress::Failed {
+            progress,
+        }
+    }
+
+    #[test]
+    fn endpoint_recovery_accepts_only_the_exact_production_esp_failure() {
+        let wallet = Address::from_str("0x90D990C81320221D2882De32beeA78923c1e77A3").unwrap();
+        let operation = m12_operation(RebalanceExecutionProgress::Failed {
                 reason: "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency.".to_owned(),
-            },
-        };
+            });
         let recovery = ApprovedLocalEntityWithdrawalRecovery {
             operation_id: operation.intent.operation_id.clone(),
             fingerprint: operation.intent.fingerprint.clone(),
@@ -4029,6 +4343,56 @@ mod tests {
             reconciliation_queries: 0,
         };
         assert!(!super::is_approved_local_entity_withdrawal_recovery_pending(&submitted));
+    }
+
+    #[test]
+    fn manual_m12_recovery_requires_both_exact_unbroadcast_travel_rule_rows() {
+        let operation = m12_operation(RebalanceExecutionProgress::Failed {
+            reason: "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.".to_owned(),
+        });
+        let record = |tr_id, travel_rule_status| TravelRuleWithdrawalRecord {
+            id: String::new(),
+            tr_id,
+            amount: "4463.83818055".to_owned(),
+            transaction_fee: "1.1".to_owned(),
+            coin: "ESP".to_owned(),
+            withdrawal_status: None,
+            travel_rule_status,
+            address: format!("{:#x}", operation.intent.wallet_owner),
+            tx_id: String::new(),
+            network: "ARBITRUM".to_owned(),
+            withdraw_order_id: operation.intent.withdraw_order_id.clone(),
+            info: String::new(),
+        };
+        let exact = vec![record(67_294_348, 4), record(67_298_920, 2)];
+        validate_manual_recovery_travel_rule_rejections(
+            &operation,
+            &exact,
+            Some(67_294_348),
+            Some(67_298_920),
+        )
+        .unwrap();
+
+        assert!(
+            validate_manual_recovery_travel_rule_rejections(
+                &operation,
+                &exact[..1],
+                Some(67_294_348),
+                Some(67_298_920),
+            )
+            .is_err()
+        );
+        let mut broadcast = exact;
+        broadcast[1].tx_id = "0xabc".to_owned();
+        assert!(
+            validate_manual_recovery_travel_rule_rejections(
+                &operation,
+                &broadcast,
+                Some(67_294_348),
+                Some(67_298_920),
+            )
+            .is_err()
+        );
     }
 
     #[test]

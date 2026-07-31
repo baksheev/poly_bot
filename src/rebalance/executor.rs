@@ -878,8 +878,15 @@ fn validate_transition(
                     && api_mode == "standard"
             )
     );
+    let approved_terminal_manual_completion = matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Failed { reason },
+            RebalanceExecutionProgress::Completed { .. },
+        ) if reason == "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
+    );
     ensure!(
-        !previous.terminal() || approved_terminal_retry,
+        !previous.terminal() || approved_terminal_retry || approved_terminal_manual_completion,
         "rebalance operation is already terminal"
     );
     if matches!(next, RebalanceExecutionProgress::Failed { .. }) {
@@ -924,14 +931,26 @@ fn validate_transition(
             Route::Direct { .. } | Route::Across { .. },
             Direction::BinanceToWallet,
             P::BinanceWithdrawalSubmissionStarted {
+                api_mode: previous_mode,
                 reconciliation_queries: previous,
                 ..
             },
             P::BinanceWithdrawalSubmissionStarted {
+                api_mode: next_mode,
                 reconciliation_queries: next,
                 ..
             },
-        ) => *previous == 0 && *next == 1,
+        ) => {
+            (previous_mode == next_mode && *previous == 0 && *next == 1)
+                || (previous_mode == "standard"
+                    && next_mode == "travel_rule_required_after_standard_-4104"
+                    && *previous == 0
+                    && *next == 0)
+                || (previous_mode == "travel_rule_required_after_standard_-4104"
+                    && next_mode == "travel_rule_ae_self_owned"
+                    && *previous == 0
+                    && *next == 0)
+        }
         // A separately approved operator withdrawal can satisfy a fail-closed
         // unindexed submission. Its recovery validates the exact Binance
         // record and on-chain receipt before appending this single terminal
@@ -948,6 +967,12 @@ fn validate_transition(
             P::Failed { .. },
             P::BinanceWithdrawalSubmissionStarted { .. },
         ) => approved_terminal_retry,
+        (
+            Route::Direct { .. },
+            Direction::BinanceToWallet,
+            P::Failed { .. },
+            P::Completed { .. },
+        ) => approved_terminal_manual_completion,
         (
             Route::Direct { .. },
             Direction::BinanceToWallet,
@@ -1140,7 +1165,11 @@ fn validate_progress_evidence(
             ensure!(
                 matches!(
                     api_mode.as_str(),
-                    "local_entity" | "standard" | "travel_rule"
+                    "local_entity"
+                        | "standard"
+                        | "travel_rule"
+                        | "travel_rule_required_after_standard_-4104"
+                        | "travel_rule_ae_self_owned"
                 ),
                 "rebalance Binance withdrawal submission API mode is invalid"
             );
@@ -1560,6 +1589,107 @@ mod tests {
                     api_mode: "standard".to_owned(),
                     bridge_balance_before: U256::ZERO,
                     reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exact_standard_4104_routes_durably_before_travel_rule_submission() {
+        let path = path("standard-4104-travel-rule-routing");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::ZERO,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::ZERO,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::ZERO,
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                        api_mode: "travel_rule_ae_self_owned".to_owned(),
+                        bridge_balance_before: U256::ZERO,
+                        reconciliation_queries: 0,
+                    },
+                )
+                .is_err()
+        );
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_required_after_standard_-4104".to_owned(),
+                    bridge_balance_before: U256::ZERO,
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: U256::ZERO,
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exact_m12_standard_failure_can_close_only_with_manual_receipt_completion() {
+        let path = path("m12-manual-receipt-completion");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.".to_owned(),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Completed {
+                    binance_balance_after: U256::ZERO,
+                    wallet_balance_after: U256::from(1),
                 },
             )
             .unwrap();

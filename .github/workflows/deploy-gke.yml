@@ -189,6 +189,26 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.capital_history_match_count" "${domain_config}")" = 0
           test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_standard_withdrawal_recovery.capital_history_checked_at_utc" "${domain_config}")" \
             = 2026-07-31T09:02:15Z
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.operation_id" "${domain_config}")" \
+            = rebalance-324-8b62a7c14f4ef643
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.gross_debit_base_units" "${domain_config}")" \
+            = 4464938180550000000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.expected_credit_base_units" "${domain_config}")" \
+            = 4463838180550000000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.expected_fee_base_units" "${domain_config}")" \
+            = 1100000000000000000
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.wallet_balance_before_base_units" "${domain_config}")" \
+            = 534923638887482447575
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.master_transfer_transaction_id" "${domain_config}")" \
+            = 396036135710
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.rejected_local_entity_travel_rule_id" "${domain_config}")" \
+            = 67294348
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.rejected_standard_travel_rule_id" "${domain_config}")" \
+            = 67298920
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.withdrawal_id" "${domain_config}")" \
+            = e02357b25de24e1ba9965bf524db37f7
+          test "$(jq -r "${esp} | .pairs[0].live_canary.rebalance_live_canary.approved_manual_withdrawal_recovery.transaction_hash" "${domain_config}")" \
+            = 0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_symbol" "${domain_config}")" \
             = ESP
           test "$(jq -r "${esp} | .pairs[0].live_canary.prefunding_rebalance.approved_travel_rule_recovery.rejected_token_amount_base_units" "${domain_config}")" \

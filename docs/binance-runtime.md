@@ -60,13 +60,21 @@ by the Rust rebalance state machine:
 - `GET /sapi/v1/capital/deposit/address/list`;
 - `GET /sapi/v2/localentity/deposit/history`;
 - `PUT /sapi/v2/localentity/deposit/provide-info`;
-- `POST /sapi/v1/capital/withdraw/apply` for every withdrawal;
+- `POST /sapi/v1/capital/withdraw/apply` as the first request for every
+  withdrawal;
+- `GET /sapi/v1/localentity/questionnaire-requirements`,
+  `GET /sapi/v1/addressVerify/list`, and
+  `POST /sapi/v1/localentity/withdraw/apply` only after that exact standard
+  request synchronously returns Binance `-4104`;
 - `GET /sapi/v1/capital/withdraw/history`.
 
-The separate deposit questionnaire is deposit-scoped: after a deposit appears,
+The deposit questionnaire remains deposit-scoped: after a deposit appears,
 `requireQuestionnaire` and `travelRuleReqStatus` decide whether Rust calls
-`deposit/provide-info`. It never changes the pinned standard withdrawal
-endpoint.
+`deposit/provide-info`. Withdrawal routing is independent: Rust does not guess
+an amount threshold, but follows Binance's exact synchronous `-4104` decision.
+The fallback request carries the already verified wallet metadata
+(`vaspName=Unhosted Wallet`, `isAddressOwner=1`, `sendTo=1`,
+`satoshiToken=USDC`, `verifyMethod=1`).
 
 ## Rails execution semantics to preserve
 

@@ -1073,6 +1073,10 @@ async fn prefund_arbitrum_canary(
                     &prefunding.binance_network,
                     ARBITRUM_CHAIN_ID,
                     transaction_hash,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await?,
         )
@@ -3397,6 +3401,25 @@ async fn run(
         }
         None => None,
     };
+    let approved_manual_withdrawal_recovery = m8_pair
+        .live_canary
+        .as_ref()
+        .and_then(|canary| canary.rebalance_live_canary.as_ref())
+        .and_then(|rebalance| rebalance.approved_manual_withdrawal_recovery.as_ref())
+        .cloned()
+        .filter(|recovery| {
+            full_rebalance_executor
+                .as_ref()
+                .and_then(|executor| executor.operations().get(&recovery.operation_id))
+                .is_some_and(|operation| {
+                    operation.intent.fingerprint == recovery.fingerprint
+                        && matches!(
+                            &operation.progress,
+                            RebalanceExecutionProgress::Failed { reason }
+                                if reason == "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
+                        )
+                })
+        });
     let user_data_subscription_id = user_data_stream.subscription_id();
     let multiplexed_binance_api = user_data_stream.api();
     tracing::info!(
@@ -4127,9 +4150,12 @@ async fn run(
     let mut binance_clock_sync_running = true;
     let (rebalance_sender, mut rebalance_receiver, mut rebalance_task, m10_risk_receiver) =
         if let Some(mut executor) = full_rebalance_executor.take() {
-            let recover_on_start =
-                rebalance_recovery_operation.is_some() || approved_endpoint_recovery.is_some();
-            let recovery_target = if approved_endpoint_recovery.is_some() {
+            let recover_on_start = rebalance_recovery_operation.is_some()
+                || approved_endpoint_recovery.is_some()
+                || approved_manual_withdrawal_recovery.is_some();
+            let recovery_target = if approved_endpoint_recovery.is_some()
+                || approved_manual_withdrawal_recovery.is_some()
+            {
                 RebalanceExecutionTarget::ArbitrumCanary
             } else {
                 rebalance_recovery_operation
@@ -4147,7 +4173,47 @@ async fn run(
                 emit_m10_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                 if recover_on_start {
                     let saga_started_at = Instant::now();
-                    let result = if let Some(recovery) = approved_endpoint_recovery.as_ref() {
+                    let result = if let Some(recovery) =
+                        approved_manual_withdrawal_recovery.as_ref()
+                    {
+                        let gross_debit =
+                            U256::from_str_radix(&recovery.gross_debit_base_units, 10)
+                                .context("approved manual M12 gross debit is invalid")?;
+                        let expected_credit =
+                            U256::from_str_radix(&recovery.expected_credit_base_units, 10)
+                                .context("approved manual M12 credit is invalid")?;
+                        let expected_fee =
+                            U256::from_str_radix(&recovery.expected_fee_base_units, 10)
+                                .context("approved manual M12 fee is invalid")?;
+                        let wallet_balance_before =
+                            U256::from_str_radix(&recovery.wallet_balance_before_base_units, 10)
+                                .context("approved manual M12 wallet balance is invalid")?;
+                        let wallet_owner = Address::from_str(&recovery.wallet_address)
+                            .context("approved manual M12 wallet is invalid")?;
+                        let transaction_hash = recovery
+                            .transaction_hash
+                            .parse::<B256>()
+                            .context("approved manual M12 transaction hash is invalid")?;
+                        executor
+                            .recover_approved_manual_direct_credit(
+                                &recovery.operation_id,
+                                &recovery.token_symbol,
+                                gross_debit,
+                                expected_credit,
+                                expected_fee,
+                                wallet_balance_before,
+                                wallet_owner,
+                                &recovery.binance_network,
+                                ARBITRUM_CHAIN_ID,
+                                transaction_hash,
+                                Some(&recovery.withdrawal_id),
+                                Some(recovery.master_transfer_transaction_id),
+                                Some(recovery.rejected_local_entity_travel_rule_id),
+                                Some(recovery.rejected_standard_travel_rule_id),
+                            )
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    } else if let Some(recovery) = approved_endpoint_recovery.as_ref() {
                         executor
                             .retry_approved_failed_local_entity_with_standard(recovery)
                             .await

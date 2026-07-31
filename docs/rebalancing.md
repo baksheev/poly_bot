@@ -280,24 +280,27 @@ Startup validates both account views before opening the live executor:
 - the master view of the subaccount matches the trading-key view;
 - both credentials are restricted to the production egress IP.
 
-Every production withdrawal is compile-time pinned to Binance
-`/sapi/v1/capital/withdraw/apply`, independent of asset, network, or amount.
-There is no runtime withdrawal-mode setting. This is the ordinary Rails
-withdrawal behavior before Rails commit `6520658`; that later global
-`localentity` replacement was disproved by the production ESP `-4024` response
-and is not copied into Rust. The exact wallet is also present in Binance's
-withdrawal-address list for Arbitrum with `whiteStatus=true`. The standard API
-selection is durably journaled before submission and cannot change after an
-ambiguous request.
+Every production withdrawal starts at Binance
+`/sapi/v1/capital/withdraw/apply`, independent of asset, network, or a locally
+guessed amount threshold. There is no runtime withdrawal-mode setting. If and
+only if that exact request synchronously returns Binance `-4104`, Rust durably
+records the routing decision, revalidates the exact `VERIFIED` wallet record,
+and submits the same deterministic withdrawal through
+`/sapi/v1/localentity/withdraw/apply`. The fallback questionnaire carries the
+Satoshi-test proof Binance stored for this address:
+`isAddressOwner=1`, `sendTo=1`, `satoshiToken=USDC`, and `verifyMethod=1`.
+The AE payload also identifies the destination as `vaspName=Unhosted Wallet`,
+matching the successful UI record.
+An ambiguous standard request never selects the fallback.
 
-Travel Rule is conditional deposit handling. After a wallet-to-Binance transfer,
-Rust reads the exact deposit-history row and submits `deposit/provide-info`
-only when `requireQuestionnaire=true` and `travelRuleReqStatus` has not passed.
-The runtime deliberately follows those Binance fields instead of duplicating a
-fiat or token threshold. It then polls until credited. A missing history row
-means "not indexed yet", not failure. Transaction hashes are matched
-case-insensitively. Duplicate matches, wrong networks, malformed hashes, or
-ambiguous addresses fail closed.
+Travel Rule deposit handling remains separate. After a wallet-to-Binance
+transfer, Rust reads the exact deposit-history row and submits
+`deposit/provide-info` only when `requireQuestionnaire=true` and
+`travelRuleReqStatus` has not passed. In both directions the runtime follows
+Binance's response rather than duplicating a fiat or token threshold. A missing
+history row means "not indexed yet", not failure. Transaction hashes are
+matched case-insensitively. Wrong networks, malformed hashes, ambiguous
+addresses, or multiple viable withdrawal submissions fail closed.
 
 ## Durability, idempotency, and recovery
 

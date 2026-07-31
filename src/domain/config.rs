@@ -484,6 +484,8 @@ pub struct LiveCanaryRebalanceConfig {
     pub bridge_mutations_enabled: bool,
     #[serde(default)]
     pub approved_standard_withdrawal_recovery: Option<LiveCanaryStandardWithdrawalRecoveryConfig>,
+    #[serde(default)]
+    pub approved_manual_withdrawal_recovery: Option<LiveCanaryManualWithdrawalRecoveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -506,6 +508,30 @@ pub struct LiveCanaryStandardWithdrawalRecoveryConfig {
     pub rejected_error_message: String,
     pub capital_history_match_count: u16,
     pub capital_history_checked_at_utc: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCanaryManualWithdrawalRecoveryConfig {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub operation_id: String,
+    pub fingerprint: String,
+    pub withdraw_order_id: String,
+    pub token_symbol: String,
+    pub gross_debit_base_units: String,
+    pub expected_credit_base_units: String,
+    pub expected_fee_base_units: String,
+    pub wallet_balance_before_base_units: String,
+    pub wallet_address: String,
+    pub binance_network: String,
+    pub master_transfer_transaction_id: u64,
+    pub rejected_local_entity_travel_rule_id: i64,
+    pub rejected_standard_travel_rule_id: i64,
+    pub withdrawal_id: String,
+    pub transaction_hash: String,
+    pub apply_time_utc: String,
+    pub complete_time_utc: String,
 }
 
 impl LiveCanaryRebalanceConfig {
@@ -579,7 +605,8 @@ impl LiveCanaryRebalanceConfig {
         let reviewed_caps = match self.approval_session_id.as_str() {
             "esp-usdc-arbitrum-rebalance-20260730-r1" => {
                 ensure!(
-                    self.approved_standard_withdrawal_recovery.is_none(),
+                    self.approved_standard_withdrawal_recovery.is_none()
+                        && self.approved_manual_withdrawal_recovery.is_none(),
                     "pair {} R1 cannot approve a later endpoint recovery",
                     pair.id
                 );
@@ -594,6 +621,10 @@ impl LiveCanaryRebalanceConfig {
                     .as_ref()
                     .context("R2 requires the exact approved standard-withdrawal recovery")?;
                 recovery.validate(pair)?;
+                self.approved_manual_withdrawal_recovery
+                    .as_ref()
+                    .context("R2 requires the exact approved manual-withdrawal recovery")?
+                    .validate(pair)?;
                 (
                     U256::from(2_600_000_000_u64),
                     U256::from(10_000_u64) * U256::from(10_u64).pow(U256::from(18_u64)),
@@ -614,6 +645,40 @@ impl LiveCanaryRebalanceConfig {
                 && token_a_fee < token_a_debit
                 && token_b_fee < token_b_debit,
             "pair {} M10 value or fee caps differ from the reviewed approval session",
+            pair.id
+        );
+        Ok(())
+    }
+}
+
+impl LiveCanaryManualWithdrawalRecoveryConfig {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        ensure!(
+            self.production_approval_actor == "operator"
+                && self.production_approval_recorded_at_utc == "2026-07-31T09:54:36Z"
+                && self.operation_id == "rebalance-324-8b62a7c14f4ef643"
+                && self.fingerprint
+                    == "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a"
+                && self.withdraw_order_id == "rb8b62a7c14f4ef6434a88c384bbb83c"
+                && self.token_symbol == pair.token_b.symbol
+                && self.gross_debit_base_units == "4464938180550000000000"
+                && self.expected_credit_base_units == "4463838180550000000000"
+                && self.expected_fee_base_units == "1100000000000000000"
+                && self.wallet_balance_before_base_units == "534923638887482447575"
+                && self
+                    .wallet_address
+                    .eq_ignore_ascii_case("0x90D990C81320221D2882De32beeA78923c1e77A3")
+                && self.binance_network == "ARBITRUM"
+                && self.master_transfer_transaction_id == 396_036_135_710
+                && self.rejected_local_entity_travel_rule_id == 67_294_348
+                && self.rejected_standard_travel_rule_id == 67_298_920
+                && self.withdrawal_id == "e02357b25de24e1ba9965bf524db37f7"
+                && self.transaction_hash
+                    == "0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd"
+                && self.transaction_hash.parse::<B256>().is_ok()
+                && self.apply_time_utc == "2026-07-31T09:50:51Z"
+                && self.complete_time_utc == "2026-07-31T09:52:10Z",
+            "pair {} manual M12 withdrawal recovery differs from the exact reviewed receipt",
             pair.id
         );
         Ok(())
@@ -2001,6 +2066,27 @@ mod tests {
         );
         assert_eq!(endpoint_recovery.retry_api_mode, "standard");
         assert_eq!(endpoint_recovery.capital_history_match_count, 0);
+        let manual_recovery = rebalance
+            .approved_manual_withdrawal_recovery
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            manual_recovery.withdrawal_id,
+            "e02357b25de24e1ba9965bf524db37f7"
+        );
+        assert_eq!(
+            manual_recovery.transaction_hash,
+            "0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd"
+        );
+        assert_eq!(
+            manual_recovery.expected_fee_base_units,
+            "1100000000000000000"
+        );
+        assert_eq!(
+            manual_recovery.rejected_local_entity_travel_rule_id,
+            67_294_348
+        );
+        assert_eq!(manual_recovery.rejected_standard_travel_rule_id, 67_298_920);
         assert!(canary.rebalance_mutations_enabled);
         let evm_recovery = prefunding
             .approved_evm_prebroadcast_rejection
@@ -2083,6 +2169,16 @@ mod tests {
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_standard_withdrawal_recovery"]
             ["withdraw_order_id"] = Value::String("rbwrong".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_manual_withdrawal_recovery"]
+            ["expected_fee_base_units"] = Value::String("1200000000000000000".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_manual_withdrawal_recovery"]
+            ["rejected_standard_travel_rule_id"] = Value::from(67_294_348);
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();

@@ -843,6 +843,15 @@ impl BinanceApiError {
                 .code
                 .is_some_and(|code| matches!(code, -4104 | -4024 | -1002))
     }
+
+    pub fn is_travel_rule_required_withdrawal_rejection(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+            && self.code == Some(-4104)
+            && self.message.as_deref()
+                == Some(
+                    "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.",
+                )
+    }
 }
 
 impl fmt::Display for BinanceApiError {
@@ -1031,6 +1040,7 @@ mod tests {
             message: Some("travel rule restrictions".to_owned()),
         };
         assert!(rejected.is_known_pre_submission_withdrawal_rejection());
+        assert!(!rejected.is_travel_rule_required_withdrawal_rejection());
         assert_eq!(
             rejected.to_string(),
             "Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4104: travel rule restrictions"
@@ -1051,6 +1061,16 @@ mod tests {
             message: Some("unreviewed rejection".to_owned()),
         };
         assert!(!unknown_bad_request.is_known_pre_submission_withdrawal_rejection());
+
+        let exact_travel_rule_required = BinanceApiError {
+            operation: "standard withdrawal submission".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            code: Some(-4104),
+            message: Some(
+                "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.".to_owned(),
+            ),
+        };
+        assert!(exact_travel_rule_required.is_travel_rule_required_withdrawal_rejection());
     }
 
     #[test]

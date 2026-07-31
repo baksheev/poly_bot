@@ -1,8 +1,8 @@
 # M12 pre-deploy review: full calculated ESP/USDC rebalance
 
-Status: first rollout failed closed on a copied Rails endpoint regression;
-corrective implementation review complete and production evidence pending one
-consolidated replacement deployment.
+Status: two endpoint probes failed closed; the operator completed the exact
+withdrawal in Binance UI, root cause is reproduced from Binance history, and
+one consolidated recovery/routing deployment is pending.
 
 The operator explicitly approved immediate ESP/USDC rebalancing on
 2026-07-31. The allocator's last production snapshot requests one direct
@@ -19,10 +19,16 @@ complete current plan but not an erroneous unit-scaled or duplicate debit.
 - [x] The only newly authorized external mutation is a direct ESP withdrawal
   from the configured Binance subaccount to the existing wallet on network
   `ARBITRUM` / chain `42161`.
-- [x] Every withdrawal is compile-time pinned to the ordinary
-  `POST /sapi/v1/capital/withdraw/apply` flow used by Rails before commit
-  `6520658`; no asset, network, or amount selects another withdrawal endpoint.
-  Travel Rule questionnaire logic remains conditional and deposit-only.
+- [x] Every withdrawal starts with
+  `POST /sapi/v1/capital/withdraw/apply`; no asset, network, or locally guessed
+  amount selects another endpoint. Only the exact synchronous Binance `-4104`
+  response durably routes the same request to
+  `POST /sapi/v1/localentity/withdraw/apply`.
+- [x] The fallback reuses the exact ownership proof stored by Binance for this
+  address (`VERIFIED`, `satoshiToken=USDC`, `verifyMethod=1`,
+  `isAddressOwner=1`, `sendTo=1`, `vaspName=Unhosted Wallet`). This fixes the
+  missing metadata that caused the API path to differ from the successful UI
+  path.
 - [x] The current plan is exactly `4,464.93818055 ESP`; the runtime does not
   split or truncate it to the historical `401.2 ESP` canary amount.
 - [x] Bridge mutations remain disabled. Optimism cannot be selected by the M12
@@ -42,6 +48,10 @@ complete current plan but not an erroneous unit-scaled or duplicate debit.
   active state from the journal and cannot start another transfer.
 - [x] A withdrawal submission with an unknown result performs at most one
   deterministic reconciliation query and never authorizes resubmission.
+- [x] A standard `-4104` history row and a later local-entity row may share the
+  deterministic ID. Restart recovery validates all rows, ignores only explicit
+  unbroadcast failures, accepts at most one viable submission, and never
+  replays an ambiguous POST.
 - [x] The failed R2 ESP operation may reopen only when operation ID,
   fingerprint, `withdrawOrderId`, amount, wallet, network, successful master
   transfer `396036135710`, exact `-4024` rejection, and zero matching capital
@@ -64,10 +74,16 @@ complete current plan but not an erroneous unit-scaled or duplicate debit.
   debit ceilings: USDC `25 -> 2,600`, ESP `401.2 -> 10,000`. Fee, count,
   concurrency, failure, 15-minute, single-query, direct-route, and no-bridge
   controls are unchanged.
-- [x] The corrective semantic diff pins new withdrawal submissions to
-  `capital/withdraw/apply` and adds the exact R2 recovery evidence observed at
-  `2026-07-31T09:02:15Z`. Historical V4 local-entity records remain replayable
-  but cannot select the endpoint for a new submission.
+- [x] The corrective semantic diff starts new withdrawals at
+  `capital/withdraw/apply`, routes only exact `-4104` to Travel Rule, and adds
+  the exact R2 recovery evidence. Historical modes remain replayable but cannot
+  select the endpoint for a new submission.
+- [x] The manual receipt is pinned to Binance withdrawal
+  `e02357b25de24e1ba9965bf524db37f7`, transaction
+  `0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd`,
+  gross debit `4,464.93818055 ESP`, fee `1.1 ESP`, credit
+  `4,463.83818055 ESP`, master transfer `396036135710`, and the two
+  unbroadcast bot rows `67294348` / `67298920`.
 - [x] The higher USDC ceiling is only a symmetric catastrophic-error bound for
   the same two-token allocator; the observed plan requests ESP and does not
   create a USDC action.
@@ -103,10 +119,11 @@ complete current plan but not an erroneous unit-scaled or duplicate debit.
   `534.923638887482447575 ESP`, direct Arbitrum amount
   `4,464.93818055 ESP`.
 - [x] The current production owner has no active operation: the R2 ESP
-  operation is terminal failed after a successful master transfer and a
-  synchronous unbroadcast local-entity `-4024`. Read-only capital recovery
-  returned `matching_withdrawals=0`; no local production mutation was used for
-  this review.
+  operation is terminal failed after a successful master transfer and
+  synchronous unbroadcast `-4024` then `-4104` responses. The operator's exact
+  UI withdrawal is complete; read-only Arbitrum state is
+  `4,998.761819437482447575 ESP`, exactly the reviewed pre-balance plus the
+  receipt credit. Recovery contains no transfer or withdrawal call.
 - [x] The complete diff is reviewed as one change before push. The final
   `scripts/predeploy-review` and `scripts/quality.sh` gates must pass on the
   same revision; there will be one clean fast-forward push and one deployment.

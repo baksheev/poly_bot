@@ -411,17 +411,21 @@ confirmed before the prefunding workflow was restored. That completed journal
 entry cannot be replayed by later rollouts.
 
 An ESP bootstrap or later rebalance must deliver ESP as ESP. A USDC-to-ESP DEX
-swap is not a substitute for the missing asset-transfer capability. The
-ordinary Rails withdrawal implementation before commit `6520658` establishes
-one withdrawal rule for every asset and amount:
-`/sapi/v1/capital/withdraw/apply`. The later global local-entity replacement
-was a regression and is excluded after production ESP rejected it with
-`-4024`. After a wallet-to-Binance transfer,
-the deposit-history response independently decides whether
-`deposit/provide-info` is required through `requireQuestionnaire` and
-`travelRuleReqStatus`; the runtime does not infer that decision from a hard-coded
-amount threshold. Rust exposes no withdrawal-mode environment setting and pins
-the standard capital endpoint in code.
+swap is not a substitute for the missing asset-transfer capability. Every
+withdrawal starts through the ordinary
+`/sapi/v1/capital/withdraw/apply` route. Rust has no asset/network/amount
+endpoint switch and does not copy Rails' later global local-entity replacement,
+which production disproved with `-4024`. Binance can nevertheless select the
+Travel Rule withdrawal flow for the particular request: only its exact
+synchronous `-4104` response may durably route the same deterministic request
+to `/sapi/v1/localentity/withdraw/apply`. Before that POST, Rust requires the
+exact verified wallet record and forwards its stored Satoshi proof
+(`satoshiToken=USDC`, `verifyMethod=1`) with the UAE self-owned-wallet fields.
+The questionnaire uses the successful UI destination identity
+`vaspName=Unhosted Wallet`.
+After a wallet-to-Binance transfer, deposit history independently decides
+whether `deposit/provide-info` is required. Neither direction uses a hard-coded
+amount threshold.
 
 The rejected legacy request is `trId=67181540`, `travelRuleStatus=4`, with no
 `withdrawalStatus` and no transaction hash. Recovery refetches the exact row,

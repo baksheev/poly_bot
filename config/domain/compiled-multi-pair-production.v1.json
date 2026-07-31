@@ -6,7 +6,7 @@
   "sources": [
     {
       "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
-      "source_fingerprint_sha256": "55d03c0eb8b2da50e2517814579d9a87524547433dfe646d3369534fc2917827",
+      "source_fingerprint_sha256": "2ae0895ca7f31822391c448deed23b5241fd389f391b6c9baaf259b0e353052d",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
@@ -165,6 +165,27 @@
                   "rejected_error_message": "[031031] User does not own this currency.",
                   "capital_history_match_count": 0,
                   "capital_history_checked_at_utc": "2026-07-31T09:02:15Z"
+                },
+                "approved_manual_withdrawal_recovery": {
+                  "production_approval_actor": "operator",
+                  "production_approval_recorded_at_utc": "2026-07-31T09:54:36Z",
+                  "operation_id": "rebalance-324-8b62a7c14f4ef643",
+                  "fingerprint": "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a",
+                  "withdraw_order_id": "rb8b62a7c14f4ef6434a88c384bbb83c",
+                  "token_symbol": "ESP",
+                  "gross_debit_base_units": "4464938180550000000000",
+                  "expected_credit_base_units": "4463838180550000000000",
+                  "expected_fee_base_units": "1100000000000000000",
+                  "wallet_balance_before_base_units": "534923638887482447575",
+                  "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
+                  "binance_network": "ARBITRUM",
+                  "master_transfer_transaction_id": 396036135710,
+                  "rejected_local_entity_travel_rule_id": 67294348,
+                  "rejected_standard_travel_rule_id": 67298920,
+                  "withdrawal_id": "e02357b25de24e1ba9965bf524db37f7",
+                  "transaction_hash": "0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd",
+                  "apply_time_utc": "2026-07-31T09:50:51Z",
+                  "complete_time_utc": "2026-07-31T09:52:10Z"
                 }
               }
             },

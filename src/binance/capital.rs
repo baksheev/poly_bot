@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use alloy_primitives::{Address, B256};
 use anyhow::{Context, bail, ensure};
@@ -11,6 +11,7 @@ use super::account::BinanceAccountClient;
 const DEPOSIT_ADDRESS_ENDPOINT: &str = "/sapi/v1/capital/deposit/address";
 const DEPOSIT_TRAVEL_RULE_ENDPOINT: &str = "/sapi/v2/localentity/deposit/provide-info";
 const STANDARD_WITHDRAWAL_ENDPOINT: &str = "/sapi/v1/capital/withdraw/apply";
+const TRAVEL_RULE_WITHDRAWAL_ENDPOINT: &str = "/sapi/v1/localentity/withdraw/apply";
 
 impl BinanceAccountClient {
     pub async fn all_coin_information(&self) -> anyhow::Result<Vec<CoinInformation>> {
@@ -193,6 +194,76 @@ impl BinanceAccountClient {
         Ok(submission)
     }
 
+    pub async fn withdraw_travel_rule_ae_self_owned(
+        &self,
+        coin: &str,
+        network: &str,
+        address: &str,
+        amount: Decimal,
+        withdraw_order_id: &str,
+        ownership_proof: &TravelRuleAddressOwnershipProof,
+    ) -> anyhow::Result<TravelRuleWithdrawalSubmission> {
+        validate_symbol("coin", coin)?;
+        validate_symbol("network", network)?;
+        validate_symbol("satoshi token", &ownership_proof.satoshi_token)?;
+        ensure!(
+            ownership_proof.verify_method == 1,
+            "Binance Travel Rule withdrawal requires the reviewed Satoshi verification method"
+        );
+        ensure!(
+            address.starts_with("0x")
+                && address.len() == 42
+                && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Binance withdrawal address must be an EVM address"
+        );
+        ensure!(amount > Decimal::ZERO, "withdrawal amount must be positive");
+        validate_withdraw_order_id(withdraw_order_id)?;
+        let query = self.signed_query(&[
+            ("coin", coin.to_owned()),
+            ("address", address.to_owned()),
+            ("amount", amount.normalize().to_string()),
+            ("network", network.to_owned()),
+            ("walletType", "0".to_owned()),
+            (
+                "questionnaire",
+                serde_json::json!({
+                    "vaspName": "Unhosted Wallet",
+                    "isAddressOwner": 1,
+                    "sendTo": 1,
+                    "satoshiToken": ownership_proof.satoshi_token.as_str(),
+                    "verifyMethod": ownership_proof.verify_method,
+                })
+                .to_string(),
+            ),
+            ("withdrawOrderId", withdraw_order_id.to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let submission: TravelRuleWithdrawalSubmission = self
+            .signed_post(
+                TRAVEL_RULE_WITHDRAWAL_ENDPOINT,
+                &query,
+                "Travel Rule withdrawal submission",
+            )
+            .await?;
+        if !submission.accepted {
+            return Err(BinanceTravelRuleWithdrawalRejected {
+                tr_id: submission.tr_id,
+                info: submission.info,
+            }
+            .into());
+        }
+        ensure!(
+            !submission.tr_id.is_empty()
+                && submission.tr_id.len() <= 128
+                && submission
+                    .tr_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "Binance Travel Rule withdrawal returned an invalid trId"
+        );
+        Ok(submission)
+    }
+
     pub async fn withdrawal_history(
         &self,
         coin: &str,
@@ -312,11 +383,7 @@ impl BinanceAccountClient {
             .into_iter()
             .filter(|record| record.coin == coin && record.withdraw_order_id == withdraw_order_id)
             .collect::<Vec<_>>();
-        ensure!(
-            matching.len() <= 1,
-            "Binance returned duplicate Travel Rule withdrawals for one client id"
-        );
-        if let Some(record) = matching.first() {
+        for record in &matching {
             ensure!(
                 record.network.is_empty() || record.network == network,
                 "Binance returned a Travel Rule withdrawal for the client id on another network"
@@ -555,6 +622,40 @@ pub struct WithdrawalSubmission {
 pub struct StandardWithdrawalSubmission {
     pub id: String,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TravelRuleWithdrawalSubmission {
+    #[serde(deserialize_with = "deserialize_opaque_id")]
+    pub tr_id: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub info: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TravelRuleAddressOwnershipProof {
+    pub satoshi_token: String,
+    pub verify_method: i64,
+}
+
+#[derive(Debug)]
+pub struct BinanceTravelRuleWithdrawalRejected {
+    tr_id: String,
+    info: String,
+}
+
+impl fmt::Display for BinanceTravelRuleWithdrawalRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Binance Travel Rule withdrawal was not accepted (trId={}): {}",
+            self.tr_id, self.info
+        )
+    }
+}
+
+impl std::error::Error for BinanceTravelRuleWithdrawalRejected {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -880,6 +981,25 @@ where
     Decimal::from_str(&value).map_err(serde::de::Error::custom)
 }
 
+fn deserialize_opaque_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OpaqueId {
+        String(String),
+        Signed(i64),
+        Unsigned(u64),
+    }
+
+    Ok(match OpaqueId::deserialize(deserializer)? {
+        OpaqueId::String(value) => value,
+        OpaqueId::Signed(value) => value.to_string(),
+        OpaqueId::Unsigned(value) => value.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, B256};
@@ -888,7 +1008,8 @@ mod tests {
         AddressVerificationRecord, CoinInformation, DEPOSIT_ADDRESS_ENDPOINT,
         DEPOSIT_TRAVEL_RULE_ENDPOINT, DepositAddressRecord, DepositCreditState, DepositRecord,
         NetworkInformation, STANDARD_WITHDRAWAL_ENDPOINT, StandardWithdrawalSubmission,
-        TravelRuleQuestionnaireRequirements, TravelRuleWithdrawalRecord, WithdrawalAddressRecord,
+        TRAVEL_RULE_WITHDRAWAL_ENDPOINT, TravelRuleQuestionnaireRequirements,
+        TravelRuleWithdrawalRecord, TravelRuleWithdrawalSubmission, WithdrawalAddressRecord,
         WithdrawalRecord, WithdrawalState, WithdrawalSubmission, matching_deposits,
         matching_withdrawals, parse_address_verification_list, select_capital_routes,
         select_evm_deposit_address,
@@ -941,6 +1062,17 @@ mod tests {
             serde_json::from_str(r#"{"id":"7213fea8e94b4a5593d507237e5a555b"}"#).unwrap();
 
         assert_eq!(submission.id, "7213fea8e94b4a5593d507237e5a555b");
+    }
+
+    #[test]
+    fn parses_travel_rule_submission_id_without_narrowing() {
+        let submission: TravelRuleWithdrawalSubmission = serde_json::from_str(
+            r#"{"trId":67300014,"accepted":true,"info":"Withdrawal request accepted"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(submission.tr_id, "67300014");
+        assert!(submission.accepted);
     }
 
     #[test]
@@ -1247,6 +1379,10 @@ mod tests {
         assert_eq!(
             DEPOSIT_TRAVEL_RULE_ENDPOINT,
             "/sapi/v2/localentity/deposit/provide-info"
+        );
+        assert_eq!(
+            TRAVEL_RULE_WITHDRAWAL_ENDPOINT,
+            "/sapi/v1/localentity/withdraw/apply"
         );
         assert!(!STANDARD_WITHDRAWAL_ENDPOINT.contains("localentity"));
         assert!(DEPOSIT_TRAVEL_RULE_ENDPOINT.contains("/deposit/"));

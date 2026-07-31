@@ -154,6 +154,14 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     assert!(DEPLOY_WORKFLOW.contains("rb8b62a7c14f4ef6434a88c384bbb83c"));
     assert!(DEPLOY_WORKFLOW.contains("396036135710"));
     assert!(DEPLOY_WORKFLOW.contains("capital_history_match_count"));
+    assert!(DEPLOY_WORKFLOW.contains("approved_manual_withdrawal_recovery.operation_id"));
+    assert!(DEPLOY_WORKFLOW.contains("e02357b25de24e1ba9965bf524db37f7"));
+    assert!(DEPLOY_WORKFLOW.contains("67294348"));
+    assert!(DEPLOY_WORKFLOW.contains("67298920"));
+    assert!(
+        DEPLOY_WORKFLOW
+            .contains("0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd")
+    );
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.approval_gate"));
     assert!(DEPLOY_WORKFLOW.contains("explicit_production_approved"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.max_parent_trades"));
