@@ -305,6 +305,9 @@ jobs:
           had_previous=false
           previous_pool=""
           previous_runtime_data="null"
+          previous_durable_schema_version=0
+          durable_schema_version=2
+          automatic_rollback_allowed=false
           rollout_applied=false
           rollout_succeeded=false
 
@@ -318,6 +321,13 @@ jobs:
             previous_runtime_data="$(kubectl get configmap arb-bot-runtime \
               --namespace "${GKE_NAMESPACE}" \
               -o json | jq -c '.data')"
+            previous_durable_schema_version="$(kubectl get deployment arb-bot \
+              --namespace "${GKE_NAMESPACE}" \
+              -o json | jq -r '.metadata.annotations["arb-bot/durable-state-schema-version"] // "1"')"
+            [[ "${previous_durable_schema_version}" =~ ^[0-9]+$ ]]
+            if (( previous_durable_schema_version >= durable_schema_version )); then
+              automatic_rollback_allowed=true
+            fi
           fi
 
           restore_on_failure() {
@@ -334,17 +344,21 @@ jobs:
               -o wide || true
             if [[ "${rollout_applied}" == true ]]; then
               if [[ "${had_previous}" == true ]]; then
-                runtime_rollback_patch="$(jq -cn \
-                  --argjson data "${previous_runtime_data}" \
-                  '[{"op":"replace","path":"/data","value":$data}]')"
-                kubectl patch configmap arb-bot-runtime \
-                  --namespace "${GKE_NAMESPACE}" \
-                  --type=json \
-                  --patch "${runtime_rollback_patch}" || true
-                kubectl rollout undo deployment/arb-bot --namespace "${GKE_NAMESPACE}" || true
-                kubectl rollout status deployment/arb-bot \
-                  --namespace "${GKE_NAMESPACE}" \
-                  --timeout=90s || true
+                if [[ "${automatic_rollback_allowed}" == true ]]; then
+                  runtime_rollback_patch="$(jq -cn \
+                    --argjson data "${previous_runtime_data}" \
+                    '[{"op":"replace","path":"/data","value":$data}]')"
+                  kubectl patch configmap arb-bot-runtime \
+                    --namespace "${GKE_NAMESPACE}" \
+                    --type=json \
+                    --patch "${runtime_rollback_patch}" || true
+                  kubectl rollout undo deployment/arb-bot --namespace "${GKE_NAMESPACE}" || true
+                  kubectl rollout status deployment/arb-bot \
+                    --namespace "${GKE_NAMESPACE}" \
+                    --timeout=90s || true
+                else
+                  echo "::error::automatic rollback refused: durable state schema ${durable_schema_version} is not readable by previous schema ${previous_durable_schema_version}; leaving the exact forward revision and runtime projection in place"
+                fi
               else
                 kubectl delete deployment arb-bot \
                   --namespace "${GKE_NAMESPACE}" \
@@ -383,6 +397,22 @@ jobs:
             --cluster="${GKE_CLUSTER}" \
             --zone="${GKE_ZONE}" \
             --format='value(name)')
+
+          if [[ "${had_previous}" == true ]]; then
+            existing_init_names="$(kubectl get deployment arb-bot \
+              --namespace "${GKE_NAMESPACE}" \
+              -o json | jq -r '[.spec.template.spec.initContainers[]?.name] | join(",")')"
+            if [[ -n "${existing_init_names}" ]]; then
+              test "${existing_init_names}" = prefund-arbitrum-m9
+              kubectl patch deployment arb-bot \
+                --namespace "${GKE_NAMESPACE}" \
+                --type=json \
+                --patch='[{"op":"test","path":"/spec/template/spec/initContainers/0/name","value":"prefund-arbitrum-m9"},{"op":"remove","path":"/spec/template/spec/initContainers"}]'
+            fi
+            test "$(kubectl get deployment arb-bot \
+              --namespace "${GKE_NAMESPACE}" \
+              -o json | jq -r '(.spec.template.spec.initContainers // []) | length')" = 0
+          fi
 
           GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
           GKE_CLUSTER="${GKE_CLUSTER}" \
@@ -510,6 +540,8 @@ jobs:
           deployment_json="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o json)"
+          test "$(jq -r '.metadata.annotations["arb-bot/durable-state-schema-version"]' \
+            <<<"${deployment_json}")" = "${durable_schema_version}"
           test "$(jq -r '.spec.template.spec.containers | map(.name) | sort | join(",")' \
             <<<"${deployment_json}")" = arb-bot,esp-market-data
           test "$(jq -r '(.spec.template.spec.initContainers // []) | length' \

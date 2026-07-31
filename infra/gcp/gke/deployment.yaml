@@ -20,6 +20,8 @@ metadata:
   labels:
     app.kubernetes.io/name: arb-bot
     app.kubernetes.io/component: trading-shadow
+  annotations:
+    arb-bot/durable-state-schema-version: "2"
 spec:
   replicas: 1
   revisionHistoryLimit: 5
@@ -52,9 +54,6 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      # Keep this explicit: client-side apply cannot infer deletion when an
-      # older live Deployment still owns the completed M9 prefunder field.
-      initContainers: []
       containers:
         - name: arb-bot
           image: __IMAGE__

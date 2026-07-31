@@ -160,7 +160,8 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
 #[test]
 fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
-    assert!(DEPLOYMENT.contains("initContainers: []"));
+    assert!(DEPLOYMENT.contains("arb-bot/durable-state-schema-version: \"2\""));
+    assert!(!DEPLOYMENT.contains("initContainers:"));
     assert!(!DEPLOYMENT.contains("name: prefund-arbitrum-m9"));
     assert!(!DEPLOYMENT.contains("exec arb_bot prefund-arbitrum-canary"));
     assert!(!DEPLOYMENT.contains("ARBITRUM_PREFUNDING_LIVE_CONFIRMATION"));
@@ -174,12 +175,22 @@ fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
     assert!(DEPLOY_WORKFLOW.contains("maximum_token_a_withdrawal_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_token_b_withdrawal_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers // []"));
+    assert!(DEPLOY_WORKFLOW.contains("existing_init_names"));
+    assert!(DEPLOY_WORKFLOW.contains("\"op\":\"test\",\"path\":\"/spec/template/spec/initContainers/0/name\",\"value\":\"prefund-arbitrum-m9\""));
+    assert!(
+        DEPLOY_WORKFLOW
+            .contains("\"op\":\"remove\",\"path\":\"/spec/template/spec/initContainers\"")
+    );
     assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.maximum_transfer_count"));
     assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.direct_route_only"));
     assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.bridge_mutations_enabled"));
     assert!(DEPLOY_WORKFLOW.contains(".status.containerStatuses"));
     assert!(DEPLOY_WORKFLOW.contains(".restartCount >= 2"));
     assert!(DEPLOY_WORKFLOW.contains("repeatedly failed startup"));
+    assert!(DEPLOY_WORKFLOW.contains("previous_durable_schema_version"));
+    assert!(DEPLOY_WORKFLOW.contains("automatic_rollback_allowed=false"));
+    assert!(DEPLOY_WORKFLOW.contains("previous_durable_schema_version >= durable_schema_version"));
+    assert!(DEPLOY_WORKFLOW.contains("automatic rollback refused"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
     assert!(DEPLOY_WORKFLOW.contains("binance-esp-address-verification.v1.json"));
     assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"amount_base_units\": \"998700\""));

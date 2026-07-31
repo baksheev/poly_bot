@@ -91,10 +91,14 @@ contract error.
   `reconciliation_queries` replays as zero while a payload mutation still
   fails closed. Evidence:
   `legacy_defaulted_progress_field_validates_the_stored_payload_bytes`.
-- [x] The M10 Deployment explicitly applies `initContainers: []`, so the
-  completed M9 prefunder cannot survive client-side apply field ownership.
-  Rollback restores ConfigMap data with a conflict-free JSON patch before
-  undoing the Deployment revision. Evidence:
+- [x] The workflow inspects the live init-container list and removes it with a
+  guarded JSON Patch only when its sole member is the completed
+  `prefund-arbitrum-m9`. Kubernetes server-side dry-run proved that both an
+  explicit empty list and `null` preserve this list under the prior field
+  owner, so the release asserts the field is absent before applying M10.
+  Durable state schema version 2 is recorded on the Deployment; a failed
+  forward-schema rollout is never automatically reverted to an older reader
+  or its runtime projection. Evidence:
   `gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state`.
 
 ## Latency and resource observation plan
