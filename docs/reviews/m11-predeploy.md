@@ -1,11 +1,12 @@
 # M11 pre-deploy review: maximum-pair capacity
 
-Status: implementation review in progress; production deployment is blocked.
+Status: complete; production verified on 2026-07-31.
 
-M11 is being reviewed as one consolidated change. No commit is pushed to
-`main` until the complete local gate below passes. The first deployment must
-contain the complete target-node replay and reporting path; it must not be used
-to discover ordinary compile, fixture, routing, restart, or limit errors.
+M11 was reviewed as one consolidated change. No implementation commit was
+pushed to `main` until the complete local gate below passed. The first
+deployment contained the complete target-node replay and reporting path; it
+was not used to discover ordinary compile, fixture, routing, restart, or limit
+errors.
 
 ## Scope and authority
 
@@ -150,6 +151,56 @@ workstation is prohibited. The target replay must be encoded in the reviewed
 GitHub deployment workflow and fail before the new application owner becomes
 Ready. If target replay or production comparisons fail, the revision is not
 accepted and no additional pair authority is enabled.
+
+## Authoritative production evidence
+
+Revision `158b48c2d544bddc080d5662670c43c98d463a3b` passed CI run
+`30610466763` and Deploy GKE run `30610767701`. The immutable application
+image is
+`sha256:c75799af20a71a95b766ea221ca06a27581639de93ba813bc642c5cb4595b284`.
+Before rollout, that exact image ran the M11 fixture on the fixed
+`c4-highcpu-8` node and produced `target_c4_replay_ready`:
+
+- 20 pairs, 23 pools, 2,000,000 strategy frames, and 160 reconnect events;
+- 2,000,160 exact single-strategy routes, zero route failures, and zero
+  dependency faults;
+- decision-owner p50/p95/p99 `73/78/97 ns`, 6,859,108 frames/second;
+- four/four maximum sizing workers, 20/20 strategies before noisy repeat,
+  21 retained work items, and 99,999 expected noisy replacements;
+- five hydration cycles, 115 pool publications, and one/one rejected partial
+  batch;
+- batch materialization p99 `105 ns`, decode p99 `52 ns`, pool build p99
+  `31,330 ns`, and publication p99 `46 ns`;
+- RSS before/after/high-water `8,314,880/25,116,672/25,313,280` bytes;
+- no network I/O and zero external mutations.
+
+Rollout then created the sole application Pod
+`arb-bot-64d564b5b9-cxn98`. Both containers started at
+`2026-07-31T06:56:58Z`, became Ready at `06:57:09Z`, use the exact digest
+above, and had zero restarts. The GCE rollback owner remained `TERMINATED`.
+The production domain remained exactly ESP/USDC plus WLD/USDC; M11 added no
+pair, subscription, inventory, order, transfer, or EVM authority.
+
+The initial half-open live comparison window
+`[2026-07-31T06:56:58Z, 2026-07-31T07:01:30Z)` had zero hot-telemetry drops
+and zero production errors. Its WLD strategy-price sample had `n=284`,
+parse p50/p95/p99/max `1/6/9/11 us`, and socket-to-decision
+`24/41/51/63 us`. WLD pool-event receive p99 was `40 us`; fee-500 prepared
+build/total p99 was `27/37 us`, and fee-3000 build/total p99 was `18/23 us`.
+This short live smoke cohort is not used to claim a tail improvement; the
+maximum-load percentile evidence is the exact 100,000-frame-per-pair target
+replay above. The live values remain inside the reviewed p99 ceilings and the
+WLD socket p99 remains within 20% of the frozen `46 us` reference.
+
+Over `[2026-07-31T06:56:58Z, 2026-07-31T07:00:30Z)`, application CPU peaked
+at `0.012993` core. Cgroup CPU throttling was zero. Monitoring memory peaked
+at `44,363,776` bytes and the later cgroup high-water was `54,812,672`
+bytes; memory high/max/OOM/OOM-kill counters were all zero. Startup recovered
+the durable trade, EVM, and rebalance journals, reported healthy account rate
+limits, and retained the reviewed globally bounded round-robin scheduler.
+The only warnings were the bounded pre-connection health sample, the known
+ESP top-only depth telemetry, and the expected absence of trading credentials
+in the separate read-only ESP collector.
 
 ## Remaining live-selection gate
 
