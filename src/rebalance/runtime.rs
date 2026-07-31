@@ -719,7 +719,19 @@ impl RebalanceExecutor {
     }
 
     pub fn m10_canary_risk(&self) -> anyhow::Result<super::RebalanceCanaryRisk> {
-        self.execution_journal.m10_canary_risk()
+        let approval_session_id = self
+            .capital_canary
+            .as_ref()
+            .context("M10 capital canary policy is not configured")?
+            .approval_session_id
+            .as_str();
+        self.execution_journal.m10_canary_risk(approval_session_id)
+    }
+
+    pub fn m10_approval_session_id(&self) -> Option<&str> {
+        self.capital_canary
+            .as_ref()
+            .map(|policy| policy.approval_session_id.as_str())
     }
 
     pub fn operations(&self) -> &std::collections::BTreeMap<String, RebalanceExecutionOperation> {
@@ -727,7 +739,9 @@ impl RebalanceExecutor {
     }
 
     pub fn latest_m10_operation(&self) -> Option<&RebalanceExecutionOperation> {
-        self.execution_journal.latest_m10_operation()
+        let approval_session_id = self.capital_canary.as_ref()?.approval_session_id.as_str();
+        self.execution_journal
+            .latest_m10_operation(approval_session_id)
     }
 
     fn emit_m10_binance_child(
@@ -754,6 +768,7 @@ impl RebalanceExecutor {
             serde_json::json!({
                 "engine_id": telemetry.engine_id,
                 "strategy_id": "rebalance-arbitrum-usdc-esp-m10",
+                "approval_session_id": operation.intent.canary_approval_session_id,
                 "operation_id": operation.intent.operation_id,
                 "owner": "binance_capital",
                 "stage": stage,
@@ -768,11 +783,13 @@ impl RebalanceExecutor {
         let Some(telemetry) = &self.telemetry else {
             return;
         };
-        match self.execution_journal.m10_canary_risk() {
+        match self.m10_canary_risk() {
             Ok(risk) => telemetry.handle.emit(
                 "m10_rebalance_risk_snapshot",
                 serde_json::json!({
                     "engine_id": telemetry.engine_id,
+                    "approval_session_id": self.capital_canary.as_ref()
+                        .map(|policy| policy.approval_session_id.as_str()),
                     "transfer_count": risk.transfer_count,
                     "active_transfer_count": risk.active_transfer_count,
                     "failed_transfer_count": risk.failed_transfer_count,
@@ -788,6 +805,8 @@ impl RebalanceExecutor {
                 "m10_rebalance_risk_snapshot",
                 serde_json::json!({
                     "engine_id": telemetry.engine_id,
+                    "approval_session_id": self.capital_canary.as_ref()
+                        .map(|policy| policy.approval_session_id.as_str()),
                     "outcome": "failed",
                     "error": format!("{error:#}"),
                 }),
@@ -1499,7 +1518,9 @@ impl RebalanceExecutor {
                 .capital_canary
                 .as_ref()
                 .context("M10 request has no compiled capital policy")?;
-            let risk = self.execution_journal.m10_canary_risk()?;
+            let risk = self
+                .execution_journal
+                .m10_canary_risk(&policy.approval_session_id)?;
             let now_unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .context("system clock is before Unix epoch")?
@@ -3709,6 +3730,7 @@ mod tests {
                     binance_balance_before: U256::from(3_075_000_679_u64),
                     wallet_balance_before: U256::from(679_994_191_u64),
                     canary_maximum_fee_base_units: None,
+                    canary_approval_session_id: None,
                 },
                 progress: RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                     api_mode: "standard".to_owned(),
@@ -3819,6 +3841,7 @@ mod tests {
                 binance_balance_before: U256::from(3_075_000_679_u64),
                 wallet_balance_before: U256::from(679_994_191_u64),
                 canary_maximum_fee_base_units: None,
+                canary_approval_session_id: None,
             },
             progress: RebalanceExecutionProgress::IntentRecorded,
         };
@@ -4226,6 +4249,7 @@ mod tests {
                 binance_balance_before: U256::from(10_000_000_000_000_000_000_000_u128),
                 wallet_balance_before: U256::ZERO,
                 canary_maximum_fee_base_units: None,
+                canary_approval_session_id: None,
             },
             progress: RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
                 api_mode: "standard".to_owned(),

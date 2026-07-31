@@ -470,6 +470,10 @@ pub fn authorize_m10_rebalance_request(
         "M10 request has the wrong execution authority"
     );
     ensure!(
+        request.canary_approval_session_id.as_deref() == Some(policy.approval_session_id.as_str()),
+        "M10 request approval session differs from the compiled policy"
+    );
+    ensure!(
         matches!(
             &request.action.route,
             Route::Direct {
@@ -990,6 +994,7 @@ mod tests {
         ]);
         runtime_plan.allocator_mode = CompiledCapitalAllocatorMode::LiveCanary;
         runtime_plan.capital_canary = Some(CompiledCapitalCanaryPolicy {
+            approval_session_id: "esp-usdc-arbitrum-rebalance-test-r2".to_owned(),
             network_id: NetworkId("eip155:42161".to_owned()),
             binance_network: "ARBITRUM".to_owned(),
             token_a_symbol: "USDC".to_owned(),
@@ -1000,9 +1005,10 @@ mod tests {
             maximum_concurrent_transfers: 1,
             maximum_failed_transfers: 1,
             maximum_token_a_debit: U256::from(1_000_u64),
-            maximum_token_b_debit: U256::from(2_000_u64),
+            maximum_token_b_debit: U256::from(10_000_u64)
+                * U256::from(10_u64).pow(U256::from(18_u64)),
             maximum_token_a_fee: U256::from(100_u64),
-            maximum_token_b_fee: U256::from(200_u64),
+            maximum_token_b_fee: U256::from(2_000_000_000_000_000_000_u128),
             rollout_duration_seconds: 900,
             maximum_unknown_reconciliation_queries: 1,
             direct_route_only: true,
@@ -1072,6 +1078,7 @@ mod tests {
             binance_balance_before: U256::from(1_000_u64),
             wallet_balance_before: U256::ZERO,
             canary_maximum_fee: Some(U256::from(100_u64)),
+            canary_approval_session_id: Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned()),
         };
         authorize_m10_rebalance_request(
             catalog.capital_canary().unwrap(),
@@ -1080,6 +1087,34 @@ mod tests {
             1_000,
         )
         .unwrap();
+
+        let mut full_esp_request = request.clone();
+        full_esp_request.token_symbol = "ESP".to_owned();
+        full_esp_request.token_decimals = 18;
+        full_esp_request.action.amount =
+            U256::from(4_464_938_180_550_u64) * U256::from(10_u64).pow(U256::from(9_u64));
+        full_esp_request.binance_balance_before =
+            U256::from(10_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        full_esp_request.canary_maximum_fee = Some(U256::from(2_000_000_000_000_000_000_u128));
+        authorize_m10_rebalance_request(
+            catalog.capital_canary().unwrap(),
+            &RebalanceCanaryRisk::default(),
+            &full_esp_request,
+            1_000,
+        )
+        .unwrap();
+
+        full_esp_request.action.amount =
+            U256::from(10_001_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        assert!(
+            authorize_m10_rebalance_request(
+                catalog.capital_canary().unwrap(),
+                &RebalanceCanaryRisk::default(),
+                &full_esp_request,
+                1_000,
+            )
+            .is_err()
+        );
 
         let exhausted = RebalanceCanaryRisk {
             transfer_count: 2,

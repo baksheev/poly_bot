@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn post_first_parent_balance_uses_runtime_presence_not_bootstrap_target() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
         let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
         let post_trade_usdc = U256::from(16_860_785_u64);
         let remaining_esp = U256::from(266_u64) * U256::from(10_u64).pow(U256::from(18_u64));
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn approved_m10_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
         let pair = &domain.snapshot().pairs[0];
         validate_readiness_pair(pair).unwrap();
 

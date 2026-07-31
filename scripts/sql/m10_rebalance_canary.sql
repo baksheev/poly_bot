@@ -18,6 +18,8 @@ WITH risk AS
       AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND startsWith(JSONExtractString(payload_json, 'engine_id'), 'arb-bot-rust-shadow-gke-')
+      AND JSONExtractString(payload_json, 'approval_session_id')
+          = 'esp-usdc-arbitrum-rebalance-20260731-r2'
 ),
 allocator AS
 (
@@ -64,6 +66,8 @@ sagas AS
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND JSONExtractString(payload_json, 'strategy_id')
           = 'rebalance-arbitrum-usdc-esp-m10'
+      AND JSONExtractString(payload_json, 'approval_session_id')
+          = 'esp-usdc-arbitrum-rebalance-20260731-r2'
     GROUP BY engine_id
 ),
 binance_children AS
@@ -83,6 +87,8 @@ binance_children AS
       AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
       AND JSONExtractString(payload_json, 'strategy_id')
           = 'rebalance-arbitrum-usdc-esp-m10'
+      AND JSONExtractString(payload_json, 'approval_session_id')
+          = 'esp-usdc-arbitrum-rebalance-20260731-r2'
       AND JSONExtractString(payload_json, 'owner') = 'binance_capital'
     GROUP BY engine_id
 ),
@@ -142,17 +148,22 @@ evm AS
 settlement AS
 (
     SELECT
-        JSONExtractString(payload_json, 'engine_id') AS engine_id,
+        JSONExtractString(stage.payload_json, 'engine_id') AS engine_id,
         count() AS settlement_count,
-        quantileExact(0.99)(JSONExtractUInt(payload_json, 'settlement_duration_us'))
+        quantileExact(0.99)(JSONExtractUInt(stage.payload_json, 'settlement_duration_us'))
             AS settlement_p99_us,
-        max(JSONExtractUInt(payload_json, 'settlement_duration_us'))
+        max(JSONExtractUInt(stage.payload_json, 'settlement_duration_us'))
             AS settlement_max_us
-    FROM runtime_telemetry
-    WHERE kind = 'rebalance_settlement_reconciled'
-      AND observed_at_ms >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
-      AND observed_at_ms < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
-      AND JSONExtractString(payload_json, 'strategy_id')
+    FROM runtime_telemetry AS stage
+    INNER JOIN saga_operations AS operation
+        ON operation.engine_id = JSONExtractString(stage.payload_json, 'engine_id')
+       AND operation.operation_id = JSONExtractString(stage.payload_json, 'operation_id')
+    WHERE stage.kind = 'rebalance_settlement_reconciled'
+      AND stage.observed_at_ms
+          >= toUnixTimestamp64Milli(parseDateTime64BestEffort({start_utc:String}))
+      AND stage.observed_at_ms
+          < toUnixTimestamp64Milli(parseDateTime64BestEffort({end_utc:String}))
+      AND JSONExtractString(stage.payload_json, 'strategy_id')
           = 'rebalance-arbitrum-usdc-esp-m10'
     GROUP BY engine_id
 ),
@@ -216,8 +227,8 @@ SELECT
             OR transfer_count > 2
             OR active_transfer_count > 1
             OR failed_transfer_count > 1
-            OR token_a_debit > toUInt256('25000000')
-            OR token_b_debit > toUInt256('401200000000000000000')
+            OR token_a_debit > toUInt256('2600000000')
+            OR token_b_debit > toUInt256('10000000000000000000000')
             OR token_a_maximum_fee > toUInt256('5000000')
             OR token_b_maximum_fee > toUInt256('2000000000000000000')
             OR allocator_failures != 0

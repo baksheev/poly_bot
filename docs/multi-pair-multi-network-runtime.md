@@ -2104,6 +2104,32 @@ Rollback:
 - remove strategies from a new immutable artifact without changing the shared
   ownership topology.
 
+### M12 — Full calculated ESP/USDC rebalance
+
+The operator approved immediate ESP/USDC balance convergence after the
+historical M10 canary completed. The V5 domain artifact opens a new durable
+approval session,
+`esp-usdc-arbitrum-rebalance-20260731-r2`, instead of resetting or rewriting
+R1 journal state.
+
+The existing 25% start threshold and 50/50 target are unchanged. At the last
+production snapshot the complete action is a direct Binance-to-Arbitrum
+withdrawal of `4,464.93818055 ESP`; the runtime must submit that calculated
+amount without the obsolete `401.2 ESP` canary truncation. A `10,000 ESP`
+hard ceiling protects against unit errors and duplicate authority without
+limiting this plan. The symmetric USDC ceiling is `2,600 USDC`. Per-operation
+fees remain capped at `2 ESP` or `5 USDC`; at most two transfers, one
+concurrent transfer, one failed transfer, one unknown-outcome reconciliation
+query, and a 15-minute window beginning with the first R2 durable intent remain
+in force. Direct `ARBITRUM` is the only route and bridge mutations remain
+disabled.
+
+Historical records without a session field are assigned only to R1. R2 risk,
+telemetry, and reporting are grouped by exact session, but the executor retains
+one global active-operation lane, so an incomplete older saga must recover
+before any R2 mutation. The full pre-deploy authority and restart review is
+recorded in `docs/reviews/m12-predeploy.md`.
+
 ## Future multi-wallet extension
 
 Multi-wallet support adds more `WalletId` values and execution lanes; it must

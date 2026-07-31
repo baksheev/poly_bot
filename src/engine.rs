@@ -4136,7 +4136,7 @@ mod tests {
     #[test]
     fn only_bounded_canary_inventory_exhaustion_is_expected() {
         let config =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
 
         assert!(is_bounded_canary_pair(&config, "arbitrum-usdc-esp"));
         assert!(!is_bounded_canary_pair(&config, "world-chain-usdc-wld"));

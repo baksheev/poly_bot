@@ -35,7 +35,7 @@ AND jsonPayload.fields.message=\"M10 Arbitrum rebalance live canary configured\"
 AND timestamp>=\"${start_utc}\"
 AND timestamp<\"${end_utc}\""
 
-echo $'timestamp\tpod\tpair\tapproval\tallocator\tnetwork\ttransfers\tconcurrent\tfailures\tusdc_debit\tesp_debit\tusdc_fee\tesp_fee\tduration\tunknown_queries\tdirect\tbridge\tshared_nonce_owner\tmutation'
+echo $'timestamp\tpod\tpair\tapproval\tapproval_session\tallocator\tnetwork\ttransfers\tconcurrent\tfailures\tusdc_debit\tesp_debit\tusdc_fee\tesp_fee\tduration\tunknown_queries\tdirect\tbridge\tshared_nonce_owner\tmutation'
 "${repo_root}/scripts/gcloud-local" logging read "${startup_filter}" \
   --project="${GCP_PROJECT_ID}" \
   --limit=100 \
@@ -49,6 +49,7 @@ echo $'timestamp\tpod\tpair\tapproval\tallocator\tnetwork\ttransfers\tconcurrent
           .resource.labels.pod_name,
           $f.pair_id,
           $f.approval_gate,
+          $f.approval_session_id,
           $f.allocator_mode,
           $f.binance_network,
           $f.maximum_transfer_count,

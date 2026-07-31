@@ -5,17 +5,17 @@
   "compiler_version": "m1-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
-      "source_fingerprint_sha256": "008841bbc05a5568f85b0470983b448763bae37ef751a73873f03e718dd92f1e",
+      "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
+      "source_fingerprint_sha256": "5ee415bc76af28d2ea55581990369cd6f345a92ffc3fe96bac1ce27827165277",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
+        "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
           "rails_pair_candidate_id": 3144,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
-          "captured_at_utc": "2026-07-30T03:45:21Z",
+          "captured_at_utc": "2026-07-31T08:09:37Z",
           "evidence": [
             "production PostgreSQL read-only PairCandidate export for ESPUSDC",
             "Binance Spot exchangeInfo and account commission filters for ESPUSDC",
@@ -23,7 +23,8 @@
             "block-pinned Arbitrum V3 local-curve and QuoterV2 parity validation",
             "M8 production readiness gate passed with funded native gas and zero mutation capability",
             "operator explicitly approved the bounded M9 production canary in Codex task poly-bot-architecture-milestone-loop on 2026-07-30",
-            "operator explicitly approved one-shot direct Arbitrum prefunding through the durable rebalance executor on 2026-07-30"
+            "operator explicitly approved one-shot direct Arbitrum prefunding through the durable rebalance executor on 2026-07-30",
+            "operator explicitly approved immediate full calculated ESP/USDC rebalance in Codex task poly-bot-architecture-milestone-loop on 2026-07-31"
           ]
         },
         "live_trading_enabled": true,
@@ -132,13 +133,14 @@
               "rebalance_live_canary": {
                 "approval_gate": "explicit_production_approved",
                 "production_approval_actor": "operator",
-                "production_approval_recorded_at_utc": "2026-07-30T23:26:16Z",
+                "production_approval_recorded_at_utc": "2026-07-31T08:09:37Z",
+                "approval_session_id": "esp-usdc-arbitrum-rebalance-20260731-r2",
                 "binance_network": "ARBITRUM",
                 "maximum_transfer_count": 2,
                 "maximum_concurrent_transfers": 1,
                 "maximum_failed_transfers": 1,
-                "maximum_token_a_debit_base_units": "25000000",
-                "maximum_token_b_debit_base_units": "401200000000000000000",
+                "maximum_token_a_debit_base_units": "2600000000",
+                "maximum_token_b_debit_base_units": "10000000000000000000000",
                 "maximum_token_a_fee_base_units": "5000000",
                 "maximum_token_b_fee_base_units": "2000000000000000000",
                 "rollout_duration_seconds": 900,
@@ -641,7 +643,7 @@
     {
       "id": "strategy:arbitrum-usdc-esp",
       "pair_id": "arbitrum-usdc-esp",
-      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
+      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ESPUSDC",
       "network_id": "eip155:42161",
@@ -829,7 +831,7 @@
     {
       "id": "compat-public-price-collector",
       "role": "public_price_collector",
-      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v4-bounded-canary",
+      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
       "pair_ids": [
         "arbitrum-usdc-esp"
       ]

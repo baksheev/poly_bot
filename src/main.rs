@@ -232,6 +232,9 @@ fn emit_m10_rebalance_risk(
             "m10_rebalance_risk_snapshot",
             serde_json::json!({
                 "engine_id": engine_id,
+                "approval_session_id": executor
+                    .m10_approval_session_id()
+                    .unwrap_or("unconfigured"),
                 "transfer_count": risk.transfer_count,
                 "active_transfer_count": risk.active_transfer_count,
                 "failed_transfer_count": risk.failed_transfer_count,
@@ -247,6 +250,9 @@ fn emit_m10_rebalance_risk(
             "m10_rebalance_risk_snapshot",
             serde_json::json!({
                 "engine_id": engine_id,
+                "approval_session_id": executor
+                    .m10_approval_session_id()
+                    .unwrap_or("unconfigured"),
                 "outcome": "failed",
                 "error": format!("{error:#}"),
             }),
@@ -277,6 +283,9 @@ fn emit_m10_rebalance_saga(
         serde_json::json!({
             "engine_id": engine_id,
             "strategy_id": "rebalance-arbitrum-usdc-esp-m10",
+            "approval_session_id": executor
+                .m10_approval_session_id()
+                .unwrap_or("unconfigured"),
             "operation_id": operation.map(|operation| &operation.intent.operation_id),
             "token": operation.map(|operation| &operation.intent.token_symbol),
             "direction": operation.map(|operation| format!("{:?}", operation.intent.direction)),
@@ -1256,6 +1265,7 @@ async fn prefund_arbitrum_canary(
                 binance_balance_before: binance_before,
                 wallet_balance_before: wallet_before,
                 canary_maximum_fee: None,
+                canary_approval_session_id: None,
             })
             .await?;
         let wallet_after = match completed.progress {
@@ -4023,6 +4033,7 @@ async fn run(
         production_approval_actor = ?m10_policy.production_approval_actor,
         production_approval_recorded_at_utc =
             ?m10_policy.production_approval_recorded_at_utc,
+        approval_session_id = m10_policy.approval_session_id,
         allocator_mode = ?portfolio_catalog.allocator_mode(),
         binance_network = m10_policy.binance_network,
         maximum_transfer_count = m10_policy.maximum_transfer_count,
@@ -5274,6 +5285,16 @@ async fn dispatch_rebalance_execution(
             binance_balance_before: evaluation.plan.projected.binance,
             wallet_balance_before: evaluation.plan.projected.wallet,
             canary_maximum_fee,
+            canary_approval_session_id: if target == RebalanceExecutionTarget::ArbitrumCanary {
+                Some(
+                    capital_policy
+                        .context("M10 dispatch has no compiled capital policy")?
+                        .approval_session_id
+                        .clone(),
+                )
+            } else {
+                None
+            },
         },
     ));
     Ok(true)
@@ -6087,7 +6108,7 @@ mod tests {
     #[test]
     fn m9_post_first_parent_restart_uses_durable_remaining_allowance_authority() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
         let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
         let first_admitted_unix_us = 1_785_426_526_104_975_u64;
         let post_trade_usdc = U256::from(16_860_785_u64);

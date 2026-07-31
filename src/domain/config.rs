@@ -468,6 +468,8 @@ pub struct LiveCanaryRebalanceConfig {
     pub production_approval_actor: Option<String>,
     #[serde(default)]
     pub production_approval_recorded_at_utc: Option<String>,
+    #[serde(default = "legacy_m10_approval_session_id")]
+    pub approval_session_id: String,
     pub binance_network: String,
     pub maximum_transfer_count: u16,
     pub maximum_concurrent_transfers: u16,
@@ -484,6 +486,14 @@ pub struct LiveCanaryRebalanceConfig {
 
 impl LiveCanaryRebalanceConfig {
     fn validate(&self, pair: &PairConfig, canary: &LiveCanaryConfig) -> anyhow::Result<()> {
+        ensure!(
+            (8..=64).contains(&self.approval_session_id.len())
+                && self.approval_session_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+                }),
+            "pair {} M10 approval session id is invalid",
+            pair.id
+        );
         match self.approval_gate {
             LiveCanaryApprovalGate::ExplicitProductionApprovalRequired => {
                 ensure!(
@@ -542,18 +552,38 @@ impl LiveCanaryRebalanceConfig {
             &self.maximum_token_b_fee_base_units,
             "live_canary.rebalance_live_canary.maximum_token_b_fee_base_units",
         )?;
+        let reviewed_caps = match self.approval_session_id.as_str() {
+            "esp-usdc-arbitrum-rebalance-20260730-r1" => (
+                U256::from(25_000_000_u64),
+                U256::from(401_200_000_000_000_000_000_u128),
+            ),
+            "esp-usdc-arbitrum-rebalance-20260731-r2" => (
+                U256::from(2_600_000_000_u64),
+                U256::from(10_000_u64) * U256::from(10_u64).pow(U256::from(18_u64)),
+            ),
+            _ => {
+                anyhow::bail!(
+                    "pair {} M10 approval session is not a reviewed production session",
+                    pair.id
+                )
+            }
+        };
         ensure!(
-            token_a_debit == U256::from(25_000_000_u64)
-                && token_b_debit == U256::from(401_200_000_000_000_000_000_u128)
+            token_a_debit == reviewed_caps.0
+                && token_b_debit == reviewed_caps.1
                 && token_a_fee == U256::from(5_000_000_u64)
                 && token_b_fee == U256::from(2_000_000_000_000_000_000_u128)
                 && token_a_fee < token_a_debit
                 && token_b_fee < token_b_debit,
-            "pair {} M10 value or fee caps differ from the reviewed bounded canary",
+            "pair {} M10 value or fee caps differ from the reviewed approval session",
             pair.id
         );
         Ok(())
     }
+}
+
+fn legacy_m10_approval_session_id() -> String {
+    "esp-usdc-arbitrum-rebalance-20260730-r1".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -1707,7 +1737,7 @@ mod tests {
     const ESP_READINESS_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v3.json");
     const ESP_CANARY_CONFIG: &str =
-        include_str!("../../config/strategies/usdc-esp-arbitrum.v4.json");
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v5.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1849,16 +1879,20 @@ mod tests {
         );
         assert_eq!(
             rebalance.production_approval_recorded_at_utc.as_deref(),
-            Some("2026-07-30T23:26:16Z")
+            Some("2026-07-31T08:09:37Z")
+        );
+        assert_eq!(
+            rebalance.approval_session_id,
+            "esp-usdc-arbitrum-rebalance-20260731-r2"
         );
         assert_eq!(rebalance.binance_network, "ARBITRUM");
         assert_eq!(rebalance.maximum_transfer_count, 2);
         assert_eq!(rebalance.maximum_concurrent_transfers, 1);
         assert_eq!(rebalance.maximum_failed_transfers, 1);
-        assert_eq!(rebalance.maximum_token_a_debit_base_units, "25000000");
+        assert_eq!(rebalance.maximum_token_a_debit_base_units, "2600000000");
         assert_eq!(
             rebalance.maximum_token_b_debit_base_units,
-            "401200000000000000000"
+            "10000000000000000000000"
         );
         assert_eq!(rebalance.maximum_token_a_fee_base_units, "5000000");
         assert_eq!(
@@ -1974,6 +2008,16 @@ mod tests {
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
         value["pairs"][0]["live_canary"]["rebalance_live_canary"]["bridge_mutations_enabled"] =
             Value::Bool(true);
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_session_id"] =
+            Value::String("esp-usdc-arbitrum-rebalance-unreviewed".to_owned());
+        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["maximum_token_b_debit_base_units"] =
+            Value::String("10001000000000000000000".to_owned());
         assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();

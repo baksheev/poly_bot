@@ -19,6 +19,7 @@ fn m10_report_proves_bounded_shared_owner_rebalance_authority() {
     assert!(query.contains("kind = 'm10_rebalance_child'"));
     assert!(query.contains("kind = 'arbitrage_execution_stage'"));
     assert!(query.contains("kind = 'rebalance_settlement_reconciled'"));
+    assert!(query.contains("esp-usdc-arbitrum-rebalance-20260731-r2"));
     assert!(query.contains("allocator_queue_p99_us"));
     assert!(query.contains("allocator_calculation_p99_us"));
     assert!(query.contains("binance_capital_child_p99_us"));
@@ -29,8 +30,8 @@ fn m10_report_proves_bounded_shared_owner_rebalance_authority() {
     assert!(query.contains("transfer_count > 2"));
     assert!(query.contains("active_transfer_count > 1"));
     assert!(query.contains("failed_transfer_count > 1"));
-    assert!(query.contains("token_a_debit > toUInt256('25000000')"));
-    assert!(query.contains("token_b_debit > toUInt256('401200000000000000000')"));
+    assert!(query.contains("token_a_debit > toUInt256('2600000000')"));
+    assert!(query.contains("token_b_debit > toUInt256('10000000000000000000000')"));
     assert!(query.contains("token_a_maximum_fee > toUInt256('5000000')"));
     assert!(query.contains("token_b_maximum_fee > toUInt256('2000000000000000000')"));
     assert!(query.contains("'limit_breach'"));

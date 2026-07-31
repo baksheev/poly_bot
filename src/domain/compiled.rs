@@ -574,6 +574,7 @@ pub enum CompiledCapitalAllocatorMode {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompiledCapitalCanaryPolicy {
+    pub approval_session_id: String,
     pub network_id: NetworkId,
     pub binance_network: String,
     pub token_a_symbol: String,
@@ -1735,6 +1736,7 @@ impl CompiledDomainGraph {
                         })
                 };
                 Ok::<_, anyhow::Error>(CompiledCapitalCanaryPolicy {
+                    approval_session_id: policy.approval_session_id.clone(),
                     network_id: NetworkId::new(format!("eip155:{}", pair.chain.chain_id))?,
                     binance_network: policy.binance_network.clone(),
                     token_a_symbol: pair.token_a.symbol.clone(),
@@ -2980,7 +2982,20 @@ mod tests {
             approved_policy
                 .production_approval_recorded_at_utc
                 .as_deref(),
-            Some("2026-07-30T23:26:16Z")
+            Some("2026-07-31T08:09:37Z")
+        );
+        assert_eq!(
+            approved_policy.approval_session_id,
+            "esp-usdc-arbitrum-rebalance-20260731-r2"
+        );
+        assert_eq!(
+            portfolio
+                .capital_canary
+                .as_ref()
+                .unwrap()
+                .maximum_token_b_debit,
+            alloy_primitives::U256::from(10_000_u64)
+                * alloy_primitives::U256::from(10_u64).pow(alloy_primitives::U256::from(18_u64))
         );
 
         let public = graph
