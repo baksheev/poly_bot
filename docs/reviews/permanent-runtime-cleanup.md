@@ -42,3 +42,32 @@ This release removes completed rollout scaffolding from executable code while pr
 - [x] No secrets, credential-bearing URLs, private keys, signed payloads, or authenticated requests are added.
 - [x] `cargo test`, targeted journal/routing tests, compiled-domain equality, and deployment assertions pass.
 - [x] `scripts/quality.sh` and `scripts/predeploy-review` must pass again immediately before commit.
+
+## Production result
+
+- [x] Revision `6b638ddfdbde40da74aec02e6257ee64e81c370b` passed CI
+  `30650542427` and Deploy GKE `30650917453`. The exact immutable image is
+  `sha256:664df5642abdb71107e4301db54b4c140b7c742950e850ffed5ccfa241acec04`.
+- [x] The sole Pod `arb-bot-b769bf8f9-5n477` started both containers at
+  `2026-07-31T17:39:30Z`, became Ready at `17:39:39Z`, and retained zero
+  restarts. The GCE rollback owner remained `TERMINATED`.
+- [x] In `[2026-07-31T17:39:30Z, 2026-07-31T18:04:24Z)`, the stable
+  production report was `armed`: 24 rebalance evaluations, 7,176 allocator
+  audits, zero action plans, zero active or failed transfers, and zero
+  planning, allocator, saga, child, or per-operation-limit failures.
+- [x] The same window recorded 3,353 WLD strategy frames, 28 adaptive tasks,
+  and zero hot-telemetry drops. WLD parse/socket p99 was `6/38 us` versus
+  `7/44 us` on the previous Pod immediately before rollout. World Chain
+  fee-500 receive/build/total p99 was `94/160/165 us`; the receive tail stayed
+  below the frozen `122 us` reference and the total stayed below the
+  `175.2/200 us` relative/hard gates.
+- [x] CPU max was `0.014292` core versus `0.016124` immediately before
+  rollout. Container memory working-set max was `75,386,880` bytes versus
+  `136,609,792` bytes immediately before rollout. Cgroup throttling and memory
+  high/max/OOM counters were zero.
+- [x] Production emitted zero `ERROR`. Transient archival-provider `header not
+  found` warnings remained recoverable and did not cause a readiness
+  transition. One known DEX revert was durably journaled with a proven
+  zero-token outcome and no unresolved exposure; the latest rebalance
+  heartbeat remained healthy, unblocked, not inflight, and not awaiting
+  settlement.
