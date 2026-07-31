@@ -395,6 +395,34 @@ pub fn validate_rebalance_readiness(
 fn validate_readiness_pair(
     pair: &PairConfig,
 ) -> anyhow::Result<&crate::domain::config::LiveCanaryConfig> {
+    let canary = pair
+        .live_canary
+        .as_ref()
+        .context("M8 readiness artifact has no canary limits")?;
+    let rebalance_gate_valid = match canary.rebalance_live_canary.as_ref() {
+        Some(policy)
+            if policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved =>
+        {
+            pair.rebalance.enabled
+                && canary.rebalance_mutations_enabled
+                && policy.production_approval_actor.as_deref() == Some("operator")
+                && policy
+                    .production_approval_recorded_at_utc
+                    .as_deref()
+                    .is_some_and(|value| value.ends_with('Z'))
+                && policy.binance_network == "ARBITRUM"
+                && policy.direct_route_only
+                && !policy.bridge_mutations_enabled
+        }
+        Some(policy) => {
+            policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+                && !pair.rebalance.enabled
+                && !canary.rebalance_mutations_enabled
+                && policy.production_approval_actor.is_none()
+                && policy.production_approval_recorded_at_utc.is_none()
+        }
+        None => !pair.rebalance.enabled && !canary.rebalance_mutations_enabled,
+    };
     ensure!(
         pair.id == "arbitrum-usdc-esp"
             && pair.chain.chain_id == ARBITRUM_CHAIN_ID
@@ -405,19 +433,15 @@ fn validate_readiness_pair(
                 .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
             && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
             && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
-            && !pair.rebalance.enabled,
+            && rebalance_gate_valid,
         "Arbitrum canary pair identity or rebalance gate differs from the reviewed artifact"
     );
-    let canary = pair
-        .live_canary
-        .as_ref()
-        .context("M8 readiness artifact has no canary limits")?;
     ensure!(
         matches!(
             canary.approval_gate,
             LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
                 | LiveCanaryApprovalGate::ExplicitProductionApproved
-        ) && !canary.rebalance_mutations_enabled,
+        ),
         "Arbitrum canary artifact has an invalid approval or rebalance gate"
     );
     Ok(canary)
@@ -536,7 +560,7 @@ mod tests {
     use super::{
         M8_CHAIN_READINESS_REFRESH_INTERVAL, M8ChainReadiness, M8ChainReadinessStatus,
         M8InjectedFailure, injected_failure_disposition, runtime_wallet_tokens_funded,
-        validate_binance_readiness,
+        validate_binance_readiness, validate_readiness_pair,
     };
 
     fn rates() -> CommissionSideRates {
@@ -702,5 +726,36 @@ mod tests {
             runtime_wallet_tokens_funded(canary, Some(post_trade_usdc), None).unwrap(),
             (true, false)
         );
+    }
+
+    #[test]
+    fn approved_m10_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail() {
+        let domain =
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
+        let pair = &domain.snapshot().pairs[0];
+        validate_readiness_pair(pair).unwrap();
+
+        let mut missing_pair_gate = pair.clone();
+        missing_pair_gate.rebalance.enabled = false;
+        assert!(validate_readiness_pair(&missing_pair_gate).is_err());
+
+        let mut missing_canary_gate = pair.clone();
+        missing_canary_gate
+            .live_canary
+            .as_mut()
+            .unwrap()
+            .rebalance_mutations_enabled = false;
+        assert!(validate_readiness_pair(&missing_canary_gate).is_err());
+
+        let mut bridge_enabled = pair.clone();
+        bridge_enabled
+            .live_canary
+            .as_mut()
+            .unwrap()
+            .rebalance_live_canary
+            .as_mut()
+            .unwrap()
+            .bridge_mutations_enabled = true;
+        assert!(validate_readiness_pair(&bridge_enabled).is_err());
     }
 }

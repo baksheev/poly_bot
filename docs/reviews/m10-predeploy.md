@@ -80,6 +80,11 @@ contract error.
   would otherwise reject every approved M10 startup. The shared PVC and
   durable saga/nonce journals remain mounted. Evidence:
   `gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state`.
+- [x] The production-derived startup readiness guard accepts only a fully
+  disabled rebalance projection or the exact approved direct-Arbitrum M10
+  projection. Missing either enable flag or enabling bridge mutation fails
+  closed. Evidence:
+  `approved_m10_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail`.
 
 ## Latency and resource observation plan
 

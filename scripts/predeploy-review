@@ -35,6 +35,7 @@ cargo test --test binance_capital_contract
 cargo test --test m10_reporting
 cargo test domain::config::tests --lib
 cargo test domain::compiled::tests --lib
+cargo test m8_readiness::tests::approved_m10_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail --lib
 cargo test portfolio::tests --lib
 cargo test dex::execution::tests::capital_handle_uses_the_same_nonce_journal_and_cannot_keep_service_alive --lib
 cargo test rebalance::executor::tests --lib
