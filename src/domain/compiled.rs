@@ -570,10 +570,12 @@ pub enum CompiledCapitalAllocatorMode {
     Disabled,
     Shadow,
     LiveCanary,
+    FullLive,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompiledCapitalCanaryPolicy {
+    pub full_live: bool,
     pub approval_session_id: String,
     pub network_id: NetworkId,
     pub binance_network: String,
@@ -1177,6 +1179,8 @@ impl CompiledDomainGraph {
         if role == CompatibilityRole::PublicPriceCollector {
             for pair in &mut snapshot.pairs {
                 pair.execution_enabled = false;
+                pair.full_live = false;
+                pair.full_live_policy = None;
                 if let Some(canary) = &mut pair.live_canary {
                     canary.approval_gate =
                         crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired;
@@ -1472,19 +1476,35 @@ impl CompiledDomainGraph {
                     fallback_gas_price_wei: 100_000,
                     includes_l1_fee: true,
                 },
-                (42_161, _, true) => {
+                (42_161, true, _) => {
                     let max_fee_headroom_bps = pairs
                         .iter()
-                        .filter_map(|pair| pair.live_canary.as_ref())
-                        .map(|canary| canary.arbitrum_max_fee_headroom_bps)
+                        .filter_map(|pair| {
+                            pair.full_live_policy
+                                .as_ref()
+                                .map(|policy| policy.arbitrum_max_fee_headroom_bps)
+                                .or_else(|| {
+                                    pair.live_canary
+                                        .as_ref()
+                                        .map(|canary| canary.arbitrum_max_fee_headroom_bps)
+                                })
+                        })
                         .next()
-                        .context("Arbitrum canary gas headroom is missing")?;
+                        .context("Arbitrum live gas headroom is missing")?;
                     ensure!(
                         pairs
                             .iter()
-                            .filter_map(|pair| pair.live_canary.as_ref())
-                            .all(|canary| canary.arbitrum_max_fee_headroom_bps
-                                == max_fee_headroom_bps),
+                            .filter_map(|pair| {
+                                pair.full_live_policy
+                                    .as_ref()
+                                    .map(|policy| policy.arbitrum_max_fee_headroom_bps)
+                                    .or_else(|| {
+                                        pair.live_canary
+                                            .as_ref()
+                                            .map(|canary| canary.arbitrum_max_fee_headroom_bps)
+                                    })
+                            })
+                            .all(|headroom| headroom == max_fee_headroom_bps),
                         "network {} has inconsistent Arbitrum max-fee headroom",
                         network.id.as_str()
                     );
@@ -1705,6 +1725,17 @@ impl CompiledDomainGraph {
             assets.len() == self.bundle.asset_mappings.len(),
             "portfolio plan does not cover every reviewed asset mapping"
         );
+        let full_live_policies = self
+            .bundle
+            .sources
+            .iter()
+            .flat_map(|source| source.snapshot.pairs.iter())
+            .filter_map(|pair| pair.full_live_policy.as_ref().map(|policy| (pair, policy)))
+            .collect::<Vec<_>>();
+        ensure!(
+            full_live_policies.len() <= 1,
+            "compiled portfolio has multiple full-live capital policies"
+        );
         let capital_canaries = self
             .bundle
             .sources
@@ -1722,20 +1753,58 @@ impl CompiledDomainGraph {
             capital_canaries.len() <= 1,
             "compiled portfolio has multiple M10 capital canaries"
         );
-        let capital_canary = capital_canaries
-            .first()
-            .map(|(pair, policy)| {
-                let economic_asset_id = |symbol: &str| {
-                    self.bundle
-                        .economic_assets
-                        .iter()
-                        .find(|asset| asset.symbol == symbol)
-                        .map(|asset| asset.id.clone())
-                        .with_context(|| {
-                            format!("compiled M10 token {symbol} has no economic asset")
-                        })
-                };
+        let economic_asset_id = |symbol: &str| {
+            self.bundle
+                .economic_assets
+                .iter()
+                .find(|asset| asset.symbol == symbol)
+                .map(|asset| asset.id.clone())
+                .with_context(|| format!("compiled capital token {symbol} has no economic asset"))
+        };
+        let capital_canary = if let Some((pair, policy)) = full_live_policies.first() {
+            Some(CompiledCapitalCanaryPolicy {
+                full_live: true,
+                approval_session_id: "esp-usdc-arbitrum-full-live".to_owned(),
+                network_id: NetworkId::new(format!("eip155:{}", pair.chain.chain_id))?,
+                binance_network: policy.rebalance_binance_network.clone(),
+                token_a_symbol: pair.token_a.symbol.clone(),
+                token_b_symbol: pair.token_b.symbol.clone(),
+                token_a_economic_asset_id: economic_asset_id(&pair.token_a.symbol)?,
+                token_b_economic_asset_id: economic_asset_id(&pair.token_b.symbol)?,
+                maximum_transfer_count: 1,
+                maximum_concurrent_transfers: 1,
+                maximum_failed_transfers: 1,
+                maximum_token_a_debit: U256::from_str_radix(
+                    &policy.maximum_rebalance_token_a_debit_base_units,
+                    10,
+                )
+                .context("compiled full-live token_a debit cap is invalid")?,
+                maximum_token_b_debit: U256::from_str_radix(
+                    &policy.maximum_rebalance_token_b_debit_base_units,
+                    10,
+                )
+                .context("compiled full-live token_b debit cap is invalid")?,
+                maximum_token_a_fee: U256::from_str_radix(
+                    &policy.maximum_rebalance_token_a_fee_base_units,
+                    10,
+                )
+                .context("compiled full-live token_a fee cap is invalid")?,
+                maximum_token_b_fee: U256::from_str_radix(
+                    &policy.maximum_rebalance_token_b_fee_base_units,
+                    10,
+                )
+                .context("compiled full-live token_b fee cap is invalid")?,
+                rollout_duration_seconds: 0,
+                maximum_unknown_reconciliation_queries: policy
+                    .maximum_unknown_reconciliation_queries,
+                direct_route_only: policy.direct_route_only,
+                bridge_mutations_enabled: policy.bridge_mutations_enabled,
+                external_mutation_authorized: role == CompatibilityRole::LiveRuntime,
+            })
+        } else {
+            capital_canaries.first().map(|(pair, policy)| {
                 Ok::<_, anyhow::Error>(CompiledCapitalCanaryPolicy {
+                    full_live: pair.full_live,
                     approval_session_id: policy.approval_session_id.clone(),
                     network_id: NetworkId::new(format!("eip155:{}", pair.chain.chain_id))?,
                     binance_network: policy.binance_network.clone(),
@@ -1775,10 +1844,17 @@ impl CompiledDomainGraph {
                         && policy.approval_gate
                             == crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApproved,
                 })
-            })
-            .transpose()?;
+            }).transpose()?
+        };
         let allocator_mode = match role {
             CompatibilityRole::PublicPriceCollector => CompiledCapitalAllocatorMode::Disabled,
+            CompatibilityRole::LiveRuntime
+                if capital_canary.as_ref().is_some_and(|policy| {
+                    policy.full_live && policy.external_mutation_authorized
+                }) =>
+            {
+                CompiledCapitalAllocatorMode::FullLive
+            }
             CompatibilityRole::LiveRuntime
                 if capital_canary
                     .as_ref()
@@ -2798,27 +2874,10 @@ mod tests {
             original_collector.snapshot().snapshot_id
         );
         assert!(!collector.config.snapshot().live_trading_enabled);
-        let collector_canary = collector.config.snapshot().pairs[0]
-            .live_canary
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            collector_canary.approval_gate,
-            crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-        );
-        assert!(!collector_canary.rebalance_mutations_enabled);
-        assert!(
-            collector_canary
-                .rebalance_live_canary
-                .as_ref()
-                .is_some_and(|policy| {
-                    policy.approval_gate
-                        == crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-                        && policy.production_approval_actor.is_none()
-                        && policy.production_approval_recorded_at_utc.is_none()
-                })
-        );
-        assert!(collector_canary.prefunding_rebalance.is_none());
+        let collector_pair = &collector.config.snapshot().pairs[0];
+        assert!(!collector_pair.full_live);
+        assert!(collector_pair.full_live_policy.is_none());
+        assert!(collector_pair.live_canary.is_none());
         let live_networks = live.network_runtime.unwrap();
         assert_eq!(
             live_networks
@@ -2897,11 +2956,12 @@ mod tests {
         let portfolio = live.portfolio_runtime.unwrap();
         assert_eq!(
             portfolio.allocator_mode,
-            CompiledCapitalAllocatorMode::LiveCanary
+            CompiledCapitalAllocatorMode::FullLive
         );
         let capital_canary = portfolio.capital_canary.as_ref().unwrap();
+        assert!(capital_canary.full_live);
         assert_eq!(capital_canary.network_id.as_str(), "eip155:42161");
-        assert_eq!(capital_canary.maximum_transfer_count, 2);
+        assert_eq!(capital_canary.maximum_transfer_count, 1);
         assert!(capital_canary.external_mutation_authorized);
         assert!(capital_canary.direct_route_only);
         assert!(!capital_canary.bridge_mutations_enabled);
@@ -2927,8 +2987,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_m10_approval_compiles_live_authority_and_public_projection_scrubs_it() {
-        let (manifest, sources, bundle) = fixture();
+    fn checked_in_esp_promotion_compiles_full_live_authority_and_public_projection_scrubs_it() {
+        let (mut manifest, sources, bundle) = fixture();
         let esp_index = sources
             .iter()
             .position(|source| {
@@ -2941,12 +3001,12 @@ mod tests {
             .unwrap();
         let graph = CompiledDomainGraph::from_bundle(bundle).unwrap();
         let projected = graph
-            .project("approved-m10.json", CompatibilityRole::LiveRuntime, false)
+            .project("esp-full-live.json", CompatibilityRole::LiveRuntime, false)
             .unwrap();
         let portfolio = projected.portfolio_runtime.unwrap();
         assert_eq!(
             portfolio.allocator_mode,
-            CompiledCapitalAllocatorMode::LiveCanary
+            CompiledCapitalAllocatorMode::FullLive
         );
         assert!(
             portfolio
@@ -2962,32 +3022,11 @@ mod tests {
             .find(|strategy| strategy.symbol == "ESPUSDC")
             .unwrap();
         let pair = &esp.domain_config.snapshot().pairs[0];
-        assert!(pair.execution_enabled);
+        assert!(pair.execution_enabled && pair.full_live);
         assert!(pair.rebalance.enabled);
-        assert!(
-            pair.live_canary
-                .as_ref()
-                .is_some_and(|canary| canary.rebalance_mutations_enabled)
-        );
-        let approved_policy = pair
-            .live_canary
-            .as_ref()
-            .and_then(|canary| canary.rebalance_live_canary.as_ref())
-            .unwrap();
-        assert_eq!(
-            approved_policy.production_approval_actor.as_deref(),
-            Some("operator")
-        );
-        assert_eq!(
-            approved_policy
-                .production_approval_recorded_at_utc
-                .as_deref(),
-            Some("2026-07-31T08:09:37Z")
-        );
-        assert_eq!(
-            approved_policy.approval_session_id,
-            "esp-usdc-arbitrum-rebalance-20260731-r2"
-        );
+        let approved_policy = pair.full_live_policy.as_ref().unwrap();
+        assert_eq!(approved_policy.production_approval_actor, "operator");
+        assert!(pair.live_canary.is_none());
         assert_eq!(
             portfolio
                 .capital_canary
@@ -3000,7 +3039,7 @@ mod tests {
 
         let public = graph
             .project(
-                "approved-m10-public.json",
+                "esp-full-live-public.json",
                 CompatibilityRole::PublicPriceCollector,
                 false,
             )
@@ -3015,34 +3054,22 @@ mod tests {
         let public_pair = &public.config.snapshot().pairs[0];
         assert!(!public_pair.execution_enabled);
         assert!(!public_pair.rebalance.enabled);
-        let public_canary = public_pair.live_canary.as_ref().unwrap();
-        assert!(!public_canary.rebalance_mutations_enabled);
-        assert!(
-            public_canary
-                .rebalance_live_canary
-                .as_ref()
-                .is_some_and(|policy| {
-                    policy.approval_gate
-                        == crate::domain::config::LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-                        && policy.production_approval_actor.is_none()
-                        && policy.production_approval_recorded_at_utc.is_none()
-                })
-        );
+        assert!(!public_pair.full_live);
+        assert!(public_pair.full_live_policy.is_none());
+        assert!(public_pair.live_canary.is_none());
 
         let mut disabled = serde_json::to_value(sources[esp_index].snapshot()).unwrap();
-        disabled["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
-            serde_json::Value::String("explicit_production_approval_required".to_owned());
-        disabled["pairs"][0]["live_canary"]["rebalance_live_canary"]
+        disabled["live_trading_enabled"] = serde_json::Value::Bool(false);
+        disabled["pairs"][0]["execution_enabled"] = serde_json::Value::Bool(false);
+        disabled["pairs"][0]["full_live"] = serde_json::Value::Bool(false);
+        disabled["pairs"][0]
             .as_object_mut()
             .unwrap()
-            .remove("production_approval_actor");
-        disabled["pairs"][0]["live_canary"]["rebalance_live_canary"]
-            .as_object_mut()
-            .unwrap()
-            .remove("production_approval_recorded_at_utc");
-        disabled["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] =
-            serde_json::Value::Bool(false);
+            .remove("full_live_policy");
         disabled["pairs"][0]["rebalance"]["enabled"] = serde_json::Value::Bool(false);
+        manifest
+            .reviewed_live_strategies
+            .retain(|strategy| strategy.as_str() != "strategy:arbitrum-usdc-esp");
         let mut disabled_sources = sources;
         disabled_sources[esp_index] = LoadedDomainConfig::from_bytes(
             disabled_sources[esp_index].path(),
@@ -3052,18 +3079,14 @@ mod tests {
         let disabled_bundle = compile_domain(&manifest, &disabled_sources).unwrap();
         let disabled_projected = CompiledDomainGraph::from_bundle(disabled_bundle)
             .unwrap()
-            .project("disabled-m10.json", CompatibilityRole::LiveRuntime, false)
+            .project("esp-disabled.json", CompatibilityRole::LiveRuntime, false)
             .unwrap();
         let disabled_portfolio = disabled_projected.portfolio_runtime.unwrap();
         assert_eq!(
             disabled_portfolio.allocator_mode,
             CompiledCapitalAllocatorMode::Shadow
         );
-        assert!(
-            disabled_portfolio
-                .capital_canary
-                .is_some_and(|policy| !policy.external_mutation_authorized)
-        );
+        assert!(disabled_portfolio.capital_canary.is_none());
     }
 
     #[test]

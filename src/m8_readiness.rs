@@ -58,8 +58,16 @@ pub fn validate_binance_readiness(
             && rules.price.step == Decimal::from_str(&pair.binance.tick_size)?,
         "live Binance ESPUSDC increments differ from the readiness artifact"
     );
+    let maximum_notional_base_units = if let Some(policy) = canary {
+        &policy.max_trade_notional_token_a_base_units
+    } else {
+        pair.adaptive_sizing
+            .limits()
+            .context("full-live ESP sizing limits are missing")?
+            .max_trade_notional
+    };
     let maximum_notional = decimal_from_base_units(
-        U256::from_str_radix(&canary.max_trade_notional_token_a_base_units, 10)?
+        U256::from_str_radix(maximum_notional_base_units, 10)?
             .try_into()
             .context("M8 maximum trade notional exceeds u128")?,
         pair.token_a.decimals,
@@ -291,11 +299,9 @@ async fn inspect_chain_readiness_at(
         rpc.native_balance_at(snapshot.owner, block),
         rpc.gas_price(),
     )?;
-    let minimum_native =
-        U256::from_str_radix(&canary.minimum_native_gas_wei, 10).context("invalid gas minimum")?;
     let token_code_present = !token_a_code.is_empty() && !token_b_code.is_empty();
     let router_code_present = !router_code.is_empty();
-    let native_gas_funded = native_balance >= minimum_native;
+    let native_gas_funded = !native_balance.is_zero();
     let token_a_balance = snapshot.token_balances.iter().find_map(|balance| {
         (balance.symbol.as_ref() == pair.token_a.symbol && balance.contract == token_a)
             .then_some(balance.base_units)
@@ -304,13 +310,18 @@ async fn inspect_chain_readiness_at(
         (balance.symbol.as_ref() == pair.token_b.symbol && balance.contract == token_b)
             .then_some(balance.base_units)
     });
-    let (token_a_funded, token_b_funded) =
-        runtime_wallet_tokens_funded(canary, token_a_balance, token_b_balance)?;
+    let (token_a_funded, token_b_funded) = if let Some(canary) = canary {
+        runtime_wallet_tokens_funded(canary, token_a_balance, token_b_balance)?
+    } else {
+        (
+            token_a_balance.is_some_and(|balance| !balance.is_zero()),
+            token_b_balance.is_some_and(|balance| !balance.is_zero()),
+        )
+    };
     let fresh_rpc_gas_price = gas_price > 0;
     let ready = exact_token_contracts
         && token_code_present
         && router_code_present
-        && native_gas_funded
         && token_a_funded
         && token_b_funded
         && fresh_rpc_gas_price;
@@ -324,7 +335,11 @@ async fn inspect_chain_readiness_at(
         token_a_funded,
         token_b_funded,
         fresh_rpc_gas_price,
-        allowance_policy: "bounded_exact_canary_cap_then_locked",
+        allowance_policy: if pair.full_live {
+            "max_uint256_then_locked"
+        } else {
+            "bounded_exact_canary_cap_then_locked"
+        },
         receipt_l1_fee_mode: "included_in_effective_gas_price_no_world_l1fee_addition",
         external_mutation_authorized: pair.execution_enabled,
         ready,
@@ -394,34 +409,46 @@ pub fn validate_rebalance_readiness(
 
 fn validate_readiness_pair(
     pair: &PairConfig,
-) -> anyhow::Result<&crate::domain::config::LiveCanaryConfig> {
-    let canary = pair
-        .live_canary
-        .as_ref()
-        .context("M8 readiness artifact has no canary limits")?;
-    let rebalance_gate_valid = match canary.rebalance_live_canary.as_ref() {
-        Some(policy)
-            if policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved =>
-        {
-            pair.rebalance.enabled
-                && canary.rebalance_mutations_enabled
-                && policy.production_approval_actor.as_deref() == Some("operator")
-                && policy
-                    .production_approval_recorded_at_utc
-                    .as_deref()
-                    .is_some_and(|value| value.ends_with('Z'))
-                && policy.binance_network == "ARBITRUM"
+) -> anyhow::Result<Option<&crate::domain::config::LiveCanaryConfig>> {
+    let canary = pair.live_canary.as_ref();
+    if let Some(policy) = pair.full_live_policy.as_ref() {
+        ensure!(
+            pair.full_live
+                && pair.rebalance.enabled
+                && policy.rebalance_binance_network == "ARBITRUM"
                 && policy.direct_route_only
-                && !policy.bridge_mutations_enabled
+                && !policy.bridge_mutations_enabled,
+            "Arbitrum full-live pair identity or rebalance policy is invalid"
+        );
+    }
+    let rebalance_gate_valid = if pair.full_live_policy.is_some() {
+        true
+    } else {
+        let legacy_canary = canary.context("legacy readiness artifact has no canary limits")?;
+        match legacy_canary.rebalance_live_canary.as_ref() {
+            Some(policy)
+                if policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved =>
+            {
+                pair.rebalance.enabled
+                    && legacy_canary.rebalance_mutations_enabled
+                    && policy.production_approval_actor.as_deref() == Some("operator")
+                    && policy
+                        .production_approval_recorded_at_utc
+                        .as_deref()
+                        .is_some_and(|value| value.ends_with('Z'))
+                    && policy.binance_network == "ARBITRUM"
+                    && policy.direct_route_only
+                    && !policy.bridge_mutations_enabled
+            }
+            Some(policy) => {
+                policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+                    && !pair.rebalance.enabled
+                    && !legacy_canary.rebalance_mutations_enabled
+                    && policy.production_approval_actor.is_none()
+                    && policy.production_approval_recorded_at_utc.is_none()
+            }
+            None => !pair.rebalance.enabled && !legacy_canary.rebalance_mutations_enabled,
         }
-        Some(policy) => {
-            policy.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-                && !pair.rebalance.enabled
-                && !canary.rebalance_mutations_enabled
-                && policy.production_approval_actor.is_none()
-                && policy.production_approval_recorded_at_utc.is_none()
-        }
-        None => !pair.rebalance.enabled && !canary.rebalance_mutations_enabled,
     };
     ensure!(
         pair.id == "arbitrum-usdc-esp"
@@ -433,17 +460,20 @@ fn validate_readiness_pair(
                 .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
             && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
             && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
-            && rebalance_gate_valid,
+            && rebalance_gate_valid
+            && (pair.full_live_policy.is_some() || canary.is_some()),
         "Arbitrum canary pair identity or rebalance gate differs from the reviewed artifact"
     );
-    ensure!(
-        matches!(
-            canary.approval_gate,
-            LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
-                | LiveCanaryApprovalGate::ExplicitProductionApproved
-        ),
-        "Arbitrum canary artifact has an invalid approval or rebalance gate"
-    );
+    if let Some(canary) = canary {
+        ensure!(
+            matches!(
+                canary.approval_gate,
+                LiveCanaryApprovalGate::ExplicitProductionApprovalRequired
+                    | LiveCanaryApprovalGate::ExplicitProductionApproved
+            ),
+            "Arbitrum canary artifact has an invalid approval or rebalance gate"
+        );
+    }
     Ok(canary)
 }
 
@@ -704,7 +734,7 @@ mod tests {
     #[test]
     fn post_first_parent_balance_uses_runtime_presence_not_bootstrap_target() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
         let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
         let post_trade_usdc = U256::from(16_860_785_u64);
         let remaining_esp = U256::from(266_u64) * U256::from(10_u64).pow(U256::from(18_u64));
@@ -729,9 +759,9 @@ mod tests {
     }
 
     #[test]
-    fn approved_m10_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail() {
+    fn full_live_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json").unwrap();
         let pair = &domain.snapshot().pairs[0];
         validate_readiness_pair(pair).unwrap();
 
@@ -739,20 +769,17 @@ mod tests {
         missing_pair_gate.rebalance.enabled = false;
         assert!(validate_readiness_pair(&missing_pair_gate).is_err());
 
-        let mut missing_canary_gate = pair.clone();
-        missing_canary_gate
-            .live_canary
+        let mut missing_live_policy = pair.clone();
+        missing_live_policy
+            .full_live_policy
             .as_mut()
             .unwrap()
-            .rebalance_mutations_enabled = false;
-        assert!(validate_readiness_pair(&missing_canary_gate).is_err());
+            .direct_route_only = false;
+        assert!(validate_readiness_pair(&missing_live_policy).is_err());
 
         let mut bridge_enabled = pair.clone();
         bridge_enabled
-            .live_canary
-            .as_mut()
-            .unwrap()
-            .rebalance_live_canary
+            .full_live_policy
             .as_mut()
             .unwrap()
             .bridge_mutations_enabled = true;

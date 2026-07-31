@@ -1,7 +1,7 @@
 # Multi-pair, multi-network trading runtime
 
-Status: **proposed migration specification**
-Last reviewed: 2026-07-29
+Status: **production architecture**
+Last reviewed: 2026-07-31
 Applies to: Binance account ownership, EVM network runtimes, pool state,
 strategy scheduling, inventory, execution, recovery, and rebalancing
 
@@ -11,9 +11,9 @@ describes how to evolve the current single-pair bootstrap into one process that
 can safely trade 10–20 pairs on several EVM networks from one Rust-owned Binance
 subaccount and, initially, one EVM signer.
 
-The migration must preserve the current WLD/USDC World Chain v12 production
-behavior at every milestone. ESP/USDC Arbitrum remains read-only until the
-milestone that explicitly authorizes a bounded live canary.
+The runtime preserves the WLD/USDC World Chain v12 production behavior while
+running ESP/USDC on Arbitrum in the same permanent `full_live` mode. Historical
+rollout stages are not runtime gates and are not part of the active artifact.
 
 ## Decision summary
 
@@ -48,12 +48,9 @@ The first production topology uses:
 The rule is **one owner per external mutation namespace**, not one subaccount or
 wallet per strategy.
 
-There is no separate production paper milestone for ESP/USDC. Implementation
-still starts behind the repository's non-mutating execution mode and explicit
-live-trading gate, but that mode is used only for deterministic tests,
-read-only production validation, and preflight verification. Once its exit
-criteria pass, the next rollout is the bounded live canary rather than an
-extended paper observation period.
+Non-mutating execution remains available for deterministic tests and read-only
+validation. The checked-in production artifact directly selects permanent
+`full_live` execution for both configured pairs.
 
 ## Goals
 
@@ -83,7 +80,7 @@ extended paper observation period.
 - Adding a second production replica or distributed coordinator.
 - Using Multicall, Quoter, RPC, Postgres, or ClickHouse in opportunity
   evaluation or entry preflight.
-- Enabling ESP/USDC trading as part of the structural refactor.
+- Changing ESP/USDC production economics outside its versioned full-live policy.
 - Implementing multi-wallet allocation, wallet selection, or capital routing
   in the first version.
 - Changing the reviewed WLD/USDC economics, adaptive sizing, DEX-first ordering,
@@ -1115,7 +1112,7 @@ build on the target C4 class against this reference:
 The hard ceilings do not replace relative comparison. Passing `60 μs` after
 moving from `46 μs` to `59 μs` is still a regression requiring review.
 
-### Performance evidence by milestone
+### Performance evidence history
 
 | Milestone | Required evidence before exit |
 | --- | --- |
@@ -1135,7 +1132,10 @@ moving from `46 μs` to `59 μs` is still a regression requiring review.
 The matching row is a mandatory exit criterion for every milestone, alongside
 its functional criteria below.
 
-## Milestones
+## Historical rollout record
+
+The following sections are retained only as implementation history. They do
+not authorize, limit, expire, or otherwise gate the current production runtime.
 
 Each milestone is independently deployable and must leave production in a
 supported state. No milestone combines a structural ownership change with
@@ -1804,15 +1804,14 @@ The existing nonce journal, known-revert diagnostics, unknown-broadcast
 recovery, positional receipt settlement, and exact transfer accounting remain
 shared typed components.
 
-The live read-only M8 startup proof checks authenticated ESPUSDC filters and
+The live startup proof checks authenticated ESPUSDC filters and
 commissions and constructs deterministic BUY/SELL LIMIT IOC plus BUY/SELL
 MARKET recovery requests without submitting them. A block-pinned wallet proof
 checks the exact token contracts, token/router bytecode, native gas floor, and
 nonzero RPC fee. Binance capital metadata is independently projected into
 direct Arbitrum rebalance routes for USDC and ESP without exposing an executor.
-`scripts/report-m8-live-readiness START_UTC END_UTC` requires all three proofs,
-four valid order shapes, two direct routes, the fail-closed gas policy, and
-zero mutation capability before chaining M7 through M0.
+Production startup requires all three proofs, four valid order shapes, two
+direct routes, and the fail-closed gas policy before readiness is published.
 
 The explicit archival-RPC parity test passed in both directions at Arbitrum
 block `489077578`,
@@ -1905,10 +1904,9 @@ Implementation status:
   next-block fee-cap rejection is terminal before broadcast and can reuse its
   nonce through a deterministic child attempt; transport, timeout, and all
   other ambiguous errors remain recovery-blocking;
-- `scripts/report-m9-live-canary START_UTC END_UTC` proves the startup
-  authority, latest complete readiness, exact canary caps, unique parent
-  admissions, cumulative bounds, zero rebalance mutations, and the inherited
-  M8 through M0 gates.
+- the permanent full-live artifact removes rollout/count windows while keeping
+  pair-scoped readiness, one Arbitrum nonce owner, deterministic journals, and
+  exact recovery semantics.
 
 Before the production rollout, the shared Binance account already held
 `10,000 ESP`, sufficient USDC and BNB, and the Arbitrum wallet held
@@ -2129,11 +2127,36 @@ query, and a 15-minute window beginning with the first R2 durable intent remain
 in force. Direct `ARBITRUM` is the only route and bridge mutations remain
 disabled.
 
-Historical records without a session field are assigned only to R1. R2 risk,
-telemetry, and reporting are grouped by exact session, but the executor retains
-one global active-operation lane, so an incomplete older saga must recover
-before any R2 mutation. The full pre-deploy authority and restart review is
-recorded in `docs/reviews/m12-predeploy.md`.
+Historical records without a session field retain their legacy recovery scope.
+The executor keeps one global active-operation lane, so an incomplete older
+saga must recover before any new mutation.
+
+### Current permanent ESP/USDC operation
+
+After the bounded trading, rebalance canary, and full calculated M12 transfer
+completed without unresolved exposure, the operator approved permanent
+ESP/USDC trading and rebalancing. The V6 domain artifact removes the
+canary-only parent count, cumulative notional, cumulative transfer count, and
+15-minute rollout window. It does not make a single external mutation
+unbounded.
+
+Each trade remains capped at `200 USDC` with at most `220 USDC` unhedged and
+`2 USDC` recovery loss. Each direct rebalance operation remains capped at
+`2,600 USDC` or `10,000 ESP`, with fees capped at `5 USDC` or `2 ESP`, one
+concurrent operation, and one unknown-outcome reconciliation query. The
+allocator derives the requested amount from current 50/50 inventory targets;
+the ceilings only reject unit errors or duplicate authority. Direct
+`ARBITRUM` remains the only capital route and bridge mutations remain disabled.
+The dedicated wallet grants the reviewed SwapRouter02 a max-uint256 allowance
+once at startup, matching the Rails V3 executor, and then permanently locks
+allowance mutation in the running process; this avoids cumulative allowance
+depletion after rebalance replenishes wallet inventory.
+
+Historical V5 and older artifacts remain checked in for exact journal replay.
+An incomplete historical saga must recover through the same single execution
+owner before V6 can admit new work. Current authority and safety bounds are
+defined by the V6 artifact and enforced by the compiled-domain, execution,
+rebalancing, and deployment tests.
 
 ## Future multi-wallet extension
 

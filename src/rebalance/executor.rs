@@ -42,6 +42,7 @@ pub enum RebalanceExecutionAuthority {
     WorldChainV12,
     ArbitrumM9Prefunding,
     ArbitrumM10Canary,
+    ArbitrumFullLive,
 }
 
 impl RebalanceExecutionAuthority {
@@ -49,7 +50,7 @@ impl RebalanceExecutionAuthority {
         match self {
             Self::WorldChainV12 => "rebalance-world-chain-v12",
             Self::ArbitrumM9Prefunding => "prefund-arbitrum-usdc-esp-m9",
-            Self::ArbitrumM10Canary => "rebalance-arbitrum-usdc-esp-m10",
+            Self::ArbitrumM10Canary | Self::ArbitrumFullLive => "rebalance-arbitrum-usdc-esp-m10",
         }
     }
 }
@@ -701,7 +702,8 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
         ) => true,
         (
             RebalanceExecutionAuthority::ArbitrumM9Prefunding
-            | RebalanceExecutionAuthority::ArbitrumM10Canary,
+            | RebalanceExecutionAuthority::ArbitrumM10Canary
+            | RebalanceExecutionAuthority::ArbitrumFullLive,
             Route::Direct {
                 chain_id: 42_161,
                 binance_network,
@@ -714,15 +716,19 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
         "rebalance execution authority does not own the selected route"
     );
     ensure!(
-        (request.authority == RebalanceExecutionAuthority::ArbitrumM10Canary)
-            == (request.canary_maximum_fee.is_some()
-                && request.canary_approval_session_id.is_some()),
+        matches!(
+            request.authority,
+            RebalanceExecutionAuthority::ArbitrumM10Canary
+                | RebalanceExecutionAuthority::ArbitrumFullLive
+        ) == (request.canary_maximum_fee.is_some() && request.canary_approval_session_id.is_some()),
         "only M10 rebalance requests carry canary fee and approval-session authority"
     );
     ensure!(
-        request.authority == RebalanceExecutionAuthority::ArbitrumM10Canary
-            || (request.canary_maximum_fee.is_none()
-                && request.canary_approval_session_id.is_none()),
+        matches!(
+            request.authority,
+            RebalanceExecutionAuthority::ArbitrumM10Canary
+                | RebalanceExecutionAuthority::ArbitrumFullLive
+        ) || (request.canary_maximum_fee.is_none() && request.canary_approval_session_id.is_none()),
         "non-M10 rebalance request carries canary authority"
     );
     if let Some(maximum_fee) = request.canary_maximum_fee {
@@ -2582,6 +2588,29 @@ mod tests {
         assert_eq!(risk.active_transfer_count, 1);
         assert_eq!(risk.token_a_debit, U256::from(900_000_u64));
         assert_eq!(risk.token_a_maximum_fee, U256::ZERO);
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn full_live_authority_retains_the_stable_esp_owner_and_session_scoped_risk() {
+        let path = path("esp-full-live-stable-owner");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let mut request = request(Direction::BinanceToWallet, direct_arbitrum());
+        request.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
+        request.canary_maximum_fee = Some(U256::from(100_000_u64));
+        request.canary_approval_session_id = Some("esp-usdc-arbitrum-full-live".to_owned());
+        let operation = journal.reserve(&request).unwrap();
+
+        assert_eq!(
+            operation.intent.scope.as_ref().unwrap().strategy_id,
+            "rebalance-arbitrum-usdc-esp-m10"
+        );
+        let risk = journal
+            .m10_canary_risk("esp-usdc-arbitrum-full-live")
+            .unwrap();
+        assert_eq!(risk.transfer_count, 1);
+        assert_eq!(risk.active_transfer_count, 1);
         drop(journal);
         fs::remove_file(path).unwrap();
     }

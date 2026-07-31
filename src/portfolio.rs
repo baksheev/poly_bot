@@ -75,13 +75,20 @@ impl PortfolioCatalog {
                 "M10 policy references a network outside the portfolio"
             );
             ensure!(
-                plan.allocator_mode != CompiledCapitalAllocatorMode::LiveCanary
-                    || policy.external_mutation_authorized,
+                !matches!(
+                    plan.allocator_mode,
+                    CompiledCapitalAllocatorMode::LiveCanary
+                        | CompiledCapitalAllocatorMode::FullLive
+                ) || policy.external_mutation_authorized,
                 "live M10 allocator has no explicit mutation approval"
             );
         } else {
             ensure!(
-                plan.allocator_mode != CompiledCapitalAllocatorMode::LiveCanary,
+                !matches!(
+                    plan.allocator_mode,
+                    CompiledCapitalAllocatorMode::LiveCanary
+                        | CompiledCapitalAllocatorMode::FullLive
+                ),
                 "live M10 allocator has no versioned policy"
             );
         }
@@ -311,7 +318,10 @@ impl CapitalAllocator {
             return Ok(Vec::new());
         }
         let capital_canary = self.capital_canary.as_ref();
-        if self.mode == CompiledCapitalAllocatorMode::LiveCanary {
+        if matches!(
+            self.mode,
+            CompiledCapitalAllocatorMode::LiveCanary | CompiledCapitalAllocatorMode::FullLive
+        ) {
             let policy = capital_canary.context("live allocator has no M10 policy")?;
             ensure!(
                 policy.external_mutation_authorized
@@ -325,7 +335,8 @@ impl CapitalAllocator {
                 "M10 permits only one external transfer at a time"
             );
             ensure!(
-                intents.len() <= usize::from(policy.maximum_transfer_count),
+                self.mode == CompiledCapitalAllocatorMode::FullLive
+                    || intents.len() <= usize::from(policy.maximum_transfer_count),
                 "M10 proposal count exceeds the transfer cap"
             );
         }
@@ -369,7 +380,11 @@ impl CapitalAllocator {
                 source_debit,
                 destination_credit: intent.destination_credit,
                 fee: intent.fee,
-                external_mutation_authorized: self.mode == CompiledCapitalAllocatorMode::LiveCanary,
+                external_mutation_authorized: matches!(
+                    self.mode,
+                    CompiledCapitalAllocatorMode::LiveCanary
+                        | CompiledCapitalAllocatorMode::FullLive
+                ),
             };
             ensure!(
                 proposal.conserves(),
@@ -466,8 +481,13 @@ pub fn authorize_m10_rebalance_request(
         "M10 policy has no bounded direct mutation authority"
     );
     ensure!(
-        request.authority == RebalanceExecutionAuthority::ArbitrumM10Canary,
-        "M10 request has the wrong execution authority"
+        request.authority
+            == if policy.full_live {
+                RebalanceExecutionAuthority::ArbitrumFullLive
+            } else {
+                RebalanceExecutionAuthority::ArbitrumM10Canary
+            },
+        "Arbitrum request has the wrong execution authority"
     );
     ensure!(
         request.canary_approval_session_id.as_deref() == Some(policy.approval_session_id.as_str()),
@@ -523,13 +543,18 @@ pub fn remaining_m10_rebalance_authority(
             && !policy.bridge_mutations_enabled,
         "M10 policy has no bounded direct mutation authority"
     );
-    if risk.transfer_count >= policy.maximum_transfer_count
-        || risk.active_transfer_count >= usize::from(policy.maximum_concurrent_transfers)
-        || risk.failed_transfer_count >= usize::from(policy.maximum_failed_transfers)
+    if risk.active_transfer_count >= usize::from(policy.maximum_concurrent_transfers) {
+        return Ok(None);
+    }
+    if !policy.full_live
+        && (risk.transfer_count >= policy.maximum_transfer_count
+            || risk.failed_transfer_count >= usize::from(policy.maximum_failed_transfers))
     {
         return Ok(None);
     }
-    if let Some(started_at) = risk.first_started_at_unix_ms {
+    if !policy.full_live
+        && let Some(started_at) = risk.first_started_at_unix_ms
+    {
         let elapsed = now_unix_ms
             .checked_sub(started_at)
             .context("M10 system time moved before the durable canary start")?;
@@ -537,23 +562,28 @@ pub fn remaining_m10_rebalance_authority(
             return Ok(None);
         }
     }
-    let (used_debit, debit_cap, used_fee, fee_cap) = if token_symbol == policy.token_a_symbol {
-        (
-            risk.token_a_debit,
-            policy.maximum_token_a_debit,
-            risk.token_a_maximum_fee,
-            policy.maximum_token_a_fee,
-        )
-    } else if token_symbol == policy.token_b_symbol {
-        (
-            risk.token_b_debit,
-            policy.maximum_token_b_debit,
-            risk.token_b_maximum_fee,
-            policy.maximum_token_b_fee,
-        )
-    } else {
-        anyhow::bail!("M10 request uses an asset outside the approved canary");
-    };
+    let (mut used_debit, debit_cap, mut used_fee, fee_cap) =
+        if token_symbol == policy.token_a_symbol {
+            (
+                risk.token_a_debit,
+                policy.maximum_token_a_debit,
+                risk.token_a_maximum_fee,
+                policy.maximum_token_a_fee,
+            )
+        } else if token_symbol == policy.token_b_symbol {
+            (
+                risk.token_b_debit,
+                policy.maximum_token_b_debit,
+                risk.token_b_maximum_fee,
+                policy.maximum_token_b_fee,
+            )
+        } else {
+            anyhow::bail!("M10 request uses an asset outside the approved canary");
+        };
+    if policy.full_live {
+        used_debit = U256::ZERO;
+        used_fee = U256::ZERO;
+    }
     let remaining_debit = debit_cap
         .checked_sub(used_debit)
         .context("M10 durable debit exceeds its policy cap")?;
@@ -648,9 +678,12 @@ impl CapitalAllocatorTask {
             CompiledCapitalAllocatorMode::Disabled => "disabled",
             CompiledCapitalAllocatorMode::Shadow => "shadow",
             CompiledCapitalAllocatorMode::LiveCanary => "live_canary",
+            CompiledCapitalAllocatorMode::FullLive => "full_live",
         };
-        let external_mutation_authorized =
-            self.allocator.mode == CompiledCapitalAllocatorMode::LiveCanary;
+        let external_mutation_authorized = matches!(
+            self.allocator.mode,
+            CompiledCapitalAllocatorMode::LiveCanary | CompiledCapitalAllocatorMode::FullLive
+        );
         let mut audit_open = true;
         let mut planner_open = true;
         while audit_open || planner_open {
@@ -994,6 +1027,7 @@ mod tests {
         ]);
         runtime_plan.allocator_mode = CompiledCapitalAllocatorMode::LiveCanary;
         runtime_plan.capital_canary = Some(CompiledCapitalCanaryPolicy {
+            full_live: false,
             approval_session_id: "esp-usdc-arbitrum-rebalance-test-r2".to_owned(),
             network_id: NetworkId("eip155:42161".to_owned()),
             binance_network: "ARBITRUM".to_owned(),
@@ -1158,6 +1192,75 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+
+        let mut full_live_policy = catalog.capital_canary().unwrap().clone();
+        full_live_policy.full_live = true;
+        full_live_policy.maximum_transfer_count = 1;
+        full_live_policy.rollout_duration_seconds = 0;
+        let mut full_live_request = request.clone();
+        full_live_request.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
+        let historical_risk = RebalanceCanaryRisk {
+            transfer_count: u16::MAX,
+            failed_transfer_count: 7,
+            token_a_debit: U256::MAX,
+            token_a_maximum_fee: U256::MAX,
+            first_started_at_unix_ms: Some(1),
+            ..RebalanceCanaryRisk::default()
+        };
+        authorize_m10_rebalance_request(
+            &full_live_policy,
+            &historical_risk,
+            &full_live_request,
+            u64::MAX,
+        )
+        .unwrap();
+        let full_live_remaining = remaining_m10_rebalance_authority(
+            &full_live_policy,
+            &historical_risk,
+            "USDC",
+            Direction::BinanceToWallet,
+            u64::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            full_live_remaining.maximum_source_debit,
+            full_live_policy.maximum_token_a_debit
+        );
+        assert_eq!(
+            full_live_remaining.maximum_fee,
+            full_live_policy.maximum_token_a_fee
+        );
+
+        let active_risk = RebalanceCanaryRisk {
+            active_transfer_count: 1,
+            ..historical_risk.clone()
+        };
+        assert!(
+            remaining_m10_rebalance_authority(
+                &full_live_policy,
+                &active_risk,
+                "USDC",
+                Direction::BinanceToWallet,
+                u64::MAX,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        full_live_request.action.amount = full_live_policy
+            .maximum_token_a_debit
+            .checked_add(U256::ONE)
+            .unwrap();
+        assert!(
+            authorize_m10_rebalance_request(
+                &full_live_policy,
+                &historical_risk,
+                &full_live_request,
+                u64::MAX,
+            )
+            .is_err()
         );
     }
 

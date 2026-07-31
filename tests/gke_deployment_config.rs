@@ -4,8 +4,6 @@ const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml"
 const MAIN: &str = include_str!("../src/main.rs");
 const COMPILED_DOMAIN: &str =
     include_str!("../config/domain/compiled-multi-pair-production.v1.json");
-const ADDRESS_VERIFICATION_ARTIFACT: &str =
-    include_str!("../config/operations/binance-esp-address-verification.v1.json");
 
 #[test]
 fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
@@ -79,10 +77,6 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("min_expected_profit_token_a_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".adaptive_sizing.mode"));
     assert!(DEPLOY_WORKFLOW.contains("max_trade_notional_token_a_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("minimum_wallet_token_a_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("minimum_runtime_wallet_token_a_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("minimum_runtime_wallet_token_b_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("minimum_wallet_token_b_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("recent_full_depth_max_update_delta"));
     assert!(DEPLOY_WORKFLOW.contains("top_of_book_max_trade_notional_token_a_base_units"));
@@ -103,7 +97,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("portfolio_allocator_mode"));
     assert!(MAIN.contains("portfolio_external_mutation_authorized"));
     assert!(MAIN.contains("live_rebalance_adapter"));
-    assert!(MAIN.contains("M9 bounded ESP production canary configured"));
+    assert!(MAIN.contains("ESP full-live production strategy configured"));
     assert!(MAIN.contains("shared_inventory_owner"));
     assert!(MAIN.contains("shared_binance_order_owner"));
     assert!(MAIN.contains("canary_rebalance_mutation_enabled"));
@@ -147,32 +141,20 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance"));
-    assert!(DEPLOY_WORKFLOW.contains("esp-usdc-arbitrum-rebalance-20260731-r2"));
-    assert!(DEPLOY_WORKFLOW.contains("approved_standard_withdrawal_recovery.operation_id"));
-    assert!(DEPLOY_WORKFLOW.contains("rebalance-324-8b62a7c14f4ef643"));
-    assert!(DEPLOY_WORKFLOW.contains("rb8b62a7c14f4ef6434a88c384bbb83c"));
-    assert!(DEPLOY_WORKFLOW.contains("396036135710"));
-    assert!(DEPLOY_WORKFLOW.contains("capital_history_match_count"));
-    assert!(DEPLOY_WORKFLOW.contains("approved_manual_withdrawal_recovery.operation_id"));
-    assert!(DEPLOY_WORKFLOW.contains("e02357b25de24e1ba9965bf524db37f7"));
-    assert!(DEPLOY_WORKFLOW.contains("67294348"));
-    assert!(DEPLOY_WORKFLOW.contains("67298920"));
-    assert!(
-        DEPLOY_WORKFLOW
-            .contains("0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd")
-    );
-    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.approval_gate"));
-    assert!(DEPLOY_WORKFLOW.contains("explicit_production_approved"));
-    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.max_parent_trades"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-esp-arbitrum-v6-full-live"));
+    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].full_live_policy.production_approval_actor"));
     assert!(DEPLOY_WORKFLOW.contains("arbitrum_max_fee_headroom_bps"));
-    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].live_canary.rebalance_mutations_enabled"));
+    assert!(DEPLOY_WORKFLOW.contains("router_allowance_mode"));
+    assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_a_debit_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_b_debit_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("has(\\\"live_canary\\\")"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].execution_enabled"));
+    assert!(DEPLOY_WORKFLOW.contains(".pairs[0].full_live"));
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].rebalance.enabled"));
 }
 
 #[test]
-fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
+fn gke_full_live_runtime_has_no_one_shot_prefunder_and_keeps_durable_state() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
     assert!(DEPLOYMENT.contains("arb-bot/durable-state-schema-version: \"2\""));
     assert!(!DEPLOYMENT.contains("initContainers:"));
@@ -186,18 +168,8 @@ fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
     assert!(!DEPLOYMENT.contains("kind: Job"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
     assert!(!DEPLOY_WORKFLOW.contains("jobs.batch"));
-    assert!(DEPLOY_WORKFLOW.contains("maximum_token_a_withdrawal_fee_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains("maximum_token_b_withdrawal_fee_base_units"));
-    assert!(DEPLOY_WORKFLOW.contains(".spec.template.spec.initContainers // []"));
-    assert!(DEPLOY_WORKFLOW.contains("existing_init_names"));
-    assert!(DEPLOY_WORKFLOW.contains("\"op\":\"test\",\"path\":\"/spec/template/spec/initContainers/0/name\",\"value\":\"prefund-arbitrum-m9\""));
-    assert!(
-        DEPLOY_WORKFLOW
-            .contains("\"op\":\"remove\",\"path\":\"/spec/template/spec/initContainers\"")
-    );
-    assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.maximum_transfer_count"));
-    assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.direct_route_only"));
-    assert!(DEPLOY_WORKFLOW.contains("rebalance_live_canary.bridge_mutations_enabled"));
+    assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_a_fee_base_units"));
+    assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_b_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains(".status.containerStatuses"));
     assert!(DEPLOY_WORKFLOW.contains(".restartCount >= 2"));
     assert!(DEPLOY_WORKFLOW.contains("repeatedly failed startup"));
@@ -206,12 +178,4 @@ fn gke_m10_removes_the_completed_m9_prefunder_and_keeps_durable_state() {
     assert!(DEPLOY_WORKFLOW.contains("previous_durable_schema_version >= durable_schema_version"));
     assert!(DEPLOY_WORKFLOW.contains("automatic rollback refused"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
-    assert!(DEPLOY_WORKFLOW.contains("binance-esp-address-verification.v1.json"));
-    assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"amount_base_units\": \"998700\""));
-    assert!(
-        ADDRESS_VERIFICATION_ARTIFACT
-            .contains("\"recipient\": \"0x64d62673799a8dc69825ff1cc0d624b1065dab39\"")
-    );
-    assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"maximum_transfer_count\": 1"));
-    assert!(ADDRESS_VERIFICATION_ARTIFACT.contains("\"bridge_allowed\": false"));
 }

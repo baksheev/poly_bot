@@ -1680,7 +1680,11 @@ impl RebalanceExecutor {
             requested <= self.limits.maximum_for(&request.token_symbol)?,
             "rebalance request exceeds the configured live maximum"
         );
-        if request.authority == super::RebalanceExecutionAuthority::ArbitrumM10Canary {
+        if matches!(
+            request.authority,
+            super::RebalanceExecutionAuthority::ArbitrumM10Canary
+                | super::RebalanceExecutionAuthority::ArbitrumFullLive
+        ) {
             let policy = self
                 .capital_canary
                 .as_ref()

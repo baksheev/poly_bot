@@ -3,7 +3,7 @@ const REBALANCE_RUNTIME: &str = include_str!("../src/rebalance/runtime.rs");
 const APP_CONFIG: &str = include_str!("../src/config.rs");
 const GKE_DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
 const GCE_STARTUP: &str = include_str!("../infra/gcp/gce-startup.sh");
-const ESP_DOMAIN: &str = include_str!("../config/strategies/usdc-esp-arbitrum.v5.json");
+const ESP_DOMAIN: &str = include_str!("../config/strategies/usdc-esp-arbitrum.v6.json");
 
 #[test]
 fn withdrawal_starts_standard_and_only_exact_4104_selects_travel_rule() {
@@ -37,8 +37,12 @@ fn withdrawal_endpoint_cannot_be_selected_by_asset_network_or_local_config() {
     }
 
     let domain: serde_json::Value = serde_json::from_str(ESP_DOMAIN).unwrap();
-    let prefunding = &domain["pairs"][0]["live_canary"]["prefunding_rebalance"];
-    assert_eq!(prefunding["withdrawal_api_mode"], "standard");
+    assert!(domain["pairs"][0].get("live_canary").is_none());
+    assert!(
+        domain["pairs"][0]["full_live_policy"]
+            .get("withdrawal_api_mode")
+            .is_none()
+    );
 }
 
 #[test]

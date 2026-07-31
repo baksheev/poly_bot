@@ -343,12 +343,17 @@ candidate's exact reservation remain separate authorization controls.
    represented by its effective gas accounting and must not receive a second
    World-specific `l1Fee` addition.
 
-The checked-in ESP/USDC Arbitrum readiness artifact does not authorize a
-mutation. It fixes the reviewed SwapRouter02/token identities, exact bounded
-allowance policy, per-trade/cumulative/loss/time limits, and an
-`explicit_production_approval_required` gate while both trade and rebalance
-execution remain disabled. Selecting a later live ESP artifact is an explicit
-M9 production decision, not an implication of M8 readiness.
+The checked-in ESP/USDC Arbitrum V6 artifact authorizes permanent `full_live`
+trading and direct Arbitrum rebalancing. It uses the same adaptive 20–200 USDC
+sizing envelope as WLD/USDC and has no rollout-duration, parent-count,
+cumulative-canary, or milestone gate. Its versioned full-live policy retains
+the reviewed gas envelope, direct-route restriction, per-operation debit and
+fee caps, one-concurrent-rebalance ownership, and fail-closed unknown-outcome
+reconciliation.
+
+The M8–M10 material below is historical recovery evidence only. It is not read
+by the current production artifact or used for readiness, admission, execution,
+or rebalancing authority.
 
 The approved M9 artifact may authorize one auditable prefunding bootstrap
 without authorizing steady-state Arbitrum rebalance. That bootstrap is limited
@@ -674,15 +679,11 @@ Every trading-path change must answer:
 - If production behavior changes, is delivery through the reviewed GKE workflow
   on `main` and is the equal-window observation plan explicit?
 
-Every milestone that adds or changes an external mutation must also have a
-completed versioned artifact under `docs/reviews/`. Before the final quality
-run, `scripts/predeploy-review` checks that artifact and reruns the endpoint,
-allocator, durable-recovery, route, and all-target compilation contracts. The
-artifact must include the complete external-side-effect matrix, every
-unknown-outcome/restart boundary, the source-versus-compiled semantic diff, the
-production observation plan, and a review of the entire diff from
-`origin/main`. A passing CI/deploy cycle is not a substitute for this local
-review and is never used to discover contract errors that the matrix can catch.
+Every production mutation change must encode its authority, side effects,
+unknown-outcome behavior, restart boundary, and source-versus-compiled semantic
+contract in versioned configuration and automated tests. `scripts/quality.sh`
+must pass before delivery. CI and rollout verification confirm the exact
+revision; they are not substitutes for local contract coverage.
 
 ## Supporting documents
 

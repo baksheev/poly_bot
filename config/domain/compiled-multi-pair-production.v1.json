@@ -5,26 +5,25 @@
   "compiler_version": "m1-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
-      "source_fingerprint_sha256": "2ae0895ca7f31822391c448deed23b5241fd389f391b6c9baaf259b0e353052d",
+      "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
+      "source_fingerprint_sha256": "a192c37656af0a835efacb151c8898eccef7e9cb723a072cfe18638d108194f1",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
+        "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
           "rails_pair_candidate_id": 3144,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.419709Z",
-          "captured_at_utc": "2026-07-31T08:09:37Z",
+          "captured_at_utc": "2026-07-31T11:00:00Z",
           "evidence": [
             "production PostgreSQL read-only PairCandidate export for ESPUSDC",
             "Binance Spot exchangeInfo and account commission filters for ESPUSDC",
             "Uniswap contracts deployment registry for Arbitrum One SwapRouter02 and QuoterV2",
             "block-pinned Arbitrum V3 local-curve and QuoterV2 parity validation",
-            "M8 production readiness gate passed with funded native gas and zero mutation capability",
-            "operator explicitly approved the bounded M9 production canary in Codex task poly-bot-architecture-milestone-loop on 2026-07-30",
-            "operator explicitly approved one-shot direct Arbitrum prefunding through the durable rebalance executor on 2026-07-30",
-            "operator explicitly approved immediate full calculated ESP/USDC rebalance in Codex task poly-bot-architecture-milestone-loop on 2026-07-31"
+            "production readiness passed with funded inventory, native gas, allowances, and isolated Arbitrum nonce ownership",
+            "bounded trading and rebalance validation completed without unresolved exposure or active durable operations",
+            "operator explicitly approved permanent full-live ESP/USDC trading and rebalancing on 2026-07-31"
           ]
         },
         "live_trading_enabled": true,
@@ -33,161 +32,20 @@
             "id": "arbitrum-usdc-esp",
             "market_data_enabled": true,
             "execution_enabled": true,
-            "live_canary": {
-              "approval_gate": "explicit_production_approved",
+            "full_live": true,
+            "full_live_policy": {
               "production_approval_actor": "operator",
-              "production_approval_recorded_at_utc": "2026-07-30T03:45:21Z",
-              "max_trade_notional_token_a_base_units": "10000000",
-              "max_total_notional_token_a_base_units": "20000000",
-              "max_unhedged_notional_token_a_base_units": "10000000",
-              "max_realized_loss_token_a_base_units": "1000000",
-              "minimum_native_gas_wei": "1000000000000000",
-              "minimum_wallet_token_a_base_units": "25000000",
-              "minimum_wallet_token_b_base_units": "400000000000000000000",
-              "minimum_runtime_wallet_token_a_base_units": "1",
-              "minimum_runtime_wallet_token_b_base_units": "1",
-              "max_parent_trades": 2,
-              "max_failed_parent_trades": 1,
-              "max_concurrent_trades": 1,
-              "rollout_duration_seconds": 900,
-              "rebalance_mutations_enabled": true,
+              "production_approval_recorded_at_utc": "2026-07-31T11:00:00Z",
               "arbitrum_max_fee_headroom_bps": 12000,
-              "prefunding_rebalance": {
-                "approval_gate": "explicit_production_approved",
-                "production_approval_actor": "operator",
-                "production_approval_recorded_at_utc": "2026-07-30T11:42:36Z",
-                "binance_network": "ARBITRUM",
-                "withdrawal_api_mode": "standard",
-                "maximum_transfer_count": 2,
-                "maximum_token_a_withdrawal_fee_base_units": "5000000",
-                "maximum_token_b_withdrawal_fee_base_units": "100000000000000000000",
-                "maximum_token_a_debit_base_units": "30000000",
-                "maximum_token_b_debit_base_units": "500000000000000000000",
-                "retry_after_verified_address": true,
-                "approved_travel_rule_recovery": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-30T07:22:10Z",
-                  "rejected_token_symbol": "ESP",
-                  "rejected_token_amount_base_units": "401200000000000000000",
-                  "rejected_http_status": 400,
-                  "rejected_error_code": -4024,
-                  "rejected_error_message": "[031031] User does not own this currency."
-                },
-                "approved_manual_token_b_credit": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-30T13:47:07Z",
-                  "operation_id": "rebalance-268-15f59bc55dcaed54",
-                  "token_symbol": "ESP",
-                  "gross_debit_base_units": "401200000000000000000",
-                  "expected_credit_base_units": "400000000000000000000",
-                  "expected_fee_base_units": "1200000000000000000",
-                  "wallet_balance_before_base_units": "0",
-                  "transaction_hash": "0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b"
-                },
-                "approved_evm_prebroadcast_rejection": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-30T14:47:00Z",
-                  "operation_id": "rustarb-m9-setup-v3-ESP.v3-router-approval",
-                  "transaction_hash": "0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977",
-                  "nonce": 1,
-                  "rpc_error_code": -32000,
-                  "rpc_error_message": "max fee per gas less than block base fee: address 0x90D990C81320221D2882De32beeA78923c1e77A3, maxFeePerGas: 20102000 baseFee: 20148000"
-                },
-                "approved_absent_standard_withdrawal": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-31T03:03:36Z",
-                  "operation_id": "rebalance-296-96fd53e70c1ab390",
-                  "fingerprint": "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50",
-                  "withdraw_order_id": "rb96fd53e70c1ab390ae3e62eb434cd1",
-                  "token_symbol": "USDC",
-                  "amount_base_units": "1197503244",
-                  "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
-                  "binance_network": "OPTIMISM",
-                  "bridge_chain_id": 10,
-                  "wallet_chain_id": 480,
-                  "bridge_balance_before_base_units": "508",
-                  "master_transfer_transaction_id": 395924104268,
-                  "reconciliation_queries": 1,
-                  "rejected_http_status": 400,
-                  "rejected_error_code": -4104,
-                  "rejected_error_message": "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
-                },
-                "approved_absent_master_transfer": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-31T02:18:00Z",
-                  "operation_id": "rebalance-294-96fd53e70c1ab390",
-                  "fingerprint": "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50",
-                  "withdraw_order_id": "rb96fd53e70c1ab390ae3e62eb434cd1",
-                  "token_symbol": "USDC",
-                  "amount_base_units": "1197503244",
-                  "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
-                  "binance_network": "OPTIMISM",
-                  "bridge_chain_id": 10,
-                  "wallet_chain_id": 480,
-                  "binance_balance_before_base_units": "3075000679",
-                  "wallet_balance_before_base_units": "679994191",
-                  "first_absent_observed_at_utc": "2026-07-31T02:13:53Z",
-                  "minimum_evidence_age_seconds": 300
-                }
-              },
-              "rebalance_live_canary": {
-                "approval_gate": "explicit_production_approved",
-                "production_approval_actor": "operator",
-                "production_approval_recorded_at_utc": "2026-07-31T08:09:37Z",
-                "approval_session_id": "esp-usdc-arbitrum-rebalance-20260731-r2",
-                "binance_network": "ARBITRUM",
-                "maximum_transfer_count": 2,
-                "maximum_concurrent_transfers": 1,
-                "maximum_failed_transfers": 1,
-                "maximum_token_a_debit_base_units": "2600000000",
-                "maximum_token_b_debit_base_units": "10000000000000000000000",
-                "maximum_token_a_fee_base_units": "5000000",
-                "maximum_token_b_fee_base_units": "2000000000000000000",
-                "rollout_duration_seconds": 900,
-                "maximum_unknown_reconciliation_queries": 1,
-                "direct_route_only": true,
-                "bridge_mutations_enabled": false,
-                "approved_standard_withdrawal_recovery": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-31T09:01:31Z",
-                  "operation_id": "rebalance-324-8b62a7c14f4ef643",
-                  "fingerprint": "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a",
-                  "withdraw_order_id": "rb8b62a7c14f4ef6434a88c384bbb83c",
-                  "token_symbol": "ESP",
-                  "amount_base_units": "4464938180550000000000",
-                  "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
-                  "binance_network": "ARBITRUM",
-                  "master_transfer_transaction_id": 396036135710,
-                  "rejected_api_mode": "local_entity",
-                  "retry_api_mode": "standard",
-                  "rejected_http_status": 400,
-                  "rejected_error_code": -4024,
-                  "rejected_error_message": "[031031] User does not own this currency.",
-                  "capital_history_match_count": 0,
-                  "capital_history_checked_at_utc": "2026-07-31T09:02:15Z"
-                },
-                "approved_manual_withdrawal_recovery": {
-                  "production_approval_actor": "operator",
-                  "production_approval_recorded_at_utc": "2026-07-31T09:54:36Z",
-                  "operation_id": "rebalance-324-8b62a7c14f4ef643",
-                  "fingerprint": "8b62a7c14f4ef6434a88c384bbb83c73ea919f7e59139db972f10ef7fc1ee43a",
-                  "withdraw_order_id": "rb8b62a7c14f4ef6434a88c384bbb83c",
-                  "token_symbol": "ESP",
-                  "gross_debit_base_units": "4464938180550000000000",
-                  "expected_credit_base_units": "4463838180550000000000",
-                  "expected_fee_base_units": "1100000000000000000",
-                  "wallet_balance_before_base_units": "534923638887482447575",
-                  "wallet_address": "0x90D990C81320221D2882De32beeA78923c1e77A3",
-                  "binance_network": "ARBITRUM",
-                  "master_transfer_transaction_id": 396036135710,
-                  "rejected_local_entity_travel_rule_id": 67294348,
-                  "rejected_standard_travel_rule_id": 67298920,
-                  "withdrawal_id": "e02357b25de24e1ba9965bf524db37f7",
-                  "transaction_hash": "0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd",
-                  "apply_time_utc": "2026-07-31T09:50:51Z",
-                  "complete_time_utc": "2026-07-31T09:52:10Z"
-                }
-              }
+              "router_allowance_mode": "max_uint256_then_locked",
+              "rebalance_binance_network": "ARBITRUM",
+              "maximum_rebalance_token_a_debit_base_units": "2600000000",
+              "maximum_rebalance_token_b_debit_base_units": "10000000000000000000000",
+              "maximum_rebalance_token_a_fee_base_units": "5000000",
+              "maximum_rebalance_token_b_fee_base_units": "2000000000000000000",
+              "maximum_unknown_reconciliation_queries": 1,
+              "direct_route_only": true,
+              "bridge_mutations_enabled": false
             },
             "chain": {
               "name": "Arbitrum One",
@@ -226,13 +84,23 @@
               "tick_size": "0.000010000000000"
             },
             "quote_sizing": {
-              "token_a_base_units": "10000000",
+              "token_a_base_units": "20000000",
               "token_b": {
                 "mode": "derive_from_binance_ask"
               }
             },
             "adaptive_sizing": {
-              "mode": "baseline_only"
+              "mode": "adaptive",
+              "max_trade_notional_token_a_base_units": "200000000",
+              "max_unhedged_notional_token_a_base_units": "220000000",
+              "max_recovery_loss_token_a_base_units": "2000000",
+              "min_expected_profit_token_a_base_units": "0",
+              "min_incremental_expected_profit_token_a_base_units": "0",
+              "depth_policy": {
+                "recent_full_depth_max_age_ms": 750,
+                "recent_full_depth_max_update_delta": 8,
+                "top_of_book_max_trade_notional_token_a_base_units": "40000000"
+              }
             },
             "strategy": {
               "kind": "profit_token_a",
@@ -299,6 +167,7 @@
             "id": "world-chain-usdc-wld",
             "market_data_enabled": true,
             "execution_enabled": true,
+            "full_live": false,
             "chain": {
               "name": "World Chain",
               "chain_id": 480,
@@ -683,7 +552,7 @@
     {
       "id": "strategy:arbitrum-usdc-esp",
       "pair_id": "arbitrum-usdc-esp",
-      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
+      "source_snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ESPUSDC",
       "network_id": "eip155:42161",
@@ -871,7 +740,7 @@
     {
       "id": "compat-public-price-collector",
       "role": "public_price_collector",
-      "source_snapshot_id": "arb-bot-live-usdc-esp-arbitrum-v5-full-rebalance",
+      "source_snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
       "pair_ids": [
         "arbitrum-usdc-esp"
       ]

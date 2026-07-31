@@ -1092,6 +1092,9 @@ pub struct LiveRiskLimits {
 
 #[derive(Clone, Debug)]
 pub struct LiveCanaryPolicy {
+    /// The per-pair scope and readiness handles remain useful after promotion;
+    /// full-live pairs do not apply historical rollout/count/loss limits.
+    pub full_live: bool,
     pub journal_scope: TradeJournalScope,
     pub maximum_trade_notional_token_a_base_units: u128,
     pub maximum_total_notional_token_a_base_units: u128,
@@ -1110,20 +1113,22 @@ impl LiveCanaryPolicy {
         self.journal_scope.validate()?;
         ensure!(
             self.maximum_trade_notional_token_a_base_units > 0
-                && self.maximum_trade_notional_token_a_base_units
-                    <= self.maximum_total_notional_token_a_base_units
                 && self.maximum_unhedged_notional_token_a_base_units
-                    <= self.maximum_trade_notional_token_a_base_units
-                && self.maximum_realized_loss_token_a_base_units
-                    <= self.maximum_total_notional_token_a_base_units,
+                    >= self.maximum_trade_notional_token_a_base_units
+                && (self.full_live
+                    || (self.maximum_trade_notional_token_a_base_units
+                        <= self.maximum_total_notional_token_a_base_units
+                        && self.maximum_realized_loss_token_a_base_units
+                            <= self.maximum_total_notional_token_a_base_units)),
             "live canary {pair_id} monetary limits are inconsistent"
         );
         ensure!(
-            self.maximum_parent_trades > 0
-                && self.maximum_failed_parent_trades > 0
-                && self.maximum_failed_parent_trades <= self.maximum_parent_trades
-                && self.maximum_concurrent_trades == 1
-                && self.rollout_duration >= Duration::from_secs(60),
+            self.maximum_concurrent_trades == 1
+                && (self.full_live
+                    || (self.maximum_parent_trades > 0
+                        && self.maximum_failed_parent_trades > 0
+                        && self.maximum_failed_parent_trades <= self.maximum_parent_trades
+                        && self.rollout_duration >= Duration::from_secs(60))),
             "live canary {pair_id} operation limits are inconsistent"
         );
         Ok(())
@@ -1190,6 +1195,9 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
         }),
     );
     for (pair_id, policy) in &risk_limits.canary_policies {
+        if policy.full_live {
+            continue;
+        }
         let risk = coordinator.canary_journal_risk(&policy.journal_scope.strategy_id)?;
         telemetry.emit(
             "m9_canary_risk_snapshot",
@@ -1398,7 +1406,12 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             None,
         );
         admit_result?;
-        if let Some(policy) = self.risk_limits.canary_policies.get(&opportunity.pair_id) {
+        if let Some(policy) = self
+            .risk_limits
+            .canary_policies
+            .get(&opportunity.pair_id)
+            .filter(|policy| !policy.full_live)
+        {
             let risk = self
                 .coordinator
                 .canary_journal_risk(&policy.journal_scope.strategy_id)?;
@@ -1456,31 +1469,38 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             .into());
         }
         if let Some(policy) = self.risk_limits.canary_policies.get(&opportunity.pair_id) {
+            ensure!(
+                policy.readiness.load(Ordering::Acquire)
+                    && policy.market_data_readiness.load(Ordering::Acquire),
+                "pair chain, funding, or market-data readiness is not healthy"
+            );
             let canary_check = (|| -> anyhow::Result<_> {
-                ensure!(
-                    policy.readiness.load(Ordering::Acquire)
-                        && policy.market_data_readiness.load(Ordering::Acquire),
-                    "M9 canary chain, funding, or market-data readiness is not healthy"
-                );
                 let notional = opportunity.cost_token_a_base_units.unsigned_abs();
                 let risk = self
                     .coordinator
                     .canary_journal_risk(&policy.journal_scope.strategy_id)?;
                 ensure!(
                     notional <= policy.maximum_trade_notional_token_a_base_units,
-                    "M9 canary per-trade notional limit reached"
+                    "pair per-trade notional limit reached"
                 );
                 ensure!(
                     notional <= policy.maximum_unhedged_notional_token_a_base_units,
-                    "M9 canary unhedged notional limit reached"
+                    "pair unhedged notional limit reached"
                 );
                 ensure!(
                     opportunity
                         .admission
                         .maximum_recovery_loss_token_a_base_units
                         <= policy.maximum_realized_loss_token_a_base_units,
-                    "M9 canary recovery-loss envelope exceeds the realized-loss cap"
+                    "pair recovery-loss envelope exceeds the per-parent cap"
                 );
+                ensure!(
+                    risk.active_parent_count < policy.maximum_concurrent_trades,
+                    "pair concurrent-parent limit reached"
+                );
+                if policy.full_live {
+                    return Ok((notional, risk));
+                }
                 ensure!(
                     risk.admitted_notional_token_a_base_units
                         .checked_add(notional)
@@ -1496,10 +1516,6 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 ensure!(
                     risk.failed_parent_count < policy.maximum_failed_parent_trades,
                     "M9 canary failure limit reached"
-                );
-                ensure!(
-                    risk.active_parent_count < policy.maximum_concurrent_trades,
-                    "M9 canary concurrent-parent limit reached"
                 );
                 ensure!(
                     risk.realized_loss_token_a_base_units
@@ -2761,6 +2777,33 @@ mod tests {
     }
 
     #[test]
+    fn full_live_policy_keeps_per_parent_and_single_concurrency_envelopes() {
+        let policy = LiveCanaryPolicy {
+            full_live: true,
+            journal_scope: scope(),
+            maximum_trade_notional_token_a_base_units: 200_000_000,
+            maximum_total_notional_token_a_base_units: 0,
+            maximum_unhedged_notional_token_a_base_units: 220_000_000,
+            maximum_realized_loss_token_a_base_units: 2_000_000,
+            maximum_parent_trades: 0,
+            maximum_failed_parent_trades: 0,
+            maximum_concurrent_trades: 1,
+            rollout_duration: Duration::ZERO,
+            readiness: Arc::new(AtomicBool::new(true)),
+            market_data_readiness: Arc::new(AtomicBool::new(true)),
+        };
+        policy.validate("arbitrum-usdc-esp").unwrap();
+
+        let mut missing_trade_cap = policy.clone();
+        missing_trade_cap.maximum_trade_notional_token_a_base_units = 0;
+        assert!(missing_trade_cap.validate("arbitrum-usdc-esp").is_err());
+
+        let mut concurrent = policy;
+        concurrent.maximum_concurrent_trades = 2;
+        assert!(concurrent.validate("arbitrum-usdc-esp").is_err());
+    }
+
+    #[test]
     fn m9_canary_fails_closed_until_ready_and_recovers_the_exact_production_parent() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-m9-canary-authority-{}-{}.jsonl",
@@ -2818,6 +2861,7 @@ mod tests {
                 canary_policies: BTreeMap::from([(
                     canary_opportunity.pair_id.clone(),
                     LiveCanaryPolicy {
+                        full_live: false,
                         journal_scope: canary_scope.clone(),
                         maximum_trade_notional_token_a_base_units: 10_000_000,
                         maximum_total_notional_token_a_base_units: 20_000_000,
@@ -2921,6 +2965,7 @@ mod tests {
                 canary_policies: BTreeMap::from([(
                     canary_opportunity.pair_id.clone(),
                     LiveCanaryPolicy {
+                        full_live: false,
                         journal_scope: canary_scope.clone(),
                         maximum_trade_notional_token_a_base_units: 10_000_000,
                         maximum_total_notional_token_a_base_units: 20_000_000,

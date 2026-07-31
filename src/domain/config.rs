@@ -223,6 +223,12 @@ pub struct PairConfig {
     pub id: String,
     pub market_data_enabled: bool,
     pub execution_enabled: bool,
+    /// Permanent production authority. Historical canary metadata may remain
+    /// deserializable for journal recovery, but it must not bound this pair.
+    #[serde(default)]
+    pub full_live: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_live_policy: Option<FullLivePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_canary: Option<LiveCanaryConfig>,
     pub chain: ChainConfig,
@@ -246,6 +252,24 @@ impl PairConfig {
             "pair {} cannot enable execution without market data",
             self.id
         );
+        ensure!(
+            !self.full_live || self.execution_enabled,
+            "pair {} cannot be full_live without execution",
+            self.id
+        );
+        ensure!(
+            self.full_live == self.full_live_policy.is_some(),
+            "pair {} full_live flag and policy must be configured together",
+            self.id
+        );
+        ensure!(
+            !self.full_live || self.live_canary.is_none(),
+            "pair {} cannot combine permanent full_live authority with a legacy canary",
+            self.id
+        );
+        if let Some(policy) = &self.full_live_policy {
+            policy.validate(self)?;
+        }
         if let Some(canary) = &self.live_canary {
             canary.validate(self)?;
         }
@@ -264,6 +288,104 @@ impl PairConfig {
         self.strategy.validate()?;
         self.rebalance.validate()?;
         self.dex.validate(&self.chain)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FullLivePolicy {
+    pub production_approval_actor: String,
+    pub production_approval_recorded_at_utc: String,
+    pub arbitrum_max_fee_headroom_bps: u16,
+    pub router_allowance_mode: FullLiveRouterAllowanceMode,
+    pub rebalance_binance_network: String,
+    pub maximum_rebalance_token_a_debit_base_units: String,
+    pub maximum_rebalance_token_b_debit_base_units: String,
+    pub maximum_rebalance_token_a_fee_base_units: String,
+    pub maximum_rebalance_token_b_fee_base_units: String,
+    pub maximum_unknown_reconciliation_queries: u16,
+    pub direct_route_only: bool,
+    pub bridge_mutations_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullLiveRouterAllowanceMode {
+    MaxUint256ThenLocked,
+}
+
+impl FullLivePolicy {
+    fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        ensure!(
+            pair.execution_enabled
+                && pair.rebalance.enabled
+                && pair.chain.chain_id == 42_161
+                && pair.binance.symbol == "ESPUSDC",
+            "full-live policy is restricted to the reviewed ESPUSDC Arbitrum pair"
+        );
+        validate_non_empty(
+            "full_live_policy.production_approval_actor",
+            &self.production_approval_actor,
+        )?;
+        ensure!(
+            self.production_approval_actor == "operator"
+                && self.production_approval_recorded_at_utc == "2026-07-31T11:00:00Z",
+            "full-live production approval identity differs from the reviewed artifact"
+        );
+        ensure!(
+            (11_000..=15_000).contains(&self.arbitrum_max_fee_headroom_bps),
+            "full-live Arbitrum maximum-fee headroom is outside the reviewed bounds"
+        );
+        ensure!(
+            self.router_allowance_mode == FullLiveRouterAllowanceMode::MaxUint256ThenLocked,
+            "full-live router allowance mode differs from the reviewed Rails-compatible policy"
+        );
+        ensure!(
+            self.rebalance_binance_network == pair.chain.binance_network_name
+                && self.maximum_unknown_reconciliation_queries == 1
+                && self.direct_route_only
+                && !self.bridge_mutations_enabled,
+            "full-live rebalance must remain direct, single-query, and no-bridge"
+        );
+        ensure!(
+            self.maximum_rebalance_token_a_debit_base_units == "2600000000"
+                && self.maximum_rebalance_token_b_debit_base_units == "10000000000000000000000"
+                && self.maximum_rebalance_token_a_fee_base_units == "5000000"
+                && self.maximum_rebalance_token_b_fee_base_units == "2000000000000000000",
+            "full-live rebalance per-operation caps differ from the reviewed artifact"
+        );
+        let sizing = pair
+            .adaptive_sizing
+            .limits()
+            .context("full-live pair has no adaptive sizing envelope")?;
+        ensure!(
+            sizing.max_trade_notional == "200000000"
+                && sizing.max_unhedged_notional == "220000000"
+                && sizing.max_recovery_loss == "2000000"
+                && pair.rebalance.start_threshold_bps == 2_500,
+            "full-live trade or rebalance envelope differs from the reviewed artifact"
+        );
+        for (name, value) in [
+            (
+                "full_live_policy.maximum_rebalance_token_a_debit_base_units",
+                &self.maximum_rebalance_token_a_debit_base_units,
+            ),
+            (
+                "full_live_policy.maximum_rebalance_token_b_debit_base_units",
+                &self.maximum_rebalance_token_b_debit_base_units,
+            ),
+            (
+                "full_live_policy.maximum_rebalance_token_a_fee_base_units",
+                &self.maximum_rebalance_token_a_fee_base_units,
+            ),
+            (
+                "full_live_policy.maximum_rebalance_token_b_fee_base_units",
+                &self.maximum_rebalance_token_b_fee_base_units,
+            ),
+        ] {
+            validate_positive_base_units(name, value)?;
+        }
         Ok(())
     }
 }
@@ -1862,7 +1984,7 @@ mod tests {
 
     use super::{
         AdaptiveSizingConfig, ArbitrageStrategy, BinanceProduct, DexProvider,
-        LiveCanaryApprovalGate, LoadedDomainConfig, TokenBQuoteSizing,
+        FullLiveRouterAllowanceMode, LiveCanaryApprovalGate, LoadedDomainConfig, TokenBQuoteSizing,
     };
 
     const CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v4.json");
@@ -1881,8 +2003,10 @@ mod tests {
         include_str!("../../config/strategies/usdc-esp-arbitrum.v2.json");
     const ESP_READINESS_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v3.json");
-    const ESP_CANARY_CONFIG: &str =
+    const ESP_HISTORICAL_CANARY_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v5.json");
+    const ESP_CANARY_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v6.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1974,265 +2098,64 @@ mod tests {
     }
 
     #[test]
-    fn committed_esp_canary_has_versioned_m10_approval_and_bounds() {
+    fn committed_esp_full_live_policy_has_permanent_bounds() {
         let loaded = load(ESP_CANARY_CONFIG.as_bytes()).unwrap();
         let pair = &loaded.snapshot().pairs[0];
-        let canary = pair.live_canary.as_ref().unwrap();
-
+        let policy = pair.full_live_policy.as_ref().unwrap();
+        assert!(pair.full_live && pair.execution_enabled && pair.rebalance.enabled);
+        assert_eq!(policy.production_approval_actor, "operator");
+        assert_eq!(policy.arbitrum_max_fee_headroom_bps, 12_000);
         assert_eq!(
-            canary.approval_gate,
-            LiveCanaryApprovalGate::ExplicitProductionApproved
+            policy.router_allowance_mode,
+            FullLiveRouterAllowanceMode::MaxUint256ThenLocked
         );
-        assert_eq!(canary.minimum_wallet_token_a_base_units, "25000000");
+        assert_eq!(policy.rebalance_binance_network, "ARBITRUM");
         assert_eq!(
-            canary.minimum_wallet_token_b_base_units,
-            "400000000000000000000"
-        );
-        assert_eq!(canary.runtime_wallet_token_a_minimum(), "1");
-        assert_eq!(canary.runtime_wallet_token_b_minimum(), "1");
-        let prefunding = canary.prefunding_rebalance.as_ref().unwrap();
-        assert_eq!(prefunding.binance_network, "ARBITRUM");
-        assert_eq!(prefunding.withdrawal_api_mode, "standard");
-        assert_eq!(prefunding.maximum_transfer_count, 2);
-        assert_eq!(prefunding.maximum_token_a_debit_base_units, "30000000");
-        assert_eq!(
-            prefunding.maximum_token_b_debit_base_units,
-            "500000000000000000000"
-        );
-        assert!(prefunding.retry_after_verified_address);
-        let recovery = prefunding.approved_travel_rule_recovery.as_ref().unwrap();
-        assert_eq!(recovery.rejected_token_symbol, "ESP");
-        assert_eq!(recovery.rejected_http_status, 400);
-        assert_eq!(recovery.rejected_error_code, -4024);
-        let manual = prefunding.approved_manual_token_b_credit.as_ref().unwrap();
-        assert_eq!(manual.operation_id, "rebalance-268-15f59bc55dcaed54");
-        assert_eq!(manual.token_symbol, "ESP");
-        assert_eq!(manual.expected_credit_base_units, "400000000000000000000");
-        assert_eq!(
-            manual.transaction_hash,
-            "0xc65237273346c647f2e47e04ad67b81e7002eedf6da779d04a5b3c49e2fd129b"
-        );
-        assert_eq!(canary.arbitrum_max_fee_headroom_bps, 12_000);
-        let rebalance = canary.rebalance_live_canary.as_ref().unwrap();
-        assert_eq!(
-            rebalance.approval_gate,
-            LiveCanaryApprovalGate::ExplicitProductionApproved
+            policy.maximum_rebalance_token_a_debit_base_units,
+            "2600000000"
         );
         assert_eq!(
-            rebalance.production_approval_actor.as_deref(),
-            Some("operator")
-        );
-        assert_eq!(
-            rebalance.production_approval_recorded_at_utc.as_deref(),
-            Some("2026-07-31T08:09:37Z")
-        );
-        assert_eq!(
-            rebalance.approval_session_id,
-            "esp-usdc-arbitrum-rebalance-20260731-r2"
-        );
-        assert_eq!(rebalance.binance_network, "ARBITRUM");
-        assert_eq!(rebalance.maximum_transfer_count, 2);
-        assert_eq!(rebalance.maximum_concurrent_transfers, 1);
-        assert_eq!(rebalance.maximum_failed_transfers, 1);
-        assert_eq!(rebalance.maximum_token_a_debit_base_units, "2600000000");
-        assert_eq!(
-            rebalance.maximum_token_b_debit_base_units,
+            policy.maximum_rebalance_token_b_debit_base_units,
             "10000000000000000000000"
         );
-        assert_eq!(rebalance.maximum_token_a_fee_base_units, "5000000");
-        assert_eq!(
-            rebalance.maximum_token_b_fee_base_units,
-            "2000000000000000000"
-        );
-        assert_eq!(rebalance.rollout_duration_seconds, 900);
-        assert_eq!(rebalance.maximum_unknown_reconciliation_queries, 1);
-        assert!(rebalance.direct_route_only);
-        assert!(!rebalance.bridge_mutations_enabled);
-        let endpoint_recovery = rebalance
-            .approved_standard_withdrawal_recovery
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            endpoint_recovery.operation_id,
-            "rebalance-324-8b62a7c14f4ef643"
-        );
-        assert_eq!(
-            endpoint_recovery.withdraw_order_id,
-            "rb8b62a7c14f4ef6434a88c384bbb83c"
-        );
-        assert_eq!(
-            endpoint_recovery.amount_base_units,
-            "4464938180550000000000"
-        );
-        assert_eq!(endpoint_recovery.retry_api_mode, "standard");
-        assert_eq!(endpoint_recovery.capital_history_match_count, 0);
-        let manual_recovery = rebalance
-            .approved_manual_withdrawal_recovery
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            manual_recovery.withdrawal_id,
-            "e02357b25de24e1ba9965bf524db37f7"
-        );
-        assert_eq!(
-            manual_recovery.transaction_hash,
-            "0x553d9635dab1477c6aab9a17fc4ab860040e44db8ca085cb894a6b3184bc27fd"
-        );
-        assert_eq!(
-            manual_recovery.expected_fee_base_units,
-            "1100000000000000000"
-        );
-        assert_eq!(
-            manual_recovery.rejected_local_entity_travel_rule_id,
-            67_294_348
-        );
-        assert_eq!(manual_recovery.rejected_standard_travel_rule_id, 67_298_920);
-        assert!(canary.rebalance_mutations_enabled);
-        let evm_recovery = prefunding
-            .approved_evm_prebroadcast_rejection
-            .as_ref()
-            .unwrap();
-        assert_eq!(evm_recovery.nonce, 1);
-        assert_eq!(
-            evm_recovery.transaction_hash,
-            "0xbdfaa80920ebd8513a01d9a368f581ae8b552e8f4528be54586eeb0963079977"
-        );
-        let absent_withdrawal = prefunding
-            .approved_absent_standard_withdrawal
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            absent_withdrawal.operation_id,
-            "rebalance-296-96fd53e70c1ab390"
-        );
-        assert_eq!(
-            absent_withdrawal.withdraw_order_id,
-            "rb96fd53e70c1ab390ae3e62eb434cd1"
-        );
-        assert_eq!(absent_withdrawal.amount_base_units, "1197503244");
-        assert_eq!(absent_withdrawal.binance_network, "OPTIMISM");
-        assert_eq!(
-            absent_withdrawal.master_transfer_transaction_id,
-            395_924_104_268
-        );
-        assert_eq!(absent_withdrawal.reconciliation_queries, 1);
-        assert_eq!(absent_withdrawal.rejected_http_status, 400);
-        assert_eq!(absent_withdrawal.rejected_error_code, -4104);
-        let absent_master_transfer = prefunding.approved_absent_master_transfer.as_ref().unwrap();
-        assert_eq!(
-            absent_master_transfer.operation_id,
-            "rebalance-294-96fd53e70c1ab390"
-        );
-        assert_eq!(
-            absent_master_transfer.fingerprint,
-            "96fd53e70c1ab390ae3e62eb434cd19f5c5e9e1434754bbbddc34d932f0efb50"
-        );
-        assert_eq!(
-            absent_master_transfer.withdraw_order_id,
-            "rb96fd53e70c1ab390ae3e62eb434cd1"
-        );
-        assert_eq!(absent_master_transfer.amount_base_units, "1197503244");
-        assert_eq!(absent_master_transfer.minimum_evidence_age_seconds, 300);
-        assert!(pair.execution_enabled);
-        assert!(pair.rebalance.enabled);
+        assert!(policy.direct_route_only);
+        assert!(!policy.bridge_mutations_enabled);
+        assert!(pair.live_canary.is_none());
 
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["minimum_wallet_token_a_base_units"] =
-            Value::String("19999999".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+        for (path, replacement) in [
+            (
+                "/pairs/0/full_live_policy/production_approval_actor",
+                Value::String("other".to_owned()),
+            ),
+            (
+                "/pairs/0/full_live_policy/router_allowance_mode",
+                Value::String("bounded".to_owned()),
+            ),
+            (
+                "/pairs/0/full_live_policy/maximum_rebalance_token_b_debit_base_units",
+                Value::String("10001000000000000000000".to_owned()),
+            ),
+            (
+                "/pairs/0/adaptive_sizing/max_trade_notional_token_a_base_units",
+                Value::String("201000000".to_owned()),
+            ),
+        ] {
+            let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+            *value.pointer_mut(path).unwrap() = replacement;
+            assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
 
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["minimum_runtime_wallet_token_a_base_units"] =
-            Value::String("0".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["minimum_runtime_wallet_token_b_base_units"] =
-            Value::String("400000000000000000001".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["prefunding_rebalance"]["maximum_token_a_withdrawal_fee_base_units"] =
-            Value::String("5000001".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["prefunding_rebalance"]["approved_manual_token_b_credit"]
-            ["transaction_hash"] = Value::String("0xdeadbeef".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["prefunding_rebalance"]["withdrawal_api_mode"] =
-            Value::String("local_entity".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_standard_withdrawal_recovery"]
-            ["withdraw_order_id"] = Value::String("rbwrong".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_manual_withdrawal_recovery"]
-            ["expected_fee_base_units"] = Value::String("1200000000000000000".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approved_manual_withdrawal_recovery"]
-            ["rejected_standard_travel_rule_id"] = Value::from(67_294_348);
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
-            Value::String("explicit_production_approval_required".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["production_approval_actor"] =
-            Value::String(String::new());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(false);
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(false);
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["direct_route_only"] =
-            Value::Bool(false);
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["bridge_mutations_enabled"] =
-            Value::Bool(true);
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_session_id"] =
-            Value::String("esp-usdc-arbitrum-rebalance-unreviewed".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["maximum_token_b_debit_base_units"] =
-            Value::String("10001000000000000000000".to_owned());
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
-
-        let mut value: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]["approval_gate"] =
-            Value::String("explicit_production_approval_required".to_owned());
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]
+        let mut missing_policy: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        missing_policy["pairs"][0]
             .as_object_mut()
             .unwrap()
-            .remove("production_approval_actor");
-        value["pairs"][0]["live_canary"]["rebalance_live_canary"]
-            .as_object_mut()
-            .unwrap()
-            .remove("production_approval_recorded_at_utc");
-        value["pairs"][0]["live_canary"]["rebalance_mutations_enabled"] = Value::Bool(false);
-        value["pairs"][0]["rebalance"]["enabled"] = Value::Bool(false);
-        assert!(load(&serde_json::to_vec(&value).unwrap()).is_ok());
+            .remove("full_live_policy");
+        assert!(load(&serde_json::to_vec(&missing_policy).unwrap()).is_err());
+
+        let historical: Value = serde_json::from_str(ESP_HISTORICAL_CANARY_CONFIG).unwrap();
+        let mut mixed_authority: Value = serde_json::from_str(ESP_CANARY_CONFIG).unwrap();
+        mixed_authority["pairs"][0]["live_canary"] = historical["pairs"][0]["live_canary"].clone();
+        assert!(load(&serde_json::to_vec(&mixed_authority).unwrap()).is_err());
     }
 
     #[test]

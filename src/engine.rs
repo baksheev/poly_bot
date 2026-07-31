@@ -3819,6 +3819,7 @@ fn is_bounded_canary_pair(domain_config: &LoadedDomainConfig, pair_id: &str) -> 
     domain_config.snapshot().pairs.iter().any(|pair| {
         pair.id == pair_id
             && pair.execution_enabled
+            && !pair.full_live
             && pair.live_canary.as_ref().is_some_and(|canary| {
                 canary.approval_gate == LiveCanaryApprovalGate::ExplicitProductionApproved
             })
@@ -4134,11 +4135,11 @@ mod tests {
     }
 
     #[test]
-    fn only_bounded_canary_inventory_exhaustion_is_expected() {
+    fn promoted_esp_inventory_exhaustion_is_actionable() {
         let config =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json").unwrap();
 
-        assert!(is_bounded_canary_pair(&config, "arbitrum-usdc-esp"));
+        assert!(!is_bounded_canary_pair(&config, "arbitrum-usdc-esp"));
         assert!(!is_bounded_canary_pair(&config, "world-chain-usdc-wld"));
         assert!(!is_bounded_canary_pair(&config, "unknown-pair"));
     }

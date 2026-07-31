@@ -290,6 +290,10 @@ fn emit_m10_rebalance_saga(
                 .unwrap_or("unconfigured"),
             "operation_id": operation.map(|operation| &operation.intent.operation_id),
             "token": operation.map(|operation| &operation.intent.token_symbol),
+            "amount_base_units": operation.map(|operation| operation.intent.amount.to_string()),
+            "maximum_fee_base_units": operation.and_then(|operation| {
+                operation.intent.canary_maximum_fee_base_units.as_deref()
+            }),
             "direction": operation.map(|operation| format!("{:?}", operation.intent.direction)),
             "progress": operation.map(|operation| format!("{:?}", operation.progress)),
             "saga_duration_us": saga_duration_us,
@@ -3032,51 +3036,53 @@ async fn run(
         portfolio_catalog.live_rebalance_adapter() == "world_chain_v12_parity",
         "live WLD rebalance is not behind the reviewed v12 parity adapter"
     );
-    let canary_rebalance_tracker =
-        if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary {
+    let canary_rebalance_tracker = if matches!(
+        portfolio_catalog.allocator_mode(),
+        CompiledCapitalAllocatorMode::LiveCanary | CompiledCapitalAllocatorMode::FullLive
+    ) {
+        ensure!(
+            m8_pair.rebalance.enabled,
+            "live M10 allocator requires the ESP pair rebalance policy"
+        );
+        let mut routes = BTreeMap::new();
+        for token in [&m8_pair.token_a, &m8_pair.token_b] {
+            let capital = select_capital_routes(
+                &capital_coins,
+                &token.symbol,
+                &m8_pair.chain.binance_network_name,
+                "OPTIMISM",
+            )?;
+            let direct = capital
+                .direct
+                .as_ref()
+                .filter(|route| route.network == m8_pair.chain.binance_network_name)
+                .context("M10 direct Arbitrum capital route is absent")?;
             ensure!(
-                m8_pair.rebalance.enabled,
-                "live M10 allocator requires the ESP pair rebalance policy"
+                capital.deposit_all_enabled
+                    && capital.withdrawal_all_enabled
+                    && direct.deposit_available()
+                    && direct.withdrawal_available(),
+                "M10 direct Arbitrum capital route is not fully available"
             );
-            let mut routes = BTreeMap::new();
-            for token in [&m8_pair.token_a, &m8_pair.token_b] {
-                let capital = select_capital_routes(
-                    &capital_coins,
-                    &token.symbol,
-                    &m8_pair.chain.binance_network_name,
-                    "OPTIMISM",
-                )?;
-                let direct = capital
-                    .direct
-                    .as_ref()
-                    .filter(|route| route.network == m8_pair.chain.binance_network_name)
-                    .context("M10 direct Arbitrum capital route is absent")?;
-                ensure!(
-                    capital.deposit_all_enabled
-                        && capital.withdrawal_all_enabled
-                        && direct.deposit_available()
-                        && direct.withdrawal_available(),
-                    "M10 direct Arbitrum capital route is not fully available"
-                );
-                routes.insert(
-                    token.symbol.clone(),
-                    route_candidates_from_capital(
-                        &CapitalRouteState {
-                            coin: capital.coin.clone(),
-                            deposit_all_enabled: capital.deposit_all_enabled,
-                            withdrawal_all_enabled: capital.withdrawal_all_enabled,
-                            direct: Some(direct.clone()),
-                            fallback: None,
-                        },
-                        token.decimals,
-                        ARBITRUM_CHAIN_ID,
-                    )?,
-                );
-            }
-            RebalanceTracker::new(&m8_pair, routes)?
-        } else {
-            RebalanceTracker::disabled()
-        };
+            routes.insert(
+                token.symbol.clone(),
+                route_candidates_from_capital(
+                    &CapitalRouteState {
+                        coin: capital.coin.clone(),
+                        deposit_all_enabled: capital.deposit_all_enabled,
+                        withdrawal_all_enabled: capital.withdrawal_all_enabled,
+                        direct: Some(direct.clone()),
+                        fallback: None,
+                    },
+                    token.decimals,
+                    ARBITRUM_CHAIN_ID,
+                )?,
+            );
+        }
+        RebalanceTracker::new(&m8_pair, routes)?
+    } else {
+        RebalanceTracker::disabled()
+    };
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -3602,6 +3608,17 @@ async fn run(
             config.arbitrage_leg_execution_channel_capacity,
         )?;
         let canary_evm_journal_started_at = Instant::now();
+        let arbitrum_max_fee_headroom_bps = m8_pair
+            .full_live_policy
+            .as_ref()
+            .map(|policy| policy.arbitrum_max_fee_headroom_bps)
+            .or_else(|| {
+                m8_pair
+                    .live_canary
+                    .as_ref()
+                    .map(|policy| policy.arbitrum_max_fee_headroom_bps)
+            })
+            .context("Arbitrum gas policy is missing")?;
         let mut canary_dex_executor = DexExecutor::hydrate_with_gas_policy(
             canary_wallet_rpc.clone(),
             EvmWallet::from_env()?,
@@ -3610,11 +3627,7 @@ async fn run(
             CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 max_priority_fee_per_gas_wei: 0,
-                max_fee_headroom_bps: m8_pair
-                    .live_canary
-                    .as_ref()
-                    .context("M9 canary policy is missing")?
-                    .arbitrum_max_fee_headroom_bps,
+                max_fee_headroom_bps: arbitrum_max_fee_headroom_bps,
                 includes_l1_fee: false,
             },
         )
@@ -3633,10 +3646,7 @@ async fn run(
             .context("M9 Arbitrum V3 router is missing")?
             .parse()
             .context("M9 Arbitrum V3 router is invalid")?;
-        let m9_canary = m8_pair
-            .live_canary
-            .as_ref()
-            .context("M9 canary policy is missing")?;
+        let legacy_canary = m8_pair.live_canary.as_ref();
         let token_a = canary_initial_wallet_balances
             .token_balances
             .iter()
@@ -3655,13 +3665,18 @@ async fn run(
             .as_micros()
             .try_into()
             .context("current Unix timestamp exceeds u64")?;
-        if let Some((token_a_required, token_b_required)) = m9_canary_allowance_requirements(
-            m9_canary,
-            canary_risk,
-            token_a.base_units,
-            token_b.base_units,
-            now_unix_us,
-        )? {
+        let allowance_requirements = if m8_pair.full_live {
+            Some((U256::MAX, U256::MAX))
+        } else {
+            m9_canary_allowance_requirements(
+                legacy_canary.context("legacy canary policy is missing")?,
+                canary_risk,
+                token_a.base_units,
+                token_b.base_units,
+                now_unix_us,
+            )?
+        };
+        if let Some((token_a_required, token_b_required)) = allowance_requirements {
             let canary_allowances = [(token_a, token_a_required), (token_b, token_b_required)]
                 .into_iter()
                 .map(|(token, required)| AllowanceRequirement {
@@ -3792,14 +3807,20 @@ async fn run(
             (pair.id.clone(), primary_executor),
             (m8_pair.id.clone(), canary_executor),
         ]))?;
-        let m9_canary = m8_pair
-            .live_canary
-            .as_ref()
-            .context("M9 canary policy is missing")?;
+        let legacy_canary = m8_pair.live_canary.as_ref();
+        let full_live_sizing = m8_pair
+            .full_live
+            .then(|| {
+                m8_pair
+                    .adaptive_sizing
+                    .limits()
+                    .context("full-live adaptive sizing limits are missing")
+            })
+            .transpose()?;
         let parse_canary_amount = |value: &str, label: &str| {
             value
                 .parse::<u128>()
-                .with_context(|| format!("M9 {label} is invalid"))
+                .with_context(|| format!("ESP {label} is invalid"))
         };
         let (handle, task, events) = live_trade_channel(
             &config.arbitrage_trade_journal_path,
@@ -3815,29 +3836,77 @@ async fn run(
                 canary_policies: BTreeMap::from([(
                     m8_pair.id.clone(),
                     LiveCanaryPolicy {
+                        full_live: m8_pair.full_live,
                         journal_scope: canary_journal_scope,
-                        maximum_trade_notional_token_a_base_units: parse_canary_amount(
-                            &m9_canary.max_trade_notional_token_a_base_units,
-                            "maximum trade notional",
-                        )?,
-                        maximum_total_notional_token_a_base_units: parse_canary_amount(
-                            &m9_canary.max_total_notional_token_a_base_units,
-                            "maximum total notional",
-                        )?,
-                        maximum_unhedged_notional_token_a_base_units: parse_canary_amount(
-                            &m9_canary.max_unhedged_notional_token_a_base_units,
-                            "maximum unhedged notional",
-                        )?,
-                        maximum_realized_loss_token_a_base_units: parse_canary_amount(
-                            &m9_canary.max_realized_loss_token_a_base_units,
-                            "maximum realized loss",
-                        )?,
-                        maximum_parent_trades: usize::from(m9_canary.max_parent_trades),
-                        maximum_failed_parent_trades: usize::from(
-                            m9_canary.max_failed_parent_trades,
+                        maximum_trade_notional_token_a_base_units: legacy_canary
+                            .map(|policy| {
+                                parse_canary_amount(
+                                    &policy.max_trade_notional_token_a_base_units,
+                                    "maximum trade notional",
+                                )
+                            })
+                            .transpose()?
+                            .or(full_live_sizing
+                                .map(|limits| {
+                                    parse_canary_amount(
+                                        limits.max_trade_notional,
+                                        "full-live maximum trade notional",
+                                    )
+                                })
+                                .transpose()?)
+                            .context("pair trade-notional policy is missing")?,
+                        maximum_total_notional_token_a_base_units: legacy_canary
+                            .map(|policy| {
+                                parse_canary_amount(
+                                    &policy.max_total_notional_token_a_base_units,
+                                    "maximum total notional",
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
+                        maximum_unhedged_notional_token_a_base_units: legacy_canary
+                            .map(|policy| {
+                                parse_canary_amount(
+                                    &policy.max_unhedged_notional_token_a_base_units,
+                                    "maximum unhedged notional",
+                                )
+                            })
+                            .transpose()?
+                            .or(full_live_sizing
+                                .map(|limits| {
+                                    parse_canary_amount(
+                                        limits.max_unhedged_notional,
+                                        "full-live maximum unhedged notional",
+                                    )
+                                })
+                                .transpose()?)
+                            .context("pair unhedged-notional policy is missing")?,
+                        maximum_realized_loss_token_a_base_units: legacy_canary
+                            .map(|policy| {
+                                parse_canary_amount(
+                                    &policy.max_realized_loss_token_a_base_units,
+                                    "maximum realized loss",
+                                )
+                            })
+                            .transpose()?
+                            .or(full_live_sizing
+                                .map(|limits| {
+                                    parse_canary_amount(
+                                        limits.max_recovery_loss,
+                                        "full-live maximum recovery loss",
+                                    )
+                                })
+                                .transpose()?)
+                            .context("pair recovery-loss policy is missing")?,
+                        maximum_parent_trades: legacy_canary
+                            .map_or(0, |policy| usize::from(policy.max_parent_trades)),
+                        maximum_failed_parent_trades: legacy_canary
+                            .map_or(0, |policy| usize::from(policy.max_failed_parent_trades)),
+                        maximum_concurrent_trades: legacy_canary
+                            .map_or(1, |policy| usize::from(policy.max_concurrent_trades)),
+                        rollout_duration: Duration::from_secs(
+                            legacy_canary.map_or(0, |policy| policy.rollout_duration_seconds),
                         ),
-                        maximum_concurrent_trades: usize::from(m9_canary.max_concurrent_trades),
-                        rollout_duration: Duration::from_secs(m9_canary.rollout_duration_seconds),
                         readiness: Arc::clone(&canary_execution_ready),
                         market_data_readiness: Arc::clone(&canary_market_data_ready),
                     },
@@ -4037,16 +4106,64 @@ async fn run(
         shared_inventory_owner = true,
         shared_binance_order_owner = true,
         canary_rebalance_mutation_enabled =
-            portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary,
+            matches!(
+                portfolio_catalog.allocator_mode(),
+                CompiledCapitalAllocatorMode::LiveCanary
+                    | CompiledCapitalAllocatorMode::FullLive
+            ),
         canary_external_mutation_authorized = true,
         root_supervisor_policy = "dependency_scoped_v1",
-        "M9 bounded ESP production canary configured"
+        "ESP full-live production strategy configured"
     );
-    let m8_canary = m8_pair
-        .live_canary
-        .as_ref()
-        .context("M9 live pair has no bounded canary policy")?;
-    tracing::info!(
+    if matches!(
+        portfolio_catalog.allocator_mode(),
+        CompiledCapitalAllocatorMode::LiveCanary | CompiledCapitalAllocatorMode::FullLive
+    ) {
+        ensure!(
+            shared_arbitrum_rebalance_owner_attached && full_rebalance_executor.is_some(),
+            "live ESP rebalance has no shared Arbitrum EVM execution owner"
+        );
+    }
+    if let Some(policy) = m8_pair.full_live_policy.as_ref() {
+        tracing::info!(
+            pair_id = m8_pair.id,
+            strategy_id = %shadow_plan.strategy_id.as_str(),
+            network_id = %shadow_plan.network_id.as_str(),
+            chain_id = m8_pair.chain.chain_id,
+            production_approval_actor = policy.production_approval_actor,
+            production_approval_recorded_at_utc = policy.production_approval_recorded_at_utc,
+            max_trade_notional_token_a_base_units = m8_pair
+                .adaptive_sizing
+                .limits()
+                .map(|limits| limits.max_trade_notional),
+            gas_policy = "fresh_eth_gas_price_fail_closed_no_world_fallback",
+            allowance_policy = "max_uint256_then_locked",
+            rebalance_policy = "continuous_direct_arbitrum_per_operation_caps",
+            allocator_mode = ?portfolio_catalog.allocator_mode(),
+            binance_network = policy.rebalance_binance_network,
+            maximum_token_a_debit_base_units =
+                policy.maximum_rebalance_token_a_debit_base_units,
+            maximum_token_b_debit_base_units =
+                policy.maximum_rebalance_token_b_debit_base_units,
+            maximum_token_a_fee_base_units =
+                policy.maximum_rebalance_token_a_fee_base_units,
+            maximum_token_b_fee_base_units =
+                policy.maximum_rebalance_token_b_fee_base_units,
+            maximum_concurrent_transfers = 1,
+            maximum_unknown_reconciliation_queries =
+                policy.maximum_unknown_reconciliation_queries,
+            direct_route_only = policy.direct_route_only,
+            bridge_mutations_enabled = policy.bridge_mutations_enabled,
+            shared_arbitrum_evm_owner = shared_arbitrum_rebalance_owner_attached,
+            external_mutation_authorized = true,
+            "ESP Arbitrum full-live execution configured"
+        );
+    } else {
+        let m8_canary = m8_pair
+            .live_canary
+            .as_ref()
+            .context("legacy live pair has no bounded canary policy")?;
+        tracing::info!(
         pair_id = m8_pair.id,
         strategy_id = %shadow_plan.strategy_id.as_str(),
         network_id = %shadow_plan.network_id.as_str(),
@@ -4079,19 +4196,13 @@ async fn run(
         execution_enabled = true,
         rebalance_enabled = m8_pair.rebalance.enabled,
         external_mutation_authorized = true,
-        "M9 Arbitrum live canary configured"
-    );
-    let m10_policy = m8_canary
-        .rebalance_live_canary
-        .as_ref()
-        .context("M10 rebalance policy is missing")?;
-    if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary {
-        ensure!(
-            shared_arbitrum_rebalance_owner_attached && full_rebalance_executor.is_some(),
-            "live M10 rebalance has no shared Arbitrum EVM execution owner"
+        "ESP Arbitrum full-live execution configured"
         );
-    }
-    tracing::info!(
+        let m10_policy = m8_canary
+            .rebalance_live_canary
+            .as_ref()
+            .context("M10 rebalance policy is missing")?;
+        tracing::info!(
         pair_id = m8_pair.id,
         strategy_id = "rebalance-arbitrum-usdc-esp-m10",
         network_id = "eip155:42161",
@@ -4121,7 +4232,8 @@ async fn run(
             .capital_canary()
             .is_some_and(|policy| policy.external_mutation_authorized),
         "M10 Arbitrum rebalance live canary configured"
-    );
+        );
+    }
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
         task: mut shadow_dex_task,
@@ -4424,7 +4536,11 @@ async fn run(
         hot_path_canary_strategy_id = %shadow_plan.strategy_id.as_str(),
         hot_path_canary_external_mutation_authorized = true,
         hot_path_canary_rebalance_mutation_authorized =
-            portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::LiveCanary,
+            matches!(
+                portfolio_catalog.allocator_mode(),
+                CompiledCapitalAllocatorMode::LiveCanary
+                    | CompiledCapitalAllocatorMode::FullLive
+            ),
         portfolio_inventory_key = "inventory_location+venue_asset_id",
         portfolio_location_count = portfolio_catalog.location_count(),
         portfolio_venue_asset_count = portfolio_catalog.asset_count(),
@@ -5395,7 +5511,11 @@ async fn dispatch_rebalance_execution(
             authority: match target {
                 RebalanceExecutionTarget::Primary => RebalanceExecutionAuthority::WorldChainV12,
                 RebalanceExecutionTarget::ArbitrumCanary => {
-                    RebalanceExecutionAuthority::ArbitrumM10Canary
+                    if capital_policy.is_some_and(|policy| policy.full_live) {
+                        RebalanceExecutionAuthority::ArbitrumFullLive
+                    } else {
+                        RebalanceExecutionAuthority::ArbitrumM10Canary
+                    }
                 }
             },
             token_symbol: evaluation.token_symbol,
@@ -6229,7 +6349,7 @@ mod tests {
     #[test]
     fn m9_post_first_parent_restart_uses_durable_remaining_allowance_authority() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v5.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v4.json").unwrap();
         let canary = domain.snapshot().pairs[0].live_canary.as_ref().unwrap();
         let first_admitted_unix_us = 1_785_426_526_104_975_u64;
         let post_trade_usdc = U256::from(16_860_785_u64);
