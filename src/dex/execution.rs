@@ -17,6 +17,7 @@ use crate::{
     domain::compiled::CompiledNetworkGasPolicy,
     pretrade_cost::{
         DexProtocol as CostTelemetryDexProtocol, GasPriceTelemetrySource, PreTradeCostTelemetry,
+        ReceiptCostTelemetrySource,
     },
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
@@ -447,6 +448,88 @@ impl DexExecutor {
 
     pub fn set_pretrade_cost_telemetry(&mut self, telemetry: PreTradeCostTelemetry) {
         self.pretrade_cost_telemetry = Some(telemetry);
+    }
+
+    /// Best-effort diagnostic bootstrap from the newest successful swap in
+    /// the durable EVM journal. It runs independently of readiness and the
+    /// execution owner, so RPC latency or failure cannot delay trading.
+    pub fn spawn_pretrade_cost_receipt_bootstrap(&self) {
+        let Some(telemetry) = self.pretrade_cost_telemetry.clone() else {
+            return;
+        };
+        let rpc = self.rpc.clone();
+        let includes_l1_fee = matches!(
+            self.gas_policy,
+            CompiledNetworkGasPolicy::WorldChainV12 {
+                includes_l1_fee: true,
+                ..
+            }
+        );
+        for protocol in [
+            CostTelemetryDexProtocol::UniswapV3,
+            CostTelemetryDexProtocol::UniswapV4,
+        ] {
+            let candidate = self
+                .journal
+                .operations()
+                .values()
+                .filter(|operation| operation.intent.purpose == protocol.label())
+                .filter_map(|operation| {
+                    let JournalStatus::MinedSuccess {
+                        transaction_hash,
+                        block_number,
+                    } = operation.status
+                    else {
+                        return None;
+                    };
+                    Some((block_number, transaction_hash))
+                })
+                .max_by_key(|(block_number, _)| *block_number);
+            let Some((block_number, transaction_hash)) = candidate else {
+                continue;
+            };
+            let rpc = rpc.clone();
+            let telemetry = telemetry.clone();
+            tokio::spawn(async move {
+                let lookup = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    rpc.transaction_receipt(transaction_hash),
+                )
+                .await;
+                match lookup {
+                    Ok(Ok(Some(receipt))) if receipt.status == 1 => {
+                        telemetry.publish_receipt_with_source(
+                            protocol,
+                            receipt.gas_used,
+                            receipt.effective_gas_price,
+                            if includes_l1_fee { receipt.l1_fee } else { 0 },
+                            ReceiptCostTelemetrySource::JournalBootstrap,
+                        );
+                        tracing::info!(
+                            block_number,
+                            protocol = protocol.label(),
+                            "pre-trade receipt-cost telemetry bootstrapped from journal"
+                        );
+                    }
+                    Ok(Ok(_)) => tracing::warn!(
+                        block_number,
+                        protocol = protocol.label(),
+                        "journal bootstrap receipt is unavailable or unsuccessful"
+                    ),
+                    Ok(Err(error)) => tracing::warn!(
+                        block_number,
+                        protocol = protocol.label(),
+                        error = %error,
+                        "journal bootstrap receipt lookup failed"
+                    ),
+                    Err(_) => tracing::warn!(
+                        block_number,
+                        protocol = protocol.label(),
+                        "journal bootstrap receipt lookup timed out"
+                    ),
+                }
+            });
+        }
     }
 
     /// Wake receipt lookup from the process-wide Alchemy new-head stream.

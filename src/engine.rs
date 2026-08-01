@@ -3165,6 +3165,17 @@ impl TradingEngine {
             }
         }
         let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
+        let cost_direction = match direction {
+            TradeDirection::BuyTokenBOnDexSellOnCex => ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            TradeDirection::BuyTokenBOnCexSellOnDex => ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+        };
+        self.hot_telemetry.emit_pretrade_candidate(
+            &plan_id,
+            quote,
+            evaluation.pair_index,
+            cost_direction,
+            trade,
+        );
         let admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,
@@ -3187,6 +3198,8 @@ impl TradingEngine {
             "top_mismatch_reason": execution_depth_health.top_mismatch_reason,
             "inventory_reservation_policy": "exact_primary_execution_envelope_v3",
             "evaluation_trigger": evaluation_trigger,
+            "update_id": quote.update_id,
+            "opportunity_received_unix_us": quote.received_unix_us,
             "market_to_admitted_us": duration_us(quote.received_at.elapsed()),
             "trigger_to_admitted_us": duration_us(evaluation_started_at.elapsed()),
             "admission_total_us": duration_us(admission_started.elapsed()),

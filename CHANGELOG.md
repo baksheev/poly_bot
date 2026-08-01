@@ -20,6 +20,12 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Make diagnostic pre-trade cost telemetry decision-grade without entering the
+  trading path: disable invalid unauthenticated collector cohorts, retain two
+  temporal source samples to avoid refresh look-ahead gaps, enforce a
+  diagnostic native-conversion TTL, bootstrap World Chain L1-fee evidence from
+  the durable receipt journal in a bounded background task, and emit exact
+  `plan_id`/`update_id` candidate-to-result joins for estimator validation.
 - Add one-Hz diagnostic-only pre-trade net-edge sampling to background
   arbitrage evaluations. It records conservative Binance commission, current
   cached gas fee cap, same-protocol realized gas/L1 inputs, source ages, and a

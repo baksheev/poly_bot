@@ -33,6 +33,7 @@ pub struct HotTelemetryHandle {
     dex_event_sender: mpsc::Sender<HotDexEventTelemetry>,
     prepared_pool_sender: mpsc::Sender<PreparedPoolRefresh>,
     shared_stream_sender: mpsc::Sender<HotSharedStreamTelemetry>,
+    pretrade_candidate_sender: mpsc::Sender<HotPreTradeCandidateTelemetry>,
     dropped: Arc<AtomicU64>,
     pretrade_cost: PreTradeCostTelemetry,
 }
@@ -43,6 +44,7 @@ pub struct HotTelemetryTask {
     dex_event_receiver: mpsc::Receiver<HotDexEventTelemetry>,
     prepared_pool_receiver: mpsc::Receiver<PreparedPoolRefresh>,
     shared_stream_receiver: mpsc::Receiver<HotSharedStreamTelemetry>,
+    pretrade_candidate_receiver: mpsc::Receiver<HotPreTradeCandidateTelemetry>,
     dropped: Arc<AtomicU64>,
     telemetry: TelemetryHandle,
     context: HotTelemetryContext,
@@ -68,6 +70,15 @@ struct HotEvaluationTelemetry {
     decision_latency_us: u128,
     trigger: &'static str,
     queued_at: std::time::Instant,
+}
+
+struct HotPreTradeCandidateTelemetry {
+    plan_id: String,
+    quote: TopOfBook,
+    pair_index: usize,
+    direction: ArbitrageDirection,
+    trade: TradeEvaluation,
+    queued_at: Instant,
 }
 
 enum HotDexEventTelemetry {
@@ -269,6 +280,8 @@ pub fn channel(
         mpsc::channel(config.telemetry_channel_capacity);
     let (shared_stream_sender, shared_stream_receiver) =
         mpsc::channel(config.telemetry_channel_capacity);
+    let (pretrade_candidate_sender, pretrade_candidate_receiver) =
+        mpsc::channel(config.telemetry_channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     Ok((
         HotTelemetryHandle {
@@ -277,6 +290,7 @@ pub fn channel(
             dex_event_sender,
             prepared_pool_sender,
             shared_stream_sender,
+            pretrade_candidate_sender,
             dropped: Arc::clone(&dropped),
             pretrade_cost: pretrade_cost.clone(),
         },
@@ -286,6 +300,7 @@ pub fn channel(
             dex_event_receiver,
             prepared_pool_receiver,
             shared_stream_receiver,
+            pretrade_candidate_receiver,
             dropped,
             telemetry,
             context,
@@ -355,6 +370,33 @@ impl HotTelemetryHandle {
                 decision_latency_us: quote.received_at.elapsed().as_micros(),
                 trigger,
                 queued_at: std::time::Instant::now(),
+            })
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Enqueue the exact admitted candidate for a joinable background cost
+    /// calculation. The trading owner performs no cost math or locking here.
+    #[inline]
+    pub fn emit_pretrade_candidate(
+        &self,
+        plan_id: &str,
+        quote: &TopOfBook,
+        pair_index: usize,
+        direction: ArbitrageDirection,
+        trade: TradeEvaluation,
+    ) {
+        if self
+            .pretrade_candidate_sender
+            .try_send(HotPreTradeCandidateTelemetry {
+                plan_id: plan_id.to_owned(),
+                quote: quote.clone(),
+                pair_index,
+                direction,
+                trade,
+                queued_at: Instant::now(),
             })
             .is_err()
         {
@@ -450,6 +492,7 @@ impl HotTelemetryTask {
     fn sample_pretrade_cost(&mut self, pair_index: usize) -> Option<PreTradeCostSnapshot> {
         const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
+        let snapshot = self.pretrade_cost.snapshot()?;
         let now = Instant::now();
         let last_sampled_at = self.last_pretrade_cost_sampled_at.get_mut(pair_index)?;
         if last_sampled_at
@@ -458,7 +501,7 @@ impl HotTelemetryTask {
             return None;
         }
         *last_sampled_at = Some(now);
-        Some(self.pretrade_cost.snapshot())
+        Some(snapshot)
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
@@ -467,11 +510,13 @@ impl HotTelemetryTask {
         let mut dex_events_open = true;
         let mut prepared_pools_open = true;
         let mut shared_stream_open = true;
+        let mut pretrade_candidates_open = true;
         while books_open
             || evaluations_open
             || dex_events_open
             || prepared_pools_open
             || shared_stream_open
+            || pretrade_candidates_open
         {
             tokio::select! {
                 event = self.book_receiver.recv(), if books_open => match event {
@@ -514,6 +559,10 @@ impl HotTelemetryTask {
                     Some(event) => self.emit_shared_stream_event(event),
                     None => shared_stream_open = false,
                 },
+                event = self.pretrade_candidate_receiver.recv(), if pretrade_candidates_open => match event {
+                    Some(event) => self.emit_pretrade_candidate(event)?,
+                    None => pretrade_candidates_open = false,
+                },
             }
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
@@ -523,6 +572,44 @@ impl HotTelemetryTask {
                 "hot telemetry records dropped outside decision path"
             );
         }
+        Ok(())
+    }
+
+    fn emit_pretrade_candidate(&self, event: HotPreTradeCandidateTelemetry) -> anyhow::Result<()> {
+        let pair = self
+            .context
+            .pairs
+            .get(event.pair_index)
+            .context("pre-trade candidate pair index is invalid")?;
+        let cost_snapshot = self.pretrade_cost.snapshot();
+        let candidate = self.trade_payload(
+            pair,
+            event.direction,
+            event.trade,
+            &event.quote,
+            cost_snapshot,
+        )?;
+        self.telemetry.emit(
+            "pretrade_cost_candidate",
+            json!({
+                "engine_id": self.context.engine_id,
+                "plan_id": event.plan_id,
+                "pair_id": pair.pair_id,
+                "strategy_id": pair.strategy_id,
+                "binance_account_id": PRIMARY_BINANCE_ACCOUNT_ID,
+                "instrument_id": pair.instrument_id,
+                "network_id": pair.network_id,
+                "chain_id": pair.chain_id,
+                "symbol": pair.symbol,
+                "update_id": event.quote.update_id,
+                "opportunity_received_unix_us": event.quote.received_unix_us,
+                "direction": event.direction.as_str(),
+                "diagnostic_only": true,
+                "decision_input": false,
+                "candidate": candidate,
+                "telemetry_queue_delay_us": event.queued_at.elapsed().as_micros(),
+            }),
+        );
         Ok(())
     }
 
@@ -911,6 +998,7 @@ impl HotTelemetryTask {
             "token_b_base_units": trade.token_b_amount.to_string(),
             "token_b_amount": format_base_units(trade.token_b_amount, pair.token_b_decimals),
             "token_a_symbol": pair.token_a_symbol,
+            "token_a_decimals": pair.token_a_decimals,
             "dex_token_a_base_units": trade.dex_token_a_amount.to_string(),
             "dex_token_a_amount": format_base_units(
                 trade.dex_token_a_amount,
@@ -936,9 +1024,10 @@ impl HotTelemetryTask {
     }
 }
 
-const PRETRADE_COST_MODEL_VERSION: &str = "diagnostic_net_edge_v1";
+const PRETRADE_COST_MODEL_VERSION: &str = "diagnostic_net_edge_v2";
 const HYPOTHETICAL_NET_EDGE_FLOOR_BPS: i64 = 5;
 const GAS_PRICE_CACHE_TTL_US: u64 = 2_000_000;
+const NATIVE_CONVERSION_CACHE_TTL_US: u64 = 30_000_000;
 const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
 
 fn pretrade_cost_payload(
@@ -955,21 +1044,22 @@ fn pretrade_cost_payload(
     };
     let binance_commission = ceil_bps(trade.cex_token_a_amount, binance_fee_bps)?;
 
-    let gas_sample = snapshot
-        .gas_price
-        .filter(|sample| sample.captured_unix_us <= quote.received_unix_us);
-    let native_conversion = snapshot
-        .native_conversion
-        .filter(|sample| sample.captured_unix_us <= quote.received_unix_us);
-    let receipt = snapshot
-        .receipt(pool.protocol)
-        .filter(|sample| sample.captured_unix_us <= quote.received_unix_us);
+    let gas_sample = snapshot.gas_price_at_or_before(quote.received_unix_us);
+    let native_conversion = snapshot.native_conversion_at_or_before(quote.received_unix_us);
+    let receipt = snapshot.receipt_at_or_before(pool.protocol, quote.received_unix_us);
     let gas_sample_age_us = gas_sample.map(|sample| {
         quote
             .received_unix_us
             .saturating_sub(sample.captured_unix_us)
     });
     let gas_sample_fresh = gas_sample_age_us.is_some_and(|age| age <= GAS_PRICE_CACHE_TTL_US);
+    let native_conversion_sample_age_us = native_conversion.map(|sample| {
+        quote
+            .received_unix_us
+            .saturating_sub(sample.captured_unix_us)
+    });
+    let native_conversion_fresh =
+        native_conversion_sample_age_us.is_some_and(|age| age <= NATIVE_CONVERSION_CACHE_TTL_US);
     let gas_units = receipt
         .map(|sample| sample.gas_used)
         .unwrap_or(HISTORICAL_SWAP_GAS_LIMIT);
@@ -979,9 +1069,12 @@ fn pretrade_cost_payload(
         "historical_swap_gas_limit_fallback"
     };
     let includes_l1_fee = gas_sample.is_some_and(|sample| sample.includes_l1_fee);
-    let l1_fee_available = !includes_l1_fee || receipt.is_some();
+    let l1_fee_available = !includes_l1_fee || receipt.is_some_and(|sample| sample.l1_fee_wei > 0);
     let l1_fee_wei = receipt.map_or(0, |sample| sample.l1_fee_wei);
-    let gas_cost = match (gas_sample.filter(|_| gas_sample_fresh), native_conversion) {
+    let gas_cost = match (
+        gas_sample.filter(|_| gas_sample_fresh),
+        native_conversion.filter(|_| native_conversion_fresh),
+    ) {
         (Some(gas), Some(conversion)) if l1_fee_available => native_gas_to_token_a_base_units(
             gas_units,
             gas.maximum_fee_per_gas_wei,
@@ -1029,6 +1122,7 @@ fn pretrade_cost_payload(
         "dex_fee_model": "embedded_in_exact_clmm_curve_quote",
         "dex_pool_fee_pips": pool.fee_pips,
         "binance_commission_model": "conservative_taker_fee_bps_without_discount",
+        "binance_commission_source": "authenticated_account_symbol_commission",
         "binance_side": match direction {
             ArbitrageDirection::BuyTokenBOnDexSellOnCex => "SELL",
             ArbitrageDirection::BuyTokenBOnCexSellOnDex => "BUY",
@@ -1047,15 +1141,17 @@ fn pretrade_cost_payload(
             "gas_price_available_pretrade": gas_sample.is_some(),
             "gas_price_fresh": gas_sample_fresh,
             "gas_price_cache_ttl_us": GAS_PRICE_CACHE_TTL_US,
+            "gas_price_history_depth": 2,
             "gas_price_sample_age_us": gas_sample_age_us,
             "gas_price_source": gas_sample.map(|sample| sample.source.label()),
             "gas_price_wei": gas_sample.map(|sample| sample.gas_price_wei.to_string()),
             "maximum_fee_per_gas_wei": gas_sample
                 .map(|sample| sample.maximum_fee_per_gas_wei.to_string()),
             "native_conversion_available_pretrade": native_conversion.is_some(),
-            "native_conversion_sample_age_us": native_conversion.map(|sample| {
-                quote.received_unix_us.saturating_sub(sample.captured_unix_us)
-            }),
+            "native_conversion_fresh": native_conversion_fresh,
+            "native_conversion_cache_ttl_us": NATIVE_CONVERSION_CACHE_TTL_US,
+            "native_conversion_history_depth": 2,
+            "native_conversion_sample_age_us": native_conversion_sample_age_us,
             "native_conversion_price_token_a": native_conversion
                 .map(|sample| sample.price_token_a.to_string()),
             "gas_units": gas_units,
@@ -1065,6 +1161,8 @@ fn pretrade_cost_payload(
             }),
             "last_effective_gas_price_wei": receipt
                 .map(|sample| sample.effective_gas_price_wei.to_string()),
+            "receipt_cost_source": receipt.map(|sample| sample.source.label()),
+            "receipt_history_depth": 2,
             "l1_fee_required": includes_l1_fee,
             "l1_fee_available": l1_fee_available,
             "l1_fee_wei": l1_fee_available.then(|| l1_fee_wei.to_string()),

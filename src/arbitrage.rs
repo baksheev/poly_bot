@@ -68,6 +68,11 @@ pub struct TradeIntent {
     /// when an old journal operation is reconciled after a process restart.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub opportunity_received_unix_us: u64,
+    /// Binance book update that produced the admitted candidate. Historical
+    /// journal records omit it; new results use it with pair/direction/receive
+    /// time to join the diagnostic pre-trade estimate exactly.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub opportunity_update_id: u64,
     pub mode: ExecutionMode,
     pub direction: ArbitrageDirection,
     pub planned_token_b_base_units: i128,
@@ -625,6 +630,7 @@ impl TradeOperation {
             "source_revision": self.intent.source_revision,
             "pair_id": self.intent.pair_id,
             "opportunity_received_unix_us": self.intent.opportunity_received_unix_us,
+            "opportunity_update_id": self.intent.opportunity_update_id,
             "execution_mode": enum_json(&self.intent.mode)?,
             "direction": enum_json(&self.intent.direction)?,
             "outcome": enum_json(&result.outcome)?,
@@ -811,6 +817,7 @@ impl PaperOpportunity {
             pair_id: self.pair_id.clone(),
             journal_scope: None,
             opportunity_received_unix_us: self.received_unix_us,
+            opportunity_update_id: self.update_id,
             mode,
             direction: self.direction,
             planned_token_b_base_units: self.token_b_base_units,
@@ -2920,6 +2927,7 @@ mod tests {
             pair_id: "world-chain-usdc-wld".to_owned(),
             journal_scope: None,
             opportunity_received_unix_us: 1_800_000_000_000_000,
+            opportunity_update_id: 42,
             mode,
             direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             planned_token_b_base_units: 100,
@@ -3131,6 +3139,7 @@ mod tests {
             payload["opportunity_received_unix_us"],
             1_800_000_000_000_000_u64
         );
+        assert_eq!(payload["opportunity_update_id"], 42);
         assert_eq!(payload["realized_profit_token_a_base_units"], "25");
         assert_eq!(payload["comparable_profit_token_a_base_units"], "25");
         assert_eq!(payload["expected_cost_token_a_base_units"], "1000");

@@ -31,7 +31,10 @@ if [[ ! "${clickhouse_database}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
 fi
 
 query_url="${CLICKHOUSE_URL}?database=${clickhouse_database}&param_start_utc=${start_utc}&param_end_utc=${end_utc}"
-curl --fail --silent --show-error \
-  --user "${clickhouse_user}:${CLICKHOUSE_PASSWORD}" \
-  --data-binary "@${repo_root}/scripts/sql/pretrade_cost_model.sql" \
-  "${query_url}"
+for query_name in pretrade_cost_model pretrade_cost_realized; do
+  echo "query=${query_name}"
+  curl --fail --silent --show-error \
+    --user "${clickhouse_user}:${CLICKHOUSE_PASSWORD}" \
+    --data-binary "@${repo_root}/scripts/sql/${query_name}.sql" \
+    "${query_url}"
+done

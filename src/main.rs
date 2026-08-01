@@ -1159,7 +1159,10 @@ async fn collect_prices(
         opportunities.pairs(),
         &mirror,
         telemetry.clone(),
-        PreTradeCostTelemetry::default(),
+        // The public collect-prices sidecar has neither authenticated
+        // per-symbol commissions nor an execution-owner gas cache. Emitting a
+        // cost model from it would create a plausible-looking invalid cohort.
+        PreTradeCostTelemetry::disabled(),
     )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry_task.run());
 
@@ -2540,6 +2543,7 @@ async fn run(
             ExecutionLatencyTelemetry::new(telemetry.clone(), config.engine_id.clone());
         dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
         dex_executor.set_pretrade_cost_telemetry(primary_pretrade_cost_telemetry.clone());
+        dex_executor.spawn_pretrade_cost_receipt_bootstrap();
         let dex_service = DexExecutionService::spawn(
             dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
@@ -2604,6 +2608,7 @@ async fn run(
         }
         esp_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
         esp_dex_executor.set_pretrade_cost_telemetry(esp_pretrade_cost_telemetry.clone());
+        esp_dex_executor.spawn_pretrade_cost_receipt_bootstrap();
         let esp_dex_service = DexExecutionService::spawn(
             esp_dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
