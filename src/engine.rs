@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -115,12 +115,12 @@ pub struct TradingEngine {
     gas_price_book: Option<TopOfBook>,
     commission_price_symbol: String,
     binance_clock_sync: Option<BinanceClockSync>,
-    rebalance_inventory_reservation: Option<String>,
+    rebalance_inventory_reservations: BTreeMap<String, String>,
     next_inventory_reservation: u64,
     pending_rebalance: Option<RebalanceEvaluation>,
     rebalance_inflight: bool,
     rebalance_inflight_since: Option<Instant>,
-    rebalance_blocked: bool,
+    rebalance_blocked_tokens: BTreeSet<String>,
     rebalance_creation_stop_reason: Option<String>,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
@@ -643,12 +643,12 @@ impl TradingEngine {
                 gas_price_book: None,
                 commission_price_symbol,
                 binance_clock_sync: None,
-                rebalance_inventory_reservation: None,
+                rebalance_inventory_reservations: BTreeMap::new(),
                 next_inventory_reservation: 0,
                 pending_rebalance: None,
                 rebalance_inflight: false,
                 rebalance_inflight_since: None,
-                rebalance_blocked: false,
+                rebalance_blocked_tokens: BTreeSet::new(),
                 rebalance_creation_stop_reason: None,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
@@ -1665,8 +1665,10 @@ impl TradingEngine {
             return Ok(None);
         };
         ensure!(
-            self.rebalance_inventory_reservation.is_none(),
-            "a rebalance inventory reservation is already active"
+            !self
+                .rebalance_inventory_reservations
+                .contains_key(&evaluation.token_symbol),
+            "a rebalance inventory reservation is already active for this token"
         );
         let action = evaluation
             .plan
@@ -1728,7 +1730,8 @@ impl TradingEngine {
         }
         self.next_inventory_reservation = next_inventory_reservation;
         self.pending_rebalance = None;
-        self.rebalance_inventory_reservation = Some(reservation_id.clone());
+        self.rebalance_inventory_reservations
+            .insert(evaluation.token_symbol.clone(), reservation_id.clone());
         self.telemetry.emit(
             "inventory_reserved",
             json!({
@@ -1904,6 +1907,7 @@ impl TradingEngine {
     pub fn on_rebalance_recovery_result(
         &mut self,
         result: Result<&RebalanceExecutionOperation, &str>,
+        blocked_token: Option<&str>,
     ) -> anyhow::Result<()> {
         self.rebalance_inflight = false;
         self.rebalance_inflight_since = None;
@@ -1954,7 +1958,9 @@ impl TradingEngine {
                 );
             }
             Err(error) => {
-                self.rebalance_blocked = true;
+                if let Some(token) = blocked_token {
+                    self.on_rebalance_token_quarantined(token, error)?;
+                }
                 self.rebalance.mark_unbalanced();
                 tracing::error!(error, "rebalance recovery failed closed");
                 self.telemetry.emit(
@@ -1974,14 +1980,16 @@ impl TradingEngine {
     pub fn on_rebalance_execution_result(
         &mut self,
         result: Result<&RebalanceExecutionOperation, &str>,
+        blocked_token: Option<&str>,
     ) -> anyhow::Result<()> {
         self.rebalance_inflight = false;
         self.rebalance_inflight_since = None;
         match result {
             Ok(operation) => {
                 let reservation_id = self
-                    .rebalance_inventory_reservation
-                    .as_deref()
+                    .rebalance_inventory_reservations
+                    .get(&operation.intent.token_symbol)
+                    .map(String::as_str)
                     .context("rebalance completed without an inventory reservation")?;
                 self.inventory.mark_pending_settlement(reservation_id)?;
                 if let (Some(binance), Some(wallet)) = (
@@ -2027,7 +2035,9 @@ impl TradingEngine {
                 );
             }
             Err(error) => {
-                self.rebalance_blocked = true;
+                if let Some(token) = blocked_token {
+                    self.on_rebalance_token_quarantined(token, error)?;
+                }
                 self.rebalance.mark_unbalanced();
                 tracing::error!(error, "rebalance executor failed closed");
                 self.telemetry.emit(
@@ -2040,6 +2050,31 @@ impl TradingEngine {
             }
         }
         self.refresh_phase(Instant::now());
+        Ok(())
+    }
+
+    pub fn on_rebalance_token_quarantined(
+        &mut self,
+        token: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.token_decimals(token)?;
+        if self.rebalance_blocked_tokens.insert(token.to_owned()) {
+            tracing::error!(
+                token,
+                reason,
+                "rebalance token quarantined; other tokens remain eligible"
+            );
+            self.telemetry.emit(
+                "rebalance_token_quarantined",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "token": token,
+                    "reason": reason,
+                    "blocked_token_count": self.rebalance_blocked_tokens.len(),
+                }),
+            );
+        }
         Ok(())
     }
 
@@ -2096,9 +2131,8 @@ impl TradingEngine {
                     "operation_id": operation_id,
                 }),
             );
-            if self.rebalance_inventory_reservation.as_ref() == Some(operation_id) {
-                self.rebalance_inventory_reservation = None;
-            }
+            self.rebalance_inventory_reservations
+                .retain(|_, reservation_id| reservation_id != operation_id);
         }
     }
 
@@ -2189,10 +2223,11 @@ impl TradingEngine {
                         }),
                     );
                 }
-                let pending_action = self.rebalance.pending_action();
+                let pending_action = self
+                    .rebalance
+                    .pending_action_excluding(&self.rebalance_blocked_tokens);
                 if mode == "full_live"
                     && !self.rebalance_inflight
-                    && !self.rebalance_blocked
                     && self.rebalance_creation_stop_reason.is_none()
                     && self.rebalance_settlement.is_none()
                     && self.pending_rebalance.is_none()
@@ -3658,7 +3693,7 @@ impl TradingEngine {
                 .max(MINIMUM_REBALANCE_SETTLEMENT_TIMEOUT.as_millis() as u64),
         );
         let health = rebalance_health_state(
-            self.rebalance_blocked,
+            !self.rebalance_blocked_tokens.is_empty(),
             inflight_age,
             settlement_age,
             Duration::from_secs(self.config.rebalance_executor_timeout_seconds),
@@ -3669,7 +3704,8 @@ impl TradingEngine {
         if health.healthy {
             tracing::info!(
                 healthy = true,
-                rebalance_blocked = self.rebalance_blocked,
+                rebalance_blocked = !self.rebalance_blocked_tokens.is_empty(),
+                rebalance_blocked_tokens = ?self.rebalance_blocked_tokens,
                 rebalance_inflight = self.rebalance_inflight,
                 inflight_age_ms,
                 settlement_waiting = self.rebalance_settlement.is_some(),
@@ -3679,7 +3715,8 @@ impl TradingEngine {
         } else {
             tracing::error!(
                 healthy = false,
-                rebalance_blocked = self.rebalance_blocked,
+                rebalance_blocked = !self.rebalance_blocked_tokens.is_empty(),
+                rebalance_blocked_tokens = ?self.rebalance_blocked_tokens,
                 rebalance_inflight = self.rebalance_inflight,
                 inflight_stuck = health.inflight_stuck,
                 inflight_age_ms,

@@ -88,7 +88,7 @@ fn deposit_questionnaire_matches_rails_order_and_is_durable_before_submission() 
 }
 
 #[test]
-fn withdrawal_unknown_outcome_and_live_fee_recheck_are_fail_closed() {
+fn withdrawal_unknown_outcome_requires_composite_absence_proof_before_retry() {
     let direct_start = REBALANCE_RUNTIME
         .find("async fn direct_binance_to_wallet(")
         .unwrap();
@@ -114,11 +114,15 @@ fn withdrawal_unknown_outcome_and_live_fee_recheck_are_fail_closed() {
         .map(|offset| begin_start + offset)
         .unwrap();
     let begin = &REBALANCE_RUNTIME[begin_start..begin_end];
-    assert!(begin.contains("*reconciliation_queries == 0"));
     assert!(begin.contains("reconciliation_queries: 1"));
-    assert!(begin.contains(
-        "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
-    ));
+    assert!(begin.contains("confirm_unknown_withdrawal_absence"));
+    assert!(begin.contains("BinanceWithdrawalRetryAuthorized"));
+    assert!(begin.contains("standard_history.is_empty()"));
+    assert!(begin.contains("travel_rule_withdrawal_history_v2_for_network"));
+    assert!(begin.contains("master_free_base_units == operation.intent.amount"));
+    assert!(begin.contains("master_locked_base_units.is_zero()"));
+    assert!(begin.contains("wallet_balance == bridge_balance_before"));
+    assert!(begin.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
     assert!(begin.contains("is_terminal_binance_withdrawal_rejection(&error)"));
     assert!(begin.contains("is_travel_rule_required_rejection(&error)"));
     assert!(begin.contains("submit_required_travel_rule_withdrawal"));

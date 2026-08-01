@@ -141,11 +141,13 @@ enum RebalanceExecutorEvent {
         target: RebalanceExecutionTarget,
         result: Result<RebalanceExecutionOperation, String>,
         active_operation_after: bool,
+        blocked_token: Option<String>,
     },
     Execution {
         target: RebalanceExecutionTarget,
         result: Result<RebalanceExecutionOperation, String>,
         active_operation_after: bool,
+        blocked_token: Option<String>,
     },
 }
 
@@ -2287,82 +2289,99 @@ async fn run(
             .await?
         }
     };
-    let (mut full_rebalance_executor, rebalance_recovery_operation) = if config
-        .rebalance_execution_mode
-        == "full_live"
-    {
-        let wallet = EvmWallet::from_env()?;
-        ensure!(
-            wallet.address() == wallet_owner,
-            "full rebalance signer does not match EVM_WALLET_ADDRESS"
-        );
-        let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
-            format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
-        })?;
-        let transaction_journal_path =
-            std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
-                format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
-            })?;
-        let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
-            .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
-        let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
-        let rebalance_journal_started_at = Instant::now();
-        let capital_policy = portfolio_catalog.capital_policy().cloned();
-        let maximum_esp = capital_policy
-            .as_ref()
-            .filter(|policy| policy.external_mutation_authorized)
-            .map(|policy| {
-                rebalance_base_units_to_decimal(
-                    policy.maximum_token_b_debit,
-                    esp_pair.token_b.decimals,
-                )
-            })
-            .transpose()?
-            .unwrap_or(Decimal::ZERO);
-        let mut executor = RebalanceExecutor::hydrate(
-            binance_account_client.clone(),
-            treasury_client,
-            subaccount_email,
-            AcrossClient::new(&config)?,
-            wallet_rpc.clone(),
-            JsonRpcClient::new(optimism_endpoint)?,
-            BTreeMap::new(),
-            wallet,
-            config.rebalance_executor_journal_path.clone(),
-            transaction_journal_path.into(),
-            RebalanceRuntimeLimits {
-                maximum_wld: config.rebalance_max_wld_amount,
-                maximum_usdc: config.rebalance_max_usdc_amount,
-                maximum_esp,
-                operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
-            },
-        )
-        .await?;
-        executor.set_capital_policy(capital_policy)?;
-        executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
-        telemetry.emit(
-            "runtime_journal_recovery",
-            serde_json::json!({
-                "engine_id": config.engine_id,
-                "owner": "rebalance_saga",
-                "journal_scope": "rebalance",
-                "duration_us": rebalance_journal_started_at.elapsed().as_micros(),
-                "active_operation_count": usize::from(executor.active_operation()?.is_some()),
-                "outcome": "success",
-            }),
-        );
-        let recovery_operation = executor.active_operation()?.cloned();
-        if let Some(operation) = recovery_operation.as_ref() {
-            tracing::warn!(
-                operation_id = %operation.intent.operation_id,
-                progress = ?operation.progress,
-                "recovered active rebalance operation for asynchronous runtime recovery"
+    let (mut full_rebalance_executor, rebalance_recovery_operation, quarantined_rebalance_tokens) =
+        if config.rebalance_execution_mode == "full_live" {
+            let wallet = EvmWallet::from_env()?;
+            ensure!(
+                wallet.address() == wallet_owner,
+                "full rebalance signer does not match EVM_WALLET_ADDRESS"
             );
-        }
-        (Some(executor), recovery_operation)
-    } else {
-        (None, None)
-    };
+            let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
+                format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
+            })?;
+            let transaction_journal_path =
+                std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
+                    format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
+                })?;
+            let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
+                .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
+            let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
+            let rebalance_journal_started_at = Instant::now();
+            let capital_policy = portfolio_catalog.capital_policy().cloned();
+            let maximum_esp = capital_policy
+                .as_ref()
+                .filter(|policy| policy.external_mutation_authorized)
+                .map(|policy| {
+                    rebalance_base_units_to_decimal(
+                        policy.maximum_token_b_debit,
+                        esp_pair.token_b.decimals,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(Decimal::ZERO);
+            let mut executor = RebalanceExecutor::hydrate(
+                binance_account_client.clone(),
+                treasury_client,
+                subaccount_email,
+                AcrossClient::new(&config)?,
+                wallet_rpc.clone(),
+                JsonRpcClient::new(optimism_endpoint)?,
+                BTreeMap::new(),
+                wallet,
+                config.rebalance_executor_journal_path.clone(),
+                transaction_journal_path.into(),
+                RebalanceRuntimeLimits {
+                    maximum_wld: config.rebalance_max_wld_amount,
+                    maximum_usdc: config.rebalance_max_usdc_amount,
+                    maximum_esp,
+                    operation_timeout: Duration::from_secs(
+                        config.rebalance_executor_timeout_seconds,
+                    ),
+                },
+            )
+            .await?;
+            executor.set_capital_policy(capital_policy)?;
+            executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
+            telemetry.emit(
+                "runtime_journal_recovery",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "owner": "rebalance_saga",
+                    "journal_scope": "rebalance",
+                    "duration_us": rebalance_journal_started_at.elapsed().as_micros(),
+                    "active_operation_count": usize::from(executor.active_operation()?.is_some()),
+                    "outcome": "success",
+                }),
+            );
+            let recovery_operation = executor.active_operation()?.cloned();
+            let quarantined_tokens = executor
+                .quarantined_operations()
+                .map(|operation| {
+                    (
+                        rebalance_target(operation),
+                        operation.intent.token_symbol.clone(),
+                        match &operation.progress {
+                            arb_bot::rebalance::RebalanceExecutionProgress::Quarantined {
+                                reason,
+                            } => reason.clone(),
+                            _ => unreachable!(
+                                "quarantined operation iterator returned another state"
+                            ),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(operation) = recovery_operation.as_ref() {
+                tracing::warn!(
+                    operation_id = %operation.intent.operation_id,
+                    progress = ?operation.progress,
+                    "recovered active rebalance operation for asynchronous runtime recovery"
+                );
+            }
+            (Some(executor), recovery_operation, quarantined_tokens)
+        } else {
+            (None, None, Vec::new())
+        };
     let user_data_subscription_id = user_data_stream.subscription_id();
     let multiplexed_binance_api = user_data_stream.api();
     tracing::info!(
@@ -3041,6 +3060,13 @@ async fn run(
                 if recover_on_start {
                     let saga_started_at = Instant::now();
                     let result = recover_rebalance_with_quote_retries(&mut executor).await;
+                    let blocked_token = if let Err(error) = &result {
+                        executor
+                            .quarantine_active_operation(error)?
+                            .map(|operation| operation.intent.token_symbol)
+                    } else {
+                        None
+                    };
                     emit_rebalance_saga(
                         &rebalance_telemetry,
                         &rebalance_engine_id,
@@ -3058,6 +3084,7 @@ async fn run(
                             target: recovery_target,
                             result,
                             active_operation_after,
+                            blocked_token,
                         })
                         .await
                         .is_err()
@@ -3068,6 +3095,13 @@ async fn run(
                 while let Some((target, request)) = request_receiver.recv().await {
                     let saga_started_at = Instant::now();
                     let result = execute_rebalance_with_quote_retries(&mut executor, request).await;
+                    let blocked_token = if let Err(error) = &result {
+                        executor
+                            .quarantine_active_operation(error)?
+                            .map(|operation| operation.intent.token_symbol)
+                    } else {
+                        None
+                    };
                     emit_rebalance_saga(
                         &rebalance_telemetry,
                         &rebalance_engine_id,
@@ -3085,6 +3119,7 @@ async fn run(
                             target,
                             result,
                             active_operation_after,
+                            blocked_token,
                         })
                         .await
                         .is_err()
@@ -3111,6 +3146,16 @@ async fn run(
                 tokio::sync::watch::channel(RebalanceRisk::default());
             (None, result_receiver, None, risk_receiver)
         };
+    for (target, token, reason) in &quarantined_rebalance_tokens {
+        match target {
+            RebalanceExecutionTarget::Primary => {
+                engine.on_rebalance_token_quarantined(token, reason)?
+            }
+            RebalanceExecutionTarget::Arbitrum => {
+                esp_engine.on_rebalance_token_quarantined(token, reason)?
+            }
+        }
+    }
     if let Some(operation) = rebalance_recovery_operation.as_ref() {
         match rebalance_target(operation) {
             RebalanceExecutionTarget::Primary => engine.on_rebalance_recovery_started(operation)?,
@@ -3631,37 +3676,41 @@ async fn run(
                     RebalanceExecutorEvent::Recovery {
                         target,
                         result,
+                        blocked_token,
                         ..
-                    } => match (target, result) {
-                        (RebalanceExecutionTarget::Primary, Ok(operation)) => {
-                            engine.on_rebalance_recovery_result(Ok(&operation))?
+                    } => match (target, result, blocked_token.as_deref()) {
+                        (RebalanceExecutionTarget::Primary, Ok(operation), blocked_token) => {
+                            engine.on_rebalance_recovery_result(Ok(&operation), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Primary, Err(error)) => {
-                            engine.on_rebalance_recovery_result(Err(&error))?
+                        (RebalanceExecutionTarget::Primary, Err(error), blocked_token) => {
+                            engine.on_rebalance_recovery_result(Err(&error), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Ok(operation)) => {
-                            esp_engine.on_rebalance_recovery_result(Ok(&operation))?
+                        (RebalanceExecutionTarget::Arbitrum, Ok(operation), blocked_token) => {
+                            esp_engine
+                                .on_rebalance_recovery_result(Ok(&operation), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Err(error)) => {
-                            esp_engine.on_rebalance_recovery_result(Err(&error))?
+                        (RebalanceExecutionTarget::Arbitrum, Err(error), blocked_token) => {
+                            esp_engine.on_rebalance_recovery_result(Err(&error), blocked_token)?
                         }
                     },
                     RebalanceExecutorEvent::Execution {
                         target,
                         result,
+                        blocked_token,
                         ..
-                    } => match (target, result) {
-                        (RebalanceExecutionTarget::Primary, Ok(operation)) => {
-                            engine.on_rebalance_execution_result(Ok(&operation))?
+                    } => match (target, result, blocked_token.as_deref()) {
+                        (RebalanceExecutionTarget::Primary, Ok(operation), blocked_token) => {
+                            engine.on_rebalance_execution_result(Ok(&operation), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Primary, Err(error)) => {
-                            engine.on_rebalance_execution_result(Err(&error))?
+                        (RebalanceExecutionTarget::Primary, Err(error), blocked_token) => {
+                            engine.on_rebalance_execution_result(Err(&error), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Ok(operation)) => {
-                            esp_engine.on_rebalance_execution_result(Ok(&operation))?
+                        (RebalanceExecutionTarget::Arbitrum, Ok(operation), blocked_token) => {
+                            esp_engine
+                                .on_rebalance_execution_result(Ok(&operation), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Err(error)) => {
-                            esp_engine.on_rebalance_execution_result(Err(&error))?
+                        (RebalanceExecutionTarget::Arbitrum, Err(error), blocked_token) => {
+                            esp_engine.on_rebalance_execution_result(Err(&error), blocked_token)?
                         }
                     },
                 }

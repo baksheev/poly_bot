@@ -134,6 +134,17 @@ pub enum RebalanceExecutionProgress {
         #[serde(default)]
         reconciliation_queries: u16,
     },
+    BinanceWithdrawalRetryAuthorized {
+        api_mode: String,
+        #[serde(with = "u256_serde")]
+        bridge_balance_before: U256,
+        #[serde(with = "u256_serde")]
+        master_free_base_units: U256,
+        #[serde(with = "u256_serde")]
+        master_locked_base_units: U256,
+        #[serde(with = "u256_serde")]
+        wallet_balance_base_units: U256,
+    },
     BinanceWithdrawalSubmitted {
         submission_reference: String,
         #[serde(with = "u256_serde")]
@@ -210,11 +221,17 @@ pub enum RebalanceExecutionProgress {
     Failed {
         reason: String,
     },
+    Quarantined {
+        reason: String,
+    },
 }
 
 impl RebalanceExecutionProgress {
     pub fn terminal(&self) -> bool {
-        matches!(self, Self::Completed { .. } | Self::Failed { .. })
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Quarantined { .. }
+        )
     }
 }
 
@@ -375,6 +392,15 @@ impl RebalanceExecutionJournal {
         Ok(operation)
     }
 
+    pub fn quarantined_operations(&self) -> impl Iterator<Item = &RebalanceExecutionOperation> {
+        self.operations.values().filter(|operation| {
+            matches!(
+                operation.progress,
+                RebalanceExecutionProgress::Quarantined { .. }
+            )
+        })
+    }
+
     pub fn rebalance_risk(&self, approval_session_id: &str) -> anyhow::Result<RebalanceRisk> {
         let mut risk = RebalanceRisk::default();
         for operation in self.operations.values().filter(|operation| {
@@ -393,6 +419,7 @@ impl RebalanceExecutionJournal {
             risk.failed_transfer_count += usize::from(matches!(
                 operation.progress,
                 RebalanceExecutionProgress::Failed { .. }
+                    | RebalanceExecutionProgress::Quarantined { .. }
             ));
             let total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_debit,
@@ -786,7 +813,9 @@ fn validate_operation(operation: &RebalanceExecutionOperation) -> anyhow::Result
             "rebalance operation amount exceeds wallet balance"
         ),
     }
-    if let RebalanceExecutionProgress::Failed { reason } = &operation.progress {
+    if let RebalanceExecutionProgress::Failed { reason }
+    | RebalanceExecutionProgress::Quarantined { reason } = &operation.progress
+    {
         ensure!(
             !reason.is_empty() && reason.len() <= MAX_REASON_BYTES,
             "rebalance failure reason is invalid"
@@ -872,7 +901,10 @@ fn validate_transition(
         !previous.terminal() || approved_terminal_retry || approved_terminal_manual_completion,
         "rebalance operation is already terminal"
     );
-    if matches!(next, RebalanceExecutionProgress::Failed { .. }) {
+    if matches!(
+        next,
+        RebalanceExecutionProgress::Failed { .. } | RebalanceExecutionProgress::Quarantined { .. }
+    ) {
         return Ok(());
     }
     use RebalanceExecutionProgress as P;
@@ -934,6 +966,32 @@ fn validate_transition(
                     && *previous == 0
                     && *next == 0)
         }
+        (
+            Route::Direct { .. } | Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceWithdrawalSubmissionStarted {
+                api_mode: previous_mode,
+                reconciliation_queries: 1,
+                ..
+            },
+            P::BinanceWithdrawalRetryAuthorized {
+                api_mode: next_mode,
+                ..
+            },
+        ) => previous_mode == next_mode,
+        (
+            Route::Direct { .. } | Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceWithdrawalRetryAuthorized {
+                api_mode: previous_mode,
+                ..
+            },
+            P::BinanceWithdrawalSubmissionStarted {
+                api_mode: next_mode,
+                reconciliation_queries: 0,
+                ..
+            },
+        ) => previous_mode == next_mode,
         // A separately approved operator withdrawal can satisfy a fail-closed
         // unindexed submission. Its recovery validates the exact Binance
         // record and on-chain receipt before appending this single terminal
@@ -1161,6 +1219,30 @@ fn validate_progress_evidence(
                 "rebalance Binance withdrawal reconciliation query limit exceeded"
             );
         }
+        P::BinanceWithdrawalRetryAuthorized {
+            api_mode,
+            bridge_balance_before,
+            master_free_base_units,
+            master_locked_base_units,
+            wallet_balance_base_units,
+        } => {
+            ensure!(
+                matches!(api_mode.as_str(), "standard" | "travel_rule_ae_self_owned"),
+                "rebalance Binance withdrawal retry API mode is invalid"
+            );
+            ensure!(
+                *master_free_base_units == intent.amount,
+                "rebalance Binance withdrawal retry did not preserve exact master inventory"
+            );
+            ensure!(
+                master_locked_base_units.is_zero(),
+                "rebalance Binance withdrawal retry retained locked master inventory"
+            );
+            ensure!(
+                wallet_balance_base_units == bridge_balance_before,
+                "rebalance Binance withdrawal retry observed a wallet credit"
+            );
+        }
         P::BinanceWithdrawalSubmitted {
             submission_reference,
             ..
@@ -1278,7 +1360,7 @@ fn validate_progress_evidence(
                 .context("rebalance completed balance overflow")?;
             ensure!(!total.is_zero(), "rebalance completed balances are zero");
         }
-        P::IntentRecorded | P::Failed { .. } => {}
+        P::IntentRecorded | P::Failed { .. } | P::Quarantined { .. } => {}
     }
     Ok(())
 }
@@ -1653,6 +1735,201 @@ mod tests {
                 },
             )
             .unwrap();
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exact_balance_and_wallet_evidence_durably_authorize_one_withdrawal_retry() {
+        let path = path("balance-proven-withdrawal-retry");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        let amount = operation.intent.amount;
+        let wallet_before = U256::from(7_000_000_u64);
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 1,
+                    bridge_balance_before: wallet_before,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: 1,
+                    bridge_balance_before: wallet_before,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: wallet_before,
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: wallet_before,
+                    reconciliation_queries: 1,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: wallet_before,
+                    master_free_base_units: amount,
+                    master_locked_base_units: U256::ZERO,
+                    wallet_balance_base_units: wallet_before,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: wallet_before,
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(matches!(
+            &replayed.operations()[&operation_id].progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                reconciliation_queries: 0,
+                ..
+            } if api_mode == "travel_rule_ae_self_owned"
+        ));
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn withdrawal_retry_authorization_rejects_locked_or_changed_inventory() {
+        let path = path("invalid-balance-proven-withdrawal-retry");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        let amount = operation.intent.amount;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::from(9),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::from(9),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::from(9),
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::from(9),
+                    reconciliation_queries: 1,
+                },
+            )
+            .unwrap();
+        for invalid in [
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                api_mode: "standard".to_owned(),
+                bridge_balance_before: U256::from(9),
+                master_free_base_units: amount,
+                master_locked_base_units: U256::ONE,
+                wallet_balance_base_units: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                api_mode: "standard".to_owned(),
+                bridge_balance_before: U256::from(9),
+                master_free_base_units: amount - U256::ONE,
+                master_locked_base_units: U256::ZERO,
+                wallet_balance_base_units: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                api_mode: "standard".to_owned(),
+                bridge_balance_before: U256::from(9),
+                master_free_base_units: amount,
+                master_locked_base_units: U256::ZERO,
+                wallet_balance_base_units: U256::from(10),
+            },
+        ] {
+            assert!(journal.advance(&operation_id, invalid).is_err());
+        }
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unresolved_operation_quarantines_only_its_token_and_releases_active_lane() {
+        let path = path("asset-scoped-quarantine");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::from(9),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "asset-scoped unresolved outcome".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert!(journal.active_operation().unwrap().is_none());
+        let quarantined = journal.quarantined_operations().collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].intent.token_symbol, "USDC");
         drop(journal);
         fs::remove_file(path).unwrap();
     }

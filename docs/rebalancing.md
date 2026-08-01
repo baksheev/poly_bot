@@ -331,7 +331,19 @@ chain. A matching receipt closes the step. A transaction without a receipt is
 accepted only after sender, chain, nonce, target, value, and calldata hash match
 the journal. Missing, replaced, unsigned, or contradictory evidence remains
 blocked for operator review; the runtime never blindly resubmits an unknown
-outcome.
+outcome. An unindexed Binance withdrawal is the narrow exception where absence
+can be proved without an operator: the standard and network-wide Travel Rule
+histories must contain no viable submission, the deterministic master transfer
+must be uniquely indexed as successful, the master account must retain the
+exact transferred amount as free inventory with zero locked inventory, and the
+destination-chain token balance must still equal the pre-withdrawal journaled
+balance. The complete observation must remain identical across two reads five
+seconds apart. Only then does the executor fsync a
+`binance_withdrawal_retry_authorized` record and resubmit the same deterministic
+client id. Any missing or conflicting input continues to fail closed for that
+token. The unresolved operation is durably quarantined, releases the shared
+execution lane, and is excluded from later planning without excluding another
+token's independent rebalance.
 
 ## M10 Arbitrum rebalance canary
 
@@ -360,10 +372,14 @@ inventory availability, source-debit conservation, route, and remaining
 durable authority before the engine reserves inventory. All Arbitrum wallet
 children use the same execution owner, nonce lane, signer, gas policy, and
 transaction journal as ESP trades and allowances. Binance withdrawal intent
-is fsynced before submission; after an ambiguous standard withdrawal the one
-exact history reconciliation query can only discover the existing result and
-never authorize a second withdrawal. Wallet deposits persist the exact
-deposit/questionnaire identity before conditional Travel Rule submission.
+is fsynced before submission. After an ambiguous standard or Travel Rule
+withdrawal, one bounded reconciliation cycle first discovers an existing result
+or uses exact master-inventory and destination-balance evidence to durably prove
+that no debit, lock, or credit occurred before authorizing a deterministic
+retry. A contradictory outcome quarantines only that token; the shared mutation
+lane remains serialized but can execute a different token. Wallet deposits
+persist the exact deposit/questionnaire identity before conditional Travel Rule
+submission.
 
 The M10 report uses real allocator, Binance child, EVM owner, saga, and
 settlement spans. It does not label the full saga duration as a Binance child

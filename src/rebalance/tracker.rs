@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_primitives::U256;
 use anyhow::{Context, ensure};
@@ -73,6 +73,13 @@ impl V12RebalanceParityAdapter {
 
     pub fn pending_action(&self) -> Option<RebalanceEvaluation> {
         self.inner.pending_action()
+    }
+
+    pub fn pending_action_excluding(
+        &self,
+        blocked_tokens: &BTreeSet<String>,
+    ) -> Option<RebalanceEvaluation> {
+        self.inner.pending_action_excluding(blocked_tokens)
     }
 }
 
@@ -185,7 +192,17 @@ impl RebalanceTracker {
     }
 
     pub fn pending_action(&self) -> Option<RebalanceEvaluation> {
+        self.pending_action_excluding(&BTreeSet::new())
+    }
+
+    pub fn pending_action_excluding(
+        &self,
+        blocked_tokens: &BTreeSet<String>,
+    ) -> Option<RebalanceEvaluation> {
         self.tokens.iter().find_map(|token| {
+            if blocked_tokens.contains(&token.symbol) {
+                return None;
+            }
             let plan = token.last_plan.as_ref()?;
             plan.action.as_ref()?;
             Some(RebalanceEvaluation {
@@ -325,7 +342,11 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Instant};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+        time::Instant,
+    };
 
     use alloy_primitives::{Address, B256, U256};
     use rust_decimal::Decimal;
@@ -621,6 +642,23 @@ mod tests {
         tracker.evaluate(&binance, &wallet).unwrap();
         assert!(tracker.pending_action().is_none());
         assert!(tracker.balanced());
+    }
+
+    #[test]
+    fn quarantined_token_does_not_hide_another_pending_action() {
+        let mut tracker = tracker();
+        let (binance, wallet) = budget_snapshots(
+            Decimal::from(1_000),
+            U256::ZERO,
+            Decimal::from(2_500),
+            U256::ZERO,
+        );
+        tracker.evaluate(&binance, &wallet).unwrap();
+        assert_eq!(tracker.pending_action().unwrap().token_symbol, "USDC");
+
+        let blocked = BTreeSet::from(["USDC".to_owned()]);
+        let eligible = tracker.pending_action_excluding(&blocked).unwrap();
+        assert_eq!(eligible.token_symbol, "WLD");
     }
 
     #[test]

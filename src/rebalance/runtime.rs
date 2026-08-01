@@ -47,6 +47,7 @@ const MAX_FEE_PER_GAS_WEI: u128 = 100_000_000_000;
 const STANDARD_BINANCE_WITHDRAWAL_API_MODE: &str = "standard";
 const TRAVEL_RULE_REQUIRED_API_MODE: &str = "travel_rule_required_after_standard_-4104";
 const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned";
+const UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY: Duration = Duration::from_secs(5);
 const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
@@ -89,6 +90,13 @@ pub struct RebalanceExecutor {
 struct RebalanceTelemetry {
     handle: TelemetryHandle,
     engine_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WithdrawalAbsenceEvidence {
+    master_free_base_units: U256,
+    master_locked_base_units: U256,
+    wallet_balance_base_units: U256,
 }
 
 /// The only rebalancing component that can access signing material or nonce
@@ -410,6 +418,30 @@ impl RebalanceExecutor {
 
     pub fn active_operation(&self) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
         self.execution_journal.active_operation()
+    }
+
+    pub fn quarantined_operations(&self) -> impl Iterator<Item = &RebalanceExecutionOperation> {
+        self.execution_journal.quarantined_operations()
+    }
+
+    pub fn quarantine_active_operation(
+        &mut self,
+        reason: &str,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        let Some(operation) = self.execution_journal.active_operation()?.cloned() else {
+            return Ok(None);
+        };
+        let reason = reason.chars().take(1_024).collect::<String>();
+        let quarantined = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::Quarantined { reason },
+        )?;
+        tracing::error!(
+            operation_id = quarantined.intent.operation_id,
+            token = quarantined.intent.token_symbol,
+            "quarantined unresolved rebalance operation without blocking other assets"
+        );
+        Ok(Some(quarantined))
     }
 
     pub fn rebalance_risk(&self) -> anyhow::Result<super::RebalanceRisk> {
@@ -1754,6 +1786,14 @@ impl RebalanceExecutor {
         submission_safe: bool,
         network: &str,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
+        if matches!(
+            operation.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { .. }
+        ) {
+            return self
+                .resume_authorized_withdrawal_retry(operation, network, true)
+                .await;
+        }
         if let RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
             api_mode,
             reconciliation_queries,
@@ -1770,10 +1810,6 @@ impl RebalanceExecutor {
                     .await;
             }
             if api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE {
-                ensure!(
-                    *reconciliation_queries == 0,
-                    "journaled Travel Rule withdrawal exhausted its one reconciliation query; operator review required"
-                );
                 let requested = base_units_to_decimal(
                     operation.intent.amount,
                     operation.intent.token_decimals,
@@ -1815,32 +1851,21 @@ impl RebalanceExecutor {
                         },
                     );
                 }
-                let bridge_balance_before = match operation.progress {
-                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                        bridge_balance_before,
-                        ..
-                    } => bridge_balance_before,
-                    _ => unreachable!("the Travel Rule state was matched above"),
-                };
-                self.execution_journal.advance(
-                    &operation.intent.operation_id,
-                    RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                        api_mode: TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
-                        bridge_balance_before,
-                        reconciliation_queries: 1,
-                    },
-                )?;
-                bail!(
-                    "journaled Travel Rule Binance withdrawal submission has no indexed outcome; operator review required"
-                )
+                ensure!(
+                    *reconciliation_queries <= 1,
+                    "journaled Travel Rule withdrawal exceeded its reconciliation query authority"
+                );
+                return self
+                    .reconcile_unknown_withdrawal_and_retry(operation, network)
+                    .await;
             }
             ensure!(
                 api_mode == STANDARD_BINANCE_WITHDRAWAL_API_MODE,
                 "journaled Binance withdrawal API mode is not the standard capital API"
             );
             ensure!(
-                *reconciliation_queries == 0,
-                "journaled standard Binance withdrawal exhausted its one reconciliation query; operator review required"
+                *reconciliation_queries <= 1,
+                "journaled standard Binance withdrawal exceeded its reconciliation query authority"
             );
         }
         let bridge_balance_before = match &operation.progress {
@@ -1875,20 +1900,12 @@ impl RebalanceExecutor {
                 "journaled Binance withdrawal API mode is not the standard capital API"
             );
             ensure!(
-                *reconciliation_queries == 0,
+                *reconciliation_queries <= 1,
                 "journaled standard Binance withdrawal exceeded its reconciliation query authority"
             );
-            self.execution_journal.advance(
-                &operation.intent.operation_id,
-                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                    api_mode: api_mode.clone(),
-                    bridge_balance_before,
-                    reconciliation_queries: 1,
-                },
-            )?;
-            bail!(
-                "journaled standard Binance withdrawal submission has no indexed outcome; operator review required"
-            )
+            return self
+                .reconcile_unknown_withdrawal_and_retry(operation, network)
+                .await;
         } else {
             ensure!(
                 submission_safe,
@@ -1940,6 +1957,320 @@ impl RebalanceExecutor {
                 bridge_balance_before,
             },
         )
+    }
+
+    async fn reconcile_unknown_withdrawal_and_retry(
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
+        network: &str,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let (api_mode, bridge_balance_before, reconciliation_queries) = match &operation.progress {
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                bridge_balance_before,
+                reconciliation_queries,
+            } => (
+                api_mode.clone(),
+                *bridge_balance_before,
+                *reconciliation_queries,
+            ),
+            _ => bail!("unknown Binance withdrawal recovery lacks a submission intent"),
+        };
+        ensure!(
+            matches!(
+                api_mode.as_str(),
+                STANDARD_BINANCE_WITHDRAWAL_API_MODE | TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE
+            ),
+            "unknown Binance withdrawal recovery uses an unsupported API mode"
+        );
+        if reconciliation_queries == 0 {
+            operation = self.execution_journal.advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: api_mode.clone(),
+                    bridge_balance_before,
+                    reconciliation_queries: 1,
+                },
+            )?;
+        }
+        let evidence = self
+            .confirm_unknown_withdrawal_absence(&operation, network, bridge_balance_before)
+            .await?;
+        operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                api_mode,
+                bridge_balance_before,
+                master_free_base_units: evidence.master_free_base_units,
+                master_locked_base_units: evidence.master_locked_base_units,
+                wallet_balance_base_units: evidence.wallet_balance_base_units,
+            },
+        )?;
+        self.resume_authorized_withdrawal_retry(operation, network, false)
+            .await
+    }
+
+    async fn resume_authorized_withdrawal_retry(
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
+        network: &str,
+        revalidate: bool,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let (
+            api_mode,
+            bridge_balance_before,
+            master_free_base_units,
+            master_locked_base_units,
+            wallet_balance_base_units,
+        ) = match &operation.progress {
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                api_mode,
+                bridge_balance_before,
+                master_free_base_units,
+                master_locked_base_units,
+                wallet_balance_base_units,
+            } => (
+                api_mode.clone(),
+                *bridge_balance_before,
+                *master_free_base_units,
+                *master_locked_base_units,
+                *wallet_balance_base_units,
+            ),
+            _ => bail!("Binance withdrawal retry lacks durable authorization"),
+        };
+        if revalidate {
+            let evidence = self
+                .confirm_unknown_withdrawal_absence(&operation, network, bridge_balance_before)
+                .await?;
+            ensure!(
+                evidence
+                    == WithdrawalAbsenceEvidence {
+                        master_free_base_units,
+                        master_locked_base_units,
+                        wallet_balance_base_units,
+                    },
+                "Binance withdrawal retry evidence changed after authorization"
+            );
+        }
+        self.verify_route(&operation, true).await?;
+        let ownership_proof = if api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE {
+            Some(
+                self.ensure_travel_rule_ae_self_owned(&operation, network)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: api_mode.clone(),
+                bridge_balance_before,
+                reconciliation_queries: 0,
+            },
+        )?;
+        let amount =
+            base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+        let submission_reference = if api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE {
+            match self
+                .submit_travel_rule_binance_withdrawal(
+                    &operation,
+                    network,
+                    amount,
+                    ownership_proof
+                        .as_ref()
+                        .context("Travel Rule withdrawal retry lost its ownership proof")?,
+                )
+                .await
+            {
+                Ok(reference) => reference,
+                Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
+                    let reason =
+                        format!("terminal Binance Travel Rule withdrawal rejection: {error}");
+                    self.execution_journal.advance(
+                        &operation.intent.operation_id,
+                        RebalanceExecutionProgress::Failed { reason },
+                    )?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            match self
+                .submit_standard_binance_withdrawal(&operation, network, amount)
+                .await
+            {
+                Ok(reference) => reference,
+                Err(error) if is_travel_rule_required_rejection(&error) => {
+                    operation = self.execution_journal.advance(
+                        &operation.intent.operation_id,
+                        RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                            api_mode: TRAVEL_RULE_REQUIRED_API_MODE.to_owned(),
+                            bridge_balance_before,
+                            reconciliation_queries: 0,
+                        },
+                    )?;
+                    return self
+                        .submit_required_travel_rule_withdrawal(operation, network)
+                        .await;
+                }
+                Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
+                    let reason = format!("terminal Binance standard withdrawal rejection: {error}");
+                    self.execution_journal.advance(
+                        &operation.intent.operation_id,
+                        RebalanceExecutionProgress::Failed { reason },
+                    )?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
+                submission_reference,
+                bridge_balance_before,
+            },
+        )
+    }
+
+    async fn confirm_unknown_withdrawal_absence(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        network: &str,
+        bridge_balance_before: U256,
+    ) -> anyhow::Result<WithdrawalAbsenceEvidence> {
+        let first = self
+            .observe_unknown_withdrawal_absence(operation, network, bridge_balance_before)
+            .await?;
+        tokio::time::sleep(UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY).await;
+        let second = self
+            .observe_unknown_withdrawal_absence(operation, network, bridge_balance_before)
+            .await?;
+        ensure!(
+            first == second,
+            "Binance withdrawal absence evidence changed during confirmation"
+        );
+        tracing::warn!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            withdraw_order_id = operation.intent.withdraw_order_id,
+            network,
+            master_free_base_units = first.master_free_base_units.to_string(),
+            master_locked_base_units = first.master_locked_base_units.to_string(),
+            wallet_balance_base_units = first.wallet_balance_base_units.to_string(),
+            confirmation_delay_ms = UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY.as_millis(),
+            "proved an unindexed Binance withdrawal absent and authorized a deterministic retry"
+        );
+        Ok(first)
+    }
+
+    async fn observe_unknown_withdrawal_absence(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        network: &str,
+        bridge_balance_before: U256,
+    ) -> anyhow::Result<WithdrawalAbsenceEvidence> {
+        let requested =
+            base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
+        let withdrawal_chain_id = route_withdrawal_chain_id(&operation.intent.route);
+        let withdrawal_token = token_on_chain(&operation.intent.token_symbol, withdrawal_chain_id)?;
+        let rpc = self.evm.rpc(withdrawal_chain_id)?;
+        let (
+            standard_history,
+            exact_travel_rule_history,
+            network_travel_rule_history,
+            transfers,
+            account,
+            wallet_balance,
+        ) = tokio::try_join!(
+            self.treasury_binance.withdrawal_history(
+                &operation.intent.token_symbol,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance.travel_rule_withdrawal_history_v2(
+                &operation.intent.token_symbol,
+                network,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance
+                .travel_rule_withdrawal_history_v2_for_network(
+                    &operation.intent.token_symbol,
+                    network,
+                ),
+            self.treasury_binance.universal_transfer_history(
+                &self.subaccount_email,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance.account_information(),
+            rpc.erc20_balance(withdrawal_token, operation.intent.wallet_owner),
+        )?;
+        ensure!(
+            standard_history.is_empty(),
+            "unindexed Binance withdrawal retry found a standard withdrawal record"
+        );
+        let mut travel_rule_history = exact_travel_rule_history;
+        for record in network_travel_rule_history.into_iter().filter(|record| {
+            matches_travel_rule_record_identity_without_client_id(
+                record,
+                requested,
+                operation.intent.wallet_owner,
+                &operation.intent.withdraw_order_id,
+            )
+        }) {
+            if !travel_rule_history
+                .iter()
+                .any(|existing| existing.tr_id == record.tr_id)
+            {
+                travel_rule_history.push(record);
+            }
+        }
+        for record in &travel_rule_history {
+            validate_travel_rule_withdrawal_record(operation, record, requested)?;
+        }
+        ensure!(
+            travel_rule_history.iter().all(|record| {
+                record.is_failed_without_broadcast() || record.is_approved_without_withdrawal()
+            }),
+            "unindexed Binance withdrawal retry found a viable Travel Rule submission"
+        );
+        ensure!(
+            transfers.len() == 1,
+            "unindexed Binance withdrawal retry lost unique master transfer evidence"
+        );
+        validate_master_transfer_record(operation, &self.subaccount_email, &transfers[0])?;
+        ensure!(
+            transfers[0].status == "SUCCESS",
+            "unindexed Binance withdrawal retry master transfer is not successful"
+        );
+        let balance = account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == operation.intent.token_symbol)
+            .context(
+                "unindexed Binance withdrawal retry asset is absent from the master account",
+            )?;
+        let master_free_base_units =
+            decimal_to_base_units(balance.free, operation.intent.token_decimals)?;
+        let master_locked_base_units =
+            decimal_to_base_units(balance.locked, operation.intent.token_decimals)?;
+        ensure!(
+            master_free_base_units == operation.intent.amount,
+            "unindexed Binance withdrawal retry did not preserve the exact master balance"
+        );
+        ensure!(
+            master_locked_base_units.is_zero(),
+            "unindexed Binance withdrawal retry found locked master inventory"
+        );
+        ensure!(
+            wallet_balance == bridge_balance_before,
+            "unindexed Binance withdrawal retry found a destination-wallet balance change"
+        );
+        Ok(WithdrawalAbsenceEvidence {
+            master_free_base_units,
+            master_locked_base_units,
+            wallet_balance_base_units: wallet_balance,
+        })
     }
 
     async fn submit_required_travel_rule_withdrawal(
@@ -2805,6 +3136,15 @@ fn route_wallet_chain_id(route: &Route) -> u64 {
         Route::Across {
             wallet_chain_id, ..
         } => *wallet_chain_id,
+    }
+}
+
+fn route_withdrawal_chain_id(route: &Route) -> u64 {
+    match route {
+        Route::Direct { chain_id, .. } => *chain_id,
+        Route::Across {
+            bridge_chain_id, ..
+        } => *bridge_chain_id,
     }
 }
 
