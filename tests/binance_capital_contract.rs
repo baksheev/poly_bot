@@ -117,6 +117,11 @@ fn withdrawal_unknown_outcome_requires_composite_absence_proof_before_retry() {
     assert!(begin.contains("reconciliation_queries: 1"));
     assert!(begin.contains("confirm_unknown_withdrawal_absence"));
     assert!(begin.contains("BinanceWithdrawalRetryAuthorized"));
+    assert!(begin.contains("current_required_withdrawal"));
+    assert!(begin.contains("cancel_stale_withdrawal_retry"));
+    assert!(begin.contains("BinanceMasterReturnSubmissionStarted"));
+    assert!(begin.contains("universal_transfer_to_subaccount"));
+    assert!(begin.contains("CancelledStale"));
     assert!(begin.contains("standard_history.is_empty()"));
     assert!(begin.contains("travel_rule_withdrawal_history_v2_for_network"));
     assert!(begin.contains("master_free_base_units == operation.intent.amount"));

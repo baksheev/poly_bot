@@ -96,7 +96,16 @@ struct RebalanceTelemetry {
 struct WithdrawalAbsenceEvidence {
     master_free_base_units: U256,
     master_locked_base_units: U256,
+    trading_free_base_units: U256,
+    trading_locked_base_units: U256,
     wallet_balance_base_units: U256,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WithdrawalAbsenceConfirmation {
+    evidence: WithdrawalAbsenceEvidence,
+    required_withdrawal_base_units: U256,
+    stale: bool,
 }
 
 /// The only rebalancing component that can access signing material or nonce
@@ -1004,6 +1013,7 @@ impl RebalanceExecutor {
                 );
                 return Ok(operation);
             }
+            RebalanceExecutionProgress::CancelledStale { .. } => return Ok(operation),
             RebalanceExecutionProgress::Failed { reason } => {
                 bail!("rebalance previously failed: {reason}")
             }
@@ -1174,6 +1184,12 @@ impl RebalanceExecutor {
         operation = self
             .begin_binance_withdrawal(operation, withdrawal_submission_safe, &binance_network)
             .await?;
+        if matches!(
+            operation.progress,
+            RebalanceExecutionProgress::CancelledStale { .. }
+        ) {
+            return Ok(operation);
+        }
         if let RebalanceExecutionProgress::BinanceWithdrawalSubmitted {
             bridge_balance_before,
             ..
@@ -1803,6 +1819,13 @@ impl RebalanceExecutor {
     ) -> anyhow::Result<RebalanceExecutionOperation> {
         if matches!(
             operation.progress,
+            RebalanceExecutionProgress::BinanceMasterReturnSubmissionStarted { .. }
+                | RebalanceExecutionProgress::BinanceMasterReturnSubmitted { .. }
+        ) {
+            return self.resume_stale_withdrawal_cancellation(operation).await;
+        }
+        if matches!(
+            operation.progress,
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { .. }
         ) {
             return self
@@ -1974,6 +1997,174 @@ impl RebalanceExecutor {
         )
     }
 
+    async fn cancel_stale_withdrawal_retry(
+        &mut self,
+        operation: RebalanceExecutionOperation,
+        confirmation: WithdrawalAbsenceConfirmation,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        ensure!(confirmation.stale, "current withdrawal retry is not stale");
+        let current_binance_balance = current_binance_balance(confirmation.evidence)?;
+        let client_transaction_id =
+            super::executor::stale_master_return_client_id(&operation.intent);
+        let operation = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::BinanceMasterReturnSubmissionStarted {
+                client_transaction_id,
+                revalidation_binance_balance: current_binance_balance,
+                revalidation_wallet_balance: confirmation.evidence.wallet_balance_base_units,
+                revalidation_required_withdrawal: confirmation.required_withdrawal_base_units,
+                reconciliation_queries: 0,
+            },
+        )?;
+        self.resume_stale_withdrawal_cancellation(operation).await
+    }
+
+    async fn resume_stale_withdrawal_cancellation(
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        if let RebalanceExecutionProgress::BinanceMasterReturnSubmissionStarted {
+            client_transaction_id,
+            revalidation_binance_balance,
+            revalidation_wallet_balance,
+            revalidation_required_withdrawal,
+            reconciliation_queries,
+        } = operation.progress.clone()
+        {
+            ensure!(
+                reconciliation_queries <= 1,
+                "stale withdrawal master-return reconciliation limit exceeded"
+            );
+            let mut existing = self
+                .treasury_binance
+                .universal_transfer_history_to_subaccount(
+                    &self.subaccount_email,
+                    &client_transaction_id,
+                )
+                .await?;
+            if reconciliation_queries == 0 {
+                operation = self.execution_journal.advance(
+                    &operation.intent.operation_id,
+                    RebalanceExecutionProgress::BinanceMasterReturnSubmissionStarted {
+                        client_transaction_id: client_transaction_id.clone(),
+                        revalidation_binance_balance,
+                        revalidation_wallet_balance,
+                        revalidation_required_withdrawal,
+                        reconciliation_queries: 1,
+                    },
+                )?;
+                if existing.is_empty() {
+                    tokio::time::sleep(UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY).await;
+                    existing = self
+                        .treasury_binance
+                        .universal_transfer_history_to_subaccount(
+                            &self.subaccount_email,
+                            &client_transaction_id,
+                        )
+                        .await?;
+                }
+            }
+            let transaction_id = if let Some(record) = existing.first() {
+                validate_master_return_record(
+                    &operation,
+                    &self.subaccount_email,
+                    &client_transaction_id,
+                    record,
+                )?;
+                record.transaction_id
+            } else {
+                self.verify_staged_master_inventory(&operation).await?;
+                let amount = base_units_to_decimal(
+                    operation.intent.amount,
+                    operation.intent.token_decimals,
+                )?;
+                self.treasury_binance
+                    .universal_transfer_to_subaccount(
+                        &self.subaccount_email,
+                        &operation.intent.token_symbol,
+                        amount,
+                        &client_transaction_id,
+                    )
+                    .await?
+                    .transaction_id
+            };
+            operation = self.execution_journal.advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::BinanceMasterReturnSubmitted {
+                    client_transaction_id,
+                    transaction_id,
+                    revalidation_binance_balance,
+                    revalidation_wallet_balance,
+                    revalidation_required_withdrawal,
+                },
+            )?;
+        }
+        let (
+            client_transaction_id,
+            transaction_id,
+            revalidation_binance_balance,
+            revalidation_wallet_balance,
+            revalidation_required_withdrawal,
+        ) = match operation.progress.clone() {
+            RebalanceExecutionProgress::BinanceMasterReturnSubmitted {
+                client_transaction_id,
+                transaction_id,
+                revalidation_binance_balance,
+                revalidation_wallet_balance,
+                revalidation_required_withdrawal,
+            } => (
+                client_transaction_id,
+                transaction_id,
+                revalidation_binance_balance,
+                revalidation_wallet_balance,
+                revalidation_required_withdrawal,
+            ),
+            _ => bail!("stale withdrawal cancellation lacks a submitted master return"),
+        };
+        self.wait_master_return(&operation, &client_transaction_id, transaction_id)
+            .await?;
+        tracing::warn!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            superseded_withdrawal_base_units = operation.intent.amount.to_string(),
+            revalidation_required_withdrawal_base_units =
+                revalidation_required_withdrawal.to_string(),
+            master_return_transaction_id = transaction_id,
+            "cancelled a stale proven-absent withdrawal and returned staged inventory to the trading sub-account"
+        );
+        self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::CancelledStale {
+                master_return_transaction_id: transaction_id,
+                revalidation_binance_balance,
+                revalidation_wallet_balance,
+                revalidation_required_withdrawal,
+            },
+        )
+    }
+
+    async fn verify_staged_master_inventory(
+        &self,
+        operation: &RebalanceExecutionOperation,
+    ) -> anyhow::Result<()> {
+        let account = self.treasury_binance.account_information().await?;
+        let balance = account
+            .balances
+            .iter()
+            .find(|balance| balance.asset == operation.intent.token_symbol)
+            .context("stale withdrawal asset is absent from the master account")?;
+        ensure!(
+            decimal_to_base_units(balance.free, operation.intent.token_decimals)?
+                == operation.intent.amount,
+            "stale withdrawal master return did not preserve exact free inventory"
+        );
+        ensure!(
+            balance.locked == Decimal::ZERO,
+            "stale withdrawal master return found locked master inventory"
+        );
+        Ok(())
+    }
+
     async fn reconcile_unknown_withdrawal_and_retry(
         &mut self,
         mut operation: RebalanceExecutionOperation,
@@ -2008,9 +2199,15 @@ impl RebalanceExecutor {
                 },
             )?;
         }
-        let evidence = self
+        let confirmation = self
             .confirm_unknown_withdrawal_absence(&operation, network, bridge_balance_before)
             .await?;
+        if confirmation.stale {
+            return self
+                .cancel_stale_withdrawal_retry(operation, confirmation)
+                .await;
+        }
+        let evidence = confirmation.evidence;
         operation = self.execution_journal.advance(
             &operation.intent.operation_id,
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
@@ -2054,15 +2251,23 @@ impl RebalanceExecutor {
             _ => bail!("Binance withdrawal retry lacks durable authorization"),
         };
         if revalidate {
-            let evidence = self
+            let confirmation = self
                 .confirm_unknown_withdrawal_absence(&operation, network, bridge_balance_before)
                 .await?;
+            if confirmation.stale {
+                return self
+                    .cancel_stale_withdrawal_retry(operation, confirmation)
+                    .await;
+            }
+            let evidence = confirmation.evidence;
             ensure!(
                 same_withdrawal_retry_authority(
                     evidence,
                     WithdrawalAbsenceEvidence {
                         master_free_base_units,
                         master_locked_base_units,
+                        trading_free_base_units: evidence.trading_free_base_units,
+                        trading_locked_base_units: evidence.trading_locked_base_units,
                         wallet_balance_base_units,
                     }
                 ),
@@ -2156,7 +2361,7 @@ impl RebalanceExecutor {
         operation: &RebalanceExecutionOperation,
         network: &str,
         bridge_balance_before: U256,
-    ) -> anyhow::Result<WithdrawalAbsenceEvidence> {
+    ) -> anyhow::Result<WithdrawalAbsenceConfirmation> {
         let first = self
             .observe_unknown_withdrawal_absence(operation, network, bridge_balance_before)
             .await?;
@@ -2168,6 +2373,11 @@ impl RebalanceExecutor {
             same_withdrawal_retry_authority(first, second),
             "Binance withdrawal absence evidence changed during confirmation"
         );
+        let first_required = current_required_withdrawal(first)?;
+        let second_required = current_required_withdrawal(second)?;
+        let first_stale = withdrawal_retry_is_stale(operation, first, first_required);
+        let second_stale = withdrawal_retry_is_stale(operation, second, second_required);
+        let stale = first_stale && second_stale;
         tracing::warn!(
             operation_id = operation.intent.operation_id,
             token = operation.intent.token_symbol,
@@ -2175,13 +2385,25 @@ impl RebalanceExecutor {
             network,
             master_free_base_units = second.master_free_base_units.to_string(),
             master_locked_base_units = second.master_locked_base_units.to_string(),
+            trading_free_base_units = second.trading_free_base_units.to_string(),
+            trading_locked_base_units = second.trading_locked_base_units.to_string(),
             wallet_balance_base_units = second.wallet_balance_base_units.to_string(),
+            first_required_withdrawal_base_units = first_required.to_string(),
+            second_required_withdrawal_base_units = second_required.to_string(),
+            durable_withdrawal_base_units = operation.intent.amount.to_string(),
+            revalidation_start_balance_base_units =
+                operation.intent.revalidation_start_balance.to_string(),
+            stale,
             wallet_balance_changed_during_confirmation =
                 first.wallet_balance_base_units != second.wallet_balance_base_units,
             confirmation_delay_ms = UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY.as_millis(),
-            "proved an unindexed Binance withdrawal absent and authorized a deterministic retry"
+            "proved an unindexed Binance withdrawal absent and revalidated its current economic need"
         );
-        Ok(second)
+        Ok(WithdrawalAbsenceConfirmation {
+            evidence: second,
+            required_withdrawal_base_units: second_required,
+            stale,
+        })
     }
 
     async fn observe_unknown_withdrawal_absence(
@@ -2200,7 +2422,8 @@ impl RebalanceExecutor {
             exact_travel_rule_history,
             network_travel_rule_history,
             transfers,
-            account,
+            master_account,
+            trading_account,
             wallet_balance,
         ) = tokio::try_join!(
             self.treasury_binance.withdrawal_history(
@@ -2222,6 +2445,7 @@ impl RebalanceExecutor {
                 &operation.intent.withdraw_order_id,
             ),
             self.treasury_binance.account_information(),
+            self.trading_binance.account_information(),
             rpc.erc20_balance(withdrawal_token, operation.intent.wallet_owner),
         )?;
         ensure!(
@@ -2262,7 +2486,7 @@ impl RebalanceExecutor {
             transfers[0].status == "SUCCESS",
             "unindexed Binance withdrawal retry master transfer is not successful"
         );
-        let balance = account
+        let balance = master_account
             .balances
             .iter()
             .find(|balance| balance.asset == operation.intent.token_symbol)
@@ -2281,10 +2505,18 @@ impl RebalanceExecutor {
             master_locked_base_units.is_zero(),
             "unindexed Binance withdrawal retry found locked master inventory"
         );
+        let (trading_free, trading_locked) =
+            account_asset_balance_or_zero(&trading_account, &operation.intent.token_symbol);
+        let trading_free_base_units =
+            decimal_to_base_units(trading_free, operation.intent.token_decimals)?;
+        let trading_locked_base_units =
+            decimal_to_base_units(trading_locked, operation.intent.token_decimals)?;
         let _ = bridge_balance_before;
         Ok(WithdrawalAbsenceEvidence {
             master_free_base_units,
             master_locked_base_units,
+            trading_free_base_units,
+            trading_locked_base_units,
             wallet_balance_base_units: wallet_balance,
         })
     }
@@ -2435,6 +2667,51 @@ impl RebalanceExecutor {
             ensure!(
                 tokio::time::Instant::now() < deadline,
                 "timed out waiting for Binance master transfer"
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    async fn wait_master_return(
+        &self,
+        operation: &RebalanceExecutionOperation,
+        client_transaction_id: &str,
+        transaction_id: u64,
+    ) -> anyhow::Result<UniversalTransferRecord> {
+        let deadline = tokio::time::Instant::now() + self.limits.operation_timeout;
+        loop {
+            if let Some(record) = self
+                .treasury_binance
+                .universal_transfer_history_to_subaccount(
+                    &self.subaccount_email,
+                    client_transaction_id,
+                )
+                .await?
+                .into_iter()
+                .next()
+            {
+                validate_master_return_record(
+                    operation,
+                    &self.subaccount_email,
+                    client_transaction_id,
+                    &record,
+                )?;
+                ensure!(
+                    record.transaction_id == transaction_id,
+                    "Binance master-return transfer id changed"
+                );
+                match record.status.as_str() {
+                    "SUCCESS" => return Ok(record),
+                    "FAILED" | "FAILURE" => bail!(
+                        "Binance master-return transfer failed with status {}",
+                        record.status
+                    ),
+                    _ => {}
+                }
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Binance master-return transfer"
             );
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
@@ -3038,6 +3315,73 @@ fn validate_master_transfer_record(
     Ok(())
 }
 
+fn validate_master_return_record(
+    operation: &RebalanceExecutionOperation,
+    subaccount_email: &str,
+    client_transaction_id: &str,
+    record: &UniversalTransferRecord,
+) -> anyhow::Result<()> {
+    ensure!(
+        !record.from_email.trim().is_empty(),
+        "Binance master-return source account is empty"
+    );
+    ensure!(
+        record.to_email.eq_ignore_ascii_case(subaccount_email),
+        "Binance master-return destination sub-account changed"
+    );
+    ensure!(
+        record.asset == operation.intent.token_symbol,
+        "Binance master-return asset changed"
+    );
+    ensure!(
+        record.from_account_type == "SPOT" && record.to_account_type == "SPOT",
+        "Binance master-return account type changed"
+    );
+    ensure!(
+        record.client_transaction_id == client_transaction_id,
+        "Binance master-return client id changed"
+    );
+    ensure!(
+        decimal_to_base_units(record.amount, operation.intent.token_decimals)?
+            == operation.intent.amount,
+        "Binance master-return amount changed"
+    );
+    Ok(())
+}
+
+fn current_binance_balance(evidence: WithdrawalAbsenceEvidence) -> anyhow::Result<U256> {
+    evidence
+        .master_free_base_units
+        .checked_add(evidence.master_locked_base_units)
+        .and_then(|balance| balance.checked_add(evidence.trading_free_base_units))
+        .and_then(|balance| balance.checked_add(evidence.trading_locked_base_units))
+        .context("current aggregate Binance balance overflow")
+}
+
+fn current_required_withdrawal(evidence: WithdrawalAbsenceEvidence) -> anyhow::Result<U256> {
+    let binance = current_binance_balance(evidence)?;
+    let total = binance
+        .checked_add(evidence.wallet_balance_base_units)
+        .context("current rebalance inventory overflow")?;
+    let wallet_target = total
+        .checked_add(U256::ONE)
+        .context("current rebalance midpoint overflow")?
+        / U256::from(2);
+    Ok(wallet_target
+        .checked_sub(evidence.wallet_balance_base_units)
+        .unwrap_or(U256::ZERO))
+}
+
+fn withdrawal_retry_is_stale(
+    operation: &RebalanceExecutionOperation,
+    evidence: WithdrawalAbsenceEvidence,
+    required_withdrawal: U256,
+) -> bool {
+    required_withdrawal < operation.intent.amount
+        || (!operation.intent.revalidation_start_balance.is_zero()
+            && evidence.wallet_balance_base_units >= operation.intent.revalidation_start_balance)
+}
+
 fn validate_master_subaccount_view(
     trading_account: &AccountInformation,
     master_balances: &[SubAccountAssetBalance],
@@ -3403,17 +3747,21 @@ mod tests {
         },
         chain::rpc::{ReceiptLog, TransactionReceipt},
         rebalance::Route,
+        rebalance::{
+            Direction, RebalanceExecutionIntent, RebalanceExecutionOperation,
+            RebalanceExecutionProgress,
+        },
     };
 
     use super::{
         ARBITRUM_CHAIN_ID, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD,
-        account_asset_balance_or_zero, base_units_to_decimal, decimal_to_base_units,
-        decimal_to_base_units_floor, matches_travel_rule_record_identity_without_client_id,
-        merge_travel_rule_withdrawal_detail, reconcile_approved_travel_rule_rejection,
-        route_wallet_chain_id, shared_evm_confirmation_timeout, validate_across_fill_receipt,
-        validate_approved_asset, validate_direct_withdrawal_receipt,
-        verified_self_owned_evm_address_record, withdrawal_received_base_units,
-        withdrawal_requested_base_units,
+        WithdrawalAbsenceEvidence, account_asset_balance_or_zero, base_units_to_decimal,
+        current_required_withdrawal, decimal_to_base_units, decimal_to_base_units_floor,
+        matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
+        reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
+        shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
+        validate_direct_withdrawal_receipt, verified_self_owned_evm_address_record,
+        withdrawal_received_base_units, withdrawal_requested_base_units, withdrawal_retry_is_stale,
     };
 
     #[test]
@@ -3426,6 +3774,70 @@ mod tests {
             shared_evm_confirmation_timeout(Duration::from_secs(60)),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn midpoint_revalidation_cancels_the_production_round_trip_shape() {
+        let required = current_required_withdrawal(WithdrawalAbsenceEvidence {
+            master_free_base_units: U256::from(2_994_u64),
+            master_locked_base_units: U256::ZERO,
+            trading_free_base_units: U256::from(808_u64),
+            trading_locked_base_units: U256::ZERO,
+            wallet_balance_base_units: U256::from(6_210_u64),
+        })
+        .unwrap();
+        assert_eq!(required, U256::ZERO);
+    }
+
+    #[test]
+    fn midpoint_revalidation_preserves_a_still_needed_withdrawal() {
+        let required = current_required_withdrawal(WithdrawalAbsenceEvidence {
+            master_free_base_units: U256::from(2_000_u64),
+            master_locked_base_units: U256::ZERO,
+            trading_free_base_units: U256::from(6_000_u64),
+            trading_locked_base_units: U256::ZERO,
+            wallet_balance_base_units: U256::from(2_000_u64),
+        })
+        .unwrap();
+        assert_eq!(required, U256::from(3_000_u64));
+    }
+
+    #[test]
+    fn threshold_revalidation_cancels_when_the_destination_has_recovered() {
+        let evidence = WithdrawalAbsenceEvidence {
+            master_free_base_units: U256::from(1_000_u64),
+            master_locked_base_units: U256::ZERO,
+            trading_free_base_units: U256::from(7_000_u64),
+            trading_locked_base_units: U256::ZERO,
+            wallet_balance_base_units: U256::from(4_000_u64),
+        };
+        let operation = RebalanceExecutionOperation {
+            intent: RebalanceExecutionIntent {
+                scope: None,
+                operation_id: "rebalance-threshold-test".to_owned(),
+                fingerprint: "1".repeat(64),
+                withdraw_order_id: "rb111111111111111111111111111111".to_owned(),
+                token_symbol: "ESP".to_owned(),
+                token_decimals: 18,
+                token_contract: Address::repeat_byte(0x11),
+                wallet_owner: Address::repeat_byte(0x22),
+                direction: Direction::BinanceToWallet,
+                route: Route::Direct {
+                    binance_network: "ARBITRUM".to_owned(),
+                    chain_id: ARBITRUM_CHAIN_ID,
+                },
+                amount: U256::from(1_000_u64),
+                binance_balance_before: U256::from(8_000_u64),
+                wallet_balance_before: U256::from(2_000_u64),
+                revalidation_start_balance: U256::from(4_000_u64),
+                maximum_fee_base_units: None,
+                approval_session_id: None,
+            },
+            progress: RebalanceExecutionProgress::IntentRecorded,
+        };
+        let required = current_required_withdrawal(evidence).unwrap();
+        assert_eq!(required, U256::from(2_000_u64));
+        assert!(withdrawal_retry_is_stale(&operation, evidence, required));
     }
 
     #[test]

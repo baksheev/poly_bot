@@ -1038,6 +1038,7 @@ mod tests {
             },
             binance_balance_before: U256::from(1_000_u64),
             wallet_balance_before: U256::ZERO,
+            revalidation_start_balance: U256::from(100_u64),
             maximum_fee: Some(U256::from(100_u64)),
             approval_session_id: Some("esp-usdc-arbitrum-rebalance-test-r2".to_owned()),
         };

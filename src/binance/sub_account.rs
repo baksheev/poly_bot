@@ -52,6 +52,41 @@ impl BinanceAccountClient {
         Ok(submission)
     }
 
+    pub async fn universal_transfer_to_subaccount(
+        &self,
+        to_email: &str,
+        asset: &str,
+        amount: Decimal,
+        client_transaction_id: &str,
+    ) -> anyhow::Result<UniversalTransferSubmission> {
+        validate_email(to_email)?;
+        validate_asset(asset)?;
+        validate_client_transaction_id(client_transaction_id)?;
+        ensure!(amount > Decimal::ZERO, "transfer amount must be positive");
+        let query = self.signed_query(&[
+            ("toEmail", to_email.to_owned()),
+            ("fromAccountType", "SPOT".to_owned()),
+            ("toAccountType", "SPOT".to_owned()),
+            ("asset", asset.to_owned()),
+            ("amount", amount.normalize().to_string()),
+            ("clientTranId", client_transaction_id.to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let submission: UniversalTransferSubmission = self
+            .signed_post(
+                "/sapi/v1/sub-account/universalTransfer",
+                &query,
+                "master-to-sub-account universal transfer",
+            )
+            .await?;
+        ensure!(submission.transaction_id > 0, "transfer id is zero");
+        ensure!(
+            submission.client_transaction_id == client_transaction_id,
+            "Binance returned a different transfer client id"
+        );
+        Ok(submission)
+    }
+
     pub async fn universal_transfer_history(
         &self,
         from_email: &str,
@@ -71,6 +106,39 @@ impl BinanceAccountClient {
                 "/sapi/v1/sub-account/universalTransfer",
                 &query,
                 "sub-account universal transfer history",
+            )
+            .await?;
+        let matching = response
+            .records
+            .into_iter()
+            .filter(|record| record.client_transaction_id == client_transaction_id)
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() <= 1,
+            "Binance returned duplicate universal transfers for one client id"
+        );
+        Ok(matching)
+    }
+
+    pub async fn universal_transfer_history_to_subaccount(
+        &self,
+        to_email: &str,
+        client_transaction_id: &str,
+    ) -> anyhow::Result<Vec<UniversalTransferRecord>> {
+        validate_email(to_email)?;
+        validate_client_transaction_id(client_transaction_id)?;
+        let query = self.signed_query(&[
+            ("toEmail", to_email.to_owned()),
+            ("clientTranId", client_transaction_id.to_owned()),
+            ("page", "1".to_owned()),
+            ("limit", "10".to_owned()),
+            ("recvWindow", "5000".to_owned()),
+        ])?;
+        let response: UniversalTransferHistory = self
+            .signed_get(
+                "/sapi/v1/sub-account/universalTransfer",
+                &query,
+                "master-to-sub-account universal transfer history",
             )
             .await?;
         let matching = response

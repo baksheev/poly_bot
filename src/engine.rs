@@ -44,7 +44,8 @@ use crate::{
     },
     portfolio::{AllocationIntent, AllocationProposal, CapitalAllocatorHandle, PortfolioCatalog},
     rebalance::{
-        Direction, RebalanceEvaluation, RebalanceExecutionOperation, V12RebalanceParityAdapter,
+        Direction, RebalanceEvaluation, RebalanceExecutionOperation, RebalanceExecutionProgress,
+        V12RebalanceParityAdapter,
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{StrategyEvaluation, StrategyEvaluator, measure_strategy_evaluation},
@@ -1888,6 +1889,24 @@ impl TradingEngine {
         &mut self,
         operation: &RebalanceExecutionOperation,
     ) -> anyhow::Result<()> {
+        if self
+            .rebalance_blocked_tokens
+            .remove(&operation.intent.token_symbol)
+        {
+            tracing::info!(
+                token = operation.intent.token_symbol,
+                "rebalance token quarantine cleared when durable recovery reopened"
+            );
+            self.telemetry.emit(
+                "rebalance_token_quarantine_cleared",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "token": operation.intent.token_symbol,
+                    "reason": "durable_recovery_reopened",
+                    "blocked_token_count": self.rebalance_blocked_tokens.len(),
+                }),
+            );
+        }
         self.rebalance_inflight = true;
         self.rebalance_inflight_since = Some(Instant::now());
         self.telemetry.emit(
@@ -1930,7 +1949,26 @@ impl TradingEngine {
                         }),
                     );
                 }
-                if let (Some(binance), Some(wallet)) = (
+                if matches!(
+                    operation.progress,
+                    RebalanceExecutionProgress::CancelledStale { .. }
+                ) {
+                    self.rebalance.mark_unbalanced();
+                    tracing::info!(
+                        operation_id = operation.intent.operation_id,
+                        token = operation.intent.token_symbol,
+                        "stale rebalance recovery cancelled after staged Binance inventory was restored"
+                    );
+                    self.telemetry.emit(
+                        "rebalance_stale_intent_cancelled",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "operation_id": operation.intent.operation_id,
+                            "token": operation.intent.token_symbol,
+                            "recovered": true,
+                        }),
+                    );
+                } else if let (Some(binance), Some(wallet)) = (
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),
                 ) {
@@ -1954,25 +1992,30 @@ impl TradingEngine {
                         started_at: Instant::now(),
                     });
                 }
-                self.telemetry.emit(
-                    "rebalance_execution_completed",
-                    json!({
-                        "engine_id": self.config.engine_id,
-                        "operation_id": operation.intent.operation_id,
-                        "strategy_id": operation.intent.scope.as_ref().map(|scope| &scope.strategy_id),
-                        "recovered": true,
-                    }),
-                );
-                self.telemetry.emit(
-                    "rebalance_settlement_waiting",
-                    json!({
-                        "engine_id": self.config.engine_id,
-                        "operation_id": operation.intent.operation_id,
-                        "token": operation.intent.token_symbol,
-                        "direction": format!("{:?}", operation.intent.direction),
-                        "recovered": true,
-                    }),
-                );
+                if !matches!(
+                    operation.progress,
+                    RebalanceExecutionProgress::CancelledStale { .. }
+                ) {
+                    self.telemetry.emit(
+                        "rebalance_execution_completed",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "operation_id": operation.intent.operation_id,
+                            "strategy_id": operation.intent.scope.as_ref().map(|scope| &scope.strategy_id),
+                            "recovered": true,
+                        }),
+                    );
+                    self.telemetry.emit(
+                        "rebalance_settlement_waiting",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "operation_id": operation.intent.operation_id,
+                            "token": operation.intent.token_symbol,
+                            "direction": format!("{:?}", operation.intent.direction),
+                            "recovered": true,
+                        }),
+                    );
+                }
             }
             Err(error) => {
                 if let Some(token) = blocked_token {

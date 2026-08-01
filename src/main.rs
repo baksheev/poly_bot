@@ -4336,6 +4336,7 @@ async fn dispatch_rebalance_execution(
             action,
             binance_balance_before: evaluation.plan.projected.binance,
             wallet_balance_before: evaluation.plan.projected.wallet,
+            revalidation_start_balance: evaluation.plan.start_balance,
             maximum_fee,
             approval_session_id: if target == RebalanceExecutionTarget::Arbitrum {
                 Some(

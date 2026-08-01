@@ -33,6 +33,7 @@ pub struct RebalanceExecutionRequest {
     pub action: RebalanceAction,
     pub binance_balance_before: U256,
     pub wallet_balance_before: U256,
+    pub revalidation_start_balance: U256,
     pub maximum_fee: Option<U256>,
     pub approval_session_id: Option<String>,
 }
@@ -74,6 +75,8 @@ pub struct RebalanceExecutionIntent {
     pub binance_balance_before: U256,
     #[serde(with = "u256_serde")]
     pub wallet_balance_before: U256,
+    #[serde(default, with = "u256_serde", skip_serializing_if = "U256::is_zero")]
+    pub revalidation_start_balance: U256,
     #[serde(
         default,
         alias = "canary_maximum_fee_base_units",
@@ -145,6 +148,27 @@ pub enum RebalanceExecutionProgress {
         master_locked_base_units: U256,
         #[serde(with = "u256_serde")]
         wallet_balance_base_units: U256,
+    },
+    BinanceMasterReturnSubmissionStarted {
+        client_transaction_id: String,
+        #[serde(with = "u256_serde")]
+        revalidation_binance_balance: U256,
+        #[serde(with = "u256_serde")]
+        revalidation_wallet_balance: U256,
+        #[serde(with = "u256_serde")]
+        revalidation_required_withdrawal: U256,
+        #[serde(default)]
+        reconciliation_queries: u16,
+    },
+    BinanceMasterReturnSubmitted {
+        client_transaction_id: String,
+        transaction_id: u64,
+        #[serde(with = "u256_serde")]
+        revalidation_binance_balance: U256,
+        #[serde(with = "u256_serde")]
+        revalidation_wallet_balance: U256,
+        #[serde(with = "u256_serde")]
+        revalidation_required_withdrawal: U256,
     },
     BinanceWithdrawalSubmitted {
         submission_reference: String,
@@ -219,6 +243,15 @@ pub enum RebalanceExecutionProgress {
         #[serde(with = "u256_serde")]
         wallet_balance_after: U256,
     },
+    CancelledStale {
+        master_return_transaction_id: u64,
+        #[serde(with = "u256_serde")]
+        revalidation_binance_balance: U256,
+        #[serde(with = "u256_serde")]
+        revalidation_wallet_balance: U256,
+        #[serde(with = "u256_serde")]
+        revalidation_required_withdrawal: U256,
+    },
     Failed {
         reason: String,
     },
@@ -231,7 +264,10 @@ impl RebalanceExecutionProgress {
     pub fn terminal(&self) -> bool {
         matches!(
             self,
-            Self::Completed { .. } | Self::Failed { .. } | Self::Quarantined { .. }
+            Self::Completed { .. }
+                | Self::CancelledStale { .. }
+                | Self::Failed { .. }
+                | Self::Quarantined { .. }
         )
     }
 }
@@ -581,6 +617,7 @@ impl RebalanceExecutionJournal {
                 amount: request.action.amount,
                 binance_balance_before: request.binance_balance_before,
                 wallet_balance_before: request.wallet_balance_before,
+                revalidation_start_balance: request.revalidation_start_balance,
                 maximum_fee_base_units: request.maximum_fee.map(|value| value.to_string()),
                 approval_session_id: request.approval_session_id.clone(),
             },
@@ -803,6 +840,10 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
         !request.action.amount.is_zero(),
         "rebalance executor amount is zero"
     );
+    ensure!(
+        !request.revalidation_start_balance.is_zero(),
+        "rebalance executor revalidation start balance is zero"
+    );
     let authority_matches_route = match (&request.authority, &request.action.route) {
         (
             RebalanceExecutionAuthority::WorldChainV12,
@@ -851,6 +892,18 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
             "rebalance executor amount exceeds wallet balance"
         ),
     }
+    let total = request
+        .binance_balance_before
+        .checked_add(request.wallet_balance_before)
+        .context("rebalance executor request balance overflow")?;
+    let required_total = request
+        .revalidation_start_balance
+        .checked_mul(U256::from(2))
+        .context("rebalance executor revalidation threshold overflow")?;
+    ensure!(
+        required_total <= total,
+        "rebalance executor revalidation threshold exceeds total inventory"
+    );
     Ok(())
 }
 
@@ -907,6 +960,20 @@ fn validate_operation(operation: &RebalanceExecutionOperation) -> anyhow::Result
             intent.amount <= intent.wallet_balance_before,
             "rebalance operation amount exceeds wallet balance"
         ),
+    }
+    if !intent.revalidation_start_balance.is_zero() {
+        let total = intent
+            .binance_balance_before
+            .checked_add(intent.wallet_balance_before)
+            .context("rebalance operation balance overflow")?;
+        let required_total = intent
+            .revalidation_start_balance
+            .checked_mul(U256::from(2))
+            .context("rebalance operation revalidation threshold overflow")?;
+        ensure!(
+            required_total <= total,
+            "rebalance operation revalidation threshold exceeds total inventory"
+        );
     }
     if let RebalanceExecutionProgress::Failed { reason }
     | RebalanceExecutionProgress::Quarantined { reason } = &operation.progress
@@ -1142,6 +1209,87 @@ fn validate_transition(
                 ..
             },
         ) => previous_mode == next_mode,
+        (
+            Route::Direct { .. } | Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceWithdrawalSubmissionStarted {
+                reconciliation_queries: 1,
+                ..
+            }
+            | P::BinanceWithdrawalRetryAuthorized { .. },
+            P::BinanceMasterReturnSubmissionStarted {
+                reconciliation_queries: 0,
+                ..
+            },
+        ) => true,
+        (
+            Route::Direct { .. } | Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceMasterReturnSubmissionStarted {
+                client_transaction_id: previous_client_id,
+                revalidation_binance_balance: previous_binance,
+                revalidation_wallet_balance: previous_wallet,
+                revalidation_required_withdrawal: previous_required,
+                reconciliation_queries: 0,
+            },
+            P::BinanceMasterReturnSubmissionStarted {
+                client_transaction_id: next_client_id,
+                revalidation_binance_balance: next_binance,
+                revalidation_wallet_balance: next_wallet,
+                revalidation_required_withdrawal: next_required,
+                reconciliation_queries: 1,
+            },
+        ) => {
+            previous_client_id == next_client_id
+                && previous_binance == next_binance
+                && previous_wallet == next_wallet
+                && previous_required == next_required
+        }
+        (
+            Route::Direct { .. } | Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceMasterReturnSubmissionStarted {
+                client_transaction_id: previous_client_id,
+                revalidation_binance_balance: previous_binance,
+                revalidation_wallet_balance: previous_wallet,
+                revalidation_required_withdrawal: previous_required,
+                reconciliation_queries: 1,
+            },
+            P::BinanceMasterReturnSubmitted {
+                client_transaction_id: next_client_id,
+                revalidation_binance_balance: next_binance,
+                revalidation_wallet_balance: next_wallet,
+                revalidation_required_withdrawal: next_required,
+                ..
+            },
+        ) => {
+            previous_client_id == next_client_id
+                && previous_binance == next_binance
+                && previous_wallet == next_wallet
+                && previous_required == next_required
+        }
+        (
+            Route::Direct { .. } | Route::Across { .. },
+            Direction::BinanceToWallet,
+            P::BinanceMasterReturnSubmitted {
+                transaction_id,
+                revalidation_binance_balance: previous_binance,
+                revalidation_wallet_balance: previous_wallet,
+                revalidation_required_withdrawal: previous_required,
+                ..
+            },
+            P::CancelledStale {
+                master_return_transaction_id,
+                revalidation_binance_balance: next_binance,
+                revalidation_wallet_balance: next_wallet,
+                revalidation_required_withdrawal: next_required,
+            },
+        ) => {
+            transaction_id == master_return_transaction_id
+                && previous_binance == next_binance
+                && previous_wallet == next_wallet
+                && previous_required == next_required
+        }
         // A separately approved operator withdrawal can satisfy a fail-closed
         // unindexed submission. Its recovery validates the exact Binance
         // record and on-chain receipt before appending this single terminal
@@ -1388,6 +1536,41 @@ fn validate_progress_evidence(
                 "rebalance Binance withdrawal retry retained locked master inventory"
             );
         }
+        P::BinanceMasterReturnSubmissionStarted {
+            client_transaction_id,
+            revalidation_binance_balance,
+            revalidation_wallet_balance,
+            revalidation_required_withdrawal,
+            reconciliation_queries,
+        } => {
+            validate_master_return_evidence(
+                intent,
+                client_transaction_id,
+                *revalidation_binance_balance,
+                *revalidation_wallet_balance,
+                *revalidation_required_withdrawal,
+            )?;
+            ensure!(
+                *reconciliation_queries <= 1,
+                "rebalance master-return reconciliation query limit exceeded"
+            );
+        }
+        P::BinanceMasterReturnSubmitted {
+            client_transaction_id,
+            transaction_id,
+            revalidation_binance_balance,
+            revalidation_wallet_balance,
+            revalidation_required_withdrawal,
+        } => {
+            validate_master_return_evidence(
+                intent,
+                client_transaction_id,
+                *revalidation_binance_balance,
+                *revalidation_wallet_balance,
+                *revalidation_required_withdrawal,
+            )?;
+            ensure!(*transaction_id > 0, "rebalance master-return id is zero");
+        }
         P::BinanceWithdrawalSubmitted {
             submission_reference,
             ..
@@ -1505,9 +1688,62 @@ fn validate_progress_evidence(
                 .context("rebalance completed balance overflow")?;
             ensure!(!total.is_zero(), "rebalance completed balances are zero");
         }
+        P::CancelledStale {
+            master_return_transaction_id,
+            revalidation_binance_balance,
+            revalidation_wallet_balance,
+            revalidation_required_withdrawal,
+        } => {
+            validate_master_return_evidence(
+                intent,
+                &stale_master_return_client_id(intent),
+                *revalidation_binance_balance,
+                *revalidation_wallet_balance,
+                *revalidation_required_withdrawal,
+            )?;
+            ensure!(
+                *master_return_transaction_id > 0,
+                "rebalance cancelled-stale master-return id is zero"
+            );
+        }
         P::IntentRecorded | P::Failed { .. } | P::Quarantined { .. } => {}
     }
     Ok(())
+}
+
+fn validate_master_return_evidence(
+    intent: &RebalanceExecutionIntent,
+    client_transaction_id: &str,
+    revalidation_binance_balance: U256,
+    revalidation_wallet_balance: U256,
+    revalidation_required_withdrawal: U256,
+) -> anyhow::Result<()> {
+    ensure!(
+        intent.direction == Direction::BinanceToWallet,
+        "rebalance master-return evidence belongs to the wrong direction"
+    );
+    ensure!(
+        client_transaction_id == stale_master_return_client_id(intent),
+        "rebalance master-return client id is not deterministic"
+    );
+    ensure!(
+        revalidation_required_withdrawal < intent.amount
+            || (!intent.revalidation_start_balance.is_zero()
+                && revalidation_wallet_balance >= intent.revalidation_start_balance),
+        "rebalance stale cancellation is still required by current balances"
+    );
+    let total = revalidation_binance_balance
+        .checked_add(revalidation_wallet_balance)
+        .context("rebalance stale-cancellation balance overflow")?;
+    ensure!(
+        !total.is_zero(),
+        "rebalance stale-cancellation balances are zero"
+    );
+    Ok(())
+}
+
+pub fn stale_master_return_client_id(intent: &RebalanceExecutionIntent) -> String {
+    format!("rc{}", &intent.fingerprint[..30])
 }
 
 fn request_fingerprint(request: &RebalanceExecutionRequest) -> anyhow::Result<String> {
@@ -1522,6 +1758,7 @@ fn request_fingerprint(request: &RebalanceExecutionRequest) -> anyhow::Result<St
         "amount": request.action.amount.to_string(),
         "binance_before": request.binance_balance_before.to_string(),
         "wallet_before": request.wallet_balance_before.to_string(),
+        "revalidation_start_balance": request.revalidation_start_balance.to_string(),
         "maximum_fee": request.maximum_fee.map(|value| value.to_string()),
         "approval_session_id": request.approval_session_id,
     }))?;
@@ -1638,7 +1875,7 @@ mod tests {
 
     use super::{
         RebalanceExecutionAuthority, RebalanceExecutionJournal, RebalanceExecutionProgress,
-        RebalanceExecutionRequest, WirePayload, WireRecord,
+        RebalanceExecutionRequest, WirePayload, WireRecord, stale_master_return_client_id,
     };
     use crate::rebalance::{Direction, RebalanceAction, Route};
 
@@ -1678,6 +1915,7 @@ mod tests {
             },
             binance_balance_before: U256::from(8_000_000_u64),
             wallet_balance_before: U256::from(8_000_000_u64),
+            revalidation_start_balance: U256::from(3_200_000_u64),
             maximum_fee: is_arbitrum.then(|| U256::from(100_000_u64)),
             approval_session_id: is_arbitrum.then(|| "esp-usdc-arbitrum-full-live".to_owned()),
         }
@@ -1733,6 +1971,93 @@ mod tests {
             binance_network: "ARBITRUM".to_owned(),
             chain_id: 42_161,
         }
+    }
+
+    #[test]
+    fn proven_absent_stale_withdrawal_returns_master_inventory_before_cancellation() {
+        let path = path("stale-withdrawal-cancellation");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id.clone();
+        let return_client_id = stale_master_return_client_id(&operation.intent);
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 10,
+                    bridge_balance_before: U256::from(100),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: 10,
+                    bridge_balance_before: U256::from(100),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::from(100),
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::from(100),
+                    reconciliation_queries: 1,
+                },
+            )
+            .unwrap();
+        let start_return = |reconciliation_queries| {
+            RebalanceExecutionProgress::BinanceMasterReturnSubmissionStarted {
+                client_transaction_id: return_client_id.clone(),
+                revalidation_binance_balance: U256::from(6_000_000_u64),
+                revalidation_wallet_balance: U256::from(10_000_000_u64),
+                revalidation_required_withdrawal: U256::ZERO,
+                reconciliation_queries,
+            }
+        };
+        journal.advance(&operation_id, start_return(0)).unwrap();
+        journal.advance(&operation_id, start_return(1)).unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceMasterReturnSubmitted {
+                    client_transaction_id: return_client_id,
+                    transaction_id: 11,
+                    revalidation_binance_balance: U256::from(6_000_000_u64),
+                    revalidation_wallet_balance: U256::from(10_000_000_u64),
+                    revalidation_required_withdrawal: U256::ZERO,
+                },
+            )
+            .unwrap();
+        let cancelled = journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::CancelledStale {
+                    master_return_transaction_id: 11,
+                    revalidation_binance_balance: U256::from(6_000_000_u64),
+                    revalidation_wallet_balance: U256::from(10_000_000_u64),
+                    revalidation_required_withdrawal: U256::ZERO,
+                },
+            )
+            .unwrap();
+        assert!(cancelled.progress.terminal());
+        assert!(journal.active_operation().unwrap().is_none());
+        drop(journal);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2576,6 +2901,7 @@ mod tests {
             binance_balance_before: U256::from(10_000_u64)
                 * U256::from(10_u64).pow(U256::from(18_u64)),
             wallet_balance_before: U256::ZERO,
+            revalidation_start_balance: U256::ZERO,
             maximum_fee_base_units: None,
             approval_session_id: None,
         };
@@ -2601,6 +2927,7 @@ mod tests {
             amount: U256::from(1_197_503_244_u64),
             binance_balance_before: U256::from(3_075_000_679_u64),
             wallet_balance_before: U256::from(679_994_191_u64),
+            revalidation_start_balance: U256::ZERO,
             maximum_fee_base_units: None,
             approval_session_id: None,
         };
