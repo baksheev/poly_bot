@@ -1913,6 +1913,23 @@ impl TradingEngine {
         self.rebalance_inflight_since = None;
         match result {
             Ok(operation) => {
+                if self
+                    .rebalance_blocked_tokens
+                    .remove(&operation.intent.token_symbol)
+                {
+                    tracing::info!(
+                        token = operation.intent.token_symbol,
+                        "rebalance token quarantine cleared after durable recovery"
+                    );
+                    self.telemetry.emit(
+                        "rebalance_token_quarantine_cleared",
+                        json!({
+                            "engine_id": self.config.engine_id,
+                            "token": operation.intent.token_symbol,
+                            "blocked_token_count": self.rebalance_blocked_tokens.len(),
+                        }),
+                    );
+                }
                 if let (Some(binance), Some(wallet)) = (
                     self.state.balances.binance.as_ref(),
                     self.state.balances.wallet.as_ref(),

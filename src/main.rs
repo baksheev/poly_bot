@@ -142,6 +142,7 @@ enum RebalanceExecutorEvent {
         result: Result<RebalanceExecutionOperation, String>,
         active_operation_after: bool,
         blocked_token: Option<String>,
+        next_recovery: Option<Box<RebalanceExecutionOperation>>,
     },
     Execution {
         target: RebalanceExecutionTarget,
@@ -2342,6 +2343,7 @@ async fn run(
             .await?;
             executor.set_capital_policy(capital_policy)?;
             executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
+            executor.reopen_next_retryable_quarantine()?;
             telemetry.emit(
                 "runtime_journal_recovery",
                 serde_json::json!({
@@ -3058,38 +3060,48 @@ async fn run(
             let task = tokio::spawn(async move {
                 emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
                 if recover_on_start {
-                    let saga_started_at = Instant::now();
-                    let result = recover_rebalance_with_quote_retries(&mut executor).await;
-                    let blocked_token = if let Err(error) = &result {
-                        executor
-                            .quarantine_active_operation(error)?
-                            .map(|operation| operation.intent.token_symbol)
-                    } else {
-                        None
-                    };
-                    emit_rebalance_saga(
-                        &rebalance_telemetry,
-                        &rebalance_engine_id,
-                        recovery_target,
-                        &result,
-                        &executor,
-                        saga_started_at,
-                        true,
-                    );
-                    emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
-                    risk_sender.send_replace(executor.rebalance_risk()?);
-                    let active_operation_after = executor.active_operation()?.is_some();
-                    if result_sender
-                        .send(RebalanceExecutorEvent::Recovery {
-                            target: recovery_target,
-                            result,
-                            active_operation_after,
-                            blocked_token,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return Ok::<(), anyhow::Error>(());
+                    let mut current_target = recovery_target;
+                    loop {
+                        let saga_started_at = Instant::now();
+                        let result = recover_rebalance_with_quote_retries(&mut executor).await;
+                        let blocked_token = if let Err(error) = &result {
+                            executor
+                                .quarantine_active_operation(error)?
+                                .map(|operation| operation.intent.token_symbol)
+                        } else {
+                            None
+                        };
+                        emit_rebalance_saga(
+                            &rebalance_telemetry,
+                            &rebalance_engine_id,
+                            current_target,
+                            &result,
+                            &executor,
+                            saga_started_at,
+                            true,
+                        );
+                        emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
+                        risk_sender.send_replace(executor.rebalance_risk()?);
+                        let next_recovery = executor.reopen_next_retryable_quarantine()?;
+                        let active_operation_after = next_recovery.is_some();
+                        let following_target = next_recovery.as_ref().map(rebalance_target);
+                        if result_sender
+                            .send(RebalanceExecutorEvent::Recovery {
+                                target: current_target,
+                                result,
+                                active_operation_after,
+                                blocked_token,
+                                next_recovery: next_recovery.map(Box::new),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        let Some(target) = following_target else {
+                            break;
+                        };
+                        current_target = target;
                     }
                 }
                 while let Some((target, request)) = request_receiver.recv().await {
@@ -3672,6 +3684,12 @@ async fn run(
                         ..
                     } => *active_operation_after,
                 };
+                let next_recovery = match &result {
+                    RebalanceExecutorEvent::Recovery { next_recovery, .. } => {
+                        next_recovery.clone()
+                    }
+                    RebalanceExecutorEvent::Execution { .. } => None,
+                };
                 match result {
                     RebalanceExecutorEvent::Recovery {
                         target,
@@ -3713,6 +3731,16 @@ async fn run(
                             esp_engine.on_rebalance_execution_result(Err(&error), blocked_token)?
                         }
                     },
+                }
+                if let Some(operation) = next_recovery.as_deref() {
+                    match rebalance_target(operation) {
+                        RebalanceExecutionTarget::Primary => {
+                            engine.on_rebalance_recovery_started(operation)?
+                        }
+                        RebalanceExecutionTarget::Arbitrum => {
+                            esp_engine.on_rebalance_recovery_started(operation)?
+                        }
+                    }
                 }
                 rebalance_lane_busy = active_operation_after;
                 if !rebalance_lane_busy {

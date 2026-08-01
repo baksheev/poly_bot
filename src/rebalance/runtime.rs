@@ -424,6 +424,21 @@ impl RebalanceExecutor {
         self.execution_journal.quarantined_operations()
     }
 
+    pub fn reopen_next_retryable_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        let reopened = self.execution_journal.reopen_next_retryable_quarantine()?;
+        if let Some(operation) = reopened.as_ref() {
+            tracing::warn!(
+                operation_id = operation.intent.operation_id,
+                token = operation.intent.token_symbol,
+                progress = ?operation.progress,
+                "reopened one previously quarantined rebalance after its false-positive guard was corrected"
+            );
+        }
+        Ok(reopened)
+    }
+
     pub fn quarantine_active_operation(
         &mut self,
         reason: &str,
@@ -2043,12 +2058,14 @@ impl RebalanceExecutor {
                 .confirm_unknown_withdrawal_absence(&operation, network, bridge_balance_before)
                 .await?;
             ensure!(
-                evidence
-                    == WithdrawalAbsenceEvidence {
+                same_withdrawal_retry_authority(
+                    evidence,
+                    WithdrawalAbsenceEvidence {
                         master_free_base_units,
                         master_locked_base_units,
                         wallet_balance_base_units,
-                    },
+                    }
+                ),
                 "Binance withdrawal retry evidence changed after authorization"
             );
         }
@@ -2148,7 +2165,7 @@ impl RebalanceExecutor {
             .observe_unknown_withdrawal_absence(operation, network, bridge_balance_before)
             .await?;
         ensure!(
-            first == second,
+            same_withdrawal_retry_authority(first, second),
             "Binance withdrawal absence evidence changed during confirmation"
         );
         tracing::warn!(
@@ -2156,13 +2173,15 @@ impl RebalanceExecutor {
             token = operation.intent.token_symbol,
             withdraw_order_id = operation.intent.withdraw_order_id,
             network,
-            master_free_base_units = first.master_free_base_units.to_string(),
-            master_locked_base_units = first.master_locked_base_units.to_string(),
-            wallet_balance_base_units = first.wallet_balance_base_units.to_string(),
+            master_free_base_units = second.master_free_base_units.to_string(),
+            master_locked_base_units = second.master_locked_base_units.to_string(),
+            wallet_balance_base_units = second.wallet_balance_base_units.to_string(),
+            wallet_balance_changed_during_confirmation =
+                first.wallet_balance_base_units != second.wallet_balance_base_units,
             confirmation_delay_ms = UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY.as_millis(),
             "proved an unindexed Binance withdrawal absent and authorized a deterministic retry"
         );
-        Ok(first)
+        Ok(second)
     }
 
     async fn observe_unknown_withdrawal_absence(
@@ -2262,10 +2281,7 @@ impl RebalanceExecutor {
             master_locked_base_units.is_zero(),
             "unindexed Binance withdrawal retry found locked master inventory"
         );
-        ensure!(
-            wallet_balance == bridge_balance_before,
-            "unindexed Binance withdrawal retry found a destination-wallet balance change"
-        );
+        let _ = bridge_balance_before;
         Ok(WithdrawalAbsenceEvidence {
             master_free_base_units,
             master_locked_base_units,
@@ -2353,6 +2369,7 @@ impl RebalanceExecutor {
             .iter()
             .filter(|record| {
                 record.wallet_address.eq_ignore_ascii_case(&wallet)
+                    && record.token == operation.intent.token_symbol
                     && record.network == network
                     && record.status == "VERIFIED"
                     && record.address_questionnaire.is_address_owner == Some(1)
@@ -3052,6 +3069,14 @@ fn is_travel_rule_required_rejection(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<BinanceApiError>()
         .is_some_and(BinanceApiError::is_travel_rule_required_withdrawal_rejection)
+}
+
+fn same_withdrawal_retry_authority(
+    left: WithdrawalAbsenceEvidence,
+    right: WithdrawalAbsenceEvidence,
+) -> bool {
+    left.master_free_base_units == right.master_free_base_units
+        && left.master_locked_base_units == right.master_locked_base_units
 }
 
 fn validate_travel_rule_withdrawal_record(

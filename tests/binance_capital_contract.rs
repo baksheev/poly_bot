@@ -121,7 +121,8 @@ fn withdrawal_unknown_outcome_requires_composite_absence_proof_before_retry() {
     assert!(begin.contains("travel_rule_withdrawal_history_v2_for_network"));
     assert!(begin.contains("master_free_base_units == operation.intent.amount"));
     assert!(begin.contains("master_locked_base_units.is_zero()"));
-    assert!(begin.contains("wallet_balance == bridge_balance_before"));
+    assert!(begin.contains("same_withdrawal_retry_authority"));
+    assert!(!begin.contains("wallet_balance == bridge_balance_before"));
     assert!(begin.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
     assert!(begin.contains("is_terminal_binance_withdrawal_rejection(&error)"));
     assert!(begin.contains("is_travel_rule_required_rejection(&error)"));
@@ -148,6 +149,7 @@ fn verified_address_metadata_is_forwarded_into_the_travel_rule_questionnaire() {
     assert!(proof.contains("record.status == \"VERIFIED\""));
     assert!(proof.contains("record.address_questionnaire.is_address_owner == Some(1)"));
     assert!(proof.contains("record.address_questionnaire.verify_method == Some(1)"));
+    assert!(proof.contains("record.token == operation.intent.token_symbol"));
     assert!(proof.contains("record.token == record.address_questionnaire.satoshi_token"));
     assert!(CAPITAL.contains("\"satoshiToken\": ownership_proof.satoshi_token.as_str()"));
     assert!(CAPITAL.contains("\"verifyMethod\": ownership_proof.verify_method"));

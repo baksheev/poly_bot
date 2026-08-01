@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions, symlink_metadata},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -246,6 +246,8 @@ pub struct RebalanceExecutionJournal {
     file: File,
     operations: BTreeMap<String, RebalanceExecutionOperation>,
     operation_started_at_unix_ms: BTreeMap<String, u64>,
+    progress_before_quarantine: BTreeMap<String, RebalanceExecutionProgress>,
+    retried_quarantined_operations: BTreeSet<String>,
     next_sequence: u64,
     poisoned: bool,
 }
@@ -315,8 +317,10 @@ impl RebalanceExecutionJournal {
             sync_parent(&path)?;
         }
 
-        let mut operations = BTreeMap::new();
+        let mut operations: BTreeMap<String, RebalanceExecutionOperation> = BTreeMap::new();
         let mut operation_started_at_unix_ms = BTreeMap::new();
+        let mut progress_before_quarantine = BTreeMap::new();
+        let mut retried_quarantined_operations = BTreeSet::new();
         let mut expected_sequence = 0_u64;
         let mut reader = BufReader::new(
             file.try_clone()
@@ -355,6 +359,23 @@ impl RebalanceExecutionJournal {
             operation_started_at_unix_ms
                 .entry(payload.operation.intent.operation_id.clone())
                 .or_insert(payload.recorded_at_unix_ms);
+            if let Some(previous) = operations.get(&payload.operation.intent.operation_id) {
+                if matches!(
+                    payload.operation.progress,
+                    RebalanceExecutionProgress::Quarantined { .. }
+                ) {
+                    progress_before_quarantine.insert(
+                        payload.operation.intent.operation_id.clone(),
+                        previous.progress.clone(),
+                    );
+                } else if matches!(
+                    previous.progress,
+                    RebalanceExecutionProgress::Quarantined { .. }
+                ) {
+                    retried_quarantined_operations
+                        .insert(payload.operation.intent.operation_id.clone());
+                }
+            }
             apply_snapshot(
                 &mut operations,
                 &payload.operation,
@@ -370,6 +391,8 @@ impl RebalanceExecutionJournal {
             file,
             operations,
             operation_started_at_unix_ms,
+            progress_before_quarantine,
+            retried_quarantined_operations,
             next_sequence: expected_sequence,
             poisoned: false,
         })
@@ -399,6 +422,41 @@ impl RebalanceExecutionJournal {
                 RebalanceExecutionProgress::Quarantined { .. }
             )
         })
+    }
+
+    pub fn reopen_next_retryable_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        ensure!(
+            self.active_operation()?.is_none(),
+            "cannot reopen a quarantined rebalance while another operation is active"
+        );
+        let candidate = self.operations.values().find_map(|operation| {
+            let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
+                return None;
+            };
+            if self
+                .retried_quarantined_operations
+                .contains(&operation.intent.operation_id)
+                || !matches!(
+                    reason.as_str(),
+                    "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        | "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                )
+            {
+                return None;
+            }
+            self.progress_before_quarantine
+                .get(&operation.intent.operation_id)
+                .cloned()
+                .map(|progress| (operation.intent.operation_id.clone(), progress))
+        });
+        let Some((operation_id, progress)) = candidate else {
+            return Ok(None);
+        };
+        let reopened = self.advance(&operation_id, progress)?;
+        self.retried_quarantined_operations.insert(operation_id);
+        Ok(Some(reopened))
     }
 
     pub fn rebalance_risk(&self, approval_session_id: &str) -> anyhow::Result<RebalanceRisk> {
@@ -538,6 +596,15 @@ impl RebalanceExecutionJournal {
             .operations
             .get(operation_id)
             .with_context(|| format!("unknown rebalance operation {operation_id}"))?;
+        if matches!(
+            current.progress,
+            RebalanceExecutionProgress::Quarantined { .. }
+        ) {
+            ensure!(
+                self.progress_before_quarantine.get(operation_id) == Some(&progress),
+                "quarantined rebalance may only reopen its exact prior durable progress"
+            );
+        }
         validate_transition(
             &current.intent,
             &current.progress,
@@ -562,6 +629,9 @@ impl RebalanceExecutionJournal {
             operation,
         };
         let mut next_operations = self.operations.clone();
+        let previous_progress = next_operations
+            .get(&payload.operation.intent.operation_id)
+            .map(|operation| operation.progress.clone());
         apply_snapshot(
             &mut next_operations,
             &payload.operation,
@@ -571,6 +641,8 @@ impl RebalanceExecutionJournal {
         next_started_at
             .entry(payload.operation.intent.operation_id.clone())
             .or_insert(payload.recorded_at_unix_ms);
+        let appended_operation_id = payload.operation.intent.operation_id.clone();
+        let appended_progress = payload.operation.progress.clone();
         let record = WireRecord::new(payload)?;
         let mut encoded = serde_json::to_vec(&record)
             .context("failed to encode rebalance executor journal record")?;
@@ -589,6 +661,21 @@ impl RebalanceExecutionJournal {
                 .context("failed to durably append rebalance executor journal record");
         }
         self.operations = next_operations;
+        if let Some(previous_progress) = previous_progress {
+            if matches!(
+                appended_progress,
+                RebalanceExecutionProgress::Quarantined { .. }
+            ) {
+                self.progress_before_quarantine
+                    .insert(appended_operation_id.clone(), previous_progress);
+            } else if matches!(
+                previous_progress,
+                RebalanceExecutionProgress::Quarantined { .. }
+            ) {
+                self.retried_quarantined_operations
+                    .insert(appended_operation_id);
+            }
+        }
         self.operation_started_at_unix_ms = next_started_at;
         self.next_sequence = self
             .next_sequence
@@ -897,10 +984,32 @@ fn validate_transition(
             RebalanceExecutionProgress::Completed { .. },
         ) if reason == "terminal Binance standard withdrawal rejection after approved local-entity endpoint correction: Binance standard withdrawal submission failed with HTTP 400 Bad Request, code -4104: Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation."
     );
+    let approved_quarantine_retry = matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                reconciliation_queries,
+                ..
+            },
+        ) if (reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
+            && api_mode == "travel_rule_ae_self_owned"
+            && *reconciliation_queries == 1)
+            || (reason == "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                && api_mode == "travel_rule_required_after_standard_-4104"
+                && *reconciliation_queries == 0)
+    );
     ensure!(
-        !previous.terminal() || approved_terminal_retry || approved_terminal_manual_completion,
+        !previous.terminal()
+            || approved_terminal_retry
+            || approved_terminal_manual_completion
+            || approved_quarantine_retry,
         "rebalance operation is already terminal"
     );
+    if approved_quarantine_retry {
+        return validate_progress_evidence(intent, next);
+    }
     if matches!(
         next,
         RebalanceExecutionProgress::Failed { .. } | RebalanceExecutionProgress::Quarantined { .. }
@@ -1221,10 +1330,9 @@ fn validate_progress_evidence(
         }
         P::BinanceWithdrawalRetryAuthorized {
             api_mode,
-            bridge_balance_before,
             master_free_base_units,
             master_locked_base_units,
-            wallet_balance_base_units,
+            ..
         } => {
             ensure!(
                 matches!(api_mode.as_str(), "standard" | "travel_rule_ae_self_owned"),
@@ -1237,10 +1345,6 @@ fn validate_progress_evidence(
             ensure!(
                 master_locked_base_units.is_zero(),
                 "rebalance Binance withdrawal retry retained locked master inventory"
-            );
-            ensure!(
-                wallet_balance_base_units == bridge_balance_before,
-                "rebalance Binance withdrawal retry observed a wallet credit"
             );
         }
         P::BinanceWithdrawalSubmitted {
@@ -1740,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_balance_and_wallet_evidence_durably_authorize_one_withdrawal_retry() {
+    fn exact_free_unlocked_master_balance_durably_authorizes_one_withdrawal_retry() {
         let path = path("balance-proven-withdrawal-retry");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -1825,7 +1929,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_retry_authorization_rejects_locked_or_changed_inventory() {
+    fn withdrawal_retry_authorization_rejects_locked_or_changed_master_inventory() {
         let path = path("invalid-balance-proven-withdrawal-retry");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -1886,17 +1990,101 @@ mod tests {
                 master_locked_base_units: U256::ZERO,
                 wallet_balance_base_units: U256::from(9),
             },
-            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
-                api_mode: "standard".to_owned(),
-                bridge_balance_before: U256::from(9),
-                master_free_base_units: amount,
-                master_locked_base_units: U256::ZERO,
-                wallet_balance_base_units: U256::from(10),
-            },
         ] {
             assert!(journal.advance(&operation_id, invalid).is_err());
         }
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                    api_mode: "standard".to_owned(),
+                    bridge_balance_before: U256::from(9),
+                    master_free_base_units: amount,
+                    master_locked_base_units: U256::ZERO,
+                    wallet_balance_base_units: U256::from(10),
+                },
+            )
+            .expect("wallet movement is diagnostic when the exact master amount remains free");
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrected_false_positive_quarantine_reopens_once_from_durable_prior_progress() {
+        let path = path("one-time-quarantine-recovery");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferSubmitted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::from(9),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceTransferCompleted {
+                    transaction_id: 1,
+                    bridge_balance_before: U256::from(9),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: U256::from(9),
+                    reconciliation_queries: 1,
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the reviewed false positive should reopen");
+        assert!(matches!(
+            reopened.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                ref api_mode,
+                reconciliation_queries: 1,
+                ..
+            } if api_mode == "travel_rule_ae_self_owned"
+        ));
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            replayed
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        drop(replayed);
         fs::remove_file(path).unwrap();
     }
 
