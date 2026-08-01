@@ -286,6 +286,83 @@ WHERE kind = '{ARBITRAGE_RESULT_KIND}'
             .execute()
             .await
             .context("failed to create ClickHouse arbitrage results materialized view")?;
+        client
+            .query(&format!(
+                r#"
+CREATE TABLE IF NOT EXISTS {}.resource_balance_snapshots
+(
+    observed_at_ms UInt64,
+    engine_id LowCardinality(String),
+    resource_id LowCardinality(String),
+    resource_kind LowCardinality(String),
+    usage LowCardinality(String),
+    account_id LowCardinality(String),
+    wallet_id LowCardinality(String),
+    wallet_location_id LowCardinality(String),
+    network_id LowCardinality(String),
+    chain_id UInt64,
+    asset LowCardinality(String),
+    decimals UInt8,
+    balance_base_units String,
+    balance String,
+    consumption_24h_base_units String,
+    consumption_24h String,
+    average_daily_consumption_base_units String,
+    average_daily_consumption String,
+    consumption_window_ms UInt64,
+    consumption_window_complete UInt8,
+    request_duration_us UInt64,
+    payload_json String,
+    ingested_at DateTime64(3, 'UTC') DEFAULT now64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Milli(observed_at_ms))
+ORDER BY (resource_id, observed_at_ms)
+"#,
+                self.database
+            ))
+            .execute()
+            .await
+            .context("failed to create ClickHouse resource balance snapshots table")?;
+        client
+            .query(&format!(
+                r#"
+CREATE MATERIALIZED VIEW IF NOT EXISTS {}.resource_balance_snapshots_from_telemetry
+TO {}.resource_balance_snapshots
+AS SELECT
+    observed_at_ms,
+    JSONExtractString(payload_json, 'engine_id') AS engine_id,
+    JSONExtractString(payload_json, 'resource_id') AS resource_id,
+    JSONExtractString(payload_json, 'resource_kind') AS resource_kind,
+    JSONExtractString(payload_json, 'usage') AS usage,
+    JSONExtractString(payload_json, 'account_id') AS account_id,
+    JSONExtractString(payload_json, 'wallet_id') AS wallet_id,
+    JSONExtractString(payload_json, 'wallet_location_id') AS wallet_location_id,
+    JSONExtractString(payload_json, 'network_id') AS network_id,
+    JSONExtractUInt(payload_json, 'chain_id') AS chain_id,
+    JSONExtractString(payload_json, 'asset') AS asset,
+    toUInt8(JSONExtractUInt(payload_json, 'decimals')) AS decimals,
+    JSONExtractString(payload_json, 'balance_base_units') AS balance_base_units,
+    JSONExtractString(payload_json, 'balance') AS balance,
+    JSONExtractString(payload_json, 'consumption_24h_base_units') AS consumption_24h_base_units,
+    JSONExtractString(payload_json, 'consumption_24h') AS consumption_24h,
+    JSONExtractString(payload_json, 'average_daily_consumption_base_units') AS average_daily_consumption_base_units,
+    JSONExtractString(payload_json, 'average_daily_consumption') AS average_daily_consumption,
+    JSONExtractUInt(payload_json, 'consumption_window_ms') AS consumption_window_ms,
+    JSONExtractBool(payload_json, 'consumption_window_complete') AS consumption_window_complete,
+    JSONExtractUInt(payload_json, 'request_duration_us') AS request_duration_us,
+    payload_json
+FROM {}.runtime_telemetry
+WHERE kind = '{}' AND JSONExtractString(payload_json, 'outcome') = 'success'
+"#,
+                self.database,
+                self.database,
+                self.database,
+                crate::resource_balances::RESOURCE_BALANCE_TELEMETRY_KIND,
+            ))
+            .execute()
+            .await
+            .context("failed to create ClickHouse resource balance materialized view")?;
         Ok(())
     }
 

@@ -85,6 +85,7 @@ use arb_bot::{
         RebalanceExecutor, RebalanceRisk, RebalanceRuntimeLimits, RebalanceTracker,
         V12RebalanceParityAdapter, rebalance_base_units_to_decimal, route_candidates_from_capital,
     },
+    resource_balances::{EvmGasBalanceSource, RESOURCE_BALANCE_INTERVAL, ResourceBalanceMonitor},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{
         CompiledStrategyDependencyIndex, FairLatestOnlySizingScheduler, HotPathDecisionOwner,
@@ -2171,6 +2172,53 @@ async fn run(
         "wallet RPC returned chain id {wallet_chain_id}, expected {}",
         pair.chain.chain_id
     );
+    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
+        format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
+    })?;
+    let optimism_rpc = JsonRpcClient::new(optimism_endpoint)?;
+    let mut gas_balance_sources = if let Some(registry) = network_registry.as_ref() {
+        registry
+            .runtimes()
+            .map(|runtime| {
+                EvmGasBalanceSource::trading(
+                    runtime.plan().network_id.as_str().to_owned(),
+                    runtime.plan().chain_id,
+                    runtime.plan().wallet_location_id.as_str().to_owned(),
+                    runtime.rpc().clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![EvmGasBalanceSource::trading(
+            arb_bot::telemetry::network_id(wallet_chain_id),
+            wallet_chain_id,
+            arb_bot::telemetry::wallet_location_id(wallet_chain_id),
+            wallet_rpc.clone(),
+        )]
+    };
+    gas_balance_sources.push(EvmGasBalanceSource::bridge(
+        "eip155:10".to_owned(),
+        OPTIMISM_CHAIN_ID,
+        "eip155:10:evm-wallet:primary".to_owned(),
+        optimism_rpc.clone(),
+    ));
+    let resource_balance_source_count = gas_balance_sources.len() + 1;
+    let resource_balance_monitor = ResourceBalanceMonitor::new(
+        telemetry.clone(),
+        config.engine_id.clone(),
+        wallet_owner,
+        gas_balance_sources,
+        binance_account_client.clone(),
+    )?;
+    let resource_balance_task = tokio::spawn(resource_balance_monitor.run());
+    tracing::info!(
+        interval_seconds = RESOURCE_BALANCE_INTERVAL.as_secs(),
+        resource_count = resource_balance_source_count,
+        consumption_window_hours = 24,
+        consumption_model = "sum_of_balance_decreases_excluding_refills",
+        readiness_gate = false,
+        "background resource balance monitor started"
+    );
     let wallet_tokens = vec![
         TokenBalanceRequest {
             symbol: pair.token_a.symbol.clone(),
@@ -2297,9 +2345,6 @@ async fn run(
                 wallet.address() == wallet_owner,
                 "full rebalance signer does not match EVM_WALLET_ADDRESS"
             );
-            let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV).with_context(|| {
-                format!("required environment variable {OPTIMISM_RPC_URL_ENV} is not set")
-            })?;
             let transaction_journal_path =
                 std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
                     format!("required environment variable {WALLET_JOURNAL_PATH_ENV} is not set")
@@ -2326,7 +2371,7 @@ async fn run(
                 subaccount_email,
                 AcrossClient::new(&config)?,
                 wallet_rpc.clone(),
-                JsonRpcClient::new(optimism_endpoint)?,
+                optimism_rpc.clone(),
                 BTreeMap::new(),
                 wallet,
                 config.rebalance_executor_journal_path.clone(),
@@ -3952,10 +3997,12 @@ async fn run(
     wallet_balance_task.abort();
     esp_wallet_balance_task.abort();
     binance_clock_sync_task.abort();
+    resource_balance_task.abort();
     let _ = binance_balance_task.await;
     let _ = wallet_balance_task.await;
     let _ = esp_wallet_balance_task.await;
     let _ = binance_clock_sync_task.await;
+    let _ = resource_balance_task.await;
     dex_task.abort();
     let _ = dex_task.await;
     shadow_dex_task.abort();
