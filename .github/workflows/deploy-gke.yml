@@ -199,6 +199,33 @@ jobs:
           image="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}@${digest}"
           echo "image=${image}" >>"${GITHUB_OUTPUT}"
 
+      - name: Apply ClickHouse telemetry migrations
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          clickhouse_url="$(gcloud secrets versions access latest \
+            --secret=CLICKHOUSE_URL \
+            --project="${GCP_PROJECT_ID}")"
+          clickhouse_password="$(gcloud secrets versions access latest \
+            --secret=CLICKHOUSE_PASSWORD \
+            --project="${GCP_PROJECT_ID}")"
+          test -n "${clickhouse_url}"
+          test -n "${clickhouse_password}"
+          echo "::add-mask::${clickhouse_url}"
+          echo "::add-mask::${clickhouse_password}"
+          export CLICKHOUSE_URL="${clickhouse_url}"
+          export CLICKHOUSE_PASSWORD="${clickhouse_password}"
+          export CLICKHOUSE_USER=default
+          export CLICKHOUSE_DATABASE=arb_bot_prod
+          docker run --rm \
+            --env CLICKHOUSE_URL \
+            --env CLICKHOUSE_USER \
+            --env CLICKHOUSE_PASSWORD \
+            --env CLICKHOUSE_DATABASE \
+            "${IMAGE}" migrate
+
       - name: Get private cluster credentials
         uses: google-github-actions/get-gke-credentials@v3
         with:
