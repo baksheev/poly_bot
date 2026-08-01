@@ -21,7 +21,7 @@ use super::{Direction, Location, PendingTransfer, RebalanceAction, Route};
 const VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
-const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 2;
+const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalanceExecutionRequest {
@@ -450,6 +450,7 @@ impl RebalanceExecutionJournal {
                     reason.as_str(),
                     "unindexed Binance withdrawal retry found a destination-wallet balance change"
                         | "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                        | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
                 )
             {
                 return None;
@@ -1008,7 +1009,11 @@ fn validate_transition(
         ) if (reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
             && api_mode == "travel_rule_ae_self_owned"
             && *reconciliation_queries == 1)
-            || (reason == "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+            || (matches!(
+                    reason.as_str(),
+                    "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                        | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
+                )
                 && matches!(
                     api_mode.as_str(),
                     "travel_rule_required_after_standard_-4104" | "travel_rule_ae_self_owned"
@@ -1019,7 +1024,11 @@ fn validate_transition(
         (
             RebalanceExecutionProgress::Quarantined { reason },
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { api_mode, .. },
-        ) if reason == "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+        ) if matches!(
+                reason.as_str(),
+                "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                    | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
+            )
             && api_mode == "travel_rule_ae_self_owned"
     );
     ensure!(
@@ -2032,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn corrected_false_positive_quarantine_has_two_bounded_durable_reopens() {
+    fn corrected_false_positive_quarantine_has_three_bounded_durable_reopens() {
         let path = path("bounded-quarantine-recovery");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -2105,6 +2114,20 @@ mod tests {
             .unwrap()
             .expect("the second reviewed guard correction should reopen once more");
         assert_eq!(reopened_again.progress, reopened.progress);
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        let reopened_third = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the third reviewed guard correction should reopen once more");
+        assert_eq!(reopened_third.progress, reopened.progress);
         replayed
             .advance(
                 &operation_id,
@@ -2253,6 +2276,7 @@ mod tests {
             .reopen_next_retryable_quarantine()
             .unwrap()
             .expect("the second guard correction should restore its exact retry authority");
+        let expected_retry_progress = reopened_retry.progress.clone();
         assert!(matches!(
             reopened_retry.progress,
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
@@ -2266,6 +2290,38 @@ mod tests {
                 && master_locked_base_units.is_zero()
                 && wallet_balance_base_units == U256::from(11)
         ));
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        let reopened_after_token_scope_correction = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the exact retry authority should survive the token-scope correction");
+        assert_eq!(
+            reopened_after_token_scope_correction.progress,
+            expected_retry_progress
+        );
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            replayed
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none()
+        );
         drop(replayed);
         fs::remove_file(path).unwrap();
     }

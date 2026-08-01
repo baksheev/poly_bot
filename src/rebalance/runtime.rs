@@ -14,8 +14,8 @@ use crate::{
     binance::{
         account::{AccountInformation, BinanceAccountClient, BinanceApiError},
         capital::{
-            DepositRecord, TravelRuleAddressOwnershipProof, TravelRuleWithdrawalRecord,
-            WithdrawalRecord, select_capital_routes,
+            AddressVerificationRecord, DepositRecord, TravelRuleAddressOwnershipProof,
+            TravelRuleWithdrawalRecord, WithdrawalRecord, select_capital_routes,
         },
         sub_account::{SubAccountAssetBalance, UniversalTransferRecord},
     },
@@ -2367,19 +2367,10 @@ impl RebalanceExecutor {
         let wallet = format!("{:#x}", operation.intent.wallet_owner);
         let matching = records
             .iter()
-            .filter(|record| {
-                record.wallet_address.eq_ignore_ascii_case(&wallet)
-                    && record.token == operation.intent.token_symbol
-                    && record.network == network
-                    && record.status == "VERIFIED"
-                    && record.address_questionnaire.is_address_owner == Some(1)
-                    && record.address_questionnaire.verify_method == Some(1)
-                    && !record.address_questionnaire.satoshi_token.is_empty()
-                    && record.token == record.address_questionnaire.satoshi_token
-            })
+            .filter(|record| verified_self_owned_address_record(record, &wallet, network))
             .collect::<Vec<_>>();
         let record = matching.first().context(
-            "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token",
+            "Binance Travel Rule ownership verification is absent for the exact wallet and network",
         )?;
         tracing::info!(
             token = operation.intent.token_symbol,
@@ -2388,7 +2379,10 @@ impl RebalanceExecutor {
             "selected one equivalent Binance Travel Rule self-owned-wallet proof"
         );
         Ok(TravelRuleAddressOwnershipProof {
-            satoshi_token: record.address_questionnaire.satoshi_token.clone(),
+            // Binance verifies ownership of an EVM address on a network. The
+            // questionnaire's token answer belongs to this withdrawal, not to
+            // whichever coin was used to create the reusable address proof.
+            satoshi_token: operation.intent.token_symbol.clone(),
             verify_method: record
                 .address_questionnaire
                 .verify_method
@@ -3083,6 +3077,18 @@ fn same_withdrawal_retry_authority(
         && left.master_locked_base_units == right.master_locked_base_units
 }
 
+fn verified_self_owned_address_record(
+    record: &AddressVerificationRecord,
+    wallet: &str,
+    network: &str,
+) -> bool {
+    record.wallet_address.eq_ignore_ascii_case(wallet)
+        && record.network == network
+        && record.status == "VERIFIED"
+        && record.address_questionnaire.is_address_owner == Some(1)
+        && record.address_questionnaire.verify_method == Some(1)
+}
+
 fn validate_travel_rule_withdrawal_record(
     operation: &RebalanceExecutionOperation,
     record: &TravelRuleWithdrawalRecord,
@@ -3392,7 +3398,10 @@ mod tests {
     use crate::{
         binance::{
             account::{AccountInformation, AssetBalance},
-            capital::{TravelRuleWithdrawalRecord, WithdrawalRecord},
+            capital::{
+                AddressVerificationQuestionnaire, AddressVerificationRecord,
+                TravelRuleWithdrawalRecord, WithdrawalRecord,
+            },
         },
         chain::rpc::{ReceiptLog, TransactionReceipt},
         rebalance::Route,
@@ -3405,7 +3414,8 @@ mod tests {
         merge_travel_rule_withdrawal_detail, reconcile_approved_travel_rule_rejection,
         route_wallet_chain_id, shared_evm_confirmation_timeout, validate_across_fill_receipt,
         validate_approved_asset, validate_direct_withdrawal_receipt,
-        withdrawal_received_base_units, withdrawal_requested_base_units,
+        verified_self_owned_address_record, withdrawal_received_base_units,
+        withdrawal_requested_base_units,
     };
 
     #[test]
@@ -3418,6 +3428,33 @@ mod tests {
             shared_evm_confirmation_timeout(Duration::from_secs(60)),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn verified_evm_address_ownership_is_reusable_for_another_token() {
+        let record = AddressVerificationRecord {
+            status: "VERIFIED".to_owned(),
+            token: "WLD".to_owned(),
+            network: "ARBITRUM".to_owned(),
+            wallet_address: "0x1111111111111111111111111111111111111111".to_owned(),
+            address_questionnaire: AddressVerificationQuestionnaire {
+                send_to: Some(1),
+                satoshi_token: "WLD".to_owned(),
+                is_address_owner: Some(1),
+                verify_method: Some(1),
+            },
+        };
+
+        assert!(verified_self_owned_address_record(
+            &record,
+            "0x1111111111111111111111111111111111111111",
+            "ARBITRUM",
+        ));
+        assert!(!verified_self_owned_address_record(
+            &record,
+            "0x1111111111111111111111111111111111111111",
+            "OPTIMISM",
+        ));
     }
 
     #[test]

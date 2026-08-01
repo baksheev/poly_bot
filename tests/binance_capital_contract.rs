@@ -146,13 +146,14 @@ fn verified_address_metadata_is_forwarded_into_the_travel_rule_questionnaire() {
     let proof = &REBALANCE_RUNTIME[start..end];
 
     assert!(proof.contains("questionnaire_country_code.as_deref() == Some(\"AE\")"));
-    assert!(proof.contains("record.status == \"VERIFIED\""));
-    assert!(proof.contains("record.address_questionnaire.is_address_owner == Some(1)"));
-    assert!(proof.contains("record.address_questionnaire.verify_method == Some(1)"));
-    assert!(proof.contains("record.token == operation.intent.token_symbol"));
+    assert!(proof.contains("verified_self_owned_address_record(record, &wallet, network)"));
+    assert!(REBALANCE_RUNTIME.contains("record.status == \"VERIFIED\""));
+    assert!(REBALANCE_RUNTIME.contains("record.address_questionnaire.is_address_owner == Some(1)"));
+    assert!(REBALANCE_RUNTIME.contains("record.address_questionnaire.verify_method == Some(1)"));
+    assert!(!proof.contains("record.token == operation.intent.token_symbol"));
     assert!(proof.contains("matching.first().context("));
     assert!(proof.contains("equivalent_verified_record_count = matching.len()"));
-    assert!(proof.contains("record.token == record.address_questionnaire.satoshi_token"));
+    assert!(proof.contains("satoshi_token: operation.intent.token_symbol.clone()"));
     assert!(CAPITAL.contains("\"satoshiToken\": ownership_proof.satoshi_token.as_str()"));
     assert!(CAPITAL.contains("\"verifyMethod\": ownership_proof.verify_method"));
 }
