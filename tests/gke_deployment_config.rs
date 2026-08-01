@@ -85,6 +85,10 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("runtime_rollback_patch"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl patch configmap arb-bot-runtime"));
     assert!(DEPLOY_WORKFLOW.contains("--type=json"));
+    assert!(DEPLOY_WORKFLOW.contains("Apply ClickHouse telemetry migrations"));
+    assert!(DEPLOY_WORKFLOW.contains("exec arb_bot migrate"));
+    assert!(DEPLOY_WORKFLOW.contains("secretProviderClass\": \"arb-bot-esp-market-data"));
+    assert!(!DEPLOY_WORKFLOW.contains("gcloud secrets versions access"));
     assert!(MAIN.contains("network_runtime_count"));
     assert!(MAIN.contains("binance_strategy_max_transport_silence_ms"));
     assert!(MAIN.contains("hot_path_strategy_count"));

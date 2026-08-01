@@ -199,33 +199,6 @@ jobs:
           image="${registry}/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}@${digest}"
           echo "image=${image}" >>"${GITHUB_OUTPUT}"
 
-      - name: Apply ClickHouse telemetry migrations
-        env:
-          IMAGE: ${{ steps.image.outputs.image }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-        run: |
-          set -euo pipefail
-          clickhouse_url="$(gcloud secrets versions access latest \
-            --secret=CLICKHOUSE_URL \
-            --project="${GCP_PROJECT_ID}")"
-          clickhouse_password="$(gcloud secrets versions access latest \
-            --secret=CLICKHOUSE_PASSWORD \
-            --project="${GCP_PROJECT_ID}")"
-          test -n "${clickhouse_url}"
-          test -n "${clickhouse_password}"
-          echo "::add-mask::${clickhouse_url}"
-          echo "::add-mask::${clickhouse_password}"
-          export CLICKHOUSE_URL="${clickhouse_url}"
-          export CLICKHOUSE_PASSWORD="${clickhouse_password}"
-          export CLICKHOUSE_USER=default
-          export CLICKHOUSE_DATABASE=arb_bot_prod
-          docker run --rm \
-            --env CLICKHOUSE_URL \
-            --env CLICKHOUSE_USER \
-            --env CLICKHOUSE_PASSWORD \
-            --env CLICKHOUSE_DATABASE \
-            "${IMAGE}" migrate
-
       - name: Get private cluster credentials
         uses: google-github-actions/get-gke-credentials@v3
         with:
@@ -234,6 +207,139 @@ jobs:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           namespace: ${{ env.GKE_NAMESPACE }}
           use_dns_based_endpoint: true
+
+      - name: Apply ClickHouse telemetry migrations
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+          migration_deployment="arb-bot-ch-migrate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup_migration() {
+            kubectl delete deployment "${migration_deployment}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --ignore-not-found \
+              --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup_migration EXIT
+
+          node_pool="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+          test -n "${node_pool}"
+
+          migration_json="$(kubectl create deployment "${migration_deployment}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --image="${IMAGE}" \
+            --dry-run=client \
+            -o json \
+            -- /bin/sh -ec 'sleep 300')"
+          jq \
+            --arg image "${IMAGE}" \
+            --arg node_pool "${node_pool}" \
+            --arg migration_instance "${migration_deployment}" \
+            '
+              .metadata.labels["app.kubernetes.io/name"] = "arb-bot-ch-migrate"
+              | .metadata.labels["arb-bot/migration-instance"] = $migration_instance
+              | .spec.replicas = 1
+              | .spec.revisionHistoryLimit = 0
+              | .spec.strategy = {"type": "Recreate"}
+              | .spec.selector.matchLabels = {
+                  "app.kubernetes.io/name": "arb-bot-ch-migrate",
+                  "arb-bot/migration-instance": $migration_instance
+                }
+              | .spec.template.metadata.labels["app.kubernetes.io/name"] = "arb-bot-ch-migrate"
+              | .spec.template.metadata.labels["arb-bot/migration-instance"] = $migration_instance
+              | .spec.template.spec.serviceAccountName = "arb-bot-runtime"
+              | .spec.template.spec.nodeSelector = {
+                  "cloud.google.com/gke-nodepool": $node_pool
+                }
+              | .spec.template.spec.securityContext = {
+                  "runAsNonRoot": true,
+                  "runAsUser": 65532,
+                  "runAsGroup": 65532,
+                  "fsGroup": 65532,
+                  "seccompProfile": {"type": "RuntimeDefault"}
+                }
+              | .spec.template.spec.containers[0].name = "hold"
+              | .spec.template.spec.containers[0].command = ["/bin/sh", "-ec"]
+              | .spec.template.spec.containers[0].args = ["sleep 300"]
+              | .spec.template.spec.containers[0].resources = {
+                  "requests": {"cpu": "5m", "memory": "8Mi"},
+                  "limits": {"cpu": "20m", "memory": "16Mi"}
+                }
+              | .spec.template.spec.containers[0].securityContext = {
+                  "allowPrivilegeEscalation": false,
+                  "readOnlyRootFilesystem": true,
+                  "capabilities": {"drop": ["ALL"]}
+                }
+              | .spec.template.spec.initContainers = [{
+                  "name": "migrate",
+                  "image": $image,
+                  "imagePullPolicy": "IfNotPresent",
+                  "command": ["/bin/sh", "-ec"],
+                  "args": [
+                    "export CLICKHOUSE_URL=\"$(cat /var/run/secrets/arb-bot-ch/CLICKHOUSE_URL)\"; export CLICKHOUSE_PASSWORD=\"$(cat /var/run/secrets/arb-bot-ch/CLICKHOUSE_PASSWORD)\"; export CLICKHOUSE_USER=default; export CLICKHOUSE_DATABASE=arb_bot_prod; exec arb_bot migrate"
+                  ],
+                  "resources": {
+                    "requests": {"cpu": "25m", "memory": "32Mi"},
+                    "limits": {"cpu": "250m", "memory": "128Mi"}
+                  },
+                  "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": {"drop": ["ALL"]}
+                  },
+                  "volumeMounts": [{
+                    "name": "clickhouse-secrets",
+                    "mountPath": "/var/run/secrets/arb-bot-ch",
+                    "readOnly": true
+                  }]
+                }]
+              | .spec.template.spec.volumes = [{
+                  "name": "clickhouse-secrets",
+                  "csi": {
+                    "driver": "secrets-store-gke.csi.k8s.io",
+                    "readOnly": true,
+                    "volumeAttributes": {
+                      "secretProviderClass": "arb-bot-esp-market-data"
+                    }
+                  }
+                }]
+            ' <<<"${migration_json}" \
+            | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+
+          migration_pod=
+          for _ in {1..60}; do
+            migration_pod="$(kubectl get pods \
+              --namespace "${GKE_NAMESPACE}" \
+              --selector="arb-bot/migration-instance=${migration_deployment}" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            test -z "${migration_pod}" || break
+            sleep 2
+          done
+          test -n "${migration_pod}"
+
+          migration_reason=
+          for _ in {1..60}; do
+            migration_reason="$(kubectl get pod "${migration_pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' \
+              2>/dev/null || true)"
+            case "${migration_reason}" in
+              Completed) break ;;
+              Error)
+                kubectl describe pod "${migration_pod}" \
+                  --namespace "${GKE_NAMESPACE}" || true
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+          if test "${migration_reason}" != Completed; then
+            kubectl describe pod "${migration_pod}" \
+              --namespace "${GKE_NAMESPACE}" || true
+            exit 1
+          fi
 
       - name: Gate exact image with capacity maximum-pair replay on target C4
         env:
