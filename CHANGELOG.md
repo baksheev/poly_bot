@@ -20,6 +20,12 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Promote diagnostic pre-trade cost telemetry to v3: bind source selection to
+  decision completion, retain bounded burst histories, learn receipt gas and
+  L1 fees per exact pool/input-token route, preserve bootstrap provenance and
+  receipt event time, capture candidates before inventory reservation with
+  joinable rejection context, and sample auxiliary raw books at one Hz. The
+  production 20 bps gate and all trading inputs remain unchanged.
 - Make diagnostic pre-trade cost telemetry decision-grade without entering the
   trading path: disable invalid unauthenticated collector cohorts, retain two
   temporal source samples to avoid refresh look-ahead gaps, enforce a

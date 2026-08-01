@@ -51,8 +51,18 @@ SELECT
     countIf(JSONExtractBool(cost_json, 'model_inputs_complete')) AS complete_evaluations,
     round(100 * complete_evaluations / evaluations, 2) AS complete_evaluation_percent,
     countIf(JSONExtractBool(cost_json, 'fixed_threshold_met')) AS fixed_threshold_candidates,
-    countIf(JSONExtractBool(cost_json, 'hypothetical_threshold_met')) AS hypothetical_net_5bps_candidates,
-    countIf(JSONExtractBool(cost_json, 'hypothetical_new_capture')) AS hypothetical_new_captures,
+    countIf(
+        JSONExtractBool(cost_json, 'fixed_threshold_met')
+        AND NOT JSONExtractBool(cost_json, 'model_inputs_complete')
+    ) AS incomplete_fixed_threshold_candidates,
+    countIf(
+        JSONExtractBool(cost_json, 'model_inputs_complete')
+        AND JSONExtractBool(cost_json, 'hypothetical_threshold_met')
+    ) AS complete_hypothetical_net_5bps_candidates,
+    countIf(
+        JSONExtractBool(cost_json, 'model_inputs_complete')
+        AND JSONExtractBool(cost_json, 'hypothetical_new_capture')
+    ) AS complete_hypothetical_new_captures,
     round(avg(JSONExtractInt(cost_json, 'gross_profit_bps_x100')) / 100, 2) AS average_gross_bps,
     round(avg(JSONExtractUInt(cost_json, 'binance_commission_bps_x100')) / 100, 2) AS average_binance_commission_bps,
     round(
@@ -82,10 +92,20 @@ SELECT
     ) AS complete_net_bps_p10_p50_p90,
     round(avg(telemetry_queue_delay_us), 2) AS average_telemetry_queue_delay_us,
     max(telemetry_queue_delay_us) AS maximum_telemetry_queue_delay_us,
-    countIf(NOT JSONExtractBool(cost_json, 'gas_price_available_pretrade')) AS missing_pretrade_gas_samples,
-    countIf(NOT JSONExtractBool(cost_json, 'gas_price_fresh')) AS stale_pretrade_gas_samples,
-    countIf(NOT JSONExtractBool(cost_json, 'native_conversion_available_pretrade')) AS missing_native_conversion_samples,
-    countIf(NOT JSONExtractBool(cost_json, 'native_conversion_fresh')) AS stale_native_conversion_samples,
+    quantiles(0.5, 0.9, 0.99)(JSONExtractUInt(cost_json, 'strategy_price_age_us'))
+        AS strategy_price_age_us_p50_p90_p99,
+    countIf(NOT JSONExtractBool(cost_json, 'gas_price_available_pretrade'))
+        AS unavailable_pretrade_gas_samples,
+    countIf(
+        JSONExtractBool(cost_json, 'gas_price_available_pretrade')
+        AND NOT JSONExtractBool(cost_json, 'gas_price_fresh')
+    ) AS available_but_stale_pretrade_gas_samples,
+    countIf(NOT JSONExtractBool(cost_json, 'native_conversion_available_pretrade'))
+        AS unavailable_native_conversion_samples,
+    countIf(
+        JSONExtractBool(cost_json, 'native_conversion_available_pretrade')
+        AND NOT JSONExtractBool(cost_json, 'native_conversion_fresh')
+    ) AS available_but_stale_native_conversion_samples,
     countIf(
         JSONExtractBool(cost_json, 'l1_fee_required')
         AND NOT JSONExtractBool(cost_json, 'l1_fee_available')
@@ -94,10 +114,21 @@ SELECT
         AS journal_bootstrap_receipt_samples,
     countIf(JSONExtractString(cost_json, 'receipt_cost_source') = 'live_execution_receipt')
         AS live_execution_receipt_samples,
+    countIf(JSONExtractString(cost_json, 'receipt_match_scope') = 'exact_pool_and_input_token')
+        AS exact_route_receipt_samples,
+    countIf(
+        JSONExtractString(cost_json, 'receipt_match_scope') = 'same_protocol_bootstrap_fallback'
+    ) AS same_protocol_bootstrap_fallback_samples,
+    countIf(empty(JSONExtractString(cost_json, 'receipt_match_scope')))
+        AS fixed_gas_limit_fallback_samples,
+    quantilesIf(0.5, 0.9, 0.99)(
+        JSONExtractUInt(cost_json, 'gas_units_event_age_us'),
+        JSONHas(cost_json, 'gas_units_event_age_us')
+    ) AS receipt_event_age_us_p50_p90_p99,
     uniqExact(update_id) AS unique_book_updates
 FROM modeled
 INNER JOIN coverage USING (engine_id, pair_id, symbol)
-WHERE JSONExtractString(cost_json, 'model_version') = 'diagnostic_net_edge_v2'
+WHERE JSONExtractString(cost_json, 'model_version') = 'diagnostic_net_edge_v3'
 GROUP BY engine_id, pair_id, symbol, direction, model_version,
     coverage.evaluation_records, coverage.sampled_records
 ORDER BY engine_id, pair_id, symbol, direction

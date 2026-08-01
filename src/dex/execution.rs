@@ -16,8 +16,8 @@ use crate::{
     dex::events::{PoolLocator, PoolUpdate, decode_pool_event},
     domain::compiled::CompiledNetworkGasPolicy,
     pretrade_cost::{
-        DexProtocol as CostTelemetryDexProtocol, GasPriceTelemetrySource, PreTradeCostTelemetry,
-        ReceiptCostTelemetrySource,
+        DexPoolCostKey, DexProtocol as CostTelemetryDexProtocol, DexRouteCostKey,
+        GasPriceTelemetrySource, PreTradeCostTelemetry, ReceiptCostTelemetrySource,
     },
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
@@ -498,16 +498,27 @@ impl DexExecutor {
                 .await;
                 match lookup {
                     Ok(Ok(Some(receipt))) if receipt.status == 1 => {
-                        telemetry.publish_receipt_with_source(
+                        let source_event_unix_us = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            rpc.block_timestamp(receipt.block_number),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|seconds| seconds.checked_mul(1_000_000));
+                        telemetry.publish_protocol_receipt_with_source(
                             protocol,
                             receipt.gas_used,
                             receipt.effective_gas_price,
                             if includes_l1_fee { receipt.l1_fee } else { 0 },
+                            Some(receipt.block_number),
+                            source_event_unix_us,
                             ReceiptCostTelemetrySource::JournalBootstrap,
                         );
                         tracing::info!(
                             block_number,
                             protocol = protocol.label(),
+                            source_event_timestamp_available = source_event_unix_us.is_some(),
                             "pre-trade receipt-cost telemetry bootstrapped from journal"
                         );
                     }
@@ -659,6 +670,13 @@ impl DexExecutor {
         request.validate()?;
         ensure!(self.nonce_lane.ready(), "DEX nonce lane is not ready");
         let protocol = request.route.protocol();
+        let cost_route = DexRouteCostKey {
+            pool: match request.route {
+                SwapRoute::V3 { pool, .. } => DexPoolCostKey::UniswapV3(pool),
+                SwapRoute::V4 { pool_key, .. } => DexPoolCostKey::UniswapV4(pool_key.pool_id()),
+            },
+            token_in: request.token_in,
+        };
         if protocol == UniswapProtocol::V4 {
             ensure!(
                 request.deadline_unix_seconds > unix_seconds()?,
@@ -739,14 +757,36 @@ impl DexExecutor {
         let l1_fee = self.accounted_l1_fee(receipt.l1_fee);
         if let Some(telemetry) = &self.pretrade_cost_telemetry {
             telemetry.publish_receipt(
-                match protocol {
-                    UniswapProtocol::V3 => CostTelemetryDexProtocol::UniswapV3,
-                    UniswapProtocol::V4 => CostTelemetryDexProtocol::UniswapV4,
-                },
+                cost_route,
                 receipt.gas_used,
                 receipt.effective_gas_price,
                 l1_fee,
+                receipt.block_number,
             );
+            let rpc = self.rpc.clone();
+            let telemetry = telemetry.clone();
+            let block_number = receipt.block_number;
+            let gas_used = receipt.gas_used;
+            let effective_gas_price = receipt.effective_gas_price;
+            tokio::spawn(async move {
+                let source_event_unix_us =
+                    tokio::time::timeout(Duration::from_secs(5), rpc.block_timestamp(block_number))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|seconds| seconds.checked_mul(1_000_000));
+                if let Some(source_event_unix_us) = source_event_unix_us {
+                    telemetry.publish_route_receipt_with_source(
+                        cost_route,
+                        gas_used,
+                        effective_gas_price,
+                        l1_fee,
+                        Some(block_number),
+                        Some(source_event_unix_us),
+                        ReceiptCostTelemetrySource::LiveExecution,
+                    );
+                }
+            });
         }
         Ok(SwapExecutionOutcome {
             protocol,

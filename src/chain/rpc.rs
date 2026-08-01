@@ -249,6 +249,24 @@ impl JsonRpcClient {
         })
     }
 
+    pub async fn block_timestamp(&self, block_number: u64) -> anyhow::Result<u64> {
+        let value = self
+            .request(
+                "eth_getBlockByNumber",
+                json!([format!("{block_number:#x}"), false]),
+            )
+            .await?;
+        let block: RpcBlock = serde_json::from_value(value)
+            .context("eth_getBlockByNumber returned an invalid block")?;
+        parse_quantity_u64(
+            "block.timestamp",
+            block
+                .timestamp
+                .as_deref()
+                .context("eth_getBlockByNumber omitted block.timestamp")?,
+        )
+    }
+
     pub async fn chain_id(&self) -> anyhow::Result<u64> {
         let value = self.request("eth_chainId", json!([])).await?;
         parse_quantity_value_u64("eth_chainId", value)
@@ -831,6 +849,8 @@ struct RpcBlock {
     hash: String,
     #[serde(rename = "parentHash")]
     parent_hash: String,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

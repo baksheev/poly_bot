@@ -3040,6 +3040,17 @@ impl TradingEngine {
             dex_plan: dex_plan.clone(),
         };
         let plan_id = opportunity.plan_id();
+        let cost_direction = match direction {
+            TradeDirection::BuyTokenBOnDexSellOnCex => ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            TradeDirection::BuyTokenBOnCexSellOnDex => ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+        };
+        self.hot_telemetry.emit_pretrade_candidate(
+            &plan_id,
+            quote,
+            evaluation.pair_index,
+            cost_direction,
+            trade,
+        );
         let dex_input_claim = U256::from(dex_plan.amount_in_base_units);
         let (token_a_claim, token_b_claim) =
             exact_execution_envelope_amounts(direction, dex_input_claim, trade);
@@ -3081,6 +3092,11 @@ impl TradingEngine {
                     json!({
                         "engine_id": self.config.engine_id,
                         "plan_id": plan_id,
+                        "pair_id": pair_id,
+                        "symbol": pair_symbol,
+                        "update_id": quote.update_id,
+                        "direction": cost_direction.as_str(),
+                        "gross_profit_bps_x100": trade.gross_profit_bps_x100,
                         "reason": "duplicate_plan_inflight",
                     }),
                 );
@@ -3099,6 +3115,11 @@ impl TradingEngine {
                     json!({
                         "engine_id": self.config.engine_id,
                         "plan_id": plan_id,
+                        "pair_id": pair_id,
+                        "symbol": pair_symbol,
+                        "update_id": quote.update_id,
+                        "direction": cost_direction.as_str(),
+                        "gross_profit_bps_x100": trade.gross_profit_bps_x100,
                         "reason": "inventory_reservation_conflict",
                     }),
                 );
@@ -3121,6 +3142,11 @@ impl TradingEngine {
                 json!({
                     "engine_id": self.config.engine_id,
                     "plan_id": plan_id,
+                    "pair_id": pair_id,
+                    "symbol": pair_symbol,
+                    "update_id": quote.update_id,
+                    "direction": cost_direction.as_str(),
+                    "gross_profit_bps_x100": trade.gross_profit_bps_x100,
                     "reason": failure_kind.telemetry_reason(),
                     "error": format!("{error:#}"),
                     "claims": claim_details,
@@ -3158,6 +3184,11 @@ impl TradingEngine {
                     json!({
                         "engine_id": self.config.engine_id,
                         "plan_id": plan_id,
+                        "pair_id": pair_id,
+                        "symbol": pair_symbol,
+                        "update_id": quote.update_id,
+                        "direction": cost_direction.as_str(),
+                        "gross_profit_bps_x100": trade.gross_profit_bps_x100,
                         "reason": "execution_lane_unavailable",
                     }),
                 );
@@ -3165,17 +3196,6 @@ impl TradingEngine {
             }
         }
         let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
-        let cost_direction = match direction {
-            TradeDirection::BuyTokenBOnDexSellOnCex => ArbitrageDirection::BuyTokenBOnDexSellOnCex,
-            TradeDirection::BuyTokenBOnCexSellOnDex => ArbitrageDirection::BuyTokenBOnCexSellOnDex,
-        };
-        self.hot_telemetry.emit_pretrade_candidate(
-            &plan_id,
-            quote,
-            evaluation.pair_index,
-            cost_direction,
-            trade,
-        );
         let admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,

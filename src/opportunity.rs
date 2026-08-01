@@ -971,6 +971,14 @@ impl PairRuntime {
         self.token_b_step
     }
 
+    pub fn token_a_address(&self) -> Address {
+        self.token_a
+    }
+
+    pub fn token_b_address(&self) -> Address {
+        self.token_b
+    }
+
     pub fn pool_indices(&self) -> &[usize] {
         &self.pool_indices
     }

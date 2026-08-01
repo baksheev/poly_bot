@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alloy_primitives::Address;
 use anyhow::Context;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -18,7 +19,10 @@ use crate::{
         ArbitrageDirection, DirectionEvaluation, PairEvaluation, PairRuntime, PreparedPoolRefresh,
         TradeEvaluation, format_base_units,
     },
-    pretrade_cost::{DexProtocol, PreTradeCostSnapshot, PreTradeCostTelemetry},
+    pretrade_cost::{
+        DexPoolCostKey, DexRouteCostKey, GAS_PRICE_HISTORY_DEPTH, NATIVE_CONVERSION_HISTORY_DEPTH,
+        PreTradeCostSnapshot, PreTradeCostTelemetry, RECEIPT_HISTORY_DEPTH,
+    },
     state::{RuntimePhase, TopOfBook},
     telemetry::{
         PRIMARY_BINANCE_ACCOUNT_ID, TelemetryHandle, instrument_id, network_id, pool_id,
@@ -35,6 +39,7 @@ pub struct HotTelemetryHandle {
     shared_stream_sender: mpsc::Sender<HotSharedStreamTelemetry>,
     pretrade_candidate_sender: mpsc::Sender<HotPreTradeCandidateTelemetry>,
     dropped: Arc<AtomicU64>,
+    auxiliary_book_last_emitted_unix_us: Arc<[AtomicU64; 2]>,
     pretrade_cost: PreTradeCostTelemetry,
 }
 
@@ -52,6 +57,8 @@ pub struct HotTelemetryTask {
     last_pretrade_cost_sampled_at: Vec<Option<Instant>>,
 }
 
+const AUXILIARY_BOOK_SAMPLE_INTERVAL_US: u64 = 1_000_000;
+
 struct HotBookTelemetry {
     quote: TopOfBook,
     decision_complete_us: u128,
@@ -68,6 +75,7 @@ struct HotEvaluationTelemetry {
     calculation_time_us: u128,
     calculation_budget_us: u64,
     decision_latency_us: u128,
+    cost_as_of_unix_us: u64,
     trigger: &'static str,
     queued_at: std::time::Instant,
 }
@@ -78,6 +86,8 @@ struct HotPreTradeCandidateTelemetry {
     pair_index: usize,
     direction: ArbitrageDirection,
     trade: TradeEvaluation,
+    cost_as_of_unix_us: u64,
+    strategy_price_age_us: u64,
     queued_at: Instant,
 }
 
@@ -134,6 +144,8 @@ struct PairTelemetryContext {
     token_b_symbol: String,
     token_a_decimals: u8,
     token_b_decimals: u8,
+    token_a_address: Address,
+    token_b_address: Address,
     opportunity_threshold_bps: u16,
     min_slippage_bps: u16,
     max_slippage_bps: u16,
@@ -149,7 +161,7 @@ struct PoolTelemetryContext {
     identity: String,
     pool_id: String,
     fee_pips: u32,
-    protocol: DexProtocol,
+    cost_pool_key: DexPoolCostKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,9 +242,9 @@ pub fn channel(
             .find(|pair| pair.pair_id == pool.pair_id)
             .context("hot telemetry pool pair is invalid")?;
         let identity = format!("{:?}", pool.identity);
-        let protocol = match pool.identity {
-            PoolIdentity::V3 { .. } => DexProtocol::UniswapV3,
-            PoolIdentity::V4 { .. } => DexProtocol::UniswapV4,
+        let cost_pool_key = match pool.identity {
+            PoolIdentity::V3 { address, .. } => DexPoolCostKey::UniswapV3(address),
+            PoolIdentity::V4 { pool_id, .. } => DexPoolCostKey::UniswapV4(pool_id),
         };
         pools.push(PoolTelemetryContext {
             pair_id: pair.pair_id.clone(),
@@ -241,7 +253,7 @@ pub fn channel(
             pool_id: pool_id(pair.chain_id, &identity),
             identity,
             fee_pips: pool.pool.fee_pips,
-            protocol,
+            cost_pool_key,
         });
     }
     let head_chain_id = pairs.first().map(|pair| pair.chain_id);
@@ -258,6 +270,8 @@ pub fn channel(
             token_b_symbol: pair.token_b_symbol.clone(),
             token_a_decimals: pair.token_a_decimals,
             token_b_decimals: pair.token_b_decimals,
+            token_a_address: pair.token_a_address(),
+            token_b_address: pair.token_b_address(),
             opportunity_threshold_bps: pair.opportunity_threshold_bps,
             min_slippage_bps: pair.min_slippage_bps,
             max_slippage_bps: pair.max_slippage_bps,
@@ -283,6 +297,7 @@ pub fn channel(
     let (pretrade_candidate_sender, pretrade_candidate_receiver) =
         mpsc::channel(config.telemetry_channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
+    let auxiliary_book_last_emitted_unix_us = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     Ok((
         HotTelemetryHandle {
             book_sender,
@@ -292,6 +307,7 @@ pub fn channel(
             shared_stream_sender,
             pretrade_candidate_sender,
             dropped: Arc::clone(&dropped),
+            auxiliary_book_last_emitted_unix_us,
             pretrade_cost: pretrade_cost.clone(),
         },
         HotTelemetryTask {
@@ -328,11 +344,25 @@ impl HotTelemetryHandle {
         runtime_phase: Option<RuntimePhase>,
         decision_outcome: &'static str,
     ) {
+        let auxiliary_index = match feed_role {
+            "gas_conversion" => Some(0),
+            "commission_conversion" => Some(1),
+            _ => None,
+        };
+        if let Some(index) = auxiliary_index
+            && !claim_auxiliary_book_sample(
+                &self.auxiliary_book_last_emitted_unix_us[index],
+                quote.received_unix_us,
+            )
+        {
+            return;
+        }
+        let decision_complete_us = quote.received_at.elapsed().as_micros();
         if self
             .book_sender
             .try_send(HotBookTelemetry {
                 quote: quote.clone(),
-                decision_complete_us: quote.received_at.elapsed().as_micros(),
+                decision_complete_us,
                 queued_at: std::time::Instant::now(),
                 feed_role,
                 runtime_phase,
@@ -359,6 +389,9 @@ impl HotTelemetryHandle {
         calculation_budget_us: u64,
         trigger: &'static str,
     ) {
+        let decision_latency_us = quote.received_at.elapsed().as_micros();
+        let cost_as_of_unix_us =
+            decision_boundary_unix_us(quote.received_unix_us, decision_latency_us);
         if self
             .evaluation_sender
             .try_send(HotEvaluationTelemetry {
@@ -367,7 +400,8 @@ impl HotTelemetryHandle {
                 world_chain_block: chain_block,
                 calculation_time_us,
                 calculation_budget_us,
-                decision_latency_us: quote.received_at.elapsed().as_micros(),
+                decision_latency_us,
+                cost_as_of_unix_us,
                 trigger,
                 queued_at: std::time::Instant::now(),
             })
@@ -377,7 +411,7 @@ impl HotTelemetryHandle {
         }
     }
 
-    /// Enqueue the exact admitted candidate for a joinable background cost
+    /// Enqueue the exact selected candidate for a joinable background cost
     /// calculation. The trading owner performs no cost math or locking here.
     #[inline]
     pub fn emit_pretrade_candidate(
@@ -388,6 +422,10 @@ impl HotTelemetryHandle {
         direction: ArbitrageDirection,
         trade: TradeEvaluation,
     ) {
+        let strategy_price_age_us =
+            u64::try_from(quote.received_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let cost_as_of_unix_us =
+            decision_boundary_unix_us(quote.received_unix_us, strategy_price_age_us.into());
         if self
             .pretrade_candidate_sender
             .try_send(HotPreTradeCandidateTelemetry {
@@ -396,6 +434,8 @@ impl HotTelemetryHandle {
                 pair_index,
                 direction,
                 trade,
+                cost_as_of_unix_us,
+                strategy_price_age_us,
                 queued_at: Instant::now(),
             })
             .is_err()
@@ -540,6 +580,7 @@ impl HotTelemetryTask {
                             event.calculation_time_us,
                             event.calculation_budget_us,
                             event.decision_latency_us,
+                            event.cost_as_of_unix_us,
                             event.trigger,
                             event.queued_at.elapsed().as_micros(),
                             cost_snapshot,
@@ -588,6 +629,8 @@ impl HotTelemetryTask {
             event.trade,
             &event.quote,
             cost_snapshot,
+            event.cost_as_of_unix_us,
+            event.strategy_price_age_us,
         )?;
         self.telemetry.emit(
             "pretrade_cost_candidate",
@@ -603,6 +646,8 @@ impl HotTelemetryTask {
                 "symbol": pair.symbol,
                 "update_id": event.quote.update_id,
                 "opportunity_received_unix_us": event.quote.received_unix_us,
+                "cost_as_of_unix_us": event.cost_as_of_unix_us,
+                "strategy_price_age_us": event.strategy_price_age_us,
                 "direction": event.direction.as_str(),
                 "diagnostic_only": true,
                 "decision_input": false,
@@ -745,6 +790,8 @@ impl HotTelemetryTask {
         runtime_phase: Option<RuntimePhase>,
         decision_outcome: &'static str,
     ) {
+        let sampling_interval_ms = matches!(feed_role, "gas_conversion" | "commission_conversion")
+            .then_some(AUXILIARY_BOOK_SAMPLE_INTERVAL_US / 1_000);
         self.telemetry.emit(
             "binance_book_ticker",
             json!({
@@ -767,6 +814,7 @@ impl HotTelemetryTask {
                 "feed_role": feed_role,
                 "runtime_phase": runtime_phase,
                 "decision_outcome": decision_outcome,
+                "telemetry_sampling_interval_ms": sampling_interval_ms,
                 "exchange_timestamp_available": quote.exchange_event_ts_ms.is_some()
                     || quote.exchange_transaction_ts_ms.is_some(),
                 "decision_complete_us": decision_complete_us,
@@ -785,6 +833,7 @@ impl HotTelemetryTask {
         calculation_time_us: u128,
         calculation_budget_us: u64,
         decision_latency_us: u128,
+        cost_as_of_unix_us: u64,
         trigger: &'static str,
         compatibility_queue_us: u128,
         cost_snapshot: Option<PreTradeCostSnapshot>,
@@ -794,9 +843,24 @@ impl HotTelemetryTask {
             .pairs
             .get(evaluation.pair_index)
             .context("hot telemetry pair index is invalid")?;
+        let strategy_price_age_us = u64::try_from(decision_latency_us).unwrap_or(u64::MAX);
         let directions = [
-            self.direction_payload(pair, &evaluation.dex_buy_cex_sell, quote, cost_snapshot)?,
-            self.direction_payload(pair, &evaluation.cex_buy_dex_sell, quote, cost_snapshot)?,
+            self.direction_payload(
+                pair,
+                &evaluation.dex_buy_cex_sell,
+                quote,
+                cost_snapshot,
+                cost_as_of_unix_us,
+                strategy_price_age_us,
+            )?,
+            self.direction_payload(
+                pair,
+                &evaluation.cex_buy_dex_sell,
+                quote,
+                cost_snapshot,
+                cost_as_of_unix_us,
+                strategy_price_age_us,
+            )?,
         ];
         self.telemetry.emit(
             "arbitrage_evaluation",
@@ -836,6 +900,8 @@ impl HotTelemetryTask {
                 "calculation_budget_exceeded":
                     calculation_time_us > u128::from(calculation_budget_us),
                 "decision_latency_us": decision_latency_us,
+                "cost_as_of_unix_us": cost_as_of_unix_us,
+                "strategy_price_age_us": strategy_price_age_us,
                 "telemetry_queue_delay_us": compatibility_queue_us,
                 "pretrade_cost_sampled": cost_snapshot.is_some(),
                 "pretrade_cost_sampling_interval_ms": 1_000,
@@ -924,6 +990,8 @@ impl HotTelemetryTask {
                             trade,
                             quote,
                             cost_snapshot,
+                            cost_as_of_unix_us,
+                            strategy_price_age_us,
                         )?,
                     }),
                 );
@@ -938,6 +1006,8 @@ impl HotTelemetryTask {
         direction: &DirectionEvaluation,
         quote: &TopOfBook,
         cost_snapshot: Option<PreTradeCostSnapshot>,
+        cost_as_of_unix_us: u64,
+        strategy_price_age_us: u64,
     ) -> anyhow::Result<serde_json::Value> {
         Ok(json!({
             "direction": direction.direction.as_str(),
@@ -954,11 +1024,14 @@ impl HotTelemetryTask {
                     trade,
                     quote,
                     cost_snapshot,
+                    cost_as_of_unix_us,
+                    strategy_price_age_us,
                 ))
                 .transpose()?,
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trade_payload(
         &self,
         pair: &PairTelemetryContext,
@@ -966,6 +1039,8 @@ impl HotTelemetryTask {
         trade: TradeEvaluation,
         quote: &TopOfBook,
         cost_snapshot: Option<PreTradeCostSnapshot>,
+        cost_as_of_unix_us: u64,
+        strategy_price_age_us: u64,
     ) -> anyhow::Result<serde_json::Value> {
         let pool = self
             .context
@@ -987,7 +1062,18 @@ impl HotTelemetryTask {
             )
         };
         let pretrade_cost = cost_snapshot
-            .map(|snapshot| pretrade_cost_payload(pair, pool, direction, trade, quote, snapshot))
+            .map(|snapshot| {
+                pretrade_cost_payload(
+                    pair,
+                    pool,
+                    direction,
+                    trade,
+                    quote,
+                    snapshot,
+                    cost_as_of_unix_us,
+                    strategy_price_age_us,
+                )
+            })
             .transpose()?;
         Ok(json!({
             "pool_index": trade.pool_index,
@@ -1024,12 +1110,35 @@ impl HotTelemetryTask {
     }
 }
 
-const PRETRADE_COST_MODEL_VERSION: &str = "diagnostic_net_edge_v2";
+const PRETRADE_COST_MODEL_VERSION: &str = "diagnostic_net_edge_v3";
 const HYPOTHETICAL_NET_EDGE_FLOOR_BPS: i64 = 5;
 const GAS_PRICE_CACHE_TTL_US: u64 = 2_000_000;
 const NATIVE_CONVERSION_CACHE_TTL_US: u64 = 30_000_000;
 const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
 
+fn claim_auxiliary_book_sample(last: &AtomicU64, received_unix_us: u64) -> bool {
+    let mut previous = last.load(Ordering::Relaxed);
+    loop {
+        if received_unix_us.saturating_sub(previous) < AUXILIARY_BOOK_SAMPLE_INTERVAL_US {
+            return false;
+        }
+        match last.compare_exchange_weak(
+            previous,
+            received_unix_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) => previous = current,
+        }
+    }
+}
+
+fn decision_boundary_unix_us(received_unix_us: u64, decision_latency_us: u128) -> u64 {
+    received_unix_us.saturating_add(u64::try_from(decision_latency_us).unwrap_or(u64::MAX))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pretrade_cost_payload(
     pair: &PairTelemetryContext,
     pool: &PoolTelemetryContext,
@@ -1037,6 +1146,8 @@ fn pretrade_cost_payload(
     trade: TradeEvaluation,
     quote: &TopOfBook,
     snapshot: PreTradeCostSnapshot,
+    cost_as_of_unix_us: u64,
+    strategy_price_age_us: u64,
 ) -> anyhow::Result<serde_json::Value> {
     let binance_fee_bps = match direction {
         ArbitrageDirection::BuyTokenBOnDexSellOnCex => pair.binance_sell_fee_bps,
@@ -1044,29 +1155,35 @@ fn pretrade_cost_payload(
     };
     let binance_commission = ceil_bps(trade.cex_token_a_amount, binance_fee_bps)?;
 
-    let gas_sample = snapshot.gas_price_at_or_before(quote.received_unix_us);
-    let native_conversion = snapshot.native_conversion_at_or_before(quote.received_unix_us);
-    let receipt = snapshot.receipt_at_or_before(pool.protocol, quote.received_unix_us);
-    let gas_sample_age_us = gas_sample.map(|sample| {
-        quote
-            .received_unix_us
-            .saturating_sub(sample.captured_unix_us)
-    });
+    let route = DexRouteCostKey {
+        pool: pool.cost_pool_key,
+        token_in: match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => pair.token_a_address,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => pair.token_b_address,
+        },
+    };
+    let gas_sample = snapshot.gas_price_at_or_before(cost_as_of_unix_us);
+    let native_conversion = snapshot.native_conversion_at_or_before(cost_as_of_unix_us);
+    let selected_receipt = snapshot.receipt_at_or_before(route, cost_as_of_unix_us);
+    let receipt = selected_receipt.map(|selection| selection.sample);
+    let gas_sample_age_us =
+        gas_sample.map(|sample| cost_as_of_unix_us.saturating_sub(sample.captured_unix_us));
     let gas_sample_fresh = gas_sample_age_us.is_some_and(|age| age <= GAS_PRICE_CACHE_TTL_US);
-    let native_conversion_sample_age_us = native_conversion.map(|sample| {
-        quote
-            .received_unix_us
-            .saturating_sub(sample.captured_unix_us)
-    });
+    let native_conversion_sample_age_us =
+        native_conversion.map(|sample| cost_as_of_unix_us.saturating_sub(sample.captured_unix_us));
     let native_conversion_fresh =
         native_conversion_sample_age_us.is_some_and(|age| age <= NATIVE_CONVERSION_CACHE_TTL_US);
     let gas_units = receipt
         .map(|sample| sample.gas_used)
         .unwrap_or(HISTORICAL_SWAP_GAS_LIMIT);
-    let gas_units_source = if receipt.is_some() {
-        "last_same_protocol_receipt"
-    } else {
-        "historical_swap_gas_limit_fallback"
+    let gas_units_source = match selected_receipt.map(|selection| selection.match_scope) {
+        Some(crate::pretrade_cost::ReceiptCostMatchScope::ExactRoute) => {
+            "last_exact_pool_and_input_token_receipt"
+        }
+        Some(crate::pretrade_cost::ReceiptCostMatchScope::SameProtocolBootstrap) => {
+            "journal_same_protocol_bootstrap_fallback"
+        }
+        None => "historical_swap_gas_limit_fallback",
     };
     let includes_l1_fee = gas_sample.is_some_and(|sample| sample.includes_l1_fee);
     let l1_fee_available = !includes_l1_fee || receipt.is_some_and(|sample| sample.l1_fee_wei > 0);
@@ -1111,6 +1228,10 @@ fn pretrade_cost_payload(
         "model_version": PRETRADE_COST_MODEL_VERSION,
         "diagnostic_only": true,
         "decision_input": false,
+        "cost_as_of_unix_us": cost_as_of_unix_us,
+        "cost_as_of_source": "decision_complete_monotonic_projection",
+        "opportunity_received_unix_us": quote.received_unix_us,
+        "strategy_price_age_us": strategy_price_age_us,
         "fixed_threshold_met": trade.meets_threshold,
         "fixed_threshold_bps": pair.opportunity_threshold_bps,
         "hypothetical_net_edge_floor_bps": HYPOTHETICAL_NET_EDGE_FLOOR_BPS,
@@ -1136,12 +1257,14 @@ fn pretrade_cost_payload(
         .expect("pre-trade cost payload is an object")
         .extend(
             json!({
-            "gas_model": "current_fee_cap_x_last_same_protocol_gas_used_plus_last_l1_fee",
-            "gas_protocol": pool.protocol.label(),
+            "gas_model": "current_fee_cap_x_route_scoped_gas_used_plus_last_l1_fee",
+            "gas_protocol": pool.cost_pool_key.protocol().label(),
+            "gas_route_pool": pool.cost_pool_key.label(),
+            "gas_route_token_in": format!("{:#x}", route.token_in),
             "gas_price_available_pretrade": gas_sample.is_some(),
             "gas_price_fresh": gas_sample_fresh,
             "gas_price_cache_ttl_us": GAS_PRICE_CACHE_TTL_US,
-            "gas_price_history_depth": 2,
+            "gas_price_history_depth": GAS_PRICE_HISTORY_DEPTH,
             "gas_price_sample_age_us": gas_sample_age_us,
             "gas_price_source": gas_sample.map(|sample| sample.source.label()),
             "gas_price_wei": gas_sample.map(|sample| sample.gas_price_wei.to_string()),
@@ -1150,19 +1273,28 @@ fn pretrade_cost_payload(
             "native_conversion_available_pretrade": native_conversion.is_some(),
             "native_conversion_fresh": native_conversion_fresh,
             "native_conversion_cache_ttl_us": NATIVE_CONVERSION_CACHE_TTL_US,
-            "native_conversion_history_depth": 2,
+            "native_conversion_history_depth": NATIVE_CONVERSION_HISTORY_DEPTH,
             "native_conversion_sample_age_us": native_conversion_sample_age_us,
             "native_conversion_price_token_a": native_conversion
                 .map(|sample| sample.price_token_a.to_string()),
             "gas_units": gas_units,
             "gas_units_source": gas_units_source,
-            "gas_units_sample_age_us": receipt.map(|sample| {
-                quote.received_unix_us.saturating_sub(sample.captured_unix_us)
+            "gas_units_observation_age_us": receipt.map(|sample| {
+                cost_as_of_unix_us.saturating_sub(sample.captured_unix_us)
             }),
+            "gas_units_event_age_us": receipt.and_then(|sample| {
+                sample.source_event_unix_us.map(|event_unix_us| {
+                    cost_as_of_unix_us.saturating_sub(event_unix_us)
+                })
+            }),
+            "receipt_observed_unix_us": receipt.map(|sample| sample.captured_unix_us),
+            "receipt_source_event_unix_us": receipt.and_then(|sample| sample.source_event_unix_us),
+            "receipt_block_number": receipt.and_then(|sample| sample.block_number),
             "last_effective_gas_price_wei": receipt
                 .map(|sample| sample.effective_gas_price_wei.to_string()),
             "receipt_cost_source": receipt.map(|sample| sample.source.label()),
-            "receipt_history_depth": 2,
+            "receipt_match_scope": selected_receipt.map(|selection| selection.match_scope.label()),
+            "receipt_history_depth": RECEIPT_HISTORY_DEPTH,
             "l1_fee_required": includes_l1_fee,
             "l1_fee_available": l1_fee_available,
             "l1_fee_wei": l1_fee_available.then(|| l1_fee_wei.to_string()),
@@ -1272,11 +1404,14 @@ fn format_bps_x100(value: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use alloy_primitives::U256;
 
     use super::{
-        HotDexEventTelemetry, HotSharedStreamTelemetry, ceil_bps, legacy_decision_projection,
-        ownership_graph_decision_projection, signed_bps_x100, signed_difference,
+        HotDexEventTelemetry, HotSharedStreamTelemetry, ceil_bps, claim_auxiliary_book_sample,
+        decision_boundary_unix_us, legacy_decision_projection, ownership_graph_decision_projection,
+        signed_bps_x100, signed_difference,
     };
     use crate::opportunity::{
         ArbitrageDirection, DirectionEvaluation, PairEvaluation, PreparedPoolRefresh,
@@ -1300,6 +1435,22 @@ mod tests {
         );
         let loss = signed_difference(U256::from(9_995_u64), U256::from(10_000_u64));
         assert_eq!(signed_bps_x100(loss, U256::from(10_000_u64)).unwrap(), -500);
+    }
+
+    #[test]
+    fn decision_boundary_projects_receive_time_without_overflow() {
+        assert_eq!(decision_boundary_unix_us(10_000, 275), 10_275);
+        assert_eq!(decision_boundary_unix_us(u64::MAX - 1, 2), u64::MAX);
+        assert_eq!(decision_boundary_unix_us(10_000, u128::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn auxiliary_book_sampling_claims_at_most_one_record_per_second() {
+        let last = AtomicU64::new(0);
+        assert!(claim_auxiliary_book_sample(&last, 10_000_000));
+        assert!(!claim_auxiliary_book_sample(&last, 10_999_999));
+        assert!(claim_auxiliary_book_sample(&last, 11_000_000));
+        assert!(!claim_auxiliary_book_sample(&last, 10_500_000));
     }
 
     #[test]

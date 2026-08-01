@@ -3,7 +3,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use alloy_primitives::{Address, B256};
 use rust_decimal::Decimal;
+
+pub const GAS_PRICE_HISTORY_DEPTH: usize = 8;
+pub const NATIVE_CONVERSION_HISTORY_DEPTH: usize = 32;
+pub const RECEIPT_HISTORY_DEPTH: usize = 4;
+const MAX_RECEIPT_ROUTES: usize = 16;
 
 /// Diagnostic-only inputs for the pre-trade cost model. The trading owner
 /// never reads this state: producers publish into it and the background hot
@@ -18,6 +24,49 @@ pub struct PreTradeCostTelemetry {
 pub enum DexProtocol {
     UniswapV3,
     UniswapV4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DexPoolCostKey {
+    UniswapV3(Address),
+    UniswapV4(B256),
+}
+
+impl DexPoolCostKey {
+    pub const fn protocol(self) -> DexProtocol {
+        match self {
+            Self::UniswapV3(_) => DexProtocol::UniswapV3,
+            Self::UniswapV4(_) => DexProtocol::UniswapV4,
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::UniswapV3(address) => format!("uniswap_v3:{address:#x}"),
+            Self::UniswapV4(pool_id) => format!("uniswap_v4:{pool_id:#x}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DexRouteCostKey {
+    pub pool: DexPoolCostKey,
+    pub token_in: Address,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptCostMatchScope {
+    ExactRoute,
+    SameProtocolBootstrap,
+}
+
+impl ReceiptCostMatchScope {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExactRoute => "exact_pool_and_input_token",
+            Self::SameProtocolBootstrap => "same_protocol_bootstrap_fallback",
+        }
+    }
 }
 
 impl DexProtocol {
@@ -84,24 +133,86 @@ pub struct NativeConversionTelemetrySample {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DexReceiptCostTelemetrySample {
     pub captured_unix_us: u64,
+    pub source_event_unix_us: Option<u64>,
+    pub block_number: Option<u64>,
     pub gas_used: u64,
     pub effective_gas_price_wei: u128,
     pub l1_fee_wei: u128,
     pub source: ReceiptCostTelemetrySource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedDexReceiptCostTelemetrySample {
+    pub sample: DexReceiptCostTelemetrySample,
+    pub match_scope: ReceiptCostMatchScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TemporalHistory<T: Copy, const N: usize> {
+    samples: [Option<T>; N],
+}
+
+impl<T: Copy, const N: usize> Default for TemporalHistory<T, N> {
+    fn default() -> Self {
+        Self { samples: [None; N] }
+    }
+}
+
+impl<T: Copy, const N: usize> TemporalHistory<T, N> {
+    fn insert(&mut self, sample: T, sample_time: impl Fn(&T) -> u64) {
+        let timestamp = sample_time(&sample);
+        if let Some(index) = self
+            .samples
+            .iter()
+            .position(|existing| existing.is_some_and(|value| sample_time(&value) == timestamp))
+        {
+            self.samples[index] = Some(sample);
+            return;
+        }
+        let insertion_index = self
+            .samples
+            .iter()
+            .position(|existing| existing.is_none_or(|value| timestamp > sample_time(&value)))
+            .unwrap_or(N);
+        if insertion_index == N {
+            return;
+        }
+        for index in (insertion_index + 1..N).rev() {
+            self.samples[index] = self.samples[index - 1];
+        }
+        self.samples[insertion_index] = Some(sample);
+    }
+
+    fn at_or_before(self, timestamp: u64, sample_time: impl Fn(&T) -> u64) -> Option<T> {
+        self.samples
+            .into_iter()
+            .flatten()
+            .find(|sample| sample_time(sample) <= timestamp)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteReceiptHistory {
+    key: DexRouteCostKey,
+    history: TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PreTradeCostSnapshot {
-    gas_prices: [Option<GasPriceTelemetrySample>; 2],
-    native_conversions: [Option<NativeConversionTelemetrySample>; 2],
-    receipts: [[Option<DexReceiptCostTelemetrySample>; 2]; 2],
+    gas_prices: TemporalHistory<GasPriceTelemetrySample, GAS_PRICE_HISTORY_DEPTH>,
+    native_conversions:
+        TemporalHistory<NativeConversionTelemetrySample, NATIVE_CONVERSION_HISTORY_DEPTH>,
+    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 2],
+    route_receipts: [Option<RouteReceiptHistory>; MAX_RECEIPT_ROUTES],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PreTradeCostInputs {
-    gas_prices: [Option<GasPriceTelemetrySample>; 2],
-    native_conversions: [Option<NativeConversionTelemetrySample>; 2],
-    receipts: [[Option<DexReceiptCostTelemetrySample>; 2]; 2],
+    gas_prices: TemporalHistory<GasPriceTelemetrySample, GAS_PRICE_HISTORY_DEPTH>,
+    native_conversions:
+        TemporalHistory<NativeConversionTelemetrySample, NATIVE_CONVERSION_HISTORY_DEPTH>,
+    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 2],
+    route_receipts: [Option<RouteReceiptHistory>; MAX_RECEIPT_ROUTES],
 }
 
 impl Default for PreTradeCostTelemetry {
@@ -138,9 +249,9 @@ impl PreTradeCostTelemetry {
             source,
             includes_l1_fee,
         };
-        insert_temporal_sample(&mut self.write().gas_prices, sample, |sample| {
-            sample.captured_unix_us
-        });
+        self.write()
+            .gas_prices
+            .insert(sample, |sample| sample.captured_unix_us);
     }
 
     pub fn publish_native_conversion(&self, captured_unix_us: u64, price_token_a: Decimal) {
@@ -151,33 +262,39 @@ impl PreTradeCostTelemetry {
             captured_unix_us,
             price_token_a,
         };
-        insert_temporal_sample(&mut self.write().native_conversions, sample, |sample| {
-            sample.captured_unix_us
-        });
+        self.write()
+            .native_conversions
+            .insert(sample, |sample| sample.captured_unix_us);
     }
 
     pub fn publish_receipt(
         &self,
-        protocol: DexProtocol,
+        route: DexRouteCostKey,
         gas_used: u64,
         effective_gas_price_wei: u128,
         l1_fee_wei: u128,
+        block_number: u64,
     ) {
-        self.publish_receipt_with_source(
-            protocol,
+        self.publish_route_receipt_with_source(
+            route,
             gas_used,
             effective_gas_price_wei,
             l1_fee_wei,
+            Some(block_number),
+            None,
             ReceiptCostTelemetrySource::LiveExecution,
         );
     }
 
-    pub fn publish_receipt_with_source(
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_protocol_receipt_with_source(
         &self,
         protocol: DexProtocol,
         gas_used: u64,
         effective_gas_price_wei: u128,
         l1_fee_wei: u128,
+        block_number: Option<u64>,
+        source_event_unix_us: Option<u64>,
         source: ReceiptCostTelemetrySource,
     ) {
         if !self.enabled || gas_used == 0 || effective_gas_price_wei == 0 {
@@ -185,16 +302,64 @@ impl PreTradeCostTelemetry {
         }
         let sample = DexReceiptCostTelemetrySample {
             captured_unix_us: unix_timestamp_us(),
+            source_event_unix_us,
+            block_number,
             gas_used,
             effective_gas_price_wei,
             l1_fee_wei,
             source,
         };
-        insert_temporal_sample(
-            &mut self.write().receipts[protocol.index()],
-            sample,
-            |sample| sample.captured_unix_us,
-        );
+        self.write().protocol_receipts[protocol.index()]
+            .insert(sample, |sample| sample.captured_unix_us);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_route_receipt_with_source(
+        &self,
+        route: DexRouteCostKey,
+        gas_used: u64,
+        effective_gas_price_wei: u128,
+        l1_fee_wei: u128,
+        block_number: Option<u64>,
+        source_event_unix_us: Option<u64>,
+        source: ReceiptCostTelemetrySource,
+    ) {
+        if !self.enabled || gas_used == 0 || effective_gas_price_wei == 0 {
+            return;
+        }
+        let sample = DexReceiptCostTelemetrySample {
+            captured_unix_us: unix_timestamp_us(),
+            source_event_unix_us,
+            block_number,
+            gas_used,
+            effective_gas_price_wei,
+            l1_fee_wei,
+            source,
+        };
+        let mut inputs = self.write();
+        if let Some(existing) = inputs
+            .route_receipts
+            .iter_mut()
+            .flatten()
+            .find(|existing| existing.key == route)
+        {
+            existing
+                .history
+                .insert(sample, |sample| sample.captured_unix_us);
+            return;
+        }
+        if let Some(empty) = inputs
+            .route_receipts
+            .iter_mut()
+            .find(|entry| entry.is_none())
+        {
+            let mut history = TemporalHistory::default();
+            history.insert(sample, |sample| sample.captured_unix_us);
+            *empty = Some(RouteReceiptHistory {
+                key: route,
+                history,
+            });
+        }
     }
 
     pub fn snapshot(&self) -> Option<PreTradeCostSnapshot> {
@@ -205,7 +370,8 @@ impl PreTradeCostTelemetry {
         Some(PreTradeCostSnapshot {
             gas_prices: inputs.gas_prices,
             native_conversions: inputs.native_conversions,
-            receipts: inputs.receipts,
+            protocol_receipts: inputs.protocol_receipts,
+            route_receipts: inputs.route_receipts,
         })
     }
 
@@ -224,67 +390,46 @@ impl PreTradeCostTelemetry {
 
 impl PreTradeCostSnapshot {
     pub fn gas_price_at_or_before(self, captured_unix_us: u64) -> Option<GasPriceTelemetrySample> {
-        sample_at_or_before(self.gas_prices, captured_unix_us, |sample| {
-            sample.captured_unix_us
-        })
+        self.gas_prices
+            .at_or_before(captured_unix_us, |sample| sample.captured_unix_us)
     }
 
     pub fn native_conversion_at_or_before(
         self,
         captured_unix_us: u64,
     ) -> Option<NativeConversionTelemetrySample> {
-        sample_at_or_before(self.native_conversions, captured_unix_us, |sample| {
-            sample.captured_unix_us
-        })
+        self.native_conversions
+            .at_or_before(captured_unix_us, |sample| sample.captured_unix_us)
     }
 
     pub fn receipt_at_or_before(
         self,
-        protocol: DexProtocol,
+        route: DexRouteCostKey,
         captured_unix_us: u64,
-    ) -> Option<DexReceiptCostTelemetrySample> {
-        sample_at_or_before(
-            self.receipts[protocol.index()],
-            captured_unix_us,
-            |sample| sample.captured_unix_us,
-        )
-    }
-}
-
-fn insert_temporal_sample<T: Copy>(
-    history: &mut [Option<T>; 2],
-    sample: T,
-    captured_unix_us: impl Fn(&T) -> u64,
-) {
-    let sample_time = captured_unix_us(&sample);
-    match history[0] {
-        None => history[0] = Some(sample),
-        Some(current) if sample_time >= captured_unix_us(&current) => {
-            if sample_time != captured_unix_us(&current) {
-                history[1] = history[0];
-            }
-            history[0] = Some(sample);
+    ) -> Option<SelectedDexReceiptCostTelemetrySample> {
+        if let Some(sample) = self
+            .route_receipts
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.key == route)
+            .and_then(|entry| {
+                entry
+                    .history
+                    .at_or_before(captured_unix_us, |sample| sample.captured_unix_us)
+            })
+        {
+            return Some(SelectedDexReceiptCostTelemetrySample {
+                sample,
+                match_scope: ReceiptCostMatchScope::ExactRoute,
+            });
         }
-        Some(_) => match history[1] {
-            None => history[1] = Some(sample),
-            Some(previous) if sample_time >= captured_unix_us(&previous) => {
-                history[1] = Some(sample);
-            }
-            Some(_) => {}
-        },
+        self.protocol_receipts[route.pool.protocol().index()]
+            .at_or_before(captured_unix_us, |sample| sample.captured_unix_us)
+            .map(|sample| SelectedDexReceiptCostTelemetrySample {
+                sample,
+                match_scope: ReceiptCostMatchScope::SameProtocolBootstrap,
+            })
     }
-}
-
-fn sample_at_or_before<T: Copy>(
-    history: [Option<T>; 2],
-    captured_unix_us: u64,
-    sample_time: impl Fn(&T) -> u64,
-) -> Option<T> {
-    history
-        .into_iter()
-        .flatten()
-        .filter(|sample| sample_time(sample) <= captured_unix_us)
-        .max_by_key(|sample| sample_time(sample))
 }
 
 fn unix_timestamp_us() -> u64 {
@@ -298,17 +443,30 @@ fn unix_timestamp_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::{Address, B256};
     use rust_decimal::Decimal;
 
-    use super::{DexProtocol, GasPriceTelemetrySource, PreTradeCostTelemetry};
+    use super::{
+        DexPoolCostKey, DexProtocol, DexRouteCostKey, GasPriceTelemetrySource,
+        NATIVE_CONVERSION_HISTORY_DEPTH, PreTradeCostTelemetry, ReceiptCostMatchScope,
+        ReceiptCostTelemetrySource,
+    };
 
     #[test]
     fn snapshot_keeps_protocol_receipts_separate() {
         let telemetry = PreTradeCostTelemetry::default();
         telemetry.publish_gas_price(100, 200, GasPriceTelemetrySource::Rpc, true);
         telemetry.publish_native_conversion(10, Decimal::new(3_500, 0));
-        telemetry.publish_receipt(DexProtocol::UniswapV3, 101, 99, 7);
-        telemetry.publish_receipt(DexProtocol::UniswapV4, 202, 88, 6);
+        let v3_route = DexRouteCostKey {
+            pool: DexPoolCostKey::UniswapV3(Address::repeat_byte(0x11)),
+            token_in: Address::repeat_byte(0x22),
+        };
+        let v4_route = DexRouteCostKey {
+            pool: DexPoolCostKey::UniswapV4(B256::repeat_byte(0x33)),
+            token_in: Address::repeat_byte(0x44),
+        };
+        telemetry.publish_receipt(v3_route, 101, 99, 7, 10);
+        telemetry.publish_receipt(v4_route, 202, 88, 6, 11);
 
         let snapshot = telemetry.snapshot().unwrap();
         assert_eq!(
@@ -327,15 +485,17 @@ mod tests {
         );
         assert_eq!(
             snapshot
-                .receipt_at_or_before(DexProtocol::UniswapV3, u64::MAX)
+                .receipt_at_or_before(v3_route, u64::MAX)
                 .unwrap()
+                .sample
                 .gas_used,
             101
         );
         assert_eq!(
             snapshot
-                .receipt_at_or_before(DexProtocol::UniswapV4, u64::MAX)
+                .receipt_at_or_before(v4_route, u64::MAX)
                 .unwrap()
+                .sample
                 .gas_used,
             202
         );
@@ -356,6 +516,80 @@ mod tests {
             Decimal::new(3_500, 0)
         );
         assert!(snapshot.native_conversion_at_or_before(9).is_none());
+    }
+
+    #[test]
+    fn conversion_history_covers_bursts_without_lookahead() {
+        let telemetry = PreTradeCostTelemetry::default();
+        for timestamp in 1..=NATIVE_CONVERSION_HISTORY_DEPTH as u64 {
+            telemetry.publish_native_conversion(timestamp, Decimal::from(timestamp));
+        }
+
+        let snapshot = telemetry.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .native_conversion_at_or_before(1)
+                .unwrap()
+                .captured_unix_us,
+            1
+        );
+        assert!(snapshot.native_conversion_at_or_before(0).is_none());
+    }
+
+    #[test]
+    fn route_receipt_wins_over_protocol_bootstrap() {
+        let telemetry = PreTradeCostTelemetry::default();
+        let route = DexRouteCostKey {
+            pool: DexPoolCostKey::UniswapV3(Address::repeat_byte(0x55)),
+            token_in: Address::repeat_byte(0x66),
+        };
+        telemetry.publish_protocol_receipt_with_source(
+            DexProtocol::UniswapV3,
+            250,
+            10,
+            1,
+            Some(9),
+            Some(1),
+            ReceiptCostTelemetrySource::JournalBootstrap,
+        );
+        telemetry.publish_receipt(route, 125, 9, 1, 10);
+
+        let selected = telemetry
+            .snapshot()
+            .unwrap()
+            .receipt_at_or_before(route, u64::MAX)
+            .unwrap();
+        assert_eq!(selected.match_scope, ReceiptCostMatchScope::ExactRoute);
+        assert_eq!(selected.sample.gas_used, 125);
+    }
+
+    #[test]
+    fn protocol_bootstrap_is_an_explicit_route_fallback() {
+        let telemetry = PreTradeCostTelemetry::default();
+        let route = DexRouteCostKey {
+            pool: DexPoolCostKey::UniswapV4(B256::repeat_byte(0x77)),
+            token_in: Address::repeat_byte(0x88),
+        };
+        telemetry.publish_protocol_receipt_with_source(
+            DexProtocol::UniswapV4,
+            222,
+            11,
+            0,
+            Some(12),
+            Some(2),
+            ReceiptCostTelemetrySource::JournalBootstrap,
+        );
+
+        let selected = telemetry
+            .snapshot()
+            .unwrap()
+            .receipt_at_or_before(route, u64::MAX)
+            .unwrap();
+        assert_eq!(
+            selected.match_scope,
+            ReceiptCostMatchScope::SameProtocolBootstrap
+        );
+        assert_eq!(selected.sample.gas_used, 222);
     }
 
     #[test]

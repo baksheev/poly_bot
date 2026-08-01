@@ -7,14 +7,15 @@ bps gate, so it can measure opportunities that a future net-edge policy might
 capture. Unsampled evaluations retain `pretrade_cost: null` and identify the
 sampling contract in top-level fields.
 
-The model is `diagnostic_net_edge_v2`. It subtracts these costs from raw venue
+The model is `diagnostic_net_edge_v3`. It subtracts these costs from raw venue
 profit:
 
 - the conservative side-specific Binance taker fee, rounded up in token-A base
   units; the BNB discount is intentionally not assumed;
 - the current execution-owner gas fee cap multiplied by the last successful
-  same-protocol gas usage, falling back to the reviewed 250,000 gas bound;
-- the last successful same-protocol World Chain `l1Fee`, when World Chain
+  exact pool-and-input-token gas usage, falling back to bootstrap evidence and
+  then the reviewed 250,000 gas bound;
+- the last successful exact-route World Chain `l1Fee`, when World Chain
   requires a separate L1 fee estimate.
 
 The exact CLMM quote already includes the pool fee and curve impact. Calldata
@@ -22,17 +23,23 @@ slippage is an execution bound, not an expected cost, and is not subtracted a
 second time. Recovery, inventory, and future market movement remain excluded
 and are explicitly listed in the payload.
 
-Every source carries availability and age fields. The background model keeps
-the current and previous gas, native-conversion, and receipt samples and picks
-the newest one captured no later than the evaluated Binance quote. This avoids
-look-ahead without losing the valid predecessor when a refresh races queued
-serialization. Gas must satisfy the reviewed two-second execution-cache TTL;
-native conversion has a diagnostic-only 30-second TTL. The hypothetical 5 bps
-result is `null` unless all model inputs are available and fresh. None of these
-values is read by readiness, sizing, admission, preflight, or execution.
+Every source carries availability and age fields. The background model retains
+bounded histories (8 gas samples, 32 native-conversion samples, and 4 receipts
+per route) and selects the newest sample captured no later than the completed
+decision. Using decision time, rather than the last Binance price-change time,
+keeps an unchanged but transport-current top from incorrectly losing its cost
+inputs while still preventing look-ahead. Gas must satisfy the reviewed
+two-second execution-cache TTL; native conversion has a diagnostic-only
+30-second TTL. The hypothetical 5 bps result is `null` unless all model inputs
+are available and fresh. None of these values is read by readiness, sizing,
+admission, preflight, or execution.
 
 On startup, each execution owner independently and best-effort fetches the
-newest successful same-protocol receipt named in its durable EVM journal. A
+newest successful same-protocol receipt named in its durable EVM journal. This
+is explicitly labeled as bootstrap fallback until a live receipt supplies
+exact pool-and-input-token evidence. The receipt's block timestamp is fetched
+best-effort in a detached task and recorded separately from observation time so
+reports measure the actual event age without delaying lane release. A
 five-second timeout or any RPC failure only leaves the diagnostic model
 incomplete; it cannot delay readiness or execution. Payloads distinguish
 `journal_bootstrap_receipt` from `live_execution_receipt`. This gives World
@@ -48,19 +55,27 @@ record pressure on the bounded ClickHouse channel. The producer path remains
 the existing `try_send`; drops are still reported by
 `hot_telemetry_dropped_records`.
 
+The BNB commission-conversion and native-token conversion feeds still publish
+every update to their in-memory accounting snapshots, but their raw diagnostic
+book records are sampled at one Hz. Strategy-price books remain unsampled. This
+removes redundant auxiliary ClickHouse traffic without changing any readiness,
+pricing, accounting, or execution input.
+
 The unauthenticated `collect-prices` sidecar disables the cost model entirely:
 it has no symbol commission or execution-owner gas source and must not create a
 plausible but invalid cohort. Live engines label commission provenance as
 `authenticated_account_symbol_commission`.
 
-Every accepted admission also enqueues one bounded background
+Every selected fixed-threshold candidate enqueues one bounded background
 `pretrade_cost_candidate` record. It contains the exact selected size,
-`plan_id`, pair, direction, Binance `update_id`, receive time, and the same v2
-cost payload. New trade journal intents persist `opportunity_update_id`, and
-`arbitrage_result` repeats it. The report can therefore join a prediction to
-the exact admitted and realized trade without running cost math on the trading
-owner. A full candidate channel is counted as a hot-telemetry drop and never
-blocks admission.
+`plan_id`, pair, direction, Binance `update_id`, receive time, and the same v3
+cost payload. It is emitted before inventory reservation, so rejected candidates
+remain measurable. Post-selection rejection records repeat the full join key
+and reason; admitted journal intents persist `opportunity_update_id`, and
+`arbitrage_result` repeats it. The report can therefore separate selected,
+rejected, admitted, and realized cohorts without running cost math on the
+trading owner. A full candidate channel is counted as a hot-telemetry drop and
+never blocks admission.
 
 After a 24-hour collection window, summarize the cohort with:
 
