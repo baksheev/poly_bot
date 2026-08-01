@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -9,11 +12,13 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::AppConfig,
-    dex::mirror::DexMirror,
+    dex::{hydration::PoolIdentity, mirror::DexMirror},
+    execution_accounting::native_gas_to_token_a_base_units,
     opportunity::{
         ArbitrageDirection, DirectionEvaluation, PairEvaluation, PairRuntime, PreparedPoolRefresh,
         TradeEvaluation, format_base_units,
     },
+    pretrade_cost::{DexProtocol, PreTradeCostSnapshot, PreTradeCostTelemetry},
     state::{RuntimePhase, TopOfBook},
     telemetry::{
         PRIMARY_BINANCE_ACCOUNT_ID, TelemetryHandle, instrument_id, network_id, pool_id,
@@ -29,6 +34,7 @@ pub struct HotTelemetryHandle {
     prepared_pool_sender: mpsc::Sender<PreparedPoolRefresh>,
     shared_stream_sender: mpsc::Sender<HotSharedStreamTelemetry>,
     dropped: Arc<AtomicU64>,
+    pretrade_cost: PreTradeCostTelemetry,
 }
 
 pub struct HotTelemetryTask {
@@ -40,6 +46,8 @@ pub struct HotTelemetryTask {
     dropped: Arc<AtomicU64>,
     telemetry: TelemetryHandle,
     context: HotTelemetryContext,
+    pretrade_cost: PreTradeCostTelemetry,
+    last_pretrade_cost_sampled_at: Vec<Option<Instant>>,
 }
 
 struct HotBookTelemetry {
@@ -130,6 +138,7 @@ struct PoolTelemetryContext {
     identity: String,
     pool_id: String,
     fee_pips: u32,
+    protocol: DexProtocol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +209,7 @@ pub fn channel(
     pairs: &[PairRuntime],
     dex: &DexMirror,
     telemetry: TelemetryHandle,
+    pretrade_cost: PreTradeCostTelemetry,
 ) -> anyhow::Result<(HotTelemetryHandle, HotTelemetryTask)> {
     let mut pools = Vec::with_capacity(dex.pool_count());
     for index in 0..dex.pool_count() {
@@ -209,6 +219,10 @@ pub fn channel(
             .find(|pair| pair.pair_id == pool.pair_id)
             .context("hot telemetry pool pair is invalid")?;
         let identity = format!("{:?}", pool.identity);
+        let protocol = match pool.identity {
+            PoolIdentity::V3 { .. } => DexProtocol::UniswapV3,
+            PoolIdentity::V4 { .. } => DexProtocol::UniswapV4,
+        };
         pools.push(PoolTelemetryContext {
             pair_id: pair.pair_id.clone(),
             strategy_id: strategy_id(&pair.pair_id),
@@ -216,6 +230,7 @@ pub fn channel(
             pool_id: pool_id(pair.chain_id, &identity),
             identity,
             fee_pips: pool.pool.fee_pips,
+            protocol,
         });
     }
     let head_chain_id = pairs.first().map(|pair| pair.chain_id);
@@ -246,6 +261,7 @@ pub fn channel(
         pools,
         head_chain_id,
     };
+    let pair_count = context.pairs.len();
     let (book_sender, book_receiver) = mpsc::channel(config.telemetry_channel_capacity);
     let (evaluation_sender, evaluation_receiver) = mpsc::channel(config.telemetry_channel_capacity);
     let (dex_event_sender, dex_event_receiver) = mpsc::channel(config.telemetry_channel_capacity);
@@ -262,6 +278,7 @@ pub fn channel(
             prepared_pool_sender,
             shared_stream_sender,
             dropped: Arc::clone(&dropped),
+            pretrade_cost: pretrade_cost.clone(),
         },
         HotTelemetryTask {
             book_receiver,
@@ -272,11 +289,22 @@ pub fn channel(
             dropped,
             telemetry,
             context,
+            pretrade_cost,
+            last_pretrade_cost_sampled_at: vec![None; pair_count],
         },
     ))
 }
 
 impl HotTelemetryHandle {
+    pub fn publish_native_conversion(
+        &self,
+        captured_unix_us: u64,
+        price_token_a: rust_decimal::Decimal,
+    ) {
+        self.pretrade_cost
+            .publish_native_conversion(captured_unix_us, price_token_a);
+    }
+
     #[inline]
     pub fn emit_binance_book(
         &self,
@@ -419,6 +447,20 @@ impl HotTelemetryHandle {
 }
 
 impl HotTelemetryTask {
+    fn sample_pretrade_cost(&mut self, pair_index: usize) -> Option<PreTradeCostSnapshot> {
+        const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+        let now = Instant::now();
+        let last_sampled_at = self.last_pretrade_cost_sampled_at.get_mut(pair_index)?;
+        if last_sampled_at
+            .is_some_and(|sampled_at| now.saturating_duration_since(sampled_at) < SAMPLE_INTERVAL)
+        {
+            return None;
+        }
+        *last_sampled_at = Some(now);
+        Some(self.pretrade_cost.snapshot())
+    }
+
     pub async fn run(mut self) -> anyhow::Result<()> {
         let mut books_open = true;
         let mut evaluations_open = true;
@@ -444,16 +486,20 @@ impl HotTelemetryTask {
                     None => books_open = false,
                 },
                 event = self.evaluation_receiver.recv(), if evaluations_open => match event {
-                    Some(event) => self.emit_evaluation(
-                        &event.quote,
-                        &event.evaluation,
-                        event.world_chain_block,
-                        event.calculation_time_us,
-                        event.calculation_budget_us,
-                        event.decision_latency_us,
-                        event.trigger,
-                        event.queued_at.elapsed().as_micros(),
-                    )?,
+                    Some(event) => {
+                        let cost_snapshot = self.sample_pretrade_cost(event.evaluation.pair_index);
+                        self.emit_evaluation(
+                            &event.quote,
+                            &event.evaluation,
+                            event.world_chain_block,
+                            event.calculation_time_us,
+                            event.calculation_budget_us,
+                            event.decision_latency_us,
+                            event.trigger,
+                            event.queued_at.elapsed().as_micros(),
+                            cost_snapshot,
+                        )?
+                    },
                     None => evaluations_open = false,
                 },
                 event = self.dex_event_receiver.recv(), if dex_events_open => match event {
@@ -654,6 +700,7 @@ impl HotTelemetryTask {
         decision_latency_us: u128,
         trigger: &'static str,
         compatibility_queue_us: u128,
+        cost_snapshot: Option<PreTradeCostSnapshot>,
     ) -> anyhow::Result<()> {
         let pair = self
             .context
@@ -661,8 +708,8 @@ impl HotTelemetryTask {
             .get(evaluation.pair_index)
             .context("hot telemetry pair index is invalid")?;
         let directions = [
-            self.direction_payload(pair, &evaluation.dex_buy_cex_sell)?,
-            self.direction_payload(pair, &evaluation.cex_buy_dex_sell)?,
+            self.direction_payload(pair, &evaluation.dex_buy_cex_sell, quote, cost_snapshot)?,
+            self.direction_payload(pair, &evaluation.cex_buy_dex_sell, quote, cost_snapshot)?,
         ];
         self.telemetry.emit(
             "arbitrage_evaluation",
@@ -702,6 +749,9 @@ impl HotTelemetryTask {
                 "calculation_budget_exceeded":
                     calculation_time_us > u128::from(calculation_budget_us),
                 "decision_latency_us": decision_latency_us,
+                "telemetry_queue_delay_us": compatibility_queue_us,
+                "pretrade_cost_sampled": cost_snapshot.is_some(),
+                "pretrade_cost_sampling_interval_ms": 1_000,
                 "evaluation_trigger": trigger,
                 "dependency_fanout_count": 1,
                 "directions": directions,
@@ -781,7 +831,13 @@ impl HotTelemetryTask {
                         "baseline_pool_index": trade.pool_index,
                         "baseline_token_b_base_units": trade.token_b_amount.to_string(),
                         "baseline_gross_profit_bps_x100": trade.gross_profit_bps_x100,
-                        "baseline": self.trade_payload(pair, trade)?,
+                        "baseline": self.trade_payload(
+                            pair,
+                            direction.direction,
+                            trade,
+                            quote,
+                            cost_snapshot,
+                        )?,
                     }),
                 );
             }
@@ -793,6 +849,8 @@ impl HotTelemetryTask {
         &self,
         pair: &PairTelemetryContext,
         direction: &DirectionEvaluation,
+        quote: &TopOfBook,
+        cost_snapshot: Option<PreTradeCostSnapshot>,
     ) -> anyhow::Result<serde_json::Value> {
         Ok(json!({
             "direction": direction.direction.as_str(),
@@ -803,7 +861,13 @@ impl HotTelemetryTask {
             ),
             "baseline": direction
                 .baseline
-                .map(|trade| self.trade_payload(pair, trade))
+                .map(|trade| self.trade_payload(
+                    pair,
+                    direction.direction,
+                    trade,
+                    quote,
+                    cost_snapshot,
+                ))
                 .transpose()?,
         }))
     }
@@ -811,7 +875,10 @@ impl HotTelemetryTask {
     fn trade_payload(
         &self,
         pair: &PairTelemetryContext,
+        direction: ArbitrageDirection,
         trade: TradeEvaluation,
+        quote: &TopOfBook,
+        cost_snapshot: Option<PreTradeCostSnapshot>,
     ) -> anyhow::Result<serde_json::Value> {
         let pool = self
             .context
@@ -832,6 +899,9 @@ impl HotTelemetryTask {
                 )
             )
         };
+        let pretrade_cost = cost_snapshot
+            .map(|snapshot| pretrade_cost_payload(pair, pool, direction, trade, quote, snapshot))
+            .transpose()?;
         Ok(json!({
             "pool_index": trade.pool_index,
             "pool_id": pool.pool_id,
@@ -861,8 +931,238 @@ impl HotTelemetryTask {
             "gross_profit_bps_x100": trade.gross_profit_bps_x100,
             "gross_profit_bps": format_bps_x100(trade.gross_profit_bps_x100),
             "meets_threshold": trade.meets_threshold,
+            "pretrade_cost": pretrade_cost,
         }))
     }
+}
+
+const PRETRADE_COST_MODEL_VERSION: &str = "diagnostic_net_edge_v1";
+const HYPOTHETICAL_NET_EDGE_FLOOR_BPS: i64 = 5;
+const GAS_PRICE_CACHE_TTL_US: u64 = 2_000_000;
+const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
+
+fn pretrade_cost_payload(
+    pair: &PairTelemetryContext,
+    pool: &PoolTelemetryContext,
+    direction: ArbitrageDirection,
+    trade: TradeEvaluation,
+    quote: &TopOfBook,
+    snapshot: PreTradeCostSnapshot,
+) -> anyhow::Result<serde_json::Value> {
+    let binance_fee_bps = match direction {
+        ArbitrageDirection::BuyTokenBOnDexSellOnCex => pair.binance_sell_fee_bps,
+        ArbitrageDirection::BuyTokenBOnCexSellOnDex => pair.binance_buy_fee_bps,
+    };
+    let binance_commission = ceil_bps(trade.cex_token_a_amount, binance_fee_bps)?;
+
+    let gas_sample = snapshot
+        .gas_price
+        .filter(|sample| sample.captured_unix_us <= quote.received_unix_us);
+    let native_conversion = snapshot
+        .native_conversion
+        .filter(|sample| sample.captured_unix_us <= quote.received_unix_us);
+    let receipt = snapshot
+        .receipt(pool.protocol)
+        .filter(|sample| sample.captured_unix_us <= quote.received_unix_us);
+    let gas_sample_age_us = gas_sample.map(|sample| {
+        quote
+            .received_unix_us
+            .saturating_sub(sample.captured_unix_us)
+    });
+    let gas_sample_fresh = gas_sample_age_us.is_some_and(|age| age <= GAS_PRICE_CACHE_TTL_US);
+    let gas_units = receipt
+        .map(|sample| sample.gas_used)
+        .unwrap_or(HISTORICAL_SWAP_GAS_LIMIT);
+    let gas_units_source = if receipt.is_some() {
+        "last_same_protocol_receipt"
+    } else {
+        "historical_swap_gas_limit_fallback"
+    };
+    let includes_l1_fee = gas_sample.is_some_and(|sample| sample.includes_l1_fee);
+    let l1_fee_available = !includes_l1_fee || receipt.is_some();
+    let l1_fee_wei = receipt.map_or(0, |sample| sample.l1_fee_wei);
+    let gas_cost = match (gas_sample.filter(|_| gas_sample_fresh), native_conversion) {
+        (Some(gas), Some(conversion)) if l1_fee_available => native_gas_to_token_a_base_units(
+            gas_units,
+            gas.maximum_fee_per_gas_wei,
+            l1_fee_wei,
+            conversion.price_token_a,
+            pair.token_a_decimals,
+        )
+        .ok()
+        .map(alloy_primitives::U256::from),
+        _ => None,
+    };
+    let modeled_cost = gas_cost.and_then(|gas_cost| gas_cost.checked_add(binance_commission));
+    let binance_commission_bps_x100 = unsigned_bps_x100(binance_commission, trade.cost_token_a)?;
+    let gas_cost_bps_x100 = gas_cost
+        .map(|cost| unsigned_bps_x100(cost, trade.cost_token_a))
+        .transpose()?;
+    let modeled_cost_bps_x100 = modeled_cost
+        .map(|cost| unsigned_bps_x100(cost, trade.cost_token_a))
+        .transpose()?;
+    let gross_profit = signed_difference(trade.proceeds_token_a, trade.cost_token_a);
+    let net_profit = modeled_cost.map(|modeled_cost| {
+        signed_difference(
+            trade.proceeds_token_a,
+            trade.cost_token_a.saturating_add(modeled_cost),
+        )
+    });
+    let net_profit_bps_x100 = net_profit
+        .map(|profit| signed_bps_x100(profit, trade.cost_token_a))
+        .transpose()?;
+    let hypothetical_threshold_met =
+        net_profit_bps_x100.map(|bps| bps >= HYPOTHETICAL_NET_EDGE_FLOOR_BPS * 100);
+
+    let mut payload = json!({
+        "model_version": PRETRADE_COST_MODEL_VERSION,
+        "diagnostic_only": true,
+        "decision_input": false,
+        "fixed_threshold_met": trade.meets_threshold,
+        "fixed_threshold_bps": pair.opportunity_threshold_bps,
+        "hypothetical_net_edge_floor_bps": HYPOTHETICAL_NET_EDGE_FLOOR_BPS,
+        "hypothetical_threshold_met": hypothetical_threshold_met,
+        "hypothetical_new_capture": hypothetical_threshold_met
+            .map(|met| met && !trade.meets_threshold),
+        "gross_profit_token_a_base_units": signed_value(gross_profit),
+        "gross_profit_bps_x100": trade.gross_profit_bps_x100,
+        "dex_fee_model": "embedded_in_exact_clmm_curve_quote",
+        "dex_pool_fee_pips": pool.fee_pips,
+        "binance_commission_model": "conservative_taker_fee_bps_without_discount",
+        "binance_side": match direction {
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex => "SELL",
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex => "BUY",
+        },
+        "binance_commission_bps": binance_fee_bps,
+        "binance_commission_bps_x100": binance_commission_bps_x100,
+        "binance_commission_token_a_base_units": binance_commission.to_string(),
+    });
+    payload
+        .as_object_mut()
+        .expect("pre-trade cost payload is an object")
+        .extend(
+            json!({
+            "gas_model": "current_fee_cap_x_last_same_protocol_gas_used_plus_last_l1_fee",
+            "gas_protocol": pool.protocol.label(),
+            "gas_price_available_pretrade": gas_sample.is_some(),
+            "gas_price_fresh": gas_sample_fresh,
+            "gas_price_cache_ttl_us": GAS_PRICE_CACHE_TTL_US,
+            "gas_price_sample_age_us": gas_sample_age_us,
+            "gas_price_source": gas_sample.map(|sample| sample.source.label()),
+            "gas_price_wei": gas_sample.map(|sample| sample.gas_price_wei.to_string()),
+            "maximum_fee_per_gas_wei": gas_sample
+                .map(|sample| sample.maximum_fee_per_gas_wei.to_string()),
+            "native_conversion_available_pretrade": native_conversion.is_some(),
+            "native_conversion_sample_age_us": native_conversion.map(|sample| {
+                quote.received_unix_us.saturating_sub(sample.captured_unix_us)
+            }),
+            "native_conversion_price_token_a": native_conversion
+                .map(|sample| sample.price_token_a.to_string()),
+            "gas_units": gas_units,
+            "gas_units_source": gas_units_source,
+            "gas_units_sample_age_us": receipt.map(|sample| {
+                quote.received_unix_us.saturating_sub(sample.captured_unix_us)
+            }),
+            "last_effective_gas_price_wei": receipt
+                .map(|sample| sample.effective_gas_price_wei.to_string()),
+            "l1_fee_required": includes_l1_fee,
+            "l1_fee_available": l1_fee_available,
+            "l1_fee_wei": l1_fee_available.then(|| l1_fee_wei.to_string()),
+            })
+            .as_object()
+            .expect("pre-trade gas payload is an object")
+            .clone(),
+        );
+    payload
+        .as_object_mut()
+        .expect("pre-trade cost payload is an object")
+        .extend(
+            json!({
+            "gas_cost_token_a_base_units": gas_cost.map(|value| value.to_string()),
+            "gas_cost_bps_x100": gas_cost_bps_x100,
+            "modeled_cost_token_a_base_units": modeled_cost.map(|value| value.to_string()),
+            "modeled_cost_bps_x100": modeled_cost_bps_x100,
+            "model_inputs_complete": modeled_cost.is_some(),
+            "net_profit_token_a_base_units": net_profit.map(signed_value),
+            "net_profit_bps_x100": net_profit_bps_x100,
+            "excluded_from_model": [
+                "binance_recovery",
+                "inventory",
+                "calldata_slippage_bound",
+                "future_market_impact"
+            ],
+            })
+            .as_object()
+            .expect("pre-trade result payload is an object")
+            .clone(),
+        );
+    Ok(payload)
+}
+
+#[derive(Clone, Copy)]
+struct SignedU256 {
+    negative: bool,
+    magnitude: alloy_primitives::U256,
+}
+
+fn signed_difference(
+    positive: alloy_primitives::U256,
+    negative: alloy_primitives::U256,
+) -> SignedU256 {
+    if positive >= negative {
+        SignedU256 {
+            negative: false,
+            magnitude: positive - negative,
+        }
+    } else {
+        SignedU256 {
+            negative: true,
+            magnitude: negative - positive,
+        }
+    }
+}
+
+fn signed_value(value: SignedU256) -> String {
+    if value.negative && !value.magnitude.is_zero() {
+        format!("-{}", value.magnitude)
+    } else {
+        value.magnitude.to_string()
+    }
+}
+
+fn signed_bps_x100(value: SignedU256, denominator: alloy_primitives::U256) -> anyhow::Result<i64> {
+    anyhow::ensure!(!denominator.is_zero(), "pre-trade cost denominator is zero");
+    let scaled = value
+        .magnitude
+        .checked_mul(alloy_primitives::U256::from(1_000_000_u64))
+        .context("pre-trade net bps numerator overflow")?
+        / denominator;
+    let magnitude = i64::try_from(scaled).unwrap_or(i64::MAX);
+    Ok(if value.negative {
+        -magnitude
+    } else {
+        magnitude
+    })
+}
+
+fn unsigned_bps_x100(
+    value: alloy_primitives::U256,
+    denominator: alloy_primitives::U256,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(!denominator.is_zero(), "pre-trade cost denominator is zero");
+    let scaled = value
+        .checked_mul(alloy_primitives::U256::from(1_000_000_u64))
+        .context("pre-trade cost bps numerator overflow")?
+        / denominator;
+    Ok(u64::try_from(scaled).unwrap_or(u64::MAX))
+}
+
+fn ceil_bps(amount: alloy_primitives::U256, bps: u16) -> anyhow::Result<alloy_primitives::U256> {
+    let numerator = amount
+        .checked_mul(alloy_primitives::U256::from(bps))
+        .and_then(|value| value.checked_add(alloy_primitives::U256::from(9_999_u64)))
+        .context("pre-trade Binance commission overflow")?;
+    Ok(numerator / alloy_primitives::U256::from(10_000_u64))
 }
 
 fn format_bps_x100(value: i64) -> String {
@@ -877,8 +1177,8 @@ mod tests {
     use alloy_primitives::U256;
 
     use super::{
-        HotDexEventTelemetry, HotSharedStreamTelemetry, legacy_decision_projection,
-        ownership_graph_decision_projection,
+        HotDexEventTelemetry, HotSharedStreamTelemetry, ceil_bps, legacy_decision_projection,
+        ownership_graph_decision_projection, signed_bps_x100, signed_difference,
     };
     use crate::opportunity::{
         ArbitrageDirection, DirectionEvaluation, PairEvaluation, PreparedPoolRefresh,
@@ -892,6 +1192,16 @@ mod tests {
         assert!(std::mem::size_of::<PreparedPoolRefresh>() <= 512);
         assert!(!std::mem::needs_drop::<HotSharedStreamTelemetry>());
         assert!(std::mem::size_of::<HotSharedStreamTelemetry>() <= 128);
+    }
+
+    #[test]
+    fn diagnostic_cost_math_rounds_commission_up_and_keeps_signed_net_edge() {
+        assert_eq!(
+            ceil_bps(U256::from(10_001_u64), 10).unwrap(),
+            U256::from(11)
+        );
+        let loss = signed_difference(U256::from(9_995_u64), U256::from(10_000_u64));
+        assert_eq!(signed_bps_x100(loss, U256::from(10_000_u64)).unwrap(), -500);
     }
 
     #[test]

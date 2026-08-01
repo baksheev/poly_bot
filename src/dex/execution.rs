@@ -15,6 +15,9 @@ use crate::{
     },
     dex::events::{PoolLocator, PoolUpdate, decode_pool_event},
     domain::compiled::CompiledNetworkGasPolicy,
+    pretrade_cost::{
+        DexProtocol as CostTelemetryDexProtocol, GasPriceTelemetrySource, PreTradeCostTelemetry,
+    },
     telemetry::ExecutionLatencyTelemetry,
     wallet::{
         EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
@@ -341,6 +344,7 @@ pub struct DexExecutor {
     last_terminal_receipt: Option<TransactionReceipt>,
     receipt_heads: Option<watch::Receiver<CanonicalBlock>>,
     latency_telemetry: Option<ExecutionLatencyTelemetry>,
+    pretrade_cost_telemetry: Option<PreTradeCostTelemetry>,
 }
 
 impl std::fmt::Debug for DexExecutor {
@@ -433,11 +437,16 @@ impl DexExecutor {
             last_terminal_receipt: None,
             receipt_heads: None,
             latency_telemetry: None,
+            pretrade_cost_telemetry: None,
         })
     }
 
     pub fn set_latency_telemetry(&mut self, telemetry: ExecutionLatencyTelemetry) {
         self.latency_telemetry = Some(telemetry);
+    }
+
+    pub fn set_pretrade_cost_telemetry(&mut self, telemetry: PreTradeCostTelemetry) {
+        self.pretrade_cost_telemetry = Some(telemetry);
     }
 
     /// Wake receipt lookup from the process-wide Alchemy new-head stream.
@@ -645,6 +654,17 @@ impl DexExecutor {
         );
         let settlement_log = settlement_log_for_route(&receipt, request.route)?;
         let l1_fee = self.accounted_l1_fee(receipt.l1_fee);
+        if let Some(telemetry) = &self.pretrade_cost_telemetry {
+            telemetry.publish_receipt(
+                match protocol {
+                    UniswapProtocol::V3 => CostTelemetryDexProtocol::UniswapV3,
+                    UniswapProtocol::V4 => CostTelemetryDexProtocol::UniswapV4,
+                },
+                receipt.gas_used,
+                receipt.effective_gas_price,
+                l1_fee,
+            );
+        }
         Ok(SwapExecutionOutcome {
             protocol,
             transaction_hash: receipt.transaction_hash,
@@ -1240,6 +1260,25 @@ impl DexExecutor {
             wei,
             source,
         });
+        if let Some(telemetry) = &self.pretrade_cost_telemetry {
+            let (maximum_fee_per_gas_wei, _) = transaction_fees_for_policy(&self.gas_policy, wei)?;
+            let includes_l1_fee = matches!(
+                self.gas_policy,
+                CompiledNetworkGasPolicy::WorldChainV12 {
+                    includes_l1_fee: true,
+                    ..
+                }
+            );
+            telemetry.publish_gas_price(
+                wei,
+                maximum_fee_per_gas_wei,
+                match source {
+                    GasPriceSource::Rpc => GasPriceTelemetrySource::Rpc,
+                    GasPriceSource::RailsFallback => GasPriceTelemetrySource::RailsFallback,
+                },
+                includes_l1_fee,
+            );
+        }
         Ok(())
     }
 }

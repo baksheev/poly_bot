@@ -20,6 +20,11 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Add one-Hz diagnostic-only pre-trade net-edge sampling to background
+  arbitrage evaluations. It records conservative Binance commission, current
+  cached gas fee cap, same-protocol realized gas/L1 inputs, source ages, and a
+  hypothetical 5 bps net result without changing the production 20 bps gate or
+  adding records to the bounded ClickHouse channel.
 - Add the M5 account-wide portfolio owner. Inventory is now keyed by exact
   account or chain/wallet location plus reviewed venue asset ID, trade and
   rebalance claims share pre-aggregated atomic reservations, settlement

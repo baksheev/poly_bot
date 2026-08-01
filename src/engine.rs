@@ -141,6 +141,7 @@ pub struct TradingExecutionHandles {
     pub portfolio_catalog: Arc<PortfolioCatalog>,
     pub inventory: SharedInventoryReservations,
     pub capital_allocator: CapitalAllocatorHandle,
+    pub pretrade_cost_telemetry: crate::pretrade_cost::PreTradeCostTelemetry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,8 +600,13 @@ impl TradingEngine {
                 .entry_preflight
                 .configure_max_transport_silence(&pair.binance.symbol, max_transport_silence_ms);
         }
-        let (hot_telemetry, hot_telemetry_task) =
-            hot_telemetry_channel(&config, opportunities.pairs(), &dex, telemetry.clone())?;
+        let (hot_telemetry, hot_telemetry_task) = hot_telemetry_channel(
+            &config,
+            opportunities.pairs(),
+            &dex,
+            telemetry.clone(),
+            execution.pretrade_cost_telemetry,
+        )?;
         let portfolio_catalog = execution.portfolio_catalog;
         let require_binance_depth =
             requires_depth_for_runtime_phase(config.arbitrage_execution_mode.as_str());
@@ -1355,6 +1361,8 @@ impl TradingEngine {
                 {
                     self.hot_telemetry
                         .emit_binance_book(&quote, "gas_conversion", None, "stored");
+                    self.hot_telemetry
+                        .publish_native_conversion(quote.received_unix_us, quote.ask_price);
                     self.gas_price_book = Some(quote);
                 }
             }

@@ -116,6 +116,8 @@ workstation.
   frozen production evidence used for the current priorities.
 - [Binance price liveness and telemetry](docs/binance-price-telemetry.md) —
   current transport-liveness contract and observability requirements.
+- [Pre-trade cost telemetry](docs/pretrade-cost-telemetry.md) — diagnostic net-edge
+  inputs and the 24-hour cohort report.
 - [Concurrent execution](docs/concurrent-execution.md) — separately gated
   experiment; DEX-first remains the production control.
 - [Release changelog](CHANGELOG.md) — implementation history.

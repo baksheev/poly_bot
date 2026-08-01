@@ -19,6 +19,7 @@ pub mod market_data;
 pub mod network_runtime;
 pub mod opportunity;
 pub mod portfolio;
+pub mod pretrade_cost;
 pub mod rebalance;
 pub mod state;
 pub mod strategy_runtime;

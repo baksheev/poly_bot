@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${ENV_FILE:-${repo_root}/.env.production}"
+start_utc="${1:-}"
+end_utc="${2:-}"
+
+if [[ ! "${start_utc}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ \
+  || ! "${end_utc}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+  echo "usage: scripts/report-pretrade-cost-model START_UTC END_UTC" >&2
+  exit 1
+fi
+if [[ ! -f "${env_file}" ]]; then
+  echo "env file not found: ${env_file}" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${env_file}"
+set +a
+
+: "${CLICKHOUSE_URL:?CLICKHOUSE_URL is required}"
+: "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required}"
+clickhouse_user="${CLICKHOUSE_USER:-default}"
+clickhouse_database="${CLICKHOUSE_DATABASE:-arb_bot_prod}"
+if [[ ! "${clickhouse_database}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  echo "CLICKHOUSE_DATABASE is not a safe identifier" >&2
+  exit 1
+fi
+
+query_url="${CLICKHOUSE_URL}?database=${clickhouse_database}&param_start_utc=${start_utc}&param_end_utc=${end_utc}"
+curl --fail --silent --show-error \
+  --user "${clickhouse_user}:${CLICKHOUSE_PASSWORD}" \
+  --data-binary "@${repo_root}/scripts/sql/pretrade_cost_model.sql" \
+  "${query_url}"

@@ -79,6 +79,7 @@ use arb_bot::{
         ArbitrageDirection, OpportunityEngine, PreparedPoolBuildBatch, PreparedPoolBuildRequest,
     },
     portfolio::{PortfolioCatalog, capital_allocator_channel, remaining_rebalance_authority},
+    pretrade_cost::PreTradeCostTelemetry,
     rebalance::{
         RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionRequest,
         RebalanceExecutor, RebalanceRisk, RebalanceRuntimeLimits, RebalanceTracker,
@@ -1153,8 +1154,13 @@ async fn collect_prices(
     let mut opportunities = OpportunityEngine::new(domain_config.snapshot(), &mirror)?;
     let balance_telemetry = telemetry.clone();
     let pool_quote_telemetry = telemetry.clone();
-    let (hot_telemetry, hot_telemetry_task) =
-        hot_telemetry::channel(&config, opportunities.pairs(), &mirror, telemetry.clone())?;
+    let (hot_telemetry, hot_telemetry_task) = hot_telemetry::channel(
+        &config,
+        opportunities.pairs(),
+        &mirror,
+        telemetry.clone(),
+        PreTradeCostTelemetry::default(),
+    )?;
     let hot_telemetry_task = tokio::spawn(hot_telemetry_task.run());
 
     let AlchemyDexStream {
@@ -2385,6 +2391,8 @@ async fn run(
         .context("ESP ESP execution has no Arbitrum wallet snapshot")?
         .clone();
     let entry_preflight = EntryPreflightHandle::default();
+    let primary_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
+    let esp_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
     let mut shared_arbitrum_rebalance_owner_attached = false;
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
         ensure!(
@@ -2531,6 +2539,7 @@ async fn run(
         let execution_latency_telemetry =
             ExecutionLatencyTelemetry::new(telemetry.clone(), config.engine_id.clone());
         dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
+        dex_executor.set_pretrade_cost_telemetry(primary_pretrade_cost_telemetry.clone());
         let dex_service = DexExecutionService::spawn(
             dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
@@ -2594,6 +2603,7 @@ async fn run(
                 .await?;
         }
         esp_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
+        esp_dex_executor.set_pretrade_cost_telemetry(esp_pretrade_cost_telemetry.clone());
         let esp_dex_service = DexExecutionService::spawn(
             esp_dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
@@ -2853,6 +2863,7 @@ async fn run(
             portfolio_catalog: Arc::clone(&portfolio_catalog),
             inventory: shared_inventory.clone(),
             capital_allocator: portfolio_allocator.clone(),
+            pretrade_cost_telemetry: primary_pretrade_cost_telemetry,
         },
         BinanceFeeBps {
             buy: binance_buy_fee_bps,
@@ -2892,6 +2903,7 @@ async fn run(
             portfolio_catalog: Arc::clone(&portfolio_catalog),
             inventory: shared_inventory.clone(),
             capital_allocator: portfolio_allocator,
+            pretrade_cost_telemetry: esp_pretrade_cost_telemetry,
         },
         BinanceFeeBps {
             buy: esp_buy_fee_bps,
