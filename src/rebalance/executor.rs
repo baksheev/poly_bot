@@ -21,7 +21,7 @@ use super::{Direction, Location, PendingTransfer, RebalanceAction, Route};
 const VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
-const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 3;
+const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalanceExecutionRequest {
@@ -446,12 +446,7 @@ impl RebalanceExecutionJournal {
                 .copied()
                 .unwrap_or(0)
                 >= MAX_CORRECTED_QUARANTINE_REOPENS
-                || !matches!(
-                    reason.as_str(),
-                    "unindexed Binance withdrawal retry found a destination-wallet balance change"
-                        | "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
-                        | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
-                )
+                || !corrected_guard_quarantine(reason)
             {
                 return None;
             }
@@ -959,6 +954,26 @@ enum TransitionOrigin {
     LiveAppend,
 }
 
+fn ownership_guard_quarantine(reason: &str) -> bool {
+    matches!(
+        reason,
+        "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+            | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
+            | "Binance Travel Rule ownership verification is absent for the exact wallet and network"
+    )
+}
+
+fn signature_encoding_quarantine(reason: &str) -> bool {
+    reason
+        == "Binance Travel Rule withdrawal submission failed with HTTP 400 Bad Request, code -1022: Signature for this request is not valid."
+}
+
+fn corrected_guard_quarantine(reason: &str) -> bool {
+    reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
+        || ownership_guard_quarantine(reason)
+        || signature_encoding_quarantine(reason)
+}
+
 #[allow(clippy::match_like_matches_macro)]
 fn validate_transition(
     intent: &RebalanceExecutionIntent,
@@ -1009,26 +1024,21 @@ fn validate_transition(
         ) if (reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
             && api_mode == "travel_rule_ae_self_owned"
             && *reconciliation_queries == 1)
-            || (matches!(
-                    reason.as_str(),
-                    "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
-                        | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
-                )
+            || (ownership_guard_quarantine(reason)
                 && matches!(
                     api_mode.as_str(),
                     "travel_rule_required_after_standard_-4104" | "travel_rule_ae_self_owned"
                 )
+                && *reconciliation_queries == 0)
+            || (signature_encoding_quarantine(reason)
+                && api_mode == "travel_rule_ae_self_owned"
                 && *reconciliation_queries == 0)
     ) || matches!(
         (previous, next),
         (
             RebalanceExecutionProgress::Quarantined { reason },
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { api_mode, .. },
-        ) if matches!(
-                reason.as_str(),
-                "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
-                    | "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
-            )
+        ) if ownership_guard_quarantine(reason)
             && api_mode == "travel_rule_ae_self_owned"
     );
     ensure!(
@@ -2041,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn corrected_false_positive_quarantine_has_three_bounded_durable_reopens() {
+    fn corrected_false_positive_quarantine_has_four_bounded_durable_reopens() {
         let path = path("bounded-quarantine-recovery");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -2137,6 +2147,20 @@ mod tests {
                 },
             )
             .unwrap();
+        let reopened_fourth = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the fourth reviewed guard correction should reopen once more");
+        assert_eq!(reopened_fourth.progress, reopened.progress);
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
         assert!(
             replayed
                 .reopen_next_retryable_quarantine()
@@ -2193,6 +2217,7 @@ mod tests {
             .reopen_next_retryable_quarantine()
             .unwrap()
             .expect("the exact Travel Rule submission progress should reopen");
+        let expected_progress = reopened.progress.clone();
         assert!(matches!(
             reopened.progress,
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
@@ -2201,6 +2226,38 @@ mod tests {
                 ..
             } if api_mode == "travel_rule_ae_self_owned"
         ));
+        for (reason, expected_reopen) in [
+            (
+                "Binance Travel Rule ownership verification is not unique for the exact wallet and network",
+                true,
+            ),
+            (
+                "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token",
+                true,
+            ),
+            (
+                "Binance Travel Rule ownership verification is absent for the exact wallet and network",
+                true,
+            ),
+            (
+                "Binance Travel Rule ownership verification is absent for the exact wallet and network",
+                false,
+            ),
+        ] {
+            replayed
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Quarantined {
+                        reason: reason.to_owned(),
+                    },
+                )
+                .unwrap();
+            let next = replayed.reopen_next_retryable_quarantine().unwrap();
+            assert_eq!(next.is_some(), expected_reopen);
+            if let Some(next) = next {
+                assert_eq!(next.progress, expected_progress);
+            }
+        }
         drop(replayed);
         fs::remove_file(path).unwrap();
     }
@@ -2310,8 +2367,42 @@ mod tests {
         replayed
             .advance(
                 &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: U256::from(9),
+                    reconciliation_queries: 0,
+                },
+            )
+            .unwrap();
+        replayed
+            .advance(
+                &operation_id,
                 RebalanceExecutionProgress::Quarantined {
-                    reason: "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token"
+                    reason: "Binance Travel Rule withdrawal submission failed with HTTP 400 Bad Request, code -1022: Signature for this request is not valid."
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        drop(replayed);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened_after_signature_correction = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the exact submission should survive the signature-encoding correction");
+        assert!(matches!(
+            reopened_after_signature_correction.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                ref api_mode,
+                reconciliation_queries: 0,
+                ..
+            } if api_mode == "travel_rule_ae_self_owned"
+        ));
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "Binance Travel Rule withdrawal submission failed with HTTP 400 Bad Request, code -1022: Signature for this request is not valid."
                         .to_owned(),
                 },
             )

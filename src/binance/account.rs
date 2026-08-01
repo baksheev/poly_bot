@@ -430,7 +430,10 @@ impl BinanceAccountClient {
             query.append_pair("timestamp", &timestamp.to_string());
         }
         url.query()
-            .map(str::to_owned)
+            // Binance's official connectors sign and transmit spaces with
+            // encodeURIComponent semantics. `Url` uses form encoding (`+`),
+            // which changes the signature payload for JSON questionnaires.
+            .map(|query| query.replace('+', "%20"))
             .context("Binance signed query encoder returned an empty query")
     }
 }
@@ -1196,5 +1199,23 @@ mod tests {
         assert!(query.starts_with(
             "questionnaire=%7B%22isAddressOwner%22%3A1%2C%22sendTo%22%3A1%7D&timestamp="
         ));
+    }
+
+    #[test]
+    fn signed_query_uses_percent_twenty_for_questionnaire_spaces() {
+        let client = BinanceAccountClient::new(
+            "https://api.binance.com",
+            BinanceCredentials::new("api", "secret"),
+        )
+        .unwrap();
+        let query = client
+            .signed_query(&[(
+                "questionnaire",
+                r#"{"vaspName":"Unhosted Wallet"}"#.to_owned(),
+            )])
+            .unwrap();
+
+        assert!(query.contains("Unhosted%20Wallet"));
+        assert!(!query.contains("Unhosted+Wallet"));
     }
 }

@@ -146,7 +146,7 @@ fn verified_address_metadata_is_forwarded_into_the_travel_rule_questionnaire() {
     let proof = &REBALANCE_RUNTIME[start..end];
 
     assert!(proof.contains("questionnaire_country_code.as_deref() == Some(\"AE\")"));
-    assert!(proof.contains("verified_self_owned_address_record(record, &wallet, network)"));
+    assert!(proof.contains("verified_self_owned_evm_address_record(record, &wallet)"));
     assert!(REBALANCE_RUNTIME.contains("record.status == \"VERIFIED\""));
     assert!(REBALANCE_RUNTIME.contains("record.address_questionnaire.is_address_owner == Some(1)"));
     assert!(REBALANCE_RUNTIME.contains("record.address_questionnaire.verify_method == Some(1)"));

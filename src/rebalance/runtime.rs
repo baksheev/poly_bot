@@ -2367,7 +2367,7 @@ impl RebalanceExecutor {
         let wallet = format!("{:#x}", operation.intent.wallet_owner);
         let matching = records
             .iter()
-            .filter(|record| verified_self_owned_address_record(record, &wallet, network))
+            .filter(|record| verified_self_owned_evm_address_record(record, &wallet))
             .collect::<Vec<_>>();
         let record = matching.first().context(
             "Binance Travel Rule ownership verification is absent for the exact wallet and network",
@@ -3077,13 +3077,11 @@ fn same_withdrawal_retry_authority(
         && left.master_locked_base_units == right.master_locked_base_units
 }
 
-fn verified_self_owned_address_record(
+fn verified_self_owned_evm_address_record(
     record: &AddressVerificationRecord,
     wallet: &str,
-    network: &str,
 ) -> bool {
     record.wallet_address.eq_ignore_ascii_case(wallet)
-        && record.network == network
         && record.status == "VERIFIED"
         && record.address_questionnaire.is_address_owner == Some(1)
         && record.address_questionnaire.verify_method == Some(1)
@@ -3414,7 +3412,7 @@ mod tests {
         merge_travel_rule_withdrawal_detail, reconcile_approved_travel_rule_rejection,
         route_wallet_chain_id, shared_evm_confirmation_timeout, validate_across_fill_receipt,
         validate_approved_asset, validate_direct_withdrawal_receipt,
-        verified_self_owned_address_record, withdrawal_received_base_units,
+        verified_self_owned_evm_address_record, withdrawal_received_base_units,
         withdrawal_requested_base_units,
     };
 
@@ -3445,15 +3443,13 @@ mod tests {
             },
         };
 
-        assert!(verified_self_owned_address_record(
+        assert!(verified_self_owned_evm_address_record(
             &record,
             "0x1111111111111111111111111111111111111111",
-            "ARBITRUM",
         ));
-        assert!(!verified_self_owned_address_record(
+        assert!(!verified_self_owned_evm_address_record(
             &record,
-            "0x1111111111111111111111111111111111111111",
-            "OPTIMISM",
+            "0x2222222222222222222222222222222222222222",
         ));
     }
 
