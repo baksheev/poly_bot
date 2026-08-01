@@ -1014,6 +1014,13 @@ fn validate_transition(
                     "travel_rule_required_after_standard_-4104" | "travel_rule_ae_self_owned"
                 )
                 && *reconciliation_queries == 0)
+    ) || matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { api_mode, .. },
+        ) if reason == "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+            && api_mode == "travel_rule_ae_self_owned"
     );
     ensure!(
         !previous.terminal()
@@ -2170,6 +2177,94 @@ mod tests {
                 reconciliation_queries: 0,
                 ..
             } if api_mode == "travel_rule_ae_self_owned"
+        ));
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ownership_guard_reopens_exact_authorized_retry_after_prior_recovery() {
+        let path = path("ownership-quarantine-authorized-retry");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let retry_amount = operation.intent.amount;
+        let operation_id = operation.intent.operation_id;
+        for progress in [
+            RebalanceExecutionProgress::BinanceTransferSubmitted {
+                transaction_id: 1,
+                bridge_balance_before: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceTransferCompleted {
+                transaction_id: 1,
+                bridge_balance_before: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: "travel_rule_ae_self_owned".to_owned(),
+                bridge_balance_before: U256::from(9),
+                reconciliation_queries: 1,
+            },
+            RebalanceExecutionProgress::Quarantined {
+                reason:
+                    "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+            },
+        ] {
+            journal.advance(&operation_id, progress).unwrap();
+        }
+        let reopened_submission = journal
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the first reviewed guard should reopen its exact submission state");
+        assert!(matches!(
+            reopened_submission.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                ref api_mode,
+                reconciliation_queries: 1,
+                ..
+            } if api_mode == "travel_rule_ae_self_owned"
+        ));
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                    api_mode: "travel_rule_ae_self_owned".to_owned(),
+                    bridge_balance_before: U256::from(9),
+                    master_free_base_units: retry_amount,
+                    master_locked_base_units: U256::ZERO,
+                    wallet_balance_base_units: U256::from(11),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened_retry = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the second guard correction should restore its exact retry authority");
+        assert!(matches!(
+            reopened_retry.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
+                ref api_mode,
+                master_free_base_units,
+                master_locked_base_units,
+                wallet_balance_base_units,
+                ..
+            } if api_mode == "travel_rule_ae_self_owned"
+                && master_free_base_units == retry_amount
+                && master_locked_base_units.is_zero()
+                && wallet_balance_base_units == U256::from(11)
         ));
         drop(replayed);
         fs::remove_file(path).unwrap();
