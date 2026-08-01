@@ -1009,7 +1009,10 @@ fn validate_transition(
             && api_mode == "travel_rule_ae_self_owned"
             && *reconciliation_queries == 1)
             || (reason == "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
-                && api_mode == "travel_rule_required_after_standard_-4104"
+                && matches!(
+                    api_mode.as_str(),
+                    "travel_rule_required_after_standard_-4104" | "travel_rule_ae_self_owned"
+                )
                 && *reconciliation_queries == 0)
     );
     ensure!(
@@ -2110,6 +2113,64 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ownership_guard_reopens_exact_travel_rule_submission_progress() {
+        let path = path("ownership-quarantine-travel-rule-progress");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        for progress in [
+            RebalanceExecutionProgress::BinanceTransferSubmitted {
+                transaction_id: 1,
+                bridge_balance_before: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceTransferCompleted {
+                transaction_id: 1,
+                bridge_balance_before: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: "standard".to_owned(),
+                bridge_balance_before: U256::from(9),
+                reconciliation_queries: 0,
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: "travel_rule_required_after_standard_-4104".to_owned(),
+                bridge_balance_before: U256::from(9),
+                reconciliation_queries: 0,
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: "travel_rule_ae_self_owned".to_owned(),
+                bridge_balance_before: U256::from(9),
+                reconciliation_queries: 0,
+            },
+            RebalanceExecutionProgress::Quarantined {
+                reason: "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+                    .to_owned(),
+            },
+        ] {
+            journal.advance(&operation_id, progress).unwrap();
+        }
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the exact Travel Rule submission progress should reopen");
+        assert!(matches!(
+            reopened.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                ref api_mode,
+                reconciliation_queries: 0,
+                ..
+            } if api_mode == "travel_rule_ae_self_owned"
+        ));
         drop(replayed);
         fs::remove_file(path).unwrap();
     }
