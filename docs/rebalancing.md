@@ -344,9 +344,9 @@ withdrawal. Only then does the executor fsync a
 client id. Any missing or conflicting input continues to fail closed for that
 token. The unresolved operation is durably quarantined, releases the shared
 execution lane, and is excluded from later planning without excluding another
-token's independent rebalance. A corrected false-positive guard may reopen its
-exact prior durable progress once; it cannot create a fresh operation or loop
-the same quarantine.
+token's independent rebalance. The two reviewed false-positive guard
+corrections may each reopen the exact prior durable progress once; the bounded
+recovery cannot create a fresh operation or loop the same quarantine.
 
 ## M10 Arbitrum rebalance canary
 

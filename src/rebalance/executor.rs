@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{File, OpenOptions, symlink_metadata},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -21,6 +21,7 @@ use super::{Direction, Location, PendingTransfer, RebalanceAction, Route};
 const VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
+const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalanceExecutionRequest {
@@ -247,7 +248,7 @@ pub struct RebalanceExecutionJournal {
     operations: BTreeMap<String, RebalanceExecutionOperation>,
     operation_started_at_unix_ms: BTreeMap<String, u64>,
     progress_before_quarantine: BTreeMap<String, RebalanceExecutionProgress>,
-    retried_quarantined_operations: BTreeSet<String>,
+    quarantine_reopen_counts: BTreeMap<String, u8>,
     next_sequence: u64,
     poisoned: bool,
 }
@@ -320,7 +321,7 @@ impl RebalanceExecutionJournal {
         let mut operations: BTreeMap<String, RebalanceExecutionOperation> = BTreeMap::new();
         let mut operation_started_at_unix_ms = BTreeMap::new();
         let mut progress_before_quarantine = BTreeMap::new();
-        let mut retried_quarantined_operations = BTreeSet::new();
+        let mut quarantine_reopen_counts = BTreeMap::new();
         let mut expected_sequence = 0_u64;
         let mut reader = BufReader::new(
             file.try_clone()
@@ -372,8 +373,12 @@ impl RebalanceExecutionJournal {
                     previous.progress,
                     RebalanceExecutionProgress::Quarantined { .. }
                 ) {
-                    retried_quarantined_operations
-                        .insert(payload.operation.intent.operation_id.clone());
+                    let count = quarantine_reopen_counts
+                        .entry(payload.operation.intent.operation_id.clone())
+                        .or_insert(0_u8);
+                    *count = count
+                        .checked_add(1)
+                        .context("rebalance quarantine reopen count overflow")?;
                 }
             }
             apply_snapshot(
@@ -392,7 +397,7 @@ impl RebalanceExecutionJournal {
             operations,
             operation_started_at_unix_ms,
             progress_before_quarantine,
-            retried_quarantined_operations,
+            quarantine_reopen_counts,
             next_sequence: expected_sequence,
             poisoned: false,
         })
@@ -436,8 +441,11 @@ impl RebalanceExecutionJournal {
                 return None;
             };
             if self
-                .retried_quarantined_operations
-                .contains(&operation.intent.operation_id)
+                .quarantine_reopen_counts
+                .get(&operation.intent.operation_id)
+                .copied()
+                .unwrap_or(0)
+                >= MAX_CORRECTED_QUARANTINE_REOPENS
                 || !matches!(
                     reason.as_str(),
                     "unindexed Binance withdrawal retry found a destination-wallet balance change"
@@ -455,7 +463,6 @@ impl RebalanceExecutionJournal {
             return Ok(None);
         };
         let reopened = self.advance(&operation_id, progress)?;
-        self.retried_quarantined_operations.insert(operation_id);
         Ok(Some(reopened))
     }
 
@@ -672,8 +679,13 @@ impl RebalanceExecutionJournal {
                 previous_progress,
                 RebalanceExecutionProgress::Quarantined { .. }
             ) {
-                self.retried_quarantined_operations
-                    .insert(appended_operation_id);
+                let count = self
+                    .quarantine_reopen_counts
+                    .entry(appended_operation_id)
+                    .or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .context("rebalance quarantine reopen count overflow")?;
             }
         }
         self.operation_started_at_unix_ms = next_started_at;
@@ -2010,8 +2022,8 @@ mod tests {
     }
 
     #[test]
-    fn corrected_false_positive_quarantine_reopens_once_from_durable_prior_progress() {
-        let path = path("one-time-quarantine-recovery");
+    fn corrected_false_positive_quarantine_has_two_bounded_durable_reopens() {
+        let path = path("bounded-quarantine-recovery");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
             .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
@@ -2062,13 +2074,27 @@ mod tests {
             .unwrap()
             .expect("the reviewed false positive should reopen");
         assert!(matches!(
-            reopened.progress,
+            &reopened.progress,
             RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                ref api_mode,
+                api_mode,
                 reconciliation_queries: 1,
                 ..
             } if api_mode == "travel_rule_ae_self_owned"
         ));
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        let reopened_again = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the second reviewed guard correction should reopen once more");
+        assert_eq!(reopened_again.progress, reopened.progress);
         replayed
             .advance(
                 &operation_id,

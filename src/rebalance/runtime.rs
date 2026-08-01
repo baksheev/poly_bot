@@ -2378,11 +2378,15 @@ impl RebalanceExecutor {
                     && record.token == record.address_questionnaire.satoshi_token
             })
             .collect::<Vec<_>>();
-        ensure!(
-            matching.len() == 1,
-            "Binance Travel Rule ownership verification is not unique for the exact wallet and network"
+        let record = matching.first().context(
+            "Binance Travel Rule ownership verification is absent for the exact wallet, network, and token",
+        )?;
+        tracing::info!(
+            token = operation.intent.token_symbol,
+            network,
+            equivalent_verified_record_count = matching.len(),
+            "selected one equivalent Binance Travel Rule self-owned-wallet proof"
         );
-        let record = matching[0];
         Ok(TravelRuleAddressOwnershipProof {
             satoshi_token: record.address_questionnaire.satoshi_token.clone(),
             verify_method: record
