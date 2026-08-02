@@ -1013,6 +1013,17 @@ impl DexExecutor {
                     .transaction_receipt(transaction_hash)
                     .await?
                     .context("journaled successful DEX receipt is unavailable"),
+                JournalStatus::Broadcast { transaction_hash } => {
+                    let receipt = self
+                        .rpc
+                        .transaction_receipt(transaction_hash)
+                        .await?
+                        .context("journaled broadcast DEX receipt is unavailable")?;
+                    self.nonce_lane
+                        .record_receipt(&mut self.journal, receipt.clone())?;
+                    self.last_terminal_receipt = Some(receipt.clone());
+                    Ok(receipt)
+                }
                 JournalStatus::MinedReverted { .. } => {
                     bail!("journaled DEX transaction reverted")
                 }
@@ -2004,16 +2015,20 @@ mod tests {
 
     use super::{
         DexExecutionService, DexExecutionServiceError, DexExecutor, EvmExecutionRequest,
-        ExactInputSwapRequest, GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy,
-        UniswapProtocol, allowance_grant_for_policy, is_definitive_prebroadcast_rejection,
-        settlement_log_for_route, transaction_fees_for_policy, wallet_transfer_totals,
+        ExactInputSwapRequest, ExecuteCallPolicy, GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute,
+        SwapSubmissionPolicy, UniswapProtocol, allowance_grant_for_policy,
+        is_definitive_prebroadcast_rejection, settlement_log_for_route,
+        transaction_fees_for_policy, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
         chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
         dex::events::v3_swap_topic,
         domain::compiled::CompiledNetworkGasPolicy,
-        wallet::{EvmWallet, JournalStatus, TransactionJournal, UnknownOutcomeReason, WalletCall},
+        wallet::{
+            EvmWallet, JournalIntent, JournalOperationIdentity, JournalStatus, TransactionJournal,
+            UnknownOutcomeReason, WalletCall,
+        },
     };
 
     const PRIVATE_KEY: &str = "0x59c6995e998f97a5a0044976f7d04f8b2b7f4e5b5d5f3e49f2f4e7838a2b0c19";
@@ -2386,6 +2401,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journaled_broadcast_is_reconciled_from_its_receipt_without_rebroadcast() {
+        let path = journal_path("broadcast-receipt-reconciliation");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let call = WalletCall::validated_contract_call(
+            Address::repeat_byte(0x11),
+            U256::ZERO,
+            vec![0x12, 0x34],
+        )
+        .unwrap();
+        let transaction_hash = B256::repeat_byte(0x42);
+        let identity = JournalOperationIdentity {
+            operation_id: "rustval-broadcast-receipt".to_owned(),
+            chain_id: 480,
+            wallet: wallet.address(),
+            nonce: 7,
+            scope: None,
+        };
+        let mut journal = TransactionJournal::open(&path).unwrap();
+        journal
+            .record_intent(&JournalIntent {
+                identity: identity.clone(),
+                purpose: "receipt_reconciliation".to_owned(),
+                target: call.target(),
+                native_value: call.value(),
+                calldata_hash: keccak256(call.calldata()),
+            })
+            .unwrap();
+        journal.record_signed(&identity, transaction_hash).unwrap();
+        journal
+            .record_broadcast(&identity, transaction_hash)
+            .unwrap();
+        drop(journal);
+
+        let (endpoint, server) = spawn_known_receipt_rpc(transaction_hash);
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        let receipt = executor
+            .execute_call(
+                identity.operation_id.clone(),
+                "receipt_reconciliation",
+                &call,
+                ExecuteCallPolicy {
+                    gas: GasLimitPolicy::fixed(100_000),
+                    quoted_gas: Some(100_000),
+                    confirmation_timeout: Duration::from_secs(1),
+                    submission_policy: SwapSubmissionPolicy::Immediate,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.transaction_hash, transaction_hash);
+        assert_eq!(receipt.status, 1);
+        drop(executor);
+        server.join().unwrap();
+        let journal = TransactionJournal::open(&path).unwrap();
+        assert!(matches!(
+            journal.operation(&identity.operation_id).unwrap().status,
+            JournalStatus::MinedSuccess {
+                block_number: 123,
+                ..
+            }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn capital_handle_uses_the_same_nonce_journal_and_cannot_keep_service_alive() {
         let (endpoint, server, _) = spawn_mock_rpc(MockOutcome::CapitalSuccess);
         let path = journal_path("capital-success");
@@ -2597,6 +2687,38 @@ mod tests {
             }
         });
         (format!("http://{address}"), thread, gas_price_requests)
+    }
+
+    fn spawn_known_receipt_rpc(transaction_hash: B256) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let id = request["id"].clone();
+                let method = request["method"].as_str().unwrap();
+                let response = match method {
+                    "eth_chainId" => rpc_result(id, json!("0x1e0")),
+                    "eth_getTransactionCount" => rpc_result(id, json!("0x8")),
+                    "eth_getTransactionReceipt" => rpc_result(
+                        id,
+                        json!({
+                            "transactionHash": format!("{transaction_hash:#x}"),
+                            "blockNumber": "0x7b",
+                            "status": "0x1",
+                            "gasUsed": "0x15f90",
+                            "effectiveGasPrice": "0xf4240",
+                            "l1Fee": "0x0",
+                            "logs": []
+                        }),
+                    ),
+                    _ => panic!("unexpected known-receipt RPC method {method}"),
+                };
+                write_response(&mut stream, &response);
+            }
+        });
+        (format!("http://{address}"), thread)
     }
 
     fn rpc_result(id: Value, result: Value) -> Value {

@@ -1665,12 +1665,27 @@ impl TradingEngine {
         let Some(evaluation) = self.pending_rebalance.clone() else {
             return Ok(None);
         };
-        ensure!(
-            !self
-                .rebalance_inventory_reservations
-                .contains_key(&evaluation.token_symbol),
-            "a rebalance inventory reservation is already active for this token"
-        );
+        if self
+            .rebalance_inventory_reservations
+            .contains_key(&evaluation.token_symbol)
+        {
+            tracing::info!(
+                token = evaluation.token_symbol,
+                "duplicate rebalance planning deferred while its inventory reservation settles"
+            );
+            self.telemetry.emit(
+                "rebalance_inventory_deferred",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "token": evaluation.token_symbol,
+                    "reason": "active_token_reservation",
+                }),
+            );
+            self.pending_rebalance = None;
+            self.rebalance_inflight = false;
+            self.rebalance_inflight_since = None;
+            return Ok(None);
+        }
         let action = evaluation
             .plan
             .action
@@ -2292,6 +2307,9 @@ impl TradingEngine {
                     && self.rebalance_settlement.is_none()
                     && self.pending_rebalance.is_none()
                     && let Some(evaluation) = pending_action
+                    && !self
+                        .rebalance_inventory_reservations
+                        .contains_key(&evaluation.token_symbol)
                 {
                     self.rebalance_inflight = true;
                     self.rebalance_inflight_since = Some(Instant::now());

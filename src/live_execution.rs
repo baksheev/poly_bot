@@ -1441,6 +1441,26 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             );
             let commands = commands_result?;
             if commands.is_empty() {
+                if let Some(command) = self
+                    .coordinator
+                    .unknown_dex_reconciliation_command(plan_id)?
+                {
+                    let intent = self
+                        .coordinator
+                        .operation(plan_id)
+                        .context("live trade disappeared before DEX reconciliation")?
+                        .intent
+                        .clone();
+                    let (role, result) = self.execute_leg_timed(&intent, &command).await;
+                    ensure!(
+                        role == LegRole::Dex,
+                        "DEX reconciliation returned the wrong leg role"
+                    );
+                    if result.status != LegStatus::Unknown {
+                        self.coordinator.reconcile_unknown(plan_id, role, result)?;
+                        continue;
+                    }
+                }
                 if let Some((expected_role, command)) = self
                     .coordinator
                     .unknown_binance_reconciliation_command(plan_id)?
@@ -3308,6 +3328,58 @@ mod tests {
                 .realized_profit_token_a_base_units,
             -5
         );
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn composed_dex_unknown_reconciles_before_cex_dispatch() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-dex-unknown-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let opportunity = opportunity();
+        let plan_id = opportunity.plan_id();
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::from([
+                unknown(LegRole::Dex, "dex:receipt-unknown").1,
+                result(100, -1_000, 5, "dex:receipt-reconciled"),
+                result(-100, 1_030, 0, "cex:after-dex-reconciliation"),
+            ])),
+        };
+        let (_handle, mut task, mut events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+
+        task.execute(opportunity).await.unwrap();
+
+        let operation = task.coordinator.operation(&plan_id).unwrap();
+        assert_eq!(
+            operation.stage,
+            crate::arbitrage::TradeStage::BalancedProfit
+        );
+        assert_eq!(
+            operation.dex_result.as_ref().unwrap().venue_reference,
+            "dex:receipt-reconciled"
+        );
+        assert_eq!(
+            operation.cex_result.as_ref().unwrap().venue_reference,
+            "cex:after-dex-reconciliation"
+        );
+        assert_eq!(
+            events.try_recv().unwrap().state,
+            PaperTradeEventState::Balanced
+        );
+
         drop(task);
         fs::remove_file(journal).unwrap();
     }

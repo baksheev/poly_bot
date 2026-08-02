@@ -2001,6 +2001,32 @@ impl PaperTradeCoordinator {
         Ok(None)
     }
 
+    /// Reconstructs the exact DEX command whose terminal result is unknown.
+    /// The DEX transaction journal must prove the existing transaction's
+    /// receipt; executing this command must never authorize another broadcast.
+    pub fn unknown_dex_reconciliation_command(
+        &self,
+        plan_id: &str,
+    ) -> anyhow::Result<Option<CoordinatorCommand>> {
+        let operation = self.journal.operation(plan_id)?;
+        if operation.stage != TradeStage::UnknownExposure
+            || !operation
+                .dex_result
+                .as_ref()
+                .is_some_and(|result| result.status == LegStatus::Unknown)
+        {
+            return Ok(None);
+        }
+        Ok(Some(CoordinatorCommand::DispatchDex {
+            operation_id: operation.intent.dex_operation_id.clone(),
+            expected_token_b_delta_base_units: operation
+                .intent
+                .direction
+                .dex_token_b_delta(operation.intent.planned_token_b_base_units),
+            plan: operation.intent.dex_plan.clone().map(Box::new),
+        }))
+    }
+
     pub fn recovery_retry_wait(&self, plan_id: &str) -> anyhow::Result<Option<(usize, Duration)>> {
         let operation = self.journal.operation(plan_id)?;
         let Some(not_before) = operation.recovery_retry_not_before_unix_ms else {
@@ -3837,6 +3863,15 @@ mod tests {
             coordinator.operation(&plan_id).unwrap().stage,
             TradeStage::UnknownExposure
         );
+        assert!(matches!(
+            coordinator
+                .unknown_dex_reconciliation_command(&plan_id)
+                .unwrap(),
+            Some(CoordinatorCommand::DispatchDex {
+                expected_token_b_delta_base_units: 100,
+                ..
+            })
+        ));
         assert_eq!(
             initial_execution_lane(&coordinator),
             ExecutionLaneState::Available
@@ -3882,6 +3917,12 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            recovered
+                .unknown_dex_reconciliation_command(&plan_id)
+                .unwrap()
+                .is_none()
+        );
         assert!(recovered.take_commands(&plan_id).unwrap().is_empty());
         assert_eq!(
             recovered.operation(&plan_id).unwrap().stage,
