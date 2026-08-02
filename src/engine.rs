@@ -119,10 +119,11 @@ pub struct TradingEngine {
     rebalance_inventory_reservations: BTreeMap<String, String>,
     next_inventory_reservation: u64,
     pending_rebalance: Option<RebalanceEvaluation>,
+    rebalance_pending_since: Option<Instant>,
     rebalance_inflight: bool,
     rebalance_inflight_since: Option<Instant>,
     rebalance_blocked_tokens: BTreeSet<String>,
-    rebalance_creation_stop_reason: Option<String>,
+    rebalance_deferred_reason: Option<String>,
     rebalance_settlement: Option<RebalanceSettlementBarrier>,
     last_rebalance_health_log_at: Option<Instant>,
     last_depth_health_log_at: Option<Instant>,
@@ -152,6 +153,7 @@ pub struct BinanceFeeBps {
 }
 
 const REBALANCE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const REBALANCE_PENDING_TIMEOUT: Duration = Duration::from_secs(60);
 const DEPTH_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BINANCE_PRICE_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BINANCE_JSON_TIME_RESOLUTION_US: u64 = 1_000;
@@ -398,21 +400,26 @@ enum ReservationPrecheck {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct RebalanceHealthState {
     healthy: bool,
+    pending_stuck: bool,
     inflight_stuck: bool,
     settlement_stuck: bool,
 }
 
 fn rebalance_health_state(
     blocked: bool,
+    pending_age: Option<Duration>,
     inflight_age: Option<Duration>,
     settlement_age: Option<Duration>,
+    pending_timeout: Duration,
     operation_timeout: Duration,
     settlement_timeout: Duration,
 ) -> RebalanceHealthState {
+    let pending_stuck = pending_age.is_some_and(|age| age >= pending_timeout);
     let inflight_stuck = inflight_age.is_some_and(|age| age >= operation_timeout);
     let settlement_stuck = settlement_age.is_some_and(|age| age >= settlement_timeout);
     RebalanceHealthState {
-        healthy: !blocked && !inflight_stuck && !settlement_stuck,
+        healthy: !blocked && !pending_stuck && !inflight_stuck && !settlement_stuck,
+        pending_stuck,
         inflight_stuck,
         settlement_stuck,
     }
@@ -647,10 +654,11 @@ impl TradingEngine {
                 rebalance_inventory_reservations: BTreeMap::new(),
                 next_inventory_reservation: 0,
                 pending_rebalance: None,
+                rebalance_pending_since: None,
                 rebalance_inflight: false,
                 rebalance_inflight_since: None,
                 rebalance_blocked_tokens: BTreeSet::new(),
-                rebalance_creation_stop_reason: None,
+                rebalance_deferred_reason: None,
                 rebalance_settlement: None,
                 last_rebalance_health_log_at: None,
                 last_depth_health_log_at: None,
@@ -1682,8 +1690,10 @@ impl TradingEngine {
                 }),
             );
             self.pending_rebalance = None;
+            self.rebalance_pending_since = None;
             self.rebalance_inflight = false;
             self.rebalance_inflight_since = None;
+            self.rebalance_deferred_reason = Some("active_token_reservation".to_owned());
             return Ok(None);
         }
         let action = evaluation
@@ -1742,10 +1752,17 @@ impl TradingEngine {
                     "error": format!("{error:#}"),
                 }),
             );
+            self.rebalance_inflight = false;
+            self.rebalance_inflight_since = None;
+            self.rebalance_deferred_reason = Some(failure_kind.telemetry_reason().to_owned());
             return Ok(None);
         }
         self.next_inventory_reservation = next_inventory_reservation;
         self.pending_rebalance = None;
+        self.rebalance_pending_since = None;
+        self.rebalance_inflight = true;
+        self.rebalance_inflight_since = Some(Instant::now());
+        self.rebalance_deferred_reason = None;
         self.rebalance_inventory_reservations
             .insert(evaluation.token_symbol.clone(), reservation_id.clone());
         self.telemetry.emit(
@@ -1767,6 +1784,91 @@ impl TradingEngine {
         self.pending_rebalance.as_ref()
     }
 
+    pub fn active_inventory_operation_count(&self) -> usize {
+        self.inventory.active_operation_ids().len()
+    }
+
+    /// Rebuilds transient work from the latest in-memory balance plan.
+    ///
+    /// Rails gets this property from its recurring job: a temporary lock or
+    /// queue conflict cannot consume the only planning edge. The Rust owner is
+    /// event-driven, so the coordinator also calls this method from its
+    /// independent supervisor tick. Pending work is never a durable stop and
+    /// is always replaced by the newest plan before dispatch.
+    pub fn refresh_pending_rebalance_execution(&mut self) {
+        if self.config.rebalance_execution_mode != "full_live"
+            || self.rebalance_inflight
+            || self.rebalance_settlement.is_some()
+        {
+            return;
+        }
+        let desired = self
+            .rebalance
+            .pending_action_excluding(&self.rebalance_blocked_tokens)
+            .filter(|evaluation| {
+                !self
+                    .rebalance_inventory_reservations
+                    .contains_key(&evaluation.token_symbol)
+            });
+        if self.pending_rebalance == desired {
+            return;
+        }
+        let same_pending_intent = self
+            .pending_rebalance
+            .as_ref()
+            .zip(desired.as_ref())
+            .is_some_and(|(current, desired)| {
+                current.token_symbol == desired.token_symbol
+                    && current.plan.action.as_ref().map(|action| action.direction)
+                        == desired.plan.action.as_ref().map(|action| action.direction)
+            });
+        let pending_since = if same_pending_intent {
+            self.rebalance_pending_since
+        } else {
+            desired.as_ref().map(|_| Instant::now())
+        };
+        self.pending_rebalance = desired;
+        self.rebalance_pending_since = pending_since;
+        if !same_pending_intent {
+            self.rebalance_deferred_reason = None;
+        }
+        if let Some(evaluation) = self.pending_rebalance.as_ref() {
+            let action = evaluation
+                .plan
+                .action
+                .as_ref()
+                .expect("pending rebalance evaluations always contain an action");
+            self.telemetry.emit(
+                "rebalance_pending_refreshed",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "token": evaluation.token_symbol,
+                    "direction": format!("{:?}", action.direction),
+                    "amount_base_units": action.amount.to_string(),
+                }),
+            );
+        }
+    }
+
+    pub fn defer_pending_rebalance_execution(&mut self, reason: &str) {
+        let reason_changed = self.rebalance_deferred_reason.as_deref() != Some(reason);
+        self.rebalance_inflight = false;
+        self.rebalance_inflight_since = None;
+        self.rebalance_deferred_reason = Some(reason.to_owned());
+        if !reason_changed {
+            return;
+        }
+        self.telemetry.emit(
+            "rebalance_dispatch_deferred",
+            json!({
+                "engine_id": self.config.engine_id,
+                "token": self.pending_rebalance.as_ref().map(|evaluation| &evaluation.token_symbol),
+                "reason": reason,
+                "active_inventory_operation_count": self.active_inventory_operation_count(),
+            }),
+        );
+    }
+
     pub fn cap_pending_rebalance_amount(&mut self, maximum: U256) -> anyhow::Result<()> {
         ensure!(!maximum.is_zero(), "rebalance dispatch maximum is zero");
         let Some(evaluation) = self.pending_rebalance.as_mut() else {
@@ -1780,20 +1882,6 @@ impl TradingEngine {
         action.amount = action.amount.min(maximum);
         ensure!(!action.amount.is_zero(), "bounded rebalance action is zero");
         Ok(())
-    }
-
-    pub fn stop_pending_rebalance_creation(&mut self, reason: &str) {
-        self.pending_rebalance = None;
-        self.rebalance_inflight = false;
-        self.rebalance_inflight_since = None;
-        self.rebalance_creation_stop_reason = Some(reason.to_owned());
-        self.telemetry.emit(
-            "rebalance_creation_stopped",
-            json!({
-                "engine_id": self.config.engine_id,
-                "reason": reason,
-            }),
-        );
     }
 
     pub async fn authorize_pending_rebalance_allocation(
@@ -1922,8 +2010,11 @@ impl TradingEngine {
                 }),
             );
         }
+        self.pending_rebalance = None;
+        self.rebalance_pending_since = None;
         self.rebalance_inflight = true;
         self.rebalance_inflight_since = Some(Instant::now());
+        self.rebalance_deferred_reason = None;
         self.telemetry.emit(
             "rebalance_recovery_inflight",
             json!({
@@ -1945,6 +2036,7 @@ impl TradingEngine {
     ) -> anyhow::Result<()> {
         self.rebalance_inflight = false;
         self.rebalance_inflight_since = None;
+        self.rebalance_deferred_reason = None;
         match result {
             Ok(operation) => {
                 if self
@@ -2059,6 +2151,7 @@ impl TradingEngine {
     ) -> anyhow::Result<()> {
         self.rebalance_inflight = false;
         self.rebalance_inflight_since = None;
+        self.rebalance_deferred_reason = None;
         match result {
             Ok(operation) => {
                 let reservation_id = self
@@ -2298,23 +2391,7 @@ impl TradingEngine {
                         }),
                     );
                 }
-                let pending_action = self
-                    .rebalance
-                    .pending_action_excluding(&self.rebalance_blocked_tokens);
-                if mode == "full_live"
-                    && !self.rebalance_inflight
-                    && self.rebalance_creation_stop_reason.is_none()
-                    && self.rebalance_settlement.is_none()
-                    && self.pending_rebalance.is_none()
-                    && let Some(evaluation) = pending_action
-                    && !self
-                        .rebalance_inventory_reservations
-                        .contains_key(&evaluation.token_symbol)
-                {
-                    self.rebalance_inflight = true;
-                    self.rebalance_inflight_since = Some(Instant::now());
-                    self.pending_rebalance = Some(evaluation);
-                }
+                self.refresh_pending_rebalance_execution();
             }
             Err(error) => {
                 self.telemetry.emit(
@@ -3757,6 +3834,9 @@ impl TradingEngine {
             return;
         }
 
+        let pending_age = self
+            .rebalance_pending_since
+            .map(|started_at| now.saturating_duration_since(started_at));
         let inflight_age = self
             .rebalance_inflight_since
             .map(|started_at| now.saturating_duration_since(started_at));
@@ -3772,18 +3852,37 @@ impl TradingEngine {
         );
         let health = rebalance_health_state(
             !self.rebalance_blocked_tokens.is_empty(),
+            pending_age,
             inflight_age,
             settlement_age,
+            REBALANCE_PENDING_TIMEOUT,
             Duration::from_secs(self.config.rebalance_executor_timeout_seconds),
             settlement_timeout,
         );
+        let pending_age_ms = pending_age.map(|age| age.as_millis());
         let inflight_age_ms = inflight_age.map(|age| age.as_millis());
         let settlement_age_ms = settlement_age.map(|age| age.as_millis());
+        let pending_token = self
+            .pending_rebalance
+            .as_ref()
+            .map(|evaluation| evaluation.token_symbol.as_str());
+        let pending_direction = self.pending_rebalance.as_ref().and_then(|evaluation| {
+            evaluation
+                .plan
+                .action
+                .as_ref()
+                .map(|action| format!("{:?}", action.direction))
+        });
         if health.healthy {
             tracing::info!(
                 healthy = true,
                 rebalance_blocked = !self.rebalance_blocked_tokens.is_empty(),
                 rebalance_blocked_tokens = ?self.rebalance_blocked_tokens,
+                rebalance_pending = self.pending_rebalance.is_some(),
+                pending_token,
+                pending_direction,
+                pending_age_ms,
+                deferred_reason = self.rebalance_deferred_reason.as_deref(),
                 rebalance_inflight = self.rebalance_inflight,
                 inflight_age_ms,
                 settlement_waiting = self.rebalance_settlement.is_some(),
@@ -3795,6 +3894,12 @@ impl TradingEngine {
                 healthy = false,
                 rebalance_blocked = !self.rebalance_blocked_tokens.is_empty(),
                 rebalance_blocked_tokens = ?self.rebalance_blocked_tokens,
+                rebalance_pending = self.pending_rebalance.is_some(),
+                pending_stuck = health.pending_stuck,
+                pending_token,
+                pending_direction,
+                pending_age_ms,
+                deferred_reason = self.rebalance_deferred_reason.as_deref(),
                 rebalance_inflight = self.rebalance_inflight,
                 inflight_stuck = health.inflight_stuck,
                 inflight_age_ms,
@@ -4642,12 +4747,18 @@ mod tests {
     fn rebalance_health_detects_blocked_and_stuck_states_at_the_boundary() {
         let timeout = std::time::Duration::from_secs(60);
 
-        assert!(rebalance_health_state(false, None, None, timeout, timeout).healthy);
-        assert!(!rebalance_health_state(true, None, None, timeout, timeout).healthy);
-        let inflight = rebalance_health_state(false, Some(timeout), None, timeout, timeout);
+        assert!(rebalance_health_state(false, None, None, None, timeout, timeout, timeout).healthy);
+        assert!(!rebalance_health_state(true, None, None, None, timeout, timeout, timeout).healthy);
+        let pending =
+            rebalance_health_state(false, Some(timeout), None, None, timeout, timeout, timeout);
+        assert!(pending.pending_stuck);
+        assert!(!pending.healthy);
+        let inflight =
+            rebalance_health_state(false, None, Some(timeout), None, timeout, timeout, timeout);
         assert!(inflight.inflight_stuck);
         assert!(!inflight.healthy);
-        let settlement = rebalance_health_state(false, None, Some(timeout), timeout, timeout);
+        let settlement =
+            rebalance_health_state(false, None, None, Some(timeout), timeout, timeout, timeout);
         assert!(settlement.settlement_stuck);
         assert!(!settlement.healthy);
     }

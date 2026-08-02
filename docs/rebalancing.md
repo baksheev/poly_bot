@@ -433,14 +433,25 @@ timeout heartbeat unhealthy while the executor continues retrying.
 
 Production also emits a structured `rebalance health heartbeat` to Cloud
 Logging once per minute. This is deliberately outside the market-data and
-decision hot path. The heartbeat reports whether rebalance is blocked, how long
-an operation has been in flight, and how long post-completion settlement has
-been waiting. It becomes unhealthy when:
+decision hot path. The heartbeat reports the latest pending token and
+direction, why dispatch is temporarily deferred, how long work has remained
+pending, how long an operation has been in flight, and how long
+post-completion settlement has been waiting. It becomes unhealthy when:
 
 - the executor has failed closed;
+- eligible work remains pending without submission for at least 60 seconds;
 - an in-flight operation reaches `REBALANCE_EXECUTOR_TIMEOUT_SECONDS`; or
 - completed-transfer settlement is still waiting for fresh Binance and wallet
   snapshots after at least 60 seconds.
+
+The process-wide rebalance supervisor runs independently once per second. It
+rebuilds pending work from the latest balance plan, waits for shared inventory
+reservations to settle, and retries temporary queue or capital-policy deferrals.
+Primary and Arbitrum targets alternate after successful submissions so one
+pair cannot starve the other. A new block-pinned wallet balance read also
+retries the narrowly classified `header not found` propagation race twice
+against the same canonical block hash; it never falls back to an unpinned
+`latest` read.
 
 `scripts/apply-gcp-rebalance-monitoring` idempotently provisions two log-based
 metrics, two Cloud Monitoring alert policies, and the operator email channel:

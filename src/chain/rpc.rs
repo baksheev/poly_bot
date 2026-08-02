@@ -14,6 +14,7 @@ use crate::chain::logs::{ChainLog, EthLogFilter, WireChainLog};
 
 const DEFAULT_BATCH_SIZE: usize = 5;
 const MAX_RATE_LIMIT_RETRIES: u32 = 6;
+const MAX_BLOCK_PROPAGATION_RETRIES: u32 = 2;
 const BASE_RETRY_DELAY_MS: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,6 +687,7 @@ impl JsonRpcClient {
 
             let body = Value::Array(requests);
             let mut attempt = 0;
+            let mut block_propagation_attempt = 0;
             let mut by_id = loop {
                 let provider_started = std::time::Instant::now();
                 let values = match self.send_json(body.clone()).await {
@@ -714,6 +716,7 @@ impl JsonRpcClient {
                     .context("JSON-RPC batch response is not an array")?;
                 let mut decoded_by_id = HashMap::with_capacity(responses.len());
                 let mut rate_limited = false;
+                let mut block_unavailable = false;
                 for response in responses {
                     let decoded: RpcResponse = serde_json::from_value(response.clone())
                         .context("invalid JSON-RPC batch response item")?;
@@ -721,6 +724,10 @@ impl JsonRpcClient {
                         .error
                         .as_ref()
                         .is_some_and(|error| error.code == 429);
+                    block_unavailable |= decoded
+                        .error
+                        .as_ref()
+                        .is_some_and(is_transient_block_unavailable);
                     ensure!(
                         decoded_by_id.insert(decoded.id, decoded).is_none(),
                         "duplicate JSON-RPC response id"
@@ -731,6 +738,18 @@ impl JsonRpcClient {
                     self.rate_limit_retries.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(retry_delay(attempt)).await;
                     attempt += 1;
+                    continue;
+                }
+                if block_unavailable && block_propagation_attempt < MAX_BLOCK_PROPAGATION_RETRIES {
+                    decode_us += decode_started.elapsed().as_micros();
+                    tracing::warn!(
+                        block_number = block.number,
+                        block_hash = %format!("{:#x}", block.hash),
+                        attempt = block_propagation_attempt + 1,
+                        "block-pinned eth_call batch retry scheduled while the head propagates"
+                    );
+                    tokio::time::sleep(retry_delay(block_propagation_attempt)).await;
+                    block_propagation_attempt += 1;
                     continue;
                 }
                 decode_us += decode_started.elapsed().as_micros();
@@ -929,6 +948,14 @@ struct RpcError {
     message: String,
     #[serde(default)]
     data: Option<Value>,
+}
+
+fn is_transient_block_unavailable(error: &RpcError) -> bool {
+    error.code == -32000
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("header not found")
 }
 
 fn decode_rpc_result(response: RpcResponse) -> anyhow::Result<Value> {
@@ -1341,9 +1368,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        JsonRpcClient, RpcError, decode_revert_data, decode_rpc_transaction,
-        diagnostic_from_rpc_error, diagnostic_from_trace, parse_data_hex, parse_quantity_u64,
-        parse_quantity_u256, sanitize_rpc_message,
+        CanonicalBlock, EthCall, JsonRpcClient, RpcError, decode_revert_data,
+        decode_rpc_transaction, diagnostic_from_rpc_error, diagnostic_from_trace,
+        is_transient_block_unavailable, parse_data_hex, parse_quantity_u64, parse_quantity_u256,
+        sanitize_rpc_message,
     };
 
     #[test]
@@ -1420,6 +1448,72 @@ mod tests {
         assert_eq!(block.number, 123);
         assert_eq!(client.stats().http_requests, 2);
         assert_eq!(client.stats().rate_limit_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn retries_block_pinned_call_when_new_head_has_not_propagated() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let calls = request.as_array().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0]["method"], "eth_call");
+                assert_eq!(calls[0]["params"][1]["requireCanonical"], true);
+                let id = calls[0]["id"].clone();
+                let response = if attempt == 0 {
+                    json!([{
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32000, "message": "header not found"}
+                    }])
+                } else {
+                    json!([{
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": format!("0x{}", "00".repeat(32))
+                    }])
+                };
+                write_response(&mut stream, &response);
+            }
+        });
+
+        let client = JsonRpcClient::new(format!("http://{address}")).unwrap();
+        let block = CanonicalBlock {
+            number: 123,
+            hash: B256::repeat_byte(0x11),
+            parent_hash: B256::repeat_byte(0x22),
+        };
+        let outputs = client
+            .eth_call_batch(
+                &[EthCall {
+                    to: Address::repeat_byte(0x33),
+                    data: vec![0x70, 0xa0, 0x82, 0x31],
+                }],
+                block,
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(outputs, vec![vec![0; 32]]);
+        assert_eq!(client.stats().http_requests, 2);
+    }
+
+    #[test]
+    fn only_known_block_propagation_error_is_retryable() {
+        assert!(is_transient_block_unavailable(&RpcError {
+            code: -32000,
+            message: "Header not found".to_owned(),
+            data: None,
+        }));
+        assert!(!is_transient_block_unavailable(&RpcError {
+            code: -32000,
+            message: "execution reverted".to_owned(),
+            data: None,
+        }));
     }
 
     #[test]

@@ -123,6 +123,7 @@ const DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY: usize = 32;
 const MAXIMUM_CONCURRENT_ADAPTIVE_SIZING_WORKERS: usize = 4;
 const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+const REBALANCE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 
 fn esp_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
     let network_id = format!("eip155:{chain_id}");
@@ -142,6 +143,36 @@ fn allowance_operation_id(symbol: &str) -> String {
 enum RebalanceExecutionTarget {
     Primary,
     Arbitrum,
+}
+
+impl RebalanceExecutionTarget {
+    fn other(self) -> Self {
+        match self {
+            Self::Primary => Self::Arbitrum,
+            Self::Arbitrum => Self::Primary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebalanceDispatchOutcome {
+    NoWork,
+    Deferred,
+    Submitted,
+}
+
+fn apply_rebalance_dispatch_outcome(
+    lane_busy: &mut bool,
+    next_target: &mut RebalanceExecutionTarget,
+    attempted_target: RebalanceExecutionTarget,
+    outcome: RebalanceDispatchOutcome,
+) -> bool {
+    if outcome != RebalanceDispatchOutcome::Submitted {
+        return false;
+    }
+    *lane_busy = true;
+    *next_target = attempted_target.other();
+    true
 }
 
 enum RebalanceExecutorEvent {
@@ -3773,30 +3804,24 @@ async fn run(
     // The executor and its durable journal are a single process-wide mutation
     // lane. Recovery owns that lane until it publishes a terminal result.
     let mut rebalance_lane_busy = rebalance_recovery_operation.is_some();
-    if !rebalance_lane_busy {
-        rebalance_lane_busy = dispatch_rebalance_execution(
-            &mut engine,
-            rebalance_sender.as_ref(),
-            pair,
-            wallet_owner,
-            RebalanceExecutionTarget::Primary,
-            None,
-            None,
-        )
-        .await?;
-    }
-    if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
-        rebalance_lane_busy = dispatch_rebalance_execution(
-            &mut esp_engine,
-            rebalance_sender.as_ref(),
-            &esp_pair,
-            wallet_owner,
-            RebalanceExecutionTarget::Arbitrum,
-            portfolio_catalog.capital_policy(),
-            Some(&rebalance_risk_receiver),
-        )
-        .await?;
-    }
+    let mut next_rebalance_target = rebalance_recovery_operation
+        .as_ref()
+        .map(rebalance_target)
+        .map(RebalanceExecutionTarget::other)
+        .unwrap_or(RebalanceExecutionTarget::Primary);
+    dispatch_next_rebalance_execution(
+        &mut rebalance_lane_busy,
+        &mut next_rebalance_target,
+        &mut engine,
+        &mut esp_engine,
+        rebalance_sender.as_ref(),
+        pair,
+        &esp_pair,
+        wallet_owner,
+        portfolio_catalog.capital_policy(),
+        &rebalance_risk_receiver,
+    )
+    .await?;
     engine.start();
     esp_engine.start();
     let mut first_ready_emitted = false;
@@ -3965,6 +3990,9 @@ async fn run(
     let mut health_tick = tokio::time::interval(health_interval);
     health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     health_tick.reset();
+    let mut rebalance_supervisor_tick = tokio::time::interval(REBALANCE_SUPERVISOR_INTERVAL);
+    rebalance_supervisor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    rebalance_supervisor_tick.reset();
 
     // These futures must survive unrelated select branches. Recreating
     // `next_event()` on every loop iteration cancels a multi-await depth
@@ -4052,6 +4080,28 @@ async fn run(
                 );
                 longest_non_price_handler_us = 0;
                 longest_non_price_handler = "none";
+            },
+            _ = rebalance_supervisor_tick.tick(), if rebalance_sender.is_some() => {
+                let handler_started_at = Instant::now();
+                dispatch_next_rebalance_execution(
+                    &mut rebalance_lane_busy,
+                    &mut next_rebalance_target,
+                    &mut engine,
+                    &mut esp_engine,
+                    rebalance_sender.as_ref(),
+                    pair,
+                    &esp_pair,
+                    wallet_owner,
+                    portfolio_catalog.capital_policy(),
+                    &rebalance_risk_receiver,
+                )
+                .await?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "rebalance_supervisor",
+                    handler_started_at.elapsed(),
+                );
             },
             event = &mut binance_market_event => {
                 drop(binance_market_event);
@@ -4196,30 +4246,19 @@ async fn run(
                     }
                     other => engine.on_balance_event(other)?,
                 }
-                if !rebalance_lane_busy {
-                    rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut engine,
-                        rebalance_sender.as_ref(),
-                        pair,
-                        wallet_owner,
-                        RebalanceExecutionTarget::Primary,
-                        None,
-                        None,
-                    )
-                    .await?;
-                }
-                if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
-                    rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut esp_engine,
-                        rebalance_sender.as_ref(),
-                        &esp_pair,
-                        wallet_owner,
-                        RebalanceExecutionTarget::Arbitrum,
-                        portfolio_catalog.capital_policy(),
-                        Some(&rebalance_risk_receiver),
-                    )
-                    .await?;
-                }
+                dispatch_next_rebalance_execution(
+                    &mut rebalance_lane_busy,
+                    &mut next_rebalance_target,
+                    &mut engine,
+                    &mut esp_engine,
+                    rebalance_sender.as_ref(),
+                    pair,
+                    &esp_pair,
+                    wallet_owner,
+                    portfolio_catalog.capital_policy(),
+                    &rebalance_risk_receiver,
+                )
+                .await?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4233,18 +4272,19 @@ async fn run(
                     bail!("Arbitrum wallet balance synchronization channel stopped unexpectedly");
                 };
                 esp_engine.on_balance_event(event)?;
-                if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
-                    rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut esp_engine,
-                        rebalance_sender.as_ref(),
-                        &esp_pair,
-                        wallet_owner,
-                        RebalanceExecutionTarget::Arbitrum,
-                        portfolio_catalog.capital_policy(),
-                        Some(&rebalance_risk_receiver),
-                    )
-                    .await?;
-                }
+                dispatch_next_rebalance_execution(
+                    &mut rebalance_lane_busy,
+                    &mut next_rebalance_target,
+                    &mut engine,
+                    &mut esp_engine,
+                    rebalance_sender.as_ref(),
+                    pair,
+                    &esp_pair,
+                    wallet_owner,
+                    portfolio_catalog.capital_policy(),
+                    &rebalance_risk_receiver,
+                )
+                .await?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4326,30 +4366,19 @@ async fn run(
                     }
                 }
                 rebalance_lane_busy = active_operation_after;
-                if !rebalance_lane_busy {
-                    rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut engine,
-                        rebalance_sender.as_ref(),
-                        pair,
-                        wallet_owner,
-                        RebalanceExecutionTarget::Primary,
-                        None,
-                        None,
-                    )
-                    .await?;
-                }
-                if !rebalance_lane_busy && engine.pending_rebalance_execution().is_none() {
-                    rebalance_lane_busy = dispatch_rebalance_execution(
-                        &mut esp_engine,
-                        rebalance_sender.as_ref(),
-                        &esp_pair,
-                        wallet_owner,
-                        RebalanceExecutionTarget::Arbitrum,
-                        portfolio_catalog.capital_policy(),
-                        Some(&rebalance_risk_receiver),
-                    )
-                    .await?;
-                }
+                dispatch_next_rebalance_execution(
+                    &mut rebalance_lane_busy,
+                    &mut next_rebalance_target,
+                    &mut engine,
+                    &mut esp_engine,
+                    rebalance_sender.as_ref(),
+                    pair,
+                    &esp_pair,
+                    wallet_owner,
+                    portfolio_catalog.capital_policy(),
+                    &rebalance_risk_receiver,
+                )
+                .await?;
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
@@ -4789,6 +4818,84 @@ fn rebalance_quote_retry_delay(retry_attempt: u32) -> Duration {
         .min(REBALANCE_QUOTE_RETRY_MAX_DELAY)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_next_rebalance_execution(
+    lane_busy: &mut bool,
+    next_target: &mut RebalanceExecutionTarget,
+    primary_engine: &mut TradingEngine,
+    arbitrum_engine: &mut TradingEngine,
+    sender: Option<
+        &tokio::sync::mpsc::Sender<(RebalanceExecutionTarget, RebalanceExecutionRequest)>,
+    >,
+    primary_pair: &arb_bot::domain::config::PairConfig,
+    arbitrum_pair: &arb_bot::domain::config::PairConfig,
+    wallet_owner: Address,
+    capital_policy: Option<&CompiledCapitalPolicy>,
+    rebalance_risk: &tokio::sync::watch::Receiver<RebalanceRisk>,
+) -> anyhow::Result<()> {
+    if *lane_busy {
+        return Ok(());
+    }
+
+    primary_engine.refresh_pending_rebalance_execution();
+    arbitrum_engine.refresh_pending_rebalance_execution();
+
+    // Arbitrage and both rebalancers share observed Binance inventory. Planning
+    // against a transient reservation produced the production audit failures
+    // seen immediately after the ESP fill. Keep the latest plan pending and let
+    // the independent supervisor retry it as soon as settlement releases all
+    // inventory operations.
+    if primary_engine.active_inventory_operation_count()
+        + arbitrum_engine.active_inventory_operation_count()
+        > 0
+    {
+        if primary_engine.pending_rebalance_execution().is_some() {
+            primary_engine.defer_pending_rebalance_execution(
+                "shared inventory operation must settle before rebalance dispatch",
+            );
+        }
+        if arbitrum_engine.pending_rebalance_execution().is_some() {
+            arbitrum_engine.defer_pending_rebalance_execution(
+                "shared inventory operation must settle before rebalance dispatch",
+            );
+        }
+        return Ok(());
+    }
+
+    for target in [*next_target, next_target.other()] {
+        let outcome = match target {
+            RebalanceExecutionTarget::Primary => {
+                dispatch_rebalance_execution(
+                    primary_engine,
+                    sender,
+                    primary_pair,
+                    wallet_owner,
+                    target,
+                    None,
+                    None,
+                )
+                .await?
+            }
+            RebalanceExecutionTarget::Arbitrum => {
+                dispatch_rebalance_execution(
+                    arbitrum_engine,
+                    sender,
+                    arbitrum_pair,
+                    wallet_owner,
+                    target,
+                    capital_policy,
+                    Some(rebalance_risk),
+                )
+                .await?
+            }
+        };
+        if apply_rebalance_dispatch_outcome(lane_busy, next_target, target, outcome) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn dispatch_rebalance_execution(
     engine: &mut TradingEngine,
     sender: Option<
@@ -4799,10 +4906,20 @@ async fn dispatch_rebalance_execution(
     target: RebalanceExecutionTarget,
     capital_policy: Option<&CompiledCapitalPolicy>,
     rebalance_risk: Option<&tokio::sync::watch::Receiver<RebalanceRisk>>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<RebalanceDispatchOutcome> {
+    engine.refresh_pending_rebalance_execution();
+    if engine.pending_rebalance_execution().is_none() {
+        return Ok(RebalanceDispatchOutcome::NoWork);
+    }
+    if engine.active_inventory_operation_count() > 0 {
+        engine.defer_pending_rebalance_execution(
+            "active inventory operation must settle before rebalance dispatch",
+        );
+        return Ok(RebalanceDispatchOutcome::Deferred);
+    }
     let rebalance_remaining = if target == RebalanceExecutionTarget::Arbitrum {
         let Some(evaluation) = engine.pending_rebalance_execution() else {
-            return Ok(false);
+            return Ok(RebalanceDispatchOutcome::NoWork);
         };
         let action = evaluation
             .plan
@@ -4821,10 +4938,10 @@ async fn dispatch_rebalance_execution(
             action.direction,
         )?
         else {
-            engine.stop_pending_rebalance_creation(
+            engine.defer_pending_rebalance_execution(
                 "rebalance concurrency, value, or fee limit reached",
             );
-            return Ok(false);
+            return Ok(RebalanceDispatchOutcome::Deferred);
         };
         engine.cap_pending_rebalance_amount(remaining.maximum_source_debit)?;
         Some(remaining)
@@ -4832,7 +4949,7 @@ async fn dispatch_rebalance_execution(
         None
     };
     let Some(pending) = engine.pending_rebalance_execution().cloned() else {
-        return Ok(false);
+        return Ok(RebalanceDispatchOutcome::NoWork);
     };
     let action = pending
         .plan
@@ -4881,13 +4998,16 @@ async fn dispatch_rebalance_execution(
     let sender = sender.context("rebalance engine produced live work without an executor")?;
     let permit = match sender.try_reserve() {
         Ok(permit) => permit,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => return Ok(false),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+            engine.defer_pending_rebalance_execution("rebalance executor queue is full");
+            return Ok(RebalanceDispatchOutcome::Deferred);
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
             bail!("rebalance executor queue is closed")
         }
     };
     let Some(evaluation) = engine.take_rebalance_execution()? else {
-        return Ok(false);
+        return Ok(RebalanceDispatchOutcome::Deferred);
     };
     ensure!(
         evaluation == pending,
@@ -4935,7 +5055,7 @@ async fn dispatch_rebalance_execution(
             },
         },
     ));
-    Ok(true)
+    Ok(RebalanceDispatchOutcome::Submitted)
 }
 
 fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
@@ -5689,7 +5809,8 @@ mod tests {
     };
 
     use super::{
-        StartupDexDrainStats, esp_evm_journal_scope, rebalance_quote_retry_delay,
+        RebalanceDispatchOutcome, RebalanceExecutionTarget, StartupDexDrainStats,
+        apply_rebalance_dispatch_outcome, esp_evm_journal_scope, rebalance_quote_retry_delay,
         sync_runtime_ready_marker,
     };
 
@@ -5748,6 +5869,32 @@ mod tests {
         assert_eq!(rebalance_quote_retry_delay(4), Duration::from_secs(40));
         assert_eq!(rebalance_quote_retry_delay(5), Duration::from_secs(60));
         assert_eq!(rebalance_quote_retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn deferred_rebalance_remains_retryable_and_success_rotates_lane_fairness() {
+        let mut lane_busy = false;
+        let mut next_target = RebalanceExecutionTarget::Arbitrum;
+
+        assert!(!apply_rebalance_dispatch_outcome(
+            &mut lane_busy,
+            &mut next_target,
+            RebalanceExecutionTarget::Arbitrum,
+            RebalanceDispatchOutcome::Deferred,
+        ));
+        assert!(!lane_busy);
+        assert_eq!(next_target, RebalanceExecutionTarget::Arbitrum);
+
+        // This is the next supervisor tick after a temporary reservation has
+        // settled: the same target is still eligible and can now be submitted.
+        assert!(apply_rebalance_dispatch_outcome(
+            &mut lane_busy,
+            &mut next_target,
+            RebalanceExecutionTarget::Arbitrum,
+            RebalanceDispatchOutcome::Submitted,
+        ));
+        assert!(lane_busy);
+        assert_eq!(next_target, RebalanceExecutionTarget::Primary);
     }
 
     #[test]

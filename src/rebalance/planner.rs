@@ -431,6 +431,35 @@ mod tests {
     }
 
     #[test]
+    fn production_esp_incident_replans_the_exact_missing_wallet_inventory() {
+        let scale = U256::from(10).pow(U256::from(18));
+        let mut policy = direct_policy();
+        policy.token_symbol = "ESP".to_owned();
+        policy.reference_inventory = U256::from(7_441) * scale;
+        policy.routes[0].withdrawal.minimum = U256::from(1) * scale;
+        policy.routes[0].withdrawal.maximum = U256::from(10_000) * scale;
+        policy.routes[0].withdrawal.multiple = U256::from(10_000_000_000_000_000_u64);
+
+        let plan = plan_rebalance(
+            &policy,
+            BalanceSnapshot {
+                // Post-trade production balances observed on 2026-08-02.
+                binance: U256::from(6_659_374_769_630_000_000_000_u128),
+                wallet: U256::from(782_294_769_617_664_032_904_u128),
+            },
+            &[],
+        )
+        .unwrap();
+        let action = plan.action.unwrap();
+
+        assert_eq!(action.direction, Direction::BinanceToWallet);
+        assert_eq!(
+            action.amount,
+            U256::from(2_938_540_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
     fn raises_small_withdrawal_to_exchange_minimum_when_surplus_allows_it() {
         let plan = plan_rebalance(
             &direct_policy(),
