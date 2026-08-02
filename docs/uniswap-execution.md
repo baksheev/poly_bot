@@ -118,10 +118,12 @@ WebSocket copy of the same event is discarded by canonical log position.
 Pending opportunities are retained for entry preflight. Immediately before
 dispatch, preflight requotes the immutable DEX input against the latest
 published pool generation and combines it with the latest Binance bid/ask. It
-requires both price paths to be inside their 30-second freshness boundaries and
-rejects when the recomputed gross spread is below 20 bps. If the relevant
-Binance price and published DEX generation are unchanged since admission, it
-reuses the admission proof without repeating the quote.
+requires the current DEX output to cover the immutable transaction minimum,
+requires both price paths to be inside their 30-second freshness boundaries,
+and rejects when the recomputed gross spread is below 20 bps. The minimum check
+is transaction feasibility only and does not introduce another profitability
+model. If the relevant Binance price and published DEX generation are unchanged
+since admission, it reuses the admission proof without repeating the quote.
 
 The receipt Swap is the authoritative immediate self-impact update. The
 process-scoped WebSocket remains the ongoing source of new external pool

@@ -287,8 +287,10 @@ candidate's exact reservation remain separate authorization controls.
      inside the same reviewed 30-second freshness boundaries as runtime
      readiness;
    - the immutable DEX input is requoted against the latest local CLMM state and
-     combined with the latest Binance bid/ask; the resulting gross venue spread
-     must still meet the configured 20 bps threshold.
+     must still cover the immutable transaction minimum before it is combined
+     with the latest Binance bid/ask; the resulting gross venue spread must
+     still meet the configured 20 bps threshold. A quote below that minimum is
+     a transaction-feasibility rejection, not another profitability model.
    When the relevant Binance price and published DEX generation are unchanged
    since admission, the persisted 20 bps proof is reused and the duplicate
    requote is skipped. Generation identity is an optimization signal, not a
@@ -332,9 +334,10 @@ candidate's exact reservation remain separate authorization controls.
    copy and a post-trade settlement barrier are forbidden.
 7. Pending work is not discarded merely because its admitted pool generation
    predates the receipt update. Entry preflight requotes it against the latest
-   published generation and rejects it only if the fresh venue prices no longer
-   clear the configured 20 bps gross threshold or the price feeds are outside
-   their 30-second freshness boundaries.
+   published generation and rejects it only if the current DEX output can no
+   longer satisfy the immutable transaction minimum, the fresh venue prices no
+   longer clear the configured 20 bps gross threshold, or the price feeds are
+   outside their 30-second freshness boundaries.
 8. WebSocket logs remain the continuous source of subsequent external pool
    updates. The receipt event's canonical position deduplicates its later
    WebSocket copy without delaying owner-loop processing.

@@ -2808,6 +2808,41 @@ mod tests {
     }
 
     #[test]
+    fn entry_preflight_rejects_requote_below_immutable_dex_minimum() {
+        let handle = default_preflight();
+        let pool = preflight_pool(U256::ONE << 96, 0);
+        let curves = preflight_curves(&pool);
+        let current_output = curves[0].quote(U256::from(1_000_u64)).unwrap();
+        handle.update_dex_pool("world-chain-usdc-wld", 0, 2, 0, 0, curves);
+        let mut candidate = opportunity();
+        candidate.dex_plan.amount_out_minimum_base_units =
+            u128::try_from(current_output + U256::ONE).unwrap();
+
+        let rejection = handle.check(&candidate).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "preflight_dex_minimum_not_met");
+        assert!(rejection.detail.contains(&current_output.to_string()));
+        assert!(
+            rejection
+                .detail
+                .contains(&(current_output + U256::ONE).to_string())
+        );
+    }
+
+    #[test]
+    fn entry_preflight_accepts_requote_at_immutable_dex_minimum() {
+        let handle = default_preflight();
+        let pool = preflight_pool(U256::ONE << 96, 0);
+        let curves = preflight_curves(&pool);
+        let current_output = curves[0].quote(U256::from(1_000_u64)).unwrap();
+        handle.update_dex_pool("world-chain-usdc-wld", 0, 2, 0, 0, curves);
+        let mut candidate = opportunity();
+        candidate.dex_plan.amount_out_minimum_base_units = u128::try_from(current_output).unwrap();
+
+        assert!(handle.check(&candidate).unwrap().is_none());
+    }
+
+    #[test]
     fn entry_preflight_requotes_cex_buy_dex_sell_direction() {
         let handle = default_preflight();
         handle.update_quote(&preflight_quote(
@@ -2826,6 +2861,31 @@ mod tests {
         handle.update_quote(&preflight_quote(Decimal::ONE, Decimal::new(101, 2), 9));
         let rejection = handle.check(&reverse).unwrap().unwrap();
         assert_eq!(rejection.reason, "preflight_spread_below_threshold");
+    }
+
+    #[test]
+    fn entry_preflight_enforces_immutable_dex_minimum_for_cex_buy_direction() {
+        let handle = default_preflight();
+        handle.update_quote(&preflight_quote(
+            Decimal::new(98, 2),
+            Decimal::new(99, 2),
+            8,
+        ));
+        let pool = preflight_pool(U256::ONE << 96, 0);
+        let curves = preflight_curves(&pool);
+        let current_output = curves[1].quote(U256::from(1_000_u64)).unwrap();
+        handle.update_dex_pool("world-chain-usdc-wld", 0, 2, 0, 0, curves);
+        let mut reverse = opportunity();
+        reverse.direction = ArbitrageDirection::BuyTokenBOnCexSellOnDex;
+        reverse.admission.cex_primary_limit_price = Decimal::new(99, 2);
+        reverse.dex_plan.token_in = "0x4444444444444444444444444444444444444444".to_owned();
+        reverse.dex_plan.token_out = "0x3333333333333333333333333333333333333333".to_owned();
+        reverse.dex_plan.amount_out_minimum_base_units =
+            u128::try_from(current_output + U256::ONE).unwrap();
+
+        let rejection = handle.check(&reverse).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "preflight_dex_minimum_not_met");
     }
 
     #[test]
@@ -2872,6 +2932,79 @@ mod tests {
         );
 
         assert!(handle.check(&opportunity()).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode entry-preflight microbenchmark"]
+    fn benchmark_entry_preflight_hot_paths() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WARMUP_ITERATIONS: usize = 10_000;
+        const MEASURED_ITERATIONS: usize = 200_000;
+        const ROUNDS: usize = 7;
+
+        let unchanged = default_preflight();
+        let unchanged_opportunity = opportunity();
+
+        let requote = default_preflight();
+        requote.update_dex_pool(
+            "world-chain-usdc-wld",
+            0,
+            2,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
+        let requote_opportunity = opportunity();
+
+        for _ in 0..WARMUP_ITERATIONS {
+            assert!(
+                unchanged
+                    .check(black_box(&unchanged_opportunity))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                requote
+                    .check(black_box(&requote_opportunity))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let measure = |handle: &EntryPreflightHandle, candidate: &PaperOpportunity| {
+            let started = Instant::now();
+            let mut accepted = 0_usize;
+            for _ in 0..MEASURED_ITERATIONS {
+                accepted += handle.check(black_box(candidate)).unwrap().is_none() as usize;
+            }
+            black_box(accepted);
+            assert_eq!(accepted, MEASURED_ITERATIONS);
+            started.elapsed().as_nanos() as f64 / MEASURED_ITERATIONS as f64
+        };
+
+        let mut unchanged_ns = Vec::with_capacity(ROUNDS);
+        let mut requote_ns = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            if round % 2 == 0 {
+                unchanged_ns.push(measure(&unchanged, &unchanged_opportunity));
+                requote_ns.push(measure(&requote, &requote_opportunity));
+            } else {
+                requote_ns.push(measure(&requote, &requote_opportunity));
+                unchanged_ns.push(measure(&unchanged, &unchanged_opportunity));
+            }
+        }
+        unchanged_ns.sort_by(f64::total_cmp);
+        requote_ns.sort_by(f64::total_cmp);
+
+        println!(
+            "entry_preflight_benchmark unchanged_median_ns={:.1} requote_median_ns={:.1} iterations={} rounds={}",
+            unchanged_ns[ROUNDS / 2],
+            requote_ns[ROUNDS / 2],
+            MEASURED_ITERATIONS,
+            ROUNDS,
+        );
     }
 
     #[test]

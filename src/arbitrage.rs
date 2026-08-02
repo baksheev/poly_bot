@@ -1249,6 +1249,16 @@ impl EntryPreflightHandle {
                     }));
                 }
             };
+        let dex_amount_out_minimum = U256::from(opportunity.dex_plan.amount_out_minimum_base_units);
+        if dex_amount_out < dex_amount_out_minimum {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "preflight_dex_minimum_not_met",
+                detail: format!(
+                    "current DEX output {} is below immutable transaction minimum {}",
+                    dex_amount_out, dex_amount_out_minimum
+                ),
+            }));
+        }
         let threshold_bps = opportunity.admission.opportunity_threshold_bps;
         let (cost_token_a, proceeds_token_a) = match opportunity.direction {
             ArbitrageDirection::BuyTokenBOnDexSellOnCex => (
