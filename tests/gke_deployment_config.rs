@@ -1,6 +1,7 @@
 const RELEASE_PLATFORM: &str = include_str!("../infra/gcp/gke/release-platform.yaml");
 const DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
 const DEPLOY_WORKFLOW: &str = include_str!("../.github/workflows/deploy-gke.yml");
+const RECOVERY_WORKFLOW: &str = include_str!("../.github/workflows/operate-gke-recovery.yml");
 const MAIN: &str = include_str!("../src/main.rs");
 const COMPILED_DOMAIN: &str =
     include_str!("../config/domain/compiled-multi-pair-production.v1.json");
@@ -179,4 +180,40 @@ fn gke_full_live_runtime_keeps_durable_state_and_safe_rollback_guards() {
     assert!(DEPLOY_WORKFLOW.contains("previous_durable_schema_version >= durable_schema_version"));
     assert!(DEPLOY_WORKFLOW.contains("automatic rollback refused"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
+}
+
+#[test]
+fn gke_recovery_workflow_enforces_a_quiescent_single_owner_handoff() {
+    assert!(RECOVERY_WORKFLOW.contains("workflow_dispatch:"));
+    assert!(!RECOVERY_WORKFLOW.contains("workflow_run:"));
+    assert!(!RECOVERY_WORKFLOW.contains("push:"));
+    assert!(RECOVERY_WORKFLOW.contains("group: production-gke"));
+    assert!(RECOVERY_WORKFLOW.contains("environment: production"));
+    assert!(RECOVERY_WORKFLOW.contains("test \"${gce_status}\" = TERMINATED"));
+    assert!(RECOVERY_WORKFLOW.contains("test \"${deployed_revision}\" = \"${SOURCE_SHA}\""));
+    assert!(RECOVERY_WORKFLOW.contains("[[ \"${image}\" == *@sha256:* ]]"));
+    assert!(RECOVERY_WORKFLOW.contains("active_operation_count=0"));
+    assert!(RECOVERY_WORKFLOW.contains("arb-bot/recovery-handoff="));
+
+    let proof = RECOVERY_WORKFLOW
+        .find("test -s \"${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe\"")
+        .expect("recovery workflow waits for the runtime quiescence proof");
+    let stop = RECOVERY_WORKFLOW
+        .find("kubectl scale deployment arb-bot")
+        .expect("recovery workflow stops the application owner");
+    let job = RECOVERY_WORKFLOW
+        .find("Run the isolated recovery command")
+        .expect("recovery workflow creates a one-shot owner");
+    assert!(proof < stop && stop < job);
+
+    assert!(RECOVERY_WORKFLOW.contains("backoffLimit: 0"));
+    assert!(RECOVERY_WORKFLOW.contains("activeDeadlineSeconds: 1200"));
+    assert!(RECOVERY_WORKFLOW.contains("select(.name == \"arb-bot\")"));
+    assert!(RECOVERY_WORKFLOW.contains(".spec.containers = ["));
+    assert!(RECOVERY_WORKFLOW.contains("arb_bot arbitrage-record-operator-recovery"));
+    assert!(RECOVERY_WORKFLOW.contains("RECORD_LIVE_ARBITRAGE_OPERATOR_RECOVERY"));
+    assert!(RECOVERY_WORKFLOW.contains("inputs.operation == 'recovery-execute'"));
+    assert!(RECOVERY_WORKFLOW.contains("if: success() && inputs.operation == 'recovery-execute'"));
+    assert!(!RECOVERY_WORKFLOW.contains("confirmation=RELEASE"));
+    assert!(RECOVERY_WORKFLOW.contains("test \"${RECOVERY_CONFIRMATION}\" = RELEASE"));
 }

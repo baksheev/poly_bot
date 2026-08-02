@@ -1899,6 +1899,12 @@ impl PaperTradeCoordinator {
         self.journal.active_operations()
     }
 
+    /// Constant-time count used by the out-of-band recovery handoff. It keeps
+    /// filesystem polling away from the journal's historical operation set.
+    pub fn active_operation_count(&self) -> usize {
+        self.journal.active_operation_count()
+    }
+
     /// Counts every durable parent intent in this journal, including terminal
     /// work. Live canary/launch caps therefore survive process restarts.
     pub fn admitted_operation_count(&self) -> usize {
@@ -2672,6 +2678,7 @@ fn residual_value_token_a_base_units(operation: &TradeOperation) -> anyhow::Resu
 struct TradeJournal {
     file: File,
     operations: BTreeMap<String, TradeOperation>,
+    active_operation_count: usize,
     unresolved_by_strategy: BTreeMap<String, usize>,
     next_sequence: u64,
     poisoned: bool,
@@ -2753,10 +2760,15 @@ impl TradeJournal {
                 .checked_add(1)
                 .context("trade journal sequence overflow")?;
         }
+        let active_operation_count = operations
+            .values()
+            .filter(|operation| !operation.stage.terminal())
+            .count();
         let unresolved_by_strategy = unresolved_strategy_index(&operations);
         Ok(Self {
             file,
             operations,
+            active_operation_count,
             unresolved_by_strategy,
             next_sequence: expected_sequence,
             poisoned: false,
@@ -2779,6 +2791,10 @@ impl TradeJournal {
                 )
             })
             .collect()
+    }
+
+    fn active_operation_count(&self) -> usize {
+        self.active_operation_count
     }
 
     fn unresolved_exposure_count(&self, strategy_id: &str) -> usize {
@@ -2813,6 +2829,22 @@ impl TradeJournal {
             self.operations.get(&payload.operation.intent.plan_id),
             &payload.operation,
         );
+        let previous_was_active = self
+            .operations
+            .get(&payload.operation.intent.plan_id)
+            .is_some_and(|operation| !operation.stage.terminal());
+        let next_is_active = !payload.operation.stage.terminal();
+        let next_active_operation_count = match (previous_was_active, next_is_active) {
+            (false, true) => self
+                .active_operation_count
+                .checked_add(1)
+                .context("active trade count overflow")?,
+            (true, false) => self
+                .active_operation_count
+                .checked_sub(1)
+                .context("active trade count underflow")?,
+            _ => self.active_operation_count,
+        };
         let record = WireRecord::new(payload)?;
         let mut encoded = serde_json::to_vec(&record).context("failed to encode trade journal")?;
         ensure!(
@@ -2828,6 +2860,7 @@ impl TradeJournal {
             self.poisoned = true;
             return Err(error).context("failed to durably append trade journal record");
         }
+        self.active_operation_count = next_active_operation_count;
         self.unresolved_by_strategy = next_unresolved_by_strategy;
         self.operations = next;
         self.next_sequence = self

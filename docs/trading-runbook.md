@@ -1,6 +1,6 @@
 # Live arbitrage operator runbook
 
-Last reviewed: 2026-07-26
+Last reviewed: 2026-08-02
 
 This runbook applies only to the isolated WLDUSDC Rust identities owned by the
 single production Pod in the private zonal GKE cluster `arb-bot` in
@@ -54,6 +54,15 @@ targeting the GKE Pod and its mounted state volume. Never SSH to the rollback
 GCE VM or mutate the production Pod from a workstation; that would operate on
 the wrong owner or bypass the audited delivery boundary.
 
+Use `Operate GKE Recovery` with `activate-entry-stop` to block admission. The
+running owner publishes
+`/var/lib/arb-bot/arbitrage-entry.stop.recovery-safe` only after the stop is
+active and its constant-time durable active-parent count is zero. Recovery
+operations refuse to scale the Deployment down until that exact marker is
+present in the Ready production Pod. The workflow records the handoff on the
+Deployment before scaling to zero, so a failed one-shot command can be retried
+without bringing up a second owner.
+
 Do not stop the process merely because an order/transaction is ambiguous. Keep
 the entry stop active, inspect the parent/child state, and prove the venue
 outcome by deterministic Binance client order ID or World Chain transaction
@@ -86,7 +95,7 @@ read-only proof:
 arb_bot arbitrage-record-operator-recovery \
   --plan-id PLAN_ID \
   --dex-transaction-hash 0xTRANSACTION_HASH \
-  --wallet-journal-path /var/lib/arb-bot/arbitrum-wallet-transactions.jsonl \
+  --wallet-journal-path /var/lib/arb-bot/arbitrage-arbitrum-wallet.jsonl \
   --order-journal-path /var/lib/arb-bot/arbitrage-binance-orders.jsonl \
   --mode dry-run \
   --maximum-quote-usdc 250
@@ -108,9 +117,37 @@ order remains authoritative even if realized slippage exceeds the pre-placement
 quote cap; the command records it and emits an error instead of recreating an
 unknown exposure.
 
+Invoke those commands through `Operate GKE Recovery`, not from a workstation:
+
+```bash
+gh workflow run operate-gke-recovery.yml --ref main \
+  -f operation=recovery-dry-run \
+  -f plan_id=PLAN_ID \
+  -f dex_transaction_hash=0xTRANSACTION_HASH \
+  -f maximum_quote_usdc=250
+
+gh workflow run operate-gke-recovery.yml --ref main \
+  -f operation=recovery-execute \
+  -f plan_id=PLAN_ID \
+  -f dex_transaction_hash=0xTRANSACTION_HASH \
+  -f maximum_quote_usdc=250 \
+  -f confirmation=EXECUTE
+```
+
+The workflow reuses the digest-pinned production image and Pod template,
+proves the GCE owner is `TERMINATED`, waits for the quiescent handoff, scales
+the Deployment to zero, and mounts the same PVC and secrets into one Job. A
+failed execute deliberately leaves the Deployment at zero with the entry stop
+active; rerun dry-run/execute to resolve the same deterministic IDs. A
+successful execute restarts the normal owner with the entry stop still active.
+
 Restart the Deployment through the reviewed recovery workflow, verify that the
 strategy quarantine is clear and balances are synchronized, and only then
 remove the entry stop. Never hand-edit or replace any journal.
+
+Release admission only through `Operate GKE Recovery` with
+`release-entry-stop` and `confirmation=RELEASE`. It requires a Ready normal Pod
+and a fresh zero-active-parent marker before deleting the stop file.
 
 ## Canary and 100-trade run
 

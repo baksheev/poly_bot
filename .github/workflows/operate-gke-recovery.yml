@@ -1,0 +1,367 @@
+name: Operate GKE Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Audited recovery operation
+        required: true
+        type: choice
+        options:
+          - activate-entry-stop
+          - recovery-dry-run
+          - recovery-execute
+          - release-entry-stop
+      plan_id:
+        description: Required for recovery-dry-run/recovery-execute
+        required: false
+        type: string
+      dex_transaction_hash:
+        description: Required canonical DEX transaction hash for recovery
+        required: false
+        type: string
+      maximum_quote_usdc:
+        description: Positive pre-placement quote cap
+        required: false
+        default: "250"
+        type: string
+      confirmation:
+        description: Enter EXECUTE for recovery-execute or RELEASE for release-entry-stop
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-gke
+  cancel-in-progress: false
+
+env:
+  GKE_ZONE: asia-southeast1-b
+  GKE_CLUSTER: arb-bot
+  GKE_NAMESPACE: arb-bot
+  GCE_INSTANCE: arb-bot-rust-shadow-gce
+  SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  recover:
+    name: Single-owner recovery operation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      RECOVERY_OPERATION: ${{ inputs.operation }}
+      RECOVERY_PLAN_ID: ${{ inputs.plan_id }}
+      RECOVERY_DEX_TRANSACTION_HASH: ${{ inputs.dex_transaction_hash }}
+      RECOVERY_MAXIMUM_QUOTE_USDC: ${{ inputs.maximum_quote_usdc }}
+      RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
+
+    steps:
+      - name: Checkout requested revision
+        uses: actions/checkout@v5
+
+      - name: Validate requested operation
+        run: |
+          set -euo pipefail
+          test -n "${GCP_PROJECT_ID}"
+          case "${RECOVERY_OPERATION}" in
+            activate-entry-stop) ;;
+            release-entry-stop)
+              test "${RECOVERY_CONFIRMATION}" = RELEASE
+              ;;
+            recovery-dry-run|recovery-execute)
+              [[ "${RECOVERY_PLAN_ID}" =~ ^[A-Za-z0-9:_-]{1,160}$ ]]
+              [[ "${RECOVERY_DEX_TRANSACTION_HASH}" =~ ^0x[0-9a-fA-F]{64}$ ]]
+              [[ "${RECOVERY_MAXIMUM_QUOTE_USDC}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+              test -n "${RECOVERY_MAXIMUM_QUOTE_USDC//[0.]/}"
+              if [[ "${RECOVERY_OPERATION}" == recovery-execute ]]; then
+                test "${RECOVERY_CONFIRMATION}" = EXECUTE
+              fi
+              ;;
+            *)
+              echo "unsupported recovery operation" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Get private cluster credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          namespace: ${{ env.GKE_NAMESPACE }}
+          use_dns_based_endpoint: true
+
+      - name: Verify the exact production owner
+        id: owner
+        run: |
+          set -euo pipefail
+          gce_status="$(gcloud compute instances describe "${GCE_INSTANCE}" \
+            --zone="${GKE_ZONE}" \
+            --project="${GCP_PROJECT_ID}" \
+            --format='value(status)')"
+          test "${gce_status}" = TERMINATED
+
+          deployment_json="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json)"
+          deployed_revision="$(jq -r '.spec.template.metadata.labels["arb-bot/source-revision"]' \
+            <<<"${deployment_json}")"
+          test "${deployed_revision}" = "${SOURCE_SHA}"
+          image="$(jq -r '.spec.template.spec.containers[] | select(.name == "arb-bot") | .image' \
+            <<<"${deployment_json}")"
+          [[ "${image}" == *@sha256:* ]]
+          replicas="$(jq -r '.spec.replicas' <<<"${deployment_json}")"
+          test "${replicas}" = 0 || test "${replicas}" = 1
+          echo "replicas=${replicas}" >>"${GITHUB_OUTPUT}"
+          echo "image=${image}" >>"${GITHUB_OUTPUT}"
+
+      - name: Activate entry stop
+        if: inputs.operation == 'activate-entry-stop'
+        run: |
+          set -euo pipefail
+          test "${{ steps.owner.outputs.replicas }}" = 1
+          pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${pod}"
+          kubectl wait pod/"${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=Ready \
+            --timeout=60s
+          kubectl exec "${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            -- /bin/sh -ec ': >"${ARBITRAGE_ENTRY_STOP_FILE}"'
+          echo "Entry stop is active. Existing journaled work remains owned by the running Pod."
+
+      - name: Prove quiescence and stop the application owner
+        if: startsWith(inputs.operation, 'recovery-') && steps.owner.outputs.replicas == '1'
+        run: |
+          set -euo pipefail
+          pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${pod}"
+          kubectl wait pod/"${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=Ready \
+            --timeout=60s
+          kubectl exec "${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            -- /bin/sh -ec 'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"; : >"${ARBITRAGE_ENTRY_STOP_FILE}"'
+
+          safe=false
+          for _ in {1..900}; do
+            if kubectl exec "${pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --container arb-bot \
+              -- /bin/sh -ec 'test -s "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe" && grep -qx "active_operation_count=0" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'; then
+              safe=true
+              break
+            fi
+            ready="$(kubectl get pod "${pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.status.containerStatuses[?(@.name=="arb-bot")].ready}')"
+            test "${ready}" = true
+            sleep 1
+          done
+          test "${safe}" = true
+
+          kubectl annotate deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --overwrite \
+            "arb-bot/recovery-handoff=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubectl scale deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --replicas=0
+          kubectl wait pod \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector=app.kubernetes.io/name=arb-bot \
+            --for=delete \
+            --timeout=120s
+
+      - name: Verify an earlier safe handoff remains recorded
+        if: startsWith(inputs.operation, 'recovery-') && steps.owner.outputs.replicas == '0'
+        run: |
+          set -euo pipefail
+          handoff="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -r '.metadata.annotations["arb-bot/recovery-handoff"] // empty')"
+          test -n "${handoff}"
+          test -z "$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector=app.kubernetes.io/name=arb-bot \
+            -o name)"
+
+      - name: Run the isolated recovery command
+        id: recovery
+        if: startsWith(inputs.operation, 'recovery-')
+        run: |
+          set -Eeuo pipefail
+          recovery_mode="${RECOVERY_OPERATION#recovery-}"
+          job="arb-bot-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            kubectl delete job "${job}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --ignore-not-found \
+              --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          template="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -c '.spec.template')"
+          jq -n \
+            --argjson template "${template}" \
+            --arg job "${job}" \
+            --arg plan_id "${RECOVERY_PLAN_ID}" \
+            --arg transaction_hash "${RECOVERY_DEX_TRANSACTION_HASH}" \
+            --arg maximum_quote "${RECOVERY_MAXIMUM_QUOTE_USDC}" \
+            --arg mode "${recovery_mode}" \
+            --arg actor "github:${GITHUB_ACTOR}" \
+            --arg confirmation "$(if [[ "${recovery_mode}" == execute ]]; then printf %s RECORD_LIVE_ARBITRAGE_OPERATOR_RECOVERY; fi)" \
+            '
+              {
+                apiVersion: "batch/v1",
+                kind: "Job",
+                metadata: {
+                  name: $job,
+                  labels: {"app.kubernetes.io/name": "arb-bot-recovery"}
+                },
+                spec: {
+                  backoffLimit: 0,
+                  activeDeadlineSeconds: 1200,
+                  ttlSecondsAfterFinished: 3600,
+                  template: (
+                    $template
+                    | .metadata.labels = {
+                        "app.kubernetes.io/name": "arb-bot-recovery",
+                        "arb-bot/recovery-instance": $job
+                      }
+                    | .metadata.annotations = {}
+                    | .spec.restartPolicy = "Never"
+                    | .spec.containers = [
+                        .spec.containers[]
+                        | select(.name == "arb-bot")
+                        | .name = "recovery"
+                        | del(.startupProbe, .readinessProbe, .livenessProbe)
+                        | .env += [
+                            {name: "RECOVERY_PLAN_ID", value: $plan_id},
+                            {name: "RECOVERY_DEX_TRANSACTION_HASH", value: $transaction_hash},
+                            {name: "RECOVERY_MAXIMUM_QUOTE_USDC", value: $maximum_quote},
+                            {name: "RECOVERY_MODE", value: $mode},
+                            {name: "RECOVERY_ACTOR", value: $actor},
+                            {name: "ARBITRAGE_OPERATOR_RECOVERY_CONFIRMATION", value: $confirmation}
+                          ]
+                        | .command = ["/bin/sh", "-ec"]
+                        | .args = [
+                            "for secret_name in CLICKHOUSE_URL CLICKHOUSE_PASSWORD ALCHEMY_WORLDCHAIN_RPC_URL ALCHEMY_WORLDCHAIN_WS_URL ALCHEMY_OPTIMISM_RPC_URL BINANCE_API_KEY BINANCE_SECRET_KEY BINANCE_TREASURY_API_KEY BINANCE_TREASURY_SECRET_KEY BINANCE_SUBACCOUNT_EMAIL EVM_WALLET_PRIVATE_KEY; do secret_value=\"$(cat \"/var/run/secrets/arb-bot/${secret_name}\")\"; export \"${secret_name}=${secret_value}\"; done; alchemy_api_key=\"${ALCHEMY_WORLDCHAIN_RPC_URL##*/}\"; test -n \"${alchemy_api_key}\"; export ARBITRUM_RPC_URL=\"https://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}\"; export ARBITRUM_WS_URL=\"wss://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}\"; unset alchemy_api_key; exec arb_bot arbitrage-record-operator-recovery --plan-id \"${RECOVERY_PLAN_ID}\" --dex-transaction-hash \"${RECOVERY_DEX_TRANSACTION_HASH}\" --wallet-journal-path \"${ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH}\" --order-journal-path \"${ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH}\" --mode \"${RECOVERY_MODE}\" --maximum-quote-usdc \"${RECOVERY_MAXIMUM_QUOTE_USDC}\" --actor \"${RECOVERY_ACTOR}\""
+                          ]
+                      ]
+                  )
+                }
+              }
+            ' | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+
+          terminal=
+          for _ in {1..1200}; do
+            terminal="$(kubectl get job "${job}" \
+              --namespace "${GKE_NAMESPACE}" \
+              -o json | jq -r '[.status.conditions[]? | select(.status == "True") | .type][0] // empty')"
+            test -z "${terminal}" || break
+            sleep 1
+          done
+          if [[ "${terminal}" != Complete ]]; then
+            kubectl logs job/"${job}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --all-containers=true || true
+            test -n "${terminal}" || echo "recovery Job did not reach a terminal state" >&2
+            exit 1
+          fi
+          kubectl logs job/"${job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --all-containers=true
+
+      - name: Restart stopped owner after dry run
+        if: always() && inputs.operation == 'recovery-dry-run' && steps.owner.outputs.replicas == '1'
+        run: |
+          set -euo pipefail
+          kubectl scale deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --replicas=1
+          kubectl rollout status deployment/arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --timeout=10m
+
+      - name: Restart owner after successful recovery
+        if: success() && inputs.operation == 'recovery-execute'
+        run: |
+          set -euo pipefail
+          kubectl scale deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --replicas=1
+          kubectl rollout status deployment/arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --timeout=10m
+          pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${pod}"
+          for _ in {1..120}; do
+            if kubectl exec "${pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --container arb-bot \
+              -- /bin/sh -ec 'test -s "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe" && grep -qx "active_operation_count=0" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "restarted owner did not prove quiescence with entry stop active" >&2
+          exit 1
+
+      - name: Release entry stop
+        if: inputs.operation == 'release-entry-stop'
+        run: |
+          set -euo pipefail
+          test "${{ steps.owner.outputs.replicas }}" = 1
+          pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${pod}"
+          kubectl wait pod/"${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=Ready \
+            --timeout=60s
+          kubectl exec "${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            -- /bin/sh -ec 'test -s "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe" && grep -qx "active_operation_count=0" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"; rm -f "${ARBITRAGE_ENTRY_STOP_FILE}" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'
+          kubectl annotate deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            arb-bot/recovery-handoff-
+          echo "Entry stop released after a running, quiescent owner proved zero active parents."

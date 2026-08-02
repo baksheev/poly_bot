@@ -2,7 +2,9 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
+    fs::{OpenOptions, remove_file},
     future::Future,
+    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -1084,6 +1086,7 @@ pub struct LiveTradeTask<E> {
     engine_id: String,
     event_sender: mpsc::UnboundedSender<PaperTradeEvent>,
     risk_limits: LiveRiskLimits,
+    recovery_safe_marker_published: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1196,6 +1199,7 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
             engine_id,
             event_sender,
             risk_limits,
+            recovery_safe_marker_published: false,
         },
         event_receiver,
     ))
@@ -1203,8 +1207,19 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
 
 impl<E: LiveLegExecutor> LiveTradeTask<E> {
     pub async fn run(mut self) -> anyhow::Result<()> {
+        self.clear_recovery_safe_marker()?;
         self.resume_active().await?;
-        while let Some(opportunity) = self.receiver.recv().await {
+        let mut recovery_control_tick = tokio::time::interval(Duration::from_millis(250));
+        recovery_control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            self.sync_recovery_safe_marker()?;
+            let opportunity = tokio::select! {
+                opportunity = self.receiver.recv() => opportunity,
+                _ = recovery_control_tick.tick() => continue,
+            };
+            let Some(opportunity) = opportunity else {
+                break;
+            };
             let plan_id = opportunity.plan_id();
             let pair_id = opportunity.pair_id.clone();
             let received_unix_us = opportunity.received_unix_us;
@@ -1263,6 +1278,67 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 self.publish_event(plan_id, Some(pair_id), state, false, None)?;
             }
         }
+        self.clear_recovery_safe_marker()?;
+        Ok(())
+    }
+
+    fn recovery_safe_marker(&self) -> PathBuf {
+        let mut marker = self.risk_limits.entry_stop_file.as_os_str().to_owned();
+        marker.push(".recovery-safe");
+        PathBuf::from(marker)
+    }
+
+    fn clear_recovery_safe_marker(&self) -> anyhow::Result<()> {
+        let marker = self.recovery_safe_marker();
+        match remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to clear recovery-safe marker {}", marker.display())
+            }),
+        }
+    }
+
+    fn sync_recovery_safe_marker(&mut self) -> anyhow::Result<()> {
+        let marker = self.recovery_safe_marker();
+        let safe = self.risk_limits.entry_stop_file.exists()
+            && self.coordinator.active_operation_count() == 0;
+        if !safe {
+            if self.recovery_safe_marker_published {
+                self.clear_recovery_safe_marker()?;
+                self.recovery_safe_marker_published = false;
+            }
+            return Ok(());
+        }
+        if self.recovery_safe_marker_published && marker.exists() {
+            return Ok(());
+        }
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&marker) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.recovery_safe_marker_published = true;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create recovery-safe marker {}", marker.display())
+                });
+            }
+        };
+        writeln!(file, "engine_id={}", self.engine_id)
+            .context("failed to write recovery-safe marker")?;
+        writeln!(file, "active_operation_count=0")
+            .context("failed to write recovery-safe marker")?;
+        file.sync_data()
+            .context("failed to sync recovery-safe marker")?;
+        self.recovery_safe_marker_published = true;
         Ok(())
     }
 
@@ -2717,6 +2793,96 @@ mod tests {
         let mut invalid = valid;
         invalid.entry_stop_file = PathBuf::new();
         assert!(invalid.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn entry_stop_publishes_quiescent_handoff_and_clears_it_on_shutdown() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-recovery-safe-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let mut marker_os = stop_file.as_os_str().to_owned();
+        marker_os.push(".recovery-safe");
+        let marker = PathBuf::from(marker_os);
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let _ = fs::remove_file(&marker);
+
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (handle, task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "recovery-safe-test-engine".to_owned(),
+            risk_limits(stop_file.clone()),
+        )
+        .unwrap();
+        let task = tokio::spawn(task.run());
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        fs::write(&stop_file, b"").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let evidence = fs::read_to_string(&marker).unwrap();
+        assert!(evidence.contains("engine_id=recovery-safe-test-engine"));
+        assert!(evidence.contains("active_operation_count=0"));
+
+        drop(handle);
+        task.await.unwrap().unwrap();
+        assert!(!marker.exists());
+
+        fs::remove_file(journal).unwrap();
+        fs::remove_file(stop_file).unwrap();
+    }
+
+    #[test]
+    fn recovery_handoff_is_revoked_when_a_parent_is_active() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-recovery-active-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "recovery-active-test-engine".to_owned(),
+            risk_limits(stop_file.clone()),
+        )
+        .unwrap();
+        fs::write(&stop_file, b"").unwrap();
+        task.sync_recovery_safe_marker().unwrap();
+        let marker = task.recovery_safe_marker();
+        assert!(marker.exists());
+        fs::remove_file(&marker).unwrap();
+        task.sync_recovery_safe_marker().unwrap();
+        assert!(marker.exists());
+
+        let mut intent = opportunity().intent(ExecutionMode::DexFirst);
+        intent.journal_scope = Some(scope());
+        task.coordinator.admit(intent).unwrap();
+        assert_eq!(task.coordinator.active_operation_count(), 1);
+        task.sync_recovery_safe_marker().unwrap();
+        assert!(!marker.exists());
+
+        drop(task);
+        fs::remove_file(journal).unwrap();
+        fs::remove_file(stop_file).unwrap();
     }
 
     #[test]
