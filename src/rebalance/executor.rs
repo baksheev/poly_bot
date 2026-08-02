@@ -468,10 +468,13 @@ impl RebalanceExecutionJournal {
     pub fn reopen_next_retryable_quarantine(
         &mut self,
     ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
-        ensure!(
-            self.active_operation()?.is_none(),
-            "cannot reopen a quarantined rebalance while another operation is active"
-        );
+        // Startup recovery must finish the single already-active mutation
+        // owner before reopening a different token's quarantined operation.
+        // Returning no candidate preserves that ownership ordering without
+        // turning a valid multi-token journal into a process-fatal error.
+        if self.active_operation()?.is_some() {
+            return Ok(None);
+        }
         let candidate = self.operations.values().find_map(|operation| {
             let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
                 return None;
@@ -2772,6 +2775,88 @@ mod tests {
         let quarantined = journal.quarantined_operations().collect::<Vec<_>>();
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].intent.token_symbol, "USDC");
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn active_recovery_defers_retryable_quarantine_until_the_lane_is_terminal() {
+        let path = path("active-recovery-defers-quarantine");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let quarantined = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        for progress in [
+            RebalanceExecutionProgress::BinanceTransferSubmitted {
+                transaction_id: 1,
+                bridge_balance_before: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceTransferCompleted {
+                transaction_id: 1,
+                bridge_balance_before: U256::from(9),
+            },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: "travel_rule_ae_self_owned".to_owned(),
+                bridge_balance_before: U256::from(9),
+                reconciliation_queries: 1,
+            },
+        ] {
+            journal
+                .advance(&quarantined.intent.operation_id, progress)
+                .unwrap();
+        }
+        journal
+            .advance(
+                &quarantined.intent.operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance withdrawal retry found a destination-wallet balance change"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+
+        let active = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        assert_eq!(
+            journal
+                .active_operation()
+                .unwrap()
+                .map(|operation| { operation.intent.operation_id.as_str() }),
+            Some(active.intent.operation_id.as_str())
+        );
+        assert!(
+            journal
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            journal
+                .operations()
+                .get(&quarantined.intent.operation_id)
+                .unwrap()
+                .progress,
+            RebalanceExecutionProgress::Quarantined { .. }
+        ));
+
+        journal
+            .advance(
+                &active.intent.operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: "active recovery completed terminally for test".to_owned(),
+                },
+            )
+            .unwrap();
+        let reopened = journal
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("retryable quarantine should reopen after the active lane is terminal");
+        assert_eq!(
+            reopened.intent.operation_id,
+            quarantined.intent.operation_id
+        );
+
         drop(journal);
         fs::remove_file(path).unwrap();
     }
