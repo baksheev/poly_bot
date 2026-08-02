@@ -795,18 +795,35 @@ impl JsonRpcClient {
 
     async fn rpc_response(&self, method: &str, params: Value) -> anyhow::Result<RpcResponse> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let response = self
-            .send_json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
-            .await?;
-        let decoded: RpcResponse =
-            serde_json::from_value(response).context("invalid JSON-RPC response")?;
-        ensure!(decoded.id == id, "JSON-RPC response id mismatch");
-        Ok(decoded)
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            let response = self.send_json(body.clone()).await?;
+            let decoded: RpcResponse =
+                serde_json::from_value(response).context("invalid JSON-RPC response")?;
+            ensure!(decoded.id == id, "JSON-RPC response id mismatch");
+            if decoded
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == 429)
+                && attempt < MAX_RATE_LIMIT_RETRIES
+            {
+                self.rate_limit_retries.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    method,
+                    attempt = attempt + 1,
+                    "JSON-RPC rate-limit retry scheduled"
+                );
+                tokio::time::sleep(retry_delay(attempt)).await;
+                continue;
+            }
+            return Ok(decoded);
+        }
+        unreachable!("bounded JSON-RPC retry loop always returns on its final attempt")
     }
 
     async fn send_json(&self, body: Value) -> anyhow::Result<Value> {
@@ -1315,8 +1332,13 @@ fn retry_delay(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+    };
+
     use alloy_primitives::{Address, B256, U256};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         JsonRpcClient, RpcError, decode_revert_data, decode_rpc_transaction,
@@ -1354,6 +1376,49 @@ mod tests {
         let sanitized = sanitize_rpc_message(&message);
         assert!(!sanitized.contains('\n'));
         assert_eq!(sanitized.chars().count(), 256);
+    }
+
+    #[tokio::test]
+    async fn retries_json_rpc_rate_limit_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert_eq!(request["method"], "eth_getBlockByNumber");
+                let id = request["id"].clone();
+                let response = if attempt == 0 {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": 429,
+                            "message": "compute units per second capacity exceeded"
+                        }
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "number": "0x7b",
+                            "hash": format!("{:#x}", B256::repeat_byte(0x11)),
+                            "parentHash": format!("{:#x}", B256::repeat_byte(0x22))
+                        }
+                    })
+                };
+                write_response(&mut stream, &response);
+            }
+        });
+
+        let client = JsonRpcClient::new(format!("http://{address}")).unwrap();
+        let block = client.latest_block().await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(block.number, 123);
+        assert_eq!(client.stats().http_requests, 2);
+        assert_eq!(client.stats().rate_limit_retries, 1);
     }
 
     #[test]
@@ -1463,5 +1528,45 @@ mod tests {
         let mut word = [0_u8; 32];
         word[24..].copy_from_slice(&value.to_be_bytes());
         word
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Value {
+        let mut encoded = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0, "mock RPC closed before request headers");
+            encoded.extend_from_slice(&buffer[..read]);
+            if let Some(position) = encoded.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&encoded[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while encoded.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0, "mock RPC closed before request body");
+            encoded.extend_from_slice(&buffer[..read]);
+        }
+        serde_json::from_slice(&encoded[header_end..header_end + content_length]).unwrap()
+    }
+
+    fn write_response(stream: &mut TcpStream, response: &Value) {
+        let body = serde_json::to_vec(response).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
     }
 }
