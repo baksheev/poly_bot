@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::chain::logs::{ChainLog, EthLogFilter, WireChainLog};
 
-const DEFAULT_BATCH_SIZE: usize = 100;
+const DEFAULT_BATCH_SIZE: usize = 5;
 const MAX_RATE_LIMIT_RETRIES: u32 = 6;
 const BASE_RETRY_DELAY_MS: u64 = 100;
 
@@ -1413,6 +1413,7 @@ mod tests {
         });
 
         let client = JsonRpcClient::new(format!("http://{address}")).unwrap();
+        assert_eq!(client.batch_size(), 5);
         let block = client.latest_block().await.unwrap();
         server.join().unwrap();
 

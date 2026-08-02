@@ -47,7 +47,7 @@ impl NetworkReadClass {
         match self {
             Self::GapRepair => NetworkReadPolicy::new(2, 8, 100, 15_000),
             Self::WalletBalance => NetworkReadPolicy::new(2, 8, 100, 5_000),
-            Self::StartupPoolHydration => NetworkReadPolicy::new(2, 8, 100, 20_000),
+            Self::StartupPoolHydration => NetworkReadPolicy::new(2, 8, 5, 20_000),
             Self::StateReconciliation => NetworkReadPolicy::new(1, 4, 50, 10_000),
             Self::QuoterParity => NetworkReadPolicy::new(1, 2, 20, 2_000),
         }
@@ -618,11 +618,13 @@ mod tests {
     fn read_classes_have_independent_capacity_and_bounded_chunks() {
         let gap = ReadLane::new(NetworkReadClass::GapRepair);
         let wallet = ReadLane::new(NetworkReadClass::WalletBalance);
+        let startup = ReadLane::new(NetworkReadClass::StartupPoolHydration);
         let quoter = ReadLane::new(NetworkReadClass::QuoterParity);
         assert!(!Arc::ptr_eq(&gap.semaphore, &wallet.semaphore));
         assert!(!Arc::ptr_eq(&wallet.semaphore, &quoter.semaphore));
         assert_eq!(gap.policy.chunk_size, 100);
         assert_eq!(wallet.policy.chunk_size, 100);
+        assert_eq!(startup.policy.chunk_size, 5);
         assert_eq!(quoter.policy.chunk_size, 20);
         assert!(gap.policy.max_queued > 0);
         assert!(wallet.policy.max_queued > 0);
