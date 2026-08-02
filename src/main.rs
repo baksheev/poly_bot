@@ -3338,6 +3338,7 @@ async fn run(
                     esp_pair.id.clone(),
                     LivePairPolicy {
                         journal_scope: esp_journal_scope,
+                        binance_base_decimals: esp_pair.token_b.decimals,
                         maximum_trade_notional_token_a_base_units: parse_live_amount(
                             full_live_sizing.max_trade_notional,
                             "maximum trade notional",

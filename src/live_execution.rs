@@ -1102,6 +1102,7 @@ pub struct LiveRiskLimits {
 #[derive(Clone, Debug)]
 pub struct LivePairPolicy {
     pub journal_scope: TradeJournalScope,
+    pub binance_base_decimals: u8,
     pub maximum_trade_notional_token_a_base_units: u128,
     pub maximum_unhedged_notional_token_a_base_units: u128,
     pub maximum_realized_loss_token_a_base_units: u128,
@@ -1113,6 +1114,19 @@ pub struct LivePairPolicy {
 impl LivePairPolicy {
     fn validate(&self, pair_id: &str) -> anyhow::Result<()> {
         self.journal_scope.validate()?;
+        ensure!(
+            !self.journal_scope.symbol.is_empty()
+                && self
+                    .journal_scope
+                    .symbol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+            "live pair {pair_id} Binance symbol is invalid"
+        );
+        ensure!(
+            self.binance_base_decimals <= 28,
+            "live pair {pair_id} Binance base decimals exceed Decimal precision"
+        );
         ensure!(
             self.maximum_trade_notional_token_a_base_units > 0
                 && self.maximum_unhedged_notional_token_a_base_units
@@ -1158,6 +1172,28 @@ impl LiveRiskLimits {
             );
         }
         Ok(())
+    }
+
+    fn binance_market_for_intent(&self, intent: &TradeIntent) -> anyhow::Result<(&str, u8)> {
+        if let Some(policy) = self.pair_policies.get(&intent.pair_id) {
+            if let Some(journal_scope) = &intent.journal_scope {
+                ensure!(
+                    journal_scope == &policy.journal_scope,
+                    "live pair intent journal scope does not match its configured policy"
+                );
+            }
+            return Ok((
+                policy.journal_scope.symbol.as_str(),
+                policy.binance_base_decimals,
+            ));
+        }
+        if let Some(journal_scope) = &intent.journal_scope {
+            ensure!(
+                journal_scope == &self.journal_scope,
+                "primary live intent journal scope does not match the configured scope"
+            );
+        }
+        Ok((&self.binance_symbol, self.binance_base_decimals))
     }
 }
 
@@ -1694,7 +1730,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
     }
 
     fn prepare_primary_cex_limit_price(&mut self, plan_id: &str) -> anyhow::Result<()> {
-        let Some((direction, admission_price, client_order_id, target_base_units)) =
+        let Some((pair_id, direction, admission_price, client_order_id, target_base_units)) =
             self.coordinator.operation(plan_id).and_then(|operation| {
                 if operation.intent.mode != ExecutionMode::DexFirst
                     || operation.cex_dispatched
@@ -1710,6 +1746,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 }
                 let bounds = operation.intent.admission.as_ref()?;
                 Some((
+                    operation.intent.pair_id.clone(),
                     operation.intent.direction,
                     bounds.cex_primary_limit_price,
                     operation.intent.cex_client_order_id.clone(),
@@ -1719,13 +1756,23 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         else {
             return Ok(());
         };
-        let target_quantity =
-            decimal_from_base_units(target_base_units, self.risk_limits.binance_base_decimals)?;
+        let operation = self
+            .coordinator
+            .operation(plan_id)
+            .context("live operation disappeared before primary CEX price selection")?;
+        ensure!(
+            operation.intent.pair_id == pair_id,
+            "live operation pair changed before primary CEX price selection"
+        );
+        let (binance_symbol, binance_base_decimals) = self
+            .risk_limits
+            .binance_market_for_intent(&operation.intent)?;
+        let target_quantity = decimal_from_base_units(target_base_units, binance_base_decimals)?;
         let selection = self
             .risk_limits
             .entry_preflight
             .favorable_primary_limit_price(
-                &self.risk_limits.binance_symbol,
+                binance_symbol,
                 direction,
                 admission_price,
                 target_quantity,
@@ -1741,7 +1788,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 "operation_id": client_order_id,
                 "client_order_id": client_order_id,
                 "role": "cex",
-                "symbol": self.risk_limits.binance_symbol,
+                "symbol": binance_symbol,
                 "direction": match direction {
                     crate::arbitrage::ArbitrageDirection::BuyTokenBOnDexSellOnCex => "sell",
                     crate::arbitrage::ArbitrageDirection::BuyTokenBOnCexSellOnDex => "buy",
@@ -2548,6 +2595,106 @@ mod tests {
     }
 
     #[test]
+    fn post_dex_primary_price_uses_the_plan_pair_binance_market() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-pair-primary-price-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+
+        let preflight = EntryPreflightHandle::default();
+        preflight.update_quote(&preflight_quote(
+            Decimal::new(31_800, 5),
+            Decimal::new(31_820, 5),
+            8,
+        ));
+        preflight.configure_max_transport_silence("WLDUSDC", 30_000);
+        let mut esp_quote = preflight_quote(Decimal::new(7_380, 5), Decimal::new(7_390, 5), 9);
+        esp_quote.symbol = Arc::from("ESPUSDC");
+        preflight.update_quote(&esp_quote);
+        preflight.configure_max_transport_silence("ESPUSDC", 30_000);
+
+        let esp_scope = TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-account-main".to_owned(),
+            network_id: "arbitrum-one".to_owned(),
+            chain_id: 42_161,
+            wallet_id: "arbitrum-one:wallet-primary".to_owned(),
+            strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
+            symbol: "ESPUSDC".to_owned(),
+        };
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "pair-primary-price-test-engine".to_owned(),
+            LiveRiskLimits {
+                entry_stop_file: stop_file,
+                entry_preflight: preflight,
+                binance_symbol: "WLDUSDC".to_owned(),
+                binance_base_decimals: 18,
+                journal_scope: scope(),
+                pair_policies: BTreeMap::from([(
+                    "arbitrum-usdc-esp".to_owned(),
+                    LivePairPolicy {
+                        journal_scope: esp_scope.clone(),
+                        binance_base_decimals: 18,
+                        maximum_trade_notional_token_a_base_units: 200_000_000,
+                        maximum_unhedged_notional_token_a_base_units: 220_000_000,
+                        maximum_realized_loss_token_a_base_units: 2_000_000,
+                        maximum_concurrent_trades: 1,
+                        readiness: Arc::new(AtomicBool::new(true)),
+                        market_data_readiness: Arc::new(AtomicBool::new(true)),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        let mut esp = opportunity();
+        esp.pair_id = "arbitrum-usdc-esp".to_owned();
+        esp.symbol = "ESPUSDC".to_owned();
+        esp.token_b_base_units = 1_000_000_000_000_000_000;
+        esp.token_b_step_base_units = 1_000_000_000_000_000;
+        esp.admission.cex_primary_limit_price = Decimal::new(7_000, 5);
+        let mut intent = esp.intent(ExecutionMode::DexFirst);
+        intent.journal_scope = Some(esp_scope);
+        let plan_id = intent.plan_id.clone();
+        task.coordinator.admit(intent).unwrap();
+        task.coordinator.take_commands(&plan_id).unwrap();
+        task.coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                result(
+                    1_000_000_000_000_000_000,
+                    -1_000,
+                    1,
+                    "dex:pair-specific-price",
+                ),
+            )
+            .unwrap();
+
+        task.prepare_primary_cex_limit_price(&plan_id).unwrap();
+
+        assert_eq!(
+            task.coordinator
+                .operation(&plan_id)
+                .unwrap()
+                .cex_execution_limit_price,
+            Some(Decimal::new(7_380, 5))
+        );
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[test]
     fn post_dex_primary_price_keeps_admission_boundary_when_favorable_top_is_thin() {
         let handle = default_preflight();
         handle.update_quote(&preflight_quote_with_quantities(
@@ -2889,6 +3036,7 @@ mod tests {
     fn full_live_policy_keeps_per_parent_and_single_concurrency_envelopes() {
         let policy = LivePairPolicy {
             journal_scope: scope(),
+            binance_base_decimals: 18,
             maximum_trade_notional_token_a_base_units: 200_000_000,
             maximum_unhedged_notional_token_a_base_units: 220_000_000,
             maximum_realized_loss_token_a_base_units: 2_000_000,
@@ -2901,6 +3049,10 @@ mod tests {
         let mut missing_trade_cap = policy.clone();
         missing_trade_cap.maximum_trade_notional_token_a_base_units = 0;
         assert!(missing_trade_cap.validate("arbitrum-usdc-esp").is_err());
+
+        let mut invalid_decimals = policy.clone();
+        invalid_decimals.binance_base_decimals = 29;
+        assert!(invalid_decimals.validate("arbitrum-usdc-esp").is_err());
 
         let mut concurrent = policy;
         concurrent.maximum_concurrent_trades = 2;
@@ -2966,6 +3118,7 @@ mod tests {
                     esp_opportunity.pair_id.clone(),
                     LivePairPolicy {
                         journal_scope: esp_scope.clone(),
+                        binance_base_decimals: 18,
                         maximum_trade_notional_token_a_base_units: 10_000_000,
                         maximum_unhedged_notional_token_a_base_units: 10_000_000,
                         maximum_realized_loss_token_a_base_units: 1_000_000,
@@ -3063,6 +3216,7 @@ mod tests {
                     esp_opportunity.pair_id.clone(),
                     LivePairPolicy {
                         journal_scope: esp_scope.clone(),
+                        binance_base_decimals: 18,
                         maximum_trade_notional_token_a_base_units: 10_000_000,
                         maximum_unhedged_notional_token_a_base_units: 10_000_000,
                         maximum_realized_loss_token_a_base_units: 1_000_000,
@@ -3327,6 +3481,7 @@ mod tests {
                     esp.pair_id.clone(),
                     LivePairPolicy {
                         journal_scope: esp_scope,
+                        binance_base_decimals: 18,
                         maximum_trade_notional_token_a_base_units: 10_000_000,
                         maximum_unhedged_notional_token_a_base_units: 10_000_000,
                         maximum_realized_loss_token_a_base_units: 1_000_000,
