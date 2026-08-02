@@ -69,6 +69,49 @@ recovery change.
 Removing the entry-stop file is a new-entry authorization. Do it only after
 venue and journal reconciliation.
 
+### Historical `dex:expired-plan` operator recovery
+
+The dedicated command is only for the legacy false-terminal shape where the
+trade journal says `dex:expired-plan`, while the exact EVM transaction journal
+and chain prove that the DEX swap filled. It refuses every other terminal
+shape. Run it only as a reviewed one-shot recovery owner with the production
+Deployment stopped and the same persistent journals mounted; the normal Pod
+and the recovery command must never hold the wallet, Binance account, nonce, or
+journal concurrently.
+
+Keep `/var/lib/arb-bot/arbitrage-entry.stop` present. First run the complete
+read-only proof:
+
+```bash
+arb_bot arbitrage-record-operator-recovery \
+  --plan-id PLAN_ID \
+  --dex-transaction-hash 0xTRANSACTION_HASH \
+  --wallet-journal-path /var/lib/arb-bot/arbitrum-wallet-transactions.jsonl \
+  --order-journal-path /var/lib/arb-bot/arbitrage-binance-orders.jsonl \
+  --mode dry-run \
+  --maximum-quote-usdc 250
+```
+
+The dry run rebuilds the exact calldata, reconciles only the already-journaled
+receipt, fetches the current same-side Binance top, checks the primary and `r1`
+client IDs once, and prints the immutable MARKET target. It cannot sign or
+broadcast a DEX transaction and cannot place a Binance order.
+
+After reviewing that evidence, repeat with `--mode execute` and
+`ARBITRAGE_OPERATOR_RECOVERY_CONFIRMATION=RECORD_LIVE_ARBITRAGE_OPERATOR_RECOVERY`.
+Execute either adopts the same deterministic terminal Binance order already
+found at the venue or, only when both IDs are proven absent, records the intent
+and places one exact-quantity MARKET order through the normal Binance execution
+owner. The command then appends the chain fill, Binance fill, actor, timestamp,
+and venue IDs to the trade journal and recomputes the terminal result. A filled
+order remains authoritative even if realized slippage exceeds the pre-placement
+quote cap; the command records it and emits an error instead of recreating an
+unknown exposure.
+
+Restart the Deployment through the reviewed recovery workflow, verify that the
+strategy quarantine is clear and balances are synchronized, and only then
+remove the entry stop. Never hand-edit or replace any journal.
+
 ## Canary and 100-trade run
 
 For the first composed live canary, enable `full_live`, wait for one terminal

@@ -22,8 +22,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
 use crate::{
-    chain::logs::ChainLog, dex::clmm::PreparedQuoteCurve, execution_plan::DexSwapPlan,
-    state::TopOfBook, telemetry::TelemetryHandle,
+    binance::order_plan::recovery_client_order_id, chain::logs::ChainLog,
+    dex::clmm::PreparedQuoteCurve, execution_plan::DexSwapPlan, state::TopOfBook,
+    telemetry::TelemetryHandle,
 };
 
 const JOURNAL_VERSION: u16 = 1;
@@ -463,6 +464,46 @@ pub struct TradeOperation {
     pub recovery_retry_not_before_unix_ms: Option<u64>,
     pub result: Option<ArbitrageResult>,
     pub blocking_reason: Option<String>,
+    /// Auditable one-shot repair of a historically false terminal state.
+    /// Normal runtime recovery never sets this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_recovery: Option<OperatorRecoveryEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperatorRecoveryEvidence {
+    pub actor: String,
+    pub recovered_at_unix_ms: u64,
+    pub dex_transaction_hash: String,
+    pub binance_order_id: u64,
+    pub binance_client_order_id: String,
+}
+
+impl OperatorRecoveryEvidence {
+    fn validate(&self) -> anyhow::Result<()> {
+        validate_id("operator recovery actor", &self.actor, 96)?;
+        ensure!(
+            self.recovered_at_unix_ms > 0,
+            "operator recovery timestamp is zero"
+        );
+        ensure!(
+            self.dex_transaction_hash.starts_with("0x")
+                && self.dex_transaction_hash.len() == 66
+                && self.dex_transaction_hash[2..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "operator recovery DEX transaction hash is invalid"
+        );
+        ensure!(
+            self.binance_order_id > 0,
+            "operator recovery Binance order id is zero"
+        );
+        validate_id(
+            "operator recovery Binance client order id",
+            &self.binance_client_order_id,
+            36,
+        )
+    }
 }
 
 impl TradeOperation {
@@ -481,6 +522,7 @@ impl TradeOperation {
             recovery_retry_not_before_unix_ms: None,
             result: None,
             blocking_reason: None,
+            operator_recovery: None,
         }
     }
 
@@ -722,6 +764,9 @@ pub enum CoordinatorCommand {
         operation_id: String,
         expected_token_b_delta_base_units: i128,
         plan: Option<Box<DexSwapPlan>>,
+        /// This command may only reconcile an exact existing transaction
+        /// journal entry and can never authorize a new DEX submission.
+        reconciliation_only: bool,
     },
     DispatchCex {
         client_order_id: String,
@@ -1913,6 +1958,12 @@ impl PaperTradeCoordinator {
                         operation.stage,
                         TradeStage::BalancedLoss | TradeStage::UnknownExposure | TradeStage::Halted
                     )));
+            risk.unresolved_exposure_count =
+                risk.unresolved_exposure_count
+                    .saturating_add(usize::from(matches!(
+                        operation.stage,
+                        TradeStage::UnknownExposure | TradeStage::Halted
+                    )));
             let admitted_notional = operation
                 .intent
                 .expected_cost_token_a_base_units
@@ -1948,11 +1999,21 @@ impl PaperTradeCoordinator {
         Ok(risk)
     }
 
+    pub fn unresolved_exposure_count(&self, strategy_id: &str) -> usize {
+        self.journal.unresolved_exposure_count(strategy_id)
+    }
+
     /// Reconstructs only a command whose dispatch ownership was already
     /// persisted before a restart. It never advances coordinator state.
     pub fn resume_command(&self, plan_id: &str) -> anyhow::Result<Option<CoordinatorCommand>> {
         let operation = self.journal.operation(plan_id)?;
         if operation.dex_dispatched && operation.dex_result.is_none() {
+            let now_unix_seconds = unix_timestamp_ms()? / 1_000;
+            let reconciliation_only = operation
+                .intent
+                .dex_plan
+                .as_ref()
+                .is_some_and(|plan| plan.deadline_unix_seconds <= now_unix_seconds);
             return Ok(Some(CoordinatorCommand::DispatchDex {
                 operation_id: operation.intent.dex_operation_id.clone(),
                 expected_token_b_delta_base_units: operation
@@ -1960,6 +2021,7 @@ impl PaperTradeCoordinator {
                     .direction
                     .dex_token_b_delta(operation.intent.planned_token_b_base_units),
                 plan: operation.intent.dex_plan.clone().map(Box::new),
+                reconciliation_only,
             }));
         }
         if operation.cex_dispatched && operation.cex_result.is_none() {
@@ -2024,6 +2086,7 @@ impl PaperTradeCoordinator {
                 .direction
                 .dex_token_b_delta(operation.intent.planned_token_b_base_units),
             plan: operation.intent.dex_plan.clone().map(Box::new),
+            reconciliation_only: true,
         }))
     }
 
@@ -2166,6 +2229,7 @@ impl PaperTradeCoordinator {
                     .direction
                     .dex_token_b_delta(operation.intent.planned_token_b_base_units),
                 plan: operation.intent.dex_plan.clone().map(Box::new),
+                reconciliation_only: false,
             });
             if operation.intent.mode == ExecutionMode::ConcurrentHedged {
                 operation.cex_dispatched = true;
@@ -2330,7 +2394,13 @@ impl PaperTradeCoordinator {
             "trade is not waiting for unknown-outcome reconciliation"
         );
         match role {
-            LegRole::Dex => replace_unknown(&mut operation.dex_result, result)?,
+            LegRole::Dex => {
+                ensure!(
+                    result.status != LegStatus::Failed || dex_failure_proves_zero_exposure(&result),
+                    "DEX reconciliation failure does not prove a terminal zero-exposure outcome"
+                );
+                replace_unknown(&mut operation.dex_result, result)?;
+            }
             LegRole::Cex => replace_unknown(&mut operation.cex_result, result)?,
             LegRole::RecoveryCex => {
                 let current = operation
@@ -2353,6 +2423,87 @@ impl PaperTradeCoordinator {
         operation.blocking_reason = None;
         self.journal.append(operation)
     }
+
+    /// Repairs only the historical false-terminal shape produced when a
+    /// journaled DEX broadcast was mislabeled `dex:expired-plan`. The caller
+    /// must provide venue-accounted DEX and Binance fills; this method never
+    /// performs or authorizes an external mutation.
+    pub fn record_operator_recovery(
+        &mut self,
+        plan_id: &str,
+        dex_result: LegResult,
+        recovery_result: LegResult,
+        evidence: OperatorRecoveryEvidence,
+    ) -> anyhow::Result<()> {
+        dex_result.validate()?;
+        recovery_result.validate()?;
+        evidence.validate()?;
+        ensure!(
+            dex_result.status == LegStatus::Filled,
+            "operator recovery DEX result is not filled"
+        );
+        ensure!(
+            recovery_result.status == LegStatus::Filled,
+            "operator recovery Binance result is not filled"
+        );
+        ensure!(
+            dex_result.venue_reference == format!("dex:{}", evidence.dex_transaction_hash),
+            "operator recovery DEX result does not match its transaction evidence"
+        );
+        ensure!(
+            recovery_result.venue_reference == format!("cex:{}", evidence.binance_order_id),
+            "operator recovery Binance result does not match its order evidence"
+        );
+        let mut operation = self.journal.operation(plan_id)?.clone();
+        ensure!(
+            operation.operator_recovery.is_none(),
+            "trade already has an operator recovery"
+        );
+        ensure!(
+            operation.intent.mode == ExecutionMode::DexFirst
+                && operation.dex_dispatched
+                && !operation.cex_dispatched
+                && operation.cex_result.is_none()
+                && operation.recovery_results.is_empty()
+                && !operation.recovery_inflight,
+            "trade is not the supported DEX-only operator recovery shape"
+        );
+        ensure!(
+            operation.stage.terminal()
+                && operation.dex_result.as_ref().is_some_and(|result| {
+                    result.status == LegStatus::Failed
+                        && result.venue_reference == "dex:expired-plan"
+                }),
+            "trade is not the historical false-terminal expired-plan shape"
+        );
+        ensure!(
+            (1..=MAX_RECOVERY_ATTEMPTS).any(|attempt| {
+                recovery_client_order_id(&operation.intent.cex_client_order_id, attempt)
+                    .is_ok_and(|candidate| candidate == evidence.binance_client_order_id)
+            }),
+            "operator recovery Binance client id is not deterministic"
+        );
+        ensure!(
+            dex_result.token_b_delta_base_units != 0
+                && recovery_result.token_b_delta_base_units
+                    == dex_result.token_b_delta_base_units.saturating_neg(),
+            "operator recovery does not exactly neutralize the DEX token-B delta"
+        );
+        operation.dex_result = Some(dex_result);
+        operation.recovery_target_token_b_delta_base_units =
+            Some(recovery_result.token_b_delta_base_units);
+        operation.recovery_results.push(recovery_result);
+        operation.result = None;
+        operation.stage = TradeStage::Recovering;
+        operation.blocking_reason = None;
+        operation.operator_recovery = Some(evidence);
+        finalize_balanced(&mut operation)?;
+        ensure!(
+            operation.token_b_residual_base_units() == 0,
+            "operator recovery left a token-B residual"
+        );
+        self.journal.append(operation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2360,6 +2511,7 @@ pub struct StrategyJournalRisk {
     pub admitted_parent_count: usize,
     pub active_parent_count: usize,
     pub failed_parent_count: usize,
+    pub unresolved_exposure_count: usize,
     pub admitted_notional_token_a_base_units: u128,
     pub realized_loss_token_a_base_units: u128,
     pub first_admitted_unix_us: Option<u64>,
@@ -2393,6 +2545,12 @@ fn recovery_failure_is_retryable(result: &LegResult) -> bool {
         ) || result.venue_reference.starts_with("cex:market-zero-fill:"))
 }
 
+fn dex_failure_proves_zero_exposure(result: &LegResult) -> bool {
+    result.status == LegStatus::Failed
+        && (result.venue_reference == "dex:unsubmitted"
+            || result.venue_reference.ends_with(":reverted"))
+}
+
 fn recovery_retry_delay_ms(completed_attempts: usize) -> anyhow::Result<u64> {
     ensure!(
         (1..MAX_RECOVERY_ATTEMPTS).contains(&completed_attempts),
@@ -2423,6 +2581,32 @@ fn refresh_recovery_retry_deadline(operation: &mut TradeOperation) -> anyhow::Re
 }
 
 fn finalize_balanced(operation: &mut TradeOperation) -> anyhow::Result<()> {
+    ensure!(
+        !operation.has_unknown_leg(),
+        "trade with an unknown venue outcome cannot be finalized as balanced"
+    );
+    ensure!(
+        !operation.dex_dispatched || operation.dex_result.is_some(),
+        "trade with a dispatched DEX leg has no terminal result"
+    );
+    ensure!(
+        !operation.cex_dispatched || operation.cex_result.is_some(),
+        "trade with a dispatched CEX leg has no terminal result"
+    );
+    ensure!(
+        !operation.recovery_inflight,
+        "trade with an inflight recovery cannot be finalized as balanced"
+    );
+    if let Some(dex) = operation
+        .dex_result
+        .as_ref()
+        .filter(|result| result.status == LegStatus::Failed)
+    {
+        ensure!(
+            dex_failure_proves_zero_exposure(dex),
+            "failed DEX leg does not prove a terminal zero-exposure outcome"
+        );
+    }
     let (realized_profit, gas) = operation.realized_profit_token_a_base_units();
     let recovery_token_a = operation
         .recovery_results
@@ -2488,6 +2672,7 @@ fn residual_value_token_a_base_units(operation: &TradeOperation) -> anyhow::Resu
 struct TradeJournal {
     file: File,
     operations: BTreeMap<String, TradeOperation>,
+    unresolved_by_strategy: BTreeMap<String, usize>,
     next_sequence: u64,
     poisoned: bool,
 }
@@ -2568,9 +2753,11 @@ impl TradeJournal {
                 .checked_add(1)
                 .context("trade journal sequence overflow")?;
         }
+        let unresolved_by_strategy = unresolved_strategy_index(&operations);
         Ok(Self {
             file,
             operations,
+            unresolved_by_strategy,
             next_sequence: expected_sequence,
             poisoned: false,
         })
@@ -2594,6 +2781,13 @@ impl TradeJournal {
             .collect()
     }
 
+    fn unresolved_exposure_count(&self, strategy_id: &str) -> usize {
+        self.unresolved_by_strategy
+            .get(strategy_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn record_intent(&mut self, intent: TradeIntent) -> anyhow::Result<()> {
         ensure!(
             !self.operations.contains_key(&intent.plan_id),
@@ -2613,6 +2807,12 @@ impl TradeJournal {
         };
         let mut next = self.operations.clone();
         apply_snapshot(&mut next, &payload.operation)?;
+        let mut next_unresolved_by_strategy = self.unresolved_by_strategy.clone();
+        update_unresolved_strategy_index(
+            &mut next_unresolved_by_strategy,
+            self.operations.get(&payload.operation.intent.plan_id),
+            &payload.operation,
+        );
         let record = WireRecord::new(payload)?;
         let mut encoded = serde_json::to_vec(&record).context("failed to encode trade journal")?;
         ensure!(
@@ -2628,6 +2828,7 @@ impl TradeJournal {
             self.poisoned = true;
             return Err(error).context("failed to durably append trade journal record");
         }
+        self.unresolved_by_strategy = next_unresolved_by_strategy;
         self.operations = next;
         self.next_sequence = self
             .next_sequence
@@ -2635,6 +2836,58 @@ impl TradeJournal {
             .context("trade journal sequence overflow")?;
         Ok(())
     }
+}
+
+fn unresolved_strategy_index(
+    operations: &BTreeMap<String, TradeOperation>,
+) -> BTreeMap<String, usize> {
+    let mut index = BTreeMap::new();
+    for operation in operations.values().filter(|operation| {
+        matches!(
+            operation.stage,
+            TradeStage::UnknownExposure | TradeStage::Halted
+        )
+    }) {
+        if let Some(scope) = &operation.intent.journal_scope {
+            let count = index.entry(scope.strategy_id.clone()).or_insert(0_usize);
+            *count = count.saturating_add(1);
+        }
+    }
+    index
+}
+
+fn update_unresolved_strategy_index(
+    index: &mut BTreeMap<String, usize>,
+    previous: Option<&TradeOperation>,
+    next: &TradeOperation,
+) {
+    if let Some(strategy_id) = previous.and_then(unresolved_strategy_id)
+        && let Some(count) = index.get_mut(strategy_id)
+    {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            index.remove(strategy_id);
+        }
+    }
+    if let Some(strategy_id) = unresolved_strategy_id(next) {
+        let count = index.entry(strategy_id.to_owned()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+}
+
+fn unresolved_strategy_id(operation: &TradeOperation) -> Option<&str> {
+    matches!(
+        operation.stage,
+        TradeStage::UnknownExposure | TradeStage::Halted
+    )
+    .then(|| {
+        operation
+            .intent
+            .journal_scope
+            .as_ref()
+            .map(|scope| scope.strategy_id.as_str())
+    })
+    .flatten()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2675,13 +2928,19 @@ fn apply_snapshot(
 ) -> anyhow::Result<()> {
     validate_operation(operation)?;
     if let Some(previous) = operations.get(&operation.intent.plan_id) {
+        let operator_terminal_correction =
+            operator_terminal_correction_allowed(previous, operation);
         ensure!(
             previous.intent == operation.intent,
             "trade journal intent changed"
         );
-        ensure!(!previous.stage.terminal(), "trade is already terminal");
         ensure!(
-            stage_transition_allowed(&previous.stage, &operation.stage),
+            !previous.stage.terminal() || operator_terminal_correction,
+            "trade is already terminal"
+        );
+        ensure!(
+            operator_terminal_correction
+                || stage_transition_allowed(&previous.stage, &operation.stage),
             "illegal parent trade stage transition"
         );
         ensure!(
@@ -2704,7 +2963,8 @@ fn apply_snapshot(
             "selected recovery target changed"
         );
         ensure!(
-            result_is_unchanged_or_reconciled(&previous.dex_result, &operation.dex_result),
+            operator_terminal_correction
+                || result_is_unchanged_or_reconciled(&previous.dex_result, &operation.dex_result),
             "DEX result changed without unknown-outcome reconciliation"
         );
         ensure!(
@@ -2718,6 +2978,11 @@ fn apply_snapshot(
             ),
             "recovery results changed"
         );
+        ensure!(
+            previous.operator_recovery.is_none()
+                || previous.operator_recovery == operation.operator_recovery,
+            "operator recovery evidence changed"
+        );
     } else {
         ensure!(
             operation.stage == TradeStage::Prepared,
@@ -2726,6 +2991,32 @@ fn apply_snapshot(
     }
     operations.insert(operation.intent.plan_id.clone(), operation.clone());
     Ok(())
+}
+
+fn operator_terminal_correction_allowed(previous: &TradeOperation, next: &TradeOperation) -> bool {
+    previous.stage.terminal()
+        && previous.operator_recovery.is_none()
+        && next.operator_recovery.is_some()
+        && previous.dex_dispatched
+        && !previous.cex_dispatched
+        && previous.cex_result.is_none()
+        && next.cex_result.is_none()
+        && previous.recovery_results.is_empty()
+        && next.recovery_results.len() == 1
+        && previous.dex_result.as_ref().is_some_and(|result| {
+            result.status == LegStatus::Failed && result.venue_reference == "dex:expired-plan"
+        })
+        && next
+            .dex_result
+            .as_ref()
+            .is_some_and(|result| result.status == LegStatus::Filled)
+        && next
+            .recovery_results
+            .first()
+            .is_some_and(|result| result.status == LegStatus::Filled)
+        && next.stage.terminal()
+        && next.result.is_some()
+        && next.token_b_residual_base_units() == 0
 }
 
 fn stage_transition_allowed(previous: &TradeStage, next: &TradeStage) -> bool {
@@ -2827,6 +3118,43 @@ fn validate_operation(operation: &TradeOperation) -> anyhow::Result<()> {
     if let Some(reason) = &operation.blocking_reason {
         validate_id("blocking reason", reason, 256)?;
     }
+    if let Some(evidence) = &operation.operator_recovery {
+        evidence.validate()?;
+        let dex = operation
+            .dex_result
+            .as_ref()
+            .context("operator recovery has no DEX result")?;
+        let recovery = operation
+            .recovery_results
+            .first()
+            .context("operator recovery has no Binance result")?;
+        ensure!(
+            operation.stage.terminal()
+                && operation.result.is_some()
+                && operation.recovery_results.len() == 1
+                && operation.token_b_residual_base_units() == 0,
+            "operator recovery is not terminal and balanced"
+        );
+        ensure!(
+            dex.status == LegStatus::Filled
+                && dex.venue_reference == format!("dex:{}", evidence.dex_transaction_hash),
+            "operator recovery DEX evidence mismatch"
+        );
+        ensure!(
+            recovery.status == LegStatus::Filled
+                && recovery.venue_reference == format!("cex:{}", evidence.binance_order_id)
+                && recovery.token_b_delta_base_units
+                    == dex.token_b_delta_base_units.saturating_neg(),
+            "operator recovery Binance evidence mismatch"
+        );
+        ensure!(
+            (1..=MAX_RECOVERY_ATTEMPTS).any(|attempt| {
+                recovery_client_order_id(&operation.intent.cex_client_order_id, attempt)
+                    .is_ok_and(|candidate| candidate == evidence.binance_client_order_id)
+            }),
+            "operator recovery client id is not deterministic"
+        );
+    }
     Ok(())
 }
 
@@ -2901,10 +3229,11 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        ArbitrageDirection, CoordinatorCommand, ExecutionLaneState, ExecutionMode, LegResult,
-        LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS, PaperTradeCoordinator,
-        RECOVERY_RETRY_BASE_DELAY_MS, TerminalOutcome, TradeIntent, TradeJournalScope, TradeStage,
-        initial_execution_lane, meets_spread_threshold, token_b_at_price_in_token_a_base_units,
+        ArbitrageDirection, ArbitrageResult, CoordinatorCommand, ExecutionLaneState, ExecutionMode,
+        LegResult, LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS, OperatorRecoveryEvidence,
+        PaperTradeCoordinator, RECOVERY_RETRY_BASE_DELAY_MS, TerminalOutcome, TradeIntent,
+        TradeJournalScope, TradeStage, initial_execution_lane, meets_spread_threshold,
+        recovery_client_order_id, token_b_at_price_in_token_a_base_units,
     };
 
     fn path(name: &str) -> std::path::PathBuf {
@@ -3731,6 +4060,41 @@ mod tests {
     }
 
     #[test]
+    fn expired_restart_dispatch_becomes_read_only_journal_reconciliation() {
+        let path = path("expired-restart-dispatch");
+        let _ = fs::remove_file(&path);
+        let mut trade_intent = intent(ExecutionMode::DexFirst);
+        trade_intent.dex_plan = Some(crate::execution_plan::DexSwapPlan {
+            route: crate::execution_plan::DexRoutePlan::UniswapV3 {
+                router: "0x1111111111111111111111111111111111111111".to_owned(),
+                pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+                fee_pips: 3_000,
+            },
+            token_in: "0x3333333333333333333333333333333333333333".to_owned(),
+            token_out: "0x4444444444444444444444444444444444444444".to_owned(),
+            amount_in_base_units: 1_000,
+            amount_out_minimum_base_units: 100,
+            deadline_unix_seconds: 1,
+        });
+        let plan_id = trade_intent.plan_id.clone();
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        drop(coordinator);
+
+        let recovered = PaperTradeCoordinator::open(&path).unwrap();
+        assert!(matches!(
+            recovered.resume_command(&plan_id).unwrap(),
+            Some(CoordinatorCommand::DispatchDex {
+                reconciliation_only: true,
+                ..
+            })
+        ));
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn concurrent_overhedge_uses_buy_market_recovery_across_restart() {
         let path = path("concurrent-overhedge");
         let _ = fs::remove_file(&path);
@@ -3869,6 +4233,7 @@ mod tests {
                 .unwrap(),
             Some(CoordinatorCommand::DispatchDex {
                 expected_token_b_delta_base_units: 100,
+                reconciliation_only: true,
                 ..
             })
         ));
@@ -3912,7 +4277,7 @@ mod tests {
                     third_asset_deltas: BTreeMap::new(),
                     third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 4,
-                    venue_reference: "dex:reconciled-revert".to_owned(),
+                    venue_reference: "dex:0x1:reverted".to_owned(),
                     dex_settlement_log: None,
                 },
             )
@@ -3927,6 +4292,138 @@ mod tests {
         assert_eq!(
             recovered.operation(&plan_id).unwrap().stage,
             TradeStage::BalancedLoss
+        );
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unknown_dex_cannot_be_reconciled_to_an_unproven_local_failure() {
+        let path = path("unknown-dex-local-failure");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let trade_intent = intent(ExecutionMode::DexFirst);
+        let plan_id = trade_intent.plan_id.clone();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                LegResult {
+                    status: LegStatus::Unknown,
+                    executed_token_b_delta_base_units: None,
+                    token_b_delta_base_units: 0,
+                    token_a_delta_base_units: 0,
+                    third_asset_deltas: BTreeMap::new(),
+                    third_asset_prices_token_a: BTreeMap::new(),
+                    gas_cost_token_a_base_units: 0,
+                    venue_reference: "dex:child-unknown".to_owned(),
+                    dex_settlement_log: None,
+                },
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+
+        let error = coordinator
+            .reconcile_unknown(&plan_id, LegRole::Dex, failed("dex:expired-plan"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not prove"));
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, TradeStage::UnknownExposure);
+        assert!(operation.result.is_none());
+        assert_eq!(
+            operation.dex_result.as_ref().unwrap().status,
+            LegStatus::Unknown
+        );
+        drop(coordinator);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn operator_recovery_repairs_only_the_historical_expired_plan_terminal_shape() {
+        let path = path("operator-recovery-expired-plan");
+        let _ = fs::remove_file(&path);
+        let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        let mut trade_intent = intent(ExecutionMode::DexFirst);
+        trade_intent.cex_client_order_id = "rustarb9081d1601ac09a4f2fc5168bcs".to_owned();
+        let plan_id = trade_intent.plan_id.clone();
+        let recovery_client_id =
+            recovery_client_order_id(&trade_intent.cex_client_order_id, 1).unwrap();
+        coordinator.admit(trade_intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(&plan_id, LegRole::Dex, failed("dex:expired-plan"))
+            .unwrap();
+
+        // Exact legacy snapshot written by the pre-fix coordinator. New code
+        // cannot produce this state through take_commands/finalize_balanced.
+        let mut legacy = coordinator.operation(&plan_id).unwrap().clone();
+        legacy.stage = TradeStage::BalancedProfit;
+        legacy.result = Some(ArbitrageResult {
+            expected_profit_token_a_base_units: 30,
+            realized_profit_token_a_base_units: 0,
+            residual_value_token_a_base_units: 0,
+            comparable_profit_token_a_base_units: 0,
+            token_b_residual_base_units: 0,
+            gas_cost_token_a_base_units: 0,
+            recovery_loss_token_a_base_units: 0,
+            outcome: TerminalOutcome::BalancedProfit,
+        });
+        coordinator.journal.append(legacy).unwrap();
+
+        let transaction_hash = format!("0x{}", "42".repeat(32));
+        coordinator
+            .record_operator_recovery(
+                &plan_id,
+                filled(100, -1_000, &format!("dex:{transaction_hash}")),
+                filled(-100, 990, "cex:42"),
+                OperatorRecoveryEvidence {
+                    actor: "operator".to_owned(),
+                    recovered_at_unix_ms: 1_785_636_500_000,
+                    dex_transaction_hash: transaction_hash.clone(),
+                    binance_order_id: 42,
+                    binance_client_order_id: recovery_client_id.clone(),
+                },
+            )
+            .unwrap();
+
+        let operation = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.stage, TradeStage::BalancedLoss);
+        assert_eq!(operation.token_b_residual_base_units(), 0);
+        assert_eq!(
+            operation
+                .result
+                .as_ref()
+                .unwrap()
+                .realized_profit_token_a_base_units,
+            -10
+        );
+        assert_eq!(
+            operation
+                .operator_recovery
+                .as_ref()
+                .unwrap()
+                .binance_client_order_id,
+            recovery_client_id
+        );
+        drop(coordinator);
+
+        let recovered = PaperTradeCoordinator::open(&path).unwrap();
+        assert_eq!(
+            recovered.operation(&plan_id).unwrap().stage,
+            TradeStage::BalancedLoss
+        );
+        assert_eq!(
+            recovered
+                .operation(&plan_id)
+                .unwrap()
+                .operator_recovery
+                .as_ref()
+                .unwrap()
+                .dex_transaction_hash,
+            transaction_hash
         );
         drop(recovered);
         fs::remove_file(path).unwrap();

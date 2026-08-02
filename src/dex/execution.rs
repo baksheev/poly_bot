@@ -130,6 +130,9 @@ pub struct ExactInputSwapRequest {
     pub deadline_unix_seconds: u64,
     pub confirmation_timeout: Duration,
     pub submission_policy: SwapSubmissionPolicy,
+    /// Read-only recovery of an already journaled swap. This mode may inspect
+    /// the canonical receipt, but it must never authorize signing or broadcast.
+    pub reconciliation_only: bool,
 }
 
 impl ExactInputSwapRequest {
@@ -204,6 +207,7 @@ impl ExactInputSwapRequest {
             deadline_unix_seconds,
             confirmation_timeout: DEFAULT_SWAP_CONFIRMATION_TIMEOUT,
             submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
+            reconciliation_only: false,
         }
     }
 }
@@ -235,6 +239,7 @@ struct ExecuteCallPolicy {
     quoted_gas: Option<u64>,
     confirmation_timeout: Duration,
     submission_policy: SwapSubmissionPolicy,
+    allow_new_submission: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -668,7 +673,6 @@ impl DexExecutor {
     ) -> anyhow::Result<SwapExecutionOutcome> {
         self.last_terminal_receipt = None;
         request.validate()?;
-        ensure!(self.nonce_lane.ready(), "DEX nonce lane is not ready");
         let protocol = request.route.protocol();
         let cost_route = DexRouteCostKey {
             pool: match request.route {
@@ -677,13 +681,17 @@ impl DexExecutor {
             },
             token_in: request.token_in,
         };
-        if protocol == UniswapProtocol::V4 {
+        if !request.reconciliation_only && protocol == UniswapProtocol::V4 {
             ensure!(
                 request.deadline_unix_seconds > unix_seconds()?,
                 "Uniswap V4 request deadline has expired"
             );
         }
-        if request.submission_policy == SwapSubmissionPolicy::Immediate {
+        if request.reconciliation_only {
+            // The exact calldata below is still rebuilt so execute_call can
+            // prove it matches the durable journal identity. No allowance,
+            // simulation, gas, nonce, signing, or broadcast work is allowed.
+        } else if request.submission_policy == SwapSubmissionPolicy::Immediate {
             ensure!(
                 !self.allowance_mutations_enabled,
                 "immediate DEX submission requires startup-validated locked allowances"
@@ -726,6 +734,7 @@ impl DexExecutor {
                     quoted_gas: request.quoted_gas,
                     confirmation_timeout: request.confirmation_timeout,
                     submission_policy: request.submission_policy,
+                    allow_new_submission: !request.reconciliation_only,
                 },
                 enqueued_at,
             )
@@ -919,6 +928,7 @@ impl DexExecutor {
                     quoted_gas: Some(RAILS_APPROVAL_DEFAULT_GAS_LIMIT),
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
+                    allow_new_submission: true,
                 },
                 None,
             )
@@ -974,6 +984,7 @@ impl DexExecutor {
                     quoted_gas: Some(RAILS_PERMIT2_APPROVAL_GAS_LIMIT),
                     confirmation_timeout: APPROVAL_CONFIRMATION_TIMEOUT,
                     submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
+                    allow_new_submission: true,
                 },
                 None,
             )
@@ -1008,11 +1019,15 @@ impl DexExecutor {
             return match existing.status {
                 JournalStatus::MinedSuccess {
                     transaction_hash, ..
-                } => self
-                    .rpc
-                    .transaction_receipt(transaction_hash)
-                    .await?
-                    .context("journaled successful DEX receipt is unavailable"),
+                } => {
+                    let receipt = self
+                        .rpc
+                        .transaction_receipt(transaction_hash)
+                        .await?
+                        .context("journaled successful DEX receipt is unavailable")?;
+                    self.last_terminal_receipt = Some(receipt.clone());
+                    Ok(receipt)
+                }
                 JournalStatus::Broadcast { transaction_hash } => {
                     let receipt = self
                         .rpc
@@ -1024,8 +1039,16 @@ impl DexExecutor {
                     self.last_terminal_receipt = Some(receipt.clone());
                     Ok(receipt)
                 }
-                JournalStatus::MinedReverted { .. } => {
-                    bail!("journaled DEX transaction reverted")
+                JournalStatus::MinedReverted {
+                    transaction_hash, ..
+                } => {
+                    let receipt = self
+                        .rpc
+                        .transaction_receipt(transaction_hash)
+                        .await?
+                        .context("journaled reverted DEX receipt is unavailable")?;
+                    self.last_terminal_receipt = Some(receipt.clone());
+                    Ok(receipt)
                 }
                 JournalStatus::CancelledBeforeSigning => {
                     bail!("journaled DEX transaction was cancelled before signing")
@@ -1040,6 +1063,10 @@ impl DexExecutor {
                 _ => bail!("journaled DEX transaction requires recovery"),
             };
         }
+        ensure!(
+            policy.allow_new_submission,
+            "reconciliation-only DEX request has no matching journaled transaction"
+        );
         ensure!(self.nonce_lane.ready(), "DEX nonce lane is not ready");
         let rpc_call = call.rpc_call(self.wallet.address());
         let preflight_started = Instant::now();
@@ -1830,6 +1857,7 @@ impl DexExecutionService {
                                             confirmation_timeout: work.request.confirmation_timeout,
                                             submission_policy:
                                                 SwapSubmissionPolicy::SimulateAndEstimate,
+                                            allow_new_submission: true,
                                         },
                                         Some(work.enqueued_at),
                                     )
@@ -2217,6 +2245,7 @@ mod tests {
             deadline_unix_seconds: 1_800_000_000,
             confirmation_timeout: Duration::from_secs(5),
             submission_policy: SwapSubmissionPolicy::SimulateAndEstimate,
+            reconciliation_only: false,
         };
         assert!(request.validate().is_err());
     }
@@ -2453,6 +2482,7 @@ mod tests {
                     quoted_gas: Some(100_000),
                     confirmation_timeout: Duration::from_secs(1),
                     submission_policy: SwapSubmissionPolicy::Immediate,
+                    allow_new_submission: true,
                 },
                 None,
             )
@@ -2470,6 +2500,122 @@ mod tests {
                 block_number: 123,
                 ..
             }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_swap_reconciliation_reads_exact_broadcast_without_new_submission() {
+        fn address_topic(address: Address) -> String {
+            let mut word = [0_u8; 32];
+            word[12..].copy_from_slice(address.as_slice());
+            format!("{:#x}", B256::from(word))
+        }
+
+        let path = journal_path("expired-swap-reconciliation");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let mut request = v3_request("rustval-expired-swap-reconciliation");
+        request.deadline_unix_seconds = 1;
+        request.reconciliation_only = true;
+        let SwapRoute::V3 {
+            router, fee_pips, ..
+        } = request.route
+        else {
+            unreachable!();
+        };
+        let calldata = super::v3_exact_input(
+            request.token_in,
+            request.token_out,
+            fee_pips,
+            wallet.address(),
+            request.amount_in,
+            request.amount_out_minimum,
+        )
+        .unwrap();
+        let call = WalletCall::validated_contract_call(router, U256::ZERO, calldata).unwrap();
+        let transaction_hash = B256::repeat_byte(0x43);
+        let identity = JournalOperationIdentity {
+            operation_id: format!("{}.swap", request.operation_id),
+            chain_id: 480,
+            wallet: wallet.address(),
+            nonce: 7,
+            scope: None,
+        };
+        let mut journal = TransactionJournal::open(&path).unwrap();
+        journal
+            .record_intent(&JournalIntent {
+                identity: identity.clone(),
+                purpose: "uniswap_v3".to_owned(),
+                target: call.target(),
+                native_value: call.value(),
+                calldata_hash: keccak256(call.calldata()),
+            })
+            .unwrap();
+        journal.record_signed(&identity, transaction_hash).unwrap();
+        journal
+            .record_broadcast(&identity, transaction_hash)
+            .unwrap();
+        drop(journal);
+
+        let transfer_topic = format!("{:#x}", keccak256("Transfer(address,address,uint256)"));
+        let block_hash = format!("{:#x}", B256::repeat_byte(0x55));
+        let common = |address: Address, topics: Vec<String>, amount: U256, log_index: &str| {
+            json!({
+                "address": format!("{address:#x}"),
+                "topics": topics,
+                "data": format!("0x{:064x}", amount),
+                "transactionHash": format!("{transaction_hash:#x}"),
+                "blockNumber": "0x7b",
+                "blockHash": block_hash,
+                "transactionIndex": "0x0",
+                "logIndex": log_index,
+                "removed": false
+            })
+        };
+        let logs = vec![
+            common(
+                request.token_in,
+                vec![
+                    transfer_topic.clone(),
+                    address_topic(wallet.address()),
+                    address_topic(router),
+                ],
+                request.amount_in,
+                "0x0",
+            ),
+            common(
+                request.token_out,
+                vec![
+                    transfer_topic,
+                    address_topic(router),
+                    address_topic(wallet.address()),
+                ],
+                request.amount_out_minimum,
+                "0x1",
+            ),
+        ];
+        let (endpoint, server) = spawn_known_receipt_rpc_with_logs(transaction_hash, logs);
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = executor.execute_exact_input(request).await.unwrap();
+
+        assert_eq!(outcome.transaction_hash, transaction_hash);
+        assert_eq!(outcome.token_in_spent, U256::from(10_000_000_u64));
+        assert_eq!(outcome.token_out_received, U256::from(1_000_000_u64));
+        drop(executor);
+        server.join().unwrap();
+        let journal = TransactionJournal::open(&path).unwrap();
+        assert!(matches!(
+            journal.operation(&identity.operation_id).unwrap().status,
+            JournalStatus::MinedSuccess { .. }
         ));
         drop(journal);
         fs::remove_file(path).unwrap();
@@ -2690,6 +2836,13 @@ mod tests {
     }
 
     fn spawn_known_receipt_rpc(transaction_hash: B256) -> (String, JoinHandle<()>) {
+        spawn_known_receipt_rpc_with_logs(transaction_hash, Vec::new())
+    }
+
+    fn spawn_known_receipt_rpc_with_logs(
+        transaction_hash: B256,
+        logs: Vec<Value>,
+    ) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let thread = std::thread::spawn(move || {
@@ -2710,7 +2863,7 @@ mod tests {
                             "gasUsed": "0x15f90",
                             "effectiveGasPrice": "0xf4240",
                             "l1Fee": "0x0",
-                            "logs": []
+                            "logs": logs
                         }),
                     ),
                     _ => panic!("unexpected known-receipt RPC method {method}"),

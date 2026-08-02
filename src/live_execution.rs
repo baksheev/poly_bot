@@ -237,7 +237,10 @@ impl ComposedLiveLegExecutor {
     ) -> (LegRole, LegResult) {
         match command {
             CoordinatorCommand::DispatchDex {
-                operation_id, plan, ..
+                operation_id,
+                plan,
+                reconciliation_only,
+                ..
             } => {
                 let role = LegRole::Dex;
                 let Some(bounds) = intent.admission.as_ref() else {
@@ -246,16 +249,19 @@ impl ComposedLiveLegExecutor {
                 let Some(plan) = plan.as_ref() else {
                     return failed(role, "dex:missing-plan");
                 };
-                if unix_seconds().is_none_or(|now| now >= plan.deadline_unix_seconds) {
+                if !reconciliation_only
+                    && unix_seconds().is_none_or(|now| now >= plan.deadline_unix_seconds)
+                {
                     return failed(role, "dex:expired-plan");
                 }
-                let request = match plan.execution_request(operation_id.clone()) {
+                let mut request = match plan.execution_request(operation_id.clone()) {
                     Ok(request) => request,
                     Err(error) => {
                         tracing::error!(operation_id, error = %error, "journaled DEX plan is invalid");
                         return failed(role, "dex:invalid-plan");
                     }
                 };
+                request.reconciliation_only = *reconciliation_only;
                 let revert_context = DexRevertContext::from_request(&request);
                 match self.dex.execute(request).await {
                     Ok(outcome) => {
@@ -1368,6 +1374,22 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             !self.risk_limits.entry_stop_file.exists(),
             "live entry stop is active"
         );
+        let journal_scope = self
+            .risk_limits
+            .pair_policies
+            .get(&opportunity.pair_id)
+            .map(|policy| &policy.journal_scope)
+            .or_else(|| {
+                (opportunity.symbol == self.risk_limits.binance_symbol)
+                    .then_some(&self.risk_limits.journal_scope)
+            })
+            .context("opportunity has no live journal scope")?;
+        ensure!(
+            self.coordinator
+                .unresolved_exposure_count(&journal_scope.strategy_id)
+                == 0,
+            "strategy is quarantined by an unresolved journaled exposure"
+        );
         if let Some(rejection) = self.risk_limits.entry_preflight.check(opportunity)? {
             self.telemetry.emit(
                 "arbitrage_entry_preflight_rejected",
@@ -1396,7 +1418,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 "pair chain, funding, or market-data readiness is not healthy"
             );
             let notional = opportunity.cost_token_a_base_units.unsigned_abs();
-            let risk = self
+            let strategy_risk = self
                 .coordinator
                 .strategy_journal_risk(&policy.journal_scope.strategy_id)?;
             ensure!(
@@ -1415,7 +1437,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 "pair recovery-loss envelope exceeds the per-parent cap"
             );
             ensure!(
-                risk.active_parent_count < policy.maximum_concurrent_trades,
+                strategy_risk.active_parent_count < policy.maximum_concurrent_trades,
                 "pair concurrent-parent limit reached"
             );
         }
@@ -2040,6 +2062,56 @@ mod tests {
                 CoordinatorCommand::DispatchCex { .. } => LegRole::Cex,
                 CoordinatorCommand::RecoverCex { .. } => LegRole::RecoveryCex,
             };
+            let result = self.results.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move { (role, result) })
+        }
+    }
+
+    struct RecordingExecutor {
+        results: Mutex<VecDeque<LegResult>>,
+        calls: Arc<Mutex<Vec<(String, LegRole)>>>,
+    }
+
+    struct RecoveryRecordingExecutor {
+        results: Mutex<VecDeque<LegResult>>,
+        calls: Arc<Mutex<Vec<(LegRole, bool)>>>,
+    }
+
+    impl LiveLegExecutor for RecoveryRecordingExecutor {
+        fn execute<'a>(
+            &'a self,
+            _intent: &'a TradeIntent,
+            command: &'a CoordinatorCommand,
+        ) -> LegFuture<'a> {
+            let (role, reconciliation_only) = match command {
+                CoordinatorCommand::DispatchDex {
+                    reconciliation_only,
+                    ..
+                } => (LegRole::Dex, *reconciliation_only),
+                CoordinatorCommand::DispatchCex { .. } => (LegRole::Cex, false),
+                CoordinatorCommand::RecoverCex { .. } => (LegRole::RecoveryCex, false),
+            };
+            self.calls.lock().unwrap().push((role, reconciliation_only));
+            let result = self.results.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move { (role, result) })
+        }
+    }
+
+    impl LiveLegExecutor for RecordingExecutor {
+        fn execute<'a>(
+            &'a self,
+            intent: &'a TradeIntent,
+            command: &'a CoordinatorCommand,
+        ) -> LegFuture<'a> {
+            let role = match command {
+                CoordinatorCommand::DispatchDex { .. } => LegRole::Dex,
+                CoordinatorCommand::DispatchCex { .. } => LegRole::Cex,
+                CoordinatorCommand::RecoverCex { .. } => LegRole::RecoveryCex,
+            };
+            self.calls
+                .lock()
+                .unwrap()
+                .push((intent.plan_id.clone(), role));
             let result = self.results.lock().unwrap().pop_front().unwrap();
             Box::pin(async move { (role, result) })
         }
@@ -3034,6 +3106,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresolved_exposure_quarantines_only_its_strategy() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-strategy-quarantine-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let esp_scope = TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-account-main".to_owned(),
+            network_id: "arbitrum-one".to_owned(),
+            chain_id: 42_161,
+            wallet_id: "arbitrum:wallet-primary".to_owned(),
+            strategy_id: "strategy-esp-usdc".to_owned(),
+            symbol: "ESPUSDC".to_owned(),
+        };
+        let mut esp = opportunity();
+        esp.pair_id = "arbitrum-usdc-esp".to_owned();
+        esp.symbol = "ESPUSDC".to_owned();
+        let mut intent = esp.intent(ExecutionMode::DexFirst);
+        intent.journal_scope = Some(esp_scope.clone());
+        let plan_id = intent.plan_id.clone();
+        let mut coordinator = PaperTradeCoordinator::open(&journal).unwrap();
+        coordinator.admit(intent).unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                unknown(LegRole::Dex, "dex:child-unknown").1,
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        drop(coordinator);
+
+        let executor = ScriptedExecutor {
+            results: Mutex::new(VecDeque::new()),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            LiveRiskLimits {
+                entry_stop_file: stop_file,
+                entry_preflight: default_preflight(),
+                binance_symbol: "WLDUSDC".to_owned(),
+                binance_base_decimals: 18,
+                journal_scope: scope(),
+                pair_policies: BTreeMap::from([(
+                    esp.pair_id.clone(),
+                    LivePairPolicy {
+                        journal_scope: esp_scope,
+                        maximum_trade_notional_token_a_base_units: 10_000_000,
+                        maximum_unhedged_notional_token_a_base_units: 10_000_000,
+                        maximum_realized_loss_token_a_base_units: 1_000_000,
+                        maximum_concurrent_trades: 1,
+                        readiness: Arc::new(AtomicBool::new(true)),
+                        market_data_readiness: Arc::new(AtomicBool::new(true)),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        let error = task.authorize_entry(&esp).unwrap_err();
+        assert!(format!("{error:#}").contains("strategy is quarantined"));
+        task.authorize_entry(&opportunity()).unwrap();
+
+        drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_finishes_before_a_queued_new_entry() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-startup-barrier-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let old = opportunity();
+        let old_plan_id = old.plan_id();
+        let mut coordinator = PaperTradeCoordinator::open(&journal).unwrap();
+        coordinator
+            .admit(old.intent(ExecutionMode::DexFirst))
+            .unwrap();
+        coordinator.take_commands(&old_plan_id).unwrap();
+        drop(coordinator);
+
+        let mut new = opportunity();
+        new.update_id += 1;
+        new.received_unix_us += 1;
+        let new_plan_id = new.plan_id();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = RecordingExecutor {
+            results: Mutex::new(VecDeque::from([
+                result(100, -1_000, 5, "dex:startup-recovery"),
+                result(-100, 1_030, 0, "cex:startup-recovery"),
+                result(100, -1_000, 5, "dex:new-entry"),
+                result(-100, 1_030, 0, "cex:new-entry"),
+            ])),
+            calls: Arc::clone(&calls),
+        };
+        let (handle, task, mut events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+        assert!(matches!(
+            handle.try_submit(new),
+            PaperTradeSubmitResult::Accepted
+        ));
+        let runner = tokio::spawn(task.run());
+
+        let recovered = events.recv().await.unwrap();
+        assert_eq!(recovered.plan_id, old_plan_id);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                (old_plan_id.clone(), LegRole::Dex),
+                (old_plan_id.clone(), LegRole::Cex)
+            ]
+        );
+        handle.finish(recovered.state);
+
+        let entered = events.recv().await.unwrap();
+        assert_eq!(entered.plan_id, new_plan_id);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                (old_plan_id.clone(), LegRole::Dex),
+                (old_plan_id, LegRole::Cex),
+                (new_plan_id.clone(), LegRole::Dex),
+                (new_plan_id, LegRole::Cex)
+            ]
+        );
+        handle.finish(entered.state);
+        drop(handle);
+        runner.await.unwrap().unwrap();
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
     async fn unknown_outcome_releases_the_lane_and_preserves_pending_work() {
         let journal = std::env::temp_dir().join(format!(
             "poly-bot-live-unknown-mailbox-{}-{}.jsonl",
@@ -3381,6 +3604,86 @@ mod tests {
         );
 
         drop(task);
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_unknown_dex_fixture_reconciles_once_hedges_once_and_restart_is_idempotent() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-live-expired-unknown-dex-fixture-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+        let mut opportunity = opportunity();
+        opportunity.dex_plan.deadline_unix_seconds = 1;
+        let plan_id = opportunity.plan_id();
+        let mut coordinator = PaperTradeCoordinator::open(&journal).unwrap();
+        coordinator
+            .admit(opportunity.intent(ExecutionMode::DexFirst))
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        coordinator
+            .record_result(
+                &plan_id,
+                LegRole::Dex,
+                unknown(LegRole::Dex, "dex:receipt-unknown").1,
+            )
+            .unwrap();
+        coordinator.take_commands(&plan_id).unwrap();
+        let before = coordinator.operation(&plan_id).unwrap();
+        assert_eq!(before.stage, crate::arbitrage::TradeStage::UnknownExposure);
+        assert!(!before.cex_dispatched);
+        assert!(before.cex_result.is_none());
+        drop(coordinator);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = RecoveryRecordingExecutor {
+            results: Mutex::new(VecDeque::from([
+                result(100, -1_000, 5, "dex:journaled-receipt"),
+                result(-100, 1_030, 0, "cex:single-hedge"),
+            ])),
+            calls: Arc::clone(&calls),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine".to_owned(),
+            risk_limits(stop_file.clone()),
+        )
+        .unwrap();
+        task.resume_active().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(LegRole::Dex, true), (LegRole::Cex, false)]
+        );
+        let operation = task.coordinator.operation(&plan_id).unwrap();
+        assert_eq!(
+            operation.stage,
+            crate::arbitrage::TradeStage::BalancedProfit
+        );
+        assert!(operation.recovery_results.is_empty());
+        drop(task);
+
+        let restart_calls = Arc::new(Mutex::new(Vec::new()));
+        let restart_executor = RecoveryRecordingExecutor {
+            results: Mutex::new(VecDeque::new()),
+            calls: Arc::clone(&restart_calls),
+        };
+        let (_handle, mut restarted, _events) = live_trade_channel(
+            &journal,
+            restart_executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "test-engine-restart".to_owned(),
+            risk_limits(stop_file),
+        )
+        .unwrap();
+        restarted.resume_active().await.unwrap();
+        assert!(restart_calls.lock().unwrap().is_empty());
+        drop(restarted);
         fs::remove_file(journal).unwrap();
     }
 

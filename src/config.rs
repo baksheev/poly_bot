@@ -123,6 +123,37 @@ pub enum Command {
         #[arg(long, env = "ARBITRAGE_EMIT_RESULT_CONFIRMATION", default_value = "")]
         live_confirmation: String,
     },
+    /// Validate, execute if absent, and durably record an exact arbitrage recovery.
+    ArbitrageRecordOperatorRecovery {
+        /// Historical false-terminal parent plan id.
+        #[arg(long)]
+        plan_id: String,
+        /// DEX transaction hash proven by the chain transaction journal.
+        #[arg(long)]
+        dex_transaction_hash: String,
+        /// Durable EVM transaction journal for the plan's network.
+        #[arg(long)]
+        wallet_journal_path: PathBuf,
+        /// Durable Binance order journal containing the deterministic recovery fill.
+        #[arg(long, env = "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH")]
+        order_journal_path: PathBuf,
+        /// `dry-run` performs every read-only proof; `execute` appends the correction.
+        #[arg(long, default_value = "dry-run")]
+        mode: String,
+        /// Maximum accepted pre-placement recovery quote forecast.
+        #[arg(long, default_value = "250")]
+        maximum_quote_usdc: String,
+        /// Audited operator identity persisted with the correction.
+        #[arg(long, default_value = "operator")]
+        actor: String,
+        /// Explicit live-journal mutation acknowledgement.
+        #[arg(
+            long,
+            env = "ARBITRAGE_OPERATOR_RECOVERY_CONFIRMATION",
+            default_value = ""
+        )]
+        live_confirmation: String,
+    },
     /// Fetch and validate a public unauthenticated Across USDC quote.
     AcrossUsdcQuote {
         /// Origin chain: 10 (Optimism) or 480 (World Chain).

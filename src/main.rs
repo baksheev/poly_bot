@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{Address, U256};
@@ -16,8 +16,9 @@ use arb_bot::{
         WORLD_CHAIN_USDC, is_retryable_quote_error, validate_quote,
     },
     arbitrage::{
-        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, PaperTradeCoordinator,
-        TradeJournalScope, TradeStage, paper_trade_channel,
+        EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS,
+        OperatorRecoveryEvidence, PaperTradeCoordinator, TradeJournalScope, TradeStage,
+        paper_trade_channel,
     },
     balances::{
         BalanceEvent, BalanceSource, BalanceSync, WalletBalanceSnapshot, WalletReadClient,
@@ -30,12 +31,15 @@ use arb_bot::{
         select_capital_routes,
     },
     binance::{
-        execution::BinanceExecutionService,
-        order_journal::{BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress},
+        execution::{BinanceExecutionService, BinanceOrderRequest, BinanceOrderRequestKind},
+        order_journal::{
+            BinanceOrderIntent, BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress,
+        },
+        order_plan::{decimal_from_base_units, recovery_client_order_id},
         runtime::SharedBinanceRuntime,
         user_data::{UserDataEvent, UserDataStream},
         validation::{BinanceCanaryKind, execute_order_round_trip},
-        ws_api::BinanceWsApiClient,
+        ws_api::{BinanceWsApiClient, OrderResult, WsApiError},
     },
     chain::rpc::{CanonicalBlock, JsonRpcClient},
     config::{self, Cli, Command},
@@ -57,7 +61,10 @@ use arb_bot::{
         config::{DexProvider, LoadedDomainConfig},
     },
     engine::{AdaptiveSizingJob, AdaptiveSizingTaskResult, BinanceFeeBps, TradingEngine},
-    execution_accounting::{CommissionAssetValuation, binance_leg_result},
+    execution_accounting::{
+        CommissionAssetValuation, binance_leg_result, dex_leg_result,
+        native_gas_to_token_a_base_units,
+    },
     hot_telemetry,
     inventory::SharedInventoryReservations,
     live_execution::{
@@ -488,6 +495,29 @@ async fn main() -> anyhow::Result<()> {
             engine_id,
             live_confirmation,
         } => arbitrage_emit_result(&cli.config, &plan_id, engine_id, &live_confirmation).await,
+        Command::ArbitrageRecordOperatorRecovery {
+            plan_id,
+            dex_transaction_hash,
+            wallet_journal_path,
+            order_journal_path,
+            mode,
+            maximum_quote_usdc,
+            actor,
+            live_confirmation,
+        } => {
+            arbitrage_record_operator_recovery(
+                &cli.config,
+                &plan_id,
+                &dex_transaction_hash,
+                wallet_journal_path,
+                order_journal_path,
+                &mode,
+                &maximum_quote_usdc,
+                &actor,
+                &live_confirmation,
+            )
+            .await
+        }
         Command::AcrossUsdcQuote {
             origin_chain_id,
             amount,
@@ -623,6 +653,513 @@ async fn arbitrage_emit_result(
         "terminal live arbitrage result emitted from trade journal"
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn arbitrage_record_operator_recovery(
+    config: &config::AppConfig,
+    plan_id: &str,
+    dex_transaction_hash: &str,
+    wallet_journal_path: PathBuf,
+    order_journal_path: PathBuf,
+    mode: &str,
+    maximum_quote_usdc: &str,
+    actor: &str,
+    live_confirmation: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        matches!(mode, "dry-run" | "execute"),
+        "operator recovery --mode must be dry-run or execute"
+    );
+    if mode == "execute" {
+        ensure!(
+            live_confirmation == "RECORD_LIVE_ARBITRAGE_OPERATOR_RECOVERY",
+            "operator recovery execute requires ARBITRAGE_OPERATOR_RECOVERY_CONFIRMATION=RECORD_LIVE_ARBITRAGE_OPERATOR_RECOVERY"
+        );
+        ensure!(
+            config.arbitrage_entry_stop_file.exists(),
+            "operator recovery execute requires the arbitrage entry-stop file"
+        );
+    }
+    let maximum_quote_usdc = Decimal::from_str(maximum_quote_usdc)
+        .context("--maximum-quote-usdc must be an exact decimal")?;
+    ensure!(
+        maximum_quote_usdc > Decimal::ZERO,
+        "operator recovery maximum quote must be positive"
+    );
+    let expected_transaction_hash = dex_transaction_hash
+        .parse::<alloy_primitives::B256>()
+        .context("--dex-transaction-hash is invalid")?;
+
+    let selection = load_compatibility_domain(
+        &config.domain_config_path,
+        CompatibilityRole::LiveRuntime,
+        false,
+    )?;
+    let domain_config = selection.config;
+    let mut coordinator = PaperTradeCoordinator::open(&config.arbitrage_trade_journal_path)?;
+    let operation = coordinator
+        .operation(plan_id)
+        .with_context(|| format!("unknown arbitrage plan {plan_id}"))?
+        .clone();
+    ensure!(
+        operation.stage.terminal()
+            && operation.dex_dispatched
+            && !operation.cex_dispatched
+            && operation.recovery_results.is_empty()
+            && operation.operator_recovery.is_none()
+            && operation.dex_result.as_ref().is_some_and(|result| {
+                result.status == LegStatus::Failed && result.venue_reference == "dex:expired-plan"
+            }),
+        "arbitrage plan is not the historical false-terminal expired-plan shape"
+    );
+    let pair = domain_config
+        .snapshot()
+        .pairs
+        .iter()
+        .find(|pair| pair.id == operation.intent.pair_id)
+        .context("operator recovery pair is absent from the live domain")?;
+    let scope = operation
+        .intent
+        .journal_scope
+        .as_ref()
+        .context("operator recovery trade has no journal scope")?;
+    ensure!(
+        scope.chain_id == pair.chain.chain_id && scope.symbol == pair.binance.symbol,
+        "operator recovery journal scope differs from the live pair"
+    );
+
+    let endpoint = std::env::var(&pair.chain.rpc_url_env).with_context(|| {
+        format!(
+            "required environment variable {} is not set",
+            pair.chain.rpc_url_env
+        )
+    })?;
+    let wallet = EvmWallet::from_env()?;
+    let mut dex_executor = DexExecutor::hydrate(
+        JsonRpcClient::new(endpoint)?,
+        wallet,
+        pair.chain.chain_id,
+        wallet_journal_path,
+    )
+    .await?;
+    dex_executor.set_journal_scope(EvmJournalScope {
+        schema_version: EvmJournalScope::SCHEMA_VERSION,
+        network_id: scope.network_id.clone(),
+        wallet_id: scope.wallet_id.clone(),
+        strategy_id: scope.strategy_id.clone(),
+    })?;
+    let mut request = operation
+        .intent
+        .dex_plan
+        .as_ref()
+        .context("operator recovery trade has no DEX plan")?
+        .execution_request(operation.intent.dex_operation_id.clone())?;
+    request.reconciliation_only = true;
+    let dex_outcome = dex_executor.execute_exact_input(request).await?;
+    ensure!(
+        dex_outcome.transaction_hash == expected_transaction_hash,
+        "journaled DEX receipt hash differs from --dex-transaction-hash"
+    );
+    let admission = operation
+        .intent
+        .admission
+        .as_ref()
+        .context("operator recovery trade has no admission accounting")?;
+    let gas = if admission.gas_conversion_price_token_a.is_zero() {
+        0
+    } else {
+        native_gas_to_token_a_base_units(
+            dex_outcome.gas_used,
+            dex_outcome.effective_gas_price,
+            dex_outcome.l1_fee,
+            admission.gas_conversion_price_token_a,
+            pair.token_a.decimals,
+        )?
+    };
+    let dex_result = dex_leg_result(operation.intent.direction, dex_outcome, gas)?;
+
+    let recovery_target = dex_result.token_b_delta_base_units.saturating_neg();
+    ensure!(
+        recovery_target != 0,
+        "operator recovery DEX receipt has no token-B exposure"
+    );
+    let recovery_quantity =
+        decimal_from_base_units(recovery_target.unsigned_abs(), pair.token_b.decimals)?;
+    let forecast_quote = operator_recovery_top_quote(
+        config,
+        &pair.binance.symbol,
+        recovery_target,
+        recovery_quantity,
+    )
+    .await?;
+    if recovery_target > 0 {
+        ensure!(
+            forecast_quote <= maximum_quote_usdc,
+            "operator recovery current-ask forecast exceeds the hard quote cap"
+        );
+    }
+
+    let mut account_client = BinanceAccountClient::from_env(config)?;
+    let clock = account_client.synchronize_clock_observed().await?;
+    let user_data_stream = UserDataStream::connect(config, clock.offset_ms).await?;
+    let binance_api = user_data_stream.api();
+    ensure!(
+        query_operator_order(
+            &binance_api,
+            &pair.binance.symbol,
+            &operation.intent.cex_client_order_id,
+        )
+        .await?
+        .is_none(),
+        "primary Binance client id exists; operator recovery cannot assume zero primary fill"
+    );
+    let mut order_journal = Some(BinanceOrderJournal::open(&order_journal_path)?);
+    let resolution = resolve_operator_recovery_order(
+        &binance_api,
+        order_journal
+            .as_mut()
+            .expect("operator order journal is open"),
+        &operation.intent.cex_client_order_id,
+        &pair.binance.symbol,
+        scope,
+        recovery_target,
+        recovery_quantity,
+        mode == "execute",
+    )
+    .await?;
+    let (recovery_client_id, order) = match resolution {
+        OperatorOrderResolution::Filled {
+            client_order_id,
+            order,
+        } => (client_order_id, *order),
+        OperatorOrderResolution::Place { client_order_id } if mode == "dry-run" => {
+            tracing::info!(
+                plan_id,
+                recovery_client_order_id = %client_order_id,
+                recovery_target_token_b_base_units = recovery_target,
+                recovery_quantity = %recovery_quantity,
+                forecast_quote_usdc = %forecast_quote,
+                maximum_quote_usdc = %maximum_quote_usdc,
+                "operator recovery dry-run proved the primary and prior deterministic recovery ids absent; execute would place one MARKET order"
+            );
+            return Ok(());
+        }
+        OperatorOrderResolution::Place { client_order_id } => {
+            let request_kind = if recovery_target > 0 {
+                BinanceOrderRequestKind::MarketBuyQuantity {
+                    quantity: recovery_quantity,
+                }
+            } else {
+                BinanceOrderRequestKind::MarketSell {
+                    quantity: recovery_quantity,
+                }
+            };
+            let request = BinanceOrderRequest {
+                operation_id: client_order_id.clone(),
+                client_order_id: client_order_id.clone(),
+                symbol: pair.binance.symbol.clone(),
+                kind: request_kind,
+                latency_origin: None,
+            };
+            request.validate()?;
+            drop(order_journal.take());
+            let service = BinanceExecutionService::spawn_scoped(
+                binance_api,
+                order_journal_path,
+                1,
+                BinanceOrderJournalScope {
+                    schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                    account_id: scope.account_id.clone(),
+                    strategy_id: scope.strategy_id.clone(),
+                },
+            )
+            .await?;
+            let outcome = service
+                .execute(request)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            drop(service);
+            (client_order_id, outcome.order)
+        }
+    };
+    ensure!(
+        order.status == "FILLED" && order.client_order_id == recovery_client_id,
+        "operator recovery Binance order is not the deterministic filled order"
+    );
+    if order.cummulative_quote_qty > maximum_quote_usdc {
+        tracing::error!(
+            plan_id,
+            actual_quote_usdc = %order.cummulative_quote_qty,
+            maximum_quote_usdc = %maximum_quote_usdc,
+            "filled operator recovery exceeded its pre-placement quote cap; the known fill remains authoritative and will still be journaled"
+        );
+    }
+    let recovery_result = binance_leg_result(
+        &order,
+        &pair.binance.base_asset,
+        pair.token_b.decimals,
+        &pair.binance.quote_asset,
+        pair.token_a.decimals,
+        pair.binance
+            .commission_asset
+            .as_deref()
+            .map(|asset| CommissionAssetValuation {
+                asset,
+                price_in_token_a: None,
+            }),
+    )?;
+    ensure!(
+        recovery_result.token_b_delta_base_units
+            == dex_result.token_b_delta_base_units.saturating_neg(),
+        "operator recovery Binance fill does not exactly neutralize the DEX token-B delta"
+    );
+    let recovered_at_unix_ms = order.transact_time.unwrap_or(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time is before Unix epoch")?
+            .as_millis()
+            .try_into()
+            .context("operator recovery timestamp exceeds u64")?,
+    );
+    let evidence = OperatorRecoveryEvidence {
+        actor: actor.to_owned(),
+        recovered_at_unix_ms,
+        dex_transaction_hash: format!("{expected_transaction_hash:#x}"),
+        binance_order_id: order.order_id,
+        binance_client_order_id: recovery_client_id.clone(),
+    };
+    tracing::info!(
+        plan_id,
+        mode,
+        dex_transaction_hash = %expected_transaction_hash,
+        dex_token_b_delta_base_units = dex_result.token_b_delta_base_units,
+        dex_token_a_delta_base_units = dex_result.token_a_delta_base_units,
+        dex_gas_cost_token_a_base_units = dex_result.gas_cost_token_a_base_units,
+        binance_order_id = order.order_id,
+        binance_client_order_id = %recovery_client_id,
+        binance_token_b_delta_base_units = recovery_result.token_b_delta_base_units,
+        binance_token_a_delta_base_units = recovery_result.token_a_delta_base_units,
+        binance_quote_spend = %order.cummulative_quote_qty,
+        maximum_quote_usdc = %maximum_quote_usdc,
+        "operator arbitrage recovery evidence validated"
+    );
+    drop(order_journal);
+    drop(user_data_stream);
+    drop(dex_executor);
+
+    if mode == "execute" {
+        coordinator.record_operator_recovery(plan_id, dex_result, recovery_result, evidence)?;
+        tracing::info!(
+            plan_id,
+            "operator arbitrage recovery correction durably recorded"
+        );
+    }
+    Ok(())
+}
+
+async fn query_operator_order(
+    api: &arb_bot::binance::user_data::MultiplexedBinanceWsApi,
+    symbol: &str,
+    client_order_id: &str,
+) -> anyhow::Result<Option<OrderResult>> {
+    match api.query_order(symbol, client_order_id).await {
+        Ok(order) => Ok(Some(order)),
+        Err(WsApiError::Rejected {
+            status: _,
+            code: -2013,
+            message: _,
+        }) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(error))
+            .with_context(|| format!("Binance order.status is inconclusive for {client_order_id}")),
+    }
+}
+
+enum OperatorOrderResolution {
+    Filled {
+        client_order_id: String,
+        order: Box<OrderResult>,
+    },
+    Place {
+        client_order_id: String,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_operator_recovery_order(
+    api: &arb_bot::binance::user_data::MultiplexedBinanceWsApi,
+    journal: &mut BinanceOrderJournal,
+    primary_client_order_id: &str,
+    symbol: &str,
+    scope: &TradeJournalScope,
+    recovery_target: i128,
+    quantity: Decimal,
+    execute: bool,
+) -> anyhow::Result<OperatorOrderResolution> {
+    let side = if recovery_target > 0 { "BUY" } else { "SELL" };
+    for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+        let client_order_id = recovery_client_order_id(primary_client_order_id, attempt)?;
+        let intent = BinanceOrderIntent {
+            scope: Some(BinanceOrderJournalScope {
+                schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                account_id: scope.account_id.clone(),
+                strategy_id: scope.strategy_id.clone(),
+            }),
+            operation_id: client_order_id.clone(),
+            client_order_id: client_order_id.clone(),
+            symbol: symbol.to_owned(),
+            side: side.to_owned(),
+            order_type: "MARKET".to_owned(),
+            quantity: Some(quantity.normalize().to_string()),
+            quote_order_quantity: None,
+            limit_price: None,
+        };
+        let existing = journal.operations().get(&client_order_id).cloned();
+        if let Some(existing) = &existing {
+            ensure!(
+                existing.intent == intent,
+                "operator recovery Binance journal intent changed"
+            );
+        }
+        let discovered = query_operator_order(api, symbol, &client_order_id).await?;
+        match (discovered, existing) {
+            (Some(order), None) => {
+                validate_operator_recovery_order(&intent, &order)?;
+                if execute {
+                    journal.record_discovered_terminal(intent, order.clone())?;
+                }
+                return Ok(OperatorOrderResolution::Filled {
+                    client_order_id,
+                    order: Box::new(order),
+                });
+            }
+            (Some(order), Some(existing)) => {
+                validate_operator_recovery_order(&intent, &order)?;
+                match existing.progress {
+                    BinanceOrderProgress::Terminal {
+                        order: Some(journaled),
+                        ..
+                    } => ensure!(
+                        journaled == order,
+                        "Binance venue and order journal disagree on the recovery order"
+                    ),
+                    BinanceOrderProgress::Terminal { order: None, .. } => {}
+                    BinanceOrderProgress::Rejected { .. } => anyhow::bail!(
+                        "Binance venue has an order whose journal entry is terminal rejected"
+                    ),
+                    BinanceOrderProgress::IntentRecorded
+                    | BinanceOrderProgress::Submitted { .. }
+                    | BinanceOrderProgress::OutcomeUnknown { .. } => {
+                        if execute {
+                            journal.advance(
+                                &client_order_id,
+                                BinanceOrderProgress::Terminal {
+                                    order_id: order.order_id,
+                                    status: order.status.clone(),
+                                    executed_quantity: order.executed_qty.to_string(),
+                                    cumulative_quote_quantity: order
+                                        .cummulative_quote_qty
+                                        .to_string(),
+                                    order: Some(order.clone()),
+                                },
+                            )?;
+                        }
+                    }
+                }
+                return Ok(OperatorOrderResolution::Filled {
+                    client_order_id,
+                    order: Box::new(order),
+                });
+            }
+            (None, None) => {
+                return Ok(OperatorOrderResolution::Place { client_order_id });
+            }
+            (None, Some(existing)) => match existing.progress {
+                BinanceOrderProgress::Rejected { code: -2013, .. } => continue,
+                BinanceOrderProgress::IntentRecorded
+                | BinanceOrderProgress::OutcomeUnknown { .. } => {
+                    if execute {
+                        journal.advance(
+                            &client_order_id,
+                            BinanceOrderProgress::Rejected {
+                                status: 400,
+                                code: -2013,
+                                reason:
+                                    "operator order.status proved deterministic recovery absent"
+                                        .to_owned(),
+                            },
+                        )?;
+                    }
+                    continue;
+                }
+                BinanceOrderProgress::Submitted { .. } => anyhow::bail!(
+                    "submitted Binance recovery is absent from order.status; outcome remains unknown"
+                ),
+                BinanceOrderProgress::Terminal { .. } => anyhow::bail!(
+                    "Binance order journal claims a recovery order that order.status reports absent"
+                ),
+                BinanceOrderProgress::Rejected { .. } => {
+                    anyhow::bail!("operator recovery journal contains a non-absence rejection")
+                }
+            },
+        }
+    }
+    anyhow::bail!("operator recovery exhausted all deterministic Binance attempts")
+}
+
+fn validate_operator_recovery_order(
+    intent: &BinanceOrderIntent,
+    order: &OrderResult,
+) -> anyhow::Result<()> {
+    ensure!(
+        order.client_order_id == intent.client_order_id
+            && order.symbol == intent.symbol
+            && order.side == intent.side
+            && order.order_type == intent.order_type
+            && Some(order.orig_qty.normalize().to_string()) == intent.quantity,
+        "discovered Binance recovery order differs from the immutable request"
+    );
+    Ok(())
+}
+
+async fn operator_recovery_top_quote(
+    config: &config::AppConfig,
+    symbol: &str,
+    recovery_target_base_units: i128,
+    quantity: Decimal,
+) -> anyhow::Result<Decimal> {
+    let endpoint = format!(
+        "{}/api/v3/ticker/bookTicker",
+        config.binance_rest_base_url.trim_end_matches('/')
+    );
+    let payload = reqwest::Client::new()
+        .get(endpoint)
+        .query(&[("symbol", symbol)])
+        .send()
+        .await
+        .context("operator recovery Binance top request failed")?
+        .error_for_status()
+        .context("operator recovery Binance top request was rejected")?
+        .json::<serde_json::Value>()
+        .await
+        .context("operator recovery Binance top response is invalid JSON")?;
+    let field = if recovery_target_base_units > 0 {
+        "askPrice"
+    } else {
+        "bidPrice"
+    };
+    let price = payload[field]
+        .as_str()
+        .with_context(|| format!("operator recovery Binance top omitted {field}"))?
+        .parse::<Decimal>()
+        .with_context(|| format!("operator recovery Binance {field} is not an exact decimal"))?;
+    ensure!(
+        price > Decimal::ZERO,
+        "operator recovery Binance top is zero"
+    );
+    price
+        .checked_mul(quantity)
+        .context("operator recovery top quote overflow")
 }
 
 fn arbitrage_reconcile_cex(

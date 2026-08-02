@@ -854,6 +854,23 @@ impl BinanceExecutionService {
         Self::spawn_inner(client, journal_path, capacity, None, None, BTreeMap::new()).await
     }
 
+    pub async fn spawn_scoped(
+        client: MultiplexedBinanceWsApi,
+        journal_path: PathBuf,
+        capacity: usize,
+        journal_scope: BinanceOrderJournalScope,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            client,
+            journal_path,
+            capacity,
+            None,
+            Some(journal_scope),
+            BTreeMap::new(),
+        )
+        .await
+    }
+
     pub async fn spawn_instrumented(
         client: MultiplexedBinanceWsApi,
         journal_path: PathBuf,

@@ -10,6 +10,7 @@ use std::{
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Context, ensure};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -235,6 +236,63 @@ impl BinanceOrderJournal {
             intent,
             progress: BinanceOrderProgress::IntentRecorded,
         })
+    }
+
+    /// Adopts one exact terminal order independently discovered by an
+    /// operator recovery query. This cannot overwrite an existing client id
+    /// and records the immutable intent before the venue result.
+    pub fn record_discovered_terminal(
+        &mut self,
+        intent: BinanceOrderIntent,
+        order: OrderResult,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !self.operations.contains_key(&intent.client_order_id),
+            "discovered Binance client order id already exists in journal"
+        );
+        ensure!(
+            order.client_order_id == intent.client_order_id
+                && order.symbol == intent.symbol
+                && order.side == intent.side
+                && order.order_type == intent.order_type,
+            "discovered Binance order does not match its operator intent"
+        );
+        if let Some(quantity) = &intent.quantity {
+            ensure!(
+                quantity
+                    .parse::<Decimal>()
+                    .context("discovered Binance intent quantity is not an exact decimal")?
+                    == order.orig_qty,
+                "discovered Binance order quantity differs from its operator intent"
+            );
+        }
+        if let Some(quote_quantity) = &intent.quote_order_quantity {
+            ensure!(
+                quote_quantity
+                    .parse::<Decimal>()
+                    .context("discovered Binance intent quote quantity is not an exact decimal")?
+                    == order.orig_quote_order_qty,
+                "discovered Binance quote quantity differs from its operator intent"
+            );
+        }
+        ensure!(
+            matches!(
+                order.status.as_str(),
+                "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED"
+            ),
+            "discovered Binance order is not terminal"
+        );
+        self.record_intent(intent)?;
+        self.advance(
+            &order.client_order_id.clone(),
+            BinanceOrderProgress::Terminal {
+                order_id: order.order_id,
+                status: order.status.clone(),
+                executed_quantity: order.executed_qty.to_string(),
+                cumulative_quote_quantity: order.cummulative_quote_qty.to_string(),
+                order: Some(order),
+            },
+        )
     }
 
     pub fn advance(
@@ -483,9 +541,12 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use std::fs;
 
+    use rust_decimal::Decimal;
+
     use super::{
         BinanceOrderIntent, BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress,
     };
+    use crate::binance::ws_api::OrderResult;
 
     fn path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -536,6 +597,49 @@ mod tests {
             BinanceOrderProgress::Terminal { .. }
         ));
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn adopts_one_exact_discovered_terminal_order_without_duplicate_authority() {
+        let path = path("discovered-terminal");
+        let _ = fs::remove_file(&path);
+        let order = OrderResult {
+            symbol: "WLDUSDC".to_owned(),
+            order_id: 42,
+            client_order_id: "rustval123LB".to_owned(),
+            transact_time: Some(1_800_000_000_000),
+            price: Decimal::new(382, 3),
+            orig_qty: Decimal::new(261, 1),
+            executed_qty: Decimal::new(261, 1),
+            orig_quote_order_qty: Decimal::ZERO,
+            cummulative_quote_qty: Decimal::new(99_702, 4),
+            status: "FILLED".to_owned(),
+            time_in_force: "IOC".to_owned(),
+            order_type: "LIMIT".to_owned(),
+            side: "BUY".to_owned(),
+            fills: Vec::new(),
+        };
+        let mut journal = BinanceOrderJournal::open(&path).unwrap();
+        journal
+            .record_discovered_terminal(intent(), order.clone())
+            .unwrap();
+        assert!(journal.active_operations().is_empty());
+        assert_eq!(
+            journal.operations()["rustval123LB"].progress,
+            BinanceOrderProgress::Terminal {
+                order_id: 42,
+                status: "FILLED".to_owned(),
+                executed_quantity: "26.1".to_owned(),
+                cumulative_quote_quantity: "9.9702".to_owned(),
+                order: Some(order.clone()),
+            }
+        );
+        assert!(journal.record_discovered_terminal(intent(), order).is_err());
+        drop(journal);
+        let recovered = BinanceOrderJournal::open(&path).unwrap();
+        assert!(recovered.active_operations().is_empty());
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 
