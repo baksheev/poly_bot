@@ -1,10 +1,32 @@
 {
-  "description": "Critical poly_bot trading admission failures caused by insufficient available inventory.",
-  "filter": "((resource.type=\"gce_instance\" AND jsonPayload.message=~\"\\\"message\\\":\\\"arbitrage admission blocked by insufficient inventory\\\"\") OR (resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\" AND jsonPayload.fields.message=\"arbitrage admission blocked by insufficient inventory\"))",
+  "description": "Repeated poly_bot trading admission failures caused by non-transient insufficient inventory.",
+  "filter": "((resource.type=\"gce_instance\" AND jsonPayload.message=~\"\\\"message\\\":\\\"arbitrage admission blocked by insufficient inventory\\\"\") OR (resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"arb-bot\" AND resource.labels.namespace_name=\"arb-bot\" AND resource.labels.container_name=\"arb-bot\" AND jsonPayload.fields.message=\"arbitrage admission blocked by insufficient inventory\" AND jsonPayload.fields.rebalance_transient=false))",
   "metricDescriptor": {
     "displayName": "poly_bot trading inventory blocked",
     "metricKind": "DELTA",
     "valueType": "INT64",
-    "unit": "1"
+    "unit": "1",
+    "labels": [
+      {
+        "key": "pair_id",
+        "valueType": "STRING",
+        "description": "Trading pair whose admission was blocked."
+      },
+      {
+        "key": "shortage_asset",
+        "valueType": "STRING",
+        "description": "Primary economic asset with insufficient available inventory."
+      },
+      {
+        "key": "rebalance_phase",
+        "valueType": "STRING",
+        "description": "Same-asset rebalance phase observed when admission was blocked."
+      }
+    ]
+  },
+  "labelExtractors": {
+    "pair_id": "EXTRACT(jsonPayload.fields.pair_id)",
+    "shortage_asset": "EXTRACT(jsonPayload.fields.shortage_asset)",
+    "rebalance_phase": "EXTRACT(jsonPayload.fields.rebalance_phase)"
   }
 }

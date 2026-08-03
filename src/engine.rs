@@ -3475,11 +3475,59 @@ impl TradingEngine {
             );
             return;
         }
+        let shortage_assets = inventory_shortage_asset_symbols(claim_details);
+        let shortage_asset = shortage_assets.iter().next().map(String::as_str);
+        let shortage_assets_json = Value::Array(
+            shortage_assets
+                .iter()
+                .map(|asset| Value::String(asset.clone()))
+                .collect(),
+        );
+        let pending_token = self
+            .pending_rebalance
+            .as_ref()
+            .map(|evaluation| evaluation.token_symbol.as_str());
+        let inflight_token = self.rebalance_inflight.then(|| {
+            self.rebalance_inventory_reservations
+                .keys()
+                .find(|token| shortage_assets.contains(*token))
+                .map(String::as_str)
+        });
+        let settlement_token = self
+            .rebalance_settlement
+            .as_ref()
+            .map(|barrier| barrier.token_symbol.as_str());
+        let (rebalance_phase, rebalance_transient) = rebalance_phase_for_shortage_assets(
+            &shortage_assets,
+            pending_token,
+            inflight_token.flatten(),
+            settlement_token,
+            &self.rebalance_blocked_tokens,
+        );
+        if rebalance_transient {
+            tracing::warn!(
+                engine_id = %self.config.engine_id,
+                pair_id,
+                pair_symbol,
+                plan_id,
+                shortage_asset,
+                shortage_assets = %shortage_assets_json,
+                rebalance_phase,
+                rebalance_transient,
+                claims = %claims,
+                "arbitrage admission deferred while matching inventory rebalances"
+            );
+            return;
+        }
         tracing::error!(
             engine_id = %self.config.engine_id,
             pair_id,
             pair_symbol,
             plan_id,
+            shortage_asset,
+            shortage_assets = %shortage_assets_json,
+            rebalance_phase,
+            rebalance_transient,
             claims = %claims,
             "arbitrage admission blocked by insufficient inventory"
         );
@@ -3492,6 +3540,10 @@ impl TradingEngine {
                 let observed = self.inventory.observed(&claim.key);
                 let reserved = self.inventory.reserved(&claim.key);
                 let available = self.inventory.available(&claim.key).ok();
+                let shortage = available.is_some_and(|amount| amount < claim.amount);
+                let shortfall = available
+                    .filter(|amount| *amount < claim.amount)
+                    .map(|amount| claim.amount - amount);
                 json!({
                     "inventory_location_kind": claim.key.location.kind_label(),
                     "inventory_location_id": claim.key.location.stable_id(),
@@ -3504,6 +3556,8 @@ impl TradingEngine {
                     "observed_base_units": observed.map(|amount| amount.to_string()),
                     "reserved_base_units": reserved.to_string(),
                     "available_base_units": available.map(|amount| amount.to_string()),
+                    "shortage": shortage,
+                    "shortfall_base_units": shortfall.map(|amount| amount.to_string()),
                 })
             })
             .collect()
@@ -4089,6 +4143,40 @@ fn classify_inventory_admission_failure(error: &anyhow::Error) -> InventoryAdmis
     }
 }
 
+fn inventory_shortage_asset_symbols(claim_details: &[Value]) -> BTreeSet<String> {
+    claim_details
+        .iter()
+        .filter(|claim| claim.get("shortage").and_then(Value::as_bool) == Some(true))
+        .filter_map(|claim| claim.get("economic_asset_id").and_then(Value::as_str))
+        .map(|asset| asset.strip_prefix("economic:").unwrap_or(asset).to_owned())
+        .collect()
+}
+
+fn rebalance_phase_for_shortage_assets(
+    shortage_assets: &BTreeSet<String>,
+    pending_token: Option<&str>,
+    inflight_token: Option<&str>,
+    settlement_token: Option<&str>,
+    blocked_tokens: &BTreeSet<String>,
+) -> (&'static str, bool) {
+    if shortage_assets
+        .iter()
+        .any(|asset| blocked_tokens.contains(asset))
+    {
+        return ("quarantined", false);
+    }
+    if pending_token.is_some_and(|token| shortage_assets.contains(token)) {
+        return ("pending", true);
+    }
+    if inflight_token.is_some_and(|token| shortage_assets.contains(token)) {
+        return ("inflight", true);
+    }
+    if settlement_token.is_some_and(|token| shortage_assets.contains(token)) {
+        return ("settlement", true);
+    }
+    ("idle", false)
+}
+
 fn rebalance_reservation_id(pair_id: &str, sequence: u64) -> String {
     format!("rebalance-reservation-{pair_id}-{sequence}")
 }
@@ -4286,7 +4374,7 @@ fn pow10(exponent: u32) -> anyhow::Result<U256> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         time::{Duration, Instant},
     };
 
@@ -4302,6 +4390,7 @@ mod tests {
         state::BalanceState,
     };
     use alloy_primitives::U256;
+    use serde_json::json;
 
     use super::{
         AdaptiveCandidate, AdaptiveDepthSource, AdaptiveSizingRuntimeLimits, DepthObservation,
@@ -4309,7 +4398,8 @@ mod tests {
         TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
         classify_depth_health, classify_inventory_admission_failure, clock_sync_estimate_valid,
         estimate_exchange_event_to_socket_us, exact_execution_envelope_amounts,
-        mark_sequence_matched_update, rebalance_health_state, rebalance_reservation_id,
+        inventory_shortage_asset_symbols, mark_sequence_matched_update, rebalance_health_state,
+        rebalance_phase_for_shortage_assets, rebalance_reservation_id,
         requires_depth_for_runtime_phase, reservation_precheck,
     };
 
@@ -4329,6 +4419,83 @@ mod tests {
         assert_eq!(
             rebalance_reservation_id("arbitrum-usdc-esp", 7),
             "rebalance-reservation-arbitrum-usdc-esp-7"
+        );
+    }
+
+    #[test]
+    fn inventory_shortages_keep_structured_asset_identity() {
+        let claims = vec![
+            json!({
+                "economic_asset_id": "economic:USDC",
+                "shortage": false,
+            }),
+            json!({
+                "economic_asset_id": "economic:ESP",
+                "shortage": true,
+                "shortfall_base_units": "1654763030778280882143",
+            }),
+        ];
+
+        assert_eq!(
+            inventory_shortage_asset_symbols(&claims),
+            BTreeSet::from(["ESP".to_owned()])
+        );
+    }
+
+    #[test]
+    fn only_matching_active_rebalance_phases_are_transient() {
+        let shortages = BTreeSet::from(["ESP".to_owned()]);
+        let no_blocked_tokens = BTreeSet::new();
+
+        assert_eq!(
+            rebalance_phase_for_shortage_assets(
+                &shortages,
+                Some("ESP"),
+                None,
+                None,
+                &no_blocked_tokens,
+            ),
+            ("pending", true)
+        );
+        assert_eq!(
+            rebalance_phase_for_shortage_assets(
+                &shortages,
+                None,
+                Some("ESP"),
+                None,
+                &no_blocked_tokens,
+            ),
+            ("inflight", true)
+        );
+        assert_eq!(
+            rebalance_phase_for_shortage_assets(
+                &shortages,
+                None,
+                None,
+                Some("ESP"),
+                &no_blocked_tokens,
+            ),
+            ("settlement", true)
+        );
+        assert_eq!(
+            rebalance_phase_for_shortage_assets(
+                &shortages,
+                Some("USDC"),
+                None,
+                None,
+                &no_blocked_tokens,
+            ),
+            ("idle", false)
+        );
+        assert_eq!(
+            rebalance_phase_for_shortage_assets(
+                &shortages,
+                Some("ESP"),
+                None,
+                None,
+                &BTreeSet::from(["ESP".to_owned()]),
+            ),
+            ("quarantined", false)
         );
     }
 

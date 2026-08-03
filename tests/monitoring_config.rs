@@ -98,6 +98,8 @@ fn rebalance_fault_policy_targets_active_gke_owner() {
 
 #[test]
 fn trading_inventory_blocked_monitoring_accepts_runtime_logs_and_targets_active_gke_owner() {
+    let metric: Value = serde_json::from_str(TRADING_INVENTORY_BLOCKED_METRIC).unwrap();
+    let policy: Value = serde_json::from_str(TRADING_INVENTORY_BLOCKED_POLICY).unwrap();
     let metric_filter = filter_from(
         TRADING_INVENTORY_BLOCKED_METRIC,
         "trading inventory blocked log metric",
@@ -110,6 +112,7 @@ fn trading_inventory_blocked_monitoring_accepts_runtime_logs_and_targets_active_
     assert!(metric_filter.contains(
         r#"jsonPayload.fields.message="arbitrage admission blocked by insufficient inventory""#
     ));
+    assert!(metric_filter.contains(r#"jsonPayload.fields.rebalance_transient=false"#));
     assert!(metric_filter.contains(r#"jsonPayload.message=~"\"message\":\"arbitrage admission blocked by insufficient inventory\"""#));
     assert!(
         !metric_filter.contains(r#" AND "arbitrage admission blocked by insufficient inventory""#)
@@ -119,6 +122,29 @@ fn trading_inventory_blocked_monitoring_accepts_runtime_logs_and_targets_active_
     assert!(policy_filter.contains(
         r#"metric.type = "logging.googleapis.com/user/poly_bot_trading_inventory_blocked""#
     ));
+    for label in ["pair_id", "shortage_asset", "rebalance_phase"] {
+        assert_eq!(
+            metric["labelExtractors"][label],
+            format!("EXTRACT(jsonPayload.fields.{label})")
+        );
+        assert!(
+            policy["conditions"][0]["conditionThreshold"]["aggregations"][0]["groupByFields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == &format!("metric.label.{label}"))
+        );
+    }
+    let threshold = &policy["conditions"][0]["conditionThreshold"];
+    assert_eq!(threshold["aggregations"][0]["alignmentPeriod"], "900s");
+    assert_eq!(
+        threshold["aggregations"][0]["perSeriesAligner"],
+        "ALIGN_SUM"
+    );
+    assert_eq!(threshold["thresholdValue"], 2);
+    assert_eq!(threshold["duration"], "300s");
+    assert_eq!(policy["alertStrategy"]["autoClose"], "3600s");
+    assert_eq!(policy["severity"], "WARNING");
 }
 
 #[test]
