@@ -1796,6 +1796,7 @@ impl TradingEngine {
     /// independent supervisor tick. Pending work is never a durable stop and
     /// is always replaced by the newest plan before dispatch.
     pub fn refresh_pending_rebalance_execution(&mut self) {
+        self.reconcile_owned_rebalance_reservations();
         if self.config.rebalance_execution_mode != "full_live"
             || self.rebalance_inflight
             || self.rebalance_settlement.is_some()
@@ -2301,6 +2302,24 @@ impl TradingEngine {
             );
             self.rebalance_inventory_reservations
                 .retain(|_, reservation_id| reservation_id != operation_id);
+        }
+    }
+
+    fn reconcile_owned_rebalance_reservations(&mut self) {
+        let settled = settled_owned_rebalance_reservations(
+            &self.inventory,
+            &mut self.rebalance_inventory_reservations,
+        );
+        for (token, operation_id) in settled {
+            self.telemetry.emit(
+                "rebalance_owner_reservation_reconciled",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "operation_id": operation_id,
+                    "token": token,
+                    "reason": "shared_inventory_settled",
+                }),
+            );
         }
     }
 
@@ -3483,6 +3502,14 @@ impl TradingEngine {
                 .map(|asset| Value::String(asset.clone()))
                 .collect(),
         );
+        let shortage_locations = inventory_shortage_location_ids(claim_details);
+        let shortage_location = shortage_locations.iter().next().map(String::as_str);
+        let shortage_locations_json = Value::Array(
+            shortage_locations
+                .iter()
+                .map(|location| Value::String(location.clone()))
+                .collect(),
+        );
         let pending_token = self
             .pending_rebalance
             .as_ref()
@@ -3512,6 +3539,8 @@ impl TradingEngine {
                 plan_id,
                 shortage_asset,
                 shortage_assets = %shortage_assets_json,
+                shortage_location,
+                shortage_locations = %shortage_locations_json,
                 rebalance_phase,
                 rebalance_transient,
                 claims = %claims,
@@ -3526,6 +3555,8 @@ impl TradingEngine {
             plan_id,
             shortage_asset,
             shortage_assets = %shortage_assets_json,
+            shortage_location,
+            shortage_locations = %shortage_locations_json,
             rebalance_phase,
             rebalance_transient,
             claims = %claims,
@@ -4152,6 +4183,30 @@ fn inventory_shortage_asset_symbols(claim_details: &[Value]) -> BTreeSet<String>
         .collect()
 }
 
+fn inventory_shortage_location_ids(claim_details: &[Value]) -> BTreeSet<String> {
+    claim_details
+        .iter()
+        .filter(|claim| claim.get("shortage").and_then(Value::as_bool) == Some(true))
+        .filter_map(|claim| claim.get("inventory_location_id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn settled_owned_rebalance_reservations(
+    inventory: &SharedInventoryReservations,
+    owned: &mut BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let settled = owned
+        .iter()
+        .filter(|(_, operation_id)| inventory.reservation(operation_id).is_none())
+        .map(|(token, operation_id)| (token.clone(), operation_id.clone()))
+        .collect::<Vec<_>>();
+    for (token, _) in &settled {
+        owned.remove(token);
+    }
+    settled
+}
+
 fn rebalance_phase_for_shortage_assets(
     shortage_assets: &BTreeSet<String>,
     pending_token: Option<&str>,
@@ -4398,9 +4453,10 @@ mod tests {
         TradingReadiness, adaptive_candidate_is_better, admission_deadline_unix_seconds,
         classify_depth_health, classify_inventory_admission_failure, clock_sync_estimate_valid,
         estimate_exchange_event_to_socket_us, exact_execution_envelope_amounts,
-        inventory_shortage_asset_symbols, mark_sequence_matched_update, rebalance_health_state,
-        rebalance_phase_for_shortage_assets, rebalance_reservation_id,
-        requires_depth_for_runtime_phase, reservation_precheck,
+        inventory_shortage_asset_symbols, inventory_shortage_location_ids,
+        mark_sequence_matched_update, rebalance_health_state, rebalance_phase_for_shortage_assets,
+        rebalance_reservation_id, requires_depth_for_runtime_phase, reservation_precheck,
+        settled_owned_rebalance_reservations,
     };
 
     #[test]
@@ -4440,6 +4496,79 @@ mod tests {
             inventory_shortage_asset_symbols(&claims),
             BTreeSet::from(["ESP".to_owned()])
         );
+    }
+
+    #[test]
+    fn inventory_shortages_keep_structured_location_identity() {
+        let claims = vec![
+            json!({
+                "inventory_location_id": "binance-spot:primary",
+                "shortage": false,
+            }),
+            json!({
+                "inventory_location_id": "eip155:42161:evm-wallet:primary",
+                "shortage": true,
+            }),
+        ];
+
+        assert_eq!(
+            inventory_shortage_location_ids(&claims),
+            BTreeSet::from(["eip155:42161:evm-wallet:primary".to_owned()])
+        );
+    }
+
+    #[test]
+    fn owner_releases_local_rebalance_marker_after_shared_inventory_settles() {
+        let inventory = SharedInventoryReservations::default();
+        let binance = InventoryLocation::binance("binance-spot:primary").unwrap();
+        let wallet =
+            InventoryLocation::evm_wallet("eip155:42161", "eip155:42161:evm-wallet:primary")
+                .unwrap();
+        let binance_asset = "binance-spot:primary:asset:ESP";
+        let wallet_asset = "eip155:42161:erc20:esp";
+        inventory
+            .update_location(
+                binance.clone(),
+                1,
+                [(binance_asset.to_owned(), U256::from(10_000))],
+            )
+            .unwrap();
+        inventory
+            .update_location(
+                wallet.clone(),
+                1,
+                [(wallet_asset.to_owned(), U256::from(10_000))],
+            )
+            .unwrap();
+        let operation_id = "rebalance-reservation-arbitrum-usdc-esp-0";
+        inventory
+            .reserve(ReservationRequest {
+                operation_id: operation_id.to_owned(),
+                purpose: ReservationPurpose::Rebalance,
+                claims: vec![InventoryClaim {
+                    key: InventoryKey::new(binance.clone(), binance_asset).unwrap(),
+                    amount: U256::from(6_000),
+                }],
+                settlement_locations: [binance.clone(), wallet.clone()].into_iter().collect(),
+            })
+            .unwrap();
+        inventory.mark_pending_settlement(operation_id).unwrap();
+        let mut owned = BTreeMap::from([("ESP".to_owned(), operation_id.to_owned())]);
+
+        inventory
+            .update_location(wallet, 2, [(wallet_asset.to_owned(), U256::from(16_000))])
+            .unwrap();
+        inventory
+            .update_location(binance, 2, [(binance_asset.to_owned(), U256::from(4_000))])
+            .unwrap();
+
+        assert!(inventory.reservation(operation_id).is_none());
+        assert_eq!(owned.get("ESP").map(String::as_str), Some(operation_id));
+        assert_eq!(
+            settled_owned_rebalance_reservations(&inventory, &mut owned),
+            vec![("ESP".to_owned(), operation_id.to_owned())]
+        );
+        assert!(owned.is_empty());
     }
 
     #[test]

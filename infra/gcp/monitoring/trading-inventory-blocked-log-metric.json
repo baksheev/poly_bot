@@ -18,6 +18,11 @@
         "description": "Primary economic asset with insufficient available inventory."
       },
       {
+        "key": "shortage_location",
+        "valueType": "STRING",
+        "description": "Exact venue or wallet inventory location with insufficient available inventory."
+      },
+      {
         "key": "rebalance_phase",
         "valueType": "STRING",
         "description": "Same-asset rebalance phase observed when admission was blocked."
@@ -27,6 +32,7 @@
   "labelExtractors": {
     "pair_id": "EXTRACT(jsonPayload.fields.pair_id)",
     "shortage_asset": "EXTRACT(jsonPayload.fields.shortage_asset)",
+    "shortage_location": "EXTRACT(jsonPayload.fields.shortage_location)",
     "rebalance_phase": "EXTRACT(jsonPayload.fields.rebalance_phase)"
   }
 }

@@ -122,7 +122,12 @@ fn trading_inventory_blocked_monitoring_accepts_runtime_logs_and_targets_active_
     assert!(policy_filter.contains(
         r#"metric.type = "logging.googleapis.com/user/poly_bot_trading_inventory_blocked""#
     ));
-    for label in ["pair_id", "shortage_asset", "rebalance_phase"] {
+    for label in [
+        "pair_id",
+        "shortage_asset",
+        "shortage_location",
+        "rebalance_phase",
+    ] {
         assert_eq!(
             metric["labelExtractors"][label],
             format!("EXTRACT(jsonPayload.fields.{label})")

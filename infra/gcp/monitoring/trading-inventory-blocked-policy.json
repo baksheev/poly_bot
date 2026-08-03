@@ -15,6 +15,7 @@
             "groupByFields": [
               "metric.label.pair_id",
               "metric.label.shortage_asset",
+              "metric.label.shortage_location",
               "metric.label.rebalance_phase"
             ]
           }
@@ -30,7 +31,7 @@
   ],
   "documentation": {
     "mimeType": "text/markdown",
-    "content": "The production `poly_bot` runtime repeatedly saw viable arbitrage candidates for one pair but rejected admission because non-transient available inventory was insufficient. The condition requires at least three matching blocks in a 15-minute window, sustained for five minutes. Same-asset `pending`, `inflight`, and `settlement` rebalance windows are excluded; `idle` and `quarantined` shortages remain actionable. Inspect `pair_id`, `shortage_asset`, `rebalance_phase`, and `claims`, then inspect the separate rebalance-fault incident and venue balances before forcing new trades."
+    "content": "The production `poly_bot` runtime repeatedly saw viable arbitrage candidates for one pair but rejected admission because non-transient available inventory was insufficient at one exact venue or wallet location. The condition requires at least three matching blocks in a 15-minute window, sustained for five minutes. Same-asset `pending`, `inflight`, and `settlement` rebalance windows are excluded; `idle` and `quarantined` shortages remain actionable. Inspect `pair_id`, `shortage_asset`, `shortage_location`, `rebalance_phase`, and `claims`, then inspect the separate rebalance-fault incident and venue balances before forcing new trades."
   },
   "alertStrategy": {
     "autoClose": "3600s"
