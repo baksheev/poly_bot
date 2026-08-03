@@ -49,7 +49,7 @@ use crate::{
     },
     telemetry::{
         ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_DEX_REVERT_KIND, ARBITRAGE_EXECUTION_STAGE_KIND,
-        ARBITRAGE_RESULT_KIND, TelemetryHandle,
+        ARBITRAGE_RESULT_KIND, ARBITRAGE_TERMINAL_STATE_KIND, TelemetryHandle,
     },
 };
 
@@ -1222,6 +1222,12 @@ pub fn live_trade_channel<E: LiveLegExecutor>(
             "outcome": "success",
         }),
     );
+    for operation in coordinator.terminal_operations() {
+        telemetry.emit(
+            ARBITRAGE_TERMINAL_STATE_KIND,
+            terminal_state_payload(operation, true, "journal_startup_snapshot"),
+        );
+    }
     let initial_lane = initial_execution_lane(&coordinator);
     let (handle, receiver, _discarded) = PaperTradeHandle::channel(initial_lane);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -1311,7 +1317,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     &plan_id,
                     operation_existed_before_attempt,
                 );
-                self.publish_event(plan_id, Some(pair_id), state, false, None)?;
+                self.publish_event(plan_id, Some(pair_id), state, false, false, None)?;
             }
         }
         self.clear_recovery_safe_marker()?;
@@ -1670,10 +1676,19 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         Value::Bool(resumed_after_restart),
                     );
                     self.telemetry.emit(ARBITRAGE_RESULT_KIND, payload);
+                    self.telemetry.emit(
+                        ARBITRAGE_TERMINAL_STATE_KIND,
+                        terminal_state_payload(
+                            operation,
+                            resumed_after_restart,
+                            "execution_terminal",
+                        ),
+                    );
                     self.publish_event(
                         plan_id.to_owned(),
                         None,
                         PaperTradeEventState::Balanced,
+                        resumed_after_restart,
                         dex_filled(operation),
                         dex_settlement_log(operation),
                     )?;
@@ -1685,6 +1700,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         plan_id.to_owned(),
                         None,
                         PaperTradeEventState::BlockedUnknown,
+                        resumed_after_restart,
                         dex_filled(operation),
                         None,
                     )?;
@@ -1857,6 +1873,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         plan_id: String,
         rejected_pair_id: Option<String>,
         state: PaperTradeEventState,
+        resumed_after_restart: bool,
         dex_filled: bool,
         dex_settlement_log: Option<crate::chain::logs::ChainLog>,
     ) -> anyhow::Result<()> {
@@ -1871,12 +1888,29 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 plan_id,
                 pair_id,
                 state,
+                resumed_after_restart,
                 dex_filled,
                 dex_settlement_log,
                 terminal_observed_at: Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("live trade event receiver is closed"))
     }
+}
+
+fn terminal_state_payload(
+    operation: &TradeOperation,
+    resumed_after_restart: bool,
+    source: &'static str,
+) -> Value {
+    serde_json::json!({
+        "plan_id": operation.intent.plan_id,
+        "pair_id": operation.intent.pair_id,
+        "state": "Balanced",
+        "stage": operation.stage,
+        "outcome": operation.result.as_ref().map(|result| &result.outcome),
+        "resumed_after_restart": resumed_after_restart,
+        "source": source,
+    })
 }
 
 fn command_operation_id(intent: &TradeIntent, command: &CoordinatorCommand) -> String {
@@ -2165,7 +2199,7 @@ mod tests {
         live_execution::{
             LegFuture, LiveLegExecutor, LivePairPolicy, LiveRiskLimits,
             cap_dex_credit_to_execution_envelope, failed, failed_with_gas, live_trade_channel,
-            unknown,
+            terminal_state_payload, unknown,
         },
         telemetry::TelemetryHandle,
     };
@@ -3684,6 +3718,7 @@ mod tests {
 
         let recovered = events.recv().await.unwrap();
         assert_eq!(recovered.plan_id, old_plan_id);
+        assert!(recovered.resumed_after_restart);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             [
@@ -3695,6 +3730,7 @@ mod tests {
 
         let entered = events.recv().await.unwrap();
         assert_eq!(entered.plan_id, new_plan_id);
+        assert!(!entered.resumed_after_restart);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             [
@@ -3863,6 +3899,13 @@ mod tests {
             operation.result.as_ref().unwrap().outcome,
             TerminalOutcome::BalancedProfit
         );
+        let terminal = task.coordinator.terminal_operations();
+        assert_eq!(terminal.len(), 1);
+        let projection = terminal_state_payload(terminal[0], true, "journal_startup_snapshot");
+        assert_eq!(projection["plan_id"], plan_id);
+        assert_eq!(projection["state"], "Balanced");
+        assert_eq!(projection["stage"], "balanced_profit");
+        assert_eq!(projection["resumed_after_restart"], true);
         drop(task);
         fs::remove_file(journal).unwrap();
     }

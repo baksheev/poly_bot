@@ -3619,20 +3619,25 @@ impl TradingEngine {
             matches!(decoded.update, PoolUpdate::Swap { .. }),
             "receipt settlement log is not a Swap event"
         );
-        let freshness = self
-            .arbitrage_plan_freshness
-            .get(&event.plan_id)
-            .context("settlement proof has no admitted plan freshness")?;
-        let pair_id = freshness.pair_id.clone();
-        let admission_generation = freshness.pool_generation;
+        let freshness = self.arbitrage_plan_freshness.get(&event.plan_id);
+        ensure!(
+            freshness.is_some() || event.resumed_after_restart,
+            "settlement proof has no admitted plan freshness"
+        );
+        let pair_id = freshness
+            .map(|freshness| freshness.pair_id.clone())
+            .unwrap_or_else(|| event.pair_id.clone());
+        let admission_generation = freshness.map(|freshness| freshness.pool_generation);
         let pool_index = self
             .dex
             .pool_index(decoded.locator)
             .context("settlement proof targets an unknown pool")?;
-        ensure!(
-            pool_index == freshness.pool_index,
-            "settlement proof pool differs from the admitted pool"
-        );
+        if let Some(freshness) = freshness {
+            ensure!(
+                pool_index == freshness.pool_index,
+                "settlement proof pool differs from the admitted pool"
+            );
+        }
         match self.dex.apply_log(target)? {
             LogApplyResult::Applied {
                 pool_index: applied_pool_index,
@@ -3653,6 +3658,7 @@ impl TradingEngine {
                         "plan_id": event.plan_id,
                         "pool_index": pool_index,
                         "admission_generation": admission_generation,
+                        "resumed_without_freshness": freshness.is_none(),
                         "prepared_generation": refresh.generation(),
                         "kind": kind,
                         "block_number": target.block_number,
@@ -3672,6 +3678,7 @@ impl TradingEngine {
                         "plan_id": event.plan_id,
                         "pool_index": pool_index,
                         "admission_generation": admission_generation,
+                        "resumed_without_freshness": freshness.is_none(),
                         "block_number": target.block_number,
                         "transaction_index": target.transaction_index,
                         "log_index": target.log_index,

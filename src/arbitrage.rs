@@ -1378,6 +1378,10 @@ pub struct PaperTradeEvent {
     pub plan_id: String,
     pub pair_id: String,
     pub state: PaperTradeEventState,
+    /// True only when the durable coordinator resumed this operation after a
+    /// process restart. The engine uses this to distinguish a receipt already
+    /// represented by freshly hydrated chain state from a missing live proof.
+    pub resumed_after_restart: bool,
     pub dex_filled: bool,
     pub dex_settlement_log: Option<ChainLog>,
     pub terminal_observed_at: Instant,
@@ -1731,6 +1735,7 @@ impl PaperTradeTask {
                 plan_id,
                 pair_id,
                 state,
+                resumed_after_restart: false,
                 dex_filled,
                 dex_settlement_log,
                 terminal_observed_at: Instant::now(),
@@ -1907,6 +1912,17 @@ impl PaperTradeCoordinator {
 
     pub fn active_operations(&self) -> Vec<&TradeOperation> {
         self.journal.active_operations()
+    }
+
+    /// Terminal operations are projected separately from P&L results. The
+    /// projection is safe to repeat on every startup and lets downstream
+    /// consumers close stale unknown-exposure rows without duplicating P&L.
+    pub fn terminal_operations(&self) -> Vec<&TradeOperation> {
+        self.journal
+            .operations
+            .values()
+            .filter(|operation| operation.stage.terminal() && operation.result.is_some())
+            .collect()
     }
 
     /// Constant-time count used by the out-of-band recovery handoff. It keeps

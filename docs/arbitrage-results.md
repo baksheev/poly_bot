@@ -1,7 +1,7 @@
 # Comparable arbitrage results
 
 Status: live parent accounting active in GKE production
-Last reviewed: 2026-07-26
+Last reviewed: 2026-08-04
 
 The Rust equivalent of Rails `arbitrage_results` is the ClickHouse
 `arbitrage_results` table. It is populated asynchronously from terminal parent
@@ -29,6 +29,65 @@ persisted with new intents. `resumed_after_restart=true` identifies a terminal
 result first produced while reconciling an older journal operation. Such a
 result is economically real, but it must not be attributed to a new opportunity
 in the restart hour.
+
+## Terminal state projection for dashboards
+
+Live completion also emits `arbitrage_terminal_state` with the deterministic
+`plan_id`, `pair_id`, terminal stage, and `state=Balanced`. Unlike
+`arbitrage_result`, this is an idempotent state projection rather than an
+accounting row. Every process startup re-emits it for terminal operations found
+in the durable coordinator journal. Consumers may therefore use it to close a
+stale `BlockedUnknown` after a crash without double-counting P&L. P&L queries
+and the `arbitrage_results` materialized view must continue to consume only
+`arbitrage_result`.
+
+The diagnostics dashboard should compare the latest blocked timestamp with
+both result and terminal-state evidence. In particular, replace the historical
+`result_at = 0` predicate with a latest-state predicate equivalent to:
+
+```sql
+SELECT plan_id, blocked_at, result_at, terminal_at, pair_id
+FROM
+(
+    SELECT
+        JSONExtractString(payload_json, 'plan_id') AS plan_id,
+        maxIf(
+            observed_at_ms,
+            kind = 'arbitrage_inventory_state'
+              AND JSONExtractString(payload_json, 'state') = 'BlockedUnknown'
+        ) AS blocked_at,
+        maxIf(observed_at_ms, kind = 'arbitrage_result') AS result_at,
+        maxIf(
+            observed_at_ms,
+            kind = 'arbitrage_terminal_state'
+              AND JSONExtractString(payload_json, 'state') = 'Balanced'
+        ) AS terminal_at,
+        argMaxIf(
+            JSONExtractString(payload_json, 'pair_id'),
+            observed_at_ms,
+            kind IN (
+                'arbitrage_admitted',
+                'arbitrage_result',
+                'arbitrage_terminal_state'
+            ) AND JSONExtractString(payload_json, 'pair_id') != ''
+        ) AS pair_id
+    FROM runtime_telemetry
+    WHERE kind IN (
+        'arbitrage_inventory_state',
+        'arbitrage_admitted',
+        'arbitrage_result',
+        'arbitrage_terminal_state'
+    )
+      AND observed_at_ms >= toUnixTimestamp64Milli(now64(3, 'UTC') - INTERVAL 30 DAY)
+    GROUP BY plan_id
+)
+WHERE blocked_at > greatest(result_at, terminal_at)
+  AND plan_id != '';
+```
+
+This keeps a genuinely newer block visible while suppressing a block that has
+later durable terminal evidence. Do not union `arbitrage_terminal_state` into
+the daily P&L query: it is deliberately replayed on startup.
 
 ## Accounting contract
 
