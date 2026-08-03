@@ -210,6 +210,26 @@ impl RebalanceEvmExecutionOwner {
         )
         .await
     }
+
+    async fn reconcile_arbitrum(
+        &mut self,
+        operation_id: String,
+        purpose: &str,
+        call: &WalletCall,
+        timeout: Duration,
+    ) -> anyhow::Result<TransactionReceipt> {
+        self.arbitrum
+            .as_ref()
+            .context("rebalance EVM owner has no shared Arbitrum execution lane")?
+            .reconcile(EvmExecutionRequest {
+                operation_id,
+                purpose: purpose.to_owned(),
+                call: call.clone(),
+                confirmation_timeout: shared_evm_confirmation_timeout(timeout),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
 }
 
 fn shared_evm_confirmation_timeout(operation_timeout: Duration) -> Duration {
@@ -446,6 +466,66 @@ impl RebalanceExecutor {
             );
         }
         Ok(reopened)
+    }
+
+    /// Reconciles a quarantined Arbitrum wallet-to-Binance transfer against
+    /// the shared EVM journal. The owner is explicitly reconciliation-only, so
+    /// an absent or mismatched transaction cannot reserve a nonce or broadcast.
+    pub async fn reconcile_next_arbitrum_deposit_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        let Some(operation) = self
+            .execution_journal
+            .next_reconcilable_arbitrum_deposit_quarantine()?
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let (binance_network, chain_id) = match &operation.intent.route {
+            Route::Direct {
+                binance_network,
+                chain_id,
+            } => (binance_network.clone(), *chain_id),
+            _ => unreachable!("reconcilable deposit quarantine must be direct"),
+        };
+        ensure!(
+            chain_id == ARBITRUM_CHAIN_ID,
+            "reconcilable deposit quarantine is not on Arbitrum"
+        );
+        let address = self
+            .trading_binance
+            .evm_deposit_address(&operation.intent.token_symbol, &binance_network)
+            .await?;
+        let call = WalletCall::erc20_transfer(
+            operation.intent.token_contract,
+            address.address,
+            operation.intent.amount,
+        )?;
+        let receipt = self
+            .evm
+            .reconcile_arbitrum(
+                format!("{}:deposit", operation.intent.operation_id),
+                "rebalance_wallet_to_binance",
+                &call,
+                self.limits.operation_timeout,
+            )
+            .await?;
+        ensure!(
+            receipt.status == 1,
+            "reconciled Arbitrum rebalance deposit reverted"
+        );
+        let reconciled = self.execution_journal.record_reconciled_arbitrum_deposit(
+            &operation.intent.operation_id,
+            receipt.transaction_hash,
+        )?;
+        tracing::warn!(
+            operation_id = reconciled.intent.operation_id,
+            token = reconciled.intent.token_symbol,
+            transaction_hash = %receipt.transaction_hash,
+            block_number = receipt.block_number,
+            "reconciled quarantined Arbitrum deposit from the exact mined EVM transaction"
+        );
+        Ok(Some(reconciled))
     }
 
     pub fn quarantine_active_operation(

@@ -2997,6 +2997,8 @@ async fn run(
         } else {
             (None, None, Vec::new())
         };
+    let mut rebalance_recovery_operation = rebalance_recovery_operation;
+    let mut quarantined_rebalance_tokens = quarantined_rebalance_tokens;
     let user_data_subscription_id = user_data_stream.subscription_id();
     let multiplexed_binance_api = user_data_stream.api();
     tracing::info!(
@@ -3255,6 +3257,35 @@ async fn run(
                 )
                 .await?;
             shared_arbitrum_rebalance_owner_attached = true;
+            match executor.reconcile_next_arbitrum_deposit_quarantine().await {
+                Ok(Some(operation)) => {
+                    rebalance_recovery_operation = Some(operation);
+                    quarantined_rebalance_tokens = executor
+                        .quarantined_operations()
+                        .map(|operation| {
+                            (
+                                rebalance_target(operation),
+                                operation.intent.token_symbol.clone(),
+                                match &operation.progress {
+                                    arb_bot::rebalance::RebalanceExecutionProgress::Quarantined {
+                                        reason,
+                                    } => reason.clone(),
+                                    _ => unreachable!(
+                                        "quarantined operation iterator returned another state"
+                                    ),
+                                },
+                            )
+                        })
+                        .collect();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "quarantined Arbitrum deposit did not pass reconciliation-only recovery; token remains isolated"
+                    );
+                }
+            }
         }
         telemetry.emit(
             "runtime_journal_recovery",

@@ -1576,6 +1576,7 @@ struct WorkItem {
 
 struct CapitalWorkItem {
     request: EvmExecutionRequest,
+    reconciliation_only: bool,
     enqueued_at: Instant,
     response: oneshot::Sender<Result<TransactionReceipt, DexExecutionServiceError>>,
 }
@@ -1636,6 +1637,24 @@ impl EvmExecutionOwnerHandle {
         &self,
         request: EvmExecutionRequest,
     ) -> Result<TransactionReceipt, DexExecutionServiceError> {
+        self.dispatch(request, false).await
+    }
+
+    /// Reconciles one exact, already-journaled capital transaction. The
+    /// execution owner may read its canonical receipt, but it must not reserve
+    /// a nonce, sign, or broadcast when the operation is absent or mismatched.
+    pub async fn reconcile(
+        &self,
+        request: EvmExecutionRequest,
+    ) -> Result<TransactionReceipt, DexExecutionServiceError> {
+        self.dispatch(request, true).await
+    }
+
+    async fn dispatch(
+        &self,
+        request: EvmExecutionRequest,
+        reconciliation_only: bool,
+    ) -> Result<TransactionReceipt, DexExecutionServiceError> {
         if let Err(error) = request.validate() {
             return Err(DexExecutionServiceError::FailedBeforeSubmission {
                 reason: format!("{error:#}"),
@@ -1645,6 +1664,7 @@ impl EvmExecutionOwnerHandle {
         self.sender
             .send(CapitalWorkItem {
                 request,
+                reconciliation_only,
                 enqueued_at: Instant::now(),
                 response,
             })
@@ -1857,7 +1877,7 @@ impl DexExecutionService {
                                             confirmation_timeout: work.request.confirmation_timeout,
                                             submission_policy:
                                                 SwapSubmissionPolicy::SimulateAndEstimate,
-                                            allow_new_submission: true,
+                                            allow_new_submission: !work.reconciliation_only,
                                         },
                                         Some(work.enqueued_at),
                                     )
@@ -2684,6 +2704,98 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn capital_reconciliation_reads_mined_unknown_without_new_submission() {
+        let path = journal_path("capital-reconcile-mined-unknown");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let call = WalletCall::erc20_transfer(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            U256::from(10_u64),
+        )
+        .unwrap();
+        let transaction_hash = B256::repeat_byte(0x42);
+        let identity = JournalOperationIdentity {
+            operation_id: "rebalance-unknown:deposit".to_owned(),
+            chain_id: 480,
+            wallet: wallet.address(),
+            nonce: 7,
+            scope: None,
+        };
+        let mut journal = TransactionJournal::open(&path).unwrap();
+        journal
+            .record_intent(&JournalIntent {
+                identity: identity.clone(),
+                purpose: "rebalance_wallet_to_binance".to_owned(),
+                target: call.target(),
+                native_value: call.value(),
+                calldata_hash: keccak256(call.calldata()),
+            })
+            .unwrap();
+        journal.record_signed(&identity, transaction_hash).unwrap();
+        journal
+            .record_unknown_outcome(
+                &identity,
+                transaction_hash,
+                UnknownOutcomeReason::BroadcastTransport,
+            )
+            .unwrap();
+        drop(journal);
+
+        let (endpoint, server) =
+            spawn_known_receipt_rpc_with_logs_and_requests(transaction_hash, Vec::new(), 6);
+        let mut executor = DexExecutor::hydrate(
+            JsonRpcClient::new(endpoint).unwrap(),
+            wallet,
+            480,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        executor.allowance_mutations_enabled = false;
+        let service = DexExecutionService::spawn(executor, 1).unwrap();
+        let owner = service.evm_execution_owner();
+        let receipt = owner
+            .reconcile(EvmExecutionRequest {
+                operation_id: identity.operation_id.clone(),
+                purpose: "rebalance_wallet_to_binance".to_owned(),
+                call: call.clone(),
+                confirmation_timeout: Duration::from_secs(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.transaction_hash, transaction_hash);
+        assert_eq!(receipt.status, 1);
+
+        let absent = owner
+            .reconcile(EvmExecutionRequest {
+                operation_id: "rebalance-absent:deposit".to_owned(),
+                purpose: "rebalance_wallet_to_binance".to_owned(),
+                call,
+                confirmation_timeout: Duration::from_secs(5),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            absent,
+            DexExecutionServiceError::FailedBeforeSubmission { .. }
+        ));
+
+        drop(service);
+        server.join().unwrap();
+        let journal = TransactionJournal::open(&path).unwrap();
+        assert!(matches!(
+            journal.operation(&identity.operation_id).unwrap().status,
+            JournalStatus::MinedSuccess {
+                block_number: 123,
+                ..
+            }
+        ));
+        assert!(journal.operation("rebalance-absent:deposit").is_none());
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
     fn v3_request(operation_id: &str) -> ExactInputSwapRequest {
         let mut request = ExactInputSwapRequest::with_rails_defaults(
             operation_id,
@@ -2843,10 +2955,18 @@ mod tests {
         transaction_hash: B256,
         logs: Vec<Value>,
     ) -> (String, JoinHandle<()>) {
+        spawn_known_receipt_rpc_with_logs_and_requests(transaction_hash, logs, 4)
+    }
+
+    fn spawn_known_receipt_rpc_with_logs_and_requests(
+        transaction_hash: B256,
+        logs: Vec<Value>,
+        request_count: usize,
+    ) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let thread = std::thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..request_count {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_request(&mut stream);
                 let id = request["id"].clone();
@@ -2854,6 +2974,7 @@ mod tests {
                 let response = match method {
                     "eth_chainId" => rpc_result(id, json!("0x1e0")),
                     "eth_getTransactionCount" => rpc_result(id, json!("0x8")),
+                    "eth_gasPrice" => rpc_result(id, json!("0xf4240")),
                     "eth_getTransactionReceipt" => rpc_result(
                         id,
                         json!({

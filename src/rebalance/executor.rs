@@ -465,6 +465,62 @@ impl RebalanceExecutionJournal {
         })
     }
 
+    pub fn next_reconcilable_arbitrum_deposit_quarantine(
+        &self,
+    ) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
+        if self.active_operation()?.is_some() {
+            return Ok(None);
+        }
+        Ok(self.operations.values().find(|operation| {
+            let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
+                return false;
+            };
+            reason.starts_with("DEX outcome unknown:")
+                && operation.intent.direction == Direction::WalletToBinance
+                && matches!(
+                    &operation.intent.route,
+                    Route::Direct {
+                        chain_id: 42_161,
+                        binance_network,
+                    } if binance_network == "ARBITRUM"
+                )
+                && self
+                    .progress_before_quarantine
+                    .get(&operation.intent.operation_id)
+                    == Some(&RebalanceExecutionProgress::IntentRecorded)
+        }))
+    }
+
+    pub fn record_reconciled_arbitrum_deposit(
+        &mut self,
+        operation_id: &str,
+        transaction_hash: B256,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let current = self
+            .operations
+            .get(operation_id)
+            .with_context(|| format!("unknown rebalance operation {operation_id}"))?;
+        ensure!(
+            self.progress_before_quarantine.get(operation_id)
+                == Some(&RebalanceExecutionProgress::IntentRecorded),
+            "reconciled Arbitrum deposit quarantine did not follow an exact recorded intent"
+        );
+        let progress = RebalanceExecutionProgress::DepositTransferMined {
+            chain_id: 42_161,
+            transaction_hash,
+        };
+        ensure!(
+            reconciled_arbitrum_deposit_transition(&current.intent, &current.progress, &progress,),
+            "rebalance quarantine is not an approved reconciled Arbitrum deposit"
+        );
+        let next = RebalanceExecutionOperation {
+            intent: current.intent.clone(),
+            progress,
+        };
+        self.append(next.clone())?;
+        Ok(next)
+    }
+
     pub fn reopen_next_retryable_quarantine(
         &mut self,
     ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
@@ -1044,6 +1100,30 @@ fn corrected_guard_quarantine(reason: &str) -> bool {
         || signature_encoding_quarantine(reason)
 }
 
+fn reconciled_arbitrum_deposit_transition(
+    intent: &RebalanceExecutionIntent,
+    previous: &RebalanceExecutionProgress,
+    next: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        (&intent.route, intent.direction, previous, next),
+        (
+            Route::Direct {
+                chain_id: 42_161,
+                binance_network,
+            },
+            Direction::WalletToBinance,
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::DepositTransferMined {
+                chain_id: 42_161,
+                transaction_hash,
+            },
+        ) if binance_network == "ARBITRUM"
+            && reason.starts_with("DEX outcome unknown:")
+            && *transaction_hash != B256::ZERO
+    )
+}
+
 #[allow(clippy::match_like_matches_macro)]
 fn validate_transition(
     intent: &RebalanceExecutionIntent,
@@ -1110,6 +1190,8 @@ fn validate_transition(
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { api_mode, .. },
         ) if ownership_guard_quarantine(reason)
             && api_mode == "travel_rule_ae_self_owned"
+    ) || reconciled_arbitrum_deposit_transition(
+        intent, previous, next,
     );
     ensure!(
         !previous.terminal()
@@ -2374,6 +2456,105 @@ mod tests {
                 },
             )
             .expect("wallet movement is diagnostic when the exact master amount remains free");
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mined_arbitrum_deposit_reconciles_exact_unknown_quarantine() {
+        let path = path("arbitrum-deposit-unknown-reconciliation");
+        let transaction_hash = B256::repeat_byte(0x42);
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "DEX outcome unknown: JSON-RPC error -32000: nonce too low".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            journal
+                .next_reconcilable_arbitrum_deposit_quarantine()
+                .unwrap()
+                .unwrap()
+                .intent
+                .operation_id,
+            operation_id
+        );
+        assert!(
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::DepositTransferMined {
+                        chain_id: 42_161,
+                        transaction_hash,
+                    },
+                )
+                .is_err(),
+            "only the evidence-gated reconciliation method may bypass quarantine"
+        );
+        let reconciled = journal
+            .record_reconciled_arbitrum_deposit(&operation_id, transaction_hash)
+            .unwrap();
+        assert_eq!(
+            reconciled.progress,
+            RebalanceExecutionProgress::DepositTransferMined {
+                chain_id: 42_161,
+                transaction_hash,
+            }
+        );
+        drop(journal);
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert_eq!(
+            replayed.active_operation().unwrap().unwrap().progress,
+            reconciled.progress
+        );
+        assert!(
+            replayed
+                .next_reconcilable_arbitrum_deposit_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unrelated_quarantine_cannot_be_recorded_as_reconciled_deposit() {
+        let path = path("arbitrum-deposit-unrelated-quarantine");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, direct_arbitrum()))
+            .unwrap();
+        journal
+            .advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "operator review required".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            journal
+                .next_reconcilable_arbitrum_deposit_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .record_reconciled_arbitrum_deposit(
+                    &operation.intent.operation_id,
+                    B256::repeat_byte(0x42),
+                )
+                .is_err()
+        );
         drop(journal);
         fs::remove_file(path).unwrap();
     }
