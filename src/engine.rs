@@ -425,6 +425,19 @@ fn rebalance_health_state(
     }
 }
 
+fn rebalance_planning_deferred_reason(
+    inflight: bool,
+    settlement_waiting: bool,
+) -> Option<&'static str> {
+    if inflight {
+        Some("operation_inflight")
+    } else if settlement_waiting {
+        Some("settlement_waiting")
+    } else {
+        None
+    }
+}
+
 fn adaptive_candidate_is_better(candidate: AdaptiveCandidate, current: AdaptiveCandidate) -> bool {
     candidate.trade_notional > current.trade_notional
         || (candidate.trade_notional == current.trade_notional
@@ -2343,6 +2356,7 @@ impl TradingEngine {
     }
 
     fn evaluate_rebalance(&mut self) {
+        let calculation_started_at = Instant::now();
         let Some(binance) = self.state.balances.binance.as_ref() else {
             return;
         };
@@ -2372,7 +2386,23 @@ impl TradingEngine {
                 }),
             );
         }
-        let calculation_started_at = Instant::now();
+        if let Some(reason) = rebalance_planning_deferred_reason(
+            self.rebalance_inflight,
+            self.rebalance_settlement.is_some(),
+        ) {
+            self.telemetry.emit(
+                "capital_allocation_evaluated",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "allocator_mode": "v12_rebalance_compatibility",
+                    "calculation_validation_us": duration_us(calculation_started_at.elapsed()),
+                    "proposal_count": 0,
+                    "outcome": "deferred",
+                    "reason": reason,
+                }),
+            );
+            return;
+        }
         match self.rebalance.evaluate(binance, wallet) {
             Ok(evaluations) => {
                 let calculation_us = duration_us(calculation_started_at.elapsed());
@@ -4462,7 +4492,8 @@ mod tests {
         estimate_exchange_event_to_socket_us, exact_execution_envelope_amounts,
         inventory_shortage_asset_symbols, inventory_shortage_location_ids,
         mark_sequence_matched_update, rebalance_health_state, rebalance_phase_for_shortage_assets,
-        rebalance_reservation_id, requires_depth_for_runtime_phase, reservation_precheck,
+        rebalance_planning_deferred_reason, rebalance_reservation_id,
+        requires_depth_for_runtime_phase, reservation_precheck,
         settled_owned_rebalance_reservations,
     };
 
@@ -5044,6 +5075,23 @@ mod tests {
             }
             .ready()
         );
+    }
+
+    #[test]
+    fn rebalance_planning_defers_only_during_mutation_or_settlement() {
+        assert_eq!(
+            rebalance_planning_deferred_reason(true, false),
+            Some("operation_inflight")
+        );
+        assert_eq!(
+            rebalance_planning_deferred_reason(false, true),
+            Some("settlement_waiting")
+        );
+        assert_eq!(
+            rebalance_planning_deferred_reason(true, true),
+            Some("operation_inflight")
+        );
+        assert_eq!(rebalance_planning_deferred_reason(false, false), None);
     }
 
     #[test]
