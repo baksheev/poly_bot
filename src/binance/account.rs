@@ -855,6 +855,12 @@ impl BinanceApiError {
                     "Please note that withdrawals are not permitted due to travel rule restrictions. To facilitate the withdrawal process, please refer to Travel Rule documentation.",
                 )
     }
+
+    pub fn is_retryable_travel_rule_ownership_withdrawal_rejection(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+            && self.code == Some(-4024)
+            && self.message.as_deref() == Some("[031031] User does not own this currency.")
+    }
 }
 
 impl fmt::Display for BinanceApiError {
@@ -1074,6 +1080,28 @@ mod tests {
             ),
         };
         assert!(exact_travel_rule_required.is_travel_rule_required_withdrawal_rejection());
+
+        let retryable_travel_rule_ownership = BinanceApiError {
+            operation: "Travel Rule withdrawal submission".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            code: Some(-4024),
+            message: Some("[031031] User does not own this currency.".to_owned()),
+        };
+        assert!(
+            retryable_travel_rule_ownership
+                .is_retryable_travel_rule_ownership_withdrawal_rejection()
+        );
+
+        let different_ownership_rejection = BinanceApiError {
+            operation: "Travel Rule withdrawal submission".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            code: Some(-4024),
+            message: Some("different rejection".to_owned()),
+        };
+        assert!(
+            !different_ownership_rejection
+                .is_retryable_travel_rule_ownership_withdrawal_rejection()
+        );
     }
 
     #[test]

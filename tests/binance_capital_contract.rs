@@ -131,12 +131,37 @@ fn withdrawal_unknown_outcome_requires_composite_absence_proof_before_retry() {
     assert!(begin.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
     assert!(begin.contains("is_terminal_binance_withdrawal_rejection(&error)"));
     assert!(begin.contains("is_travel_rule_required_rejection(&error)"));
+    assert!(begin.contains("is_retryable_travel_rule_ownership_rejection(&error)"));
     assert!(begin.contains("submit_required_travel_rule_withdrawal"));
     assert!(begin.contains("RebalanceExecutionProgress::Failed { reason }"));
     assert!(
         REBALANCE_RUNTIME.contains("BinanceApiError::is_known_pre_submission_withdrawal_rejection")
     );
     assert!(!REBALANCE_RUNTIME.contains("BinanceWithdrawalRejected"));
+}
+
+#[test]
+fn exact_travel_rule_ownership_rejection_gets_one_proven_retry() {
+    let start = REBALANCE_RUNTIME
+        .find("async fn submit_required_travel_rule_withdrawal(")
+        .unwrap();
+    let end = REBALANCE_RUNTIME[start..]
+        .find("async fn ensure_travel_rule_ae_self_owned(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let submission = &REBALANCE_RUNTIME[start..end];
+
+    assert!(submission.contains("is_retryable_travel_rule_ownership_rejection(&error)"));
+    assert!(submission.contains("reconcile_unknown_withdrawal_and_retry(operation, network)"));
+    assert!(submission.contains("retry_limit = 1"));
+    assert!(
+        submission
+            .find("is_retryable_travel_rule_ownership_rejection")
+            .unwrap()
+            < submission
+                .find("is_terminal_binance_withdrawal_rejection")
+                .unwrap()
+    );
 }
 
 #[test]

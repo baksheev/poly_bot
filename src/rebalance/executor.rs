@@ -22,6 +22,8 @@ const VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
 const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 4;
+const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS: u8 = 1;
+const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalanceExecutionRequest {
@@ -285,6 +287,7 @@ pub struct RebalanceExecutionJournal {
     operation_started_at_unix_ms: BTreeMap<String, u64>,
     progress_before_quarantine: BTreeMap<String, RebalanceExecutionProgress>,
     quarantine_reopen_counts: BTreeMap<String, u8>,
+    travel_rule_ownership_reopen_counts: BTreeMap<String, u8>,
     next_sequence: u64,
     poisoned: bool,
 }
@@ -358,6 +361,7 @@ impl RebalanceExecutionJournal {
         let mut operation_started_at_unix_ms = BTreeMap::new();
         let mut progress_before_quarantine = BTreeMap::new();
         let mut quarantine_reopen_counts = BTreeMap::new();
+        let mut travel_rule_ownership_reopen_counts = BTreeMap::new();
         let mut expected_sequence = 0_u64;
         let mut reader = BufReader::new(
             file.try_clone()
@@ -416,6 +420,17 @@ impl RebalanceExecutionJournal {
                         .checked_add(1)
                         .context("rebalance quarantine reopen count overflow")?;
                 }
+                if retryable_travel_rule_ownership_reopen(
+                    &previous.progress,
+                    &payload.operation.progress,
+                ) {
+                    let count = travel_rule_ownership_reopen_counts
+                        .entry(payload.operation.intent.operation_id.clone())
+                        .or_insert(0_u8);
+                    *count = count
+                        .checked_add(1)
+                        .context("Travel Rule ownership rejection reopen count overflow")?;
+                }
             }
             apply_snapshot(
                 &mut operations,
@@ -434,6 +449,7 @@ impl RebalanceExecutionJournal {
             operation_started_at_unix_ms,
             progress_before_quarantine,
             quarantine_reopen_counts,
+            travel_rule_ownership_reopen_counts,
             next_sequence: expected_sequence,
             poisoned: false,
         })
@@ -530,6 +546,31 @@ impl RebalanceExecutionJournal {
         // turning a valid multi-token journal into a process-fatal error.
         if self.active_operation()?.is_some() {
             return Ok(None);
+        }
+        let terminal_candidate = self.operations.values().find(|operation| {
+            matches!(
+                &operation.progress,
+                RebalanceExecutionProgress::Failed { reason }
+                    if retryable_travel_rule_ownership_failure(reason)
+            ) && self
+                .travel_rule_ownership_reopen_counts
+                .get(&operation.intent.operation_id)
+                .copied()
+                .unwrap_or(0)
+                < MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS
+        });
+        if let Some(operation) = terminal_candidate {
+            let operation_id = operation.intent.operation_id.clone();
+            let bridge_balance_before = operation.intent.wallet_balance_before;
+            let reopened = self.advance(
+                &operation_id,
+                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                    api_mode: TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                    bridge_balance_before,
+                    reconciliation_queries: 0,
+                },
+            )?;
+            return Ok(Some(reopened));
         }
         let candidate = self.operations.values().find_map(|operation| {
             let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
@@ -766,18 +807,27 @@ impl RebalanceExecutionJournal {
                 RebalanceExecutionProgress::Quarantined { .. }
             ) {
                 self.progress_before_quarantine
-                    .insert(appended_operation_id.clone(), previous_progress);
+                    .insert(appended_operation_id.clone(), previous_progress.clone());
             } else if matches!(
                 previous_progress,
                 RebalanceExecutionProgress::Quarantined { .. }
             ) {
                 let count = self
                     .quarantine_reopen_counts
-                    .entry(appended_operation_id)
+                    .entry(appended_operation_id.clone())
                     .or_insert(0);
                 *count = count
                     .checked_add(1)
                     .context("rebalance quarantine reopen count overflow")?;
+            }
+            if retryable_travel_rule_ownership_reopen(&previous_progress, &appended_progress) {
+                let count = self
+                    .travel_rule_ownership_reopen_counts
+                    .entry(appended_operation_id.clone())
+                    .or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .context("Travel Rule ownership rejection reopen count overflow")?;
             }
         }
         self.operation_started_at_unix_ms = next_started_at;
@@ -1094,6 +1144,29 @@ fn signature_encoding_quarantine(reason: &str) -> bool {
         == "Binance Travel Rule withdrawal submission failed with HTTP 400 Bad Request, code -1022: Signature for this request is not valid."
 }
 
+fn retryable_travel_rule_ownership_failure(reason: &str) -> bool {
+    reason
+        == "terminal Binance Travel Rule withdrawal rejection: Binance Travel Rule withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency."
+}
+
+fn retryable_travel_rule_ownership_reopen(
+    previous: &RebalanceExecutionProgress,
+    next: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Failed { reason },
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                reconciliation_queries: 0,
+                ..
+            },
+        ) if retryable_travel_rule_ownership_failure(reason)
+            && api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE
+    )
+}
+
 fn corrected_guard_quarantine(reason: &str) -> bool {
     reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
         || ownership_guard_quarantine(reason)
@@ -1154,6 +1227,8 @@ fn validate_transition(
                 reason == "terminal Binance local-entity withdrawal rejection: Binance local-entity withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency."
                     && api_mode == "standard"
             )
+            || (retryable_travel_rule_ownership_failure(reason)
+                && api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE)
     );
     let approved_terminal_manual_completion = matches!(
         (previous, next),
@@ -1960,7 +2035,8 @@ mod tests {
 
     use super::{
         RebalanceExecutionAuthority, RebalanceExecutionJournal, RebalanceExecutionProgress,
-        RebalanceExecutionRequest, WirePayload, WireRecord, stale_master_return_client_id,
+        RebalanceExecutionRequest, TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE, WirePayload,
+        WireRecord, stale_master_return_client_id,
     };
     use crate::rebalance::{Direction, RebalanceAction, Route};
 
@@ -2219,6 +2295,60 @@ mod tests {
             )
             .unwrap();
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exact_travel_rule_031031_failure_reopens_once_for_a_proven_retry() {
+        let path = path("travel-rule-031031-bounded-retry");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        let bridge_balance_before = operation.intent.wallet_balance_before;
+        let failure = "terminal Binance Travel Rule withdrawal rejection: Binance Travel Rule withdrawal submission failed with HTTP 400 Bad Request, code -4024: [031031] User does not own this currency.";
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: failure.to_owned(),
+                },
+            )
+            .unwrap();
+
+        let reopened = journal
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the reviewed ownership rejection should reopen once");
+        assert!(matches!(
+            reopened.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                bridge_balance_before: observed_bridge_balance,
+                reconciliation_queries: 0,
+            } if api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE
+                && observed_bridge_balance == bridge_balance_before
+        ));
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: failure.to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(
+            replayed
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none(),
+            "a second -4024 must remain terminal across restart"
+        );
+        drop(replayed);
         fs::remove_file(path).unwrap();
     }
 

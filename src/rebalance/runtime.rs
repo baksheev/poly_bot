@@ -1973,8 +1973,7 @@ impl RebalanceExecutor {
                     *reconciliation_queries <= 1,
                     "journaled Travel Rule withdrawal exceeded its reconciliation query authority"
                 );
-                return self
-                    .reconcile_unknown_withdrawal_and_retry(operation, network)
+                return Box::pin(self.reconcile_unknown_withdrawal_and_retry(operation, network))
                     .await;
             }
             ensure!(
@@ -2643,6 +2642,18 @@ impl RebalanceExecutor {
             .await
         {
             Ok(reference) => reference,
+            Err(error) if is_retryable_travel_rule_ownership_rejection(&error) => {
+                tracing::warn!(
+                    operation_id = operation.intent.operation_id,
+                    token = operation.intent.token_symbol,
+                    network,
+                    error = %format!("{error:#}"),
+                    retry_limit = 1,
+                    "Binance Travel Rule ownership rejection will be retried after absence proof"
+                );
+                return Box::pin(self.reconcile_unknown_withdrawal_and_retry(operation, network))
+                    .await;
+            }
             Err(error) if is_terminal_binance_withdrawal_rejection(&error) => {
                 let reason = format!("terminal Binance Travel Rule withdrawal rejection: {error}");
                 self.execution_journal.advance(
@@ -3491,6 +3502,12 @@ fn is_travel_rule_required_rejection(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<BinanceApiError>()
         .is_some_and(BinanceApiError::is_travel_rule_required_withdrawal_rejection)
+}
+
+fn is_retryable_travel_rule_ownership_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BinanceApiError>()
+        .is_some_and(BinanceApiError::is_retryable_travel_rule_ownership_withdrawal_rejection)
 }
 
 fn same_withdrawal_retry_authority(

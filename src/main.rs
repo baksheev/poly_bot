@@ -4871,28 +4871,6 @@ async fn dispatch_next_rebalance_execution(
     primary_engine.refresh_pending_rebalance_execution();
     arbitrum_engine.refresh_pending_rebalance_execution();
 
-    // Arbitrage and both rebalancers share observed Binance inventory. Planning
-    // against a transient reservation produced the production audit failures
-    // seen immediately after the ESP fill. Keep the latest plan pending and let
-    // the independent supervisor retry it as soon as settlement releases all
-    // inventory operations.
-    if primary_engine.active_inventory_operation_count()
-        + arbitrum_engine.active_inventory_operation_count()
-        > 0
-    {
-        if primary_engine.pending_rebalance_execution().is_some() {
-            primary_engine.defer_pending_rebalance_execution(
-                "shared inventory operation must settle before rebalance dispatch",
-            );
-        }
-        if arbitrum_engine.pending_rebalance_execution().is_some() {
-            arbitrum_engine.defer_pending_rebalance_execution(
-                "shared inventory operation must settle before rebalance dispatch",
-            );
-        }
-        return Ok(());
-    }
-
     for target in [*next_target, next_target.other()] {
         let outcome = match target {
             RebalanceExecutionTarget::Primary => {
@@ -4941,12 +4919,6 @@ async fn dispatch_rebalance_execution(
     engine.refresh_pending_rebalance_execution();
     if engine.pending_rebalance_execution().is_none() {
         return Ok(RebalanceDispatchOutcome::NoWork);
-    }
-    if engine.active_inventory_operation_count() > 0 {
-        engine.defer_pending_rebalance_execution(
-            "active inventory operation must settle before rebalance dispatch",
-        );
-        return Ok(RebalanceDispatchOutcome::Deferred);
     }
     let rebalance_remaining = if target == RebalanceExecutionTarget::Arbitrum {
         let Some(evaluation) = engine.pending_rebalance_execution() else {
