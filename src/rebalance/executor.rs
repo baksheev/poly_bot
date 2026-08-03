@@ -22,7 +22,9 @@ const VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
 const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 4;
-const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS: u8 = 1;
+pub const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES: u8 = 3;
+const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS: u8 =
+    MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES - 1;
 const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -547,30 +549,24 @@ impl RebalanceExecutionJournal {
         if self.active_operation()?.is_some() {
             return Ok(None);
         }
-        let terminal_candidate = self.operations.values().find(|operation| {
-            matches!(
-                &operation.progress,
-                RebalanceExecutionProgress::Failed { reason }
-                    if retryable_travel_rule_ownership_failure(reason)
-            ) && self
-                .travel_rule_ownership_reopen_counts
-                .get(&operation.intent.operation_id)
-                .copied()
-                .unwrap_or(0)
-                < MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS
-        });
-        if let Some(operation) = terminal_candidate {
-            let operation_id = operation.intent.operation_id.clone();
-            let bridge_balance_before = operation.intent.wallet_balance_before;
-            let reopened = self.advance(
-                &operation_id,
-                RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
-                    api_mode: TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
-                    bridge_balance_before,
-                    reconciliation_queries: 0,
-                },
-            )?;
-            return Ok(Some(reopened));
+        let terminal_candidate = self
+            .operations
+            .values()
+            .find(|operation| {
+                matches!(
+                    &operation.progress,
+                    RebalanceExecutionProgress::Failed { reason }
+                        if retryable_travel_rule_ownership_failure(reason)
+                ) && self
+                    .travel_rule_ownership_reopen_counts
+                    .get(&operation.intent.operation_id)
+                    .copied()
+                    .unwrap_or(0)
+                    < MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS
+            })
+            .map(|operation| operation.intent.operation_id.clone());
+        if let Some(operation_id) = terminal_candidate {
+            return self.reopen_retryable_travel_rule_ownership_failure(&operation_id);
         }
         let candidate = self.operations.values().find_map(|operation| {
             let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
@@ -595,6 +591,41 @@ impl RebalanceExecutionJournal {
             return Ok(None);
         };
         let reopened = self.advance(&operation_id, progress)?;
+        Ok(Some(reopened))
+    }
+
+    pub fn reopen_retryable_travel_rule_ownership_failure(
+        &mut self,
+        operation_id: &str,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        if self.active_operation()?.is_some() {
+            return Ok(None);
+        }
+        let Some(operation) = self.operations.get(operation_id) else {
+            return Ok(None);
+        };
+        let retryable = matches!(
+            &operation.progress,
+            RebalanceExecutionProgress::Failed { reason }
+                if retryable_travel_rule_ownership_failure(reason)
+        );
+        let reopen_count = self
+            .travel_rule_ownership_reopen_counts
+            .get(operation_id)
+            .copied()
+            .unwrap_or(0);
+        if !retryable || reopen_count >= MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS {
+            return Ok(None);
+        }
+        let bridge_balance_before = operation.intent.wallet_balance_before;
+        let reopened = self.advance(
+            operation_id,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode: TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE.to_owned(),
+                bridge_balance_before,
+                reconciliation_queries: 0,
+            },
+        )?;
         Ok(Some(reopened))
     }
 
@@ -2308,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_travel_rule_031031_failure_reopens_once_for_a_proven_retry() {
+    fn exact_travel_rule_031031_failure_allows_three_total_proven_retries() {
         let path = path("travel-rule-031031-bounded-retry");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -2347,6 +2378,26 @@ mod tests {
                 },
             )
             .unwrap();
+        let reopened_again = journal
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the reviewed ownership rejection should reopen twice");
+        assert!(matches!(
+            reopened_again.progress,
+            RebalanceExecutionProgress::BinanceWithdrawalSubmissionStarted {
+                api_mode,
+                reconciliation_queries: 0,
+                ..
+            } if api_mode == TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE
+        ));
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Failed {
+                    reason: failure.to_owned(),
+                },
+            )
+            .unwrap();
         drop(journal);
 
         let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
@@ -2355,7 +2406,7 @@ mod tests {
                 .reopen_next_retryable_quarantine()
                 .unwrap()
                 .is_none(),
-            "a second -4024 must remain terminal across restart"
+            "the fourth retry must remain terminal across restart"
         );
         drop(replayed);
         fs::remove_file(path).unwrap();

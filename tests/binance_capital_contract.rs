@@ -1,4 +1,5 @@
 const CAPITAL: &str = include_str!("../src/binance/capital.rs");
+const REBALANCE_EXECUTOR: &str = include_str!("../src/rebalance/executor.rs");
 const REBALANCE_RUNTIME: &str = include_str!("../src/rebalance/runtime.rs");
 const APP_CONFIG: &str = include_str!("../src/config.rs");
 const GKE_DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
@@ -168,7 +169,7 @@ fn unindexed_master_transfer_reuses_its_id_only_after_two_phase_absence_proof() 
 }
 
 #[test]
-fn exact_travel_rule_ownership_rejection_gets_one_proven_retry() {
+fn exact_travel_rule_ownership_rejection_gets_three_proven_retries() {
     let start = REBALANCE_RUNTIME
         .find("async fn submit_required_travel_rule_withdrawal(")
         .unwrap();
@@ -180,7 +181,7 @@ fn exact_travel_rule_ownership_rejection_gets_one_proven_retry() {
 
     assert!(submission.contains("is_retryable_travel_rule_ownership_rejection(&error)"));
     assert!(submission.contains("reconcile_unknown_withdrawal_and_retry(operation, network)"));
-    assert!(submission.contains("retry_limit = 1"));
+    assert!(submission.contains("retry_limit = MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES"));
     assert!(
         submission
             .find("is_retryable_travel_rule_ownership_rejection")
@@ -189,6 +190,12 @@ fn exact_travel_rule_ownership_rejection_gets_one_proven_retry() {
                 .find("is_terminal_binance_withdrawal_rejection")
                 .unwrap()
     );
+    assert!(
+        REBALANCE_EXECUTOR
+            .contains("pub const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES: u8 = 3;")
+    );
+    assert!(REBALANCE_RUNTIME.contains("process_with_travel_rule_ownership_retries"));
+    assert!(REBALANCE_RUNTIME.contains("reopen_retryable_travel_rule_ownership_failure"));
 }
 
 #[test]

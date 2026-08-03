@@ -37,7 +37,7 @@ use rust_decimal::Decimal;
 
 use super::{
     Direction, RebalanceExecutionJournal, RebalanceExecutionOperation, RebalanceExecutionProgress,
-    RebalanceExecutionRequest, Route,
+    RebalanceExecutionRequest, Route, executor::MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES,
 };
 
 const GAS_LIMIT_MARGIN_NUMERATOR: u64 = 120;
@@ -900,7 +900,9 @@ impl RebalanceExecutor {
             operation.intent.wallet_owner == self.evm.wallet_address(),
             "journaled rebalance wallet differs from signer"
         );
-        self.process(operation, false).await.map(Some)
+        self.process_with_travel_rule_ownership_retries(operation, false)
+            .await
+            .map(Some)
     }
 
     pub async fn execute(
@@ -934,7 +936,39 @@ impl RebalanceExecutor {
         }
         let operation = self.execution_journal.reserve(&request)?;
         self.emit_rebalance_risk_snapshot();
-        self.process(operation, true).await
+        self.process_with_travel_rule_ownership_retries(operation, true)
+            .await
+    }
+
+    async fn process_with_travel_rule_ownership_retries(
+        &mut self,
+        mut operation: RebalanceExecutionOperation,
+        mut created_here: bool,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let operation_id = operation.intent.operation_id.clone();
+        loop {
+            match self.process(operation, created_here).await {
+                Ok(operation) => return Ok(operation),
+                Err(error) if is_retryable_travel_rule_ownership_rejection(&error) => {
+                    let Some(reopened) = self
+                        .execution_journal
+                        .reopen_retryable_travel_rule_ownership_failure(&operation_id)?
+                    else {
+                        return Err(error);
+                    };
+                    tracing::warn!(
+                        operation_id,
+                        token = reopened.intent.token_symbol,
+                        retry_limit = MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES,
+                        error = %format!("{error:#}"),
+                        "Binance Travel Rule ownership rejection will receive another proven retry"
+                    );
+                    operation = reopened;
+                    created_here = false;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn process(
@@ -2723,7 +2757,7 @@ impl RebalanceExecutor {
                     token = operation.intent.token_symbol,
                     network,
                     error = %format!("{error:#}"),
-                    retry_limit = 1,
+                    retry_limit = MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES,
                     "Binance Travel Rule ownership rejection will be retried after absence proof"
                 );
                 return Box::pin(self.reconcile_unknown_withdrawal_and_retry(operation, network))
