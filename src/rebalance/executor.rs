@@ -1169,6 +1169,8 @@ fn retryable_travel_rule_ownership_reopen(
 
 fn corrected_guard_quarantine(reason: &str) -> bool {
     reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
+        || reason
+            == "rebalance intent has no indexed Binance master transfer; operator review required"
         || ownership_guard_quarantine(reason)
         || signature_encoding_quarantine(reason)
 }
@@ -1265,6 +1267,13 @@ fn validate_transition(
             RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized { api_mode, .. },
         ) if ownership_guard_quarantine(reason)
             && api_mode == "travel_rule_ae_self_owned"
+    ) || matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::IntentRecorded,
+        ) if reason
+            == "rebalance intent has no indexed Binance master transfer; operator review required"
     ) || reconciled_arbitrum_deposit_transition(
         intent, previous, next,
     );
@@ -2805,6 +2814,38 @@ mod tests {
                 .reopen_next_retryable_quarantine()
                 .unwrap()
                 .is_none()
+        );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unindexed_master_transfer_quarantine_reopens_the_exact_recorded_intent() {
+        let path = path("unindexed-master-transfer-reopen");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "rebalance intent has no indexed Binance master transfer; operator review required"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("an unindexed deterministic master transfer should reopen");
+        assert_eq!(
+            reopened.progress,
+            RebalanceExecutionProgress::IntentRecorded
         );
         drop(replayed);
         fs::remove_file(path).unwrap();

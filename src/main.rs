@@ -4981,10 +4981,23 @@ async fn dispatch_rebalance_execution(
             );
             bounded
         };
-        let proposal = engine
+        let proposal = match engine
             .authorize_pending_rebalance_allocation(authorized_fee)
-            .await?
-            .context("rebalance capital allocator returned no proposal")?;
+            .await
+        {
+            Ok(proposal) => proposal.context("rebalance capital allocator returned no proposal")?,
+            Err(error) if transient_capital_allocator_inventory_mismatch(&error) => {
+                tracing::info!(
+                    error = %format!("{error:#}"),
+                    "rebalance allocation deferred while an active inventory reservation settles"
+                );
+                engine.defer_pending_rebalance_execution(
+                    "capital allocator inventory snapshot is transiently unsettled",
+                );
+                return Ok(RebalanceDispatchOutcome::Deferred);
+            }
+            Err(error) => return Err(error),
+        };
         ensure!(
             proposal.external_mutation_authorized
                 && proposal.source_debit == action.amount
@@ -5059,6 +5072,17 @@ async fn dispatch_rebalance_execution(
         },
     ));
     Ok(RebalanceDispatchOutcome::Submitted)
+}
+
+fn transient_capital_allocator_inventory_mismatch(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.to_string().as_str(),
+            "reserved portfolio amount exceeds observed balance"
+                | "portfolio reservations exceed observed economic asset"
+                | "allocator reservations exceed observed source inventory"
+        )
+    })
 }
 
 fn mark_runtime_ready() -> anyhow::Result<Option<PathBuf>> {
@@ -5814,7 +5838,7 @@ mod tests {
     use super::{
         RebalanceDispatchOutcome, RebalanceExecutionTarget, StartupDexDrainStats,
         apply_rebalance_dispatch_outcome, esp_evm_journal_scope, rebalance_quote_retry_delay,
-        sync_runtime_ready_marker,
+        sync_runtime_ready_marker, transient_capital_allocator_inventory_mismatch,
     };
 
     #[test]
@@ -5872,6 +5896,20 @@ mod tests {
         assert_eq!(rebalance_quote_retry_delay(4), Duration::from_secs(40));
         assert_eq!(rebalance_quote_retry_delay(5), Duration::from_secs(60));
         assert_eq!(rebalance_quote_retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn transient_allocator_inventory_mismatch_is_deferred_without_hiding_other_errors() {
+        assert!(transient_capital_allocator_inventory_mismatch(
+            &anyhow::anyhow!("reserved portfolio amount exceeds observed balance")
+        ));
+        assert!(transient_capital_allocator_inventory_mismatch(
+            &anyhow::anyhow!("allocator reservations exceed observed source inventory")
+                .context("rebalance allocation failed")
+        ));
+        assert!(!transient_capital_allocator_inventory_mismatch(
+            &anyhow::anyhow!("capital allocator returned a malformed proposal")
+        ));
     }
 
     #[test]

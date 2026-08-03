@@ -141,6 +141,33 @@ fn withdrawal_unknown_outcome_requires_composite_absence_proof_before_retry() {
 }
 
 #[test]
+fn unindexed_master_transfer_reuses_its_id_only_after_two_phase_absence_proof() {
+    let start = REBALANCE_RUNTIME
+        .find("async fn begin_master_transfer(")
+        .unwrap();
+    let end = REBALANCE_RUNTIME[start..]
+        .find("async fn finish_master_transfer(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let implementation = &REBALANCE_RUNTIME[start..end];
+
+    let proof = implementation
+        .find("confirm_unindexed_master_transfer_absent")
+        .unwrap();
+    let retry = implementation
+        .find("universal_transfer_from_subaccount")
+        .unwrap();
+    assert!(proof < retry);
+    assert!(implementation.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
+    assert!(implementation.contains("history.is_empty()"));
+    assert!(implementation.contains("first.0.is_zero()"));
+    assert!(implementation.contains("second.0.is_zero()"));
+    assert!(implementation.contains("second.2 >= operation.intent.amount"));
+    assert!(implementation.contains("client_transaction_id"));
+    assert!(implementation.contains("validate_master_transfer_record"));
+}
+
+#[test]
 fn exact_travel_rule_ownership_rejection_gets_one_proven_retry() {
     let start = REBALANCE_RUNTIME
         .find("async fn submit_required_travel_rule_withdrawal(")

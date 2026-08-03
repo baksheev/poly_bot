@@ -1843,21 +1843,38 @@ impl RebalanceExecutor {
             validate_master_transfer_record(&operation, &self.subaccount_email, record)?;
             record.transaction_id
         } else {
-            ensure!(
-                created_here,
-                "rebalance intent has no indexed Binance master transfer; operator review required"
-            );
+            if !created_here {
+                self.confirm_unindexed_master_transfer_absent(&operation)
+                    .await?;
+            }
             let amount =
                 base_units_to_decimal(operation.intent.amount, operation.intent.token_decimals)?;
-            self.treasury_binance
+            let submission = self
+                .treasury_binance
                 .universal_transfer_from_subaccount(
                     &self.subaccount_email,
                     &operation.intent.token_symbol,
                     amount,
                     client_transaction_id,
                 )
-                .await?
-                .transaction_id
+                .await;
+            match submission {
+                Ok(submission) => submission.transaction_id,
+                Err(error) if !created_here => {
+                    let indexed = self
+                        .treasury_binance
+                        .universal_transfer_history(&self.subaccount_email, client_transaction_id)
+                        .await?;
+                    let Some(record) = indexed.first() else {
+                        return Err(error).context(
+                            "idempotent Binance master-transfer retry failed without an indexed transfer",
+                        );
+                    };
+                    validate_master_transfer_record(&operation, &self.subaccount_email, record)?;
+                    record.transaction_id
+                }
+                Err(error) => return Err(error),
+            }
         };
         self.execution_journal.advance(
             &operation.intent.operation_id,
@@ -1866,6 +1883,64 @@ impl RebalanceExecutor {
                 bridge_balance_before,
             },
         )
+    }
+
+    async fn confirm_unindexed_master_transfer_absent(
+        &self,
+        operation: &RebalanceExecutionOperation,
+    ) -> anyhow::Result<()> {
+        let first = self
+            .observe_unindexed_master_transfer_absence(operation)
+            .await?;
+        tokio::time::sleep(UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY).await;
+        let second = self
+            .observe_unindexed_master_transfer_absence(operation)
+            .await?;
+        ensure!(
+            first.0.is_zero() && first.1.is_zero() && second.0.is_zero() && second.1.is_zero(),
+            "unindexed Binance master-transfer retry found staged master inventory"
+        );
+        ensure!(
+            first.2 >= operation.intent.amount && second.2 >= operation.intent.amount,
+            "unindexed Binance master-transfer retry lacks sufficient source inventory"
+        );
+        tracing::warn!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            client_transaction_id = operation.intent.withdraw_order_id,
+            first_trading_free_base_units = first.2.to_string(),
+            second_trading_free_base_units = second.2.to_string(),
+            confirmation_delay_ms = UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY.as_millis(),
+            "proved an unindexed Binance master transfer absent; retrying its deterministic client id"
+        );
+        Ok(())
+    }
+
+    async fn observe_unindexed_master_transfer_absence(
+        &self,
+        operation: &RebalanceExecutionOperation,
+    ) -> anyhow::Result<(U256, U256, U256)> {
+        let (history, master, trading) = tokio::try_join!(
+            self.treasury_binance.universal_transfer_history(
+                &self.subaccount_email,
+                &operation.intent.withdraw_order_id,
+            ),
+            self.treasury_binance.account_information(),
+            self.trading_binance.account_information(),
+        )?;
+        ensure!(
+            history.is_empty(),
+            "unindexed Binance master-transfer retry found an indexed transfer"
+        );
+        let (master_free, master_locked) =
+            account_asset_balance_or_zero(&master, &operation.intent.token_symbol);
+        let (trading_free, _) =
+            account_asset_balance_or_zero(&trading, &operation.intent.token_symbol);
+        Ok((
+            decimal_to_base_units(master_free, operation.intent.token_decimals)?,
+            decimal_to_base_units(master_locked, operation.intent.token_decimals)?,
+            decimal_to_base_units(trading_free, operation.intent.token_decimals)?,
+        ))
     }
 
     async fn finish_master_transfer(
