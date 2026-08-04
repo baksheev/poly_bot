@@ -3,7 +3,7 @@
   "bundle_id": "arb-bot-production-multi-pair-v1",
   "compiler_version": "production-v1",
   "source_paths": [
-    "config/strategies/usdc-wld-world-chain.v13.json",
+    "config/strategies/usdc-wld-world-chain.v14.json",
     "config/strategies/usdc-esp-arbitrum.v7.json"
   ],
   "accounts": [
@@ -41,6 +41,12 @@
       "pair_id": "world-chain-usdc-wld",
       "fee_pips": 3000,
       "address": "0xc19bc89ac024426f5a23c5bb8bc91d8017c90684",
+      "lifecycle": "execution_eligible"
+    },
+    {
+      "pair_id": "world-chain-usdc-wld",
+      "fee_pips": 10000,
+      "address": "0x610e319b3a3ab56a0ed5562927d37c233774ba39",
       "lifecycle": "execution_eligible"
     }
   ],

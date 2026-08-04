@@ -20,6 +20,9 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Add the canonical World Chain Uniswap V3 WLD/USDC 1% pool to the immutable
+  v14 production domain. The existing local V3 curve, calldata, receipt,
+  self-impact, recovery, and single-route selection paths are reused unchanged.
 - Promote diagnostic pre-trade cost telemetry to v3: bind source selection to
   decision completion, retain bounded burst histories, learn receipt gas and
   L1 fees per exact pool/input-token route, preserve bootstrap provenance and

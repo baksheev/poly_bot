@@ -1,6 +1,6 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default and separately gated WLD v13 / ESP v7 adaptive-live artifacts
+Status: v4 read/paper default and separately gated WLD v14 / ESP v7 adaptive-live artifacts
 Last reviewed: 2026-08-04
 
 ## Runtime boundary
@@ -41,7 +41,7 @@ attached to the production runtime.
 
 ## Captured behavior
 
-The WLD v4-v13 snapshots record:
+The WLD v4-v14 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
@@ -51,9 +51,9 @@ The WLD v4-v13 snapshots record:
 - the accounting-only BNB fee asset, its Binance balance precision, and Spot
   `BNBUSDT` valuation symbol; this
   auxiliary feed is excluded from strategy readiness and execution decisions;
-- historical 20 USDC detector/control notional through v12; v13 fixes it at
+- historical 20 USDC detector/control notional through v12; v13-v14 fix it at
   6 USDC with a startup-validated 1 USDC gap above the current Binance minimum;
-  v10-v13 execute adaptive whole-step
+  v10-v14 execute adaptive whole-step
   sizing from sequence-matched depth, capped recent depth, or a 40 USDC-capped
   top-only book up to the global 200 USDC cap, while retaining immediate
   bookTicker admission for a threshold-clearing baseline;
@@ -64,7 +64,7 @@ The WLD v4-v13 snapshots record:
   and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, market-data liveness,
   slippage reserve, DEX fee reserve, and exact execution-envelope inventory
-  reservations; v9-v13
+  reservations; v9-v14
   make this 20 bps spread the entry verdict independently of worst-case gas
   and recovery coverage;
 - event-driven price content is separate from transport liveness: an unchanged
@@ -75,7 +75,9 @@ The WLD v4-v13 snapshots record:
   there is no environment override;
 - paper rebalance enablement and a 2500 bps start threshold derived from the
   process's initial combined inventory;
-- the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs.
+- the production Uniswap V3/V4 allowlist, fee tiers, and V4 pool configs. The
+  v14 source adds only the factory-validated World Chain V3 WLD/USDC 1% pool
+  `0x610e319b3a3ab56a0ed5562927d37c233774ba39` to the v13 pool set.
 
 Wallets, balances, bridge state, private keys, RPC URLs, and execution
 credentials are deliberately absent. The artifact contains only environment
@@ -94,7 +96,7 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v13 artifact has
+The committed v4 default has both execution gates false. The v14 artifact has
 both true and is valid only for the explicitly confirmed GKE live path. Older
 artifacts remain immutable release provenance and deserialize according to
 their committed schemas.
@@ -119,7 +121,7 @@ The pair was re-read from production on 2026-07-17 after its latest
 `updated_at`. It still specifies pair `id=3`, World Chain `480`, active
 `USDC/WLD`, Spot `WLDUSDC`, historical 20 USDC minimum buy amount, WLD step `0.1`, price
 tick `0.001`, `profit_token_a`, and the V3/V4 provider set. The older Rails seed
-value of 10 USDC is not authoritative. The v13 Rust artifact deliberately
+value of 10 USDC is not authoritative. The v14 Rust artifact deliberately
 changes the detector/control amount to 6 USDC while retaining the Rails source
 row as provenance.
 

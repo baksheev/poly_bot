@@ -11,9 +11,9 @@ and must never run while the GKE Deployment has a nonzero replica count.
 ## Immutable launch inputs
 
 - digest-pinned image built from a clean committed revision;
-- v13 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 6 USDC
+- v14 adaptive-live artifact: pair 3, World Chain 480, WLDUSDC Spot, 6 USDC
   detector/fallback, 200 USDC execution cap, WLD step 0.1, live exchange tick
-  0.0001, `profit_token_a`, 20 bps, V3/V4,
+  0.0001, `profit_token_a`, 20 bps, V3/V4 including the canonical V3 1% pool,
   a 30-second maximum Binance transport silence, and a 30-second maximum age
   of the latest received canonical World Chain head;
 - dedicated GCE static egress `34.21.220.162` on the Binance key allowlist;
@@ -26,7 +26,7 @@ and must never run while the GKE Deployment has a nonzero replica count.
   only free inventory after exact reservations is admissible. User Data,
   native-token conversion-feed health, and full-depth health are observed
   separately and do not gate DEX-first readiness;
-- fixed full-live v13/v7 adaptive deployment, DEX-curve-only maximum-slot sizing,
+- fixed full-live v14/v7 adaptive deployment, DEX-curve-only maximum-slot sizing,
   20 bps spread admission, exact primary reservations, single-owner
   enforcement, and entry-stop recovery controls.
 
@@ -35,7 +35,7 @@ push the validated commit directly to `main`, approve the `production`
 environment when requested, and deploy only with the `Deploy GKE` workflow. Do
 not open a routine production PR, force-push, or overwrite remote commits. The
 workflow builds the image, resolves its immutable digest, reuses the fixed node,
-and verifies the v13/v7 full-live runtime config. Do not deploy from a workstation
+and verifies the v14/v7 full-live runtime config. Do not deploy from a workstation
 or use the GCE updater.
 
 ```bash

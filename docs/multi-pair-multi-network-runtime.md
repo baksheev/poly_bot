@@ -777,7 +777,7 @@ stable GKE owner window, not a laptop benchmark:
 | --- | --- |
 | deployment source-revision annotation | `d93fb2955b47de64fc8118a36e339a7c8fa90207` |
 | engine | `arb-bot-rust-shadow-gke-arb-bot-7964b95cf7-7hjkv` |
-| artifact | `config/strategies/usdc-wld-world-chain.v12.json` (frozen pre-change reference; current source is v13) |
+| artifact | `config/strategies/usdc-wld-world-chain.v12.json` (frozen pre-change reference; current source is v14) |
 | node | fixed `c4-highcpu-8`, `asia-southeast1-b` |
 | telemetry interval | `[2026-07-28T10:00:05Z, 2026-07-29T02:57:52Z]` |
 | WLDUSDC strategy frames | 157,247 |

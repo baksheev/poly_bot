@@ -1,6 +1,6 @@
 # Trading improvement roadmap
 
-Status: M1 implemented for the next reviewed release; later milestones remain proposed
+Status: M1 and M2 implemented for the next reviewed release; later milestones remain proposed
 Last reviewed: 2026-08-04
 Applies to: opportunity detection, candidate scheduling, DEX and Binance
 execution, pair and route expansion, execution capacity, wallets, capital
@@ -235,6 +235,12 @@ Economic success is decided from the production cohort, not from a one-trade
 verdict.
 
 ## M2: additional DEX pools and routes
+
+Implementation decision: add exactly the canonical World Chain Uniswap V3
+WLD/USDC 1% pool selected in
+[`m2-pool-route-selection-2026-08-04.md`](m2-pool-route-selection-2026-08-04.md)
+through the v14 WLD artifact. No new ESP, V4, non-Uniswap, multi-hop, or split
+route is part of this milestone.
 
 ### Purpose
 

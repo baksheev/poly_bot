@@ -7,7 +7,7 @@ const COMPILED_DOMAIN: &str =
     include_str!("../config/domain/compiled-multi-pair-production.v1.json");
 
 #[test]
-fn gke_manifest_is_the_full_live_v13_adaptive_owner() {
+fn gke_manifest_is_the_full_live_v14_adaptive_owner() {
     assert!(
         RELEASE_PLATFORM
             .contains("DOMAIN_CONFIG_PATH: config/domain/compiled-multi-pair-production.v1.json")
@@ -67,6 +67,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:WLDUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("live_runtime"));
     assert!(DEPLOY_WORKFLOW.contains("public_price_collector"));
+    assert!(
+        DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool")
+    );
+    assert!(DEPLOY_WORKFLOW.contains("[500,3000,10000]"));
+    assert!(DEPLOY_WORKFLOW.contains("0x610e319b3a3ab56a0ed5562927d37c233774ba39"));
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("max_transport_silence_ms"));

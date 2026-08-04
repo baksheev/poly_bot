@@ -33,7 +33,7 @@ journals and provides a second single-writer boundary on C4. Recreate rollout
 plus the journal file locks prevent two processes from owning the same trade or
 rebalance operation. The current manifest selects `full_live` for arbitrage and
 rebalancing, loads the compiled multi-pair bundle through the strict WLD/USDC
-v13 live compatibility projection, mounts the wallet signer, and uses separate
+v14 live compatibility projection, mounts the wallet signer, and uses separate
 Binance subaccount and master treasury credentials. The ESP sidecar reads the
 same bundle through its non-mutating v2 collector projection.
 The parent-trade, Binance-order, arbitrage-wallet, rebalance-executor, and
@@ -145,7 +145,7 @@ Kubernetes retains five Deployment revisions.
    engine identity.
 7. Confirm that the startup log reports
    `arbitrage_execution_mode=full_live`,
-   `rebalance_execution_mode=full_live`, and the reviewed v13/v7 domain snapshots;
+   `rebalance_execution_mode=full_live`, and the reviewed v14/v7 domain snapshots;
    verify that the journals have no unexpected active operation and only the
    new release emits telemetry from the fixed node pool.
 8. Confirm that both `poly_bot rebalance` alert policies are enabled and target

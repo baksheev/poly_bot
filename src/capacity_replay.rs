@@ -298,7 +298,7 @@ pub fn run_capacity_replay(
         artifact.frames_per_pair = frames_per_pair;
     }
 
-    let base_config = LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v13.json")?;
+    let base_config = LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v14.json")?;
     let mut strategies = Vec::with_capacity(artifact.pairs.len());
     let mut counters = BTreeMap::new();
     let mut evaluators = Vec::with_capacity(artifact.pairs.len());

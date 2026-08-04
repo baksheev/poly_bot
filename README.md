@@ -13,7 +13,7 @@ settlement, reservations, rebalancing, or deployment.
 - One application Pod runs on the fixed `c4-highcpu-8` node in the private
   zonal GKE Standard cluster `arb-bot` in `asia-southeast1-b`.
 - Both runtime containers load one compiled multi-pair bundle. Its strict live
-  compatibility projection preserves the reviewed WLD/USDC v13 and ESP/USDC
+  compatibility projection preserves the reviewed WLD/USDC v14 and ESP/USDC
   v7 adaptive-live artifacts with arbitrage and rebalancing in `full_live`.
 - The live container derives one shared Binance account runtime from that
   bundle: a directly-polled stream shard carries WLDUSDC and ESPUSDC, one

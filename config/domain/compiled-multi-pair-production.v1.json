@@ -131,17 +131,17 @@
       }
     },
     {
-      "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
-      "source_fingerprint_sha256": "82448f00a6ea1f3f16f212422e4d12466e55458da41296b0cd12cabf65c3ef90",
+      "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool",
+      "source_fingerprint_sha256": "bccee48c0bdcba8f143ce4bb77e59d65c8522bba3627ad829259cece117f642a",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
+        "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "e381dff246e806b86ca9cf3de4a5c805204cb86c",
           "rails_pair_id": 3,
           "rails_pair_updated_at_utc": "2026-07-21T18:35:54.337674Z",
-          "captured_at_utc": "2026-07-23T10:00:09Z",
+          "captured_at_utc": "2026-08-04T07:07:58Z",
           "evidence": [
             "production PostgreSQL whitelist SELECT from arb_bot_production",
             "docs/multi-wallet-infrastructure.md current USDC-WLD configuration",
@@ -160,7 +160,9 @@
             "explicit reviewed Rust decision: exact execution-envelope inventory claims replace the legacy Rails 3x multiplier",
             "explicit reviewed Rust decision: the configured 20 bps primary spread is the profitability gate; worst-case gas and recovery remain reservation and risk-cap inputs",
             "explicit operator decision: an event-driven Binance top remains current while the same connection generation has a fresh server heartbeat; the 30-second maximum applies to transport silence, not unchanged price age",
-            "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC"
+            "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC",
+            "explicit operator decision: add the canonical World Chain Uniswap V3 WLD/USDC 1% pool selected in docs/m2-pool-route-selection-2026-08-04.md",
+            "direct World Chain factory validation resolved fee 10000 to 0x610e319b3a3ab56a0ed5562927d37c233774ba39 with WLD token0, USDC token1, and tick spacing 200"
           ]
         },
         "live_trading_enabled": true,
@@ -250,7 +252,8 @@
               "uniswap_v3": {
                 "fee_tiers": [
                   500,
-                  3000
+                  3000,
+                  10000
                 ]
               },
               "uniswap_v4": {
@@ -517,6 +520,17 @@
       "lifecycle": "execution_eligible"
     },
     {
+      "id": "eip155:480:pool:V3 { address: 0x610E319b3A3Ab56A0eD5562927D37c233774ba39, fee_pips: 10000 }",
+      "pair_id": "world-chain-usdc-wld",
+      "network_id": "eip155:480",
+      "protocol": "uniswap_v3",
+      "canonical_identity": "V3 { address: 0x610E319b3A3Ab56A0eD5562927D37c233774ba39, fee_pips: 10000 }",
+      "fee_pips": 10000,
+      "tick_spacing": null,
+      "hooks": null,
+      "lifecycle": "execution_eligible"
+    },
+    {
       "id": "eip155:480:pool:V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
       "pair_id": "world-chain-usdc-wld",
       "network_id": "eip155:480",
@@ -563,7 +577,7 @@
     {
       "id": "strategy:world-chain-usdc-wld",
       "pair_id": "world-chain-usdc-wld",
-      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
+      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:WLDUSDC",
       "network_id": "eip155:480",
@@ -583,6 +597,7 @@
       "instrument_id": "binance-spot:primary:WLDUSDC",
       "pool_ids": [
         "eip155:480:pool:V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
+        "eip155:480:pool:V3 { address: 0x610E319b3A3Ab56A0eD5562927D37c233774ba39, fee_pips: 10000 }",
         "eip155:480:pool:V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
         "eip155:480:pool:V4 { pool_id: 0x4ca0af0122d384225dc0be3702e42cfc81d22d442fd595ddd0edfc5d1c2b23cf, fee_pips: 3000 }",
         "eip155:480:pool:V4 { pool_id: 0xbf415332fad64886704ccbaeff2cc16e505ea746a042dba9af9be9dd23da91ff, fee_pips: 500 }"
@@ -655,6 +670,7 @@
       "kind": "network_runtime",
       "owned_ids": [
         "eip155:480:pool:V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
+        "eip155:480:pool:V3 { address: 0x610E319b3A3Ab56A0eD5562927D37c233774ba39, fee_pips: 10000 }",
         "eip155:480:pool:V3 { address: 0xC19BC89ac024426F5A23c5bb8bc91D8017c90684, fee_pips: 3000 }",
         "eip155:480:pool:V4 { pool_id: 0x4ca0af0122d384225dc0be3702e42cfc81d22d442fd595ddd0edfc5d1c2b23cf, fee_pips: 3000 }",
         "eip155:480:pool:V4 { pool_id: 0xbf415332fad64886704ccbaeff2cc16e505ea746a042dba9af9be9dd23da91ff, fee_pips: 500 }"
@@ -734,7 +750,7 @@
     {
       "id": "compat-live-runtime",
       "role": "live_runtime",
-      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
+      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool",
       "pair_ids": [
         "world-chain-usdc-wld"
       ]

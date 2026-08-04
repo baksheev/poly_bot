@@ -2610,7 +2610,7 @@ mod tests {
     use super::{
         CompatibilityRole, CompiledCapitalAllocatorMode, CompiledDomainBundle, CompiledDomainGraph,
         CompiledInventoryLocation, CompiledNetworkGasPolicy, DomainCompilerManifest, PoolLifecycle,
-        compile_domain,
+        PoolProtocol, compile_domain,
     };
     use crate::domain::config::LoadedDomainConfig;
 
@@ -2655,7 +2655,16 @@ mod tests {
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
         assert_eq!(bundle.strategies.len(), 2);
-        assert_eq!(bundle.pools.len(), 5);
+        assert_eq!(bundle.pools.len(), 6);
+        assert!(bundle.pools.iter().any(|pool| {
+            pool.pair_id == "world-chain-usdc-wld"
+                && pool.protocol == PoolProtocol::UniswapV3
+                && pool.fee_pips == 10_000
+                && pool
+                    .canonical_identity
+                    .to_ascii_lowercase()
+                    .contains("0x610e319b3a3ab56a0ed5562927d37c233774ba39")
+        }));
         let runtime = CompiledDomainGraph::from_bundle(bundle.clone())
             .unwrap()
             .binance_runtime_plan()
@@ -2838,7 +2847,7 @@ mod tests {
             .unwrap();
         assert!(wld.observe && wld.plan && wld.execute);
         assert_eq!(wld.network_id.as_str(), "eip155:480");
-        assert_eq!(wld.pool_ids.len(), 4);
+        assert_eq!(wld.pool_ids.len(), 5);
         assert!(wld.domain_config.snapshot().live_trading_enabled);
         let esp = hot_path
             .strategies

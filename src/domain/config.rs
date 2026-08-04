@@ -1138,7 +1138,9 @@ mod tests {
         include_str!("../../config/strategies/usdc-wld-world-chain.v9.json");
     const V10_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v13.json");
+    const V13_LIVE_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-wld-world-chain.v13.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v14.json");
     const ESP_SHADOW_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v2.json");
     const ESP_PRODUCTION_CONFIG: &str =
@@ -1405,6 +1407,33 @@ mod tests {
                 .commission_price_binance_symbol
                 .as_deref(),
             Some("BNBUSDT")
+        );
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .dex
+                .uniswap_v3
+                .as_ref()
+                .unwrap()
+                .fee_tiers,
+            [500, 3000, 10000]
+        );
+        assert_eq!(
+            loaded.fingerprint_sha256(),
+            "bccee48c0bdcba8f143ce4bb77e59d65c8522bba3627ad829259cece117f642a"
+        );
+    }
+
+    #[test]
+    fn v13_live_snapshot_remains_readable_as_release_provenance() {
+        let loaded = load(V13_LIVE_CONFIG.as_bytes()).unwrap();
+        assert_eq!(
+            loaded.snapshot().pairs[0]
+                .dex
+                .uniswap_v3
+                .as_ref()
+                .unwrap()
+                .fee_tiers,
+            [500, 3000]
         );
         assert_eq!(
             loaded.fingerprint_sha256(),

@@ -1,7 +1,7 @@
 # Uniswap V3/V4 execution
 
 The Rust runtime has one typed exact-input execution boundary for buying and
-selling the configured pair through Uniswap V3 and V4. The v13 production
+selling the configured pair through Uniswap V3 and V4. The v14 production
 artifact enables live arbitrage; the manual `uniswap-round-trip` command is a
 separate historical validation tool and is not a routine production path.
 
