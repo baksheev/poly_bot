@@ -653,7 +653,7 @@ Validation rejects:
 - rebalancing without a location-specific route policy;
 - live execution on a network that has only read-only validation evidence.
 
-The current v12 WLD/USDC artifact and ESP/USDC v2 artifact remain immutable.
+The historical v12 WLD/USDC artifact and ESP/USDC v2 artifact remain immutable.
 Migration creates a new combined artifact version; it does not edit historical
 artifacts in place.
 
@@ -777,7 +777,7 @@ stable GKE owner window, not a laptop benchmark:
 | --- | --- |
 | deployment source-revision annotation | `d93fb2955b47de64fc8118a36e339a7c8fa90207` |
 | engine | `arb-bot-rust-shadow-gke-arb-bot-7964b95cf7-7hjkv` |
-| artifact | `config/strategies/usdc-wld-world-chain.v12.json` |
+| artifact | `config/strategies/usdc-wld-world-chain.v12.json` (frozen pre-change reference; current source is v13) |
 | node | fixed `c4-highcpu-8`, `asia-southeast1-b` |
 | telemetry interval | `[2026-07-28T10:00:05Z, 2026-07-29T02:57:52Z]` |
 | WLDUSDC strategy frames | 157,247 |

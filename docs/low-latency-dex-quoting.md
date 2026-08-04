@@ -95,13 +95,13 @@ decision is accepted.
 ## Opportunity and capacity model
 
 For each accepted Binance update, the single state owner evaluates every
-hydrated pool in both directions using Rails' direction-specific 20 USDC
+hydrated pool in both directions using the reviewed direction-specific 6 USDC
 baseline:
 
-1. DEX buy / CEX sell: exact-input quote 20 USDC on each DEX pool, round the
+1. DEX buy / CEX sell: exact-input quote 6 USDC on each DEX pool, round the
    resulting WLD down to the Binance step, then exact-output quote that rounded
    WLD amount and compare its raw DEX cost with Binance bid proceeds.
-2. CEX buy / DEX sell: derive WLD from 20 USDC at the current Binance ask,
+2. CEX buy / DEX sell: derive WLD from 6 USDC at the current Binance ask,
    round it down to the Binance step, and compare the Binance cost with the
    raw exact-input DEX proceeds.
 3. If the baseline clears 20 bps, search whole Binance steps over an

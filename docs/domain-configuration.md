@@ -1,7 +1,7 @@
 # Versioned domain configuration
 
-Status: v4 read/paper default, separately gated v12 adaptive-live artifact, and ESP/USDC Arbitrum price shadow implemented
-Last reviewed: 2026-07-28
+Status: v4 read/paper default and separately gated WLD v13 / ESP v7 adaptive-live artifacts
+Last reviewed: 2026-08-04
 
 ## Runtime boundary
 
@@ -22,8 +22,8 @@ signer/order journals, single-owner deployment, and startup health checks are
 independently required. Earlier artifacts remain provenance for prior shadow
 stages.
 
-The independent
-`config/strategies/usdc-esp-arbitrum.v2.json` artifact captures Rails
+The independent ESP artifact family starting at
+`config/strategies/usdc-esp-arbitrum.v2.json` captures Rails
 `PairCandidate id=3144` and enables public Spot `ESPUSDC` plus the hydrated
 Arbitrum Uniswap V3 0.01% pool. Production observation of v1 showed that the
 V4 2.88% pool stayed on one tick, could not quote ESP exact output, and
@@ -31,10 +31,8 @@ returned a one-way executable quote far below V3 and Binance, so v2 excludes
 V4. Its dedicated `collect-prices`
 runtime has execution and rebalancing disabled, does not receive a signer or
 Binance trading credentials, and emits book, DEX evaluation, and public
-wallet-balance telemetry. Each accepted Binance update also emits one
-`dex_pool_quote` per direction for the hydrated V3 pool. Binance balance
-telemetry is optional and requires a separately provisioned read-only API key
-whose trading, withdrawal, and transfer permissions are all disabled.
+wallet-balance telemetry. The reviewed v7 artifact is the full-live production
+successor and fixes the detector/control notional at 6 USDC.
 
 Production Postgres is an export-time source only. The ignored
 `.env.production` may contain `ARB_BOT_DATABASE_URL` for operator-driven
@@ -43,7 +41,7 @@ attached to the production runtime.
 
 ## Captured behavior
 
-The v4-v12 snapshots record:
+The WLD v4-v13 snapshots record:
 
 - World Chain `chain_id=480`, V3 Factory, V4 PoolManager/StateView, Quoters,
   routers, and other public contract addresses;
@@ -53,7 +51,9 @@ The v4-v12 snapshots record:
 - the accounting-only BNB fee asset, its Binance balance precision, and Spot
   `BNBUSDT` valuation symbol; this
   auxiliary feed is excluded from strategy readiness and execution decisions;
-- fixed 20 USDC detector/control notional; v10-v12 execute adaptive whole-step
+- historical 20 USDC detector/control notional through v12; v13 fixes it at
+  6 USDC with a startup-validated 1 USDC gap above the current Binance minimum;
+  v10-v13 execute adaptive whole-step
   sizing from sequence-matched depth, capped recent depth, or a 40 USDC-capped
   top-only book up to the global 200 USDC cap, while retaining immediate
   bookTicker admission for a threshold-clearing baseline;
@@ -64,7 +64,7 @@ The v4-v12 snapshots record:
   and observed top-of-book quantity;
 - `profit_token_a`, 20 bps opportunity threshold, market-data liveness,
   slippage reserve, DEX fee reserve, and exact execution-envelope inventory
-  reservations; v9-v12
+  reservations; v9-v13
   make this 20 bps spread the entry verdict independently of worst-case gas
   and recovery coverage;
 - event-driven price content is separate from transport liveness: an unchanged
@@ -94,7 +94,7 @@ Startup rejects:
 - inconsistent global/pair execution gates, including execution without market
   data.
 
-The committed v4 default has both execution gates false. The v12 artifact has
+The committed v4 default has both execution gates false. The v13 artifact has
 both true and is valid only for the explicitly confirmed GKE live path. Older
 artifacts remain immutable release provenance and deserialize according to
 their committed schemas.
@@ -117,10 +117,11 @@ Rails configuration change must not silently alter a running Rust strategy.
 
 The pair was re-read from production on 2026-07-17 after its latest
 `updated_at`. It still specifies pair `id=3`, World Chain `480`, active
-`USDC/WLD`, Spot `WLDUSDC`, 20 USDC minimum buy amount, WLD step `0.1`, price
+`USDC/WLD`, Spot `WLDUSDC`, historical 20 USDC minimum buy amount, WLD step `0.1`, price
 tick `0.001`, `profit_token_a`, and the V3/V4 provider set. The older Rails seed
-value of 10 USDC is not authoritative; the versioned artifact follows the live
-production row and records its exact update timestamp.
+value of 10 USDC is not authoritative. The v13 Rust artifact deliberately
+changes the detector/control amount to 6 USDC while retaining the Rails source
+row as provenance.
 
 Binance advertises a WLDUSDC `PRICE_FILTER` tick of `0.0001`. The v7 live
 artifact deliberately uses that venue tick instead of the coarser Rails

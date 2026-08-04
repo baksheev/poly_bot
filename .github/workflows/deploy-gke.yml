@@ -78,13 +78,13 @@ jobs:
           test "$(jq -c '.capabilities' "${domain_config}")" = \
             '[{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
           test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
-            = arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness
+            = arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector
           test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
-            = arb-bot-production-usdc-esp-arbitrum-v6-full-live
+            = arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector
           wld='.sources[] | select(.snapshot.pairs[0].id == "world-chain-usdc-wld") | .snapshot'
           test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.mode" "${domain_config}")" = adaptive
           test "$(jq -r "${wld} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
-          test "$(jq -r "${wld} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 20000000
+          test "$(jq -r "${wld} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 6000000
           test "$(jq -r "${wld} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
           test "$(jq -r "${wld} | .pairs[0].strategy.max_quote_age_ms" "${domain_config}")" = 30000
           test "$(jq -r "${wld} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
@@ -110,7 +110,7 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].adaptive_sizing.max_recovery_loss_token_a_base_units" "${domain_config}")" = 2000000
           test "$(jq -r "${esp} | .pairs[0].adaptive_sizing.min_expected_profit_token_a_base_units" "${domain_config}")" = 0
           test "$(jq -r "${esp} | .pairs[0].adaptive_sizing.min_incremental_expected_profit_token_a_base_units" "${domain_config}")" = 0
-          test "$(jq -r "${esp} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 20000000
+          test "$(jq -r "${esp} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 6000000
           test "$(jq -r "${esp} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
           test "$(jq -r "${esp} | .pairs[0].strategy.max_quote_age_ms" "${domain_config}")" = 30000
           test "$(jq -r "${esp} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000

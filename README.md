@@ -13,17 +13,16 @@ settlement, reservations, rebalancing, or deployment.
 - One application Pod runs on the fixed `c4-highcpu-8` node in the private
   zonal GKE Standard cluster `arb-bot` in `asia-southeast1-b`.
 - Both runtime containers load one compiled multi-pair bundle. Its strict live
-  compatibility projection preserves the reviewed WLD/USDC v12 adaptive-live
-  artifact with arbitrage and rebalancing in `full_live`; its collector
-  projection preserves non-mutating ESP/USDC v2 behavior.
+  compatibility projection preserves the reviewed WLD/USDC v13 and ESP/USDC
+  v7 adaptive-live artifacts with arbitrage and rebalancing in `full_live`.
 - The live container derives one shared Binance account runtime from that
   bundle: a directly-polled stream shard carries WLDUSDC and ESPUSDC, one
   account generation hydrates all Spot assets and per-symbol metadata, and the
-  capability boundary continues to reject ESP order placement.
+  capability boundary authorizes only the two reviewed execution symbols.
 - The same live projection derives one reusable `NetworkRuntime` for World
   Chain and one for Arbitrum. Startup pool and wallet reads are canonical
   block-hash-pinned and priority-isolated; only World Chain has a reviewed
-  mutation/gas policy, while Arbitrum remains read-only.
+  World Chain and Arbitrum each retain their reviewed mutation/gas policy.
 - The stopped `arb-bot-rust-shadow-gce` VM is a rollback target only. It must
   never run while the GKE Deployment has a nonzero replica count.
 - Rails runs independently with separate mutable state. Rust never reads Rails
@@ -49,7 +48,8 @@ Binance book/depth + World Chain pool state
 
 Production stays DEX-first. Adaptive sizing may use up to 200 USDC from
 sequence-matched or sufficiently recent full depth; top-of-book-only sizing is
-capped at 40 USDC. The profitability gate is the configured 20 bps spread.
+capped at 40 USDC. The detector/control notional is 6 USDC and the
+profitability gate is the configured 20 bps spread.
 Inventory uses the exact execution envelope without the legacy Rails `3x`
 multiplier. Binance price readiness uses a 30-second maximum transport silence;
 an unchanged top remains current while the WebSocket heartbeat is fresh.
@@ -101,6 +101,8 @@ workstation.
 
 - [Rust production architecture](docs/rust-production-architecture.md) —
   canonical production decisions and review checklist.
+- [Trading improvement roadmap](docs/trading-improvements.md) — TTM-ranked
+  full-live production cohorts, market expansion, execution, and scale triggers.
 - [Trading runbook](docs/trading-runbook.md) — stop, recovery, rollout, and
   rollback operations.
 - [GKE deployment](docs/gke-deployment.md) — production delivery topology.

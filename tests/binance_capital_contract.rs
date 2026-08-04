@@ -4,7 +4,7 @@ const REBALANCE_RUNTIME: &str = include_str!("../src/rebalance/runtime.rs");
 const APP_CONFIG: &str = include_str!("../src/config.rs");
 const GKE_DEPLOYMENT: &str = include_str!("../infra/gcp/gke/deployment.yaml");
 const GCE_STARTUP: &str = include_str!("../infra/gcp/gce-startup.sh");
-const ESP_DOMAIN: &str = include_str!("../config/strategies/usdc-esp-arbitrum.v6.json");
+const ESP_DOMAIN: &str = include_str!("../config/strategies/usdc-esp-arbitrum.v7.json");
 
 #[test]
 fn withdrawal_starts_standard_and_only_exact_4104_selects_travel_rule() {

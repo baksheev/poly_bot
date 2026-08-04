@@ -1398,7 +1398,7 @@ mod tests {
     };
 
     fn config() -> LoadedDomainConfig {
-        LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v12.json").unwrap()
+        LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v13.json").unwrap()
     }
 
     fn strategy(id: &str, symbol: &str, pool: &str, execute: bool) -> CompiledHotPathStrategyPlan {

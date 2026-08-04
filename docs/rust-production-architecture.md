@@ -264,7 +264,7 @@ candidate's exact reservation remain separate authorization controls.
    gas converted to USDC nor recovery profitability is an opportunity
    threshold: the configured 20 bps gross venue spread is the only
    profitability gate.
-5. Baseline sizing preserves the reviewed 20 USDC detector. Adaptive sizing
+5. Baseline sizing uses the reviewed 6 USDC detector. Adaptive sizing
    may select only the largest exact Binance-step-aligned DEX-curve amount
    within the versioned 200 USDC cap. Binance top quantity, full depth,
    recovery forecasts, gas economics, and inventory are not sizing inputs.

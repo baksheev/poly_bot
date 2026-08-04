@@ -7,7 +7,7 @@ const COMPILED_DOMAIN: &str =
     include_str!("../config/domain/compiled-multi-pair-production.v1.json");
 
 #[test]
-fn gke_manifest_is_the_full_live_v12_adaptive_owner() {
+fn gke_manifest_is_the_full_live_v13_adaptive_owner() {
     assert!(
         RELEASE_PLATFORM
             .contains("DOMAIN_CONFIG_PATH: config/domain/compiled-multi-pair-production.v1.json")
@@ -150,7 +150,14 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-esp-arbitrum-v6-full-live"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector"));
+    assert_eq!(
+        DEPLOY_WORKFLOW
+            .matches(".pairs[0].quote_sizing.token_a_base_units")
+            .count(),
+        2
+    );
+    assert_eq!(DEPLOY_WORKFLOW.matches("= 6000000").count(), 2);
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].full_live_policy.production_approval_actor"));
     assert!(DEPLOY_WORKFLOW.contains("arbitrum_max_fee_headroom_bps"));
     assert!(DEPLOY_WORKFLOW.contains("router_allowance_mode"));

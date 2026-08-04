@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use crate::{
     balances::{WalletBalanceSnapshot, fetch_wallet_snapshot_coordinated},
     binance::{
-        account::BinanceSymbolState,
+        account::{BinanceSymbolState, SymbolRules},
         capital::{CoinInformation, select_capital_routes},
         execution::{BinanceOrderRequest, BinanceOrderRequestKind},
         order_plan::{
@@ -35,6 +35,8 @@ pub struct BinanceReadiness {
     pub sell_fee_bps: u16,
     pub validation_price: Decimal,
     pub validation_quantity: Decimal,
+    pub configured_detector_notional: Decimal,
+    pub effective_detector_notional: Decimal,
     pub request_fingerprints: Vec<String>,
     pub filters_ready: bool,
     pub external_mutation_authorized: bool,
@@ -75,6 +77,7 @@ pub fn validate_binance_readiness(
     );
 
     let validation_price = aligned_validation_price(rules)?;
+    let detector_notional = validate_detector_control_notional(pair, rules)?;
     let quantity = round_up(
         (rules.min_notional / validation_price)
             .max(rules.lot_size.min)
@@ -147,9 +150,62 @@ pub fn validate_binance_readiness(
         sell_fee_bps: state.commission.conservative_taker_fee_bps("SELL")?,
         validation_price,
         validation_quantity: quantity,
+        configured_detector_notional: detector_notional.configured,
+        effective_detector_notional: detector_notional.effective,
         request_fingerprints,
         filters_ready: true,
         external_mutation_authorized: pair.execution_enabled,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetectorNotionalReadiness {
+    pub configured: Decimal,
+    pub validation_price: Decimal,
+    pub validation_quantity: Decimal,
+    pub effective: Decimal,
+}
+
+/// Validates the production detector/control notional once during startup.
+///
+/// This deliberately stays outside the market-data and execution hot paths.
+pub fn validate_detector_control_notional(
+    pair: &PairConfig,
+    rules: &SymbolRules,
+) -> anyhow::Result<DetectorNotionalReadiness> {
+    let configured = decimal_from_base_units(
+        U256::from_str_radix(&pair.quote_sizing.token_a_base_units, 10)?
+            .try_into()
+            .context("detector/control notional exceeds u128")?,
+        pair.token_a.decimals,
+    )?;
+    ensure!(
+        configured == Decimal::from(6_u32),
+        "production detector/control notional must be exactly 6 USDC"
+    );
+    ensure!(
+        rules.min_notional > Decimal::ZERO && configured - rules.min_notional >= Decimal::ONE,
+        "production detector/control notional must retain at least 1 USDC headroom above Binance MIN_NOTIONAL"
+    );
+
+    let validation_price = aligned_validation_price(rules)?;
+    let validation_quantity = round_down(configured / validation_price, rules.lot_size.step)?;
+    let effective = validation_quantity * validation_price;
+    ensure!(
+        validation_quantity >= rules.lot_size.min
+            && validation_quantity >= rules.market_lot_size.min
+            && validation_quantity <= rules.lot_size.max
+            && validation_quantity <= rules.market_lot_size.max
+            && effective >= rules.min_notional
+            && effective <= configured,
+        "6 USDC detector/control notional cannot satisfy the live Binance quantity and notional filters"
+    );
+
+    Ok(DetectorNotionalReadiness {
+        configured,
+        validation_price,
+        validation_quantity,
+        effective,
     })
 }
 
@@ -425,6 +481,14 @@ fn round_up(value: Decimal, increment: Decimal) -> anyhow::Result<Decimal> {
     Ok((value / increment).ceil() * increment)
 }
 
+fn round_down(value: Decimal, increment: Decimal) -> anyhow::Result<Decimal> {
+    ensure!(
+        increment > Decimal::ZERO,
+        "Binance increment is non-positive"
+    );
+    Ok((value / increment).floor() * increment)
+}
+
 fn submitted_market(plan: MarketOrderPlan, side: &str) -> anyhow::Result<BinanceOrderRequest> {
     match plan {
         MarketOrderPlan::Submit(plan) => Ok(plan.request),
@@ -514,7 +578,8 @@ mod tests {
 
     use super::{
         CHAIN_READINESS_REFRESH_INTERVAL, ChainReadiness, ChainReadinessStatus, InjectedFailure,
-        injected_failure_disposition, validate_binance_readiness, validate_readiness_pair,
+        injected_failure_disposition, validate_binance_readiness,
+        validate_detector_control_notional, validate_readiness_pair,
     };
 
     fn rates() -> CommissionSideRates {
@@ -580,18 +645,36 @@ mod tests {
     #[test]
     fn esp_binance_primary_and_recovery_matrix_is_deterministic() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v7.json").unwrap();
         let first = validate_binance_readiness(&domain.snapshot().pairs[0], &state()).unwrap();
         let second = validate_binance_readiness(&domain.snapshot().pairs[0], &state()).unwrap();
 
         assert_eq!(first, second);
         assert!(first.filters_ready);
         assert!(first.external_mutation_authorized);
+        assert_eq!(first.configured_detector_notional, Decimal::from(6));
+        assert!(first.effective_detector_notional >= Decimal::from(5));
         assert_eq!(first.request_fingerprints.len(), 4);
         assert!(first.request_fingerprints[0].contains("limit_ioc:BUY"));
         assert!(first.request_fingerprints[1].contains("limit_ioc:SELL"));
         assert!(first.request_fingerprints[2].contains("market_buy_quantity"));
         assert!(first.request_fingerprints[3].contains("market_sell"));
+    }
+
+    #[test]
+    fn six_usdc_detector_requires_the_reviewed_minimum_notional_gap() {
+        let domain =
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v7.json").unwrap();
+        let pair = &domain.snapshot().pairs[0];
+        let mut rules = state().symbol_rules;
+
+        let readiness = validate_detector_control_notional(pair, &rules).unwrap();
+        assert_eq!(readiness.configured, Decimal::from(6));
+        assert_eq!(readiness.effective, Decimal::from(6));
+
+        rules.min_notional = Decimal::new(501, 2);
+        let error = validate_detector_control_notional(pair, &rules).unwrap_err();
+        assert!(error.to_string().contains("at least 1 USDC headroom"));
     }
 
     #[test]
@@ -656,7 +739,7 @@ mod tests {
     #[test]
     fn full_live_rebalance_is_a_valid_readiness_projection_and_partial_gates_fail() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v7.json").unwrap();
         let pair = &domain.snapshot().pairs[0];
         validate_readiness_pair(pair).unwrap();
 

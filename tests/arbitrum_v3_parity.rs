@@ -14,7 +14,7 @@ use arb_bot::{
 #[tokio::test]
 #[ignore = "explicit Arbitrum archival-RPC parity gate"]
 async fn arbitrum_v3_local_quotes_match_quoter_v2_at_one_pinned_block() -> anyhow::Result<()> {
-    let domain = LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v6.json")?;
+    let domain = LoadedDomainConfig::load("config/strategies/usdc-esp-arbitrum.v7.json")?;
     let pair = &domain.snapshot().pairs[0];
     let rpc_endpoint = std::env::var(&pair.chain.rpc_url_env)?;
     let rpc = JsonRpcClient::new(rpc_endpoint)?;

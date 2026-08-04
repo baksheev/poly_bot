@@ -15,7 +15,7 @@ use arb_bot::{
 #[tokio::test]
 #[ignore = "explicit archival-RPC parity gate"]
 async fn world_v4_local_quotes_match_quoter_at_one_pinned_block() -> anyhow::Result<()> {
-    let domain = LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v12.json")?;
+    let domain = LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v13.json")?;
     let pair = &domain.snapshot().pairs[0];
     let rpc_endpoint = std::env::var(&pair.chain.rpc_url_env)?;
     let rpc = JsonRpcClient::new(rpc_endpoint)?;

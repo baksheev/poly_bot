@@ -15,7 +15,7 @@ It does not predict failure recovery, inspect Binance depth, price native gas,
 rank expected post-cost profit, or inspect balances. Those inputs do not change
 the requested trade size.
 
-The configured 20 USDC quote remains the cheap opportunity detector. Once that
+The configured 6 USDC quote is the cheap opportunity detector. Once that
 baseline clears 20 bps, the adaptive worker searches the same prepared DEX
 generation for the maximum executable slot. In `adaptive` mode the larger
 candidate is executed; if no larger candidate exists, execution falls back to
@@ -179,6 +179,7 @@ The only adaptive sizing amount control is:
 
 ```json
 {
+  "quote_sizing": { "token_a_base_units": "6000000" },
   "mode": "adaptive",
   "max_trade_notional_token_a_base_units": "200000000"
 }

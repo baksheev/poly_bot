@@ -1138,10 +1138,12 @@ mod tests {
         include_str!("../../config/strategies/usdc-wld-world-chain.v9.json");
     const V10_LIVE_CONFIG: &str =
         include_str!("../../config/strategies/usdc-wld-world-chain.v10.json");
-    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v12.json");
+    const LIVE_CONFIG: &str = include_str!("../../config/strategies/usdc-wld-world-chain.v13.json");
     const ESP_SHADOW_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v2.json");
     const ESP_PRODUCTION_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-esp-arbitrum.v7.json");
+    const ESP_LEGACY_PRODUCTION_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v6.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
@@ -1201,6 +1203,7 @@ mod tests {
         let pair = &loaded.snapshot().pairs[0];
         let policy = pair.full_live_policy.as_ref().unwrap();
         assert!(pair.full_live && pair.execution_enabled && pair.rebalance.enabled);
+        assert_eq!(pair.quote_sizing.token_a_base_units, "6000000");
         assert_eq!(policy.production_approval_actor, "operator");
         assert_eq!(policy.arbitrum_max_fee_headroom_bps, 12_000);
         assert_eq!(
@@ -1352,6 +1355,10 @@ mod tests {
             "adaptive"
         );
         let limits = loaded.snapshot().pairs[0].adaptive_sizing.limits().unwrap();
+        assert_eq!(
+            loaded.snapshot().pairs[0].quote_sizing.token_a_base_units,
+            "6000000"
+        );
         assert_eq!(limits.depth_policy.recent_full_depth_max_age_ms, 750);
         assert_eq!(limits.depth_policy.recent_full_depth_max_update_delta, 8);
         assert_eq!(
@@ -1401,7 +1408,7 @@ mod tests {
         );
         assert_eq!(
             loaded.fingerprint_sha256(),
-            "f4f8533c6349d41a2086033582598a14ee6a47918aebb952168d4c425db91d56"
+            "82448f00a6ea1f3f16f212422e4d12466e55458da41296b0cd12cabf65c3ef90"
         );
     }
 
@@ -1412,6 +1419,15 @@ mod tests {
         assert_eq!(
             loaded.fingerprint_sha256(),
             "19ac100b29724f7269a053aca566776168ebe5cdd919a63d50aeb7d962a404fe"
+        );
+    }
+
+    #[test]
+    fn esp_v6_full_live_snapshot_remains_readable_as_release_provenance() {
+        let loaded = load(ESP_LEGACY_PRODUCTION_CONFIG.as_bytes()).unwrap();
+        assert_eq!(
+            loaded.snapshot().pairs[0].quote_sizing.token_a_base_units,
+            "20000000"
         );
     }
 

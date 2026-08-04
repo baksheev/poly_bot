@@ -74,7 +74,7 @@ use arb_bot::{
     live_readiness::{
         ARBITRUM_CHAIN_ID, CHAIN_READINESS_REFRESH_INTERVAL, ChainReadiness, ChainReadinessProbe,
         ChainReadinessStatus, inspect_chain_readiness, validate_binance_readiness,
-        validate_rebalance_readiness,
+        validate_detector_control_notional, validate_rebalance_readiness,
     },
     market_data::{
         MarketEvent,
@@ -2488,6 +2488,8 @@ async fn run(
                 "sell_fee_bps": readiness.sell_fee_bps,
                 "validation_price": readiness.validation_price.to_string(),
                 "validation_quantity": readiness.validation_quantity.to_string(),
+                "configured_detector_notional": readiness.configured_detector_notional.to_string(),
+                "effective_detector_notional": readiness.effective_detector_notional.to_string(),
                 "request_fingerprints": readiness.request_fingerprints,
                 "request_count": 4,
                 "filters_ready": readiness.filters_ready,
@@ -2602,6 +2604,24 @@ async fn run(
             == Decimal::from_str(&pair.binance.step_size)
                 .context("domain Binance step_size is invalid")?,
         "domain Binance step_size differs from live LOT_SIZE"
+    );
+    let wld_detector_notional = validate_detector_control_notional(pair, &execution_symbol_rules)?;
+    telemetry.emit(
+        "live_readiness",
+        serde_json::json!({
+            "engine_id": config.engine_id,
+            "stage": "detector_control_notional",
+            "pair_id": pair.id,
+            "network_id": "eip155:480",
+            "symbol": pair.binance.symbol,
+            "configured_detector_notional": wld_detector_notional.configured.to_string(),
+            "validation_price": wld_detector_notional.validation_price.to_string(),
+            "validation_quantity": wld_detector_notional.validation_quantity.to_string(),
+            "effective_detector_notional": wld_detector_notional.effective.to_string(),
+            "filters_ready": true,
+            "hot_path_logic_added": false,
+            "ready": true,
+        }),
     );
     let gas_price_symbol = pair
         .chain

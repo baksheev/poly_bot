@@ -5,11 +5,11 @@
   "compiler_version": "production-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
-      "source_fingerprint_sha256": "a192c37656af0a835efacb151c8898eccef7e9cb723a072cfe18638d108194f1",
+      "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector",
+      "source_fingerprint_sha256": "d2dab8c80c4ef8d51b47634f8c3dcfb7a9b0ad391496705592b0a983d755bbe5",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
+        "snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
@@ -23,7 +23,8 @@
             "block-pinned Arbitrum V3 local-curve and QuoterV2 parity validation",
             "production readiness passed with funded inventory, native gas, allowances, and isolated Arbitrum nonce ownership",
             "bounded trading and rebalance validation completed without unresolved exposure or active durable operations",
-            "operator explicitly approved permanent full-live ESP/USDC trading and rebalancing on 2026-07-31"
+            "operator explicitly approved permanent full-live ESP/USDC trading and rebalancing on 2026-07-31",
+            "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC"
           ]
         },
         "live_trading_enabled": true,
@@ -84,7 +85,7 @@
               "tick_size": "0.000010000000000"
             },
             "quote_sizing": {
-              "token_a_base_units": "20000000",
+              "token_a_base_units": "6000000",
               "token_b": {
                 "mode": "derive_from_binance_ask"
               }
@@ -130,11 +131,11 @@
       }
     },
     {
-      "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
-      "source_fingerprint_sha256": "f4f8533c6349d41a2086033582598a14ee6a47918aebb952168d4c425db91d56",
+      "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
+      "source_fingerprint_sha256": "82448f00a6ea1f3f16f212422e4d12466e55458da41296b0cd12cabf65c3ef90",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+        "snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "e381dff246e806b86ca9cf3de4a5c805204cb86c",
@@ -158,7 +159,8 @@
             "explicit reviewed Rust decision: full_live DEX-first runtime readiness is independent of full-depth freshness",
             "explicit reviewed Rust decision: exact execution-envelope inventory claims replace the legacy Rails 3x multiplier",
             "explicit reviewed Rust decision: the configured 20 bps primary spread is the profitability gate; worst-case gas and recovery remain reservation and risk-cap inputs",
-            "explicit operator decision: an event-driven Binance top remains current while the same connection generation has a fresh server heartbeat; the 30-second maximum applies to transport silence, not unchanged price age"
+            "explicit operator decision: an event-driven Binance top remains current while the same connection generation has a fresh server heartbeat; the 30-second maximum applies to transport silence, not unchanged price age",
+            "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC"
           ]
         },
         "live_trading_enabled": true,
@@ -209,7 +211,7 @@
               "tick_size": "0.000100000000000"
             },
             "quote_sizing": {
-              "token_a_base_units": "20000000",
+              "token_a_base_units": "6000000",
               "token_b": {
                 "mode": "derive_from_binance_ask"
               }
@@ -552,7 +554,7 @@
     {
       "id": "strategy:arbitrum-usdc-esp",
       "pair_id": "arbitrum-usdc-esp",
-      "source_snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
+      "source_snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ESPUSDC",
       "network_id": "eip155:42161",
@@ -561,7 +563,7 @@
     {
       "id": "strategy:world-chain-usdc-wld",
       "pair_id": "world-chain-usdc-wld",
-      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:WLDUSDC",
       "network_id": "eip155:480",
@@ -732,7 +734,7 @@
     {
       "id": "compat-live-runtime",
       "role": "live_runtime",
-      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v12-binance-transport-liveness",
+      "source_snapshot_id": "arb-bot-production-usdc-wld-world-chain-v13-six-usdc-detector",
       "pair_ids": [
         "world-chain-usdc-wld"
       ]
@@ -740,7 +742,7 @@
     {
       "id": "compat-public-price-collector",
       "role": "public_price_collector",
-      "source_snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v6-full-live",
+      "source_snapshot_id": "arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector",
       "pair_ids": [
         "arbitrum-usdc-esp"
       ]

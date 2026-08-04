@@ -62,7 +62,7 @@ a time.
   revision, and monitor it through rollout verification. Never force-push or
   discard remote commits; stop and report if `main` cannot be fast-forwarded or
   branch protection rejects the direct push.
-- The production GKE Pod must use the reviewed v12 adaptive-live domain artifact
+- The production GKE Pod must use the reviewed v13/v7 six-USDC adaptive-live domain artifacts
   with both arbitrage and rebalancing in `full_live`. Adaptive sizing selects
   the largest Binance-step-aligned exact DEX-curve candidate that clears the
   configured 20 bps gross spread and the 200 USDC cap. Binance top quantity,
