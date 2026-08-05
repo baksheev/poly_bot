@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "artifact_id": "pancakeswap-v3-arb-usdc-p7-production",
+  "source_revision": "c3ce70501ceac1914b10bbce5430b26982b6c781",
+  "window_start_utc": "2026-08-05T13:14:22Z",
+  "selection_enabled": false,
+  "allowance_mutation_authorized": false,
+  "shadow_evaluations": 1315,
+  "shadow_candidate_items": 2630,
+  "shadow_calculation_p95_us": 21,
+  "shadow_calculation_p99_us": 26,
+  "live_pancake_events": 10,
+  "steady_state_event_queue_p99_us": 46,
+  "startup_backlog_max_us": 14867568,
+  "prepared_curve_build_p99_us": 16,
+  "hot_telemetry_dropped_records": 0,
+  "live_pancake_admissions": 0,
+  "live_pancake_executions": 0,
+  "live_tail_claim": false,
+  "target_c4_supplement": {
+    "previous_production_control": {
+      "workflow_run": 30990393138,
+      "decision_p99_ns": 99,
+      "pool_build_p99_ns": 28888,
+      "frames_per_second": 6994407
+    },
+    "runs": [
+      {
+        "workflow_run": 31008572360,
+        "decision_p99_ns": 104,
+        "pool_build_p99_ns": 35730,
+        "frames_per_second": 6696373,
+        "route_failures": 0,
+        "dependency_faults": 0,
+        "external_mutations": 0
+      },
+      {
+        "workflow_run": 31009406688,
+        "decision_p99_ns": 100,
+        "pool_build_p99_ns": 33555,
+        "frames_per_second": 6917546,
+        "route_failures": 0,
+        "dependency_faults": 0,
+        "external_mutations": 0
+      }
+    ],
+    "median_decision_p99_ns": 102,
+    "median_decision_p99_ratio": 1.0304,
+    "median_pool_build_p99_ns": 34642.5,
+    "median_pool_build_p99_ratio": 1.1992,
+    "decision_gate": "pass",
+    "pool_build_gate": "pass",
+    "hard_ceiling_gate": "pass"
+  },
+  "gate": "pass_without_live_tail_claim"
+}

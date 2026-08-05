@@ -1,7 +1,7 @@
 use std::{sync::Mutex, time::Instant};
 
 const ROUNDS: usize = 32;
-const ITERATIONS_PER_ROUND: u32 = 32_768;
+const ITERATIONS_PER_ROUND: u32 = 262_144;
 static BENCHMARK_OWNER: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug)]
@@ -20,7 +20,9 @@ pub(crate) fn assert_paired_non_regression<U, P>(
     U: FnMut(),
     P: FnMut(),
 {
-    let _owner = BENCHMARK_OWNER.lock().expect("paired benchmark mutex");
+    let _owner = BENCHMARK_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for _ in 0..10_000 {
         uniswap();
         pancake();

@@ -148,7 +148,7 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
           arb='.sources[] | select(.snapshot.pairs[0].id == "arbitrum-usdc-arb") | .snapshot'
-          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow
+          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live
           test "$(jq -r "${arb} | .source.rails_pair_candidate_id" "${domain_config}")" = 2694
           test "$(jq -r "${arb} | .pairs[0].binance.symbol" "${domain_config}")" = ARBUSDC
           test "$(jq -r "${arb} | .pairs[0].binance.step_size" "${domain_config}")" = 0.10000000
@@ -165,10 +165,10 @@ jobs:
           test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_router_address" "${domain_config}")" = 0x1b81D678ffb9C0263b24A97847620C99d213eB14
           test "$(jq -c "${arb} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["uniswap_v3","pancake_swap_v3"]'
           test "$(jq -c "${arb} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" = '[500,3000]'
-          test "$(jq -c "${arb} | .pairs[0].dex.pancakeswap_v3.pools" "${domain_config}")" = '[{"fee_tier":500,"expected_address":"0x9ffca51d23ac7f7df82da414865ef1055e5afcc3","selection_enabled":false}]'
+          test "$(jq -c "${arb} | .pairs[0].dex.pancakeswap_v3.pools" "${domain_config}")" = '[{"fee_tier":500,"expected_address":"0x9ffca51d23ac7f7df82da414865ef1055e5afcc3","selection_enabled":true}]'
           test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 500 and ((.canonical_identity | ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 3000 and ((.canonical_identity | ascii_downcase) | contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")))] | length' "${domain_config}")" = 1
-          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "pancake_swap_v3" and .fee_pips == 500 and .lifecycle == "validated" and ((.canonical_identity | ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "pancake_swap_v3" and .fee_pips == 500 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"

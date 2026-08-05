@@ -250,8 +250,17 @@ fn decode_pool_event_with_locator(
         if validate_receipt_fields {
             // Validate Pancake's two trailing protocol-fee words in the same
             // receipt pass without charging the WebSocket mirror hot path.
-            let _protocol_fee_0 = decode_u128(&log.data, 5)?;
-            let _protocol_fee_1 = decode_u128(&log.data, 6)?;
+            // The exact seven-word length was checked above, so validating the
+            // zero high halves is sufficient and avoids constructing two
+            // otherwise-unused U256 values on every receipt.
+            ensure!(
+                log.data[5 * 32..5 * 32 + 16] == [0_u8; 16],
+                "Pancake V3 protocol fee 0 does not fit uint128"
+            );
+            ensure!(
+                log.data[6 * 32..6 * 32 + 16] == [0_u8; 16],
+                "Pancake V3 protocol fee 1 does not fit uint128"
+            );
         }
         return Ok(Some(DecodedPoolEvent {
             locator: PoolLocator::PancakeV3(log.address),

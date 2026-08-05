@@ -5,17 +5,17 @@
   "compiler_version": "production-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow",
-      "source_fingerprint_sha256": "c1ea5f2408296b570b002ef5598859a4a28f51e4b4ffb4802a11d2bd7f7b0460",
+      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live",
+      "source_fingerprint_sha256": "0940e55ab57440b2686b8eb00c6b1a8267db9f2bcbf0fa11519dd8be483e2b0d",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow",
+        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
           "rails_pair_candidate_id": 2694,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.274070Z",
-          "captured_at_utc": "2026-08-05T12:30:00Z",
+          "captured_at_utc": "2026-08-05T13:26:19Z",
           "evidence": [
             "production PostgreSQL read-only PairCandidate export for ARBUSDC",
             "Binance Spot exchangeInfo and account commission filters for ARBUSDC",
@@ -28,7 +28,9 @@
             "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC",
             "canonical PancakeSwap V3 factory and pool-state verification for the Arbitrum One 0.05% ARB/USDC pool at block 491332082",
             "PancakeSwap V3 QuoterV2 exact-input and exact-output parity at one canonical Arbitrum block",
-            "operator approved a production observe-only Pancake V3 performance cohort before direct live enablement"
+            "operator approved a production observe-only Pancake V3 performance cohort before direct live enablement",
+            "P7 production shadow cohort proved quotable Pancake economics without selection or allowance mutation; two target-C4 runs passed the frozen performance bounds",
+            "explicit operator decision: enable the canonical PancakeSwap V3 fee-500 ARB/USDC route directly in full-live production without a paper phase"
           ]
         },
         "live_trading_enabled": true,
@@ -139,7 +141,7 @@
                   {
                     "fee_tier": 500,
                     "expected_address": "0x9ffca51d23ac7f7df82da414865ef1055e5afcc3",
-                    "selection_enabled": false
+                    "selection_enabled": true
                   }
                 ]
               }
@@ -687,7 +689,7 @@
       "fee_pips": 500,
       "tick_spacing": null,
       "hooks": null,
-      "lifecycle": "validated"
+      "lifecycle": "execution_eligible"
     },
     {
       "id": "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
@@ -782,7 +784,7 @@
     {
       "id": "strategy:arbitrum-usdc-arb",
       "pair_id": "arbitrum-usdc-arb",
-      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow",
+      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "network_id": "eip155:42161",

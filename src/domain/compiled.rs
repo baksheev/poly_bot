@@ -2745,7 +2745,7 @@ mod tests {
             pool.pair_id == "arbitrum-usdc-arb"
                 && pool.protocol == PoolProtocol::PancakeSwapV3
                 && pool.fee_pips == 500
-                && pool.lifecycle == PoolLifecycle::Validated
+                && pool.lifecycle == PoolLifecycle::ExecutionEligible
                 && pool
                     .canonical_identity
                     .to_ascii_lowercase()
@@ -2819,8 +2819,7 @@ mod tests {
                 .iter()
                 .filter(|pool| pool.pair_id == "arbitrum-usdc-arb")
                 .all(|pool| match pool.protocol {
-                    PoolProtocol::PancakeSwapV3 => pool.lifecycle == PoolLifecycle::Validated,
-                    PoolProtocol::UniswapV3 => {
+                    PoolProtocol::PancakeSwapV3 | PoolProtocol::UniswapV3 => {
                         pool.lifecycle == PoolLifecycle::ExecutionEligible
                     }
                     PoolProtocol::UniswapV4 => false,
