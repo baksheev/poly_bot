@@ -560,40 +560,22 @@ jobs:
           test "$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.replicas}')" = 1
-          pod="$(kubectl get pods \
+          kubectl wait deployment/arb-bot \
             --namespace "${GKE_NAMESPACE}" \
-            --selector='app.kubernetes.io/name=arb-bot' \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}')"
-          test -n "${pod}"
-          kubectl wait pod/"${pod}" \
-            --namespace "${GKE_NAMESPACE}" \
-            --for=condition=Ready \
+            --for=condition=Available \
             --timeout=60s
-          kubectl exec "${pod}" \
+
+          template="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
-            --container arb-bot \
-            -- /bin/sh -ec 'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"; : >"${ARBITRAGE_ENTRY_STOP_FILE}"'
-
-          safe=false
-          for _ in {1..900}; do
-            if kubectl exec "${pod}" \
-              --namespace "${GKE_NAMESPACE}" \
-              --container arb-bot \
-              -- /bin/sh -ec 'test -s "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe" && grep -qx "active_operation_count=0" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'; then
-              safe=true
-              break
-            fi
-            sleep 1
-          done
-          test "${safe}" = true
-
+            -o json | jq -c '.spec.template')"
           job="arb-bot-arb-bootstrap-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          stop_job="arb-bot-arb-entry-stop-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          clear_job="arb-bot-arb-entry-clear-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           restore_old_owner=false
           cleanup_bootstrap() {
             status="$?"
             trap - EXIT
-            kubectl delete job "${job}" \
+            kubectl delete job "${job}" "${stop_job}" "${clear_job}" \
               --namespace "${GKE_NAMESPACE}" \
               --ignore-not-found \
               --wait=false >/dev/null 2>&1 || true
@@ -609,6 +591,60 @@ jobs:
           }
           trap cleanup_bootstrap EXIT
 
+          jq -n \
+            --argjson template "${template}" \
+            --arg job "${stop_job}" \
+            '
+              {
+                apiVersion: "batch/v1",
+                kind: "Job",
+                metadata: {
+                  name: $job,
+                  labels: {"app.kubernetes.io/name": "arb-bot-arb-entry-stop"}
+                },
+                spec: {
+                  backoffLimit: 0,
+                  activeDeadlineSeconds: 920,
+                  ttlSecondsAfterFinished: 3600,
+                  template: (
+                    $template
+                    | .metadata.labels = {
+                        "app.kubernetes.io/name": "arb-bot-arb-entry-stop",
+                        "arb-bot/bootstrap-instance": $job
+                      }
+                    | .metadata.annotations = {}
+                    | .spec.automountServiceAccountToken = false
+                    | .spec.restartPolicy = "Never"
+                    | .spec.containers = [
+                        .spec.containers[]
+                        | select(.name == "arb-bot")
+                        | .name = "entry-stop"
+                        | del(.startupProbe, .readinessProbe, .livenessProbe)
+                        | .resources = {
+                            "requests": {"cpu": "5m", "memory": "8Mi"},
+                            "limits": {"cpu": "20m", "memory": "16Mi"}
+                          }
+                        | .command = ["/bin/sh", "-ec"]
+                        | .args = [
+                            "rm -f \"${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe\"; : >\"${ARBITRAGE_ENTRY_STOP_FILE}\"; attempts=0; while test \"${attempts}\" -lt 900; do if test -s \"${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe\" && grep -qx \"active_operation_count=0\" \"${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe\"; then exit 0; fi; attempts=$((attempts + 1)); sleep 1; done; exit 1"
+                          ]
+                      ]
+                  )
+                }
+              }
+            ' | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+
+          if ! kubectl wait job/"${stop_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=Complete \
+            --timeout=940s; then
+            kubectl logs job/"${stop_job}" --namespace "${GKE_NAMESPACE}" || true
+            exit 1
+          fi
+          kubectl delete job "${stop_job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --wait=true
+
           kubectl scale deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             --replicas=0
@@ -619,9 +655,6 @@ jobs:
             --for=delete \
             --timeout=120s
 
-          template="$(kubectl get deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            -o json | jq -c '.spec.template')"
           jq -n \
             --argjson template "${template}" \
             --arg job "${job}" \
@@ -676,16 +709,59 @@ jobs:
           kubectl rollout status deployment/arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             --timeout=180s
-          restored_pod="$(kubectl get pods \
+
+          jq -n \
+            --argjson template "${template}" \
+            --arg job "${clear_job}" \
+            '
+              {
+                apiVersion: "batch/v1",
+                kind: "Job",
+                metadata: {
+                  name: $job,
+                  labels: {"app.kubernetes.io/name": "arb-bot-arb-entry-clear"}
+                },
+                spec: {
+                  backoffLimit: 0,
+                  activeDeadlineSeconds: 120,
+                  ttlSecondsAfterFinished: 3600,
+                  template: (
+                    $template
+                    | .metadata.labels = {
+                        "app.kubernetes.io/name": "arb-bot-arb-entry-clear",
+                        "arb-bot/bootstrap-instance": $job
+                      }
+                    | .metadata.annotations = {}
+                    | .spec.automountServiceAccountToken = false
+                    | .spec.restartPolicy = "Never"
+                    | .spec.containers = [
+                        .spec.containers[]
+                        | select(.name == "arb-bot")
+                        | .name = "entry-clear"
+                        | del(.startupProbe, .readinessProbe, .livenessProbe)
+                        | .resources = {
+                            "requests": {"cpu": "5m", "memory": "8Mi"},
+                            "limits": {"cpu": "20m", "memory": "16Mi"}
+                          }
+                        | .command = ["/bin/sh", "-ec"]
+                        | .args = [
+                            "rm -f \"${ARBITRAGE_ENTRY_STOP_FILE}\" \"${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe\""
+                          ]
+                      ]
+                  )
+                }
+              }
+            ' | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+          if ! kubectl wait job/"${clear_job}" \
             --namespace "${GKE_NAMESPACE}" \
-            --selector='app.kubernetes.io/name=arb-bot' \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}')"
-          test -n "${restored_pod}"
-          kubectl exec "${restored_pod}" \
+            --for=condition=Complete \
+            --timeout=140s; then
+            kubectl logs job/"${clear_job}" --namespace "${GKE_NAMESPACE}" || true
+            exit 1
+          fi
+          kubectl delete job "${clear_job}" \
             --namespace "${GKE_NAMESPACE}" \
-            --container arb-bot \
-            -- /bin/sh -ec 'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'
+            --wait=true
           kubectl annotate deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             --overwrite \

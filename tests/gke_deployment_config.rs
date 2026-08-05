@@ -123,6 +123,8 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("bootstrap-arb-inventory --quote-usdc 500"));
     assert!(DEPLOY_WORKFLOW.contains("active_operation_count=0"));
     assert!(DEPLOY_WORKFLOW.contains("arb-inventory-bootstrap-v1=complete:"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-arb-entry-stop"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-arb-entry-clear"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
         .expect("startup DEX backlog drain is wired");
@@ -132,7 +134,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(startup_drain < readiness);
     assert!(MAIN.contains("backlog_empty_before_ready"));
     assert!(MAIN.contains("on_startup_dex_event"));
-    assert!(DEPLOY_WORKFLOW.contains("kubectl exec"));
+    assert!(!DEPLOY_WORKFLOW.contains("kubectl exec"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl logs job/\"${job}\""));
 }
