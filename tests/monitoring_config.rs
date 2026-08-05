@@ -8,16 +8,13 @@ const REBALANCE_FAULT_METRIC: &str =
     include_str!("../infra/gcp/monitoring/rebalance-fault-log-metric.json");
 const REBALANCE_FAULT_POLICY: &str =
     include_str!("../infra/gcp/monitoring/rebalance-fault-policy.json");
-const TRADING_INVENTORY_BLOCKED_METRIC: &str =
-    include_str!("../infra/gcp/monitoring/trading-inventory-blocked-log-metric.json");
-const TRADING_INVENTORY_BLOCKED_POLICY: &str =
-    include_str!("../infra/gcp/monitoring/trading-inventory-blocked-policy.json");
 const BINANCE_DEPTH_UNHEALTHY_METRIC: &str =
     include_str!("../infra/gcp/monitoring/binance-depth-unhealthy-log-metric.json");
 const RUNTIME_DEPENDENCY_FAULT_METRIC: &str =
     include_str!("../infra/gcp/monitoring/runtime-dependency-fault-log-metric.json");
 const RUNTIME_DEPENDENCY_FAULT_POLICY: &str =
     include_str!("../infra/gcp/monitoring/runtime-dependency-fault-policy.json");
+const APPLY_MONITORING_SCRIPT: &str = include_str!("../scripts/apply-gcp-rebalance-monitoring");
 
 fn filter_from(config: &str, name: &str) -> String {
     let config: Value = serde_json::from_str(config).unwrap_or_else(|error| {
@@ -75,7 +72,11 @@ fn rebalance_fault_metric_matches_the_boolean_health_field() {
     let filter = filter_from(REBALANCE_FAULT_METRIC, "rebalance fault log metric");
 
     assert!(filter.contains(r#"jsonPayload.fields.message="rebalance executor failed closed""#));
+    assert!(filter.contains(r#"jsonPayload.fields.message="rebalance recovery failed closed""#));
     assert!(filter.contains(r#"jsonPayload.fields.message="rebalance planning failed closed""#));
+    assert!(filter.contains(
+        r#"jsonPayload.fields.message="rebalance token quarantined; other tokens remain eligible""#
+    ));
     assert!(filter.contains(
         r#"jsonPayload.fields.message="rebalance health heartbeat" AND jsonPayload.fields.healthy=false"#
     ));
@@ -87,6 +88,7 @@ fn rebalance_fault_metric_matches_the_boolean_health_field() {
 
 #[test]
 fn rebalance_fault_policy_targets_active_gke_owner() {
+    let policy: Value = serde_json::from_str(REBALANCE_FAULT_POLICY).unwrap();
     let filter = first_condition_filter_from(REBALANCE_FAULT_POLICY, "rebalance fault policy");
 
     assert!(filter.contains(r#"resource.type = "k8s_container""#));
@@ -94,62 +96,30 @@ fn rebalance_fault_policy_targets_active_gke_owner() {
     assert!(
         filter.contains(r#"metric.type = "logging.googleapis.com/user/poly_bot_rebalance_fault""#)
     );
+    assert_eq!(
+        policy["conditions"][0]["conditionThreshold"]["duration"],
+        "0s"
+    );
+    assert!(
+        policy["documentation"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("independent of whether an arbitrage opportunity has appeared")
+    );
 }
 
 #[test]
-fn trading_inventory_blocked_monitoring_accepts_runtime_logs_and_targets_active_gke_owner() {
-    let metric: Value = serde_json::from_str(TRADING_INVENTORY_BLOCKED_METRIC).unwrap();
-    let policy: Value = serde_json::from_str(TRADING_INVENTORY_BLOCKED_POLICY).unwrap();
-    let metric_filter = filter_from(
-        TRADING_INVENTORY_BLOCKED_METRIC,
-        "trading inventory blocked log metric",
-    );
-    let policy_filter = first_condition_filter_from(
-        TRADING_INVENTORY_BLOCKED_POLICY,
-        "trading inventory blocked policy",
-    );
-
-    assert!(metric_filter.contains(
-        r#"jsonPayload.fields.message="arbitrage admission blocked by insufficient inventory""#
-    ));
-    assert!(metric_filter.contains(r#"jsonPayload.fields.rebalance_transient=false"#));
-    assert!(metric_filter.contains(r#"jsonPayload.message=~"\"message\":\"arbitrage admission blocked by insufficient inventory\"""#));
+fn deployment_retires_the_opportunity_dependent_inventory_alert() {
     assert!(
-        !metric_filter.contains(r#" AND "arbitrage admission blocked by insufficient inventory""#)
+        APPLY_MONITORING_SCRIPT
+            .contains("delete_policy_by_display_name \"poly_bot trading inventory blocked\"")
     );
-    assert!(policy_filter.contains(r#"resource.type = "k8s_container""#));
-    assert!(!policy_filter.contains(r#"resource.type = "gce_instance""#));
-    assert!(policy_filter.contains(
-        r#"metric.type = "logging.googleapis.com/user/poly_bot_trading_inventory_blocked""#
-    ));
-    for label in [
-        "pair_id",
-        "shortage_asset",
-        "shortage_location",
-        "rebalance_phase",
-    ] {
-        assert_eq!(
-            metric["labelExtractors"][label],
-            format!("EXTRACT(jsonPayload.fields.{label})")
-        );
-        assert!(
-            policy["conditions"][0]["conditionThreshold"]["aggregations"][0]["groupByFields"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|field| field == &format!("metric.label.{label}"))
-        );
-    }
-    let threshold = &policy["conditions"][0]["conditionThreshold"];
-    assert_eq!(threshold["aggregations"][0]["alignmentPeriod"], "900s");
-    assert_eq!(
-        threshold["aggregations"][0]["perSeriesAligner"],
-        "ALIGN_SUM"
+    assert!(
+        APPLY_MONITORING_SCRIPT
+            .contains("delete_log_metric_if_present poly_bot_trading_inventory_blocked")
     );
-    assert_eq!(threshold["thresholdValue"], 2);
-    assert_eq!(threshold["duration"], "300s");
-    assert_eq!(policy["alertStrategy"]["autoClose"], "3600s");
-    assert_eq!(policy["severity"], "WARNING");
+    assert!(!APPLY_MONITORING_SCRIPT.contains("trading-inventory-blocked-policy.json"));
+    assert!(!APPLY_MONITORING_SCRIPT.contains("trading-inventory-blocked-log-metric.json"));
 }
 
 #[test]

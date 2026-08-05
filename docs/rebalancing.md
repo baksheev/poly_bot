@@ -453,18 +453,22 @@ retries the narrowly classified `header not found` propagation race twice
 against the same canonical block hash; it never falls back to an unpinned
 `latest` read.
 
-`scripts/apply-gcp-rebalance-monitoring` idempotently provisions two log-based
-metrics, two Cloud Monitoring alert policies, and the operator email channel:
+`scripts/apply-gcp-rebalance-monitoring` idempotently provisions the rebalance
+log-based metrics, Cloud Monitoring alert policies, and the operator email
+channel:
 
-- `poly_bot rebalance fault` alerts on planner/executor errors or an unhealthy
-  heartbeat;
+- `poly_bot rebalance fault` alerts immediately on planner, executor, recovery,
+  or token-quarantine errors, or on an unhealthy heartbeat proving that
+  pending, in-flight, or settlement work is stuck;
 - `poly_bot rebalance heartbeat missing` alerts after five minutes without any
   heartbeat, covering a stopped process, pod, logging path, or event loop.
 
 Both policies notify `baksheev@me.com`. They are reapplied by the GitHub GKE
 deployment workflow after a successful rollout. Rollouts aggregate heartbeat
 series across pod names, so replacing the immutable release pod does not create
-a false missing-heartbeat incident.
+a false missing-heartbeat incident. Trading admission failures caused by
+insufficient inventory remain structured diagnostics, but do not page the
+operator: they are downstream symptoms and depend on an opportunity appearing.
 
 Useful read-only commands remain available:
 

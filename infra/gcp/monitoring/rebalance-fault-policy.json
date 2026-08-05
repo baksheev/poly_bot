@@ -25,7 +25,7 @@
   ],
   "documentation": {
     "mimeType": "text/markdown",
-    "content": "A critical rebalance signal was emitted by the production `poly_bot` GKE runtime. This covers planner or executor failure, a fail-closed blocked state, an operation exceeding `REBALANCE_EXECUTOR_TIMEOUT_SECONDS`, or settlement waiting for fresh balance streams for at least 60 seconds. Inspect the `arb-bot` namespace logs and `/var/lib/arb-bot/rebalance-executor.jsonl` before changing funds or retrying an operation."
+    "content": "The production `poly_bot` runtime cannot currently complete or safely recover a rebalance. This alert is raised directly by planner, executor, recovery, or token-quarantine failures, or by a heartbeat proving that pending, in-flight, or settlement work is stuck. It is independent of whether an arbitrage opportunity has appeared. Inspect the `arb-bot` namespace logs and `/var/lib/arb-bot/rebalance-executor.jsonl` before changing funds or retrying an operation."
   },
   "alertStrategy": {
     "autoClose": "1800s"

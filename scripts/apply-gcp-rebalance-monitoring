@@ -39,9 +39,6 @@ upsert_log_metric \
   poly_bot_rebalance_fault \
   "${monitoring_dir}/rebalance-fault-log-metric.json"
 upsert_log_metric \
-  poly_bot_trading_inventory_blocked \
-  "${monitoring_dir}/trading-inventory-blocked-log-metric.json"
-upsert_log_metric \
   poly_bot_binance_depth_unhealthy \
   "${monitoring_dir}/binance-depth-unhealthy-log-metric.json"
 upsert_log_metric \
@@ -126,6 +123,40 @@ upsert_policy() {
   rm -f "${rendered}"
 }
 
+delete_policy_by_display_name() {
+  local display_name="$1"
+  local policies_json
+  local existing
+  policies_json="$("${gcloud_bin}" alpha monitoring policies list \
+    "${project_args[@]}" \
+    --format=json)"
+  existing=()
+  while IFS= read -r policy; do
+    existing+=("${policy}")
+  done < <(
+    jq -r --arg display_name "${display_name}" \
+      '.[] | select(.displayName == $display_name) | .name' \
+      <<<"${policies_json}"
+  )
+  if [[ "${#existing[@]}" -gt 1 ]]; then
+    echo "multiple alert policies are named ${display_name}" >&2
+    exit 1
+  fi
+  if [[ "${#existing[@]}" -eq 1 ]]; then
+    "${gcloud_bin}" alpha monitoring policies delete "${existing[0]}" \
+      "${project_args[@]}" >/dev/null
+  fi
+}
+
+delete_log_metric_if_present() {
+  local metric_name="$1"
+  if "${gcloud_bin}" logging metrics describe "${metric_name}" \
+    "${project_args[@]}" >/dev/null 2>&1; then
+    "${gcloud_bin}" logging metrics delete "${metric_name}" \
+      "${project_args[@]}" >/dev/null
+  fi
+}
+
 upsert_policy \
   "poly_bot rebalance fault" \
   "${monitoring_dir}/rebalance-fault-policy.json"
@@ -133,10 +164,12 @@ upsert_policy \
   "poly_bot rebalance heartbeat missing" \
   "${monitoring_dir}/rebalance-heartbeat-missing-policy.json"
 upsert_policy \
-  "poly_bot trading inventory blocked" \
-  "${monitoring_dir}/trading-inventory-blocked-policy.json"
-upsert_policy \
   "poly_bot runtime dependency fault" \
   "${monitoring_dir}/runtime-dependency-fault-policy.json"
+
+# Admission failures are downstream symptoms. Alert on the rebalance fault that
+# causes unavailable inventory, and retire the old opportunity-dependent signal.
+delete_policy_by_display_name "poly_bot trading inventory blocked"
+delete_log_metric_if_present poly_bot_trading_inventory_blocked
 
 echo "production runtime monitoring configured for ${ALERT_EMAIL}"
