@@ -82,5 +82,46 @@
     "dependency_faults": 0,
     "gate": "pass"
   },
-  "target_c4_gate": "required_before_rollout"
+  "shadow_scheduler_followup": {
+    "purpose": "evaluate observe-only Pancake economics even when no live provider clears 20 bps",
+    "provider_paired_gate": "pass",
+    "event_decode_p95_ratio": 0.9897,
+    "event_decode_p99_ratio": 0.9752,
+    "receipt_proof_p95_ratio": 1.0758,
+    "receipt_proof_p99_ratio": 1.0797,
+    "plan_p95_ratio": 1.0665,
+    "plan_p99_ratio": 1.0521,
+    "calldata_p95_ratio": 0.9398,
+    "calldata_p99_ratio": 0.8302,
+    "local_decision_p99_ns": 84,
+    "local_pool_build_p99_ns": 15917,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "quality_gate": "pass"
+  },
+  "target_c4_gate": {
+    "status": "pass",
+    "workflow_run": 31006763857,
+    "source_revision": "13fe1f3c4a10e142b0a5baf0f884c72661cee7b8",
+    "image_digest": "sha256:cef2e05ade044c732fa0270836048fb41be62ef8d473bb801b8a977c9e2d2063",
+    "cpu_class": "c4-highcpu-8",
+    "pair_count": 20,
+    "pool_count": 25,
+    "frames": 2000000,
+    "arbusdc_frames": 100000,
+    "decision_p95_ns": 76,
+    "decision_p99_ns": 97,
+    "previous_decision_p99_ns": 99,
+    "pool_build_p95_ns": 25208,
+    "pool_build_p99_ns": 30829,
+    "previous_pool_build_p99_ns": 28888,
+    "frames_per_second": 7021091,
+    "previous_frames_per_second": 6994407,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "route_failures": 0,
+    "dependency_faults": 0
+  }
 }

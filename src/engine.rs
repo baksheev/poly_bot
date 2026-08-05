@@ -3085,15 +3085,15 @@ impl TradingEngine {
             .unwrap_or(AdaptiveSizingRuntimeLimits::parse(
                 &pair_config.adaptive_sizing,
             )?);
-        if !evaluation
+        let live_baseline_meets_threshold = evaluation
             .dex_buy_cex_sell
             .baseline
             .is_some_and(|trade| trade.meets_threshold)
-            && !evaluation
+            || evaluation
                 .cex_buy_dex_sell
                 .baseline
-                .is_some_and(|trade| trade.meets_threshold)
-        {
+                .is_some_and(|trade| trade.meets_threshold);
+        if !live_baseline_meets_threshold && pair.shadow_pool_indices().is_empty() {
             return Ok(false);
         }
         let token_b_decimals = pair.token_b_decimals;
