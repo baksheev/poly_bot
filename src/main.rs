@@ -2976,6 +2976,18 @@ async fn run(
             .await?;
             executor.set_capital_policy(capital_policy)?;
             executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
+            match executor.reconcile_next_across_fill_quarantine().await {
+                Ok(Some(operation)) => tracing::warn!(
+                    operation_id = %operation.intent.operation_id,
+                    progress = ?operation.progress,
+                    "recovered a proven Across fill for asynchronous journal completion"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "quarantined Across timeout did not pass reconciliation-only recovery; token remains isolated"
+                ),
+            }
             executor.reopen_next_retryable_quarantine()?;
             telemetry.emit(
                 "runtime_journal_recovery",

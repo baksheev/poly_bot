@@ -509,6 +509,33 @@ impl RebalanceExecutionJournal {
         }))
     }
 
+    pub fn next_reconcilable_across_fill_quarantine(
+        &self,
+    ) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
+        if self.active_operation()?.is_some() {
+            return Ok(None);
+        }
+        Ok(self.operations.values().find(|operation| {
+            let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
+                return false;
+            };
+            across_fill_timeout_quarantine(reason)
+                && matches!(&operation.intent.route, Route::Across { .. })
+                && matches!(
+                    self.progress_before_quarantine
+                        .get(&operation.intent.operation_id),
+                    Some(RebalanceExecutionProgress::BridgeMined { .. })
+                )
+        }))
+    }
+
+    pub fn progress_before_quarantine(
+        &self,
+        operation_id: &str,
+    ) -> Option<&RebalanceExecutionProgress> {
+        self.progress_before_quarantine.get(operation_id)
+    }
+
     pub fn record_reconciled_arbitrum_deposit(
         &mut self,
         operation_id: &str,
@@ -530,6 +557,47 @@ impl RebalanceExecutionJournal {
         ensure!(
             reconciled_arbitrum_deposit_transition(&current.intent, &current.progress, &progress,),
             "rebalance quarantine is not an approved reconciled Arbitrum deposit"
+        );
+        let next = RebalanceExecutionOperation {
+            intent: current.intent.clone(),
+            progress,
+        };
+        self.append(next.clone())?;
+        Ok(next)
+    }
+
+    pub fn record_reconciled_across_fill(
+        &mut self,
+        operation_id: &str,
+        fill_transaction_hash: B256,
+        received_base_units: U256,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let current = self
+            .operations
+            .get(operation_id)
+            .with_context(|| format!("unknown rebalance operation {operation_id}"))?;
+        let previous = self
+            .progress_before_quarantine
+            .get(operation_id)
+            .context("reconciled Across fill quarantine has no prior durable progress")?;
+        let RebalanceExecutionProgress::BridgeMined {
+            minimum_output_amount,
+            ..
+        } = previous
+        else {
+            anyhow::bail!("reconciled Across fill quarantine did not follow a mined bridge")
+        };
+        ensure!(
+            received_base_units >= *minimum_output_amount,
+            "reconciled Across fill is below the journaled minimum"
+        );
+        let progress = RebalanceExecutionProgress::AcrossFilled {
+            fill_transaction_hash,
+            received_base_units,
+        };
+        ensure!(
+            reconciled_across_fill_transition(&current.intent, &current.progress, &progress),
+            "rebalance quarantine is not an approved reconciled Across fill"
         );
         let next = RebalanceExecutionOperation {
             intent: current.intent.clone(),
@@ -1206,6 +1274,10 @@ fn corrected_guard_quarantine(reason: &str) -> bool {
         || signature_encoding_quarantine(reason)
 }
 
+fn across_fill_timeout_quarantine(reason: &str) -> bool {
+    reason == "timed out waiting for Across fill"
+}
+
 fn reconciled_arbitrum_deposit_transition(
     intent: &RebalanceExecutionIntent,
     previous: &RebalanceExecutionProgress,
@@ -1227,6 +1299,26 @@ fn reconciled_arbitrum_deposit_transition(
         ) if binance_network == "ARBITRUM"
             && reason.starts_with("DEX outcome unknown:")
             && *transaction_hash != B256::ZERO
+    )
+}
+
+fn reconciled_across_fill_transition(
+    intent: &RebalanceExecutionIntent,
+    previous: &RebalanceExecutionProgress,
+    next: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        (&intent.route, previous, next),
+        (
+            Route::Across { .. },
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::AcrossFilled {
+                fill_transaction_hash,
+                received_base_units,
+            },
+        ) if across_fill_timeout_quarantine(reason)
+            && *fill_transaction_hash != B256::ZERO
+            && !received_base_units.is_zero()
     )
 }
 
@@ -1307,7 +1399,7 @@ fn validate_transition(
             == "rebalance intent has no indexed Binance master transfer; operator review required"
     ) || reconciled_arbitrum_deposit_transition(
         intent, previous, next,
-    );
+    ) || reconciled_across_fill_transition(intent, previous, next);
     ensure!(
         !previous.terminal()
             || approved_terminal_retry
@@ -2746,6 +2838,109 @@ mod tests {
                 .is_err()
         );
         drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn proven_across_fill_reconciles_exact_timeout_quarantine() {
+        let path = path("across-fill-timeout-reconciliation");
+        let origin_hash = B256::repeat_byte(0x41);
+        let fill_hash = B256::repeat_byte(0x42);
+        let minimum_output_amount = U256::from(1_990_000_u64);
+        let received_base_units = U256::from(1_995_000_u64);
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::BridgePrepared {
+                    origin_chain_id: 480,
+                    input_amount: U256::from(2_000_000_u64),
+                    target: Address::repeat_byte(0x35),
+                    calldata: vec![0x36],
+                    calldata_hash: keccak256([0x36]),
+                    minimum_output_amount,
+                    destination_balance_before: U256::from(10_000_000_u64),
+                },
+            )
+            .unwrap();
+        let mined = RebalanceExecutionProgress::BridgeMined {
+            origin_chain_id: 480,
+            transaction_hash: origin_hash,
+            minimum_output_amount,
+            destination_balance_before: U256::from(10_000_000_u64),
+        };
+        journal.advance(&operation_id, mined.clone()).unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "timed out waiting for Across fill".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            journal.progress_before_quarantine(&operation_id),
+            Some(&mined)
+        );
+        assert_eq!(
+            journal
+                .next_reconcilable_across_fill_quarantine()
+                .unwrap()
+                .unwrap()
+                .intent
+                .operation_id,
+            operation_id
+        );
+        assert!(
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::AcrossFilled {
+                        fill_transaction_hash: fill_hash,
+                        received_base_units,
+                    },
+                )
+                .is_err(),
+            "only the evidence-gated reconciliation method may bypass quarantine"
+        );
+        assert!(
+            journal
+                .record_reconciled_across_fill(
+                    &operation_id,
+                    fill_hash,
+                    minimum_output_amount - U256::ONE,
+                )
+                .is_err()
+        );
+        let reconciled = journal
+            .record_reconciled_across_fill(&operation_id, fill_hash, received_base_units)
+            .unwrap();
+        assert_eq!(
+            reconciled.progress,
+            RebalanceExecutionProgress::AcrossFilled {
+                fill_transaction_hash: fill_hash,
+                received_base_units,
+            }
+        );
+        drop(journal);
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert_eq!(
+            replayed.active_operation().unwrap().unwrap().progress,
+            reconciled.progress
+        );
+        assert!(
+            replayed
+                .next_reconcilable_across_fill_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        drop(replayed);
         fs::remove_file(path).unwrap();
     }
 

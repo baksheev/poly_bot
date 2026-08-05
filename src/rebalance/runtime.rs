@@ -528,6 +528,99 @@ impl RebalanceExecutor {
         Ok(Some(reconciled))
     }
 
+    /// Reconciles an Across timeout only when the API and destination-chain
+    /// receipt prove that the already-mined bridge was filled. This path does
+    /// not reserve a nonce, sign, or broadcast another transaction.
+    pub async fn reconcile_next_across_fill_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        let Some(operation) = self
+            .execution_journal
+            .next_reconcilable_across_fill_quarantine()?
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let RebalanceExecutionProgress::BridgeMined {
+            origin_chain_id,
+            transaction_hash,
+            minimum_output_amount,
+            ..
+        } = self
+            .execution_journal
+            .progress_before_quarantine(&operation.intent.operation_id)
+            .cloned()
+            .context("reconcilable Across fill has no prior mined bridge")?
+        else {
+            bail!("reconcilable Across fill did not follow a mined bridge")
+        };
+        let (bridge_chain_id, wallet_chain_id) = match &operation.intent.route {
+            Route::Across {
+                bridge_chain_id,
+                wallet_chain_id,
+                ..
+            } => (*bridge_chain_id, *wallet_chain_id),
+            _ => unreachable!("reconcilable Across fill must use Across"),
+        };
+        let (expected_origin_chain_id, destination_chain_id) = match operation.intent.direction {
+            Direction::BinanceToWallet => (bridge_chain_id, wallet_chain_id),
+            Direction::WalletToBinance => (wallet_chain_id, bridge_chain_id),
+        };
+        ensure!(
+            origin_chain_id == expected_origin_chain_id,
+            "reconciled Across origin chain differs from the durable route"
+        );
+        let minimum =
+            u128::try_from(minimum_output_amount).context("Across minimum exceeds u128")?;
+        let origin_transaction_hash = format!("{transaction_hash:#x}");
+        let status = self.across.deposit_status(&origin_transaction_hash).await?;
+        if !validate_deposit_status(
+            &status,
+            origin_chain_id,
+            &origin_transaction_hash,
+            destination_chain_id,
+            token_on_chain(&operation.intent.token_symbol, destination_chain_id)?,
+            minimum,
+        )? {
+            return Ok(None);
+        }
+        let fill_hash = B256::from_str(
+            status
+                .fill_txn_ref
+                .as_deref()
+                .context("Across fill has no transaction hash")?,
+        )?;
+        let receipt = self
+            .evm
+            .rpc(destination_chain_id)?
+            .transaction_receipt(fill_hash)
+            .await?
+            .context("Across reports filled but the destination receipt is unavailable")?;
+        let received = validate_across_fill_receipt(
+            &receipt,
+            fill_hash,
+            token_on_chain(&operation.intent.token_symbol, destination_chain_id)?,
+            operation.intent.wallet_owner,
+            minimum_output_amount,
+        )?;
+        let reconciled = self.execution_journal.record_reconciled_across_fill(
+            &operation.intent.operation_id,
+            fill_hash,
+            received,
+        )?;
+        tracing::warn!(
+            operation_id = reconciled.intent.operation_id,
+            token = reconciled.intent.token_symbol,
+            origin_chain_id,
+            destination_chain_id,
+            origin_transaction_hash = %transaction_hash,
+            fill_transaction_hash = %fill_hash,
+            received_base_units = %received,
+            "reconciled quarantined Across timeout from the exact destination receipt"
+        );
+        Ok(Some(reconciled))
+    }
+
     pub fn quarantine_active_operation(
         &mut self,
         reason: &str,
