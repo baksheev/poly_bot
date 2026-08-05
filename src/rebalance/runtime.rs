@@ -3134,7 +3134,8 @@ impl RebalanceExecutor {
                             "Binance changed the deposit id after questionnaire submission started"
                         );
                     } else {
-                        let chain_id = route_wallet_chain_id(&operation.intent.route);
+                        let chain_id =
+                            deposit_questionnaire_chain_id(&operation.progress, transaction_hash)?;
                         operation = self.execution_journal.advance(
                             &operation.intent.operation_id,
                             RebalanceExecutionProgress::DepositQuestionnaireSubmissionStarted {
@@ -3827,6 +3828,24 @@ fn route_wallet_chain_id(route: &Route) -> u64 {
     }
 }
 
+fn deposit_questionnaire_chain_id(
+    progress: &RebalanceExecutionProgress,
+    transaction_hash: B256,
+) -> anyhow::Result<u64> {
+    let RebalanceExecutionProgress::DepositTransferMined {
+        chain_id,
+        transaction_hash: recorded_transaction_hash,
+    } = progress
+    else {
+        bail!("Binance deposit questionnaire has no mined transfer evidence")
+    };
+    ensure!(
+        *recorded_transaction_hash == transaction_hash,
+        "Binance deposit questionnaire transaction differs from the durable journal"
+    );
+    Ok(*chain_id)
+}
+
 fn route_withdrawal_chain_id(route: &Route) -> u64 {
     match route {
         Route::Direct { chain_id, .. } => *chain_id,
@@ -4072,11 +4091,12 @@ mod tests {
         ARBITRUM_CHAIN_ID, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD,
         WithdrawalAbsenceEvidence, account_asset_balance_or_zero, base_units_to_decimal,
         current_required_withdrawal, decimal_to_base_units, decimal_to_base_units_floor,
-        matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
-        reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
-        shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
-        validate_direct_withdrawal_receipt, verified_self_owned_evm_address_record,
-        withdrawal_received_base_units, withdrawal_requested_base_units, withdrawal_retry_is_stale,
+        deposit_questionnaire_chain_id, matches_travel_rule_record_identity_without_client_id,
+        merge_travel_rule_withdrawal_detail, reconcile_approved_travel_rule_rejection,
+        route_wallet_chain_id, shared_evm_confirmation_timeout, validate_across_fill_receipt,
+        validate_approved_asset, validate_direct_withdrawal_receipt,
+        verified_self_owned_evm_address_record, withdrawal_received_base_units,
+        withdrawal_requested_base_units, withdrawal_retry_is_stale,
     };
 
     #[test]
@@ -4189,6 +4209,21 @@ mod tests {
             }),
             ARBITRUM_CHAIN_ID
         );
+    }
+
+    #[test]
+    fn across_deposit_questionnaire_uses_the_mined_destination_chain() {
+        let transaction_hash = B256::repeat_byte(0x34);
+        let progress = RebalanceExecutionProgress::DepositTransferMined {
+            chain_id: 10,
+            transaction_hash,
+        };
+
+        assert_eq!(
+            deposit_questionnaire_chain_id(&progress, transaction_hash).unwrap(),
+            10
+        );
+        assert!(deposit_questionnaire_chain_id(&progress, B256::repeat_byte(0x35)).is_err());
     }
 
     #[test]

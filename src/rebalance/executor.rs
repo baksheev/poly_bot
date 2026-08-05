@@ -646,14 +646,18 @@ impl RebalanceExecutionJournal {
                 .copied()
                 .unwrap_or(0)
                 >= MAX_CORRECTED_QUARANTINE_REOPENS
-                || !corrected_guard_quarantine(reason)
             {
                 return None;
             }
-            self.progress_before_quarantine
-                .get(&operation.intent.operation_id)
-                .cloned()
-                .map(|progress| (operation.intent.operation_id.clone(), progress))
+            let previous = self
+                .progress_before_quarantine
+                .get(&operation.intent.operation_id)?;
+            if !corrected_guard_quarantine(reason)
+                && !corrected_across_deposit_chain_quarantine(&operation.intent, reason, previous)
+            {
+                return None;
+            }
+            Some((operation.intent.operation_id.clone(), previous.clone()))
         });
         let Some((operation_id, progress)) = candidate else {
             return Ok(None);
@@ -1284,6 +1288,27 @@ fn corrected_guard_quarantine(reason: &str) -> bool {
         || signature_encoding_quarantine(reason)
 }
 
+fn corrected_across_deposit_chain_quarantine(
+    intent: &RebalanceExecutionIntent,
+    reason: &str,
+    progress_before_quarantine: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        (&intent.route, intent.direction, progress_before_quarantine),
+        (
+            Route::Across {
+                bridge_chain_id,
+                wallet_chain_id,
+                ..
+            },
+            Direction::WalletToBinance,
+            RebalanceExecutionProgress::DepositTransferMined { chain_id, .. },
+        ) if reason == "illegal rebalance executor state transition"
+            && bridge_chain_id != wallet_chain_id
+            && chain_id == bridge_chain_id
+    )
+}
+
 fn across_fill_timeout_quarantine(reason: &str) -> bool {
     reason == "timed out waiting for Across fill"
 }
@@ -1409,7 +1434,9 @@ fn validate_transition(
             == "rebalance intent has no indexed Binance master transfer; operator review required"
     ) || reconciled_arbitrum_deposit_transition(
         intent, previous, next,
-    ) || reconciled_across_fill_transition(intent, previous, next);
+    ) || reconciled_across_fill_transition(intent, previous, next)
+        || matches!(previous, RebalanceExecutionProgress::Quarantined { reason }
+            if corrected_across_deposit_chain_quarantine(intent, reason, next));
     ensure!(
         !previous.terminal()
             || approved_terminal_retry
@@ -2276,6 +2303,56 @@ mod tests {
         }
     }
 
+    fn advance_to_across_deposit(
+        journal: &mut RebalanceExecutionJournal,
+        operation_id: &str,
+        deposit_chain_id: u64,
+    ) {
+        journal
+            .advance(
+                operation_id,
+                RebalanceExecutionProgress::BridgePrepared {
+                    origin_chain_id: 480,
+                    input_amount: U256::from(2_000_000_u64),
+                    target: Address::repeat_byte(0x35),
+                    calldata: vec![0x36],
+                    calldata_hash: keccak256([0x36]),
+                    minimum_output_amount: U256::from(1_990_000_u64),
+                    destination_balance_before: U256::from(10_000_000_u64),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                operation_id,
+                RebalanceExecutionProgress::BridgeMined {
+                    origin_chain_id: 480,
+                    transaction_hash: B256::repeat_byte(0x32),
+                    minimum_output_amount: U256::from(1_990_000_u64),
+                    destination_balance_before: U256::from(10_000_000_u64),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                operation_id,
+                RebalanceExecutionProgress::AcrossFilled {
+                    fill_transaction_hash: B256::repeat_byte(0x33),
+                    received_base_units: U256::from(1_995_000_u64),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                operation_id,
+                RebalanceExecutionProgress::DepositTransferMined {
+                    chain_id: deposit_chain_id,
+                    transaction_hash: B256::repeat_byte(0x34),
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn proven_absent_stale_withdrawal_returns_master_inventory_before_cancellation() {
         let path = path("stale-withdrawal-cancellation");
@@ -3065,6 +3142,71 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            replayed
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_across_questionnaire_chain_quarantine_reopens_exact_mined_deposit() {
+        let path = path("across-questionnaire-chain-reopen");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        advance_to_across_deposit(&mut journal, &operation_id, 10);
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "illegal rebalance executor state transition".to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the historical destination-chain mismatch should reopen");
+        assert_eq!(
+            reopened.progress,
+            RebalanceExecutionProgress::DepositTransferMined {
+                chain_id: 10,
+                transaction_hash: B256::repeat_byte(0x34),
+            }
+        );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unrelated_illegal_transition_quarantine_stays_closed() {
+        let path = path("unrelated-illegal-transition-stays-closed");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        advance_to_across_deposit(&mut journal, &operation_id, 480);
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "illegal rebalance executor state transition".to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
         assert!(
             replayed
                 .reopen_next_retryable_quarantine()
