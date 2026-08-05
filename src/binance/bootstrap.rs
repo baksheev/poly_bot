@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 
 use crate::{
     binance::{
-        account::BinanceAccountClient,
+        account::{AssetBalance, BinanceAccountClient},
         capital::select_capital_routes,
         execution::{
             BinanceExecutionService, BinanceOrderOutcome, BinanceOrderRequest,
@@ -56,26 +56,7 @@ pub async fn bootstrap_arb_inventory(
         state.open_orders.is_empty(),
         "Binance account has open ARBUSDC orders; bootstrap refused"
     );
-    let usdc = state
-        .account
-        .balances
-        .iter()
-        .find(|balance| balance.asset == "USDC")
-        .context("Binance account has no USDC balance")?;
-    let arb = state
-        .account
-        .balances
-        .iter()
-        .find(|balance| balance.asset == "ARB")
-        .context("Binance account has no ARB balance")?;
-    ensure!(
-        usdc.locked.is_zero() && arb.locked.is_zero(),
-        "ARB bootstrap assets are locked by another operation"
-    );
-    ensure!(
-        usdc.free >= quote_usdc,
-        "Binance free USDC balance is below the 500 USDC bootstrap"
-    );
+    validate_bootstrap_balances(&state.account.balances, quote_usdc)?;
     let coins = account.all_coin_information().await?;
     for asset in ["USDC", "ARB"] {
         let capital = select_capital_routes(&coins, asset, "ARBITRUM", "OPTIMISM")?;
@@ -133,4 +114,79 @@ pub async fn bootstrap_arb_inventory(
         "ARB Binance inventory bootstrap completed"
     );
     Ok(outcome)
+}
+
+fn validate_bootstrap_balances(
+    balances: &[AssetBalance],
+    quote_usdc: Decimal,
+) -> anyhow::Result<()> {
+    let usdc = balances
+        .iter()
+        .find(|balance| balance.asset == "USDC")
+        .context("Binance account has no USDC balance")?;
+    // Account hydration deliberately requests omitZeroBalances=true. A new
+    // bootstrap asset therefore has no row until its first fill; that absence
+    // is exactly zero free and zero locked, not an unknown account state.
+    let arb_locked = balances
+        .iter()
+        .find(|balance| balance.asset == "ARB")
+        .map(|balance| balance.locked)
+        .unwrap_or(Decimal::ZERO);
+    ensure!(
+        usdc.locked.is_zero() && arb_locked.is_zero(),
+        "ARB bootstrap assets are locked by another operation"
+    );
+    ensure!(
+        usdc.free >= quote_usdc,
+        "Binance free USDC balance is below the 500 USDC bootstrap"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn balance(asset: &str, free: i64, locked: i64) -> AssetBalance {
+        AssetBalance {
+            asset: asset.to_owned(),
+            free: Decimal::from(free),
+            locked: Decimal::from(locked),
+        }
+    }
+
+    #[test]
+    fn missing_zero_arb_row_is_valid_for_the_first_bootstrap_fill() {
+        validate_bootstrap_balances(&[balance("USDC", 1_000, 0)], ARB_BOOTSTRAP_QUOTE_USDC)
+            .unwrap();
+    }
+
+    #[test]
+    fn bootstrap_still_rejects_locked_or_insufficient_assets() {
+        let locked = [balance("USDC", 1_000, 0), balance("ARB", 0, 1)];
+        assert!(
+            validate_bootstrap_balances(&locked, ARB_BOOTSTRAP_QUOTE_USDC)
+                .unwrap_err()
+                .to_string()
+                .contains("locked")
+        );
+
+        let insufficient = [balance("USDC", 499, 0)];
+        assert!(
+            validate_bootstrap_balances(&insufficient, ARB_BOOTSTRAP_QUOTE_USDC)
+                .unwrap_err()
+                .to_string()
+                .contains("below the 500 USDC bootstrap")
+        );
+    }
+
+    #[test]
+    fn missing_usdc_row_remains_an_error() {
+        assert!(
+            validate_bootstrap_balances(&[], ARB_BOOTSTRAP_QUOTE_USDC)
+                .unwrap_err()
+                .to_string()
+                .contains("no USDC balance")
+        );
+    }
 }
