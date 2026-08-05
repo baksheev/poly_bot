@@ -124,6 +124,7 @@ const MAXIMUM_CONCURRENT_ADAPTIVE_SIZING_WORKERS: usize = 4;
 const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const REBALANCE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
+const ACROSS_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 
 fn esp_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
     let network_id = format!("eip155:{chain_id}");
@@ -181,6 +182,7 @@ enum RebalanceExecutorEvent {
         result: Result<RebalanceExecutionOperation, String>,
         active_operation_after: bool,
         blocked_token: Option<String>,
+        recovery_started: Option<Box<RebalanceExecutionOperation>>,
         next_recovery: Option<Box<RebalanceExecutionOperation>>,
     },
     Execution {
@@ -189,6 +191,18 @@ enum RebalanceExecutorEvent {
         active_operation_after: bool,
         blocked_token: Option<String>,
     },
+    AcrossReconciliationIdle {
+        attempted: bool,
+        error: Option<String>,
+    },
+}
+
+enum RebalanceExecutorCommand {
+    Execute {
+        target: RebalanceExecutionTarget,
+        request: Box<RebalanceExecutionRequest>,
+    },
+    ReconcileAcross,
 }
 
 fn rebalance_target(operation: &RebalanceExecutionOperation) -> RebalanceExecutionTarget {
@@ -3768,6 +3782,7 @@ async fn run(
                                 result,
                                 active_operation_after,
                                 blocked_token,
+                                recovery_started: None,
                                 next_recovery: next_recovery.map(Box::new),
                             })
                             .await
@@ -3781,39 +3796,140 @@ async fn run(
                         current_target = target;
                     }
                 }
-                while let Some((target, request)) = request_receiver.recv().await {
-                    let saga_started_at = Instant::now();
-                    let result = execute_rebalance_with_quote_retries(&mut executor, request).await;
-                    let blocked_token = if let Err(error) = &result {
-                        executor
-                            .quarantine_active_operation(error)?
-                            .map(|operation| operation.intent.token_symbol)
-                    } else {
-                        None
-                    };
-                    emit_rebalance_saga(
-                        &rebalance_telemetry,
-                        &rebalance_engine_id,
-                        target,
-                        &result,
-                        &executor,
-                        saga_started_at,
-                        false,
-                    );
-                    emit_rebalance_risk(&rebalance_telemetry, &rebalance_engine_id, &executor);
-                    risk_sender.send_replace(executor.rebalance_risk()?);
-                    let active_operation_after = executor.active_operation()?.is_some();
-                    if result_sender
-                        .send(RebalanceExecutorEvent::Execution {
-                            target,
-                            result,
-                            active_operation_after,
-                            blocked_token,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return Ok::<(), anyhow::Error>(());
+                while let Some(command) = request_receiver.recv().await {
+                    match command {
+                        RebalanceExecutorCommand::Execute { target, request } => {
+                            let saga_started_at = Instant::now();
+                            let result =
+                                execute_rebalance_with_quote_retries(&mut executor, *request).await;
+                            let blocked_token = if let Err(error) = &result {
+                                executor
+                                    .quarantine_active_operation(error)?
+                                    .map(|operation| operation.intent.token_symbol)
+                            } else {
+                                None
+                            };
+                            emit_rebalance_saga(
+                                &rebalance_telemetry,
+                                &rebalance_engine_id,
+                                target,
+                                &result,
+                                &executor,
+                                saga_started_at,
+                                false,
+                            );
+                            emit_rebalance_risk(
+                                &rebalance_telemetry,
+                                &rebalance_engine_id,
+                                &executor,
+                            );
+                            risk_sender.send_replace(executor.rebalance_risk()?);
+                            let active_operation_after = executor.active_operation()?.is_some();
+                            if result_sender
+                                .send(RebalanceExecutorEvent::Execution {
+                                    target,
+                                    result,
+                                    active_operation_after,
+                                    blocked_token,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                        }
+                        RebalanceExecutorCommand::ReconcileAcross => {
+                            let reconciliation_started_at = Instant::now();
+                            if !executor.has_reconcilable_across_fill_quarantine()? {
+                                if result_sender
+                                    .send(RebalanceExecutorEvent::AcrossReconciliationIdle {
+                                        attempted: false,
+                                        error: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok::<(), anyhow::Error>(());
+                                }
+                                continue;
+                            }
+                            match executor.reconcile_next_across_fill_quarantine().await {
+                                Ok(Some(reopened)) => {
+                                    let target = rebalance_target(&reopened);
+                                    let result =
+                                        recover_rebalance_with_quote_retries(&mut executor).await;
+                                    let blocked_token = if let Err(error) = &result {
+                                        executor
+                                            .quarantine_active_operation(error)?
+                                            .map(|operation| operation.intent.token_symbol)
+                                    } else {
+                                        None
+                                    };
+                                    emit_rebalance_saga(
+                                        &rebalance_telemetry,
+                                        &rebalance_engine_id,
+                                        target,
+                                        &result,
+                                        &executor,
+                                        reconciliation_started_at,
+                                        true,
+                                    );
+                                    emit_rebalance_risk(
+                                        &rebalance_telemetry,
+                                        &rebalance_engine_id,
+                                        &executor,
+                                    );
+                                    risk_sender.send_replace(executor.rebalance_risk()?);
+                                    let active_operation_after =
+                                        executor.active_operation()?.is_some();
+                                    if result_sender
+                                        .send(RebalanceExecutorEvent::Recovery {
+                                            target,
+                                            result,
+                                            active_operation_after,
+                                            blocked_token,
+                                            recovery_started: Some(Box::new(reopened)),
+                                            next_recovery: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                }
+                                Ok(None) => {
+                                    if result_sender
+                                        .send(RebalanceExecutorEvent::AcrossReconciliationIdle {
+                                            attempted: true,
+                                            error: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                }
+                                Err(error) => {
+                                    let error = format!("{error:#}");
+                                    tracing::warn!(
+                                        error,
+                                        retry_after_seconds =
+                                            ACROSS_RECONCILIATION_INTERVAL.as_secs(),
+                                        "Across quarantine reconciliation will be retried"
+                                    );
+                                    if result_sender
+                                        .send(RebalanceExecutorEvent::AcrossReconciliationIdle {
+                                            attempted: true,
+                                            error: Some(error),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Ok::<(), anyhow::Error>(())
@@ -3825,10 +3941,8 @@ async fn run(
                 risk_receiver,
             )
         } else {
-            let (_request_sender, _request_receiver) = tokio::sync::mpsc::channel::<(
-                RebalanceExecutionTarget,
-                RebalanceExecutionRequest,
-            )>(1);
+            let (_request_sender, _request_receiver) =
+                tokio::sync::mpsc::channel::<RebalanceExecutorCommand>(1);
             let (_result_sender, result_receiver) =
                 tokio::sync::mpsc::channel::<RebalanceExecutorEvent>(1);
             let (_risk_sender, risk_receiver) =
@@ -4056,6 +4170,9 @@ async fn run(
     let mut rebalance_supervisor_tick = tokio::time::interval(REBALANCE_SUPERVISOR_INTERVAL);
     rebalance_supervisor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     rebalance_supervisor_tick.reset();
+    let mut across_reconciliation_tick = tokio::time::interval(ACROSS_RECONCILIATION_INTERVAL);
+    across_reconciliation_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    across_reconciliation_tick.reset();
 
     // These futures must survive unrelated select branches. Recreating
     // `next_event()` on every loop iteration cancels a multi-await depth
@@ -4163,6 +4280,19 @@ async fn run(
                     &mut longest_non_price_handler_us,
                     &mut longest_non_price_handler,
                     "rebalance_supervisor",
+                    handler_started_at.elapsed(),
+                );
+            },
+            _ = across_reconciliation_tick.tick(), if rebalance_sender.is_some() => {
+                let handler_started_at = Instant::now();
+                dispatch_across_reconciliation(
+                    &mut rebalance_lane_busy,
+                    rebalance_sender.as_ref(),
+                )?;
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "across_reconciliation_dispatch",
                     handler_started_at.elapsed(),
                 );
             },
@@ -4369,12 +4499,32 @@ async fn run(
                         active_operation_after,
                         ..
                     } => *active_operation_after,
+                    RebalanceExecutorEvent::AcrossReconciliationIdle { .. } => false,
                 };
                 let next_recovery = match &result {
                     RebalanceExecutorEvent::Recovery { next_recovery, .. } => {
                         next_recovery.clone()
                     }
-                    RebalanceExecutorEvent::Execution { .. } => None,
+                    RebalanceExecutorEvent::Execution { .. }
+                    | RebalanceExecutorEvent::AcrossReconciliationIdle { .. } => None,
+                };
+                let recovery_started = match &result {
+                    RebalanceExecutorEvent::Recovery {
+                        recovery_started,
+                        ..
+                    } => recovery_started.clone(),
+                    RebalanceExecutorEvent::Execution { .. }
+                    | RebalanceExecutorEvent::AcrossReconciliationIdle { .. } => None,
+                };
+                if let Some(operation) = recovery_started.as_deref() {
+                    match rebalance_target(operation) {
+                        RebalanceExecutionTarget::Primary => {
+                            engine.on_rebalance_recovery_started(operation)?
+                        }
+                        RebalanceExecutionTarget::Arbitrum => {
+                            esp_engine.on_rebalance_recovery_started(operation)?
+                        }
+                    }
                 };
                 match result {
                     RebalanceExecutorEvent::Recovery {
@@ -4417,6 +4567,24 @@ async fn run(
                             esp_engine.on_rebalance_execution_result(Err(&error), blocked_token)?
                         }
                     },
+                    RebalanceExecutorEvent::AcrossReconciliationIdle { attempted, error } => {
+                        if attempted {
+                            telemetry.emit(
+                                "rebalance_across_reconciliation",
+                                serde_json::json!({
+                                    "engine_id": config.engine_id,
+                                    "outcome": if error.is_some() {
+                                        "retryable_error"
+                                    } else {
+                                        "fill_pending"
+                                    },
+                                    "error": error,
+                                    "retry_after_seconds": ACROSS_RECONCILIATION_INTERVAL.as_secs(),
+                                    "external_mutation_authorized": false,
+                                }),
+                            );
+                        }
+                    }
                 }
                 if let Some(operation) = next_recovery.as_deref() {
                     match rebalance_target(operation) {
@@ -4881,15 +5049,35 @@ fn rebalance_quote_retry_delay(retry_attempt: u32) -> Duration {
         .min(REBALANCE_QUOTE_RETRY_MAX_DELAY)
 }
 
+fn dispatch_across_reconciliation(
+    lane_busy: &mut bool,
+    sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutorCommand>>,
+) -> anyhow::Result<bool> {
+    if *lane_busy {
+        return Ok(false);
+    }
+    let sender = sender.context("Across reconciliation has no rebalance executor")?;
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+            bail!("rebalance executor queue is full while its lane is idle")
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+            bail!("rebalance executor queue is closed")
+        }
+    };
+    permit.send(RebalanceExecutorCommand::ReconcileAcross);
+    *lane_busy = true;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_next_rebalance_execution(
     lane_busy: &mut bool,
     next_target: &mut RebalanceExecutionTarget,
     primary_engine: &mut TradingEngine,
     arbitrum_engine: &mut TradingEngine,
-    sender: Option<
-        &tokio::sync::mpsc::Sender<(RebalanceExecutionTarget, RebalanceExecutionRequest)>,
-    >,
+    sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutorCommand>>,
     primary_pair: &arb_bot::domain::config::PairConfig,
     arbitrum_pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
@@ -4939,9 +5127,7 @@ async fn dispatch_next_rebalance_execution(
 
 async fn dispatch_rebalance_execution(
     engine: &mut TradingEngine,
-    sender: Option<
-        &tokio::sync::mpsc::Sender<(RebalanceExecutionTarget, RebalanceExecutionRequest)>,
-    >,
+    sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutorCommand>>,
     pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
     target: RebalanceExecutionTarget,
@@ -5069,9 +5255,9 @@ async fn dispatch_rebalance_execution(
         .contract
         .parse::<Address>()
         .context("rebalance execution token contract is invalid")?;
-    permit.send((
+    permit.send(RebalanceExecutorCommand::Execute {
         target,
-        RebalanceExecutionRequest {
+        request: Box::new(RebalanceExecutionRequest {
             authority: match target {
                 RebalanceExecutionTarget::Primary => RebalanceExecutionAuthority::WorldChainV12,
                 RebalanceExecutionTarget::Arbitrum => {
@@ -5101,8 +5287,8 @@ async fn dispatch_rebalance_execution(
             } else {
                 None
             },
-        },
-    ));
+        }),
+    });
     Ok(RebalanceDispatchOutcome::Submitted)
 }
 
@@ -5868,8 +6054,9 @@ mod tests {
     };
 
     use super::{
-        RebalanceDispatchOutcome, RebalanceExecutionTarget, StartupDexDrainStats,
-        apply_rebalance_dispatch_outcome, esp_evm_journal_scope, rebalance_quote_retry_delay,
+        ACROSS_RECONCILIATION_INTERVAL, RebalanceDispatchOutcome, RebalanceExecutionTarget,
+        RebalanceExecutorCommand, StartupDexDrainStats, apply_rebalance_dispatch_outcome,
+        dispatch_across_reconciliation, esp_evm_journal_scope, rebalance_quote_retry_delay,
         sync_runtime_ready_marker, transient_capital_allocator_inventory_mismatch,
     };
 
@@ -5928,6 +6115,22 @@ mod tests {
         assert_eq!(rebalance_quote_retry_delay(4), Duration::from_secs(40));
         assert_eq!(rebalance_quote_retry_delay(5), Duration::from_secs(60));
         assert_eq!(rebalance_quote_retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn across_reconciliation_poll_claims_only_an_idle_lane() {
+        assert_eq!(ACROSS_RECONCILIATION_INTERVAL, Duration::from_secs(30));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut lane_busy = false;
+
+        assert!(dispatch_across_reconciliation(&mut lane_busy, Some(&sender)).unwrap());
+        assert!(lane_busy);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(RebalanceExecutorCommand::ReconcileAcross)
+        ));
+        assert!(!dispatch_across_reconciliation(&mut lane_busy, Some(&sender)).unwrap());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

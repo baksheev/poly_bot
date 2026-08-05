@@ -453,6 +453,13 @@ impl RebalanceExecutor {
         self.execution_journal.quarantined_operations()
     }
 
+    pub fn has_reconcilable_across_fill_quarantine(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .execution_journal
+            .next_reconcilable_across_fill_quarantine()?
+            .is_some())
+    }
+
     pub fn reopen_next_retryable_quarantine(
         &mut self,
     ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
