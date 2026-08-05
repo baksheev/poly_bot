@@ -706,9 +706,11 @@ jobs:
             done
             if [[ "${restore_old_owner}" == true ]]; then
               if [[ "${helpers_gone}" == true ]]; then
-                kubectl scale deployment arb-bot \
+                kubectl patch deployment arb-bot \
                   --namespace "${GKE_NAMESPACE}" \
-                  --replicas=1 >/dev/null || true
+                  --type=json \
+                  --patch='[{"op":"replace","path":"/spec/replicas","value":1}]' \
+                  >/dev/null || true
                 kubectl rollout status deployment/arb-bot \
                   --namespace "${GKE_NAMESPACE}" \
                   --timeout=180s || true
@@ -727,9 +729,10 @@ jobs:
           wait_operation_owner "${stop_owner}" entry-stop 470
           delete_operation_owner "${stop_owner}"
 
-          kubectl scale deployment arb-bot \
+          kubectl patch deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
-            --replicas=0
+            --type=json \
+            --patch='[{"op":"replace","path":"/spec/replicas","value":0}]'
           restore_old_owner=true
           kubectl wait pod \
             --namespace "${GKE_NAMESPACE}" \
@@ -744,9 +747,10 @@ jobs:
           wait_operation_owner "${bootstrap_owner}" bootstrap 310
           delete_operation_owner "${bootstrap_owner}"
 
-          kubectl scale deployment arb-bot \
+          kubectl patch deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
-            --replicas=1
+            --type=json \
+            --patch='[{"op":"replace","path":"/spec/replicas","value":1}]'
           kubectl rollout status deployment/arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             --timeout=180s
