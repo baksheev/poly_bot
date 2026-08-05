@@ -73,12 +73,12 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     );
     assert!(DEPLOY_WORKFLOW.contains("[500,3000,10000]"));
     assert!(DEPLOY_WORKFLOW.contains("0x610e319b3a3ab56a0ed5562927d37c233774ba39"));
-    assert!(
-        DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live")
-    );
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live"));
     assert!(DEPLOY_WORKFLOW.contains("[500,3000]"));
     assert!(DEPLOY_WORKFLOW.contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"));
     assert!(DEPLOY_WORKFLOW.contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"));
+    assert!(DEPLOY_WORKFLOW.contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"));
+    assert!(DEPLOY_WORKFLOW.contains("0x1F721E2E82F6676FCE4eA07A5958cF098D339e18"));
     assert!(DEPLOY_WORKFLOW.contains("selection_enabled\":true"));
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
@@ -118,6 +118,14 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("Arbitrum full-live production strategies configured"));
     assert!(MAIN.contains("shared_inventory_owner"));
     assert!(MAIN.contains("shared_binance_order_owner"));
+    assert!(MAIN.contains("enable_camelot_submissions_after_allowance_lock"));
+    let camelot_allowance = MAIN
+        .find("protocol: DexProtocol::CamelotV3")
+        .expect("Camelot allowance is prepared by the Arbitrum execution owner");
+    let camelot_gate = MAIN
+        .find("enable_camelot_submissions_after_allowance_lock")
+        .expect("Camelot submission gate is wired");
+    assert!(camelot_allowance < camelot_gate);
     assert!(MAIN.contains("secondary_hot_path_rebalance_mutation_authorized"));
     assert!(MAIN.contains("report_strategy_dependency_faults"));
     assert!(MAIN.contains("engine.take_adaptive_sizing_jobs()"));

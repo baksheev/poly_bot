@@ -1,4 +1,9 @@
-use std::{collections::HashMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use alloy_primitives::{I256, U256};
 use anyhow::{Context, ensure};
@@ -21,7 +26,10 @@ const PREPARED_CURVE_INITIAL_SEGMENT_CAPACITY: usize = 128;
 /// must never be represented by this type.
 #[derive(Debug, Clone)]
 pub struct ClmmPool {
+    /// Static fee for Uniswap-style pools and the zero-to-one directional fee
+    /// for Algebra V1.9 pools. Use `fee_pips_for_direction` while quoting.
     pub fee_pips: u32,
+    one_for_zero_fee_pips: u32,
     pub tick_spacing: i32,
     pub sqrt_price_x96: U256,
     pub tick: i32,
@@ -29,6 +37,13 @@ pub struct ClmmPool {
     tick_bitmap: HashMap<i16, U256>,
     ticks: HashMap<i32, TickLiquidity>,
     word_boundary_sqrt_ratios: Arc<HashMap<i32, U256>>,
+    tick_traversal: TickTraversal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TickTraversal {
+    SpacingCompressed,
+    AlgebraRaw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +108,51 @@ impl ClmmPool {
         tick: i32,
         liquidity: u128,
     ) -> anyhow::Result<Self> {
-        ensure!(fee_pips < 1_000_000, "fee must be below 1_000_000 pips");
+        Self::new_with_profile(
+            fee_pips,
+            fee_pips,
+            tick_spacing,
+            sqrt_price_x96,
+            tick,
+            liquidity,
+            TickTraversal::SpacingCompressed,
+        )
+    }
+
+    /// Constructs a Camelot/Algebra V1.9 pool. Algebra stores actual ticks in
+    /// each 256-bit row and selects a different fee for each swap direction.
+    pub fn new_algebra_v1_9(
+        fee_zero_for_one_pips: u32,
+        fee_one_for_zero_pips: u32,
+        tick_spacing: i32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        liquidity: u128,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_profile(
+            fee_zero_for_one_pips,
+            fee_one_for_zero_pips,
+            tick_spacing,
+            sqrt_price_x96,
+            tick,
+            liquidity,
+            TickTraversal::AlgebraRaw,
+        )
+    }
+
+    fn new_with_profile(
+        fee_zero_for_one_pips: u32,
+        fee_one_for_zero_pips: u32,
+        tick_spacing: i32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        liquidity: u128,
+        tick_traversal: TickTraversal,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            fee_zero_for_one_pips < 1_000_000 && fee_one_for_zero_pips < 1_000_000,
+            "fee must be below 1_000_000 pips"
+        );
         ensure!(tick_spacing > 0, "tick spacing must be positive");
         ensure!(
             (MIN_TICK..=MAX_TICK).contains(&tick),
@@ -106,15 +165,48 @@ impl ClmmPool {
         ensure!(liquidity > 0, "active liquidity must be positive");
 
         Ok(Self {
-            fee_pips,
+            fee_pips: fee_zero_for_one_pips,
+            one_for_zero_fee_pips: fee_one_for_zero_pips,
             tick_spacing,
             sqrt_price_x96,
             tick,
             liquidity,
             tick_bitmap: HashMap::new(),
             ticks: HashMap::new(),
-            word_boundary_sqrt_ratios: Arc::new(word_boundary_sqrt_ratios(tick_spacing)?),
+            word_boundary_sqrt_ratios: word_boundary_sqrt_ratios(tick_spacing, tick_traversal)?,
+            tick_traversal,
         })
+    }
+
+    #[inline]
+    pub const fn fee_pips_for_direction(&self, zero_for_one: bool) -> u32 {
+        if zero_for_one {
+            self.fee_pips
+        } else {
+            self.one_for_zero_fee_pips
+        }
+    }
+
+    pub const fn directional_fee_pips(&self) -> (u32, u32) {
+        (self.fee_pips, self.one_for_zero_fee_pips)
+    }
+
+    pub fn set_algebra_directional_fees(
+        &mut self,
+        fee_zero_for_one_pips: u32,
+        fee_one_for_zero_pips: u32,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.tick_traversal == TickTraversal::AlgebraRaw,
+            "directional fees require an Algebra V1.9 pool"
+        );
+        ensure!(
+            fee_zero_for_one_pips < 1_000_000 && fee_one_for_zero_pips < 1_000_000,
+            "fee must be below 1_000_000 pips"
+        );
+        self.fee_pips = fee_zero_for_one_pips;
+        self.one_for_zero_fee_pips = fee_one_for_zero_pips;
+        Ok(())
     }
 
     pub fn initialized_tick_count(&self) -> usize {
@@ -123,6 +215,10 @@ impl ClmmPool {
 
     pub fn tick_liquidity(&self, index: i32) -> Option<TickLiquidity> {
         self.ticks.get(&index).copied()
+    }
+
+    pub fn initialized_ticks(&self) -> impl Iterator<Item = (i32, TickLiquidity)> + '_ {
+        self.ticks.iter().map(|(index, state)| (*index, *state))
     }
 
     /// Installs an absolute initialized-tick snapshot during hydration.
@@ -140,12 +236,12 @@ impl ClmmPool {
         match (previous, gross) {
             (None, 0) => {}
             (None, _) => {
-                flip_tick(&mut self.tick_bitmap, index, self.tick_spacing)
+                self.flip_tick(index)
                     .context("failed to initialize tick bitmap bit")?;
                 self.ticks.insert(index, TickLiquidity { gross, net });
             }
             (Some(_), 0) => {
-                flip_tick(&mut self.tick_bitmap, index, self.tick_spacing)
+                self.flip_tick(index)
                     .context("failed to clear tick bitmap bit")?;
                 self.ticks.remove(&index);
             }
@@ -286,6 +382,7 @@ impl ClmmPool {
     ) -> anyhow::Result<U256> {
         ensure!(!amount_out.is_zero(), "amount out must be positive");
         ensure!(amount_out < (U256::ONE << 255), "amount out exceeds int256");
+        let fee_pips = self.fee_pips_for_direction(zero_for_one);
 
         let sqrt_price_limit_x96 = if zero_for_one {
             MIN_SQRT_RATIO + U256::ONE
@@ -303,13 +400,7 @@ impl ClmmPool {
             && sqrt_price_x96 != sqrt_price_limit_x96
             && liquidity != 0
         {
-            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
-                &self.tick_bitmap,
-                tick,
-                self.tick_spacing,
-                zero_for_one,
-            )
-            .context("failed to find next initialized tick")?;
+            let (mut tick_next, initialized) = self.next_initialized_tick(tick, zero_for_one)?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
 
             let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
@@ -323,7 +414,7 @@ impl ClmmPool {
                 target,
                 liquidity,
                 -I256::from_raw(amount_remaining),
-                self.fee_pips,
+                fee_pips,
             )
             .context("failed to compute exact-output swap step")?;
 
@@ -437,6 +528,7 @@ impl ClmmPool {
             maximum_amount_out < (U256::ONE << 255),
             "prepared curve output maximum exceeds int256"
         );
+        let fee_pips = self.fee_pips_for_direction(zero_for_one);
         let sqrt_price_limit_x96 = if zero_for_one {
             MIN_SQRT_RATIO + U256::ONE
         } else {
@@ -461,13 +553,7 @@ impl ClmmPool {
             && sqrt_price_x96 != sqrt_price_limit_x96
             && liquidity != 0
         {
-            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
-                &self.tick_bitmap,
-                tick,
-                self.tick_spacing,
-                zero_for_one,
-            )
-            .context("failed to find next initialized tick while preparing fused curve")?;
+            let (mut tick_next, initialized) = self.next_initialized_tick(tick, zero_for_one)?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
             let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
             let target = if zero_for_one {
@@ -480,7 +566,7 @@ impl ClmmPool {
                 target,
                 liquidity,
                 -I256::from_raw(result_remaining),
-                self.fee_pips,
+                fee_pips,
             )
             .context("failed to build fused exact-output boundary")?;
             let input_with_fee = step_in
@@ -499,7 +585,7 @@ impl ClmmPool {
                         target,
                         liquidity,
                         I256::from_raw(input_with_fee),
-                        self.fee_pips,
+                        fee_pips,
                     )
                     .context("failed to finalize fused exact-input segment")?;
                 (
@@ -568,7 +654,7 @@ impl ClmmPool {
 
         Ok(PreparedQuoteCurve {
             kind: PreparedQuoteKind::ExactInput,
-            fee_pips: self.fee_pips,
+            fee_pips,
             segments,
         })
     }
@@ -634,6 +720,7 @@ impl ClmmPool {
             maximum_specified < (U256::ONE << 255),
             "prepared curve maximum exceeds int256"
         );
+        let fee_pips = self.fee_pips_for_direction(zero_for_one);
         let sqrt_price_limit_x96 = if zero_for_one {
             MIN_SQRT_RATIO + U256::ONE
         } else {
@@ -667,13 +754,7 @@ impl ClmmPool {
                 PreparedQuoteKind::ExactInput => I256::from_raw(specified_remaining),
                 PreparedQuoteKind::ExactOutput => -I256::from_raw(specified_remaining),
             };
-            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
-                &self.tick_bitmap,
-                tick,
-                self.tick_spacing,
-                zero_for_one,
-            )
-            .context("failed to find next initialized tick while preparing curve")?;
+            let (mut tick_next, initialized) = self.next_initialized_tick(tick, zero_for_one)?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
             let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
             let target = if zero_for_one {
@@ -681,14 +762,9 @@ impl ClmmPool {
             } else {
                 sqrt_price_next_x96.min(sqrt_price_limit_x96)
             };
-            let (sqrt_after, step_in, step_out, fee_amount) = compute_swap_step(
-                sqrt_price_x96,
-                target,
-                liquidity,
-                specified_delta,
-                self.fee_pips,
-            )
-            .context("failed to build prepared swap segment")?;
+            let (sqrt_after, step_in, step_out, fee_amount) =
+                compute_swap_step(sqrt_price_x96, target, liquidity, specified_delta, fee_pips)
+                    .context("failed to build prepared swap segment")?;
             let input_with_fee = step_in
                 .checked_add(fee_amount)
                 .context("prepared swap input overflow")?;
@@ -743,7 +819,7 @@ impl ClmmPool {
 
         Ok(PreparedQuoteCurve {
             kind,
-            fee_pips: self.fee_pips,
+            fee_pips,
             segments,
         })
     }
@@ -756,6 +832,7 @@ impl ClmmPool {
     ) -> anyhow::Result<LocalQuote> {
         ensure!(!amount_in.is_zero(), "amount in must be positive");
         ensure!(amount_in < (U256::ONE << 255), "amount in exceeds int256");
+        let fee_pips = self.fee_pips_for_direction(zero_for_one);
 
         let sqrt_price_limit_x96 = if zero_for_one {
             MIN_SQRT_RATIO + U256::ONE
@@ -770,13 +847,7 @@ impl ClmmPool {
         let mut initialized_ticks_crossed = 0_u32;
 
         while !amount_remaining.is_zero() && sqrt_price_x96 != sqrt_price_limit_x96 {
-            let (mut tick_next, initialized) = next_initialized_tick_within_one_word(
-                &self.tick_bitmap,
-                tick,
-                self.tick_spacing,
-                zero_for_one,
-            )
-            .context("failed to find next initialized tick")?;
+            let (mut tick_next, initialized) = self.next_initialized_tick(tick, zero_for_one)?;
             tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
 
             let sqrt_price_next_x96 = self.sqrt_ratio_at_traversal_tick(tick_next, initialized)?;
@@ -790,7 +861,7 @@ impl ClmmPool {
                 target,
                 liquidity,
                 I256::from_raw(amount_remaining),
-                self.fee_pips,
+                fee_pips,
             )
             .context("failed to compute swap step")?;
 
@@ -860,6 +931,40 @@ impl ClmmPool {
         }
         get_sqrt_ratio_at_tick(tick).context("failed to price initialized tick")
     }
+
+    fn flip_tick(&mut self, tick: i32) -> anyhow::Result<()> {
+        match self.tick_traversal {
+            TickTraversal::SpacingCompressed => {
+                flip_tick(&mut self.tick_bitmap, tick, self.tick_spacing)
+                    .context("failed to toggle spacing-compressed tick")
+            }
+            TickTraversal::AlgebraRaw => {
+                let word = i16::try_from(tick >> 8).context("Algebra tick row exceeds int16")?;
+                let bit =
+                    u32::try_from(tick.rem_euclid(256)).context("Algebra tick bit is negative")?;
+                let entry = self.tick_bitmap.entry(word).or_default();
+                *entry ^= U256::ONE << bit;
+                Ok(())
+            }
+        }
+    }
+
+    fn next_initialized_tick(&self, tick: i32, zero_for_one: bool) -> anyhow::Result<(i32, bool)> {
+        match self.tick_traversal {
+            TickTraversal::SpacingCompressed => next_initialized_tick_within_one_word(
+                &self.tick_bitmap,
+                tick,
+                self.tick_spacing,
+                zero_for_one,
+            )
+            .context("failed to find spacing-compressed tick"),
+            TickTraversal::AlgebraRaw => Ok(next_algebra_tick_in_same_row(
+                &self.tick_bitmap,
+                tick,
+                zero_for_one,
+            )),
+        }
+    }
 }
 
 impl PreparedQuoteCurve {
@@ -921,6 +1026,10 @@ impl PreparedQuoteCurve {
         self.segments.len()
     }
 
+    pub fn specified_boundaries(&self) -> impl Iterator<Item = U256> + '_ {
+        self.segments.iter().map(|segment| segment.specified_end)
+    }
+
     pub fn specified_capacity(&self) -> U256 {
         self.segments
             .last()
@@ -963,19 +1072,80 @@ fn updated_boundary(
     Ok(TickLiquidity { gross, net })
 }
 
-fn word_boundary_sqrt_ratios(tick_spacing: i32) -> anyhow::Result<HashMap<i32, U256>> {
-    let minimum_compressed = MIN_TICK.div_euclid(tick_spacing);
-    let maximum_compressed = MAX_TICK.div_euclid(tick_spacing);
-    let minimum_word = minimum_compressed >> 8;
-    let maximum_word = maximum_compressed >> 8;
+fn next_algebra_tick_in_same_row(
+    tick_table: &HashMap<i16, U256>,
+    tick: i32,
+    zero_for_one: bool,
+) -> (i32, bool) {
+    let search_tick = if zero_for_one {
+        tick
+    } else {
+        tick.saturating_add(1)
+    };
+    let word = (search_tick >> 8) as i16;
+    let bit = search_tick.rem_euclid(256) as u32;
+    let row = tick_table.get(&word).copied().unwrap_or(U256::ZERO);
+    let (next, initialized) = if zero_for_one {
+        let mask = if bit == 255 {
+            U256::MAX
+        } else {
+            (U256::ONE << (bit + 1)) - U256::ONE
+        };
+        let masked = row & mask;
+        if masked.is_zero() {
+            ((i32::from(word)) << 8, false)
+        } else {
+            (
+                ((i32::from(word)) << 8) + (255 - masked.leading_zeros()) as i32,
+                true,
+            )
+        }
+    } else {
+        let mask = U256::MAX << bit;
+        let masked = row & mask;
+        if masked.is_zero() {
+            (((i32::from(word)) << 8) + 255, false)
+        } else {
+            (
+                ((i32::from(word)) << 8) + masked.trailing_zeros() as i32,
+                true,
+            )
+        }
+    };
+    (next.clamp(MIN_TICK, MAX_TICK), initialized)
+}
+
+fn word_boundary_sqrt_ratios(
+    tick_spacing: i32,
+    tick_traversal: TickTraversal,
+) -> anyhow::Result<Arc<HashMap<i32, U256>>> {
+    type Cache = HashMap<(i32, TickTraversal), Arc<HashMap<i32, U256>>>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("word-boundary cache is poisoned"))?
+        .get(&(tick_spacing, tick_traversal))
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let (minimum_word, maximum_word, scale) = match tick_traversal {
+        TickTraversal::SpacingCompressed => (
+            MIN_TICK.div_euclid(tick_spacing) >> 8,
+            MAX_TICK.div_euclid(tick_spacing) >> 8,
+            i64::from(tick_spacing),
+        ),
+        TickTraversal::AlgebraRaw => (MIN_TICK >> 8, MAX_TICK >> 8, 1),
+    };
     let mut ratios = HashMap::with_capacity(((maximum_word - minimum_word + 1) as usize) * 2 + 2);
 
     for word in minimum_word..=maximum_word {
         let word_start = i64::from(word) << 8;
-        let lower = (word_start * i64::from(tick_spacing))
-            .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
-        let upper = ((word_start + 255) * i64::from(tick_spacing))
-            .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
+        let lower = (word_start * scale).clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
+        let upper =
+            ((word_start + 255) * scale).clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
         for tick in [lower, upper] {
             ratios.entry(tick).or_insert(
                 get_sqrt_ratio_at_tick(tick).context("failed to cache word-boundary price")?,
@@ -987,12 +1157,22 @@ fn word_boundary_sqrt_ratios(tick_spacing: i32) -> anyhow::Result<HashMap<i32, U
             .entry(tick)
             .or_insert(get_sqrt_ratio_at_tick(tick).context("failed to cache terminal price")?);
     }
-    Ok(ratios)
+    let ratios = Arc::new(ratios);
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("word-boundary cache is poisoned"))?;
+    Ok(cache
+        .entry((tick_spacing, tick_traversal))
+        .or_insert_with(|| Arc::clone(&ratios))
+        .clone())
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{U256, uint};
+    use std::hint::black_box;
+
+    use alloy_primitives::{I256, U256, uint};
+    use uniswap_v3_math::swap_math::compute_swap_step;
     use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
 
     use super::{ClmmPool, PreparedQuoteSegment};
@@ -1000,6 +1180,192 @@ mod tests {
     #[test]
     fn prepared_segment_keeps_only_non_derivable_state() {
         assert!(std::mem::size_of::<PreparedQuoteSegment>() <= 144);
+    }
+
+    #[test]
+    fn algebra_price_movement_matches_official_v1_9_golden_vector() {
+        // cryptoalgebra/AlgebraV1.9 PriceMovement.spec.ts: exact input capped
+        // at sqrt(101/100), one-for-zero, 2e18 liquidity and 600 fee pips.
+        let result = compute_swap_step(
+            U256::from(79_228_162_514_264_337_593_543_950_336_u128),
+            U256::from(79_623_317_895_830_914_510_639_640_423_u128),
+            2_000_000_000_000_000_000,
+            I256::from_raw(U256::from(1_000_000_000_000_000_000_u128)),
+            600,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            (
+                U256::from(79_623_317_895_830_914_510_639_640_423_u128),
+                U256::from(9_975_124_224_178_055_u64),
+                U256::from(9_925_619_580_021_728_u64),
+                U256::from(5_988_667_735_148_u64),
+            )
+        );
+    }
+
+    #[test]
+    fn algebra_tick_table_uses_raw_tick_rows() {
+        let mut pool = ClmmPool::new_algebra_v1_9(
+            117,
+            219,
+            10,
+            get_sqrt_ratio_at_tick(300).unwrap(),
+            300,
+            1_000_000_000,
+        )
+        .unwrap();
+        pool.set_tick(250, 100, 100).unwrap();
+        pool.set_tick(500, 100, -100).unwrap();
+        pool.set_tick(600, 100, -100).unwrap();
+
+        assert_eq!(pool.next_initialized_tick(300, true).unwrap(), (256, false));
+        assert_eq!(pool.next_initialized_tick(255, true).unwrap(), (250, true));
+        assert_eq!(pool.next_initialized_tick(300, false).unwrap(), (500, true));
+        assert_eq!(
+            pool.next_initialized_tick(500, false).unwrap(),
+            (511, false)
+        );
+        assert_eq!(pool.next_initialized_tick(511, false).unwrap(), (600, true));
+    }
+
+    #[test]
+    fn algebra_directional_prepared_curves_match_iterative_quotes() {
+        let mut pool = ClmmPool::new_algebra_v1_9(
+            117,
+            333,
+            10,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        pool.set_tick(-300, 500_000_000, 500_000_000).unwrap();
+        pool.set_tick(300, 500_000_000, -500_000_000).unwrap();
+        assert_eq!(pool.directional_fee_pips(), (117, 333));
+
+        let maximum = U256::from(20_000_000_u64);
+        for zero_for_one in [true, false] {
+            let exact_in = pool
+                .prepare_exact_input_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let exact_out = pool
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            for amount in [
+                U256::ONE,
+                U256::from(1_000_u64),
+                U256::from(1_000_000_u64),
+                maximum,
+            ] {
+                assert_eq!(
+                    exact_in.quote(amount).unwrap(),
+                    pool.quote_exact_in_amount_out(zero_for_one, amount)
+                        .unwrap()
+                );
+                assert_eq!(
+                    exact_out.quote(amount).unwrap(),
+                    pool.quote_exact_out_amount_in(zero_for_one, amount)
+                        .unwrap()
+                );
+            }
+        }
+
+        let low_fee_output = pool
+            .quote_exact_in_amount_out(true, U256::from(1_000_000_u64))
+            .unwrap();
+        pool.set_algebra_directional_fees(5_000, 333).unwrap();
+        let high_fee_output = pool
+            .quote_exact_in_amount_out(true, U256::from(1_000_000_u64))
+            .unwrap();
+        assert!(high_fee_output < low_fee_output);
+    }
+
+    #[test]
+    fn algebra_pools_share_the_immutable_word_boundary_cache() {
+        let first =
+            ClmmPool::new_algebra_v1_9(100, 100, 10, get_sqrt_ratio_at_tick(0).unwrap(), 0, 1_000)
+                .unwrap();
+        let second =
+            ClmmPool::new_algebra_v1_9(200, 300, 10, get_sqrt_ratio_at_tick(1).unwrap(), 1, 2_000)
+                .unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &first.word_boundary_sqrt_ratios,
+            &second.word_boundary_sqrt_ratios
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Camelot/Uniswap prepared-curve benchmark"]
+    fn benchmark_uniswap_and_camelot_prepared_quote_and_build() {
+        let uniswap = ClmmPool::new(
+            500,
+            10,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        let camelot = ClmmPool::new_algebra_v1_9(
+            500,
+            500,
+            10,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000,
+        )
+        .unwrap();
+        let maximum = U256::from(20_000_u64);
+        let probe = U256::from(10_000_u64);
+        let uniswap_curve = uniswap
+            .prepare_exact_input_curve_bounded(true, maximum)
+            .unwrap();
+        let camelot_curve = camelot
+            .prepare_exact_input_curve_bounded(true, maximum)
+            .unwrap();
+        assert_eq!(uniswap_curve.segment_count(), camelot_curve.segment_count());
+        assert_eq!(
+            uniswap_curve.quote(probe).unwrap(),
+            camelot_curve.quote(probe).unwrap()
+        );
+
+        crate::paired_benchmark::assert_named_paired_non_regression(
+            "v3_prepared_quote_benchmark",
+            1.05,
+            "uniswap_v3",
+            "camelot_v3",
+            || {
+                black_box(uniswap_curve.quote(black_box(probe))).unwrap();
+            },
+            || {
+                black_box(camelot_curve.quote(black_box(probe))).unwrap();
+            },
+        );
+        crate::paired_benchmark::assert_named_paired_non_regression_with_work(
+            "v3_prepared_curve_build_benchmark",
+            1.20,
+            "uniswap_v3",
+            "camelot_v3",
+            32,
+            4_096,
+            || {
+                black_box(
+                    uniswap
+                        .prepare_exact_input_curve_bounded(true, black_box(maximum))
+                        .unwrap(),
+                );
+            },
+            || {
+                black_box(
+                    camelot
+                        .prepare_exact_input_curve_bounded(true, black_box(maximum))
+                        .unwrap(),
+                );
+            },
+        );
     }
 
     fn pool() -> ClmmPool {

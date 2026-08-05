@@ -1055,7 +1055,9 @@ impl ComposedLiveLegExecutor {
 impl DexRevertContext {
     fn from_request(request: &crate::dex::execution::ExactInputSwapRequest) -> Self {
         let pool_reference = match request.route {
-            SwapRoute::UniswapV3 { pool, .. } | SwapRoute::PancakeSwapV3 { pool, .. } => {
+            SwapRoute::UniswapV3 { pool, .. }
+            | SwapRoute::PancakeSwapV3 { pool, .. }
+            | SwapRoute::CamelotV3 { pool, .. } => {
                 format!("{pool:#x}")
             }
             SwapRoute::V4 { pool_key, .. } => format!("{:#x}", pool_key.pool_id()),
@@ -1319,7 +1321,14 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     &plan_id,
                     operation_existed_before_attempt,
                 );
-                self.publish_event(plan_id, Some(pair_id), state, false, false, None)?;
+                self.publish_event(
+                    plan_id,
+                    Some(pair_id),
+                    state,
+                    false,
+                    false,
+                    DexSettlementAcceleration::default(),
+                )?;
             }
         }
         self.clear_recovery_safe_marker()?;
@@ -1521,6 +1530,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                     "update_id": opportunity.update_id,
                     "dex_pool_index": opportunity.dex_pool_index,
                     "dex_pool_generation": opportunity.dex_pool_generation,
+                    "dex_fee_generation": opportunity.dex_fee_generation,
                     "reason": rejection.reason,
                     "detail": rejection.detail,
                 }),
@@ -1692,7 +1702,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         PaperTradeEventState::Balanced,
                         resumed_after_restart,
                         dex_filled(operation),
-                        dex_settlement_log(operation),
+                        dex_settlement(operation),
                     )?;
                 } else if matches!(
                     operation.stage,
@@ -1704,7 +1714,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                         PaperTradeEventState::BlockedUnknown,
                         resumed_after_restart,
                         dex_filled(operation),
-                        None,
+                        DexSettlementAcceleration::default(),
                     )?;
                 }
                 return Ok(());
@@ -1877,7 +1887,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
         state: PaperTradeEventState,
         resumed_after_restart: bool,
         dex_filled: bool,
-        dex_settlement_log: Option<crate::chain::logs::ChainLog>,
+        settlement: DexSettlementAcceleration,
     ) -> anyhow::Result<()> {
         let pair_id = self
             .coordinator
@@ -1892,7 +1902,8 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
                 state,
                 resumed_after_restart,
                 dex_filled,
-                dex_settlement_log,
+                dex_settlement_fee: settlement.fee,
+                dex_settlement_log: settlement.swap,
                 terminal_observed_at: Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("live trade event receiver is closed"))
@@ -2099,11 +2110,20 @@ fn dex_filled(operation: &TradeOperation) -> bool {
     })
 }
 
-fn dex_settlement_log(operation: &TradeOperation) -> Option<crate::chain::logs::ChainLog> {
-    operation
-        .dex_result
-        .as_ref()
-        .and_then(|result| result.dex_settlement_log.clone())
+#[derive(Default)]
+struct DexSettlementAcceleration {
+    fee: Option<crate::dex::events::CamelotFeeReceiptProof>,
+    swap: Option<crate::chain::logs::ChainLog>,
+}
+
+fn dex_settlement(operation: &TradeOperation) -> DexSettlementAcceleration {
+    let Some(result) = operation.dex_result.as_ref() else {
+        return DexSettlementAcceleration::default();
+    };
+    DexSettlementAcceleration {
+        fee: result.dex_settlement_fee,
+        swap: result.dex_settlement_log.clone(),
+    }
 }
 
 /// Keeps every Binance sell command reachable from a DEX-buy plan inside the
@@ -2143,6 +2163,7 @@ fn failed_with_gas(role: LegRole, gas_cost: u128, reference: &str) -> (LegRole, 
             third_asset_prices_token_a: Default::default(),
             gas_cost_token_a_base_units: gas_cost,
             venue_reference: reference.to_owned(),
+            dex_settlement_fee: None,
             dex_settlement_log: None,
         },
     )
@@ -2160,6 +2181,7 @@ fn unknown(role: LegRole, reference: &str) -> (LegRole, LegResult) {
             third_asset_prices_token_a: Default::default(),
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
+            dex_settlement_fee: None,
             dex_settlement_log: None,
         },
     )
@@ -2287,6 +2309,7 @@ mod tests {
             direction: ArbitrageDirection::BuyTokenBOnDexSellOnCex,
             dex_pool_index: 0,
             dex_pool_generation: 1,
+            dex_fee_generation: 0,
             token_b_base_units: 100,
             token_b_step_base_units: 1,
             cost_token_a_base_units: 1_000,
@@ -2347,6 +2370,7 @@ mod tests {
             third_asset_prices_token_a: Default::default(),
             gas_cost_token_a_base_units: gas,
             venue_reference: reference.to_owned(),
+            dex_settlement_fee: None,
             dex_settlement_log: None,
         }
     }
@@ -2407,6 +2431,44 @@ mod tests {
         let first = opportunity();
         let mut second = first.clone();
         second.dex_pool_generation += 1;
+
+        assert_ne!(first.plan_id(), second.plan_id());
+        assert_ne!(
+            first.intent(ExecutionMode::DexFirst).cex_client_order_id,
+            second.intent(ExecutionMode::DexFirst).cex_client_order_id
+        );
+    }
+
+    #[test]
+    fn opportunity_identity_changes_with_the_dynamic_fee_generation() {
+        let mut first = opportunity();
+        first.dex_fee_generation = 1;
+        first.dex_plan.route = crate::execution_plan::DexRoutePlan::CamelotV3 {
+            router: "0x1111111111111111111111111111111111111111".to_owned(),
+            pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+            pool_generation: first.dex_pool_generation,
+            fee_generation: 1,
+            fee_zto_current_pips: 104,
+            fee_otz_current_pips: 104,
+            fee_zto_envelope_pips: 117,
+            fee_otz_envelope_pips: 117,
+            fee_horizon_first_unix_seconds: 1_800_000_029,
+            fee_horizon_last_unix_seconds: 1_800_000_030,
+        };
+        let mut second = first.clone();
+        second.dex_fee_generation = 2;
+        second.dex_plan.route = crate::execution_plan::DexRoutePlan::CamelotV3 {
+            router: "0x1111111111111111111111111111111111111111".to_owned(),
+            pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+            pool_generation: second.dex_pool_generation,
+            fee_generation: 2,
+            fee_zto_current_pips: 104,
+            fee_otz_current_pips: 104,
+            fee_zto_envelope_pips: 117,
+            fee_otz_envelope_pips: 117,
+            fee_horizon_first_unix_seconds: 1_800_000_029,
+            fee_horizon_last_unix_seconds: 1_800_000_030,
+        };
 
         assert_ne!(first.plan_id(), second.plan_id());
         assert_ne!(
@@ -2839,6 +2901,38 @@ mod tests {
         );
 
         let rejection = handle.check(&opportunity()).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "preflight_spread_below_threshold");
+    }
+
+    #[test]
+    fn entry_preflight_requotes_when_only_the_dynamic_fee_generation_changes() {
+        let handle = default_preflight();
+        handle.update_dex_pool_with_fee_generation(
+            "world-chain-usdc-wld",
+            0,
+            1,
+            2,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 95, -13_864)),
+        );
+        let mut candidate = opportunity();
+        candidate.dex_fee_generation = 1;
+        candidate.dex_plan.route = crate::execution_plan::DexRoutePlan::CamelotV3 {
+            router: "0x1111111111111111111111111111111111111111".to_owned(),
+            pool_address: "0x2222222222222222222222222222222222222222".to_owned(),
+            pool_generation: candidate.dex_pool_generation,
+            fee_generation: 1,
+            fee_zto_current_pips: 104,
+            fee_otz_current_pips: 104,
+            fee_zto_envelope_pips: 117,
+            fee_otz_envelope_pips: 117,
+            fee_horizon_first_unix_seconds: 1_800_000_029,
+            fee_horizon_last_unix_seconds: 1_800_000_030,
+        };
+
+        let rejection = handle.check(&candidate).unwrap().unwrap();
 
         assert_eq!(rejection.reason, "preflight_spread_below_threshold");
     }

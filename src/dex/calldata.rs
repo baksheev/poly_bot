@@ -82,6 +82,43 @@ pub fn pancake_v3_exact_input_single(
     Ok(encoded)
 }
 
+pub fn camelot_v3_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    recipient: Address,
+    deadline: u64,
+    amount_in: U256,
+    amount_out_minimum: U256,
+) -> anyhow::Result<Vec<u8>> {
+    validate_currency_pair(token_in, token_out)?;
+    ensure!(recipient != Address::ZERO, "Camelot V3 recipient is zero");
+    ensure!(deadline > 0, "Camelot V3 deadline is zero");
+    ensure!(!amount_in.is_zero(), "Camelot V3 input amount is zero");
+    ensure!(
+        !amount_out_minimum.is_zero(),
+        "Camelot V3 minimum output amount is zero"
+    );
+
+    // Algebra V1.9 SwapRouter.exactInputSingle((address,address,address,
+    // uint256,uint256,uint256,uint160)). The selected pool is resolved only
+    // from the two tokens; there is deliberately no Uniswap-style fee word.
+    let mut encoded =
+        selector("exactInputSingle((address,address,address,uint256,uint256,uint256,uint160))")
+            .to_vec();
+    ensure!(
+        encoded.as_slice() == [0xbc, 0x65, 0x11, 0x88],
+        "Camelot V3 exactInputSingle selector differs from the reviewed router"
+    );
+    push_address_word(&mut encoded, token_in);
+    push_address_word(&mut encoded, token_out);
+    push_address_word(&mut encoded, recipient);
+    push_u256_word(&mut encoded, U256::from(deadline));
+    push_u256_word(&mut encoded, amount_in);
+    push_u256_word(&mut encoded, amount_out_minimum);
+    push_u256_word(&mut encoded, U256::ZERO);
+    Ok(encoded)
+}
+
 pub fn v3_quote_exact_input_single(
     token_in: Address,
     token_out: Address,
@@ -147,6 +184,49 @@ pub fn decode_v3_quote_exact_output_single(encoded: &[u8]) -> anyhow::Result<U25
         "V3 exact-output QuoterV2 result is truncated"
     );
     Ok(U256::from_be_slice(&encoded[..WORD_BYTES]))
+}
+
+pub fn camelot_v3_quote_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> anyhow::Result<Vec<u8>> {
+    validate_currency_pair(token_in, token_out)?;
+    ensure!(!amount_in.is_zero(), "Camelot V3 quote input is zero");
+    let mut encoded = selector("quoteExactInputSingle(address,address,uint256,uint160)").to_vec();
+    push_address_word(&mut encoded, token_in);
+    push_address_word(&mut encoded, token_out);
+    push_u256_word(&mut encoded, amount_in);
+    push_u256_word(&mut encoded, U256::ZERO);
+    Ok(encoded)
+}
+
+pub fn camelot_v3_quote_exact_output_single(
+    token_in: Address,
+    token_out: Address,
+    amount_out: U256,
+) -> anyhow::Result<Vec<u8>> {
+    validate_currency_pair(token_in, token_out)?;
+    ensure!(
+        !amount_out.is_zero(),
+        "Camelot V3 exact-output quote amount is zero"
+    );
+    let mut encoded = selector("quoteExactOutputSingle(address,address,uint256,uint160)").to_vec();
+    push_address_word(&mut encoded, token_in);
+    push_address_word(&mut encoded, token_out);
+    push_u256_word(&mut encoded, amount_out);
+    push_u256_word(&mut encoded, U256::ZERO);
+    Ok(encoded)
+}
+
+pub fn decode_camelot_v3_quote(encoded: &[u8]) -> anyhow::Result<(U256, u16)> {
+    ensure!(
+        encoded.len() == 2 * WORD_BYTES,
+        "Camelot V3 Quoter result has an unexpected shape"
+    );
+    let fee_word = U256::from_be_slice(&encoded[WORD_BYTES..]);
+    let fee = u16::try_from(fee_word).context("Camelot V3 Quoter fee does not fit uint16")?;
+    Ok((U256::from_be_slice(&encoded[..WORD_BYTES]), fee))
 }
 
 pub fn v4_exact_input_single(
@@ -408,12 +488,15 @@ mod tests {
 
     use alloy_primitives::{Address, U256, hex, keccak256};
 
-    use crate::paired_benchmark::assert_paired_non_regression;
+    use crate::paired_benchmark::{
+        assert_named_paired_non_regression, assert_paired_non_regression,
+    };
 
     use super::{
-        decode_permit2_allowance, decode_v3_quote_exact_input_single,
-        pancake_v3_exact_input_single, permit2_approve, v3_exact_input,
-        v3_quote_exact_input_single, v4_exact_input_single,
+        camelot_v3_exact_input_single, camelot_v3_quote_exact_input_single,
+        camelot_v3_quote_exact_output_single, decode_camelot_v3_quote, decode_permit2_allowance,
+        decode_v3_quote_exact_input_single, pancake_v3_exact_input_single, permit2_approve,
+        v3_exact_input, v3_quote_exact_input_single, v4_exact_input_single,
     };
     use crate::dex::pool_id::V4PoolKey;
 
@@ -492,6 +575,97 @@ mod tests {
         assert_eq!(
             U256::from_be_slice(&calldata[4 + 7 * 32..4 + 8 * 32]),
             U256::ZERO
+        );
+    }
+
+    #[test]
+    fn camelot_v3_quoter_calldata_and_directional_fee_result_are_exact() {
+        let usdc = address("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let arb = address("0x912ce59144191c1204e64559fe8253a0e49e6548");
+        let input =
+            camelot_v3_quote_exact_input_single(usdc, arb, U256::from(200_000_000_u64)).unwrap();
+        let output = camelot_v3_quote_exact_output_single(
+            usdc,
+            arb,
+            U256::from(160_u8) * U256::from(10_u64).pow(U256::from(18_u8)),
+        )
+        .unwrap();
+        assert_eq!(&input[..4], &[0x2d, 0x9e, 0xbd, 0x1d]);
+        assert_eq!(&output[..4], &[0x9e, 0x73, 0xc8, 0x1d]);
+        assert_eq!(input.len(), 4 + 4 * 32);
+        assert_eq!(output.len(), 4 + 4 * 32);
+
+        let mut response = vec![0_u8; 64];
+        response[..32].copy_from_slice(&U256::from(123_u8).to_be_bytes::<32>());
+        response[32..].copy_from_slice(&U256::from(117_u8).to_be_bytes::<32>());
+        assert_eq!(
+            decode_camelot_v3_quote(&response).unwrap(),
+            (U256::from(123_u8), 117)
+        );
+        response.push(0);
+        assert!(decode_camelot_v3_quote(&response).is_err());
+    }
+
+    #[test]
+    fn camelot_v3_exact_input_single_is_the_reviewed_seven_word_tuple() {
+        let usdc = address("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let arb = address("0x912ce59144191c1204e64559fe8253a0e49e6548");
+        let recipient = Address::repeat_byte(0x44);
+        let calldata = camelot_v3_exact_input_single(
+            usdc,
+            arb,
+            recipient,
+            1_900_000_002,
+            U256::from(200_000_000_u64),
+            U256::from(150_u8) * U256::from(10_u64).pow(U256::from(18_u8)),
+        )
+        .unwrap();
+
+        assert_eq!(&calldata[..4], &[0xbc, 0x65, 0x11, 0x88]);
+        assert_eq!(calldata.len(), 4 + 7 * 32);
+        assert_eq!(&calldata[16..36], usdc.as_slice());
+        assert_eq!(&calldata[48..68], arb.as_slice());
+        assert_eq!(&calldata[80..100], recipient.as_slice());
+        assert_eq!(
+            U256::from_be_slice(&calldata[100..132]),
+            U256::from(1_900_000_002_u64)
+        );
+        assert_eq!(U256::from_be_slice(&calldata[196..228]), U256::ZERO);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Camelot/Uniswap calldata benchmark"]
+    fn benchmark_uniswap_and_camelot_v3_calldata_builders() {
+        let usdc = address("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let arb = address("0x912ce59144191c1204e64559fe8253a0e49e6548");
+        let recipient = Address::repeat_byte(0x44);
+        assert_named_paired_non_regression(
+            "camelot_v3_calldata_build_benchmark",
+            1.10,
+            "uniswap_v3",
+            "camelot_v3",
+            || {
+                black_box(v3_exact_input(
+                    usdc,
+                    arb,
+                    500,
+                    recipient,
+                    U256::from(6_000_000_u64),
+                    U256::from(7_000_000_000_000_000_000_u128),
+                ))
+                .unwrap();
+            },
+            || {
+                black_box(camelot_v3_exact_input_single(
+                    usdc,
+                    arb,
+                    recipient,
+                    1_900_000_002,
+                    U256::from(6_000_000_u64),
+                    U256::from(7_000_000_000_000_000_000_u128),
+                ))
+                .unwrap();
+            },
         );
     }
 

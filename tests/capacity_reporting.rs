@@ -10,6 +10,9 @@ fn report_enforces_the_full_read_only_capacity_gate() {
         .expect("capacity artifact must be readable");
 
     assert!(report.contains(".pair_count == 20"));
+    assert!(report.contains(".provider_pool_counts.camelot_v3 == 1"));
+    assert!(report.contains(".provider_parity.prepared_quote.p99_ratio_bps <= 10500"));
+    assert!(report.contains(".provider_parity.prepared_curve_build.p99_ratio_bps <= 12000"));
     assert!(report.contains(".frames_per_pair >= 100000"));
     assert!(report.contains(".route_failures == 0"));
     assert!(report.contains(".dependency_faults == 0"));
@@ -29,6 +32,8 @@ fn report_enforces_the_full_read_only_capacity_gate() {
     assert_eq!(artifact.matches("\"pair_id\":").count(), 20);
     assert!(artifact.contains("\"pair_id\": \"capacity-arbitrum-arb-usdc\""));
     assert!(artifact.contains("\"symbol\": \"ARBUSDC\""));
+    assert!(artifact.contains("\"pancakeswap_v3\""));
+    assert!(artifact.contains("\"camelot_v3\""));
 }
 
 #[test]
@@ -50,6 +55,11 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(DEPLOY_WORKFLOW.contains(".decision_owner_latency.p99_ns <= 25000"));
     assert!(DEPLOY_WORKFLOW.contains(".total_strategy_frames == 2000000"));
     assert!(DEPLOY_WORKFLOW.contains(".pool_count == 25"));
+    assert!(DEPLOY_WORKFLOW.contains(".provider_pool_counts.camelot_v3 == 1"));
+    assert!(DEPLOY_WORKFLOW.contains(".provider_parity.prepared_quote.p99_ratio_bps <= 10500"));
+    assert!(
+        DEPLOY_WORKFLOW.contains(".provider_parity.prepared_curve_build.p99_ratio_bps <= 12000")
+    );
     assert!(DEPLOY_WORKFLOW.contains(".rehydration.pool_publications == 125"));
     assert!(DEPLOY_WORKFLOW.contains(".route_failures == 0"));
     assert!(DEPLOY_WORKFLOW.contains(".external_mutations == 0"));

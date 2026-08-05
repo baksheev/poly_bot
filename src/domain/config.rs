@@ -621,6 +621,14 @@ pub struct ChainConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pancakeswap_v3_router_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelot_v3_factory_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelot_v3_pool_deployer_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelot_v3_quoter_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelot_v3_router_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_quoter_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_router_address: Option<String>,
@@ -666,6 +674,22 @@ impl ChainConfig {
         validate_optional_address(
             "chain.pancakeswap_v3_router_address",
             self.pancakeswap_v3_router_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.camelot_v3_factory_address",
+            self.camelot_v3_factory_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.camelot_v3_pool_deployer_address",
+            self.camelot_v3_pool_deployer_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.camelot_v3_quoter_address",
+            self.camelot_v3_quoter_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.camelot_v3_router_address",
+            self.camelot_v3_router_address.as_deref(),
         )?;
         validate_optional_address(
             "chain.uniswap_v4_quoter_address",
@@ -915,6 +939,8 @@ pub struct DexConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pancakeswap_v3: Option<PancakeSwapV3Config>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelot_v3: Option<CamelotV3Config>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4: Option<UniswapV4Config>,
 }
 
@@ -989,6 +1015,34 @@ impl DexConfig {
                 "dex.pancakeswap_v3 is configured but not allowed"
             );
         }
+
+        if unique.contains(&DexProvider::CamelotV3) {
+            ensure!(
+                chain.camelot_v3_factory_address.is_some(),
+                "Camelot V3 requires chain.camelot_v3_factory_address"
+            );
+            ensure!(
+                chain.camelot_v3_pool_deployer_address.is_some(),
+                "Camelot V3 requires chain.camelot_v3_pool_deployer_address"
+            );
+            ensure!(
+                chain.camelot_v3_quoter_address.is_some(),
+                "Camelot V3 requires chain.camelot_v3_quoter_address"
+            );
+            ensure!(
+                chain.camelot_v3_router_address.is_some(),
+                "Camelot V3 requires chain.camelot_v3_router_address"
+            );
+            self.camelot_v3
+                .as_ref()
+                .context("Camelot V3 provider requires dex.camelot_v3")?
+                .validate()?;
+        } else {
+            ensure!(
+                self.camelot_v3.is_none(),
+                "dex.camelot_v3 is configured but not allowed"
+            );
+        }
         Ok(())
     }
 }
@@ -1000,6 +1054,7 @@ pub enum DexProvider {
     UniswapV3,
     UniswapV4,
     PancakeSwapV3,
+    CamelotV3,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -1068,6 +1123,64 @@ pub struct PancakeSwapV3PoolConfig {
     pub fee_tier: u32,
     pub expected_address: String,
     pub selection_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CamelotV3Config {
+    pub pools: Vec<CamelotV3PoolConfig>,
+}
+
+impl CamelotV3Config {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(!self.pools.is_empty(), "Camelot V3 pools must not be empty");
+        let unique_addresses: HashSet<_> = self
+            .pools
+            .iter()
+            .map(|pool| pool.expected_address.to_ascii_lowercase())
+            .collect();
+        ensure!(
+            unique_addresses.len() == self.pools.len(),
+            "Camelot V3 pools contain duplicate expected addresses"
+        );
+        for pool in &self.pools {
+            pool.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CamelotV3PoolConfig {
+    pub expected_address: String,
+    pub selection_enabled: bool,
+    pub required_active_incentive: String,
+    pub expected_tick_spacing: i32,
+    pub dynamic_fee_horizon_seconds: u64,
+}
+
+impl CamelotV3PoolConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        validate_evm_address("Camelot V3 expected_address", &self.expected_address)?;
+        validate_evm_address(
+            "Camelot V3 required_active_incentive",
+            &self.required_active_incentive,
+        )?;
+        ensure!(
+            self.required_active_incentive == "0x0000000000000000000000000000000000000000",
+            "initial Camelot V3 route requires a zero active incentive"
+        );
+        ensure!(
+            self.expected_tick_spacing > 0,
+            "Camelot V3 expected_tick_spacing must be positive"
+        );
+        ensure!(
+            (1..=30).contains(&self.dynamic_fee_horizon_seconds),
+            "Camelot V3 dynamic_fee_horizon_seconds must be between 1 and 30"
+        );
+        Ok(())
+    }
 }
 
 impl PancakeSwapV3PoolConfig {
@@ -1248,6 +1361,8 @@ mod tests {
         include_str!("../../config/strategies/usdc-esp-arbitrum.v7.json");
     const ESP_LEGACY_PRODUCTION_CONFIG: &str =
         include_str!("../../config/strategies/usdc-esp-arbitrum.v6.json");
+    const ARB_PRODUCTION_CONFIG: &str =
+        include_str!("../../config/strategies/usdc-arb-arbitrum.v5.json");
 
     fn load(bytes: &[u8]) -> anyhow::Result<LoadedDomainConfig> {
         LoadedDomainConfig::from_bytes(PathBuf::from("fixture.json"), bytes)
@@ -1276,6 +1391,48 @@ mod tests {
         assert_eq!(pair.adaptive_sizing, AdaptiveSizingConfig::BaselineOnly);
         assert!(!pair.execution_enabled);
         assert_eq!(loaded.fingerprint_sha256().len(), 64);
+    }
+
+    #[test]
+    fn camelot_v3_schema_is_typed_and_fails_closed() {
+        fn fixture() -> Value {
+            serde_json::from_str(ARB_PRODUCTION_CONFIG).unwrap()
+        }
+
+        let loaded = load(&serde_json::to_vec(&fixture()).unwrap()).unwrap();
+        let pair = &loaded.snapshot().pairs[0];
+        assert!(pair.dex.allowed_providers.contains(&DexProvider::CamelotV3));
+        let pool = &pair.dex.camelot_v3.as_ref().unwrap().pools[0];
+        assert_eq!(pool.expected_tick_spacing, 10);
+        assert_eq!(pool.dynamic_fee_horizon_seconds, 2);
+        assert!(pool.selection_enabled);
+
+        for missing in [
+            "camelot_v3_factory_address",
+            "camelot_v3_pool_deployer_address",
+            "camelot_v3_quoter_address",
+            "camelot_v3_router_address",
+        ] {
+            let mut value = fixture();
+            value["pairs"][0]["chain"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+
+        for (field, invalid) in [
+            ("dynamic_fee_horizon_seconds", serde_json::json!(31)),
+            ("expected_tick_spacing", serde_json::json!(0)),
+            (
+                "required_active_incentive",
+                serde_json::json!("0x0000000000000000000000000000000000000001"),
+            ),
+        ] {
+            let mut value = fixture();
+            value["pairs"][0]["dex"]["camelot_v3"]["pools"][0][field] = invalid;
+            assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
     }
 
     #[test]

@@ -27,6 +27,9 @@ jq -e \
     and .mode == "capacity_replay_only"
     and .pair_count == 20
     and .pool_count == 25
+    and .provider_pool_counts.uniswap_v3 == 23
+    and .provider_pool_counts.pancakeswap_v3 == 1
+    and .provider_pool_counts.camelot_v3 == 1
     and .frames_per_pair >= 100000
     and .total_strategy_frames == (.pair_count * .frames_per_pair)
     and .reconnect_bursts >= 4
@@ -51,6 +54,21 @@ jq -e \
     and .rehydration.decode_latency.p99_ns <= 25000
     and .rehydration.pool_build_latency.p99_ns <= 200000
     and .rehydration.publication_latency.p99_ns <= 25000
+    and .provider_parity.comparison_scope
+      == "same_tick_domain_price_liquidity_fee_curve_bounds_and_bidirectional_work"
+    and .provider_parity.prepared_quote.control == "uniswap_v3"
+    and .provider_parity.prepared_quote.candidate == "camelot_v3"
+    and .provider_parity.prepared_quote.maximum_ratio_bps == 10500
+    and .provider_parity.prepared_quote.p95_ratio_bps <= 10500
+    and .provider_parity.prepared_quote.p99_ratio_bps <= 10500
+    and .provider_parity.prepared_quote.gate == "pass"
+    and .provider_parity.prepared_curve_build.control == "uniswap_v3"
+    and .provider_parity.prepared_curve_build.candidate == "camelot_v3"
+    and .provider_parity.prepared_curve_build.maximum_ratio_bps == 12000
+    and .provider_parity.prepared_curve_build.p95_ratio_bps <= 12000
+    and .provider_parity.prepared_curve_build.p99_ratio_bps <= 12000
+    and .provider_parity.prepared_curve_build.gate == "pass"
+    and .provider_parity.gate == "pass"
     and .network_io_performed == false
     and .external_mutations == 0
     and .gate == "local_replay_ready_target_c4_required"

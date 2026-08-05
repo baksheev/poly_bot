@@ -13,7 +13,10 @@ use crate::{
         logs::ChainLog,
         rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
     },
-    dex::events::{PoolLocator, PoolUpdate, decode_pool_event_for_receipt},
+    dex::events::{
+        CamelotFeeReceiptProof, PoolLocator, camelot_fee_topic, pancake_v3_swap_topic,
+        v3_swap_topic, v4_swap_topic,
+    },
     domain::compiled::CompiledNetworkGasPolicy,
     pretrade_cost::{
         DexPoolCostKey, DexProtocol as CostTelemetryDexProtocol, DexRouteCostKey,
@@ -28,8 +31,8 @@ use crate::{
 };
 
 use super::calldata::{
-    decode_permit2_allowance, pancake_v3_exact_input_single, permit2_allowance, permit2_approve,
-    v3_exact_input, v4_exact_input_single,
+    camelot_v3_exact_input_single, decode_permit2_allowance, pancake_v3_exact_input_single,
+    permit2_allowance, permit2_approve, v3_exact_input, v4_exact_input_single,
 };
 use super::pool_id::V4PoolKey;
 
@@ -44,6 +47,13 @@ const RAILS_APPROVAL_DEFAULT_GAS_LIMIT: u64 = 800_000;
 // One local-curve fallback for V3 and V4. It leaves roughly 27% headroom over
 // the largest observed Rails V3/V4 receipt from 2026-05-25..2026-07-25.
 const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
+// P6 starts with an explicit provider-scoped conservative fallback. P7 may
+// tighten it only after pinned simulation and a reviewed receipt cohort.
+// The exact pinned ARB/USDC route replays at 753,956 gas through its historical
+// aggregation envelope. A one-million fallback safely covers that upper-bound
+// observation when the immediate live path deliberately skips estimation;
+// only gas actually consumed is charged.
+const CAMELOT_V3_SWAP_GAS_LIMIT: u64 = 1_000_000;
 const RAILS_PERMIT2_APPROVAL_GAS_LIMIT: u64 = 120_000;
 const CAPITAL_TRANSFER_GAS_LIMIT: u64 = 200_000;
 const GAS_PRICE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -61,6 +71,7 @@ const PERMIT2_MIN_REMAINING_VALIDITY: Duration = Duration::from_secs(60 * 60);
 pub enum DexProtocol {
     UniswapV3,
     PancakeSwapV3,
+    CamelotV3,
     UniswapV4,
 }
 
@@ -84,6 +95,7 @@ impl DexProtocol {
         match self {
             Self::UniswapV3 => "uniswap_v3",
             Self::PancakeSwapV3 => "pancakeswap_v3",
+            Self::CamelotV3 => "camelot_v3",
             Self::UniswapV4 => "uniswap_v4",
         }
     }
@@ -101,6 +113,10 @@ pub enum SwapRoute {
         pool: Address,
         fee_pips: u32,
     },
+    CamelotV3 {
+        router: Address,
+        pool: Address,
+    },
     V4 {
         router: Address,
         pool_key: V4PoolKey,
@@ -112,6 +128,7 @@ impl SwapRoute {
         match self {
             Self::UniswapV3 { .. } => DexProtocol::UniswapV3,
             Self::PancakeSwapV3 { .. } => DexProtocol::PancakeSwapV3,
+            Self::CamelotV3 { .. } => DexProtocol::CamelotV3,
             Self::V4 { .. } => DexProtocol::UniswapV4,
         }
     }
@@ -120,6 +137,7 @@ impl SwapRoute {
         match self {
             Self::UniswapV3 { router, .. }
             | Self::PancakeSwapV3 { router, .. }
+            | Self::CamelotV3 { router, .. }
             | Self::V4 { router, .. } => router,
         }
     }
@@ -181,6 +199,9 @@ impl ExactInputSwapRequest {
                 ensure!(pool != Address::ZERO, "V3 pool is zero");
                 ensure!(fee_pips > 0 && fee_pips <= 0x00ff_ffff, "invalid V3 fee");
             }
+            SwapRoute::CamelotV3 { pool, .. } => {
+                ensure!(pool != Address::ZERO, "Camelot V3 pool is zero");
+            }
             SwapRoute::V4 { pool_key, .. } => {
                 ensure!(
                     pool_key.currency0 < pool_key.currency1,
@@ -233,7 +254,35 @@ pub struct SwapExecutionOutcome {
     pub l1_fee: u128,
     pub token_in_spent: U256,
     pub token_out_received: U256,
+    /// Camelot-only Fee event positionally preceding `settlement_log` in the
+    /// same successful transaction. Both are absent when the receipt cannot
+    /// provide a complete acceleration proof and the WebSocket mirror remains
+    /// the settlement fallback.
+    pub settlement_fee: Option<CamelotFeeReceiptProof>,
     pub settlement_log: Option<ChainLog>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReceiptSettlementLogs {
+    fee: Option<CamelotFeeReceiptProof>,
+    swap: Option<ChainLog>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiptSettlementKind {
+    Fee,
+    Swap,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadOnlySwapSimulation {
+    pub protocol: DexProtocol,
+    pub wallet: Address,
+    pub router: Address,
+    pub calldata_hash: B256,
+    pub selector: [u8; 4],
+    pub estimated_gas: u64,
+    pub policy_gas_limit: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +337,12 @@ impl GasLimitPolicy {
                 multiplier: 2,
                 minimum: 0,
                 default: HISTORICAL_SWAP_GAS_LIMIT,
+                additional,
+            },
+            DexProtocol::CamelotV3 => Self {
+                multiplier: 2,
+                minimum: 0,
+                default: CAMELOT_V3_SWAP_GAS_LIMIT,
                 additional,
             },
             DexProtocol::UniswapV4 => Self {
@@ -358,6 +413,7 @@ pub struct DexExecutor {
     gas_price: Option<GasPriceSample>,
     gas_policy: CompiledNetworkGasPolicy,
     allowance_mutations_enabled: bool,
+    camelot_submissions_enabled: bool,
     last_terminal_receipt: Option<TransactionReceipt>,
     receipt_heads: Option<watch::Receiver<CanonicalBlock>>,
     latency_telemetry: Option<ExecutionLatencyTelemetry>,
@@ -451,6 +507,7 @@ impl DexExecutor {
             gas_price: None,
             gas_policy,
             allowance_mutations_enabled: true,
+            camelot_submissions_enabled: false,
             last_terminal_receipt: None,
             receipt_heads: None,
             latency_telemetry: None,
@@ -484,6 +541,7 @@ impl DexExecutor {
         for protocol in [
             CostTelemetryDexProtocol::UniswapV3,
             CostTelemetryDexProtocol::PancakeSwapV3,
+            CostTelemetryDexProtocol::CamelotV3,
             CostTelemetryDexProtocol::UniswapV4,
         ] {
             let candidate = self
@@ -628,7 +686,7 @@ impl DexExecutor {
                 "DEX allowance amount is zero"
             );
             match requirement.protocol {
-                DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 => {
+                DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 | DexProtocol::CamelotV3 => {
                     self.ensure_erc20_allowance(
                         &format!(
                             "{}.{}-router-approval",
@@ -675,6 +733,52 @@ impl DexExecutor {
         Ok(())
     }
 
+    /// P6 keeps this unopened. The direct-live rollout may call it only after
+    /// the exact Camelot token/router allowances have been prepared and the
+    /// executor has permanently locked allowance mutation.
+    pub fn enable_camelot_submissions_after_allowance_lock(&mut self) -> anyhow::Result<()> {
+        ensure!(
+            !self.allowance_mutations_enabled,
+            "Camelot submission cannot open before allowances are locked"
+        );
+        self.camelot_submissions_enabled = true;
+        Ok(())
+    }
+
+    /// Runs only `eth_call` and `eth_estimateGas` against the exact locally
+    /// built call. It never reserves a nonce, writes the journal, signs,
+    /// broadcasts, or mutates an allowance.
+    pub async fn simulate_exact_input_read_only(
+        &self,
+        request: &ExactInputSwapRequest,
+    ) -> anyhow::Result<ReadOnlySwapSimulation> {
+        request.validate()?;
+        let calldata = exact_input_calldata(request, self.wallet.address())?;
+        let selector: [u8; 4] = calldata[..4]
+            .try_into()
+            .expect("validated DEX calldata always has a selector");
+        let call =
+            WalletCall::validated_contract_call(request.route.router(), U256::ZERO, calldata)?;
+        let rpc_call = call.rpc_call(self.wallet.address());
+        self.rpc
+            .simulate_transaction(&rpc_call)
+            .await
+            .context("read-only DEX simulation reverted")?;
+        let estimated_gas = self.rpc.estimate_gas(&rpc_call).await?;
+        let policy_gas_limit =
+            GasLimitPolicy::for_swap(request.route.protocol(), request.additional_gas)
+                .resolve(request.quoted_gas, estimated_gas)?;
+        Ok(ReadOnlySwapSimulation {
+            protocol: request.route.protocol(),
+            wallet: self.wallet.address(),
+            router: request.route.router(),
+            calldata_hash: keccak256(call.calldata()),
+            selector,
+            estimated_gas,
+            policy_gas_limit,
+        })
+    }
+
     pub async fn execute_exact_input(
         &mut self,
         request: ExactInputSwapRequest,
@@ -690,10 +794,17 @@ impl DexExecutor {
         self.last_terminal_receipt = None;
         request.validate()?;
         let protocol = request.route.protocol();
+        if protocol == DexProtocol::CamelotV3 && !request.reconciliation_only {
+            ensure!(
+                self.camelot_submissions_enabled,
+                "Camelot V3 broadcast is disabled until the direct-live allowance gate opens"
+            );
+        }
         let cost_route = DexRouteCostKey {
             pool: match request.route {
                 SwapRoute::UniswapV3 { pool, .. } => DexPoolCostKey::UniswapV3(pool),
                 SwapRoute::PancakeSwapV3 { pool, .. } => DexPoolCostKey::PancakeSwapV3(pool),
+                SwapRoute::CamelotV3 { pool, .. } => DexPoolCostKey::CamelotV3(pool),
                 SwapRoute::V4 { pool_key, .. } => DexPoolCostKey::UniswapV4(pool_key.pool_id()),
             },
             token_in: request.token_in,
@@ -701,7 +812,7 @@ impl DexExecutor {
         if !request.reconciliation_only
             && matches!(
                 protocol,
-                DexProtocol::PancakeSwapV3 | DexProtocol::UniswapV4
+                DexProtocol::PancakeSwapV3 | DexProtocol::CamelotV3 | DexProtocol::UniswapV4
             )
         {
             ensure!(
@@ -724,34 +835,7 @@ impl DexExecutor {
                 .with_context(|| format!("{} input-token approval failed", protocol.label()))?;
         }
 
-        let calldata = match request.route {
-            SwapRoute::UniswapV3 { fee_pips, .. } => v3_exact_input(
-                request.token_in,
-                request.token_out,
-                fee_pips,
-                self.wallet.address(),
-                request.amount_in,
-                request.amount_out_minimum,
-            )?,
-            SwapRoute::PancakeSwapV3 { fee_pips, .. } => pancake_v3_exact_input_single(
-                request.token_in,
-                request.token_out,
-                fee_pips,
-                self.wallet.address(),
-                request.deadline_unix_seconds,
-                request.amount_in,
-                request.amount_out_minimum,
-            )?,
-            SwapRoute::V4 { pool_key, .. } => v4_exact_input_single(
-                pool_key,
-                request.token_in == pool_key.currency0,
-                request.amount_in,
-                request.amount_out_minimum,
-                request.token_in,
-                request.token_out,
-                request.deadline_unix_seconds,
-            )?,
-        };
+        let calldata = exact_input_calldata(&request, self.wallet.address())?;
         let call =
             WalletCall::validated_contract_call(request.route.router(), U256::ZERO, calldata)?;
         let operation_id = format!("{}.swap", request.operation_id);
@@ -793,7 +877,7 @@ impl DexExecutor {
             token_out_received >= request.amount_out_minimum,
             "DEX receipt output-token delta is below the submitted minimum"
         );
-        let settlement_log = settlement_log_for_route(&receipt, request.route)?;
+        let settlement = settlement_logs_for_route(&receipt, request.route)?;
         let l1_fee = self.accounted_l1_fee(receipt.l1_fee);
         if let Some(telemetry) = &self.pretrade_cost_telemetry {
             telemetry.publish_receipt(
@@ -837,7 +921,8 @@ impl DexExecutor {
             l1_fee,
             token_in_spent,
             token_out_received,
-            settlement_log,
+            settlement_fee: settlement.fee,
+            settlement_log: settlement.swap,
         })
     }
 
@@ -904,6 +989,15 @@ impl DexExecutor {
             SwapRoute::PancakeSwapV3 { router, .. } => {
                 self.ensure_erc20_allowance(
                     &format!("{}.pancakeswap-v3-router-approval", request.operation_id),
+                    request.token_in,
+                    router,
+                    request.amount_in,
+                )
+                .await
+            }
+            SwapRoute::CamelotV3 { router, .. } => {
+                self.ensure_erc20_allowance(
+                    &format!("{}.camelot-v3-router-approval", request.operation_id),
                     request.token_in,
                     router,
                     request.amount_in,
@@ -1537,16 +1631,68 @@ fn is_definitive_prebroadcast_rejection(error: &anyhow::Error) -> bool {
             || message.contains("fee cap less than block base fee"))
 }
 
+fn exact_input_calldata(
+    request: &ExactInputSwapRequest,
+    recipient: Address,
+) -> anyhow::Result<Vec<u8>> {
+    match request.route {
+        SwapRoute::UniswapV3 { fee_pips, .. } => v3_exact_input(
+            request.token_in,
+            request.token_out,
+            fee_pips,
+            recipient,
+            request.amount_in,
+            request.amount_out_minimum,
+        ),
+        SwapRoute::PancakeSwapV3 { fee_pips, .. } => pancake_v3_exact_input_single(
+            request.token_in,
+            request.token_out,
+            fee_pips,
+            recipient,
+            request.deadline_unix_seconds,
+            request.amount_in,
+            request.amount_out_minimum,
+        ),
+        SwapRoute::CamelotV3 { .. } => camelot_v3_exact_input_single(
+            request.token_in,
+            request.token_out,
+            recipient,
+            request.deadline_unix_seconds,
+            request.amount_in,
+            request.amount_out_minimum,
+        ),
+        SwapRoute::V4 { pool_key, .. } => v4_exact_input_single(
+            pool_key,
+            request.token_in == pool_key.currency0,
+            request.amount_in,
+            request.amount_out_minimum,
+            request.token_in,
+            request.token_out,
+            request.deadline_unix_seconds,
+        ),
+    }
+}
+
+#[cfg(test)]
 fn settlement_log_for_route(
     receipt: &TransactionReceipt,
     route: SwapRoute,
 ) -> anyhow::Result<Option<ChainLog>> {
+    Ok(settlement_logs_for_route(receipt, route)?.swap)
+}
+
+fn settlement_logs_for_route(
+    receipt: &TransactionReceipt,
+    route: SwapRoute,
+) -> anyhow::Result<ReceiptSettlementLogs> {
     let expected = match route {
         SwapRoute::UniswapV3 { pool, .. } => PoolLocator::V3(pool),
         SwapRoute::PancakeSwapV3 { pool, .. } => PoolLocator::PancakeV3(pool),
+        SwapRoute::CamelotV3 { pool, .. } => PoolLocator::CamelotV3(pool),
         SwapRoute::V4 { pool_key, .. } => PoolLocator::V4(pool_key.pool_id()),
     };
-    let mut matched = None;
+    let mut matched_fee = None;
+    let mut matched_swap = None;
     for receipt_log in &receipt.logs {
         if let Some(position) = receipt_log.position {
             ensure!(
@@ -1554,27 +1700,140 @@ fn settlement_log_for_route(
                 "DEX receipt log belongs to another transaction"
             );
         }
-        let Ok(log) = receipt_log.chain_log() else {
-            continue;
-        };
         if matches!(
             expected,
-            PoolLocator::V3(pool) | PoolLocator::PancakeV3(pool) if log.address != pool
+            PoolLocator::V3(pool)
+                | PoolLocator::PancakeV3(pool)
+                | PoolLocator::CamelotV3(pool)
+                if receipt_log.address != pool
         ) {
             continue;
         }
-        let Some(event) = decode_pool_event_for_receipt(&log, expected)? else {
+        let Some(kind) = receipt_settlement_kind(receipt_log, expected)? else {
             continue;
         };
-        if event.locator == expected && matches!(event.update, PoolUpdate::Swap { .. }) {
-            ensure!(
-                matched.is_none(),
-                "DEX receipt contains duplicate route Swap events"
-            );
-            matched = Some(log);
+        match kind {
+            ReceiptSettlementKind::Fee => {
+                ensure!(
+                    matched_fee.is_none(),
+                    "DEX receipt contains duplicate route Fee events"
+                );
+                let position = receipt_log
+                    .position
+                    .context("Camelot receipt Fee has no canonical position")?;
+                matched_fee = Some(CamelotFeeReceiptProof {
+                    pool: receipt_log.address,
+                    zero_for_one: u16::from_be_bytes([receipt_log.data[30], receipt_log.data[31]]),
+                    one_for_zero: u16::from_be_bytes([receipt_log.data[62], receipt_log.data[63]]),
+                    block_number: position.block_number,
+                    block_hash: position.block_hash,
+                    transaction_index: position.transaction_index,
+                    log_index: position.log_index,
+                });
+            }
+            ReceiptSettlementKind::Swap => {
+                let Ok(log) = receipt_log.chain_log() else {
+                    continue;
+                };
+                ensure!(
+                    matched_swap.is_none(),
+                    "DEX receipt contains duplicate route Swap events"
+                );
+                matched_swap = Some(log);
+            }
         }
     }
-    Ok(matched)
+    if matches!(expected, PoolLocator::CamelotV3(_)) {
+        let (Some(fee), Some(swap)) = (matched_fee.take(), matched_swap.take()) else {
+            return Ok(ReceiptSettlementLogs::default());
+        };
+        ensure!(
+            fee.pool == swap.address
+                && fee.block_number == swap.block_number
+                && fee.block_hash == swap.block_hash
+                && fee.transaction_index == swap.transaction_index
+                && fee.log_index < swap.log_index,
+            "Camelot receipt Fee is not positionally before Swap in one transaction"
+        );
+        return Ok(ReceiptSettlementLogs {
+            fee: Some(fee),
+            swap: Some(swap),
+        });
+    }
+    ensure!(
+        matched_fee.is_none(),
+        "static-fee route receipt contains a Camelot Fee event"
+    );
+    Ok(ReceiptSettlementLogs {
+        fee: None,
+        swap: matched_swap,
+    })
+}
+
+fn receipt_settlement_kind(
+    log: &ReceiptLog,
+    expected: PoolLocator,
+) -> anyhow::Result<Option<ReceiptSettlementKind>> {
+    let Some(signature) = log.topics.first().copied() else {
+        return Ok(None);
+    };
+    ensure!(
+        !matches!(expected, PoolLocator::V3(_))
+            || (signature != pancake_v3_swap_topic() && signature != camelot_fee_topic()),
+        "receipt event topic does not match its routed Uniswap V3 provider"
+    );
+    ensure!(
+        !matches!(expected, PoolLocator::PancakeV3(_))
+            || (signature != v3_swap_topic() && signature != camelot_fee_topic()),
+        "receipt event topic does not match its routed Pancake V3 provider"
+    );
+    ensure!(
+        !matches!(expected, PoolLocator::CamelotV3(_)) || signature != pancake_v3_swap_topic(),
+        "receipt event topic does not match its routed Camelot V3 provider"
+    );
+    match expected {
+        PoolLocator::V3(_) if signature == v3_swap_topic() => {
+            ensure!(log.topics.len() == 3, "invalid V3 Swap topic count");
+            ensure!(log.data.len() == 5 * 32, "invalid V3 Swap data length");
+            Ok(Some(ReceiptSettlementKind::Swap))
+        }
+        PoolLocator::PancakeV3(_) if signature == pancake_v3_swap_topic() => {
+            ensure!(log.topics.len() == 3, "invalid Pancake V3 Swap topic count");
+            ensure!(
+                log.data.len() == 7 * 32,
+                "invalid Pancake V3 Swap data length"
+            );
+            ensure!(
+                log.data[5 * 32..5 * 32 + 16] == [0_u8; 16]
+                    && log.data[6 * 32..6 * 32 + 16] == [0_u8; 16],
+                "Pancake V3 protocol fee does not fit uint128"
+            );
+            Ok(Some(ReceiptSettlementKind::Swap))
+        }
+        PoolLocator::CamelotV3(_) if signature == camelot_fee_topic() => {
+            ensure!(log.topics.len() == 1, "invalid Camelot Fee topic count");
+            ensure!(log.data.len() == 2 * 32, "invalid Camelot Fee data length");
+            ensure!(
+                log.data[..30] == [0_u8; 30] && log.data[32..62] == [0_u8; 30],
+                "Camelot Fee does not fit uint16"
+            );
+            Ok(Some(ReceiptSettlementKind::Fee))
+        }
+        PoolLocator::CamelotV3(_) if signature == v3_swap_topic() => {
+            ensure!(log.topics.len() == 3, "invalid Camelot Swap topic count");
+            ensure!(log.data.len() == 5 * 32, "invalid Camelot Swap data length");
+            Ok(Some(ReceiptSettlementKind::Swap))
+        }
+        PoolLocator::V4(pool_id) if signature == v4_swap_topic() => {
+            ensure!(log.topics.len() == 3, "invalid V4 Swap topic count");
+            ensure!(log.data.len() == 6 * 32, "invalid V4 Swap data length");
+            Ok((log.topics[1] == pool_id).then_some(ReceiptSettlementKind::Swap))
+        }
+        PoolLocator::V3(_)
+        | PoolLocator::PancakeV3(_)
+        | PoolLocator::CamelotV3(_)
+        | PoolLocator::V4(_) => Ok(None),
+    }
 }
 
 fn wallet_transfer_totals(
@@ -2106,22 +2365,22 @@ mod tests {
         time::Duration,
     };
 
-    use alloy_primitives::{Address, B256, U256, hex, keccak256};
+    use alloy_primitives::{Address, B256, U256, address, hex, keccak256};
     use serde_json::{Value, json};
 
     use super::{
-        DexExecutionService, DexExecutionServiceError, DexExecutor, DexProtocol,
-        EvmExecutionRequest, ExactInputSwapRequest, ExecuteCallPolicy, GasLimitPolicy,
+        CAMELOT_V3_SWAP_GAS_LIMIT, DexExecutionService, DexExecutionServiceError, DexExecutor,
+        DexProtocol, EvmExecutionRequest, ExactInputSwapRequest, ExecuteCallPolicy, GasLimitPolicy,
         MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, allowance_grant_for_policy,
-        is_definitive_prebroadcast_rejection, settlement_log_for_route,
-        transaction_fees_for_policy, wallet_transfer_totals,
+        exact_input_calldata, is_definitive_prebroadcast_rejection, settlement_log_for_route,
+        settlement_logs_for_route, transaction_fees_for_policy, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
         chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
-        dex::events::{pancake_v3_swap_topic, v3_swap_topic},
+        dex::events::{camelot_fee_topic, pancake_v3_swap_topic, v3_swap_topic},
         domain::compiled::CompiledNetworkGasPolicy,
-        paired_benchmark::assert_paired_non_regression,
+        paired_benchmark::{assert_named_paired_non_regression, assert_paired_non_regression},
         wallet::{
             EvmWallet, JournalIntent, JournalOperationIdentity, JournalStatus, TransactionJournal,
             UnknownOutcomeReason, WalletCall,
@@ -2142,6 +2401,32 @@ mod tests {
                 .unwrap(),
             250_000
         );
+    }
+
+    #[test]
+    fn camelot_has_provider_scoped_gas_and_exact_call_identity() {
+        let policy = GasLimitPolicy::for_swap(DexProtocol::CamelotV3, 0);
+        assert_eq!(
+            policy.resolve_without_estimate(None).unwrap(),
+            CAMELOT_V3_SWAP_GAS_LIMIT
+        );
+        assert_eq!(policy.resolve(None, 175_000).unwrap(), 1_000_000);
+
+        let request = ExactInputSwapRequest::with_rails_defaults(
+            "camelot-read-only",
+            SwapRoute::CamelotV3 {
+                router: Address::repeat_byte(0x11),
+                pool: Address::repeat_byte(0x22),
+            },
+            Address::repeat_byte(0x33),
+            Address::repeat_byte(0x44),
+            U256::from(6_000_000_u64),
+            U256::from(5_000_000_u64),
+            1_900_000_002,
+        );
+        let calldata = exact_input_calldata(&request, Address::repeat_byte(0x55)).unwrap();
+        assert_eq!(&calldata[..4], &[0xbc, 0x65, 0x11, 0x88]);
+        assert_eq!(calldata.len(), 4 + 7 * 32);
     }
 
     #[test]
@@ -2261,6 +2546,134 @@ mod tests {
         assert_eq!(log.transaction_index, 7);
         assert_eq!(log.log_index, 9);
         assert_eq!(log.address, pool);
+    }
+
+    #[test]
+    fn pinned_camelot_arb_usdc_receipt_proves_fee_swap_and_wallet_deltas() {
+        let pool = address!("fae2ae0a9f87fd35b5b0e24b47bac796a7eefea1");
+        let arb = address!("912ce59144191c1204e64559fe8253a0e49e6548");
+        let usdc = address!("af88d065e77c8cc2239327c5edb3a432268e5831");
+        let wallet = address!("278d858f05b94576c1e6f73285886876ff6ef8d2");
+        let transaction_hash = "0xb78c6166d764cc5c7075853d2eae19ae03780bc979158283215b11393bcbc20d"
+            .parse::<B256>()
+            .unwrap();
+        let block_hash = "0x2f474c93b25d6c52a6b3114ebccdde3d3ce010e5ccdac659922336289feeca41"
+            .parse::<B256>()
+            .unwrap();
+        let position = |log_index| {
+            Some(ReceiptLogPosition {
+                transaction_hash,
+                block_number: 491_426_734,
+                block_hash,
+                transaction_index: 8,
+                log_index,
+                removed: false,
+            })
+        };
+        let topic = |value: &str| value.parse::<B256>().unwrap();
+        let transfer = keccak256("Transfer(address,address,uint256)");
+        let logs = vec![
+            ReceiptLog {
+                address: pool,
+                topics: vec![camelot_fee_topic()],
+                data: hex::decode(concat!(
+                    "0000000000000000000000000000000000000000000000000000000000000068",
+                    "0000000000000000000000000000000000000000000000000000000000000068"
+                ))
+                .unwrap(),
+                position: position(17),
+            },
+            ReceiptLog {
+                address: usdc,
+                topics: vec![
+                    transfer,
+                    topic("0x000000000000000000000000fae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"),
+                    topic("0x000000000000000000000000278d858f05b94576c1e6f73285886876ff6ef8d2"),
+                ],
+                data: hex::decode(
+                    "0000000000000000000000000000000000000000000000000000000000ed91f4",
+                )
+                .unwrap(),
+                position: position(18),
+            },
+            ReceiptLog {
+                address: arb,
+                topics: vec![
+                    transfer,
+                    topic("0x000000000000000000000000278d858f05b94576c1e6f73285886876ff6ef8d2"),
+                    topic("0x000000000000000000000000fae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"),
+                ],
+                data: hex::decode(
+                    "00000000000000000000000000000000000000000000000a63c954375be9cce0",
+                )
+                .unwrap(),
+                position: position(19),
+            },
+            ReceiptLog {
+                address: arb,
+                topics: vec![
+                    transfer,
+                    topic("0x000000000000000000000000fae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"),
+                    topic("0x00000000000000000000000058095979b412a366687ca05cbe85ff56241be21f"),
+                ],
+                data: hex::decode(
+                    "000000000000000000000000000000000000000000000000000a9f437629b6b6",
+                )
+                .unwrap(),
+                position: position(20),
+            },
+            ReceiptLog {
+                address: pool,
+                topics: vec![
+                    v3_swap_topic(),
+                    topic("0x000000000000000000000000278d858f05b94576c1e6f73285886876ff6ef8d2"),
+                    topic("0x000000000000000000000000278d858f05b94576c1e6f73285886876ff6ef8d2"),
+                ],
+                data: hex::decode(concat!(
+                    "00000000000000000000000000000000000000000000000a63c954375be9cce0",
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff126e0c",
+                    "0000000000000000000000000000000000000000000004c7fa99952c976887d6",
+                    "00000000000000000000000000000000000000000000000002075d7ed929db34",
+                    "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffb6687"
+                ))
+                .unwrap(),
+                position: position(21),
+            },
+        ];
+        let receipt = TransactionReceipt {
+            transaction_hash,
+            block_number: 491_426_734,
+            status: 1,
+            gas_used: 307_979,
+            effective_gas_price: 20_084_000,
+            l1_fee: 0,
+            logs,
+        };
+        let route = SwapRoute::CamelotV3 {
+            router: address!("1f721e2e82f6676fce4ea07a5958cf098d339e18"),
+            pool,
+        };
+        let proof = settlement_logs_for_route(&receipt, route).unwrap();
+        assert_eq!(proof.fee.as_ref().unwrap().log_index, 17);
+        assert_eq!(proof.swap.as_ref().unwrap().log_index, 21);
+        assert_eq!(
+            wallet_transfer_totals(&receipt.logs, arb, wallet).unwrap(),
+            (
+                U256::ZERO,
+                U256::from_be_slice(&hex::decode("0a63c954375be9cce0").unwrap())
+            )
+        );
+        assert_eq!(
+            wallet_transfer_totals(&receipt.logs, usdc, wallet).unwrap(),
+            (U256::from(15_569_396_u64), U256::ZERO)
+        );
+
+        let mut incomplete = receipt;
+        incomplete.logs.remove(0);
+        assert_eq!(
+            settlement_logs_for_route(&incomplete, route).unwrap(),
+            super::ReceiptSettlementLogs::default()
+        );
     }
 
     #[test]
@@ -2403,6 +2816,100 @@ mod tests {
             },
             || {
                 black_box(settlement_log_for_route(&pancake, pancake_route)).unwrap();
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Camelot/Uniswap receipt benchmark"]
+    fn benchmark_uniswap_and_camelot_v3_receipt_proof() {
+        let pool = Address::repeat_byte(0x45);
+        let token_in = Address::repeat_byte(0x02);
+        let token_out = Address::repeat_byte(0x03);
+        let wallet = Address::ZERO;
+        let transfer_topic = keccak256("Transfer(address,address,uint256)");
+        let receipt = |camelot: bool| {
+            let transaction_hash = B256::repeat_byte(if camelot { 0x56 } else { 0x55 });
+            let position = |log_index| {
+                Some(ReceiptLogPosition {
+                    transaction_hash,
+                    block_number: 124,
+                    block_hash: B256::repeat_byte(0x67),
+                    transaction_index: 8,
+                    log_index,
+                    removed: false,
+                })
+            };
+            let mut swap_data = vec![0_u8; 5 * 32];
+            swap_data[95] = 1;
+            swap_data[112..128].copy_from_slice(&1_000_u128.to_be_bytes());
+            let mut logs = Vec::with_capacity(5);
+            if camelot {
+                logs.push(ReceiptLog {
+                    address: pool,
+                    topics: vec![camelot_fee_topic()],
+                    data: vec![0_u8; 2 * 32],
+                    position: position(1),
+                });
+            } else {
+                logs.push(ReceiptLog {
+                    address: Address::repeat_byte(0x10),
+                    topics: vec![B256::ZERO],
+                    data: Vec::new(),
+                    position: position(1),
+                });
+            }
+            for index in 2..=4 {
+                let mut data = vec![0_u8; 32];
+                data[31] = index as u8;
+                logs.push(ReceiptLog {
+                    address: Address::repeat_byte(index as u8),
+                    topics: vec![transfer_topic, B256::ZERO, B256::ZERO],
+                    data,
+                    position: position(index),
+                });
+            }
+            logs.push(ReceiptLog {
+                address: pool,
+                topics: vec![v3_swap_topic(), B256::ZERO, B256::ZERO],
+                data: swap_data,
+                position: position(5),
+            });
+            TransactionReceipt {
+                transaction_hash,
+                block_number: 124,
+                status: 1,
+                gas_used: 100_000,
+                effective_gas_price: 1_000_000,
+                l1_fee: 0,
+                logs,
+            }
+        };
+        let uniswap = receipt(false);
+        let camelot = receipt(true);
+        let uniswap_route = SwapRoute::UniswapV3 {
+            router: Address::repeat_byte(0x33),
+            pool,
+            fee_pips: 500,
+        };
+        let camelot_route = SwapRoute::CamelotV3 {
+            router: Address::repeat_byte(0x33),
+            pool,
+        };
+        assert_named_paired_non_regression(
+            "camelot_v3_receipt_accounting_and_proof_benchmark",
+            1.10,
+            "uniswap_v3",
+            "camelot_v3",
+            || {
+                black_box(wallet_transfer_totals(&uniswap.logs, token_in, wallet)).unwrap();
+                black_box(wallet_transfer_totals(&uniswap.logs, token_out, wallet)).unwrap();
+                black_box(settlement_logs_for_route(&uniswap, uniswap_route)).unwrap();
+            },
+            || {
+                black_box(wallet_transfer_totals(&camelot.logs, token_in, wallet)).unwrap();
+                black_box(wallet_transfer_totals(&camelot.logs, token_out, wallet)).unwrap();
+                black_box(settlement_logs_for_route(&camelot, camelot_route)).unwrap();
             },
         );
     }

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+test_filter="${PAIRED_BENCHMARK_FILTER:-benchmark_uniswap_and_pancake}"
+minimum_reports="${PAIRED_BENCHMARK_MINIMUM_REPORTS:-4}"
+raw_output="$(mktemp)"
+report_lines="$(mktemp)"
+trap 'rm -f "${raw_output}" "${report_lines}"' EXIT
+
+[[ "${minimum_reports}" =~ ^[1-9][0-9]*$ ]]
+
+if ! (
+  cd "${repo_root}"
+  cargo test --release "${test_filter}" -- --ignored --nocapture --test-threads=1
+) >"${raw_output}" 2>&1; then
+  sed -n '1,260p' "${raw_output}" >&2
+  exit 1
+fi
+
+rg -o 'PAIRED_BENCHMARK_JSON=\{.*\}' "${raw_output}" \
+  | sed 's/^PAIRED_BENCHMARK_JSON=//' >"${report_lines}"
+
+actual_reports="$(wc -l <"${report_lines}" | tr -d ' ')"
+if (( actual_reports < minimum_reports )); then
+  sed -n '1,260p' "${raw_output}" >&2
+  echo "expected at least ${minimum_reports} paired reports, found ${actual_reports}" >&2
+  exit 1
+fi
+
+revision="$(git -C "${repo_root}" rev-parse HEAD)"
+captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+architecture="$(uname -m)"
+kernel="$(uname -sr)"
+rustc_version="$(rustc --version)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  cpu="$(sysctl -n machdep.cpu.brand_string)"
+else
+  cpu="$(awk -F ': ' '/model name/ { print $2; exit }' /proc/cpuinfo)"
+fi
+
+jq -s \
+  --arg captured_at_utc "${captured_at_utc}" \
+  --arg revision "${revision}" \
+  --arg architecture "${architecture}" \
+  --arg kernel "${kernel}" \
+  --arg cpu "${cpu}" \
+  --arg rustc "${rustc_version}" \
+  --arg test_filter "${test_filter}" \
+  '
+    {
+      schema_version: 1,
+      artifact_id: "paired-v3-benchmark-report",
+      captured_at_utc: $captured_at_utc,
+      base_revision: $revision,
+      profile: "release",
+      test_filter: $test_filter,
+      host: {
+        architecture: $architecture,
+        kernel: $kernel,
+        cpu: $cpu,
+        rustc: $rustc
+      },
+      benchmarks: (map({key: .label, value: .}) | from_entries),
+      gate: (if all(.p95_ratio <= .maximum_ratio and .p99_ratio <= .maximum_ratio)
+        then "pass"
+        else "fail"
+      end)
+    }
+  ' "${report_lines}"

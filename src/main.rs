@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
@@ -2166,17 +2166,39 @@ fn process_price_collector_dex_event(
     event: arb_bot::market_data::alchemy::DexStreamEvent,
 ) -> anyhow::Result<bool> {
     match event {
-        arb_bot::market_data::alchemy::DexStreamEvent::Log { log, .. } => {
-            let LogApplyResult::Applied { pool_index, .. } = mirror.apply_log(&log)? else {
+        arb_bot::market_data::alchemy::DexStreamEvent::Log {
+            log,
+            block_timestamp,
+            ..
+        } => {
+            let LogApplyResult::Applied {
+                pool_index,
+                refresh_required,
+                ..
+            } = mirror.apply_log_at_timestamp(&log, block_timestamp)?
+            else {
+                return Ok(false);
+            };
+            if !refresh_required {
+                return Ok(false);
+            }
+            mirror.refresh_pool_for_publication(pool_index)?;
+            let request = opportunities.request_pool_refresh(pool_index, mirror)?;
+            let result = request.build()?;
+            Ok(opportunities.finish_pool_refresh(result)?.is_some())
+        }
+        arb_bot::market_data::alchemy::DexStreamEvent::Head {
+            head,
+            timestamp,
+            received_at,
+        } => {
+            let applied = mirror.apply_head_at(head, Some(timestamp), received_at)?;
+            let Some(pool_index) = applied.refresh_pool_index else {
                 return Ok(false);
             };
             let request = opportunities.request_pool_refresh(pool_index, mirror)?;
             let result = request.build()?;
             Ok(opportunities.finish_pool_refresh(result)?.is_some())
-        }
-        arb_bot::market_data::alchemy::DexStreamEvent::Head { head, received_at } => {
-            mirror.apply_head(head, received_at)?;
-            Ok(false)
         }
     }
 }
@@ -2200,13 +2222,14 @@ fn emit_price_collector_evaluation(
             let pool = mirror.pool(pool_index)?;
             let (provider, pool_identity, fee_pips) = match pool.identity {
                 PoolIdentity::V3 { address, fee_pips } => {
-                    ("uniswap_v3", address.to_string(), fee_pips)
+                    ("uniswap_v3", address.to_string(), Some(fee_pips))
                 }
                 PoolIdentity::PancakeV3 { address, fee_pips } => {
-                    ("pancakeswap_v3", address.to_string(), fee_pips)
+                    ("pancakeswap_v3", address.to_string(), Some(fee_pips))
                 }
+                PoolIdentity::CamelotV3 { address } => ("camelot_v3", address.to_string(), None),
                 PoolIdentity::V4 { pool_id, fee_pips } => {
-                    ("uniswap_v4", pool_id.to_string(), fee_pips)
+                    ("uniswap_v4", pool_id.to_string(), Some(fee_pips))
                 }
             };
             for direction in [
@@ -3588,9 +3611,35 @@ async fn run(
                     });
                 }
             }
+            let camelot_live = arb_pair
+                .dex
+                .camelot_v3
+                .as_ref()
+                .is_some_and(|config| config.pools.iter().any(|pool| pool.selection_enabled));
+            if camelot_live {
+                let camelot_router = arb_pair
+                    .chain
+                    .camelot_v3_router_address
+                    .as_deref()
+                    .context("ARB Camelot V3 router is missing")?
+                    .parse()
+                    .context("ARB Camelot V3 router is invalid")?;
+                for token in [token_a, arb_token] {
+                    esp_allowances.push(AllowanceRequirement {
+                        operation_id: allowance_operation_id(token.symbol.as_ref()),
+                        protocol: DexProtocol::CamelotV3,
+                        token: token.contract,
+                        router: camelot_router,
+                        required: U256::MAX,
+                    });
+                }
+            }
             esp_dex_executor
                 .prepare_and_lock_allowances(&esp_allowances)
                 .await?;
+            if camelot_live {
+                esp_dex_executor.enable_camelot_submissions_after_allowance_lock()?;
+            }
         }
         esp_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
         esp_dex_executor.set_pretrade_cost_telemetry(esp_pretrade_cost_telemetry.clone());
@@ -6488,17 +6537,57 @@ async fn initialize_dex(
             && right.address == left.address
             && right.block_hash == left.block_hash
     });
+    let camelot_addresses: BTreeSet<_> = hydrated
+        .pools
+        .iter()
+        .filter_map(|pool| match pool.identity {
+            PoolIdentity::CamelotV3 { address } => Some(address),
+            _ => None,
+        })
+        .collect();
+    let mut camelot_timestamps = BTreeMap::<B256, u32>::new();
+    for log in backfill
+        .iter()
+        .filter(|log| camelot_addresses.contains(&log.address))
+    {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            camelot_timestamps.entry(log.block_hash)
+        {
+            let (_, timestamp) = rpc
+                .canonical_block_by_hash(log.block_number, log.block_hash)
+                .await?;
+            entry.insert(u32::try_from(timestamp).context("Camelot log timestamp exceeds uint32")?);
+        }
+    }
+    let backfill_head_timestamp = if camelot_addresses.is_empty() {
+        None
+    } else {
+        Some(
+            u32::try_from(rpc.canonical_block_timestamp(backfill_head).await?)
+                .context("Camelot backfill head timestamp exceeds uint32")?,
+        )
+    };
     let backfill_provider_us = backfill_provider_started_at.elapsed().as_micros();
 
     let backfill_apply_started_at = Instant::now();
     let mut mirror = DexMirror::new(hydrated)?;
     let mut applied = 0_usize;
     for log in &backfill {
-        if matches!(mirror.apply_log(log)?, LogApplyResult::Applied { .. }) {
+        let result = if camelot_addresses.contains(&log.address) {
+            mirror.apply_log_at_timestamp(
+                log,
+                *camelot_timestamps
+                    .get(&log.block_hash)
+                    .context("Camelot backfill log timestamp is missing")?,
+            )?
+        } else {
+            mirror.apply_log(log)?
+        };
+        if matches!(result, LogApplyResult::Applied { .. }) {
             applied += 1;
         }
     }
-    mirror.finish_backfill(backfill_head)?;
+    mirror.finish_backfill_at(backfill_head, backfill_head_timestamp)?;
     let backfill_apply_us = backfill_apply_started_at.elapsed().as_micros();
     tracing::info!(
         hydration_block = hydration_block.number,
@@ -6835,6 +6924,7 @@ mod tests {
                 hash: B256::repeat_byte(1),
                 parent_hash: B256::ZERO,
             },
+            timestamp: 1,
             received_at: Instant::now() - Duration::from_millis(2),
         });
         first.pool_build_count = 1;

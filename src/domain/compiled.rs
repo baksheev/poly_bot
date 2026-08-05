@@ -408,6 +408,7 @@ pub enum PoolProtocol {
     UniswapV3,
     UniswapV4,
     PancakeSwapV3,
+    CamelotV3,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -418,7 +419,9 @@ pub struct PoolNode {
     pub network_id: NetworkId,
     pub protocol: PoolProtocol,
     pub canonical_identity: String,
-    pub fee_pips: u32,
+    /// Static fee for fee-tier protocols. Camelot V3 keeps this absent because
+    /// its two directional fees are dynamic pool state, not pool identity.
+    pub fee_pips: Option<u32>,
     pub tick_spacing: Option<i32>,
     pub hooks: Option<String>,
     pub lifecycle: PoolLifecycle,
@@ -2216,7 +2219,7 @@ pub fn compile_domain(
                     network_id: network_id.clone(),
                     protocol: PoolProtocol::UniswapV3,
                     canonical_identity: identity,
-                    fee_pips: *fee_pips,
+                    fee_pips: Some(*fee_pips),
                     tick_spacing: None,
                     hooks: None,
                     lifecycle: resolution.lifecycle,
@@ -2248,7 +2251,7 @@ pub fn compile_domain(
                     network_id: network_id.clone(),
                     protocol: PoolProtocol::UniswapV4,
                     canonical_identity: identity,
-                    fee_pips: configured_pool.fee_tier,
+                    fee_pips: Some(configured_pool.fee_tier),
                     tick_spacing: Some(configured_pool.tick_spacing),
                     hooks: Some(configured_pool.hooks.to_ascii_lowercase()),
                     lifecycle: if pair.execution_enabled {
@@ -2274,8 +2277,31 @@ pub fn compile_domain(
                     network_id: network_id.clone(),
                     protocol: PoolProtocol::PancakeSwapV3,
                     canonical_identity: identity,
-                    fee_pips: configured_pool.fee_tier,
+                    fee_pips: Some(configured_pool.fee_tier),
                     tick_spacing: None,
+                    hooks: None,
+                    lifecycle: if pair.execution_enabled && configured_pool.selection_enabled {
+                        PoolLifecycle::ExecutionEligible
+                    } else {
+                        PoolLifecycle::Validated
+                    },
+                });
+                strategy_pool_ids.push(pool_id);
+            }
+        }
+        if let Some(camelot_v3) = &pair.dex.camelot_v3 {
+            for configured_pool in &camelot_v3.pools {
+                let address = parse_address(&configured_pool.expected_address)?;
+                let identity = format!("CamelotV3 {{ address: {address} }}");
+                let pool_id = PoolId(format!("{}:pool:{identity}", network_id.as_str()));
+                pools.push(PoolNode {
+                    id: pool_id.clone(),
+                    pair_id: pair.id.clone(),
+                    network_id: network_id.clone(),
+                    protocol: PoolProtocol::CamelotV3,
+                    canonical_identity: identity,
+                    fee_pips: None,
+                    tick_spacing: Some(configured_pool.expected_tick_spacing),
                     hooks: None,
                     lifecycle: if pair.execution_enabled && configured_pool.selection_enabled {
                         PoolLifecycle::ExecutionEligible
@@ -2731,11 +2757,11 @@ mod tests {
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
         assert_eq!(bundle.strategies.len(), 3);
-        assert_eq!(bundle.pools.len(), 9);
+        assert_eq!(bundle.pools.len(), 10);
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "arbitrum-usdc-arb"
                 && pool.protocol == PoolProtocol::UniswapV3
-                && pool.fee_pips == 500
+                && pool.fee_pips == Some(500)
                 && pool
                     .canonical_identity
                     .to_ascii_lowercase()
@@ -2744,7 +2770,7 @@ mod tests {
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "arbitrum-usdc-arb"
                 && pool.protocol == PoolProtocol::PancakeSwapV3
-                && pool.fee_pips == 500
+                && pool.fee_pips == Some(500)
                 && pool.lifecycle == PoolLifecycle::ExecutionEligible
                 && pool
                     .canonical_identity
@@ -2752,9 +2778,20 @@ mod tests {
                     .contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")
         }));
         assert!(bundle.pools.iter().any(|pool| {
+            pool.pair_id == "arbitrum-usdc-arb"
+                && pool.protocol == PoolProtocol::CamelotV3
+                && pool.fee_pips.is_none()
+                && pool.tick_spacing == Some(10)
+                && pool.lifecycle == PoolLifecycle::ExecutionEligible
+                && pool
+                    .canonical_identity
+                    .to_ascii_lowercase()
+                    .contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1")
+        }));
+        assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "world-chain-usdc-wld"
                 && pool.protocol == PoolProtocol::UniswapV3
-                && pool.fee_pips == 10_000
+                && pool.fee_pips == Some(10_000)
                 && pool
                     .canonical_identity
                     .to_ascii_lowercase()
@@ -2819,7 +2856,9 @@ mod tests {
                 .iter()
                 .filter(|pool| pool.pair_id == "arbitrum-usdc-arb")
                 .all(|pool| match pool.protocol {
-                    PoolProtocol::PancakeSwapV3 | PoolProtocol::UniswapV3 => {
+                    PoolProtocol::PancakeSwapV3
+                    | PoolProtocol::UniswapV3
+                    | PoolProtocol::CamelotV3 => {
                         pool.lifecycle == PoolLifecycle::ExecutionEligible
                     }
                     PoolProtocol::UniswapV4 => false,
@@ -2831,6 +2870,39 @@ mod tests {
                 .iter()
                 .filter(|pool| pool.pair_id == "arbitrum-usdc-esp")
                 .all(|pool| pool.lifecycle == PoolLifecycle::Validated)
+        );
+    }
+
+    #[test]
+    fn production_bundle_compiles_camelot_dynamic_fee_identity() {
+        let (_, _, bundle) = fixture();
+
+        let camelot = bundle
+            .pools
+            .iter()
+            .find(|pool| pool.protocol == PoolProtocol::CamelotV3)
+            .unwrap();
+        assert_eq!(camelot.pair_id, "arbitrum-usdc-arb");
+        assert_eq!(
+            camelot.canonical_identity,
+            "CamelotV3 { address: 0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1 }"
+        );
+        assert_eq!(camelot.fee_pips, None);
+        assert_eq!(camelot.tick_spacing, Some(10));
+        assert_eq!(camelot.lifecycle, PoolLifecycle::ExecutionEligible);
+
+        let dependency = bundle
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.strategy_id.as_str() == "strategy:arbitrum-usdc-arb")
+            .unwrap();
+        assert!(dependency.pool_ids.contains(&camelot.id));
+        assert!(
+            bundle
+                .pools
+                .iter()
+                .filter(|pool| pool.protocol != PoolProtocol::CamelotV3)
+                .all(|pool| pool.fee_pips.is_some())
         );
     }
 
@@ -2858,6 +2930,7 @@ mod tests {
                 .unwrap();
         let checked_in: CompiledDomainBundle = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(checked_in, expected);
+        assert_eq!(bytes, serde_json::to_vec_pretty(&expected).unwrap());
     }
 
     #[test]
@@ -2981,7 +3054,7 @@ mod tests {
             .unwrap();
         assert!(arb.observe && arb.plan && arb.execute);
         assert_eq!(arb.network_id.as_str(), "eip155:42161");
-        assert_eq!(arb.pool_ids.len(), 3);
+        assert_eq!(arb.pool_ids.len(), 4);
         assert!(arb.pool_ids.iter().any(|pool_id| {
             pool_id
                 .as_str()
@@ -2993,6 +3066,12 @@ mod tests {
                 .as_str()
                 .to_ascii_lowercase()
                 .contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")
+        }));
+        assert!(arb.pool_ids.iter().any(|pool_id| {
+            pool_id
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1")
         }));
         assert!(arb.domain_config.snapshot().live_trading_enabled);
         assert_ne!(

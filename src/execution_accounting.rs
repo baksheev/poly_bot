@@ -40,6 +40,7 @@ pub fn dex_leg_result(
         third_asset_prices_token_a: BTreeMap::new(),
         gas_cost_token_a_base_units,
         venue_reference: format!("dex:{:#x}", outcome.transaction_hash),
+        dex_settlement_fee: outcome.settlement_fee,
         dex_settlement_log: outcome.settlement_log,
     })
 }
@@ -117,6 +118,7 @@ pub fn binance_leg_result(
         third_asset_prices_token_a,
         gas_cost_token_a_base_units: 0,
         venue_reference: format!("cex:{}", order.order_id),
+        dex_settlement_fee: None,
         dex_settlement_log: None,
     })
 }
@@ -258,6 +260,7 @@ mod tests {
             l1_fee: 3,
             token_in_spent: U256::from(1_000_u16),
             token_out_received: U256::from(1_100_u16),
+            settlement_fee: None,
             settlement_log: Some(crate::chain::logs::ChainLog {
                 address: Address::repeat_byte(2),
                 topics: Vec::new(),

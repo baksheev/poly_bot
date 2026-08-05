@@ -148,7 +148,7 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
           arb='.sources[] | select(.snapshot.pairs[0].id == "arbitrum-usdc-arb") | .snapshot'
-          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live
+          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live
           test "$(jq -r "${arb} | .source.rails_pair_candidate_id" "${domain_config}")" = 2694
           test "$(jq -r "${arb} | .pairs[0].binance.symbol" "${domain_config}")" = ARBUSDC
           test "$(jq -r "${arb} | .pairs[0].binance.step_size" "${domain_config}")" = 0.10000000
@@ -163,14 +163,21 @@ jobs:
           test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_factory_address" "${domain_config}")" = 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
           test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_quoter_address" "${domain_config}")" = 0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
           test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_router_address" "${domain_config}")" = 0x1b81D678ffb9C0263b24A97847620C99d213eB14
-          test "$(jq -c "${arb} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["uniswap_v3","pancake_swap_v3"]'
+          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_factory_address" "${domain_config}")" = 0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B
+          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_pool_deployer_address" "${domain_config}")" = 0x6Dd3FB9653B10e806650F107C3B5A0a6fF974F65
+          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_quoter_address" "${domain_config}")" = 0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E
+          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_router_address" "${domain_config}")" = 0x1F721E2E82F6676FCE4eA07A5958cF098D339e18
+          test "$(jq -c "${arb} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["uniswap_v3","pancake_swap_v3","camelot_v3"]'
           test "$(jq -c "${arb} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" = '[500,3000]'
           test "$(jq -c "${arb} | .pairs[0].dex.pancakeswap_v3.pools" "${domain_config}")" = '[{"fee_tier":500,"expected_address":"0x9ffca51d23ac7f7df82da414865ef1055e5afcc3","selection_enabled":true}]'
+          test "$(jq -c "${arb} | .pairs[0].dex.camelot_v3.pools" "${domain_config}")" = '[{"expected_address":"0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1","selection_enabled":true,"required_active_incentive":"0x0000000000000000000000000000000000000000","expected_tick_spacing":10,"dynamic_fee_horizon_seconds":2}]'
           test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 500 and ((.canonical_identity | ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 3000 and ((.canonical_identity | ascii_downcase) | contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "pancake_swap_v3" and .fee_pips == 500 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "camelot_v3" and .fee_pips == null and .tick_spacing == 10 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -522,6 +529,9 @@ jobs:
             and .mode == "capacity_replay_only"
             and .pair_count == 20
             and .pool_count == 25
+            and .provider_pool_counts.uniswap_v3 == 23
+            and .provider_pool_counts.pancakeswap_v3 == 1
+            and .provider_pool_counts.camelot_v3 == 1
             and .frames_per_pair == 100000
             and .total_strategy_frames == 2000000
             and .reconnect_bursts == 4
@@ -544,6 +554,20 @@ jobs:
             and .rehydration.decode_latency.p99_ns <= 25000
             and .rehydration.pool_build_latency.p99_ns <= 200000
             and .rehydration.publication_latency.p99_ns <= 25000
+            and .provider_parity.comparison_scope == "same_tick_domain_price_liquidity_fee_curve_bounds_and_bidirectional_work"
+            and .provider_parity.prepared_quote.control == "uniswap_v3"
+            and .provider_parity.prepared_quote.candidate == "camelot_v3"
+            and .provider_parity.prepared_quote.maximum_ratio_bps == 10500
+            and .provider_parity.prepared_quote.p95_ratio_bps <= 10500
+            and .provider_parity.prepared_quote.p99_ratio_bps <= 10500
+            and .provider_parity.prepared_quote.gate == "pass"
+            and .provider_parity.prepared_curve_build.control == "uniswap_v3"
+            and .provider_parity.prepared_curve_build.candidate == "camelot_v3"
+            and .provider_parity.prepared_curve_build.maximum_ratio_bps == 12000
+            and .provider_parity.prepared_curve_build.p95_ratio_bps <= 12000
+            and .provider_parity.prepared_curve_build.p99_ratio_bps <= 12000
+            and .provider_parity.prepared_curve_build.gate == "pass"
+            and .provider_parity.gate == "pass"
             and .network_io_performed == false
             and .external_mutations == 0
             and .target_cpu_class == "c4-highcpu-8"

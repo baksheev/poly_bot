@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p7-local",
+  "captured_at_utc": "2026-08-05T19:58:09Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "measurement_scope": "working_tree_after_p7",
+  "profile": "release",
+  "pinned_arb_usdc_read_only_replay": {
+    "source_transaction": "0x42cc0e4d929640dd22e42a1d273128f3e8afe55b0dc18b63cf175462de25f6fc",
+    "parent_block": 400150196,
+    "parent_block_hash": "0x96b854e6c3708c5cda4eb46c631d511e4233276e302e84cb3cee6fa8e5c517de",
+    "router": "0x1f721e2e82f6676fce4ea07a5958cf098d339e18",
+    "pool": "0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1",
+    "token_in": "0x912ce59144191c1204e64559fe8253a0e49e6548",
+    "token_out": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+    "fee_log_index": 6,
+    "swap_log_index": 11,
+    "estimated_gas": 753956,
+    "gas_fallback": 1000000,
+    "eth_call": "pass",
+    "eth_estimate_gas": "pass",
+    "signing": false,
+    "broadcast": false,
+    "allowance_mutation": false,
+    "account_mutation": false,
+    "gate": "pass"
+  },
+  "receipt_and_self_impact": {
+    "pinned_receipt_wallet_deltas_exact": true,
+    "positional_fee_before_swap": true,
+    "compact_fee_proof_matches_canonical_log_apply": true,
+    "bounded_canonical_timestamp_cache": 128,
+    "queued_websocket_drain_before_receipt_apply": true,
+    "second_get_logs_wait": false,
+    "durable_settlement_barrier": false,
+    "websocket_fallback_when_complete_proof_missing": true,
+    "gate": "pass"
+  },
+  "camelot_vs_uniswap": {
+    "receipt_accounting_and_proof": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.10,
+      "uniswap_p95_ns": 416.1336,
+      "uniswap_p99_ns": 416.1526,
+      "camelot_p95_ns": 425.7844,
+      "camelot_p99_ns": 426.8502,
+      "p95_ratio": 1.02319,
+      "p99_ratio": 1.02571,
+      "gate": "pass"
+    },
+    "event_decode_apply": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.10,
+      "uniswap_p95_ns": 88.5140,
+      "uniswap_p99_ns": 129.7228,
+      "camelot_p95_ns": 96.0511,
+      "camelot_p99_ns": 108.8715,
+      "p95_ratio": 1.08515,
+      "p99_ratio": 0.83926,
+      "gate": "pass"
+    },
+    "prepared_quote": {
+      "maximum_ratio": 1.05,
+      "p95_ratio": 0.99909,
+      "p99_ratio": 0.99967,
+      "gate": "pass"
+    },
+    "prepared_curve_build": {
+      "maximum_ratio": 1.20,
+      "p95_ratio": 1.00734,
+      "p99_ratio": 1.00870,
+      "gate": "pass"
+    },
+    "receipt_to_lane_release_publication": {
+      "comparison_scope": "same_tick_domain_traversal_liquidity_and_curve_bounds",
+      "rounds": 32,
+      "iterations_per_provider": 131072,
+      "maximum_ratio": 1.15,
+      "uniswap_p95_ns": 86533.8035,
+      "uniswap_p99_ns": 86550.7305,
+      "camelot_p95_ns": 66359.7310,
+      "camelot_p99_ns": 66414.5916,
+      "p95_ratio": 0.76686,
+      "p99_ratio": 0.76735,
+      "rejected_unmatched_control_ratio": 38.99,
+      "rejected_control_difference": "spacing_60_compressed_vs_spacing_10_algebra_raw",
+      "gate_widened": false,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "recovery_composition": {
+    "success": "pass",
+    "known_revert": "pass",
+    "timeout_and_unknown_receipt": "pass",
+    "restart_reconciliation": "pass",
+    "dex_success_binance_partial_and_zero_ioc": "pass",
+    "bounded_market_recovery_unchanged": true,
+    "provider_journal_identity_isolated": true,
+    "gate": "pass"
+  },
+  "mixed_capacity_replay": {
+    "frames": 2000000,
+    "decision_p95_ns": 42,
+    "decision_p99_ns": 84,
+    "decision_p99_hard_ns": 25000,
+    "frames_per_second": 11234782,
+    "pool_build_p99_ns": 32875,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass"
+  },
+  "quality_gate": {
+    "scripts_quality": "pass",
+    "lib_tests_passed": 547,
+    "binary_tests_passed": 8,
+    "tests_failed": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "p7_gate": "pass"
+}

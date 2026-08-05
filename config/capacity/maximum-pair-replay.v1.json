@@ -13,6 +13,13 @@
   "frames_per_pair": 100000,
   "reconnect_bursts": 4,
   "maximum_sizing_workers": 4,
+  "mixed_provider_assignments": {
+    "capacity-arbitrum-arb-usdc": [
+      "uniswap_v3",
+      "pancakeswap_v3",
+      "camelot_v3"
+    ]
+  },
   "rehydration_fixture": {
     "source": "Alchemy World Chain archival eth_call captured at block hash 0x8a5e7109a09bb06e8f6aceaaf4194d48113c6d2ebaedae4c646c248388b37a90",
     "fee_pips": 3000,

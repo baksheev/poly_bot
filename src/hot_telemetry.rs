@@ -245,6 +245,7 @@ pub fn channel(
         let cost_pool_key = match pool.identity {
             PoolIdentity::V3 { address, .. } => DexPoolCostKey::UniswapV3(address),
             PoolIdentity::PancakeV3 { address, .. } => DexPoolCostKey::PancakeSwapV3(address),
+            PoolIdentity::CamelotV3 { address } => DexPoolCostKey::CamelotV3(address),
             PoolIdentity::V4 { pool_id, .. } => DexPoolCostKey::UniswapV4(pool_id),
         };
         pools.push(PoolTelemetryContext {
@@ -766,6 +767,9 @@ impl HotTelemetryTask {
                 "prepared_token_a_limit_base_units": prepared.token_a_limit.to_string(),
                 "prepared_exact_output_token_b_limit_base_units": prepared.exact_output_token_b_limit.to_string(),
                 "prepared_exact_input_token_b_limit_base_units": prepared.exact_input_token_b_limit.to_string(),
+                "fee_generation": prepared.fee_generation,
+                "fee_zero_for_one_pips": prepared.fee_zero_for_one_pips,
+                "fee_one_for_zero_pips": prepared.fee_one_for_zero_pips,
                 "build_time_us": prepared.build_time_us,
                 "pre_dispatch_time_us": prepared.pre_dispatch_time_us,
                 "request_send_time_us": prepared.request_send_time_us,

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    hint::black_box,
     path::Path,
     sync::{
         Arc,
@@ -9,7 +10,7 @@ use std::{
     time::Instant,
 };
 
-use alloy_primitives::hex;
+use alloy_primitives::{U256, hex};
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,9 @@ pub struct CapacityReplayArtifact {
     pub frames_per_pair: u64,
     pub reconnect_bursts: u32,
     pub maximum_sizing_workers: usize,
+    /// Provider assignments are needed only for genuinely mixed-provider
+    /// pairs. Unlisted pools retain the frozen Uniswap control profile.
+    pub mixed_provider_assignments: BTreeMap<String, Vec<CapacityDexProvider>>,
     pub rehydration_fixture: RehydrationFixture,
     pub pairs: Vec<CapacityPair>,
 }
@@ -70,6 +74,25 @@ pub struct CapacityPair {
     pub network_id: String,
     pub candidate_ids: Vec<u64>,
     pub pool_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityDexProvider {
+    UniswapV3,
+    #[serde(rename = "pancakeswap_v3")]
+    PancakeSwapV3,
+    CamelotV3,
+}
+
+impl CapacityDexProvider {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::UniswapV3 => "uniswap_v3",
+            Self::PancakeSwapV3 => "pancakeswap_v3",
+            Self::CamelotV3 => "camelot_v3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,7 +211,38 @@ impl CapacityReplayArtifact {
                 );
             }
         }
+        for (pair_id, providers) in &self.mixed_provider_assignments {
+            let pair = self
+                .pairs
+                .iter()
+                .find(|pair| pair.pair_id == *pair_id)
+                .with_context(|| format!("mixed provider assignment has unknown pair {pair_id}"))?;
+            ensure!(
+                providers.len() == pair.pool_count,
+                "mixed provider assignment for {pair_id} differs from pool_count"
+            );
+        }
+        let arbitrum_arb = self
+            .mixed_provider_assignments
+            .get("capacity-arbitrum-arb-usdc")
+            .context("capacity ARB/USDC mixed provider assignment is missing")?;
+        ensure!(
+            arbitrum_arb
+                == &[
+                    CapacityDexProvider::UniswapV3,
+                    CapacityDexProvider::PancakeSwapV3,
+                    CapacityDexProvider::CamelotV3,
+                ],
+            "capacity ARB/USDC must exercise Uniswap, Pancake, and Camelot in stable order"
+        );
         Ok(())
+    }
+
+    fn providers_for(&self, pair: &CapacityPair) -> Vec<CapacityDexProvider> {
+        self.mixed_provider_assignments
+            .get(&pair.pair_id)
+            .cloned()
+            .unwrap_or_else(|| vec![CapacityDexProvider::UniswapV3; pair.pool_count])
     }
 }
 
@@ -222,12 +276,35 @@ pub struct RehydrationSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PairedProviderLatencySummary {
+    pub control: String,
+    pub candidate: String,
+    pub rounds: usize,
+    pub iterations_per_provider: u64,
+    pub maximum_ratio_bps: u64,
+    pub control_latency: LatencySummary,
+    pub candidate_latency: LatencySummary,
+    pub p95_ratio_bps: u64,
+    pub p99_ratio_bps: u64,
+    pub gate: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderParitySummary {
+    pub comparison_scope: String,
+    pub prepared_quote: PairedProviderLatencySummary,
+    pub prepared_curve_build: PairedProviderLatencySummary,
+    pub gate: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CapacityReplayReport {
     pub schema_version: u32,
     pub artifact_id: String,
     pub mode: String,
     pub pair_count: usize,
     pub pool_count: usize,
+    pub provider_pool_counts: BTreeMap<String, usize>,
     pub frames_per_pair: u64,
     pub total_strategy_frames: u64,
     pub reconnect_bursts: u32,
@@ -245,6 +322,7 @@ pub struct CapacityReplayReport {
     pub target_cpu_class: Option<String>,
     pub fairness: FairnessSummary,
     pub rehydration: RehydrationSummary,
+    pub provider_parity: ProviderParitySummary,
     pub network_io_performed: bool,
     pub external_mutations: u64,
     pub gate: String,
@@ -300,6 +378,7 @@ pub fn run_capacity_replay(
 
     let base_config = LoadedDomainConfig::load("config/strategies/usdc-wld-world-chain.v14.json")?;
     let mut strategies = Vec::with_capacity(artifact.pairs.len());
+    let mut provider_pool_counts = BTreeMap::new();
     let mut counters = BTreeMap::new();
     let mut evaluators = Vec::with_capacity(artifact.pairs.len());
     for (pair_index, pair) in artifact.pairs.iter().enumerate() {
@@ -311,8 +390,22 @@ pub fn run_capacity_replay(
             symbol: pair.symbol.clone(),
             evaluations,
         };
-        let pool_ids = (0..pair.pool_count)
-            .map(|pool_index| PoolId::new(format!("pool:capacity:{}:{pool_index}", pair.pair_id)))
+        let providers = artifact.providers_for(pair);
+        for provider in &providers {
+            *provider_pool_counts
+                .entry(provider.label().to_owned())
+                .or_insert(0) += 1;
+        }
+        let pool_ids = providers
+            .iter()
+            .enumerate()
+            .map(|(pool_index, provider)| {
+                PoolId::new(format!(
+                    "pool:capacity:{}:{}:{pool_index}",
+                    pair.pair_id,
+                    provider.label()
+                ))
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
         strategies.push(CompiledHotPathStrategyPlan {
             strategy_id,
@@ -434,6 +527,7 @@ pub fn run_capacity_replay(
     );
     let fairness = exercise_fairness(&owner, &artifact)?;
     let rehydration = exercise_rehydration(&artifact)?;
+    let provider_parity = exercise_provider_parity(&artifact)?;
     let decision_owner_latency = latency_summary(&mut latencies)?;
     let frames_per_second = if elapsed_ns == 0 {
         expected_frames
@@ -469,6 +563,7 @@ pub fn run_capacity_replay(
         mode: artifact.mode,
         pair_count: artifact.pairs.len(),
         pool_count: artifact.pairs.iter().map(|pair| pair.pool_count).sum(),
+        provider_pool_counts,
         frames_per_pair: artifact.frames_per_pair,
         total_strategy_frames: expected_frames,
         reconnect_bursts: artifact.reconnect_bursts,
@@ -486,10 +581,165 @@ pub fn run_capacity_replay(
         target_cpu_class: target_cpu_class.map(str::to_owned),
         fairness,
         rehydration,
+        provider_parity,
         network_io_performed: false,
         external_mutations: 0,
         gate: gate.to_owned(),
     })
+}
+
+fn exercise_provider_parity(
+    artifact: &CapacityReplayArtifact,
+) -> anyhow::Result<ProviderParitySummary> {
+    const ROUNDS: usize = 16;
+    const QUOTE_ITERATIONS: u32 = 65_536;
+    const BUILD_ITERATIONS: u32 = 8_192;
+    const QUOTE_MAXIMUM_RATIO_BPS: u64 = 10_500;
+    const BUILD_MAXIMUM_RATIO_BPS: u64 = 12_000;
+
+    let captured = [
+        decode_hex("slot0", &artifact.rehydration_fixture.slot0)?,
+        decode_hex("liquidity", &artifact.rehydration_fixture.liquidity)?,
+        decode_hex("tick_spacing", &artifact.rehydration_fixture.tick_spacing)?,
+    ];
+    let decoded = decode_v3_core_head(&captured)?;
+    let uniswap = ClmmPool::new(
+        artifact.rehydration_fixture.fee_pips,
+        decoded.tick_spacing,
+        decoded.sqrt_price_x96,
+        decoded.tick,
+        decoded.liquidity,
+    )?;
+    let camelot = ClmmPool::new_algebra_v1_9(
+        artifact.rehydration_fixture.fee_pips,
+        artifact.rehydration_fixture.fee_pips,
+        decoded.tick_spacing,
+        decoded.sqrt_price_x96,
+        decoded.tick,
+        decoded.liquidity,
+    )?;
+    let maximum = U256::from(200_000_000_u64);
+    let probe = U256::from(6_000_000_u64);
+    let uniswap_curves = [
+        uniswap.prepare_exact_input_curve_bounded(false, maximum)?,
+        uniswap.prepare_exact_input_curve_bounded(true, maximum)?,
+    ];
+    let camelot_curves = [
+        camelot.prepare_exact_input_curve_bounded(false, maximum)?,
+        camelot.prepare_exact_input_curve_bounded(true, maximum)?,
+    ];
+    ensure!(
+        uniswap_curves[0].quote(probe)? == camelot_curves[0].quote(probe)?
+            && uniswap_curves[1].quote(probe)? == camelot_curves[1].quote(probe)?,
+        "capacity paired provider curves differ on the matched workload"
+    );
+
+    let prepared_quote = paired_provider_latency(
+        ROUNDS,
+        QUOTE_ITERATIONS,
+        QUOTE_MAXIMUM_RATIO_BPS,
+        || {
+            black_box(uniswap_curves[0].quote(black_box(probe))?);
+            black_box(uniswap_curves[1].quote(black_box(probe))?);
+            Ok(())
+        },
+        || {
+            black_box(camelot_curves[0].quote(black_box(probe))?);
+            black_box(camelot_curves[1].quote(black_box(probe))?);
+            Ok(())
+        },
+    )?;
+    let prepared_curve_build = paired_provider_latency(
+        ROUNDS,
+        BUILD_ITERATIONS,
+        BUILD_MAXIMUM_RATIO_BPS,
+        || {
+            black_box(uniswap.prepare_exact_input_curve_bounded(false, maximum)?);
+            black_box(uniswap.prepare_exact_input_curve_bounded(true, maximum)?);
+            Ok(())
+        },
+        || {
+            black_box(camelot.prepare_exact_input_curve_bounded(false, maximum)?);
+            black_box(camelot.prepare_exact_input_curve_bounded(true, maximum)?);
+            Ok(())
+        },
+    )?;
+
+    Ok(ProviderParitySummary {
+        comparison_scope:
+            "same_tick_domain_price_liquidity_fee_curve_bounds_and_bidirectional_work".to_owned(),
+        prepared_quote,
+        prepared_curve_build,
+        gate: "pass".to_owned(),
+    })
+}
+
+fn paired_provider_latency<C, N>(
+    rounds: usize,
+    iterations: u32,
+    maximum_ratio_bps: u64,
+    mut control: C,
+    mut candidate: N,
+) -> anyhow::Result<PairedProviderLatencySummary>
+where
+    C: FnMut() -> anyhow::Result<()>,
+    N: FnMut() -> anyhow::Result<()>,
+{
+    for _ in 0..10_000 {
+        control()?;
+        candidate()?;
+    }
+    let mut control_rounds = Vec::with_capacity(rounds);
+    let mut candidate_rounds = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        if round % 2 == 0 {
+            control_rounds.push(measure_iterations(iterations, &mut control)?);
+            candidate_rounds.push(measure_iterations(iterations, &mut candidate)?);
+        } else {
+            candidate_rounds.push(measure_iterations(iterations, &mut candidate)?);
+            control_rounds.push(measure_iterations(iterations, &mut control)?);
+        }
+    }
+    let control_latency = latency_summary(&mut control_rounds)?;
+    let candidate_latency = latency_summary(&mut candidate_rounds)?;
+    let p95_ratio_bps = ratio_bps(candidate_latency.p95_ns, control_latency.p95_ns)?;
+    let p99_ratio_bps = ratio_bps(candidate_latency.p99_ns, control_latency.p99_ns)?;
+    ensure!(
+        p95_ratio_bps <= maximum_ratio_bps && p99_ratio_bps <= maximum_ratio_bps,
+        "Camelot target replay latency exceeds the frozen Uniswap ratio"
+    );
+    Ok(PairedProviderLatencySummary {
+        control: "uniswap_v3".to_owned(),
+        candidate: "camelot_v3".to_owned(),
+        rounds,
+        iterations_per_provider: u64::from(iterations).saturating_mul(rounds as u64),
+        maximum_ratio_bps,
+        control_latency,
+        candidate_latency,
+        p95_ratio_bps,
+        p99_ratio_bps,
+        gate: "pass".to_owned(),
+    })
+}
+
+fn measure_iterations(
+    iterations: u32,
+    operation: &mut impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    let started = Instant::now();
+    for _ in 0..iterations {
+        operation()?;
+    }
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(elapsed.checked_div(u64::from(iterations)).unwrap_or(0))
+}
+
+fn ratio_bps(candidate: u64, control: u64) -> anyhow::Result<u64> {
+    ensure!(control > 0, "capacity paired control latency is zero");
+    candidate
+        .checked_mul(10_000)
+        .and_then(|value| value.checked_div(control))
+        .context("capacity paired latency ratio overflow")
 }
 
 fn exercise_rehydration(artifact: &CapacityReplayArtifact) -> anyhow::Result<RehydrationSummary> {
@@ -518,9 +768,18 @@ fn exercise_rehydration(artifact: &CapacityReplayArtifact) -> anyhow::Result<Reh
     let mut publication_latencies = Vec::with_capacity(sample_count);
     let mut pool_publications = 0;
 
+    let providers = artifact
+        .pairs
+        .iter()
+        .flat_map(|pair| artifact.providers_for(pair))
+        .collect::<Vec<_>>();
+    ensure!(
+        providers.len() == pool_count,
+        "capacity provider assignment count differs from pool count"
+    );
     for _ in 0..cycles {
         let mut published = Vec::with_capacity(pool_count);
-        for _ in 0..pool_count {
+        for provider in &providers {
             let started = Instant::now();
             let batch = captured.clone();
             materialization_latencies
@@ -537,13 +796,25 @@ fn exercise_rehydration(artifact: &CapacityReplayArtifact) -> anyhow::Result<Reh
             );
 
             let started = Instant::now();
-            let pool = ClmmPool::new(
-                artifact.rehydration_fixture.fee_pips,
-                decoded.tick_spacing,
-                decoded.sqrt_price_x96,
-                decoded.tick,
-                decoded.liquidity,
-            )?;
+            let pool = match provider {
+                CapacityDexProvider::UniswapV3 | CapacityDexProvider::PancakeSwapV3 => {
+                    ClmmPool::new(
+                        artifact.rehydration_fixture.fee_pips,
+                        decoded.tick_spacing,
+                        decoded.sqrt_price_x96,
+                        decoded.tick,
+                        decoded.liquidity,
+                    )?
+                }
+                CapacityDexProvider::CamelotV3 => ClmmPool::new_algebra_v1_9(
+                    artifact.rehydration_fixture.fee_pips,
+                    artifact.rehydration_fixture.fee_pips,
+                    decoded.tick_spacing,
+                    decoded.sqrt_price_x96,
+                    decoded.tick,
+                    decoded.liquidity,
+                )?,
+            };
             build_latencies.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
             let started = Instant::now();

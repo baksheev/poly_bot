@@ -576,6 +576,9 @@ fn validate_pair(pair: &PairConfig, protocol: DexProtocol) -> anyhow::Result<()>
         DexProtocol::PancakeSwapV3 => {
             anyhow::bail!("PancakeSwap is outside the World Chain Uniswap validation command")
         }
+        DexProtocol::CamelotV3 => {
+            anyhow::bail!("Camelot is outside the World Chain Uniswap validation command")
+        }
     };
     ensure!(
         pair.dex.allowed_providers.contains(&provider),

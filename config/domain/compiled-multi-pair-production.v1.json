@@ -5,17 +5,17 @@
   "compiler_version": "production-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live",
-      "source_fingerprint_sha256": "0940e55ab57440b2686b8eb00c6b1a8267db9f2bcbf0fa11519dd8be483e2b0d",
+      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live",
+      "source_fingerprint_sha256": "f37d0b8d8f5b85be7dd953e4cbcfbb8edb43afa929c585f18c099b73bac194b5",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live",
+        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
           "rails_pair_candidate_id": 2694,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.274070Z",
-          "captured_at_utc": "2026-08-05T13:26:19Z",
+          "captured_at_utc": "2026-08-05T20:01:56Z",
           "evidence": [
             "production PostgreSQL read-only PairCandidate export for ARBUSDC",
             "Binance Spot exchangeInfo and account commission filters for ARBUSDC",
@@ -28,9 +28,13 @@
             "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC",
             "canonical PancakeSwap V3 factory and pool-state verification for the Arbitrum One 0.05% ARB/USDC pool at block 491332082",
             "PancakeSwap V3 QuoterV2 exact-input and exact-output parity at one canonical Arbitrum block",
-            "operator approved a production observe-only Pancake V3 performance cohort before direct live enablement",
             "P7 production shadow cohort proved quotable Pancake economics without selection or allowance mutation; two target-C4 runs passed the frozen performance bounds",
-            "explicit operator decision: enable the canonical PancakeSwap V3 fee-500 ARB/USDC route directly in full-live production without a paper phase"
+            "explicit operator decision: enable the canonical PancakeSwap V3 fee-500 ARB/USDC route directly in full-live production without a paper phase",
+            "canonical Camelot V3 Algebra factory, deployer, router, Quoter, pool identity, tokens, zero active incentive, tick spacing, directional fees, and runtime code verified at Arbitrum block 491383703",
+            "Camelot V3 exact-input and exact-output local quote parity proved against the pinned Quoter, including a canonical transition-event replay",
+            "Camelot V3 exact router calldata simulated read-only and one historical ARB/native-USDC route replay estimated 753956 gas without signing, broadcasting, or allowance mutation",
+            "all frozen paired Uniswap/Camelot performance gates and the two-million-frame maximum-pair capacity replay passed after receipt-settlement integration",
+            "explicit operator decision: enable the canonical Camelot V3 ARB/native-USDC route immediately in full-live production without observe-only, paper, reduced-size, or canary phases"
           ]
         },
         "live_trading_enabled": true,
@@ -69,7 +73,11 @@
               "uniswap_v3_router_address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
               "pancakeswap_v3_factory_address": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
               "pancakeswap_v3_quoter_address": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
-              "pancakeswap_v3_router_address": "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+              "pancakeswap_v3_router_address": "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+              "camelot_v3_factory_address": "0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B",
+              "camelot_v3_pool_deployer_address": "0x6Dd3FB9653B10e806650F107C3B5A0a6fF974F65",
+              "camelot_v3_quoter_address": "0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E",
+              "camelot_v3_router_address": "0x1F721E2E82F6676FCE4eA07A5958cF098D339e18"
             },
             "token_a": {
               "symbol": "USDC",
@@ -128,7 +136,8 @@
             "dex": {
               "allowed_providers": [
                 "uniswap_v3",
-                "pancake_swap_v3"
+                "pancake_swap_v3",
+                "camelot_v3"
               ],
               "uniswap_v3": {
                 "fee_tiers": [
@@ -142,6 +151,17 @@
                     "fee_tier": 500,
                     "expected_address": "0x9ffca51d23ac7f7df82da414865ef1055e5afcc3",
                     "selection_enabled": true
+                  }
+                ]
+              },
+              "camelot_v3": {
+                "pools": [
+                  {
+                    "expected_address": "0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1",
+                    "selection_enabled": true,
+                    "required_active_incentive": "0x0000000000000000000000000000000000000000",
+                    "expected_tick_spacing": 10,
+                    "dynamic_fee_horizon_seconds": 2
                   }
                 ]
               }
@@ -681,6 +701,17 @@
   ],
   "pools": [
     {
+      "id": "eip155:42161:pool:CamelotV3 { address: 0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1 }",
+      "pair_id": "arbitrum-usdc-arb",
+      "network_id": "eip155:42161",
+      "protocol": "camelot_v3",
+      "canonical_identity": "CamelotV3 { address: 0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1 }",
+      "fee_pips": null,
+      "tick_spacing": 10,
+      "hooks": null,
+      "lifecycle": "execution_eligible"
+    },
+    {
       "id": "eip155:42161:pool:PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
       "pair_id": "arbitrum-usdc-arb",
       "network_id": "eip155:42161",
@@ -784,7 +815,7 @@
     {
       "id": "strategy:arbitrum-usdc-arb",
       "pair_id": "arbitrum-usdc-arb",
-      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v4-pancakeswap-v3-live",
+      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "network_id": "eip155:42161",
@@ -814,6 +845,7 @@
       "strategy_id": "strategy:arbitrum-usdc-arb",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "pool_ids": [
+        "eip155:42161:pool:CamelotV3 { address: 0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1 }",
         "eip155:42161:pool:PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
         "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }",
         "eip155:42161:pool:V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }"
@@ -898,6 +930,7 @@
       "owner_id": "owner:network:eip155:42161",
       "kind": "network_runtime",
       "owned_ids": [
+        "eip155:42161:pool:CamelotV3 { address: 0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1 }",
         "eip155:42161:pool:PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
         "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
         "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }",

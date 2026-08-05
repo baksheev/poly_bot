@@ -30,6 +30,18 @@ pub enum DexRoutePlan {
         pool_address: String,
         fee_pips: u32,
     },
+    CamelotV3 {
+        router: String,
+        pool_address: String,
+        pool_generation: u64,
+        fee_generation: u64,
+        fee_zto_current_pips: u16,
+        fee_otz_current_pips: u16,
+        fee_zto_envelope_pips: u16,
+        fee_otz_envelope_pips: u16,
+        fee_horizon_first_unix_seconds: u32,
+        fee_horizon_last_unix_seconds: u32,
+    },
     UniswapV4 {
         router: String,
         pool_id: String,
@@ -57,6 +69,8 @@ impl DexSwapPlan {
         pool: &HydratedPool,
         direction: ArbitrageDirection,
         trade: TradeEvaluation,
+        pool_generation: u64,
+        fee_generation: u64,
         deadline_unix_seconds: u64,
     ) -> anyhow::Result<Self> {
         ensure!(
@@ -94,6 +108,35 @@ impl DexSwapPlan {
                 pool_address: address.to_string(),
                 fee_pips,
             },
+            PoolIdentity::CamelotV3 { address } => {
+                ensure!(pool_generation > 0, "Camelot pool generation is zero");
+                ensure!(fee_generation > 0, "Camelot fee generation is zero");
+                let fee = pool
+                    .camelot_fee
+                    .as_ref()
+                    .context("Camelot fee state is unavailable for execution planning")?;
+                ensure!(
+                    deadline_unix_seconds >= u64::from(fee.envelope.first_timestamp)
+                        && deadline_unix_seconds <= u64::from(fee.envelope.last_timestamp),
+                    "Camelot deadline is outside the prepared fee horizon"
+                );
+                DexRoutePlan::CamelotV3 {
+                    router: required_address(
+                        "camelot_v3_router_address",
+                        pair.chain.camelot_v3_router_address.as_deref(),
+                    )?
+                    .to_string(),
+                    pool_address: address.to_string(),
+                    pool_generation,
+                    fee_generation,
+                    fee_zto_current_pips: fee.state.current_fees.zero_for_one,
+                    fee_otz_current_pips: fee.state.current_fees.one_for_zero,
+                    fee_zto_envelope_pips: fee.envelope.maximum.zero_for_one,
+                    fee_otz_envelope_pips: fee.envelope.maximum.one_for_zero,
+                    fee_horizon_first_unix_seconds: fee.envelope.first_timestamp,
+                    fee_horizon_last_unix_seconds: fee.envelope.last_timestamp,
+                }
+            }
             PoolIdentity::V4 { pool_id, fee_pips } => {
                 let key = configured_v4_key(pair, pool, pool_id)?;
                 ensure!(
@@ -158,6 +201,43 @@ impl DexSwapPlan {
                 parse_address("DEX plan Pancake V3 pool", pool_address)?;
                 ensure!(*fee_pips > 0, "DEX plan Pancake V3 fee is zero");
             }
+            DexRoutePlan::CamelotV3 {
+                router,
+                pool_address,
+                pool_generation,
+                fee_generation,
+                fee_zto_current_pips,
+                fee_otz_current_pips,
+                fee_zto_envelope_pips,
+                fee_otz_envelope_pips,
+                fee_horizon_first_unix_seconds,
+                fee_horizon_last_unix_seconds,
+            } => {
+                parse_address("DEX plan Camelot V3 router", router)?;
+                parse_address("DEX plan Camelot V3 pool", pool_address)?;
+                ensure!(
+                    *pool_generation > 0,
+                    "DEX plan Camelot pool generation is zero"
+                );
+                ensure!(
+                    *fee_generation > 0,
+                    "DEX plan Camelot fee generation is zero"
+                );
+                ensure!(
+                    fee_zto_envelope_pips >= fee_zto_current_pips
+                        && fee_otz_envelope_pips >= fee_otz_current_pips,
+                    "DEX plan Camelot envelope is below its current fee"
+                );
+                ensure!(
+                    fee_horizon_last_unix_seconds >= fee_horizon_first_unix_seconds,
+                    "DEX plan Camelot fee horizon is reversed"
+                );
+                ensure!(
+                    self.deadline_unix_seconds >= u64::from(*fee_horizon_first_unix_seconds)
+                        && self.deadline_unix_seconds <= u64::from(*fee_horizon_last_unix_seconds),
+                    "DEX plan Camelot deadline is outside its fee horizon"
+                );
+            }
             DexRoutePlan::UniswapV4 {
                 router,
                 pool_id,
@@ -214,6 +294,14 @@ impl DexSwapPlan {
                 router: parse_address("DEX plan Pancake V3 router", router)?,
                 pool: parse_address("DEX plan Pancake V3 pool", pool_address)?,
                 fee_pips: *fee_pips,
+            },
+            DexRoutePlan::CamelotV3 {
+                router,
+                pool_address,
+                ..
+            } => SwapRoute::CamelotV3 {
+                router: parse_address("DEX plan Camelot V3 router", router)?,
+                pool: parse_address("DEX plan Camelot V3 pool", pool_address)?,
             },
             DexRoutePlan::UniswapV4 {
                 router,
@@ -299,7 +387,9 @@ mod tests {
         execution::{SwapRoute, SwapSubmissionPolicy},
         pool_id::V4PoolKey,
     };
-    use crate::paired_benchmark::assert_paired_non_regression;
+    use crate::paired_benchmark::{
+        assert_named_paired_non_regression, assert_paired_non_regression,
+    };
 
     use super::{DexRoutePlan, DexSwapPlan};
 
@@ -351,6 +441,84 @@ mod tests {
             } if actual_router == router && actual_pool == pool
         ));
         assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
+    }
+
+    fn camelot_plan() -> DexSwapPlan {
+        DexSwapPlan {
+            route: DexRoutePlan::CamelotV3 {
+                router: Address::repeat_byte(0x11).to_string(),
+                pool_address: Address::repeat_byte(0x22).to_string(),
+                pool_generation: 7,
+                fee_generation: 6,
+                fee_zto_current_pips: 104,
+                fee_otz_current_pips: 105,
+                fee_zto_envelope_pips: 117,
+                fee_otz_envelope_pips: 118,
+                fee_horizon_first_unix_seconds: 1_900_000_000,
+                fee_horizon_last_unix_seconds: 1_900_000_002,
+            },
+            token_in: Address::repeat_byte(0x33).to_string(),
+            token_out: Address::repeat_byte(0x44).to_string(),
+            amount_in_base_units: 6_000_000,
+            amount_out_minimum_base_units: 5_000_000,
+            deadline_unix_seconds: 1_900_000_002,
+        }
+    }
+
+    #[test]
+    fn camelot_plan_binds_fee_horizon_and_provider_identity() {
+        let plan = camelot_plan();
+        let encoded = serde_json::to_value(&plan).unwrap();
+        assert_eq!(encoded["route"]["protocol"], "camelot_v3");
+        assert_eq!(encoded["route"]["fee_generation"], 6);
+        assert_eq!(encoded["route"]["fee_zto_envelope_pips"], 117);
+        assert_eq!(
+            encoded["route"]["fee_horizon_last_unix_seconds"],
+            1_900_000_002_u64
+        );
+
+        let request = plan.execution_request("rustarb-camelot-plan.dex").unwrap();
+        assert!(matches!(
+            request.route,
+            SwapRoute::CamelotV3 { router, pool }
+                if router == Address::repeat_byte(0x11)
+                    && pool == Address::repeat_byte(0x22)
+        ));
+        assert_eq!(request.deadline_unix_seconds, 1_900_000_002);
+
+        let mut outside_horizon = plan;
+        outside_horizon.deadline_unix_seconds = 1_900_000_003;
+        assert!(outside_horizon.validate().is_err());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Camelot/Uniswap durable-plan benchmark"]
+    fn benchmark_uniswap_and_camelot_v3_plan_materialization() {
+        let uniswap = DexSwapPlan {
+            route: DexRoutePlan::UniswapV3 {
+                router: Address::repeat_byte(0x11).to_string(),
+                pool_address: Address::repeat_byte(0x22).to_string(),
+                fee_pips: 500,
+            },
+            token_in: Address::repeat_byte(0x33).to_string(),
+            token_out: Address::repeat_byte(0x44).to_string(),
+            amount_in_base_units: 6_000_000,
+            amount_out_minimum_base_units: 5_000_000,
+            deadline_unix_seconds: 1_900_000_000,
+        };
+        let camelot = camelot_plan();
+        assert_named_paired_non_regression(
+            "camelot_v3_plan_materialization_benchmark",
+            1.10,
+            "uniswap_v3",
+            "camelot_v3",
+            || {
+                black_box(uniswap.execution_request("bench-uniswap")).unwrap();
+            },
+            || {
+                black_box(camelot.execution_request("bench-camelot")).unwrap();
+            },
+        );
     }
 
     #[test]

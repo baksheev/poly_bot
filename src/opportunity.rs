@@ -143,6 +143,11 @@ struct PreparedPoolQuotes {
     token_a_limit: U256,
     exact_output_token_b_limit: U256,
     exact_input_token_b_limit: U256,
+    /// Camelot's quoted fee is part of the prepared generation. Static-fee
+    /// providers keep this false and report fee generation zero.
+    dynamic_fee: bool,
+    fee_zero_for_one_pips: u32,
+    fee_one_for_zero_pips: u32,
 }
 
 /// Immutable, generation-tagged prepared curves shared by the single-owner
@@ -168,6 +173,9 @@ pub struct PreparedPoolRefresh {
     pub token_a_limit: U256,
     pub exact_output_token_b_limit: U256,
     pub exact_input_token_b_limit: U256,
+    pub fee_generation: u64,
+    pub fee_zero_for_one_pips: u32,
+    pub fee_one_for_zero_pips: u32,
     pub build_time_us: u128,
     pub pre_dispatch_time_us: Option<u128>,
     pub request_send_time_us: Option<u128>,
@@ -188,6 +196,7 @@ pub struct PreparedPoolBuildRequest {
     exact_output_zero_for_one: bool,
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
+    dynamic_fee: bool,
     estimated_build_segments: usize,
     previous_prepared: Option<PreparedCurveGenerationHandle>,
     timing: PreparedPoolBuildTimingHandle,
@@ -616,6 +625,7 @@ impl OpportunityEngine {
             exact_output_zero_for_one: hydrated.token0 == pair.token_a,
             exact_input_zero_for_one: hydrated.token0 == pair.token_b,
             token_a_limit: pair.prepared_token_a_limit,
+            dynamic_fee: hydrated.camelot_fee.is_some(),
             estimated_build_segments,
             previous_prepared,
             timing: PreparedPoolBuildTimingHandle::new(),
@@ -640,6 +650,13 @@ impl OpportunityEngine {
         let token_a_limit = result.prepared.token_a_limit;
         let exact_output_token_b_limit = result.prepared.exact_output_token_b_limit;
         let exact_input_token_b_limit = result.prepared.exact_input_token_b_limit;
+        let fee_generation = if result.prepared.dynamic_fee {
+            result.generation
+        } else {
+            0
+        };
+        let fee_zero_for_one_pips = result.prepared.fee_zero_for_one_pips;
+        let fee_one_for_zero_pips = result.prepared.fee_one_for_zero_pips;
         let build_time_us = result.build_time_us;
         let timing = result.timing.clone();
         self.prepared_pools[result.pool_index] = Some(PreparedCurveGenerationHandle::new(
@@ -659,6 +676,9 @@ impl OpportunityEngine {
             token_a_limit,
             exact_output_token_b_limit,
             exact_input_token_b_limit,
+            fee_generation,
+            fee_zero_for_one_pips,
+            fee_one_for_zero_pips,
             build_time_us,
             pre_dispatch_time_us: stages.pre_dispatch_time_us,
             request_send_time_us: stages.request_send_time_us,
@@ -700,6 +720,22 @@ impl OpportunityEngine {
                     prepared.generation
                 })
             })
+    }
+
+    /// Returns the dynamic-fee generation bound into the currently published
+    /// curves. Static-fee providers deliberately use generation zero.
+    pub fn pool_fee_generation(&self, pool_index: usize) -> anyhow::Result<u64> {
+        let prepared = self
+            .prepared_pools
+            .get(pool_index)
+            .context("fee-generation pool index is invalid")?
+            .as_ref()
+            .context("prepared DEX pool is unavailable for fee generation")?;
+        Ok(if prepared.quotes.dynamic_fee {
+            prepared.generation
+        } else {
+            0
+        })
     }
 
     pub fn exact_candidate_capacity(
@@ -774,6 +810,7 @@ impl PreparedPoolBuildRequest {
             self.exact_output_zero_for_one,
             self.exact_input_zero_for_one,
             self.token_a_limit,
+            self.dynamic_fee,
             self.generation,
             self.previous_prepared
                 .map(PreparedCurveGenerationHandle::into_quotes),
@@ -897,6 +934,7 @@ fn prepare_pool_quotes(
         exact_output_zero_for_one,
         exact_input_zero_for_one,
         pair.prepared_token_a_limit,
+        hydrated.camelot_fee.is_some(),
         generation,
         None,
     )
@@ -907,6 +945,7 @@ fn prepare_pool_quotes_from_pool(
     exact_output_zero_for_one: bool,
     exact_input_zero_for_one: bool,
     token_a_limit: U256,
+    dynamic_fee: bool,
     _generation: u64,
     previous: Option<PreparedPoolQuotes>,
 ) -> anyhow::Result<PreparedPoolQuotes> {
@@ -963,6 +1002,9 @@ fn prepare_pool_quotes_from_pool(
         token_a_limit,
         exact_output_token_b_limit,
         exact_input_token_b_limit,
+        dynamic_fee,
+        fee_zero_for_one_pips: pool.fee_pips_for_direction(true),
+        fee_one_for_zero_pips: pool.fee_pips_for_direction(false),
     })
 }
 
@@ -1416,7 +1458,9 @@ fn slippage_bps(pair: &PairRuntime, profit_bps: u16) -> anyhow::Result<u16> {
 fn trade_is_better(candidate: &TradeEvaluation, current: &TradeEvaluation) -> bool {
     candidate.gross_profit_bps_x100 > current.gross_profit_bps_x100
         || (candidate.gross_profit_bps_x100 == current.gross_profit_bps_x100
-            && candidate.token_b_amount > current.token_b_amount)
+            && (candidate.token_b_amount > current.token_b_amount
+                || (candidate.token_b_amount == current.token_b_amount
+                    && candidate.pool_index < current.pool_index)))
 }
 
 fn cex_token_a_amount(
@@ -1658,7 +1702,12 @@ pub fn format_base_units(amount: U256, decimals: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        str::FromStr,
+        sync::Arc,
+        time::Instant,
+    };
 
     use alloy_primitives::{Address, B256, U256, address};
     use rust_decimal::Decimal;
@@ -1667,8 +1716,11 @@ mod tests {
     use crate::{
         chain::rpc::CanonicalBlock,
         dex::{
+            camelot_fee::{
+                AdaptiveFeeConfiguration, DirectionalFees, FeeProjectionState, Timepoint,
+            },
             clmm::ClmmPool,
-            hydration::{HydratedDexState, HydratedPool, PoolIdentity},
+            hydration::{HydratedCamelotFee, HydratedDexState, HydratedPool, PoolIdentity},
             mirror::DexMirror,
         },
         state::TopOfBook,
@@ -1713,6 +1765,7 @@ mod tests {
                 token0: token_a,
                 token1: token_b,
                 pool,
+                camelot_fee: None,
             }],
             unavailable: vec![],
         })
@@ -1768,6 +1821,7 @@ mod tests {
                     token0,
                     token1,
                     pool: uniswap_pool,
+                    camelot_fee: None,
                 },
                 HydratedPool {
                     pair_id: "test-pair".into(),
@@ -1778,6 +1832,118 @@ mod tests {
                     token0,
                     token1,
                     pool: pancake_pool,
+                    camelot_fee: None,
+                },
+            ],
+            unavailable: vec![],
+        })
+        .unwrap();
+        (runtime, mirror)
+    }
+
+    fn mixed_v3_and_camelot_provider_fixture() -> (PairRuntime, DexMirror) {
+        let (mut runtime, uniswap_only) = fixture();
+        let base = uniswap_only.pool(0).unwrap();
+        let token0 = base.token0;
+        let token1 = base.token1;
+        let mut camelot_pool = ClmmPool::new_algebra_v1_9(
+            3_000,
+            3_000,
+            60,
+            get_sqrt_ratio_at_tick(0).unwrap(),
+            0,
+            1_000_000_000_000_000_000_000_000,
+        )
+        .unwrap();
+        let liquidity = 1_000_000_000_000_000_000_000_000_u128;
+        let liquidity_net = i128::try_from(liquidity).unwrap();
+        camelot_pool
+            .set_tick(-887_220, liquidity, liquidity_net)
+            .unwrap();
+        camelot_pool
+            .set_tick(887_220, liquidity, -liquidity_net)
+            .unwrap();
+        let config = AdaptiveFeeConfiguration {
+            alpha1: 0,
+            alpha2: 0,
+            beta1: 0,
+            beta2: 0,
+            gamma1: 1,
+            gamma2: 1,
+            volume_beta: 0,
+            volume_gamma: 1,
+            base_fee: 3_000,
+        };
+        let timepoint = Timepoint {
+            initialized: true,
+            block_timestamp: 1,
+            tick_cumulative: 0,
+            seconds_per_liquidity_cumulative: U256::ZERO,
+            volatility_cumulative: 0,
+            average_tick: 0,
+            volume_per_liquidity_cumulative: U256::ZERO,
+        };
+        let state = FeeProjectionState {
+            head_timestamp: 1,
+            latest_timepoint_timestamp: 1,
+            tick: 0,
+            liquidity,
+            index: 0,
+            oldest_index: 0,
+            current_fees: DirectionalFees {
+                zero_for_one: 3_000,
+                one_for_zero: 3_000,
+            },
+            volume_per_liquidity_in_block: 0,
+            zero_for_one_config: config,
+            one_for_zero_config: config,
+            timepoints: BTreeMap::from([(0, timepoint)]),
+        };
+        let envelope = state.envelope(2).unwrap();
+        runtime.pool_indices = vec![0, 1, 2];
+        runtime.selection_pool_indices = vec![0, 1, 2];
+        let mirror = DexMirror::new(HydratedDexState {
+            block: CanonicalBlock {
+                number: 1,
+                hash: hash(1),
+                parent_hash: hash(0),
+            },
+            pools: vec![
+                HydratedPool {
+                    pair_id: "test-pair".into(),
+                    identity: PoolIdentity::V3 {
+                        address: Address::from([3_u8; 20]),
+                        fee_pips: 3_000,
+                    },
+                    token0,
+                    token1,
+                    pool: base.pool.clone(),
+                    camelot_fee: None,
+                },
+                HydratedPool {
+                    pair_id: "test-pair".into(),
+                    identity: PoolIdentity::PancakeV3 {
+                        address: Address::from([4_u8; 20]),
+                        fee_pips: 3_000,
+                    },
+                    token0,
+                    token1,
+                    pool: base.pool.clone(),
+                    camelot_fee: None,
+                },
+                HydratedPool {
+                    pair_id: "test-pair".into(),
+                    identity: PoolIdentity::CamelotV3 {
+                        address: Address::from([5_u8; 20]),
+                    },
+                    token0,
+                    token1,
+                    pool: camelot_pool,
+                    camelot_fee: Some(HydratedCamelotFee {
+                        data_storage_operator: Address::from([6_u8; 20]),
+                        state,
+                        envelope,
+                    }),
                 },
             ],
             unavailable: vec![],
@@ -1801,6 +1967,27 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    fn engine_for_pair(pair: PairRuntime, dex: &DexMirror) -> OpportunityEngine {
+        let pool_count = dex.pool_count();
+        let mut prepared_pools = Vec::with_capacity(pool_count);
+        for pool_index in 0..pool_count {
+            let prepared = super::prepare_pool_quotes(&pair, dex, pool_index, 1).unwrap();
+            prepared_pools.push(Some(super::PreparedCurveGenerationHandle::new(
+                pool_index, 1, prepared,
+            )));
+        }
+        OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0); pool_count],
+            pool_generations: vec![1; pool_count],
+            prepared_pools,
+            baseline_quote_cache: (0..pool_count)
+                .map(|_| PoolBaselineQuoteCache::default())
+                .collect(),
+        }
     }
 
     #[test]
@@ -1888,6 +2075,45 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn mixed_uniswap_pancake_and_camelot_use_one_candidate_path_and_stable_ties() {
+        let (mut pair, dex) = mixed_v3_and_camelot_provider_fixture();
+        pair.selection_pool_indices = vec![2, 1, 0];
+        let mut engine = engine_for_pair(pair, &dex);
+        let book = quote("1.10", "100", "1.11", "100");
+        let aligned = engine.pair(0).unwrap().token_b_step() * U256::from(20_u8);
+
+        for direction in [
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+        ] {
+            let control = engine
+                .evaluate_exact_candidate(0, &book, direction, 0, aligned)
+                .unwrap();
+            for candidate_pool in [1, 2] {
+                let candidate = engine
+                    .evaluate_exact_candidate(0, &book, direction, candidate_pool, aligned)
+                    .unwrap();
+                assert_eq!(
+                    control.map(|trade| TradeEvaluation {
+                        pool_index: 0,
+                        ..trade
+                    }),
+                    candidate.map(|trade| TradeEvaluation {
+                        pool_index: 0,
+                        ..trade
+                    })
+                );
+            }
+        }
+
+        let evaluation = engine.evaluate(&book).unwrap().unwrap();
+        assert_eq!(evaluation.dex_buy_cex_sell.baseline.unwrap().pool_index, 0);
+        assert_eq!(engine.pool_fee_generation(0).unwrap(), 0);
+        assert_eq!(engine.pool_fee_generation(1).unwrap(), 0);
+        assert_eq!(engine.pool_fee_generation(2).unwrap(), 1);
     }
 
     #[test]

@@ -22,8 +22,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
 use crate::{
-    binance::order_plan::recovery_client_order_id, chain::logs::ChainLog,
-    dex::clmm::PreparedQuoteCurve, execution_plan::DexSwapPlan, state::TopOfBook,
+    binance::order_plan::recovery_client_order_id,
+    chain::logs::ChainLog,
+    dex::{clmm::PreparedQuoteCurve, events::CamelotFeeReceiptProof},
+    execution_plan::{DexRoutePlan, DexSwapPlan},
+    state::TopOfBook,
     telemetry::TelemetryHandle,
 };
 
@@ -367,6 +370,8 @@ pub struct LegResult {
     /// The durable coordinator journal deliberately excludes this acceleration
     /// hint; restart recovery falls back to normal WebSocket settlement.
     #[serde(skip)]
+    pub dex_settlement_fee: Option<CamelotFeeReceiptProof>,
+    #[serde(skip)]
     pub dex_settlement_log: Option<ChainLog>,
 }
 
@@ -393,8 +398,13 @@ impl LegResult {
             "third-asset valuation has no matching balance delta"
         );
         ensure!(
-            self.dex_settlement_log.is_none() || self.status == LegStatus::Filled,
+            (self.dex_settlement_fee.is_none() && self.dex_settlement_log.is_none())
+                || self.status == LegStatus::Filled,
             "only a filled leg may carry a DEX settlement log"
+        );
+        ensure!(
+            self.dex_settlement_fee.is_none() || self.dex_settlement_log.is_some(),
+            "DEX settlement Fee log has no matching Swap log"
         );
         Ok(())
     }
@@ -793,6 +803,9 @@ pub struct PaperOpportunity {
     pub direction: ArbitrageDirection,
     pub dex_pool_index: usize,
     pub dex_pool_generation: u64,
+    /// Generation of the directional fee projection embedded in the prepared
+    /// curves. Static-fee providers use zero.
+    pub dex_fee_generation: u64,
     pub token_b_base_units: i128,
     pub token_b_step_base_units: i128,
     pub cost_token_a_base_units: i128,
@@ -833,6 +846,26 @@ impl PaperOpportunity {
         );
         self.admission.validate()?;
         self.dex_plan.validate()?;
+        if let DexRoutePlan::CamelotV3 {
+            pool_generation,
+            fee_generation,
+            ..
+        } = &self.dex_plan.route
+        {
+            ensure!(
+                *pool_generation == self.dex_pool_generation,
+                "Camelot plan pool generation differs from opportunity"
+            );
+            ensure!(
+                *fee_generation == self.dex_fee_generation,
+                "Camelot plan fee generation differs from opportunity"
+            );
+        } else {
+            ensure!(
+                self.dex_fee_generation == 0,
+                "static-fee opportunity has a dynamic fee generation"
+            );
+        }
         Ok(())
     }
 
@@ -913,6 +946,7 @@ struct PreflightTransportState {
 #[derive(Clone, Debug)]
 struct PreflightDexPool {
     generation: u64,
+    fee_generation: u64,
     token_a_decimals: u8,
     token_b_decimals: u8,
     exact_input_by_direction: [PreparedQuoteCurve; 2],
@@ -1148,6 +1182,28 @@ impl EntryPreflightHandle {
         token_b_decimals: u8,
         exact_input_by_direction: [PreparedQuoteCurve; 2],
     ) {
+        self.update_dex_pool_with_fee_generation(
+            pair_id,
+            pool_index,
+            generation,
+            0,
+            token_a_decimals,
+            token_b_decimals,
+            exact_input_by_direction,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_dex_pool_with_fee_generation(
+        &self,
+        pair_id: &str,
+        pool_index: usize,
+        generation: u64,
+        fee_generation: u64,
+        token_a_decimals: u8,
+        token_b_decimals: u8,
+        exact_input_by_direction: [PreparedQuoteCurve; 2],
+    ) {
         let Ok(mut state) = self.inner.write() else {
             return;
         };
@@ -1155,6 +1211,7 @@ impl EntryPreflightHandle {
             (pair_id.to_owned(), pool_index),
             PreflightDexPool {
                 generation,
+                fee_generation,
                 token_a_decimals,
                 token_b_decimals,
                 exact_input_by_direction,
@@ -1228,9 +1285,23 @@ impl EntryPreflightHandle {
             ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
             ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
         };
+        if matches!(&opportunity.dex_plan.route, DexRoutePlan::CamelotV3 { .. }) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?
+                .as_secs();
+            if now > opportunity.dex_plan.deadline_unix_seconds {
+                return Ok(Some(EntryPreflightRejection {
+                    reason: "preflight_fee_horizon_expired",
+                    detail: "Camelot transaction deadline is outside the live fee horizon"
+                        .to_owned(),
+                }));
+            }
+        }
         if opportunity.admission.opportunity_threshold_met
             && relevant_binance_price == opportunity.admission.cex_primary_limit_price
             && pool.generation == opportunity.dex_pool_generation
+            && pool.fee_generation == opportunity.dex_fee_generation
         {
             return Ok(None);
         }
@@ -1288,6 +1359,17 @@ impl EntryPreflightHandle {
                 detail: format!(
                     "current proceeds {} and cost {} no longer satisfy {} bps",
                     proceeds_token_a, cost_token_a, threshold_bps
+                ),
+            }));
+        }
+        if matches!(&opportunity.dex_plan.route, DexRoutePlan::CamelotV3 { .. })
+            && pool.fee_generation != opportunity.dex_fee_generation
+        {
+            return Ok(Some(EntryPreflightRejection {
+                reason: "preflight_fee_generation_changed",
+                detail: format!(
+                    "Camelot fee generation advanced from {} to {}",
+                    opportunity.dex_fee_generation, pool.fee_generation
                 ),
             }));
         }
@@ -1383,6 +1465,7 @@ pub struct PaperTradeEvent {
     /// represented by freshly hydrated chain state from a missing live proof.
     pub resumed_after_restart: bool,
     pub dex_filled: bool,
+    pub dex_settlement_fee: Option<CamelotFeeReceiptProof>,
     pub dex_settlement_log: Option<ChainLog>,
     pub terminal_observed_at: Instant,
 }
@@ -1737,6 +1820,7 @@ impl PaperTradeTask {
                 state,
                 resumed_after_restart: false,
                 dex_filled,
+                dex_settlement_fee: None,
                 dex_settlement_log,
                 terminal_observed_at: Instant::now(),
             })
@@ -1812,6 +1896,7 @@ fn simulate_command(
                     third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 0,
                     venue_reference: format!("paper:dex:{}", intent.plan_id),
+                    dex_settlement_fee: None,
                     dex_settlement_log: None,
                 },
             ))
@@ -1870,6 +1955,7 @@ fn simulated_cex_result(
         third_asset_prices_token_a: BTreeMap::new(),
         gas_cost_token_a_base_units: 0,
         venue_reference: format!("paper:cex:{role}:{}", intent.plan_id),
+        dex_settlement_fee: None,
         dex_settlement_log: None,
     })
 }
@@ -3415,6 +3501,7 @@ mod tests {
             third_asset_prices_token_a: BTreeMap::new(),
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
+            dex_settlement_fee: None,
             dex_settlement_log: None,
         }
     }
@@ -3429,6 +3516,7 @@ mod tests {
             third_asset_prices_token_a: BTreeMap::new(),
             gas_cost_token_a_base_units: 0,
             venue_reference: reference.to_owned(),
+            dex_settlement_fee: None,
             dex_settlement_log: None,
         }
     }
@@ -4277,6 +4365,7 @@ mod tests {
                     third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 0,
                     venue_reference: "dex:unknown".to_owned(),
+                    dex_settlement_fee: None,
                     dex_settlement_log: None,
                 },
             )
@@ -4337,6 +4426,7 @@ mod tests {
                     third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 4,
                     venue_reference: "dex:0x1:reverted".to_owned(),
+                    dex_settlement_fee: None,
                     dex_settlement_log: None,
                 },
             )
@@ -4378,6 +4468,7 @@ mod tests {
                     third_asset_prices_token_a: BTreeMap::new(),
                     gas_cost_token_a_base_units: 0,
                     venue_reference: "dex:child-unknown".to_owned(),
+                    dex_settlement_fee: None,
                     dex_settlement_log: None,
                 },
             )

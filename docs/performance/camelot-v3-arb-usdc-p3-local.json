@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p3-local",
+  "captured_at_utc": "2026-08-05T17:29:00Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "measurement_scope": "working_tree_after_p3",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)"
+  },
+  "pinned_parity": {
+    "pool": "0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1",
+    "data_storage_operator": "0x2998a7232ce882fdc52c9c14a4b035bc18515f44",
+    "blocks": [
+      {
+        "number": 491383703,
+        "hash": "0xb74c400c8e68aeca18ece2ca02adf0aca8185f1e36a5c12a6dd2e7279cb2cc43",
+        "timestamp": 1785938977,
+        "fee_zto": 117,
+        "fee_otz": 117,
+        "projected_volatility_average": 9072,
+        "projected_volume_per_liquidity_average": 31,
+        "horizon_seconds": 2,
+        "envelope_fee_zto": 117,
+        "envelope_fee_otz": 117
+      },
+      {
+        "number": 491426734,
+        "hash": "0x2f474c93b25d6c52a6b3114ebccdde3d3ce010e5ccdac659922336289feeca41",
+        "fee_zto": 104,
+        "fee_otz": 104
+      }
+    ],
+    "identity": {
+      "same_block_factory_pool_by_pair": "pass",
+      "pool_deployer": "pass",
+      "pool_tokens_and_factory": "pass",
+      "router_and_quoter_factory": "pass",
+      "data_storage_operator": "pass",
+      "bytecode_factory_deployer_pool_router_quoter_operator_multicall": "pass",
+      "active_incentive_zero": "pass",
+      "liquidity_cooldown_zero": "pass",
+      "tick_spacing": 10
+    },
+    "hydration": {
+      "tick_table_profile": "raw_actual_tick_rows",
+      "tick_table_rows": 6932,
+      "multicall3_targets_per_call": 500,
+      "full_ring_overwrite_and_oldest_index_wrap": "pass",
+      "internal_volume_storage_slot": 3,
+      "packed_public_liquidity_cross_check": "pass",
+      "timepoint_window_brackets": "binary_search_at_canonical_block",
+      "partial_state_publication": false,
+      "uniswap_rpc_path_changed": false
+    },
+    "quoter": {
+      "exact_input_amounts_per_direction": 3,
+      "exact_output_amounts_per_direction": 3,
+      "scales_usdc": [6, 50, 200],
+      "amount_parity": "byte_exact",
+      "returned_directional_fee_parity": "byte_exact",
+      "fee_transition_amount_checks": 2,
+      "prepared_exact_input_boundaries_and_adjacent_units": "pass",
+      "prepared_exact_output_boundaries_and_adjacent_units": "pass"
+    },
+    "gate": "pass"
+  },
+  "camelot_vs_matched_uniswap_real_pool": {
+    "prepared_quote_zto": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.05,
+      "uniswap_p95_ns": 377.4732,
+      "uniswap_p99_ns": 426.0910,
+      "camelot_p95_ns": 371.3484,
+      "camelot_p99_ns": 372.4049,
+      "p95_ratio": 0.98377,
+      "p99_ratio": 0.87400,
+      "gate": "pass"
+    },
+    "prepared_quote_otz": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.05,
+      "uniswap_p95_ns": 210.9319,
+      "uniswap_p99_ns": 212.3238,
+      "camelot_p95_ns": 210.7746,
+      "camelot_p99_ns": 212.0399,
+      "p95_ratio": 0.99925,
+      "p99_ratio": 0.99866,
+      "gate": "pass"
+    },
+    "curve_build_zto": {
+      "rounds": 32,
+      "iterations_per_provider": 131072,
+      "maximum_ratio": 1.2,
+      "uniswap_p95_ns": 468.6992,
+      "uniswap_p99_ns": 471.5271,
+      "camelot_p95_ns": 427.5208,
+      "camelot_p99_ns": 433.0750,
+      "p95_ratio": 0.91214,
+      "p99_ratio": 0.91845,
+      "matched_segment_count": true,
+      "gate": "pass"
+    },
+    "curve_build_otz": {
+      "rounds": 32,
+      "iterations_per_provider": 131072,
+      "maximum_ratio": 1.2,
+      "uniswap_p95_ns": 316.1316,
+      "uniswap_p99_ns": 326.7822,
+      "camelot_p95_ns": 277.1404,
+      "camelot_p99_ns": 278.1677,
+      "p95_ratio": 0.87666,
+      "p99_ratio": 0.85123,
+      "matched_segment_count": true,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "fee_projection": {
+    "rounds": 32,
+    "iterations": 131072,
+    "timepoints_in_benchmark_state": 37,
+    "horizon_seconds": 2,
+    "maximum_p95_ns": 10000,
+    "maximum_p99_ns": 10000,
+    "contract_p99_hard_ns": 25000,
+    "p50_ns": 1750.7732,
+    "p95_ns": 2264.0686,
+    "p99_ns": 2501.4446,
+    "runs_outside_binance_frame_path": true,
+    "gate": "pass"
+  },
+  "synthetic_matched_controls": {
+    "prepared_quote": {
+      "maximum_ratio": 1.05,
+      "uniswap_p95_ns": 317.8161,
+      "uniswap_p99_ns": 317.9420,
+      "camelot_p95_ns": 317.6322,
+      "camelot_p99_ns": 317.8814,
+      "p95_ratio": 0.99942,
+      "p99_ratio": 0.99981,
+      "gate": "pass"
+    },
+    "normalized_curve_build": {
+      "maximum_ratio": 1.2,
+      "uniswap_p95_ns": 533.7727,
+      "uniswap_p99_ns": 536.4990,
+      "camelot_p95_ns": 542.4805,
+      "camelot_p99_ns": 545.0337,
+      "p95_ratio": 1.01631,
+      "p99_ratio": 1.01591,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "frozen_uniswap_controls": {
+    "maximum_p0_ratio": 1.05,
+    "event_decode_p95_ns": 8.9726,
+    "event_decode_p99_ns": 9.0267,
+    "receipt_proof_p95_ns": 55.6175,
+    "receipt_proof_p99_ns": 55.9665,
+    "plan_materialization_p95_ns": 75.9301,
+    "plan_materialization_p99_ns": 76.0298,
+    "calldata_build_p95_ns": 387.2355,
+    "calldata_build_p99_ns": 387.4041,
+    "maximum_observed_p0_ratio": 0.96720,
+    "gate": "pass"
+  },
+  "prepared_quote_ns_per_operation": {
+    "exact_in_zero_for_one": 358.8,
+    "exact_in_one_for_zero": 238.1,
+    "exact_out_zero_for_one": 242.2,
+    "exact_out_one_for_zero": 335.4,
+    "sparse_curve_build": 13095.4,
+    "sparse_curve_build_p0_ratio": 0.98218,
+    "gate": "pass"
+  },
+  "capacity_replay": {
+    "pair_count": 20,
+    "pool_count": 25,
+    "frames": 2000000,
+    "arbusdc_frames": 100000,
+    "decision_p95_ns": 42,
+    "decision_p99_ns": 84,
+    "decision_p99_previous_ratio": 1.0,
+    "pool_build_p95_ns": 12542,
+    "pool_build_p99_ns": 17666,
+    "pool_build_p99_previous_ratio": 0.93595,
+    "frames_per_second": 11160493,
+    "frames_per_second_previous_ratio": 0.96783,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "gate": "pass"
+  },
+  "quality_gate": {
+    "tests_passed": 565,
+    "tests_failed": 0,
+    "ignored_network_or_manual_benchmarks": 13,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "p3_gate": "pass"
+}

@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p0-local",
+  "captured_at_utc": "2026-08-05T16:07:36Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)"
+  },
+  "paired_provider_controls": {
+    "purpose": "freeze the pre-Camelot Uniswap V3 control and validate the provider-neutral report harness",
+    "test_filter": "benchmark_uniswap_and_pancake",
+    "rounds": 32,
+    "iterations_per_provider": 8388608,
+    "maximum_allowed_p95_ratio": 1.1,
+    "maximum_allowed_p99_ratio": 1.1,
+    "event_decode": {
+      "control": "uniswap_v3",
+      "candidate": "pancake_swap_v3",
+      "control_p50_ns": 8.7996,
+      "control_p95_ns": 9.9583,
+      "control_p99_ns": 10.2534,
+      "candidate_p50_ns": 9.3905,
+      "candidate_p95_ns": 10.5626,
+      "candidate_p99_ns": 10.7824,
+      "p95_ratio": 1.06068,
+      "p99_ratio": 1.05159,
+      "gate": "pass"
+    },
+    "receipt_proof": {
+      "control": "uniswap_v3",
+      "candidate": "pancake_swap_v3",
+      "control_p50_ns": 55.9227,
+      "control_p95_ns": 57.8159,
+      "control_p99_ns": 57.8643,
+      "candidate_p50_ns": 60.0541,
+      "candidate_p95_ns": 60.8931,
+      "candidate_p99_ns": 60.9943,
+      "p95_ratio": 1.05322,
+      "p99_ratio": 1.05409,
+      "gate": "pass"
+    },
+    "plan_materialization": {
+      "control": "uniswap_v3",
+      "candidate": "pancake_swap_v3",
+      "control_p50_ns": 78.08,
+      "control_p95_ns": 80.0853,
+      "control_p99_ns": 80.2118,
+      "candidate_p50_ns": 77.5975,
+      "candidate_p95_ns": 79.1632,
+      "candidate_p99_ns": 79.6045,
+      "p95_ratio": 0.98849,
+      "p99_ratio": 0.99243,
+      "gate": "pass"
+    },
+    "calldata_build": {
+      "control": "uniswap_v3",
+      "candidate": "pancake_swap_v3",
+      "control_p50_ns": 393.1948,
+      "control_p95_ns": 399.8435,
+      "control_p99_ns": 404.0422,
+      "candidate_p50_ns": 355.8699,
+      "candidate_p95_ns": 359.8987,
+      "candidate_p99_ns": 365.6467,
+      "p95_ratio": 0.9001,
+      "p99_ratio": 0.90497,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "prepared_quote_ns_per_operation": {
+    "exact_in_zero_for_one": 371.8,
+    "exact_in_one_for_zero": 245.7,
+    "exact_out_zero_for_one": 255.0,
+    "exact_out_one_for_zero": 348.9,
+    "sparse_curve_build": 13333.1
+  },
+  "capacity_replay": {
+    "pair_count": 20,
+    "pool_count": 25,
+    "frames": 2000000,
+    "arbusdc_frames": 100000,
+    "decision_p95_ns": 42,
+    "decision_p99_ns": 84,
+    "pool_build_p95_ns": 14458,
+    "pool_build_p99_ns": 20917,
+    "frames_per_second": 11388500,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "gate": "pass"
+  },
+  "p0_gate": "pass"
+}

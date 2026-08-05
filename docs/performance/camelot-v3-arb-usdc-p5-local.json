@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p5-local",
+  "captured_at_utc": "2026-08-05T18:52:57Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "measurement_scope": "working_tree_after_p5",
+  "profile": "release",
+  "opportunity_and_preflight": {
+    "normal_candidate_set_contains_uniswap_pancake_and_camelot": true,
+    "provider_tie_break_is_iteration_order_independent": true,
+    "dynamic_fee_generation_in_prepared_telemetry": true,
+    "dynamic_fee_generation_in_durable_opportunity_identity": true,
+    "fee_only_generation_change_forces_preflight_requote": true,
+    "static_provider_fee_generation": 0,
+    "gate": "pass"
+  },
+  "camelot_vs_uniswap_prepared": {
+    "quote": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.05,
+      "uniswap_p95_ns": 319.3262,
+      "uniswap_p99_ns": 364.4670,
+      "camelot_p95_ns": 317.8821,
+      "camelot_p99_ns": 317.8879,
+      "p95_ratio": 0.99548,
+      "p99_ratio": 0.87220,
+      "gate": "pass"
+    },
+    "normalized_curve_build": {
+      "rounds": 32,
+      "iterations_per_provider": 131072,
+      "maximum_ratio": 1.20,
+      "uniswap_p95_ns": 546.3154,
+      "uniswap_p99_ns": 546.5798,
+      "camelot_p95_ns": 533.0505,
+      "camelot_p99_ns": 536.9668,
+      "p95_ratio": 0.97572,
+      "p99_ratio": 0.98241,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "mixed_capacity_replay": {
+    "pair_count": 20,
+    "pool_count": 25,
+    "provider_pool_counts": {
+      "uniswap_v3": 23,
+      "pancakeswap_v3": 1,
+      "camelot_v3": 1
+    },
+    "arb_usdc_provider_order": ["uniswap_v3", "pancakeswap_v3", "camelot_v3"],
+    "frames": 2000000,
+    "decision_p95_ns": 42,
+    "decision_p99_ns": 83,
+    "decision_p99_p4_ratio": 1.0,
+    "decision_p99_hard_ns": 25000,
+    "frames_per_second": 12437601,
+    "pool_build_p95_ns": 42,
+    "pool_build_p99_ns": 17709,
+    "pool_build_cold_maximum_ns": 875958,
+    "cold_maximum_scope": "startup_only_immutable_algebra_word_boundary_cache_fill",
+    "steady_state_constructor_cache": "shared_arc_no_quote_or_event_lock",
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "gate": "pass"
+  },
+  "frozen_uniswap_controls": {
+    "maximum_p4_ratio": 1.05,
+    "event_decode_p95_ns": 8.7422,
+    "event_decode_p99_ns": 8.7659,
+    "receipt_proof_p95_ns": 53.0470,
+    "receipt_proof_p99_ns": 53.2284,
+    "plan_materialization_p95_ns": 76.5737,
+    "plan_materialization_p99_ns": 76.9925,
+    "calldata_isolated_repeat_p95_ns": 390.5807,
+    "calldata_isolated_repeat_p99_ns": 390.6428,
+    "calldata_p95_p4_ratio": 1.01153,
+    "calldata_p99_p4_ratio": 0.99349,
+    "rejected_busy_host_calldata_max_ns": 435.0317,
+    "busy_host_outlier_policy": "isolated_repeat_same_32_round_workload_no_gate_widening",
+    "gate": "pass"
+  },
+  "quality_gate": {
+    "scripts_quality": "pass",
+    "lib_tests_passed": 541,
+    "binary_tests_passed": 8,
+    "tests_failed": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "p5_gate": "pass"
+}

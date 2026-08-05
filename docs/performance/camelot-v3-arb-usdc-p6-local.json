@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p6-local",
+  "captured_at_utc": "2026-08-05T19:12:45Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "measurement_scope": "working_tree_after_p6",
+  "profile": "release",
+  "plan_and_executor": {
+    "durable_provider_router_pool_identity": true,
+    "pool_generation_bound": true,
+    "fee_generation_bound": true,
+    "directional_fee_envelope_bound": true,
+    "fee_horizon_and_deadline_bound": true,
+    "selector": "0xbc651188",
+    "tuple_words": 7,
+    "static_fee_word_present": false,
+    "provider_scoped_gas_fallback": 1000000,
+    "direct_erc20_allowance_model": true,
+    "new_camelot_broadcast_enabled": false,
+    "allowance_mutation_during_simulation": false,
+    "signing_during_simulation": false,
+    "broadcast_during_simulation": false,
+    "gate": "pass"
+  },
+  "pinned_read_only_simulation": {
+    "chain_id": 42161,
+    "block": 265700003,
+    "block_hash": "0x385c8fa17b7bd1d4c10aa1d6fc08d38ac44b72c926169d6aadf20e2d1aab7d8a",
+    "router": "0x1f721e2e82f6676fce4ea07a5958cf098d339e18",
+    "selector": "0xbc651188",
+    "source_transaction": "0xbfbc26038df4a05de8d82f99bb0da36e61ca450f47079efc6facb1f500a5f82b",
+    "result_bytes": 160,
+    "canonical_hash_pinned": true,
+    "eth_call_only": true,
+    "gate": "pass"
+  },
+  "camelot_vs_uniswap": {
+    "calldata_build": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.10,
+      "uniswap_p95_ns": 382.9700,
+      "uniswap_p99_ns": 383.2936,
+      "camelot_p95_ns": 357.9917,
+      "camelot_p99_ns": 358.7565,
+      "p95_ratio": 0.93478,
+      "p99_ratio": 0.93598,
+      "gate": "pass"
+    },
+    "plan_materialization": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.10,
+      "uniswap_p95_ns": 76.1660,
+      "uniswap_p99_ns": 76.2793,
+      "camelot_p95_ns": 77.2160,
+      "camelot_p99_ns": 77.8648,
+      "p95_ratio": 1.01379,
+      "p99_ratio": 1.02079,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "mixed_capacity_replay": {
+    "frames": 2000000,
+    "provider_pool_counts": {
+      "uniswap_v3": 23,
+      "pancakeswap_v3": 1,
+      "camelot_v3": 1
+    },
+    "decision_p95_ns": 83,
+    "decision_p99_ns": 84,
+    "decision_p99_hard_ns": 25000,
+    "frames_per_second": 11042029,
+    "pool_build_p99_ns": 17292,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass"
+  },
+  "frozen_uniswap_controls": {
+    "maximum_candidate_ratio": 1.10,
+    "event_decode_uniswap_p95_ns": 8.7290,
+    "event_decode_uniswap_p99_ns": 8.7531,
+    "receipt_proof_uniswap_p95_ns": 53.0880,
+    "receipt_proof_uniswap_p99_ns": 53.9215,
+    "plan_materialization_uniswap_p95_ns": 75.4647,
+    "plan_materialization_uniswap_p99_ns": 76.2424,
+    "calldata_uniswap_p95_ns": 399.5635,
+    "calldata_uniswap_p99_ns": 440.0735,
+    "all_existing_candidate_ratios_within_gate": true,
+    "gate": "pass"
+  },
+  "quality_gate": {
+    "scripts_quality": "pass",
+    "lib_tests_passed": 544,
+    "binary_tests_passed": 8,
+    "tests_failed": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "p6_gate": "pass"
+}

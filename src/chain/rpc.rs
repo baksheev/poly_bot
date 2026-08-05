@@ -268,6 +268,60 @@ impl JsonRpcClient {
         )
     }
 
+    pub async fn canonical_block_timestamp(&self, block: CanonicalBlock) -> anyhow::Result<u64> {
+        let value = self
+            .request(
+                "eth_getBlockByHash",
+                json!([format!("{:#x}", block.hash), false]),
+            )
+            .await?;
+        let wire: RpcBlock = serde_json::from_value(value)
+            .context("eth_getBlockByHash returned an invalid block")?;
+        ensure!(
+            parse_quantity_u64("block.number", &wire.number)? == block.number
+                && parse_b256("block.hash", &wire.hash)? == block.hash
+                && parse_b256("block.parentHash", &wire.parent_hash)? == block.parent_hash,
+            "canonical block timestamp response changed identity"
+        );
+        parse_quantity_u64(
+            "block.timestamp",
+            wire.timestamp
+                .as_deref()
+                .context("eth_getBlockByHash omitted block.timestamp")?,
+        )
+    }
+
+    pub async fn canonical_block_by_hash(
+        &self,
+        expected_number: u64,
+        expected_hash: B256,
+    ) -> anyhow::Result<(CanonicalBlock, u64)> {
+        let value = self
+            .request(
+                "eth_getBlockByHash",
+                json!([format!("{expected_hash:#x}"), false]),
+            )
+            .await?;
+        let wire: RpcBlock = serde_json::from_value(value)
+            .context("eth_getBlockByHash returned an invalid block")?;
+        let block = CanonicalBlock {
+            number: parse_quantity_u64("block.number", &wire.number)?,
+            hash: parse_b256("block.hash", &wire.hash)?,
+            parent_hash: parse_b256("block.parentHash", &wire.parent_hash)?,
+        };
+        ensure!(
+            block.number == expected_number && block.hash == expected_hash,
+            "canonical block response differs from log identity"
+        );
+        let timestamp = parse_quantity_u64(
+            "block.timestamp",
+            wire.timestamp
+                .as_deref()
+                .context("eth_getBlockByHash omitted block.timestamp")?,
+        )?;
+        Ok((block, timestamp))
+    }
+
     pub async fn chain_id(&self) -> anyhow::Result<u64> {
         let value = self.request("eth_chainId", json!([])).await?;
         parse_quantity_value_u64("eth_chainId", value)
@@ -312,6 +366,26 @@ impl JsonRpcClient {
         parse_data_hex("eth_getCode result", encoded)
     }
 
+    pub async fn storage_at(
+        &self,
+        address: Address,
+        slot: U256,
+        block: CanonicalBlock,
+    ) -> anyhow::Result<U256> {
+        ensure!(address != Address::ZERO, "eth_getStorageAt address is zero");
+        let value = self
+            .request(
+                "eth_getStorageAt",
+                json!([
+                    format!("{address:#x}"),
+                    format!("{slot:#x}"),
+                    block.eip1898()
+                ]),
+            )
+            .await?;
+        parse_quantity_value_u256("eth_getStorageAt", value)
+    }
+
     pub async fn pending_nonce(&self, address: Address) -> anyhow::Result<u64> {
         self.nonce(address, "pending").await
     }
@@ -348,11 +422,39 @@ impl JsonRpcClient {
         parse_data_hex("eth_call transaction result", encoded)
     }
 
+    pub async fn simulate_transaction_at(
+        &self,
+        transaction: &TransactionCall,
+        block: CanonicalBlock,
+    ) -> anyhow::Result<Vec<u8>> {
+        let value = self
+            .request("eth_call", json!([transaction.json(), block.eip1898()]))
+            .await?;
+        let encoded = value
+            .as_str()
+            .context("block-pinned eth_call transaction result is not a hex string")?;
+        parse_data_hex("block-pinned eth_call transaction result", encoded)
+    }
+
     pub async fn estimate_gas(&self, transaction: &TransactionCall) -> anyhow::Result<u64> {
         let value = self
             .request("eth_estimateGas", json!([transaction.json(), "pending"]))
             .await?;
         parse_quantity_value_u64("eth_estimateGas", value)
+    }
+
+    pub async fn estimate_gas_at(
+        &self,
+        transaction: &TransactionCall,
+        block: CanonicalBlock,
+    ) -> anyhow::Result<u64> {
+        let value = self
+            .request(
+                "eth_estimateGas",
+                json!([transaction.json(), block.eip1898()]),
+            )
+            .await?;
+        parse_quantity_value_u64("block-pinned eth_estimateGas", value)
     }
 
     pub async fn send_raw_transaction(&self, raw: &[u8]) -> anyhow::Result<B256> {

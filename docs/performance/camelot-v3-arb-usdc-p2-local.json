@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p2-local",
+  "captured_at_utc": "2026-08-05T16:31:51Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "measurement_scope": "working_tree_after_p2",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)"
+  },
+  "correctness": {
+    "deployed_source_profile": "Camelot Algebra V1.9 directional-fee pool",
+    "official_price_movement_golden_vector": "byte_exact",
+    "tick_table_profile": "raw_actual_tick_rows",
+    "tick_row_width": 256,
+    "directional_fee_width": "uint16",
+    "prepared_exact_input_matches_iterative_both_directions": true,
+    "prepared_exact_output_matches_iterative_both_directions": true,
+    "adjacent_base_unit_and_boundary_fixtures": "pass",
+    "production_source_changed": false,
+    "gate": "pass"
+  },
+  "camelot_vs_uniswap": {
+    "prepared_quote": {
+      "rounds": 32,
+      "iterations_per_provider": 8388608,
+      "maximum_ratio": 1.05,
+      "uniswap_p50_ns": 315.8549,
+      "uniswap_p95_ns": 321.4685,
+      "uniswap_p99_ns": 364.3436,
+      "camelot_p50_ns": 316.1583,
+      "camelot_p95_ns": 317.6997,
+      "camelot_p99_ns": 318.3398,
+      "p95_ratio": 0.98828,
+      "p99_ratio": 0.87374,
+      "gate": "pass"
+    },
+    "normalized_curve_build": {
+      "rounds": 32,
+      "iterations_per_provider": 131072,
+      "maximum_ratio": 1.2,
+      "uniswap_p50_ns": 515.6758,
+      "uniswap_p95_ns": 535.0342,
+      "uniswap_p99_ns": 538.0554,
+      "camelot_p50_ns": 511.1389,
+      "camelot_p95_ns": 530.9753,
+      "camelot_p99_ns": 538.8997,
+      "p95_ratio": 0.99241,
+      "p99_ratio": 1.00157,
+      "matched_segment_count": true,
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "frozen_uniswap_controls": {
+    "maximum_p0_ratio": 1.05,
+    "event_decode_p95_ns": 9.0804,
+    "event_decode_p99_ns": 9.0925,
+    "receipt_proof_p95_ns": 55.5393,
+    "receipt_proof_p99_ns": 55.7981,
+    "plan_materialization_p95_ns": 75.6445,
+    "plan_materialization_p99_ns": 75.7769,
+    "calldata_build_p95_ns": 378.6743,
+    "calldata_build_p99_ns": 380.5502,
+    "maximum_observed_p0_ratio": 0.96429,
+    "gate": "pass"
+  },
+  "prepared_quote_ns_per_operation": {
+    "exact_in_zero_for_one": 360.3,
+    "exact_in_one_for_zero": 235.6,
+    "exact_out_zero_for_one": 243.7,
+    "exact_out_one_for_zero": 337.0,
+    "sparse_curve_build": 13056.6,
+    "maximum_observed_p0_ratio": 0.97926,
+    "gate": "pass"
+  },
+  "capacity_replay": {
+    "pair_count": 20,
+    "pool_count": 25,
+    "frames": 2000000,
+    "arbusdc_frames": 100000,
+    "decision_p95_ns": 42,
+    "decision_p99_ns": 84,
+    "decision_p99_p0_ratio": 1.0,
+    "pool_build_p95_ns": 12708,
+    "pool_build_p99_ns": 18875,
+    "pool_build_p99_p0_ratio": 0.90214,
+    "frames_per_second": 11531401,
+    "frames_per_second_p0_ratio": 1.01255,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "gate": "pass"
+  },
+  "quality_gate": {
+    "tests_passed": 559,
+    "tests_failed": 0,
+    "ignored_network_or_manual_benchmarks": 11,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "p2_gate": "pass"
+}

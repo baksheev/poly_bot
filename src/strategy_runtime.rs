@@ -659,11 +659,26 @@ impl ShadowStrategyEvaluator {
     ) -> anyhow::Result<StrategyEvaluation> {
         let mut changed = false;
         match event {
-            DexStreamEvent::Log { log, received_at } => {
-                if let LogApplyResult::Applied { pool_index, kind } = self.mirror.apply_log(&log)? {
-                    let request = self
-                        .opportunities
-                        .request_pool_refresh(pool_index, &self.mirror)?;
+            DexStreamEvent::Log {
+                log,
+                block_timestamp,
+                received_at,
+            } => {
+                if let LogApplyResult::Applied {
+                    pool_index,
+                    kind,
+                    refresh_required,
+                } = self.mirror.apply_log_at_timestamp(&log, block_timestamp)?
+                {
+                    let request = if refresh_required {
+                        self.mirror.refresh_pool_for_publication(pool_index)?;
+                        Some(
+                            self.opportunities
+                                .request_pool_refresh(pool_index, &self.mirror)?,
+                        )
+                    } else {
+                        None
+                    };
                     if emit_hot_path_latency {
                         self.hot_telemetry.emit_dex_pool_event(
                             pool_index,
@@ -672,27 +687,50 @@ impl ShadowStrategyEvaluator {
                             log.transaction_index,
                             log.log_index,
                             received_at.elapsed().as_micros(),
-                            request.generation(),
+                            request.as_ref().map_or(
+                                self.opportunities.pool_generation(pool_index)?,
+                                crate::opportunity::PreparedPoolBuildRequest::generation,
+                            ),
                         );
                     }
-                    let timing = request.timing_handle();
-                    timing.mark_request_dispatch_started();
-                    timing.mark_request_dispatch_finished();
+                    if let Some(request) = request {
+                        let timing = request.timing_handle();
+                        timing.mark_request_dispatch_started();
+                        timing.mark_request_dispatch_finished();
+                        let result = request.build()?;
+                        let result_timing = result.timing_handle();
+                        result_timing.mark_result_send_started();
+                        result_timing.mark_result_send_finished();
+                        result.mark_owner_received();
+                        if let Some(prepared) = self.opportunities.finish_pool_refresh(result)? {
+                            self.hot_telemetry.emit_dex_pool_prepared(prepared);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            DexStreamEvent::Head {
+                head,
+                timestamp,
+                received_at,
+            } => {
+                let applied = self
+                    .mirror
+                    .apply_head_at(head, Some(timestamp), received_at)?;
+                if applied.advanced && emit_hot_path_latency {
+                    self.hot_telemetry
+                        .emit_dex_head(head.number, received_at.elapsed().as_micros());
+                }
+                if let Some(pool_index) = applied.refresh_pool_index {
+                    let request = self
+                        .opportunities
+                        .request_pool_refresh(pool_index, &self.mirror)?;
                     let result = request.build()?;
-                    let result_timing = result.timing_handle();
-                    result_timing.mark_result_send_started();
-                    result_timing.mark_result_send_finished();
                     result.mark_owner_received();
                     if let Some(prepared) = self.opportunities.finish_pool_refresh(result)? {
                         self.hot_telemetry.emit_dex_pool_prepared(prepared);
                         changed = true;
                     }
-                }
-            }
-            DexStreamEvent::Head { head, received_at } => {
-                if self.mirror.apply_head(head, received_at)? && emit_hot_path_latency {
-                    self.hot_telemetry
-                        .emit_dex_head(head.number, received_at.elapsed().as_micros());
                 }
             }
         }

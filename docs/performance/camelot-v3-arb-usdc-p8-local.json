@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "artifact_id": "camelot-v3-arb-usdc-p8-local",
+  "captured_at_utc": "2026-08-05T20:24:00Z",
+  "base_revision": "8dec701a8aa61dcf86c7b4c37757b35010e36501",
+  "measurement_scope": "working_tree_direct_full_live_pre_rollout",
+  "production_domain": {
+    "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live",
+    "pair_id": "arbitrum-usdc-arb",
+    "live_trading_enabled": true,
+    "execution_enabled": true,
+    "full_live": true,
+    "provider": "camelot_v3",
+    "pool": "0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1",
+    "lifecycle": "execution_eligible",
+    "detector_notional_usdc": 6,
+    "gross_spread_gate_bps": 20,
+    "adaptive_cap_usdc": 200,
+    "canary": false,
+    "gate": "pass"
+  },
+  "allowance_and_authority": {
+    "owner": "single_shared_arbitrum_evm_execution_owner",
+    "spender": "0x1f721e2e82f6676fce4ea07a5958cf098d339e18",
+    "tokens": [
+      "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "0x912ce59144191c1204e64559fe8253a0e49e6548"
+    ],
+    "amount": "max_uint256",
+    "allowance_mutations_locked_before_submission_gate": true,
+    "camelot_broadcast_enabled_only_after_lock": true,
+    "second_nonce_owner": false,
+    "gate": "pass"
+  },
+  "local_camelot_vs_uniswap": {
+    "prepared_quote_p99_ratio": 0.99914,
+    "prepared_curve_build_p99_ratio": 0.98847,
+    "calldata_p99_ratio": 0.85214,
+    "plan_p99_ratio": 0.97805,
+    "receipt_accounting_and_proof_p99_ratio": 1.02542,
+    "event_decode_apply_p99_ratio": 1.07095,
+    "receipt_to_lane_release_p99_ratio": 0.75781,
+    "gate_widened": false,
+    "gate": "pass"
+  },
+  "exact_image_target_c4_gate": {
+    "wired_before_rollout": true,
+    "comparison_scope": "same_tick_domain_price_liquidity_fee_curve_bounds_and_bidirectional_work",
+    "prepared_quote_maximum_ratio_bps": 10500,
+    "prepared_curve_build_maximum_ratio_bps": 12000,
+    "local_release_precheck_quote_p99_ratio_bps": 9982,
+    "local_release_precheck_curve_build_p99_ratio_bps": 9657,
+    "target_cpu_class": "c4-highcpu-8",
+    "gate": "pass_pending_exact_image_ci_execution"
+  },
+  "mixed_capacity_replay": {
+    "frames": 2000000,
+    "decision_p95_ns": 83,
+    "decision_p99_ns": 84,
+    "frames_per_second": 11147249,
+    "pool_build_p99_ns": 20500,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass"
+  },
+  "pinned_network_proof": {
+    "quoter_parity": "pass",
+    "router_eth_call": "pass",
+    "historical_route_eth_call": "pass",
+    "historical_route_estimated_gas": 753956,
+    "canonical_fee_swap_transition": "byte_exact",
+    "signing": false,
+    "broadcast": false,
+    "allowance_mutation": false,
+    "account_mutation": false,
+    "gate": "pass"
+  },
+  "rollback": {
+    "gce_owner_status": "TERMINATED",
+    "previous_ready_replicas": 1,
+    "previous_image": "asia-southeast1-docker.pkg.dev/poly-bot-502515/poly-bot/poly-bot@sha256:01290d8001126f3aa357f03a25419c8bd07b943c6c0a78b3fc6c396efa8d158a",
+    "inventory_migration_required": false,
+    "second_owner_required": false,
+    "gate": "pass"
+  },
+  "quality_gate": {
+    "scripts_quality": "pass",
+    "lib_tests_passed": 547,
+    "binary_tests_passed": 8,
+    "tests_failed": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "p8_pre_rollout_gate": "pass"
+}

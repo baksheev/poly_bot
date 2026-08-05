@@ -29,4 +29,5 @@ pub mod telemetry;
 pub mod wallet;
 
 #[cfg(test)]
+#[doc(hidden)]
 pub(crate) mod paired_benchmark;

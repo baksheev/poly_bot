@@ -24,7 +24,7 @@ use crate::{
     },
     config::AppConfig,
     dex::{
-        events::{PoolUpdate, decode_pool_event},
+        events::{PoolLocator, PoolUpdate, decode_pool_event, decode_pool_event_for_locator},
         mirror::{DexMirror, LogApplyResult},
     },
     domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
@@ -594,14 +594,17 @@ impl TradingEngine {
             let curves = opportunities
                 .preflight_exact_input_curves(pool_index)?
                 .context("initial prepared DEX pool is unavailable for preflight")?;
-            execution.entry_preflight.update_dex_pool(
-                &pool.pair_id,
-                pool_index,
-                opportunities.pool_generation(pool_index)?,
-                pair.token_a.decimals,
-                pair.token_b.decimals,
-                curves,
-            );
+            execution
+                .entry_preflight
+                .update_dex_pool_with_fee_generation(
+                    &pool.pair_id,
+                    pool_index,
+                    opportunities.pool_generation(pool_index)?,
+                    opportunities.pool_fee_generation(pool_index)?,
+                    pair.token_a.decimals,
+                    pair.token_b.decimals,
+                    curves,
+                );
         }
         for pair in domain_config
             .snapshot()
@@ -700,6 +703,7 @@ impl TradingEngine {
                         DexProvider::UniswapV3 => "uniswap_v3",
                         DexProvider::UniswapV4 => "uniswap_v4",
                         DexProvider::PancakeSwapV3 => "pancakeswap_v3",
+                        DexProvider::CamelotV3 => "camelot_v3",
                     },
                     "fee_pips": pool.fee_pips,
                     "address": pool.address.map(|address| format!("{address:?}")),
@@ -909,11 +913,26 @@ impl TradingEngine {
         emit_hot_path_latency: bool,
     ) -> anyhow::Result<Option<PreparedPoolBuildRequest>> {
         let request = match event {
-            DexStreamEvent::Log { log, received_at } => {
-                if let LogApplyResult::Applied { pool_index, kind } = self.dex.apply_log(&log)? {
-                    let request = self
-                        .opportunities
-                        .request_pool_refresh(pool_index, &self.dex)?;
+            DexStreamEvent::Log {
+                log,
+                block_timestamp,
+                received_at,
+            } => {
+                if let LogApplyResult::Applied {
+                    pool_index,
+                    kind,
+                    refresh_required,
+                } = self.dex.apply_log_at_timestamp(&log, block_timestamp)?
+                {
+                    let request = if refresh_required {
+                        self.dex.refresh_pool_for_publication(pool_index)?;
+                        Some(
+                            self.opportunities
+                                .request_pool_refresh(pool_index, &self.dex)?,
+                        )
+                    } else {
+                        None
+                    };
                     if emit_hot_path_latency {
                         self.hot_telemetry.emit_dex_pool_event(
                             pool_index,
@@ -922,16 +941,24 @@ impl TradingEngine {
                             log.transaction_index,
                             log.log_index,
                             received_at.elapsed().as_micros(),
-                            request.generation(),
+                            request.as_ref().map_or(
+                                self.opportunities.pool_generation(pool_index)?,
+                                PreparedPoolBuildRequest::generation,
+                            ),
                         );
                     }
-                    Some(request)
+                    request
                 } else {
                     None
                 }
             }
-            DexStreamEvent::Head { head, received_at } => {
-                if self.dex.apply_head(head, received_at)? && emit_hot_path_latency {
+            DexStreamEvent::Head {
+                head,
+                timestamp,
+                received_at,
+            } => {
+                let applied = self.dex.apply_head_at(head, Some(timestamp), received_at)?;
+                if applied.advanced && emit_hot_path_latency {
                     self.hot_telemetry
                         .emit_dex_head(head.number, received_at.elapsed().as_micros());
                 }
@@ -945,7 +972,13 @@ impl TradingEngine {
                         .as_str(),
                     self.dex.latest_head_received_at(),
                 );
-                None
+                applied
+                    .refresh_pool_index
+                    .map(|pool_index| {
+                        self.opportunities
+                            .request_pool_refresh(pool_index, &self.dex)
+                    })
+                    .transpose()?
             }
         };
         self.refresh_phase(Instant::now());
@@ -971,10 +1004,11 @@ impl TradingEngine {
             .iter()
             .find(|pair| pair.id == pool.pair_id)
             .with_context(|| format!("DEX pool {} has no domain pair", pool.pair_id))?;
-        self.entry_preflight.update_dex_pool(
+        self.entry_preflight.update_dex_pool_with_fee_generation(
             &pool.pair_id,
             pool_index,
             self.opportunities.pool_generation(pool_index)?,
+            self.opportunities.pool_fee_generation(pool_index)?,
             pair.token_a.decimals,
             pair.token_b.decimals,
             self.opportunities
@@ -3239,15 +3273,22 @@ impl TradingEngine {
         )?;
         let liquidity_source = "dex_curve_only";
         let dex_pool_generation = self.opportunities.pool_generation(trade.pool_index)?;
+        let dex_fee_generation = self.opportunities.pool_fee_generation(trade.pool_index)?;
         let token_a_symbol = pair_config.token_a.symbol.clone();
         let token_b_symbol = pair_config.token_b.symbol.clone();
-        let deadline_unix_seconds =
-            admission_deadline_unix_seconds(quote.received_unix_us, quote.received_at.elapsed())?;
+        let selected_pool = self.dex.pool(trade.pool_index)?;
+        let deadline_unix_seconds = if let Some(fee) = selected_pool.camelot_fee.as_ref() {
+            u64::from(fee.envelope.last_timestamp)
+        } else {
+            admission_deadline_unix_seconds(quote.received_unix_us, quote.received_at.elapsed())?
+        };
         let dex_plan = DexSwapPlan::build(
             pair_config,
-            self.dex.pool(trade.pool_index)?,
+            selected_pool,
             direction,
             trade,
+            dex_pool_generation,
+            dex_fee_generation,
             deadline_unix_seconds,
         )?;
         let mut opportunity = PaperOpportunity {
@@ -3260,6 +3301,7 @@ impl TradingEngine {
             direction,
             dex_pool_index: trade.pool_index,
             dex_pool_generation,
+            dex_fee_generation,
             token_b_base_units: u256_to_i128(trade.token_b_amount, "paper token-B amount")?,
             token_b_step_base_units: u256_to_i128(token_b_step, "paper token-B step")?,
             cost_token_a_base_units: u256_to_i128(trade.cost_token_a, "paper token-A cost")?,
@@ -3673,12 +3715,6 @@ impl TradingEngine {
             return Ok(None);
         };
         ensure!(!target.removed, "receipt settlement Swap event is removed");
-        let decoded = decode_pool_event(target)?
-            .context("receipt settlement log is not a recognized pool event")?;
-        ensure!(
-            matches!(decoded.update, PoolUpdate::Swap { .. }),
-            "receipt settlement log is not a Swap event"
-        );
         let freshness = self.arbitrage_plan_freshness.get(&event.plan_id);
         ensure!(
             freshness.is_some() || event.resumed_after_restart,
@@ -3688,6 +3724,17 @@ impl TradingEngine {
             .map(|freshness| freshness.pair_id.clone())
             .unwrap_or_else(|| event.pair_id.clone());
         let admission_generation = freshness.map(|freshness| freshness.pool_generation);
+        let is_camelot = self.dex.is_camelot_address(target.address);
+        let decoded = if is_camelot {
+            decode_pool_event_for_locator(target, PoolLocator::CamelotV3(target.address))?
+        } else {
+            decode_pool_event(target)?
+        }
+        .context("receipt settlement log is not a recognized pool event")?;
+        ensure!(
+            matches!(decoded.update, PoolUpdate::Swap { .. }),
+            "receipt settlement log is not a Swap event"
+        );
         let pool_index = self
             .dex
             .pool_index(decoded.locator)
@@ -3698,15 +3745,100 @@ impl TradingEngine {
                 "settlement proof pool differs from the admitted pool"
             );
         }
-        match self.dex.apply_log(target)? {
+        if target.block_number <= self.dex.backfilled_through() {
+            self.telemetry.emit(
+                "arbitrage_receipt_settlement_already_applied",
+                json!({
+                    "engine_id": self.config.engine_id,
+                    "pair_id": pair_id,
+                    "plan_id": event.plan_id,
+                    "pool_index": pool_index,
+                    "admission_generation": admission_generation,
+                    "resumed_without_freshness": freshness.is_none(),
+                    "block_number": target.block_number,
+                    "transaction_index": target.transaction_index,
+                    "log_index": target.log_index,
+                    "source": "startup_backfill_before_receipt",
+                }),
+            );
+            return Ok(None);
+        }
+        let block_timestamp = if is_camelot {
+            let Some(fee) = event.dex_settlement_fee.as_ref() else {
+                self.telemetry.emit(
+                    "arbitrage_receipt_settlement_unavailable",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "pair_id": pair_id,
+                        "plan_id": event.plan_id,
+                        "pool_index": pool_index,
+                        "reason": "camelot_receipt_fee_missing",
+                    }),
+                );
+                return Ok(None);
+            };
+            ensure!(
+                fee.pool == target.address
+                    && fee.block_number == target.block_number
+                    && fee.block_hash == target.block_hash
+                    && fee.transaction_index == target.transaction_index
+                    && fee.log_index < target.log_index,
+                "Camelot receipt Fee is not positionally before Swap"
+            );
+            let Some(timestamp) = self.dex.canonical_timestamp_for_log(target) else {
+                self.telemetry.emit(
+                    "arbitrage_receipt_settlement_unavailable",
+                    json!({
+                        "engine_id": self.config.engine_id,
+                        "pair_id": pair_id,
+                        "plan_id": event.plan_id,
+                        "pool_index": pool_index,
+                        "reason": "canonical_block_timestamp_missing",
+                    }),
+                );
+                return Ok(None);
+            };
+            match self.dex.apply_camelot_fee_receipt(*fee, timestamp)? {
+                LogApplyResult::Applied {
+                    pool_index: applied_pool_index,
+                    kind: "fee",
+                    refresh_required: false,
+                } => ensure!(
+                    applied_pool_index == pool_index,
+                    "receipt settlement Fee applied another pool"
+                ),
+                LogApplyResult::Duplicate => {}
+                LogApplyResult::Applied { .. } => {
+                    anyhow::bail!("Camelot receipt Fee produced an invalid apply result")
+                }
+                LogApplyResult::Unknown => {
+                    anyhow::bail!("Camelot receipt Fee targets an unknown pool")
+                }
+            }
+            Some(timestamp)
+        } else {
+            ensure!(
+                event.dex_settlement_fee.is_none(),
+                "static-fee receipt unexpectedly carries a Camelot Fee"
+            );
+            None
+        };
+        let apply = if let Some(timestamp) = block_timestamp {
+            self.dex.apply_log_at_timestamp(target, timestamp)?
+        } else {
+            self.dex.apply_log(target)?
+        };
+        match apply {
             LogApplyResult::Applied {
                 pool_index: applied_pool_index,
                 kind,
+                ..
             } => {
                 ensure!(
                     applied_pool_index == pool_index,
                     "receipt settlement applied another pool"
                 );
+                self.dex.refresh_pool_for_publication(pool_index)?;
                 let refresh = self
                     .opportunities
                     .request_pool_refresh(pool_index, &self.dex)?;
@@ -3724,6 +3856,7 @@ impl TradingEngine {
                         "block_number": target.block_number,
                         "transaction_index": target.transaction_index,
                         "log_index": target.log_index,
+                        "fee_log_index": event.dex_settlement_fee.as_ref().map(|fee| fee.log_index),
                         "source": "transaction_receipt",
                     }),
                 );

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 use alloy_primitives::B256;
 use anyhow::{Context, anyhow, bail, ensure};
@@ -17,10 +20,12 @@ use crate::chain::{
 pub enum DexStreamEvent {
     Log {
         log: ChainLog,
+        block_timestamp: u32,
         received_at: Instant,
     },
     Head {
         head: CanonicalBlock,
+        timestamp: u32,
         received_at: Instant,
     },
 }
@@ -112,7 +117,7 @@ pub async fn connect_dex_stream(
     }
 
     let (sender, receiver) = mpsc::channel(channel_capacity);
-    let task = tokio::spawn(run_stream(socket, subscriptions, sender));
+    let task = tokio::spawn(run_stream(socket, subscriptions, sender, channel_capacity));
     Ok(AlchemyDexStream { receiver, task })
 }
 
@@ -154,20 +159,22 @@ async fn run_stream<S>(
     mut socket: WebSocketStream<S>,
     subscriptions: HashMap<String, SubscriptionKind>,
     sender: mpsc::Sender<DexStreamEvent>,
+    channel_capacity: usize,
 ) -> anyhow::Result<()>
 where
     WebSocketStream<S>: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Unpin,
 {
+    let mut canonical = CanonicalEventBuffer::new(channel_capacity);
     while let Some(message) = socket.next().await {
         let message = message.map_err(|_| anyhow!("Alchemy WSS stream failed"))?;
         match message {
             Message::Text(payload) => {
-                forward_notification(payload.as_bytes(), &subscriptions, &sender)?;
+                forward_notification(payload.as_bytes(), &subscriptions, &sender, &mut canonical)?;
             }
             Message::Binary(payload) => {
-                forward_notification(payload.as_ref(), &subscriptions, &sender)?;
+                forward_notification(payload.as_ref(), &subscriptions, &sender, &mut canonical)?;
             }
             Message::Ping(payload) => socket
                 .send(Message::Pong(payload))
@@ -185,6 +192,7 @@ fn forward_notification(
     payload: &[u8],
     subscriptions: &HashMap<String, SubscriptionKind>,
     sender: &mpsc::Sender<DexStreamEvent>,
+    canonical: &mut CanonicalEventBuffer,
 ) -> anyhow::Result<()> {
     let received_at = Instant::now();
     let notification: WireNotification =
@@ -196,28 +204,112 @@ fn forward_notification(
     let kind = subscriptions
         .get(&notification.params.subscription)
         .context("notification for unknown Alchemy subscription")?;
-    let event = match kind {
+    match kind {
         SubscriptionKind::Logs => {
             let wire: WireChainLog = serde_json::from_value(notification.params.result)
                 .context("invalid Alchemy log notification")?;
-            DexStreamEvent::Log {
-                log: wire.try_into()?,
-                received_at,
-            }
+            canonical.accept_log(wire.try_into()?, received_at, sender)
         }
         SubscriptionKind::NewHeads => {
             let wire: WireHead = serde_json::from_value(notification.params.result)
                 .context("invalid Alchemy newHeads notification")?;
+            let (head, timestamp) = wire.try_into()?;
+            canonical.accept_head(head, timestamp, received_at, sender)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalEventBuffer {
+    heads: VecDeque<(B256, u64, u32)>,
+    pending_logs: HashMap<B256, Vec<(ChainLog, Instant)>>,
+    pending_count: usize,
+    maximum_pending: usize,
+}
+
+impl CanonicalEventBuffer {
+    fn new(maximum_pending: usize) -> Self {
+        Self {
+            heads: VecDeque::with_capacity(128),
+            pending_logs: HashMap::new(),
+            pending_count: 0,
+            maximum_pending,
+        }
+    }
+
+    fn accept_log(
+        &mut self,
+        log: ChainLog,
+        received_at: Instant,
+        sender: &mpsc::Sender<DexStreamEvent>,
+    ) -> anyhow::Result<()> {
+        if let Some((_, _, timestamp)) = self
+            .heads
+            .iter()
+            .find(|(hash, _, _)| *hash == log.block_hash)
+        {
+            return send_event(
+                sender,
+                DexStreamEvent::Log {
+                    log,
+                    block_timestamp: *timestamp,
+                    received_at,
+                },
+            );
+        }
+        ensure!(
+            self.pending_count < self.maximum_pending,
+            "canonical DEX log buffer is full"
+        );
+        self.pending_logs
+            .entry(log.block_hash)
+            .or_default()
+            .push((log, received_at));
+        self.pending_count += 1;
+        Ok(())
+    }
+
+    fn accept_head(
+        &mut self,
+        head: CanonicalBlock,
+        timestamp: u32,
+        received_at: Instant,
+        sender: &mpsc::Sender<DexStreamEvent>,
+    ) -> anyhow::Result<()> {
+        send_event(
+            sender,
             DexStreamEvent::Head {
-                head: wire.try_into()?,
+                head,
+                timestamp,
                 received_at,
+            },
+        )?;
+        self.heads.push_back((head.hash, head.number, timestamp));
+        while self.heads.len() > 128 {
+            self.heads.pop_front();
+        }
+        if let Some(mut logs) = self.pending_logs.remove(&head.hash) {
+            self.pending_count -= logs.len();
+            logs.sort_unstable_by_key(|(log, _)| log.position());
+            for (log, received_at) in logs {
+                send_event(
+                    sender,
+                    DexStreamEvent::Log {
+                        log,
+                        block_timestamp: timestamp,
+                        received_at,
+                    },
+                )?;
             }
         }
-    };
+        Ok(())
+    }
+}
+
+fn send_event(sender: &mpsc::Sender<DexStreamEvent>, event: DexStreamEvent) -> anyhow::Result<()> {
     sender
         .try_send(event)
-        .map_err(|error| anyhow!("critical DEX event channel unavailable: {error}"))?;
-    Ok(())
+        .map_err(|error| anyhow!("critical DEX event channel unavailable: {error}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,20 +330,25 @@ struct WireHead {
     number: String,
     hash: String,
     parent_hash: String,
+    timestamp: String,
 }
 
-impl TryFrom<WireHead> for CanonicalBlock {
+impl TryFrom<WireHead> for (CanonicalBlock, u32) {
     type Error = anyhow::Error;
 
     fn try_from(value: WireHead) -> Result<Self, Self::Error> {
-        Ok(Self {
-            number: parse_quantity("head.number", &value.number)?,
-            hash: value.hash.parse::<B256>().context("invalid head hash")?,
-            parent_hash: value
-                .parent_hash
-                .parse::<B256>()
-                .context("invalid head parentHash")?,
-        })
+        Ok((
+            CanonicalBlock {
+                number: parse_quantity("head.number", &value.number)?,
+                hash: value.hash.parse::<B256>().context("invalid head hash")?,
+                parent_hash: value
+                    .parent_hash
+                    .parse::<B256>()
+                    .context("invalid head parentHash")?,
+            },
+            u32::try_from(parse_quantity("head.timestamp", &value.timestamp)?)
+                .context("head timestamp exceeds uint32")?,
+        ))
     }
 }
 
@@ -261,22 +358,59 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{DexStreamEvent, SubscriptionKind, forward_notification};
+    use super::{CanonicalEventBuffer, DexStreamEvent, SubscriptionKind, forward_notification};
 
     #[test]
     fn parses_new_head_notification() {
         let mut subscriptions = HashMap::new();
         subscriptions.insert("heads".into(), SubscriptionKind::NewHeads);
         let (sender, mut receiver) = mpsc::channel(1);
+        let mut canonical = CanonicalEventBuffer::new(1);
         forward_notification(
-            br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"heads","result":{"number":"0xa","hash":"0x000000000000000000000000000000000000000000000000000000000000000a","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000009"}}}"#,
+            br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"heads","result":{"number":"0xa","hash":"0x000000000000000000000000000000000000000000000000000000000000000a","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000009","timestamp":"0x64"}}}"#,
             &subscriptions,
             &sender,
+            &mut canonical,
         )
         .unwrap();
         match receiver.try_recv().unwrap() {
             DexStreamEvent::Head { head, .. } => assert_eq!(head.number, 10),
             DexStreamEvent::Log { .. } => panic!("expected head"),
         }
+    }
+
+    #[test]
+    fn buffers_log_until_its_head_and_emits_canonical_timestamp_first() {
+        let mut subscriptions = HashMap::new();
+        subscriptions.insert("logs".into(), SubscriptionKind::Logs);
+        subscriptions.insert("heads".into(), SubscriptionKind::NewHeads);
+        let (sender, mut receiver) = mpsc::channel(4);
+        let mut canonical = CanonicalEventBuffer::new(4);
+        forward_notification(
+            br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"logs","result":{"address":"0x0000000000000000000000000000000000000001","topics":["0x0000000000000000000000000000000000000000000000000000000000000002"],"data":"0x","blockNumber":"0xa","blockHash":"0x000000000000000000000000000000000000000000000000000000000000000a","transactionIndex":"0x1","logIndex":"0x2","removed":false}}}"#,
+            &subscriptions,
+            &sender,
+            &mut canonical,
+        )
+        .unwrap();
+        assert!(receiver.try_recv().is_err());
+        forward_notification(
+            br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"heads","result":{"number":"0xa","hash":"0x000000000000000000000000000000000000000000000000000000000000000a","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000009","timestamp":"0x64"}}}"#,
+            &subscriptions,
+            &sender,
+            &mut canonical,
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            DexStreamEvent::Head { timestamp: 100, .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            DexStreamEvent::Log {
+                block_timestamp: 100,
+                ..
+            }
+        ));
     }
 }

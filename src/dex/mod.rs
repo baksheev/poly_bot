@@ -1,4 +1,5 @@
 pub mod calldata;
+pub mod camelot_fee;
 pub mod clmm;
 pub mod events;
 pub mod execution;

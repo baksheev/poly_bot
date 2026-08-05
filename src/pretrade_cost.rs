@@ -10,6 +10,7 @@ pub const GAS_PRICE_HISTORY_DEPTH: usize = 8;
 pub const NATIVE_CONVERSION_HISTORY_DEPTH: usize = 32;
 pub const RECEIPT_HISTORY_DEPTH: usize = 4;
 const MAX_RECEIPT_ROUTES: usize = 16;
+const DEX_PROTOCOL_COUNT: usize = 4;
 
 /// Diagnostic-only inputs for the pre-trade cost model. The trading owner
 /// never reads this state: producers publish into it and the background hot
@@ -25,6 +26,7 @@ pub enum DexProtocol {
     UniswapV3,
     UniswapV4,
     PancakeSwapV3,
+    CamelotV3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +34,7 @@ pub enum DexPoolCostKey {
     UniswapV3(Address),
     UniswapV4(B256),
     PancakeSwapV3(Address),
+    CamelotV3(Address),
 }
 
 impl DexPoolCostKey {
@@ -40,6 +43,7 @@ impl DexPoolCostKey {
             Self::UniswapV3(_) => DexProtocol::UniswapV3,
             Self::UniswapV4(_) => DexProtocol::UniswapV4,
             Self::PancakeSwapV3(_) => DexProtocol::PancakeSwapV3,
+            Self::CamelotV3(_) => DexProtocol::CamelotV3,
         }
     }
 
@@ -48,6 +52,7 @@ impl DexPoolCostKey {
             Self::UniswapV3(address) => format!("uniswap_v3:{address:#x}"),
             Self::UniswapV4(pool_id) => format!("uniswap_v4:{pool_id:#x}"),
             Self::PancakeSwapV3(address) => format!("pancakeswap_v3:{address:#x}"),
+            Self::CamelotV3(address) => format!("camelot_v3:{address:#x}"),
         }
     }
 }
@@ -79,6 +84,7 @@ impl DexProtocol {
             Self::UniswapV3 => "uniswap_v3",
             Self::UniswapV4 => "uniswap_v4",
             Self::PancakeSwapV3 => "pancakeswap_v3",
+            Self::CamelotV3 => "camelot_v3",
         }
     }
 
@@ -87,6 +93,7 @@ impl DexProtocol {
             Self::UniswapV3 => 0,
             Self::UniswapV4 => 1,
             Self::PancakeSwapV3 => 2,
+            Self::CamelotV3 => 3,
         }
     }
 }
@@ -208,7 +215,8 @@ pub struct PreTradeCostSnapshot {
     gas_prices: TemporalHistory<GasPriceTelemetrySample, GAS_PRICE_HISTORY_DEPTH>,
     native_conversions:
         TemporalHistory<NativeConversionTelemetrySample, NATIVE_CONVERSION_HISTORY_DEPTH>,
-    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 3],
+    protocol_receipts:
+        [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; DEX_PROTOCOL_COUNT],
     route_receipts: [Option<RouteReceiptHistory>; MAX_RECEIPT_ROUTES],
 }
 
@@ -217,7 +225,8 @@ struct PreTradeCostInputs {
     gas_prices: TemporalHistory<GasPriceTelemetrySample, GAS_PRICE_HISTORY_DEPTH>,
     native_conversions:
         TemporalHistory<NativeConversionTelemetrySample, NATIVE_CONVERSION_HISTORY_DEPTH>,
-    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 3],
+    protocol_receipts:
+        [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; DEX_PROTOCOL_COUNT],
     route_receipts: [Option<RouteReceiptHistory>; MAX_RECEIPT_ROUTES],
 }
 
@@ -457,6 +466,18 @@ mod tests {
         NATIVE_CONVERSION_HISTORY_DEPTH, PreTradeCostTelemetry, ReceiptCostMatchScope,
         ReceiptCostTelemetrySource,
     };
+
+    #[test]
+    fn camelot_cost_identity_never_aliases_uniswap() {
+        let address = Address::from([0x42; 20]);
+        let camelot = DexPoolCostKey::CamelotV3(address);
+        let uniswap = DexPoolCostKey::UniswapV3(address);
+
+        assert_ne!(camelot, uniswap);
+        assert_eq!(camelot.protocol(), DexProtocol::CamelotV3);
+        assert_eq!(camelot.label(), format!("camelot_v3:{address:#x}"));
+        assert_eq!(DexProtocol::CamelotV3.label(), "camelot_v3");
+    }
 
     #[test]
     fn snapshot_keeps_protocol_receipts_separate() {
