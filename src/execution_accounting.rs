@@ -210,7 +210,7 @@ mod tests {
     use crate::{
         arbitrage::{ArbitrageDirection, LegStatus},
         binance::ws_api::{OrderFill, OrderResult},
-        dex::execution::{SwapExecutionOutcome, UniswapProtocol},
+        dex::execution::{DexProtocol, SwapExecutionOutcome},
     };
 
     use super::{
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn dex_receipt_delta_maps_both_directions() {
         let outcome = SwapExecutionOutcome {
-            protocol: UniswapProtocol::V3,
+            protocol: DexProtocol::UniswapV3,
             transaction_hash: B256::repeat_byte(1),
             block_number: 10,
             gas_used: 100,

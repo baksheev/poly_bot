@@ -55,7 +55,14 @@ pub(crate) fn decode_v3_core_head(outputs: &[Vec<u8>]) -> anyhow::Result<Decoded
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolIdentity {
     V3 { address: Address, fee_pips: u32 },
+    PancakeV3 { address: Address, fee_pips: u32 },
     V4 { pool_id: B256, fee_pips: u32 },
+}
+
+#[derive(Clone, Copy)]
+struct V3PoolTarget {
+    fee_pips: u32,
+    expected_address: Option<Address>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +158,17 @@ impl<'client> DexHydrator<'client> {
                     .await
                     .with_context(|| format!("failed to hydrate V3 pair {}", pair.id))?;
             }
+            if pair
+                .dex
+                .allowed_providers
+                .contains(&DexProvider::PancakeSwapV3)
+            {
+                self.hydrate_pancake_v3(pair, block, &mut pools, &mut unavailable)
+                    .await
+                    .with_context(|| {
+                        format!("failed to hydrate PancakeSwap V3 pair {}", pair.id)
+                    })?;
+            }
             if pair.dex.allowed_providers.contains(&DexProvider::UniswapV4) {
                 self.hydrate_v4(pair, block, &mut pools, &mut unavailable)
                     .await
@@ -173,9 +191,6 @@ impl<'client> DexHydrator<'client> {
         pools: &mut Vec<HydratedPool>,
         unavailable: &mut Vec<UnavailablePool>,
     ) -> anyhow::Result<()> {
-        let token_a = parse_address("token_a", &pair.token_a.contract)?;
-        let token_b = parse_address("token_b", &pair.token_b.contract)?;
-        let (token0, token1) = sort_tokens(token_a, token_b);
         let factory = parse_address(
             "uniswap_v3_factory_address",
             pair.chain
@@ -184,32 +199,173 @@ impl<'client> DexHydrator<'client> {
                 .context("missing V3 factory")?,
         )?;
         let config = pair.dex.uniswap_v3.as_ref().context("missing V3 config")?;
-
-        let discovery_calls: Vec<_> = config
+        let targets: Vec<_> = config
             .fee_tiers
             .iter()
-            .map(|fee| EthCall {
+            .copied()
+            .map(|fee_pips| V3PoolTarget {
+                fee_pips,
+                expected_address: None,
+            })
+            .collect();
+        self.hydrate_v3_targets(
+            pair,
+            block,
+            DexProvider::UniswapV3,
+            factory,
+            &targets,
+            pools,
+            unavailable,
+        )
+        .await
+    }
+
+    async fn hydrate_pancake_v3(
+        &self,
+        pair: &PairConfig,
+        block: CanonicalBlock,
+        pools: &mut Vec<HydratedPool>,
+        unavailable: &mut Vec<UnavailablePool>,
+    ) -> anyhow::Result<()> {
+        let factory = parse_address(
+            "pancakeswap_v3_factory_address",
+            pair.chain
+                .pancakeswap_v3_factory_address
+                .as_deref()
+                .context("missing PancakeSwap V3 factory")?,
+        )?;
+        let config = pair
+            .dex
+            .pancakeswap_v3
+            .as_ref()
+            .context("missing PancakeSwap V3 config")?;
+        let targets: Vec<_> = config
+            .pools
+            .iter()
+            .map(|pool| {
+                Ok(V3PoolTarget {
+                    fee_pips: pool.fee_tier,
+                    expected_address: Some(parse_address(
+                        "PancakeSwap V3 expected pool",
+                        &pool.expected_address,
+                    )?),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        self.hydrate_v3_targets(
+            pair,
+            block,
+            DexProvider::PancakeSwapV3,
+            factory,
+            &targets,
+            pools,
+            unavailable,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hydrate_v3_targets(
+        &self,
+        pair: &PairConfig,
+        block: CanonicalBlock,
+        protocol: DexProvider,
+        factory: Address,
+        targets: &[V3PoolTarget],
+        pools: &mut Vec<HydratedPool>,
+        unavailable: &mut Vec<UnavailablePool>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            matches!(
+                protocol,
+                DexProvider::UniswapV3 | DexProvider::PancakeSwapV3
+            ),
+            "non-V3 provider entered V3 hydration"
+        );
+        let token_a = parse_address("token_a", &pair.token_a.contract)?;
+        let token_b = parse_address("token_b", &pair.token_b.contract)?;
+        let (token0, token1) = sort_tokens(token_a, token_b);
+
+        let discovery_calls: Vec<_> = targets
+            .iter()
+            .map(|target| EthCall {
                 to: factory,
                 data: encode_call(
                     "getPool(address,address,uint24)",
-                    &[word_address(token0), word_address(token1), word_u32(*fee)],
+                    &[
+                        word_address(token0),
+                        word_address(token1),
+                        word_u32(target.fee_pips),
+                    ],
                 ),
             })
             .collect();
         let discovery = self.read_batch(&discovery_calls, block).await?;
 
-        for (fee_pips, output) in config.fee_tiers.iter().copied().zip(discovery) {
+        for (target, output) in targets.iter().copied().zip(discovery) {
+            let fee_pips = target.fee_pips;
             let address = decode_address(&output, 0)?;
             if address.is_zero() {
                 unavailable.push(UnavailablePool {
                     pair_id: pair.id.clone(),
-                    protocol: DexProvider::UniswapV3,
+                    protocol,
                     fee_pips,
                     address: None,
                     pool_id: None,
                     reason: UnavailableReason::NotCreated,
                 });
                 continue;
+            }
+            if let Some(expected_address) = target.expected_address {
+                ensure!(
+                    address == expected_address,
+                    "PancakeSwap V3 factory result differs from expected pool address"
+                );
+                let identity = self
+                    .read_batch(
+                        &[
+                            EthCall {
+                                to: address,
+                                data: encode_call("token0()", &[]),
+                            },
+                            EthCall {
+                                to: address,
+                                data: encode_call("token1()", &[]),
+                            },
+                            EthCall {
+                                to: address,
+                                data: encode_call("fee()", &[]),
+                            },
+                            EthCall {
+                                to: address,
+                                data: encode_call("factory()", &[]),
+                            },
+                        ],
+                        block,
+                    )
+                    .await?;
+                ensure!(identity.len() == 4, "partial PancakeSwap V3 identity batch");
+                ensure!(
+                    decode_address(&identity[0], 0)? == token0
+                        && decode_address(&identity[1], 0)? == token1,
+                    "PancakeSwap V3 pool tokens differ from configured pair"
+                );
+                ensure!(
+                    decode_u24(&identity[2], 0)? == fee_pips,
+                    "PancakeSwap V3 pool fee differs from configured fee"
+                );
+                ensure!(
+                    decode_address(&identity[3], 0)? == factory,
+                    "PancakeSwap V3 pool factory differs from configured factory"
+                );
+                ensure!(
+                    !self
+                        .rpc()
+                        .contract_code_at(address, block)
+                        .await?
+                        .is_empty(),
+                    "PancakeSwap V3 pool has no bytecode at pinned block"
+                );
             }
 
             let head = self
@@ -236,7 +392,7 @@ impl<'client> DexHydrator<'client> {
             if sqrt_price_x96.is_zero() {
                 unavailable.push(UnavailablePool {
                     pair_id: pair.id.clone(),
-                    protocol: DexProvider::UniswapV3,
+                    protocol,
                     fee_pips,
                     address: Some(address),
                     pool_id: None,
@@ -249,7 +405,7 @@ impl<'client> DexHydrator<'client> {
             if liquidity == 0 {
                 unavailable.push(UnavailablePool {
                     pair_id: pair.id.clone(),
-                    protocol: DexProvider::UniswapV3,
+                    protocol,
                     fee_pips,
                     address: Some(address),
                     pool_id: None,
@@ -265,7 +421,11 @@ impl<'client> DexHydrator<'client> {
             install_ticks(&mut pool, ticks)?;
             pools.push(HydratedPool {
                 pair_id: pair.id.clone(),
-                identity: PoolIdentity::V3 { address, fee_pips },
+                identity: match protocol {
+                    DexProvider::UniswapV3 => PoolIdentity::V3 { address, fee_pips },
+                    DexProvider::PancakeSwapV3 => PoolIdentity::PancakeV3 { address, fee_pips },
+                    _ => unreachable!("validated V3 provider"),
+                },
                 token0,
                 token1,
                 pool,

@@ -25,6 +25,11 @@ pub enum DexRoutePlan {
         pool_address: String,
         fee_pips: u32,
     },
+    PancakeSwapV3 {
+        router: String,
+        pool_address: String,
+        fee_pips: u32,
+    },
     UniswapV4 {
         router: String,
         pool_id: String,
@@ -75,6 +80,15 @@ impl DexSwapPlan {
                 router: required_address(
                     "uniswap_v3_router_address",
                     pair.chain.uniswap_v3_router_address.as_deref(),
+                )?
+                .to_string(),
+                pool_address: address.to_string(),
+                fee_pips,
+            },
+            PoolIdentity::PancakeV3 { address, fee_pips } => DexRoutePlan::PancakeSwapV3 {
+                router: required_address(
+                    "pancakeswap_v3_router_address",
+                    pair.chain.pancakeswap_v3_router_address.as_deref(),
                 )?
                 .to_string(),
                 pool_address: address.to_string(),
@@ -135,6 +149,15 @@ impl DexSwapPlan {
                 parse_address("DEX plan V3 pool", pool_address)?;
                 ensure!(*fee_pips > 0, "DEX plan V3 fee is zero");
             }
+            DexRoutePlan::PancakeSwapV3 {
+                router,
+                pool_address,
+                fee_pips,
+            } => {
+                parse_address("DEX plan Pancake V3 router", router)?;
+                parse_address("DEX plan Pancake V3 pool", pool_address)?;
+                ensure!(*fee_pips > 0, "DEX plan Pancake V3 fee is zero");
+            }
             DexRoutePlan::UniswapV4 {
                 router,
                 pool_id,
@@ -178,9 +201,18 @@ impl DexSwapPlan {
                 router,
                 pool_address,
                 fee_pips,
-            } => SwapRoute::V3 {
+            } => SwapRoute::UniswapV3 {
                 router: parse_address("DEX plan V3 router", router)?,
                 pool: parse_address("DEX plan V3 pool", pool_address)?,
+                fee_pips: *fee_pips,
+            },
+            DexRoutePlan::PancakeSwapV3 {
+                router,
+                pool_address,
+                fee_pips,
+            } => SwapRoute::PancakeSwapV3 {
+                router: parse_address("DEX plan Pancake V3 router", router)?,
+                pool: parse_address("DEX plan Pancake V3 pool", pool_address)?,
                 fee_pips: *fee_pips,
             },
             DexRoutePlan::UniswapV4 {
@@ -259,12 +291,15 @@ fn parse_hooks_address(name: &str, value: &str) -> anyhow::Result<Address> {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+
     use alloy_primitives::{Address, U256};
 
     use crate::dex::{
         execution::{SwapRoute, SwapSubmissionPolicy},
         pool_id::V4PoolKey,
     };
+    use crate::paired_benchmark::assert_paired_non_regression;
 
     use super::{DexRoutePlan, DexSwapPlan};
 
@@ -287,6 +322,68 @@ mod tests {
         assert_eq!(request.amount_in, U256::from(10_000_000_u64));
         assert_eq!(request.amount_out_minimum, U256::from(9_000_000_u64));
         assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
+    }
+
+    #[test]
+    fn pancake_v3_plan_round_trips_without_crossing_provider_identity() {
+        let router = Address::repeat_byte(0x11);
+        let pool = Address::repeat_byte(0x22);
+        let plan = DexSwapPlan {
+            route: DexRoutePlan::PancakeSwapV3 {
+                router: router.to_string(),
+                pool_address: pool.to_string(),
+                fee_pips: 500,
+            },
+            token_in: Address::repeat_byte(0x33).to_string(),
+            token_out: Address::repeat_byte(0x44).to_string(),
+            amount_in_base_units: 6_000_000,
+            amount_out_minimum_base_units: 5_000_000,
+            deadline_unix_seconds: 1_900_000_000,
+        };
+
+        let request = plan.execution_request("rustarb-pancake-plan.dex").unwrap();
+        assert!(matches!(
+            request.route,
+            SwapRoute::PancakeSwapV3 {
+                router: actual_router,
+                pool: actual_pool,
+                fee_pips: 500,
+            } if actual_router == router && actual_pool == pool
+        ));
+        assert_eq!(request.submission_policy, SwapSubmissionPolicy::Immediate);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired V3 durable-plan benchmark"]
+    fn benchmark_uniswap_and_pancake_v3_plan_materialization() {
+        let common = |route| DexSwapPlan {
+            route,
+            token_in: Address::repeat_byte(0x33).to_string(),
+            token_out: Address::repeat_byte(0x44).to_string(),
+            amount_in_base_units: 6_000_000,
+            amount_out_minimum_base_units: 5_000_000,
+            deadline_unix_seconds: 1_900_000_000,
+        };
+        let uniswap = common(DexRoutePlan::UniswapV3 {
+            router: Address::repeat_byte(0x11).to_string(),
+            pool_address: Address::repeat_byte(0x22).to_string(),
+            fee_pips: 500,
+        });
+        let pancake = common(DexRoutePlan::PancakeSwapV3 {
+            router: Address::repeat_byte(0x11).to_string(),
+            pool_address: Address::repeat_byte(0x22).to_string(),
+            fee_pips: 500,
+        });
+        assert_paired_non_regression(
+            "v3_plan_materialization_benchmark",
+            1.10,
+            || {
+                black_box(uniswap.execution_request("bench-uniswap")).unwrap();
+            },
+            || {
+                black_box(pancake.execution_request("bench-pancake")).unwrap();
+            },
+        );
     }
 
     #[test]

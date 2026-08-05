@@ -5,17 +5,17 @@
   "compiler_version": "production-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool",
-      "source_fingerprint_sha256": "37842505660a3e44fe7e2b950c4f545366506e54a76fb2900079ada1e9fb2885",
+      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow",
+      "source_fingerprint_sha256": "c1ea5f2408296b570b002ef5598859a4a28f51e4b4ffb4802a11d2bd7f7b0460",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool",
+        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
           "rails_pair_candidate_id": 2694,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.274070Z",
-          "captured_at_utc": "2026-08-05T08:29:32Z",
+          "captured_at_utc": "2026-08-05T12:30:00Z",
           "evidence": [
             "production PostgreSQL read-only PairCandidate export for ARBUSDC",
             "Binance Spot exchangeInfo and account commission filters for ARBUSDC",
@@ -25,7 +25,10 @@
             "historical bucket replay recorded persistent 20 bps opportunities over the comparison period",
             "operator funded the isolated Rust Binance subaccount with 1000 USDC and approved permanent full-live ARB/USDC trading and rebalancing on 2026-08-05",
             "operator approved the additive canonical Uniswap V3 0.05% ARB/USDC production route on 2026-08-05",
-            "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC"
+            "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC",
+            "canonical PancakeSwap V3 factory and pool-state verification for the Arbitrum One 0.05% ARB/USDC pool at block 491332082",
+            "PancakeSwap V3 QuoterV2 exact-input and exact-output parity at one canonical Arbitrum block",
+            "operator approved a production observe-only Pancake V3 performance cohort before direct live enablement"
           ]
         },
         "live_trading_enabled": true,
@@ -61,7 +64,10 @@
               "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
               "uniswap_v3_factory_address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
               "uniswap_v3_quoter_address": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
-              "uniswap_v3_router_address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+              "uniswap_v3_router_address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+              "pancakeswap_v3_factory_address": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+              "pancakeswap_v3_quoter_address": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+              "pancakeswap_v3_router_address": "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
             },
             "token_a": {
               "symbol": "USDC",
@@ -119,12 +125,22 @@
             },
             "dex": {
               "allowed_providers": [
-                "uniswap_v3"
+                "uniswap_v3",
+                "pancake_swap_v3"
               ],
               "uniswap_v3": {
                 "fee_tiers": [
                   500,
                   3000
+                ]
+              },
+              "pancakeswap_v3": {
+                "pools": [
+                  {
+                    "fee_tier": 500,
+                    "expected_address": "0x9ffca51d23ac7f7df82da414865ef1055e5afcc3",
+                    "selection_enabled": false
+                  }
                 ]
               }
             }
@@ -663,6 +679,17 @@
   ],
   "pools": [
     {
+      "id": "eip155:42161:pool:PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
+      "pair_id": "arbitrum-usdc-arb",
+      "network_id": "eip155:42161",
+      "protocol": "pancake_swap_v3",
+      "canonical_identity": "PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
+      "fee_pips": 500,
+      "tick_spacing": null,
+      "hooks": null,
+      "lifecycle": "validated"
+    },
+    {
       "id": "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
       "pair_id": "arbitrum-usdc-esp",
       "network_id": "eip155:42161",
@@ -755,7 +782,7 @@
     {
       "id": "strategy:arbitrum-usdc-arb",
       "pair_id": "arbitrum-usdc-arb",
-      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool",
+      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "network_id": "eip155:42161",
@@ -785,6 +812,7 @@
       "strategy_id": "strategy:arbitrum-usdc-arb",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "pool_ids": [
+        "eip155:42161:pool:PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
         "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }",
         "eip155:42161:pool:V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }"
       ]
@@ -868,6 +896,7 @@
       "owner_id": "owner:network:eip155:42161",
       "kind": "network_runtime",
       "owned_ids": [
+        "eip155:42161:pool:PancakeV3 { address: 0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3, fee_pips: 500 }",
         "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
         "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }",
         "eip155:42161:pool:V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }"

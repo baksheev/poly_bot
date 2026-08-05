@@ -615,6 +615,12 @@ pub struct ChainConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v3_router_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pancakeswap_v3_factory_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pancakeswap_v3_quoter_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pancakeswap_v3_router_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_quoter_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_router_address: Option<String>,
@@ -648,6 +654,18 @@ impl ChainConfig {
         validate_optional_address(
             "chain.uniswap_v3_router_address",
             self.uniswap_v3_router_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.pancakeswap_v3_factory_address",
+            self.pancakeswap_v3_factory_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.pancakeswap_v3_quoter_address",
+            self.pancakeswap_v3_quoter_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.pancakeswap_v3_router_address",
+            self.pancakeswap_v3_router_address.as_deref(),
         )?;
         validate_optional_address(
             "chain.uniswap_v4_quoter_address",
@@ -895,6 +913,8 @@ pub struct DexConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v3: Option<UniswapV3Config>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pancakeswap_v3: Option<PancakeSwapV3Config>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4: Option<UniswapV4Config>,
 }
 
@@ -945,6 +965,30 @@ impl DexConfig {
                 "dex.uniswap_v4 is configured but not allowed"
             );
         }
+
+        if unique.contains(&DexProvider::PancakeSwapV3) {
+            ensure!(
+                chain.pancakeswap_v3_factory_address.is_some(),
+                "PancakeSwap V3 requires chain.pancakeswap_v3_factory_address"
+            );
+            ensure!(
+                chain.pancakeswap_v3_quoter_address.is_some(),
+                "PancakeSwap V3 requires chain.pancakeswap_v3_quoter_address"
+            );
+            ensure!(
+                chain.pancakeswap_v3_router_address.is_some(),
+                "PancakeSwap V3 requires chain.pancakeswap_v3_router_address"
+            );
+            self.pancakeswap_v3
+                .as_ref()
+                .context("PancakeSwap V3 provider requires dex.pancakeswap_v3")?
+                .validate()?;
+        } else {
+            ensure!(
+                self.pancakeswap_v3.is_none(),
+                "dex.pancakeswap_v3 is configured but not allowed"
+            );
+        }
         Ok(())
     }
 }
@@ -955,6 +999,7 @@ pub enum DexProvider {
     ZeroX,
     UniswapV3,
     UniswapV4,
+    PancakeSwapV3,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -981,6 +1026,57 @@ impl UniswapV3Config {
             "invalid Uniswap V3 fee tier"
         );
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PancakeSwapV3Config {
+    pub pools: Vec<PancakeSwapV3PoolConfig>,
+}
+
+impl PancakeSwapV3Config {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.pools.is_empty(),
+            "PancakeSwap V3 pools must not be empty"
+        );
+        let unique_fees: HashSet<_> = self.pools.iter().map(|pool| pool.fee_tier).collect();
+        ensure!(
+            unique_fees.len() == self.pools.len(),
+            "PancakeSwap V3 pools contain duplicate fee tiers"
+        );
+        let unique_addresses: HashSet<_> = self
+            .pools
+            .iter()
+            .map(|pool| pool.expected_address.to_ascii_lowercase())
+            .collect();
+        ensure!(
+            unique_addresses.len() == self.pools.len(),
+            "PancakeSwap V3 pools contain duplicate expected addresses"
+        );
+        for pool in &self.pools {
+            pool.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PancakeSwapV3PoolConfig {
+    pub fee_tier: u32,
+    pub expected_address: String,
+    pub selection_enabled: bool,
+}
+
+impl PancakeSwapV3PoolConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.fee_tier > 0 && self.fee_tier <= 1_000_000,
+            "invalid PancakeSwap V3 fee tier"
+        );
+        validate_evm_address("PancakeSwap V3 expected_address", &self.expected_address)
     }
 }
 

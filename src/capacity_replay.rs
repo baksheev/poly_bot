@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(report.fairness.unique_strategies_before_noisy_repeat, 20);
         assert_eq!(report.fairness.maximum_observed_running, 4);
         assert_eq!(report.rehydration.cycles, 5);
-        assert_eq!(report.rehydration.pool_publications, 115);
+        assert_eq!(report.rehydration.pool_publications, 125);
         assert_eq!(report.rehydration.partial_batches_rejected, 1);
         assert_eq!(report.external_mutations, 0);
     }

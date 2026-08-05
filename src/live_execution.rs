@@ -1055,7 +1055,9 @@ impl ComposedLiveLegExecutor {
 impl DexRevertContext {
     fn from_request(request: &crate::dex::execution::ExactInputSwapRequest) -> Self {
         let pool_reference = match request.route {
-            SwapRoute::V3 { pool, .. } => format!("{pool:#x}"),
+            SwapRoute::UniswapV3 { pool, .. } | SwapRoute::PancakeSwapV3 { pool, .. } => {
+                format!("{pool:#x}")
+            }
             SwapRoute::V4 { pool_key, .. } => format!("{:#x}", pool_key.pool_id()),
         };
         Self {

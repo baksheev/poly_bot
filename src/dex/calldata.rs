@@ -42,6 +42,46 @@ pub fn v3_exact_input(
     Ok(encoded)
 }
 
+pub fn pancake_v3_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    fee: u32,
+    recipient: Address,
+    deadline: u64,
+    amount_in: U256,
+    amount_out_minimum: U256,
+) -> anyhow::Result<Vec<u8>> {
+    validate_currency_pair(token_in, token_out)?;
+    ensure!(recipient != Address::ZERO, "Pancake V3 recipient is zero");
+    ensure!(deadline > 0, "Pancake V3 deadline is zero");
+    ensure!(!amount_in.is_zero(), "Pancake V3 input amount is zero");
+    ensure!(
+        !amount_out_minimum.is_zero(),
+        "Pancake V3 minimum output amount is zero"
+    );
+    ensure!(
+        fee > 0 && fee <= 0x00ff_ffff,
+        "Pancake V3 fee does not fit uint24"
+    );
+
+    // Pancake V3 SwapRouter.exactInputSingle((address,address,uint24,address,
+    // uint256,uint256,uint256,uint160)). This is the reviewed V3-only router,
+    // not the Smart Router or Universal Router surface.
+    let mut encoded = selector(
+        "exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))",
+    )
+    .to_vec();
+    push_address_word(&mut encoded, token_in);
+    push_address_word(&mut encoded, token_out);
+    push_u256_word(&mut encoded, U256::from(fee));
+    push_address_word(&mut encoded, recipient);
+    push_u256_word(&mut encoded, U256::from(deadline));
+    push_u256_word(&mut encoded, amount_in);
+    push_u256_word(&mut encoded, amount_out_minimum);
+    push_u256_word(&mut encoded, U256::ZERO);
+    Ok(encoded)
+}
+
 pub fn v3_quote_exact_input_single(
     token_in: Address,
     token_out: Address,
@@ -70,6 +110,41 @@ pub fn decode_v3_quote_exact_input_single(encoded: &[u8]) -> anyhow::Result<U256
     ensure!(
         encoded.len() >= 4 * WORD_BYTES,
         "Uniswap V3 QuoterV2 result is truncated"
+    );
+    Ok(U256::from_be_slice(&encoded[..WORD_BYTES]))
+}
+
+pub fn v3_quote_exact_output_single(
+    token_in: Address,
+    token_out: Address,
+    amount_out: U256,
+    fee: u32,
+) -> anyhow::Result<Vec<u8>> {
+    validate_currency_pair(token_in, token_out)?;
+    ensure!(
+        !amount_out.is_zero(),
+        "V3 exact-output quote amount is zero"
+    );
+    ensure!(
+        fee > 0 && fee <= 0x00ff_ffff,
+        "V3 exact-output quote fee does not fit uint24"
+    );
+
+    // PancakeSwap and Uniswap QuoterV2 share this exact static tuple shape.
+    let mut encoded =
+        selector("quoteExactOutputSingle((address,address,uint256,uint24,uint160))").to_vec();
+    push_address_word(&mut encoded, token_in);
+    push_address_word(&mut encoded, token_out);
+    push_u256_word(&mut encoded, amount_out);
+    push_u256_word(&mut encoded, U256::from(fee));
+    push_u256_word(&mut encoded, U256::ZERO);
+    Ok(encoded)
+}
+
+pub fn decode_v3_quote_exact_output_single(encoded: &[u8]) -> anyhow::Result<U256> {
+    ensure!(
+        encoded.len() >= 4 * WORD_BYTES,
+        "V3 exact-output QuoterV2 result is truncated"
     );
     Ok(U256::from_be_slice(&encoded[..WORD_BYTES]))
 }
@@ -329,13 +404,16 @@ fn push_signed_i32_word(encoded: &mut Vec<u8>, value: i32) {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{hint::black_box, str::FromStr};
 
     use alloy_primitives::{Address, U256, hex, keccak256};
 
+    use crate::paired_benchmark::assert_paired_non_regression;
+
     use super::{
-        decode_permit2_allowance, decode_v3_quote_exact_input_single, permit2_approve,
-        v3_exact_input, v3_quote_exact_input_single, v4_exact_input_single,
+        decode_permit2_allowance, decode_v3_quote_exact_input_single,
+        pancake_v3_exact_input_single, permit2_approve, v3_exact_input,
+        v3_quote_exact_input_single, v4_exact_input_single,
     };
     use crate::dex::pool_id::V4PoolKey;
 
@@ -384,6 +462,71 @@ mod tests {
         assert_eq!(
             decode_v3_quote_exact_input_single(&response).unwrap(),
             U256::from(123_u64)
+        );
+    }
+
+    #[test]
+    fn pancake_v3_exact_input_single_matches_reviewed_v3_only_router_abi() {
+        let usdc = address("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let arb = address("0x912ce59144191c1204e64559fe8253a0e49e6548");
+        let recipient = Address::repeat_byte(0x44);
+        let calldata = pancake_v3_exact_input_single(
+            usdc,
+            arb,
+            500,
+            recipient,
+            1_800_000_000,
+            U256::from(6_000_000_u64),
+            U256::from(7_000_000_000_000_000_000_u128),
+        )
+        .unwrap();
+
+        assert_eq!(&calldata[..4], &[0x41, 0x4b, 0xf3, 0x89]);
+        assert_eq!(calldata.len(), 4 + 8 * 32);
+        assert_eq!(&calldata[4 + 12..4 + 32], usdc.as_slice());
+        assert_eq!(&calldata[4 + 32 + 12..4 + 2 * 32], arb.as_slice());
+        assert_eq!(
+            U256::from_be_slice(&calldata[4 + 4 * 32..4 + 5 * 32]),
+            U256::from(1_800_000_000_u64)
+        );
+        assert_eq!(
+            U256::from_be_slice(&calldata[4 + 7 * 32..4 + 8 * 32]),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired V3 calldata benchmark"]
+    fn benchmark_uniswap_and_pancake_v3_calldata_builders() {
+        let usdc = address("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let arb = address("0x912ce59144191c1204e64559fe8253a0e49e6548");
+        let recipient = Address::repeat_byte(0x44);
+        assert_paired_non_regression(
+            "v3_calldata_build_benchmark",
+            1.10,
+            || {
+                black_box(v3_exact_input(
+                    usdc,
+                    arb,
+                    500,
+                    recipient,
+                    U256::from(6_000_000_u64),
+                    U256::from(7_000_000_000_000_000_000_u128),
+                ))
+                .unwrap();
+            },
+            || {
+                black_box(pancake_v3_exact_input_single(
+                    usdc,
+                    arb,
+                    500,
+                    recipient,
+                    1_800_000_000,
+                    U256::from(6_000_000_u64),
+                    U256::from(7_000_000_000_000_000_000_u128),
+                ))
+                .unwrap();
+            },
         );
     }
 

@@ -24,12 +24,14 @@ pub struct PreTradeCostTelemetry {
 pub enum DexProtocol {
     UniswapV3,
     UniswapV4,
+    PancakeSwapV3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DexPoolCostKey {
     UniswapV3(Address),
     UniswapV4(B256),
+    PancakeSwapV3(Address),
 }
 
 impl DexPoolCostKey {
@@ -37,6 +39,7 @@ impl DexPoolCostKey {
         match self {
             Self::UniswapV3(_) => DexProtocol::UniswapV3,
             Self::UniswapV4(_) => DexProtocol::UniswapV4,
+            Self::PancakeSwapV3(_) => DexProtocol::PancakeSwapV3,
         }
     }
 
@@ -44,6 +47,7 @@ impl DexPoolCostKey {
         match self {
             Self::UniswapV3(address) => format!("uniswap_v3:{address:#x}"),
             Self::UniswapV4(pool_id) => format!("uniswap_v4:{pool_id:#x}"),
+            Self::PancakeSwapV3(address) => format!("pancakeswap_v3:{address:#x}"),
         }
     }
 }
@@ -74,6 +78,7 @@ impl DexProtocol {
         match self {
             Self::UniswapV3 => "uniswap_v3",
             Self::UniswapV4 => "uniswap_v4",
+            Self::PancakeSwapV3 => "pancakeswap_v3",
         }
     }
 
@@ -81,6 +86,7 @@ impl DexProtocol {
         match self {
             Self::UniswapV3 => 0,
             Self::UniswapV4 => 1,
+            Self::PancakeSwapV3 => 2,
         }
     }
 }
@@ -202,7 +208,7 @@ pub struct PreTradeCostSnapshot {
     gas_prices: TemporalHistory<GasPriceTelemetrySample, GAS_PRICE_HISTORY_DEPTH>,
     native_conversions:
         TemporalHistory<NativeConversionTelemetrySample, NATIVE_CONVERSION_HISTORY_DEPTH>,
-    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 2],
+    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 3],
     route_receipts: [Option<RouteReceiptHistory>; MAX_RECEIPT_ROUTES],
 }
 
@@ -211,7 +217,7 @@ struct PreTradeCostInputs {
     gas_prices: TemporalHistory<GasPriceTelemetrySample, GAS_PRICE_HISTORY_DEPTH>,
     native_conversions:
         TemporalHistory<NativeConversionTelemetrySample, NATIVE_CONVERSION_HISTORY_DEPTH>,
-    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 2],
+    protocol_receipts: [TemporalHistory<DexReceiptCostTelemetrySample, RECEIPT_HISTORY_DEPTH>; 3],
     route_receipts: [Option<RouteReceiptHistory>; MAX_RECEIPT_ROUTES],
 }
 

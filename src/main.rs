@@ -46,7 +46,7 @@ use arb_bot::{
     config::{self, Cli, Command},
     dex::{
         events::build_log_filters,
-        execution::{AllowanceRequirement, DexExecutionService, DexExecutor, UniswapProtocol},
+        execution::{AllowanceRequirement, DexExecutionService, DexExecutor, DexProtocol},
         hydration::{DexHydrator, PoolIdentity},
         mirror::{DexMirror, LogApplyResult},
         revert_diagnostics::dex_revert_diagnostic_channel,
@@ -616,8 +616,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
             let protocol = match protocol.as_str() {
-                "v3" => UniswapProtocol::V3,
-                "v4" => UniswapProtocol::V4,
+                "v3" => DexProtocol::UniswapV3,
+                "v4" => DexProtocol::UniswapV4,
                 _ => bail!("--protocol must be v3 or v4"),
             };
             let outcome = execute_round_trip(
@@ -656,8 +656,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let domain_config = LoadedDomainConfig::load(&cli.config.domain_config_path)?;
             let protocol = match protocol.as_str() {
-                "v3" => UniswapProtocol::V3,
-                "v4" => UniswapProtocol::V4,
+                "v3" => DexProtocol::UniswapV3,
+                "v4" => DexProtocol::UniswapV4,
                 _ => bail!("--protocol must be v3 or v4"),
             };
             let outcome = execute_recovery_sell(
@@ -2189,12 +2189,15 @@ fn emit_price_collector_evaluation(
         let pair_id = pair.pair_id.clone();
         let chain_id = pair.chain_id;
         let symbol = pair.symbol.clone();
-        let pool_indices = pair.pool_indices().to_vec();
+        let pool_indices = pair.all_pool_indices().to_vec();
         for pool_index in pool_indices {
             let pool = mirror.pool(pool_index)?;
             let (provider, pool_identity, fee_pips) = match pool.identity {
                 PoolIdentity::V3 { address, fee_pips } => {
                     ("uniswap_v3", address.to_string(), fee_pips)
+                }
+                PoolIdentity::PancakeV3 { address, fee_pips } => {
+                    ("pancakeswap_v3", address.to_string(), fee_pips)
                 }
                 PoolIdentity::V4 { pool_id, fee_pips } => {
                     ("uniswap_v4", pool_id.to_string(), fee_pips)
@@ -3433,7 +3436,7 @@ async fn run(
             if pair.dex.allowed_providers.contains(&DexProvider::UniswapV3) {
                 allowance_requirements.push(AllowanceRequirement {
                     operation_id: format!("rustarb-setup-v3-{}", token.symbol),
-                    protocol: UniswapProtocol::V3,
+                    protocol: DexProtocol::UniswapV3,
                     token: token.contract,
                     router: pair
                         .chain
@@ -3445,10 +3448,30 @@ async fn run(
                     required,
                 });
             }
+            if pair
+                .dex
+                .pancakeswap_v3
+                .as_ref()
+                .is_some_and(|config| config.pools.iter().any(|pool| pool.selection_enabled))
+            {
+                allowance_requirements.push(AllowanceRequirement {
+                    operation_id: format!("rustarb-setup-pancake-v3-{}", token.symbol),
+                    protocol: DexProtocol::PancakeSwapV3,
+                    token: token.contract,
+                    router: pair
+                        .chain
+                        .pancakeswap_v3_router_address
+                        .as_deref()
+                        .context("live Pancake V3 router is missing")?
+                        .parse()
+                        .context("live Pancake V3 router is invalid")?,
+                    required,
+                });
+            }
             if pair.dex.allowed_providers.contains(&DexProvider::UniswapV4) {
                 allowance_requirements.push(AllowanceRequirement {
                     operation_id: format!("rustarb-setup-v4-{}", token.symbol),
-                    protocol: UniswapProtocol::V4,
+                    protocol: DexProtocol::UniswapV4,
                     token: token.contract,
                     router: pair
                         .chain
@@ -3522,7 +3545,7 @@ async fn run(
             .find(|token| token.symbol.as_ref() == arb_pair.token_b.symbol)
             .context("ARB startup wallet snapshot is missing ARB")?;
         {
-            let esp_allowances = [
+            let mut esp_allowances = [
                 (token_a, U256::MAX),
                 (token_b, U256::MAX),
                 (arb_token, U256::MAX),
@@ -3530,12 +3553,35 @@ async fn run(
             .into_iter()
             .map(|(token, required)| AllowanceRequirement {
                 operation_id: allowance_operation_id(token.symbol.as_ref()),
-                protocol: UniswapProtocol::V3,
+                protocol: DexProtocol::UniswapV3,
                 token: token.contract,
                 router: esp_router,
                 required,
             })
             .collect::<Vec<_>>();
+            if arb_pair
+                .dex
+                .pancakeswap_v3
+                .as_ref()
+                .is_some_and(|config| config.pools.iter().any(|pool| pool.selection_enabled))
+            {
+                let pancake_router = arb_pair
+                    .chain
+                    .pancakeswap_v3_router_address
+                    .as_deref()
+                    .context("ARB Pancake V3 router is missing")?
+                    .parse()
+                    .context("ARB Pancake V3 router is invalid")?;
+                for token in [token_a, arb_token] {
+                    esp_allowances.push(AllowanceRequirement {
+                        operation_id: allowance_operation_id(token.symbol.as_ref()),
+                        protocol: DexProtocol::PancakeSwapV3,
+                        token: token.contract,
+                        router: pancake_router,
+                        required: U256::MAX,
+                    });
+                }
+            }
             esp_dex_executor
                 .prepare_and_lock_allowances(&esp_allowances)
                 .await?;

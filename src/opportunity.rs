@@ -119,7 +119,11 @@ pub struct PairRuntime {
     token_b_step: U256,
     token_a: Address,
     token_b: Address,
+    /// Every hydrated pool, including provider-shadow pools that must keep
+    /// receiving events and prepared-curve refreshes.
     pool_indices: Vec<usize>,
+    selection_pool_indices: Vec<usize>,
+    shadow_pool_indices: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -979,8 +983,16 @@ impl PairRuntime {
         self.token_b
     }
 
-    pub fn pool_indices(&self) -> &[usize] {
+    pub fn selectable_pool_indices(&self) -> &[usize] {
+        &self.selection_pool_indices
+    }
+
+    pub fn all_pool_indices(&self) -> &[usize] {
         &self.pool_indices
+    }
+
+    pub fn shadow_pool_indices(&self) -> &[usize] {
+        &self.shadow_pool_indices
     }
 
     fn new(config: &PairConfig, dex: &DexMirror) -> anyhow::Result<Self> {
@@ -1007,6 +1019,8 @@ impl PairRuntime {
         ensure!(!token_b_step.is_zero(), "Binance step_size rounds to zero");
 
         let mut pool_indices = Vec::new();
+        let mut selection_pool_indices = Vec::new();
+        let mut shadow_pool_indices = Vec::new();
         for index in 0..dex.pool_count() {
             let pool = dex.pool(index)?;
             if pool.pair_id != config.id {
@@ -1019,6 +1033,29 @@ impl PairRuntime {
                 config.id
             );
             pool_indices.push(index);
+            let selection_enabled = match pool.identity {
+                crate::dex::hydration::PoolIdentity::PancakeV3 { address, fee_pips } => {
+                    config
+                        .dex
+                        .pancakeswap_v3
+                        .as_ref()
+                        .and_then(|configured| {
+                            configured.pools.iter().find(|candidate| {
+                                candidate.fee_tier == fee_pips
+                                    && Address::from_str(&candidate.expected_address).ok()
+                                        == Some(address)
+                            })
+                        })
+                        .context("hydrated Pancake pool is absent from pair config")?
+                        .selection_enabled
+                }
+                _ => true,
+            };
+            if selection_enabled {
+                selection_pool_indices.push(index);
+            } else {
+                shadow_pool_indices.push(index);
+            }
         }
         ensure!(
             !pool_indices.is_empty(),
@@ -1046,6 +1083,8 @@ impl PairRuntime {
             token_a,
             token_b,
             pool_indices,
+            selection_pool_indices,
+            shadow_pool_indices,
         })
     }
 }
@@ -1060,7 +1099,7 @@ fn evaluate_direction(
 ) -> anyhow::Result<DirectionEvaluation> {
     let mut prepared_pools: Vec<Option<PreparedCurveGenerationHandle>> =
         (0..dex.pool_count()).map(|_| None).collect();
-    for &pool_index in &pair.pool_indices {
+    for &pool_index in &pair.selection_pool_indices {
         prepared_pools[pool_index] = Some(PreparedCurveGenerationHandle::new(
             pool_index,
             1,
@@ -1117,7 +1156,7 @@ fn evaluate_direction_impl(
     );
 
     let mut best_baseline: Option<TradeEvaluation> = None;
-    for &pool_index in &pair.pool_indices {
+    for &pool_index in &pair.selection_pool_indices {
         if prepared_pools
             .get(pool_index)
             .and_then(Option::as_ref)
@@ -1698,7 +1737,52 @@ mod tests {
             token_a,
             token_b,
             pool_indices: vec![0],
+            selection_pool_indices: vec![0],
+            shadow_pool_indices: vec![],
         };
+        (runtime, mirror)
+    }
+
+    fn mixed_v3_provider_fixture() -> (PairRuntime, DexMirror) {
+        let (mut runtime, uniswap_only) = fixture();
+        let base = uniswap_only.pool(0).unwrap();
+        let token0 = base.token0;
+        let token1 = base.token1;
+        let uniswap_pool = base.pool.clone();
+        let pancake_pool = base.pool.clone();
+        runtime.pool_indices = vec![0, 1];
+        runtime.selection_pool_indices = vec![0, 1];
+        let mirror = DexMirror::new(HydratedDexState {
+            block: CanonicalBlock {
+                number: 1,
+                hash: hash(1),
+                parent_hash: hash(0),
+            },
+            pools: vec![
+                HydratedPool {
+                    pair_id: "test-pair".into(),
+                    identity: PoolIdentity::V3 {
+                        address: Address::from([3_u8; 20]),
+                        fee_pips: 3_000,
+                    },
+                    token0,
+                    token1,
+                    pool: uniswap_pool,
+                },
+                HydratedPool {
+                    pair_id: "test-pair".into(),
+                    identity: PoolIdentity::PancakeV3 {
+                        address: Address::from([4_u8; 20]),
+                        fee_pips: 3_000,
+                    },
+                    token0,
+                    token1,
+                    pool: pancake_pool,
+                },
+            ],
+            unavailable: vec![],
+        })
+        .unwrap();
         (runtime, mirror)
     }
 
@@ -1759,6 +1843,89 @@ mod tests {
                     aligned + U256::ONE,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn mixed_uniswap_and_pancake_pools_share_identical_prepared_quote_semantics() {
+        let (pair, dex) = mixed_v3_provider_fixture();
+        let uniswap = super::prepare_pool_quotes(&pair, &dex, 0, 1).unwrap();
+        let pancake = super::prepare_pool_quotes(&pair, &dex, 1, 1).unwrap();
+        let engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0), Some(0)],
+            pool_generations: vec![1, 1],
+            prepared_pools: vec![
+                Some(super::PreparedCurveGenerationHandle::new(0, 1, uniswap)),
+                Some(super::PreparedCurveGenerationHandle::new(1, 1, pancake)),
+            ],
+            baseline_quote_cache: vec![
+                PoolBaselineQuoteCache::default(),
+                PoolBaselineQuoteCache::default(),
+            ],
+        };
+        let book = quote("1.10", "100", "1.11", "100");
+        let aligned = engine.pair(0).unwrap().token_b_step() * U256::from(20_u8);
+        for direction in [
+            ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+            ArbitrageDirection::BuyTokenBOnCexSellOnDex,
+        ] {
+            let uniswap = engine
+                .evaluate_exact_candidate(0, &book, direction, 0, aligned)
+                .unwrap();
+            let pancake = engine
+                .evaluate_exact_candidate(0, &book, direction, 1, aligned)
+                .unwrap();
+            assert_eq!(
+                uniswap.map(|trade| TradeEvaluation {
+                    pool_index: 0,
+                    ..trade
+                }),
+                pancake.map(|trade| TradeEvaluation {
+                    pool_index: 0,
+                    ..trade
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_pool_is_prepared_and_quotable_but_cannot_win_live_selection() {
+        let (mut pair, dex) = mixed_v3_provider_fixture();
+        pair.selection_pool_indices = vec![0];
+        pair.shadow_pool_indices = vec![1];
+        let uniswap = super::prepare_pool_quotes(&pair, &dex, 0, 1).unwrap();
+        let pancake = super::prepare_pool_quotes(&pair, &dex, 1, 1).unwrap();
+        let mut engine = OpportunityEngine {
+            pairs: vec![pair],
+            pair_indices_by_symbol: HashMap::from([("BA".to_owned(), 0)]),
+            pair_index_by_pool: vec![Some(0), Some(0)],
+            pool_generations: vec![1, 1],
+            prepared_pools: vec![
+                Some(super::PreparedCurveGenerationHandle::new(0, 1, uniswap)),
+                Some(super::PreparedCurveGenerationHandle::new(1, 1, pancake)),
+            ],
+            baseline_quote_cache: vec![
+                PoolBaselineQuoteCache::default(),
+                PoolBaselineQuoteCache::default(),
+            ],
+        };
+        let book = quote("1.10", "100", "1.11", "100");
+        let evaluation = engine.evaluate(&book).unwrap().unwrap();
+        assert_eq!(evaluation.dex_buy_cex_sell.baseline.unwrap().pool_index, 0);
+        assert_eq!(engine.pair(0).unwrap().shadow_pool_indices(), &[1]);
+        assert!(
+            engine
+                .evaluate_exact_candidate(
+                    0,
+                    &book,
+                    ArbitrageDirection::BuyTokenBOnDexSellOnCex,
+                    1,
+                    evaluation.baseline_token_b_amount,
+                )
+                .unwrap()
+                .is_some()
         );
     }
 

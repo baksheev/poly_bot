@@ -699,6 +699,7 @@ impl TradingEngine {
                         DexProvider::ZeroX => "zero_x",
                         DexProvider::UniswapV3 => "uniswap_v3",
                         DexProvider::UniswapV4 => "uniswap_v4",
+                        DexProvider::PancakeSwapV3 => "pancakeswap_v3",
                     },
                     "fee_pips": pool.fee_pips,
                     "address": pool.address.map(|address| format!("{address:?}")),
@@ -2732,7 +2733,7 @@ impl AdaptiveSizingSnapshot {
                 ),
             });
 
-            for &pool_index in pair.pool_indices() {
+            for &pool_index in pair.selectable_pool_indices() {
                 let (pool_winner, search) = self.search_adaptive_pool(
                     quote,
                     evaluation.pair_index,
@@ -2791,6 +2792,34 @@ impl AdaptiveSizingSnapshot {
         )
         .then_some(selected)
         .flatten();
+        let mut shadow_candidates = Vec::new();
+        for direction in [evaluation.dex_buy_cex_sell, evaluation.cex_buy_dex_sell] {
+            let token_b_amount = direction
+                .baseline
+                .map_or(evaluation.baseline_token_b_amount, |trade| {
+                    trade.token_b_amount
+                });
+            for &pool_index in pair.shadow_pool_indices() {
+                let trade = self.opportunities.evaluate_exact_candidate(
+                    evaluation.pair_index,
+                    quote,
+                    direction.direction,
+                    pool_index,
+                    token_b_amount,
+                )?;
+                shadow_candidates.push(json!({
+                    "dex_protocol": "pancakeswap_v3",
+                    "pool_index": pool_index,
+                    "direction": direction.direction.as_str(),
+                    "token_b_base_units": token_b_amount.to_string(),
+                    "quotable": trade.is_some(),
+                    "meets_threshold": trade.map(|candidate| candidate.meets_threshold),
+                    "gross_profit_bps_x100": trade.map(|candidate| candidate.gross_profit_bps_x100.to_string()),
+                    "cost_token_a_base_units": trade.map(|candidate| candidate.cost_token_a.to_string()),
+                    "proceeds_token_a_base_units": trade.map(|candidate| candidate.proceeds_token_a.to_string()),
+                }));
+            }
+        }
         let rejection_counts = rejection_counts
             .into_iter()
             .map(|(reason, count)| (reason.to_owned(), Value::from(count)))
@@ -2833,6 +2862,7 @@ impl AdaptiveSizingSnapshot {
             "rejection_counts": Value::Object(rejection_counts),
             "calculation_us": calculation_us,
             "execution_size_changed": execution_candidate.is_some(),
+            "shadow_candidates": shadow_candidates,
         });
         let object = payload
             .as_object_mut()
@@ -3073,7 +3103,7 @@ impl TradingEngine {
             && let Some(limits) = adaptive_limits
         {
             let pool_generations = pair
-                .pool_indices()
+                .selectable_pool_indices()
                 .iter()
                 .copied()
                 .map(|pool_index| {

@@ -13,7 +13,7 @@ use crate::{
         logs::ChainLog,
         rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
     },
-    dex::events::{PoolLocator, PoolUpdate, decode_pool_event},
+    dex::events::{PoolLocator, PoolUpdate, decode_pool_event_for_receipt},
     domain::compiled::CompiledNetworkGasPolicy,
     pretrade_cost::{
         DexPoolCostKey, DexProtocol as CostTelemetryDexProtocol, DexRouteCostKey,
@@ -28,8 +28,8 @@ use crate::{
 };
 
 use super::calldata::{
-    decode_permit2_allowance, permit2_allowance, permit2_approve, v3_exact_input,
-    v4_exact_input_single,
+    decode_permit2_allowance, pancake_v3_exact_input_single, permit2_allowance, permit2_approve,
+    v3_exact_input, v4_exact_input_single,
 };
 use super::pool_id::V4PoolKey;
 
@@ -58,9 +58,10 @@ const PERMIT2_APPROVAL_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 6
 const PERMIT2_MIN_REMAINING_VALIDITY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UniswapProtocol {
-    V3,
-    V4,
+pub enum DexProtocol {
+    UniswapV3,
+    PancakeSwapV3,
+    UniswapV4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,24 +73,30 @@ pub enum SwapSubmissionPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllowanceRequirement {
     pub operation_id: String,
-    pub protocol: UniswapProtocol,
+    pub protocol: DexProtocol,
     pub token: Address,
     pub router: Address,
     pub required: U256,
 }
 
-impl UniswapProtocol {
+impl DexProtocol {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::V3 => "uniswap_v3",
-            Self::V4 => "uniswap_v4",
+            Self::UniswapV3 => "uniswap_v3",
+            Self::PancakeSwapV3 => "pancakeswap_v3",
+            Self::UniswapV4 => "uniswap_v4",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapRoute {
-    V3 {
+    UniswapV3 {
+        router: Address,
+        pool: Address,
+        fee_pips: u32,
+    },
+    PancakeSwapV3 {
         router: Address,
         pool: Address,
         fee_pips: u32,
@@ -101,16 +108,19 @@ pub enum SwapRoute {
 }
 
 impl SwapRoute {
-    pub const fn protocol(self) -> UniswapProtocol {
+    pub const fn protocol(self) -> DexProtocol {
         match self {
-            Self::V3 { .. } => UniswapProtocol::V3,
-            Self::V4 { .. } => UniswapProtocol::V4,
+            Self::UniswapV3 { .. } => DexProtocol::UniswapV3,
+            Self::PancakeSwapV3 { .. } => DexProtocol::PancakeSwapV3,
+            Self::V4 { .. } => DexProtocol::UniswapV4,
         }
     }
 
     pub const fn router(self) -> Address {
         match self {
-            Self::V3 { router, .. } | Self::V4 { router, .. } => router,
+            Self::UniswapV3 { router, .. }
+            | Self::PancakeSwapV3 { router, .. }
+            | Self::V4 { router, .. } => router,
         }
     }
 }
@@ -166,8 +176,9 @@ impl ExactInputSwapRequest {
             "DEX confirmation timeout is zero"
         );
         match self.route {
-            SwapRoute::V3 { pool, fee_pips, .. } => {
-                ensure!(pool != Address::ZERO, "Uniswap V3 pool is zero");
+            SwapRoute::UniswapV3 { pool, fee_pips, .. }
+            | SwapRoute::PancakeSwapV3 { pool, fee_pips, .. } => {
+                ensure!(pool != Address::ZERO, "V3 pool is zero");
                 ensure!(fee_pips > 0 && fee_pips <= 0x00ff_ffff, "invalid V3 fee");
             }
             SwapRoute::V4 { pool_key, .. } => {
@@ -214,7 +225,7 @@ impl ExactInputSwapRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwapExecutionOutcome {
-    pub protocol: UniswapProtocol,
+    pub protocol: DexProtocol,
     pub transaction_hash: B256,
     pub block_number: u64,
     pub gas_used: u64,
@@ -271,15 +282,15 @@ impl GasPriceSample {
 }
 
 impl GasLimitPolicy {
-    const fn for_swap(protocol: UniswapProtocol, additional: u64) -> Self {
+    const fn for_swap(protocol: DexProtocol, additional: u64) -> Self {
         match protocol {
-            UniswapProtocol::V3 => Self {
+            DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 => Self {
                 multiplier: 2,
                 minimum: 0,
                 default: HISTORICAL_SWAP_GAS_LIMIT,
                 additional,
             },
-            UniswapProtocol::V4 => Self {
+            DexProtocol::UniswapV4 => Self {
                 multiplier: 4,
                 minimum: HISTORICAL_SWAP_GAS_LIMIT,
                 default: HISTORICAL_SWAP_GAS_LIMIT,
@@ -472,6 +483,7 @@ impl DexExecutor {
         );
         for protocol in [
             CostTelemetryDexProtocol::UniswapV3,
+            CostTelemetryDexProtocol::PancakeSwapV3,
             CostTelemetryDexProtocol::UniswapV4,
         ] {
             let candidate = self
@@ -616,16 +628,20 @@ impl DexExecutor {
                 "DEX allowance amount is zero"
             );
             match requirement.protocol {
-                UniswapProtocol::V3 => {
+                DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 => {
                     self.ensure_erc20_allowance(
-                        &format!("{}.v3-router-approval", requirement.operation_id),
+                        &format!(
+                            "{}.{}-router-approval",
+                            requirement.operation_id,
+                            requirement.protocol.label()
+                        ),
                         requirement.token,
                         requirement.router,
                         requirement.required,
                     )
                     .await?;
                 }
-                UniswapProtocol::V4 => {
+                DexProtocol::UniswapV4 => {
                     self.ensure_erc20_allowance(
                         &format!("{}.permit2-erc20-approval", requirement.operation_id),
                         requirement.token,
@@ -676,15 +692,21 @@ impl DexExecutor {
         let protocol = request.route.protocol();
         let cost_route = DexRouteCostKey {
             pool: match request.route {
-                SwapRoute::V3 { pool, .. } => DexPoolCostKey::UniswapV3(pool),
+                SwapRoute::UniswapV3 { pool, .. } => DexPoolCostKey::UniswapV3(pool),
+                SwapRoute::PancakeSwapV3 { pool, .. } => DexPoolCostKey::PancakeSwapV3(pool),
                 SwapRoute::V4 { pool_key, .. } => DexPoolCostKey::UniswapV4(pool_key.pool_id()),
             },
             token_in: request.token_in,
         };
-        if !request.reconciliation_only && protocol == UniswapProtocol::V4 {
+        if !request.reconciliation_only
+            && matches!(
+                protocol,
+                DexProtocol::PancakeSwapV3 | DexProtocol::UniswapV4
+            )
+        {
             ensure!(
                 request.deadline_unix_seconds > unix_seconds()?,
-                "Uniswap V4 request deadline has expired"
+                "deadline-bearing DEX request has expired"
             );
         }
         if request.reconciliation_only {
@@ -703,11 +725,20 @@ impl DexExecutor {
         }
 
         let calldata = match request.route {
-            SwapRoute::V3 { fee_pips, .. } => v3_exact_input(
+            SwapRoute::UniswapV3 { fee_pips, .. } => v3_exact_input(
                 request.token_in,
                 request.token_out,
                 fee_pips,
                 self.wallet.address(),
+                request.amount_in,
+                request.amount_out_minimum,
+            )?,
+            SwapRoute::PancakeSwapV3 { fee_pips, .. } => pancake_v3_exact_input_single(
+                request.token_in,
+                request.token_out,
+                fee_pips,
+                self.wallet.address(),
+                request.deadline_unix_seconds,
                 request.amount_in,
                 request.amount_out_minimum,
             )?,
@@ -861,9 +892,18 @@ impl DexExecutor {
 
     async fn ensure_allowance(&mut self, request: &ExactInputSwapRequest) -> anyhow::Result<()> {
         match request.route {
-            SwapRoute::V3 { router, .. } => {
+            SwapRoute::UniswapV3 { router, .. } => {
                 self.ensure_erc20_allowance(
                     &format!("{}.v3-router-approval", request.operation_id),
+                    request.token_in,
+                    router,
+                    request.amount_in,
+                )
+                .await
+            }
+            SwapRoute::PancakeSwapV3 { router, .. } => {
+                self.ensure_erc20_allowance(
+                    &format!("{}.pancakeswap-v3-router-approval", request.operation_id),
                     request.token_in,
                     router,
                     request.amount_in,
@@ -1502,7 +1542,8 @@ fn settlement_log_for_route(
     route: SwapRoute,
 ) -> anyhow::Result<Option<ChainLog>> {
     let expected = match route {
-        SwapRoute::V3 { pool, .. } => PoolLocator::V3(pool),
+        SwapRoute::UniswapV3 { pool, .. } => PoolLocator::V3(pool),
+        SwapRoute::PancakeSwapV3 { pool, .. } => PoolLocator::PancakeV3(pool),
         SwapRoute::V4 { pool_key, .. } => PoolLocator::V4(pool_key.pool_id()),
     };
     let mut matched = None;
@@ -1516,7 +1557,13 @@ fn settlement_log_for_route(
         let Ok(log) = receipt_log.chain_log() else {
             continue;
         };
-        let Some(event) = decode_pool_event(&log)? else {
+        if matches!(
+            expected,
+            PoolLocator::V3(pool) | PoolLocator::PancakeV3(pool) if log.address != pool
+        ) {
+            continue;
+        }
+        let Some(event) = decode_pool_event_for_receipt(&log, expected)? else {
             continue;
         };
         if event.locator == expected && matches!(event.update, PoolUpdate::Swap { .. }) {
@@ -2047,6 +2094,7 @@ fn unix_seconds() -> anyhow::Result<u64> {
 mod tests {
     use std::{
         fs,
+        hint::black_box,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
@@ -2062,17 +2110,18 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DexExecutionService, DexExecutionServiceError, DexExecutor, EvmExecutionRequest,
-        ExactInputSwapRequest, ExecuteCallPolicy, GasLimitPolicy, MAX_GAS_LIMIT, SwapRoute,
-        SwapSubmissionPolicy, UniswapProtocol, allowance_grant_for_policy,
+        DexExecutionService, DexExecutionServiceError, DexExecutor, DexProtocol,
+        EvmExecutionRequest, ExactInputSwapRequest, ExecuteCallPolicy, GasLimitPolicy,
+        MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, allowance_grant_for_policy,
         is_definitive_prebroadcast_rejection, settlement_log_for_route,
         transaction_fees_for_policy, wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
         chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
-        dex::events::v3_swap_topic,
+        dex::events::{pancake_v3_swap_topic, v3_swap_topic},
         domain::compiled::CompiledNetworkGasPolicy,
+        paired_benchmark::assert_paired_non_regression,
         wallet::{
             EvmWallet, JournalIntent, JournalOperationIdentity, JournalStatus, TransactionJournal,
             UnknownOutcomeReason, WalletCall,
@@ -2084,11 +2133,11 @@ mod tests {
 
     #[test]
     fn rails_v3_gas_multiplier_and_extra_are_applied() {
-        let policy = GasLimitPolicy::for_swap(UniswapProtocol::V3, 25_000);
+        let policy = GasLimitPolicy::for_swap(DexProtocol::UniswapV3, 25_000);
         assert_eq!(policy.resolve(Some(100_000), 110_000).unwrap(), 225_000);
         assert_eq!(policy.resolve(None, 110_000).unwrap(), 275_000);
         assert_eq!(
-            GasLimitPolicy::for_swap(UniswapProtocol::V3, 0)
+            GasLimitPolicy::for_swap(DexProtocol::UniswapV3, 0)
                 .resolve_without_estimate(None)
                 .unwrap(),
             250_000
@@ -2126,17 +2175,17 @@ mod tests {
 
     #[test]
     fn rails_v4_gas_multiplier_minimum_and_extra_are_applied() {
-        let policy = GasLimitPolicy::for_swap(UniswapProtocol::V4, 10_000);
+        let policy = GasLimitPolicy::for_swap(DexProtocol::UniswapV4, 10_000);
         assert_eq!(policy.resolve(Some(50_000), 60_000).unwrap(), 260_000);
         assert_eq!(policy.resolve(Some(120_000), 130_000).unwrap(), 490_000);
         assert_eq!(
-            GasLimitPolicy::for_swap(UniswapProtocol::V4, 0)
+            GasLimitPolicy::for_swap(DexProtocol::UniswapV4, 0)
                 .resolve_without_estimate(None)
                 .unwrap(),
             250_000
         );
         assert!(
-            GasLimitPolicy::for_swap(UniswapProtocol::V4, MAX_GAS_LIMIT)
+            GasLimitPolicy::for_swap(DexProtocol::UniswapV4, MAX_GAS_LIMIT)
                 .resolve(Some(120_000), 130_000)
                 .is_err()
         );
@@ -2199,7 +2248,7 @@ mod tests {
 
         let log = settlement_log_for_route(
             &receipt,
-            SwapRoute::V3 {
+            SwapRoute::UniswapV3 {
                 router: Address::repeat_byte(0x33),
                 pool,
                 fee_pips: 3_000,
@@ -2212,6 +2261,63 @@ mod tests {
         assert_eq!(log.transaction_index, 7);
         assert_eq!(log.log_index, 9);
         assert_eq!(log.address, pool);
+    }
+
+    #[test]
+    fn pancake_receipt_uses_extended_swap_layout_and_preserves_provider_locator() {
+        let pool = Address::repeat_byte(0x45);
+        let transaction_hash = B256::repeat_byte(0x56);
+        let mut data = vec![0_u8; 7 * 32];
+        data[95] = 1;
+        data[112..128].copy_from_slice(&1_000_u128.to_be_bytes());
+        data[191] = 7;
+        data[223] = 11;
+        let receipt = TransactionReceipt {
+            transaction_hash,
+            block_number: 124,
+            status: 1,
+            gas_used: 100_000,
+            effective_gas_price: 1_000_000,
+            l1_fee: 0,
+            logs: vec![ReceiptLog {
+                address: pool,
+                topics: vec![pancake_v3_swap_topic(), B256::ZERO, B256::ZERO],
+                data,
+                position: Some(ReceiptLogPosition {
+                    transaction_hash,
+                    block_number: 124,
+                    block_hash: B256::repeat_byte(0x67),
+                    transaction_index: 8,
+                    log_index: 10,
+                    removed: false,
+                }),
+            }],
+        };
+
+        let log = settlement_log_for_route(
+            &receipt,
+            SwapRoute::PancakeSwapV3 {
+                router: Address::repeat_byte(0x33),
+                pool,
+                fee_pips: 500,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(log.address, pool);
+        assert_eq!(log.block_number, 124);
+        assert!(
+            settlement_log_for_route(
+                &receipt,
+                SwapRoute::UniswapV3 {
+                    router: Address::repeat_byte(0x33),
+                    pool,
+                    fee_pips: 500,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2235,7 +2341,7 @@ mod tests {
         assert!(
             settlement_log_for_route(
                 &receipt,
-                SwapRoute::V3 {
+                SwapRoute::UniswapV3 {
                     router: Address::repeat_byte(0x33),
                     pool,
                     fee_pips: 3_000,
@@ -2243,6 +2349,61 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired V3 receipt benchmark"]
+    fn benchmark_uniswap_and_pancake_v3_receipt_proof() {
+        let pool = Address::repeat_byte(0x45);
+        let receipt = |topic, words: usize| {
+            let transaction_hash = B256::repeat_byte(words as u8);
+            let mut data = vec![0_u8; words * 32];
+            data[95] = 1;
+            data[112..128].copy_from_slice(&1_000_u128.to_be_bytes());
+            TransactionReceipt {
+                transaction_hash,
+                block_number: 124,
+                status: 1,
+                gas_used: 100_000,
+                effective_gas_price: 1_000_000,
+                l1_fee: 0,
+                logs: vec![ReceiptLog {
+                    address: pool,
+                    topics: vec![topic, B256::ZERO, B256::ZERO],
+                    data,
+                    position: Some(ReceiptLogPosition {
+                        transaction_hash,
+                        block_number: 124,
+                        block_hash: B256::repeat_byte(0x67),
+                        transaction_index: 8,
+                        log_index: 10,
+                        removed: false,
+                    }),
+                }],
+            }
+        };
+        let uniswap = receipt(v3_swap_topic(), 5);
+        let pancake = receipt(pancake_v3_swap_topic(), 7);
+        let uniswap_route = SwapRoute::UniswapV3 {
+            router: Address::repeat_byte(0x33),
+            pool,
+            fee_pips: 500,
+        };
+        let pancake_route = SwapRoute::PancakeSwapV3 {
+            router: Address::repeat_byte(0x33),
+            pool,
+            fee_pips: 500,
+        };
+        assert_paired_non_regression(
+            "v3_receipt_proof_benchmark",
+            1.10,
+            || {
+                black_box(settlement_log_for_route(&uniswap, uniswap_route)).unwrap();
+            },
+            || {
+                black_box(settlement_log_for_route(&pancake, pancake_route)).unwrap();
+            },
         );
     }
 
@@ -2538,7 +2699,7 @@ mod tests {
         let mut request = v3_request("rustval-expired-swap-reconciliation");
         request.deadline_unix_seconds = 1;
         request.reconciliation_only = true;
-        let SwapRoute::V3 {
+        let SwapRoute::UniswapV3 {
             router, fee_pips, ..
         } = request.route
         else {
@@ -2799,7 +2960,7 @@ mod tests {
     fn v3_request(operation_id: &str) -> ExactInputSwapRequest {
         let mut request = ExactInputSwapRequest::with_rails_defaults(
             operation_id,
-            SwapRoute::V3 {
+            SwapRoute::UniswapV3 {
                 router: Address::repeat_byte(0x33),
                 pool: Address::repeat_byte(0x44),
                 fee_pips: 3_000,

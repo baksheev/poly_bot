@@ -27,3 +27,6 @@ pub mod strategy_runtime;
 pub mod supervision;
 pub mod telemetry;
 pub mod wallet;
+
+#[cfg(test)]
+pub(crate) mod paired_benchmark;

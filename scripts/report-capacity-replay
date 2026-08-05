@@ -26,7 +26,7 @@ jq -e \
     and .artifact_id == "maximum-pair-replay-v1"
     and .mode == "capacity_replay_only"
     and .pair_count == 20
-    and .pool_count == 23
+    and .pool_count == 25
     and .frames_per_pair >= 100000
     and .total_strategy_frames == (.pair_count * .frames_per_pair)
     and .reconnect_bursts >= 4

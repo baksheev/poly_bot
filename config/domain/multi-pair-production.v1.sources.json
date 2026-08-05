@@ -5,7 +5,7 @@
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v14.json",
     "config/strategies/usdc-esp-arbitrum.v7.json",
-    "config/strategies/usdc-arb-arbitrum.v2.json"
+    "config/strategies/usdc-arb-arbitrum.v3.json"
   ],
   "accounts": [
     {

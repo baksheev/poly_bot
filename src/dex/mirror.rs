@@ -9,7 +9,7 @@ use crate::{
         rpc::CanonicalBlock,
     },
     dex::{
-        events::{PoolLocator, PoolUpdate, decode_pool_event},
+        events::{PoolLocator, PoolUpdate, decode_pool_event, decode_pool_event_for_locator},
         hydration::{HydratedDexState, HydratedPool, PoolIdentity, UnavailablePool},
     },
 };
@@ -18,6 +18,7 @@ pub struct DexMirror {
     pools: Vec<HydratedPool>,
     unavailable: Vec<UnavailablePool>,
     v3_indices: HashMap<Address, usize>,
+    pancake_v3_indices: HashMap<Address, usize>,
     v4_indices: HashMap<B256, usize>,
     last_positions: HashMap<PoolLocator, LogPosition>,
     backfilled_through: u64,
@@ -38,10 +39,14 @@ pub enum LogApplyResult {
 impl DexMirror {
     pub fn new(hydrated: HydratedDexState) -> anyhow::Result<Self> {
         let mut v3_indices = HashMap::new();
+        let mut pancake_v3_indices = HashMap::new();
         let mut v4_indices = HashMap::new();
         for (index, pool) in hydrated.pools.iter().enumerate() {
             let previous = match pool.identity {
                 PoolIdentity::V3 { address, .. } => v3_indices.insert(address, index),
+                PoolIdentity::PancakeV3 { address, .. } => {
+                    pancake_v3_indices.insert(address, index)
+                }
                 PoolIdentity::V4 { pool_id, .. } => v4_indices.insert(pool_id, index),
             };
             ensure!(previous.is_none(), "duplicate hydrated pool identity");
@@ -50,6 +55,7 @@ impl DexMirror {
             pools: hydrated.pools,
             unavailable: hydrated.unavailable,
             v3_indices,
+            pancake_v3_indices,
             v4_indices,
             last_positions: HashMap::new(),
             backfilled_through: hydrated.block.number,
@@ -63,7 +69,20 @@ impl DexMirror {
         if log.block_number <= self.backfilled_through {
             return Ok(LogApplyResult::Duplicate);
         }
-        let Some(event) = decode_pool_event(log)? else {
+        let locator_hint = self
+            .v3_indices
+            .contains_key(&log.address)
+            .then_some(PoolLocator::V3(log.address))
+            .or_else(|| {
+                self.pancake_v3_indices
+                    .contains_key(&log.address)
+                    .then_some(PoolLocator::PancakeV3(log.address))
+            });
+        let decoded = match locator_hint {
+            Some(locator) => decode_pool_event_for_locator(log, locator)?,
+            None => decode_pool_event(log)?,
+        };
+        let Some(event) = decoded else {
             return Ok(LogApplyResult::Unknown);
         };
         if self
@@ -75,6 +94,7 @@ impl DexMirror {
         }
         let pool_index = match event.locator {
             PoolLocator::V3(address) => self.v3_indices.get(&address).copied(),
+            PoolLocator::PancakeV3(address) => self.pancake_v3_indices.get(&address).copied(),
             PoolLocator::V4(pool_id) => self.v4_indices.get(&pool_id).copied(),
         };
         let Some(pool_index) = pool_index else {
@@ -182,6 +202,7 @@ impl DexMirror {
     pub fn pool_index(&self, locator: PoolLocator) -> Option<usize> {
         match locator {
             PoolLocator::V3(address) => self.v3_indices.get(&address).copied(),
+            PoolLocator::PancakeV3(address) => self.pancake_v3_indices.get(&address).copied(),
             PoolLocator::V4(pool_id) => self.v4_indices.get(&pool_id).copied(),
         }
     }

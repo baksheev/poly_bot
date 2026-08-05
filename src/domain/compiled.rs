@@ -407,6 +407,7 @@ pub struct AssetMapping {
 pub enum PoolProtocol {
     UniswapV3,
     UniswapV4,
+    PancakeSwapV3,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -2259,6 +2260,32 @@ pub fn compile_domain(
                 strategy_pool_ids.push(pool_id);
             }
         }
+        if let Some(pancake_v3) = &pair.dex.pancakeswap_v3 {
+            for configured_pool in &pancake_v3.pools {
+                let address = parse_address(&configured_pool.expected_address)?;
+                let identity = format!(
+                    "PancakeV3 {{ address: {address}, fee_pips: {} }}",
+                    configured_pool.fee_tier
+                );
+                let pool_id = PoolId(format!("{}:pool:{identity}", network_id.as_str()));
+                pools.push(PoolNode {
+                    id: pool_id.clone(),
+                    pair_id: pair.id.clone(),
+                    network_id: network_id.clone(),
+                    protocol: PoolProtocol::PancakeSwapV3,
+                    canonical_identity: identity,
+                    fee_pips: configured_pool.fee_tier,
+                    tick_spacing: None,
+                    hooks: None,
+                    lifecycle: if pair.execution_enabled && configured_pool.selection_enabled {
+                        PoolLifecycle::ExecutionEligible
+                    } else {
+                        PoolLifecycle::Validated
+                    },
+                });
+                strategy_pool_ids.push(pool_id);
+            }
+        }
         strategy_pool_ids.sort();
         dependencies.push(StrategyDependency {
             strategy_id,
@@ -2704,7 +2731,7 @@ mod tests {
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
         assert_eq!(bundle.strategies.len(), 3);
-        assert_eq!(bundle.pools.len(), 8);
+        assert_eq!(bundle.pools.len(), 9);
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "arbitrum-usdc-arb"
                 && pool.protocol == PoolProtocol::UniswapV3
@@ -2713,6 +2740,16 @@ mod tests {
                     .canonical_identity
                     .to_ascii_lowercase()
                     .contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")
+        }));
+        assert!(bundle.pools.iter().any(|pool| {
+            pool.pair_id == "arbitrum-usdc-arb"
+                && pool.protocol == PoolProtocol::PancakeSwapV3
+                && pool.fee_pips == 500
+                && pool.lifecycle == PoolLifecycle::Validated
+                && pool
+                    .canonical_identity
+                    .to_ascii_lowercase()
+                    .contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")
         }));
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "world-chain-usdc-wld"
@@ -2781,7 +2818,13 @@ mod tests {
                 .pools
                 .iter()
                 .filter(|pool| pool.pair_id == "arbitrum-usdc-arb")
-                .all(|pool| pool.lifecycle == PoolLifecycle::ExecutionEligible)
+                .all(|pool| match pool.protocol {
+                    PoolProtocol::PancakeSwapV3 => pool.lifecycle == PoolLifecycle::Validated,
+                    PoolProtocol::UniswapV3 => {
+                        pool.lifecycle == PoolLifecycle::ExecutionEligible
+                    }
+                    PoolProtocol::UniswapV4 => false,
+                })
         );
         assert!(
             bundle
@@ -2939,7 +2982,7 @@ mod tests {
             .unwrap();
         assert!(arb.observe && arb.plan && arb.execute);
         assert_eq!(arb.network_id.as_str(), "eip155:42161");
-        assert_eq!(arb.pool_ids.len(), 2);
+        assert_eq!(arb.pool_ids.len(), 3);
         assert!(arb.pool_ids.iter().any(|pool_id| {
             pool_id
                 .as_str()

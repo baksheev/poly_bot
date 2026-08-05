@@ -27,6 +27,8 @@ fn report_enforces_the_full_read_only_capacity_gate() {
     assert!(artifact.contains("\"network_io_enabled\": false"));
     assert!(artifact.contains("\"external_mutation_authorized\": false"));
     assert_eq!(artifact.matches("\"pair_id\":").count(), 20);
+    assert!(artifact.contains("\"pair_id\": \"capacity-arbitrum-arb-usdc\""));
+    assert!(artifact.contains("\"symbol\": \"ARBUSDC\""));
 }
 
 #[test]
@@ -47,7 +49,8 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(DEPLOY_WORKFLOW.contains("state.terminated.message"));
     assert!(DEPLOY_WORKFLOW.contains(".decision_owner_latency.p99_ns <= 25000"));
     assert!(DEPLOY_WORKFLOW.contains(".total_strategy_frames == 2000000"));
-    assert!(DEPLOY_WORKFLOW.contains(".rehydration.pool_publications == 115"));
+    assert!(DEPLOY_WORKFLOW.contains(".pool_count == 25"));
+    assert!(DEPLOY_WORKFLOW.contains(".rehydration.pool_publications == 125"));
     assert!(DEPLOY_WORKFLOW.contains(".route_failures == 0"));
     assert!(DEPLOY_WORKFLOW.contains(".external_mutations == 0"));
     assert!(DEPLOY_WORKFLOW.contains("automountServiceAccountToken = false"));

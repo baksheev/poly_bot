@@ -1026,7 +1026,7 @@ pub(crate) fn evaluate_shadow_sizing(
         ArbitrageDirection::BuyTokenBOnDexSellOnCex,
         ArbitrageDirection::BuyTokenBOnCexSellOnDex,
     ] {
-        for &pool_index in pair.pool_indices() {
+        for &pool_index in pair.selectable_pool_indices() {
             let Some(capacity) = opportunities.exact_candidate_capacity(
                 evaluation.pair_index,
                 direction,

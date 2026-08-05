@@ -244,6 +244,7 @@ pub fn channel(
         let identity = format!("{:?}", pool.identity);
         let cost_pool_key = match pool.identity {
             PoolIdentity::V3 { address, .. } => DexPoolCostKey::UniswapV3(address),
+            PoolIdentity::PancakeV3 { address, .. } => DexPoolCostKey::PancakeSwapV3(address),
             PoolIdentity::V4 { pool_id, .. } => DexPoolCostKey::UniswapV4(pool_id),
         };
         pools.push(PoolTelemetryContext {

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::LazyLock};
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, ensure};
@@ -10,15 +10,27 @@ use crate::{
 };
 
 const V3_SWAP_SIGNATURE: &str = "Swap(address,address,int256,int256,uint160,uint128,int24)";
+const PANCAKE_V3_SWAP_SIGNATURE: &str =
+    "Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)";
 const V3_MINT_SIGNATURE: &str = "Mint(address,address,int24,int24,uint128,uint256,uint256)";
 const V3_BURN_SIGNATURE: &str = "Burn(address,int24,int24,uint128,uint256,uint256)";
 const V4_SWAP_SIGNATURE: &str = "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)";
 const V4_MODIFY_LIQUIDITY_SIGNATURE: &str =
     "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)";
 
+static V3_SWAP_TOPIC: LazyLock<B256> = LazyLock::new(|| keccak256(V3_SWAP_SIGNATURE));
+static PANCAKE_V3_SWAP_TOPIC: LazyLock<B256> =
+    LazyLock::new(|| keccak256(PANCAKE_V3_SWAP_SIGNATURE));
+static V3_MINT_TOPIC: LazyLock<B256> = LazyLock::new(|| keccak256(V3_MINT_SIGNATURE));
+static V3_BURN_TOPIC: LazyLock<B256> = LazyLock::new(|| keccak256(V3_BURN_SIGNATURE));
+static V4_SWAP_TOPIC: LazyLock<B256> = LazyLock::new(|| keccak256(V4_SWAP_SIGNATURE));
+static V4_MODIFY_LIQUIDITY_TOPIC: LazyLock<B256> =
+    LazyLock::new(|| keccak256(V4_MODIFY_LIQUIDITY_SIGNATURE));
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PoolLocator {
     V3(Address),
+    PancakeV3(Address),
     V4(B256),
 }
 
@@ -59,11 +71,15 @@ pub fn build_log_filters(
     hydrated: &HydratedDexState,
 ) -> anyhow::Result<Vec<EthLogFilter>> {
     let mut v3_addresses = BTreeSet::new();
+    let mut pancake_v3_addresses = BTreeSet::new();
     let mut v4_pool_ids = BTreeSet::new();
     for pool in &hydrated.pools {
         match pool.identity {
             PoolIdentity::V3 { address, .. } => {
                 v3_addresses.insert(address);
+            }
+            PoolIdentity::PancakeV3 { address, .. } => {
+                pancake_v3_addresses.insert(address);
             }
             PoolIdentity::V4 { pool_id, .. } => {
                 v4_pool_ids.insert(pool_id);
@@ -71,12 +87,22 @@ pub fn build_log_filters(
         }
     }
 
-    let mut filters = Vec::with_capacity(2);
+    let mut filters = Vec::with_capacity(3);
     if !v3_addresses.is_empty() {
         filters.push(EthLogFilter::new(
             v3_addresses.into_iter().collect(),
             vec![Some(vec![
                 v3_swap_topic(),
+                v3_mint_topic(),
+                v3_burn_topic(),
+            ])],
+        )?);
+    }
+    if !pancake_v3_addresses.is_empty() {
+        filters.push(EthLogFilter::new(
+            pancake_v3_addresses.into_iter().collect(),
+            vec![Some(vec![
+                pancake_v3_swap_topic(),
                 v3_mint_topic(),
                 v3_burn_topic(),
             ])],
@@ -128,6 +154,20 @@ pub fn build_pool_log_filter(
                 ])],
             )
         }
+        PoolLocator::PancakeV3(pool) => {
+            ensure!(
+                event_address == pool,
+                "PancakeSwap V3 settlement event address differs from its pool"
+            );
+            EthLogFilter::new(
+                vec![pool],
+                vec![Some(vec![
+                    pancake_v3_swap_topic(),
+                    v3_mint_topic(),
+                    v3_burn_topic(),
+                ])],
+            )
+        }
         PoolLocator::V4(pool_id) => EthLogFilter::new(
             vec![event_address],
             vec![
@@ -139,10 +179,52 @@ pub fn build_pool_log_filter(
 }
 
 pub fn decode_pool_event(log: &ChainLog) -> anyhow::Result<Option<DecodedPoolEvent>> {
+    decode_pool_event_with_locator(log, None, false)
+}
+
+pub fn decode_pool_event_for_locator(
+    log: &ChainLog,
+    locator: PoolLocator,
+) -> anyhow::Result<Option<DecodedPoolEvent>> {
+    decode_pool_event_with_locator(log, Some(locator), false)
+}
+
+pub(crate) fn decode_pool_event_for_receipt(
+    log: &ChainLog,
+    locator: PoolLocator,
+) -> anyhow::Result<Option<DecodedPoolEvent>> {
+    decode_pool_event_with_locator(log, Some(locator), true)
+}
+
+/// Receipt-only accounting for Pancake's two trailing protocol-fee words.
+/// The WebSocket mirror intentionally skips these fields in its hot path.
+pub fn decode_pancake_v3_protocol_fees(log: &ChainLog) -> anyhow::Result<Option<(u128, u128)>> {
+    if log.topics.first().copied() != Some(pancake_v3_swap_topic()) {
+        return Ok(None);
+    }
+    ensure!(
+        log.data.len() == 7 * 32,
+        "invalid Pancake V3 Swap data length"
+    );
+    Ok(Some((
+        decode_u128(&log.data, 5)?,
+        decode_u128(&log.data, 6)?,
+    )))
+}
+
+fn decode_pool_event_with_locator(
+    log: &ChainLog,
+    locator_hint: Option<PoolLocator>,
+    validate_receipt_fields: bool,
+) -> anyhow::Result<Option<DecodedPoolEvent>> {
     let Some(signature) = log.topics.first().copied() else {
         return Ok(None);
     };
     if signature == v3_swap_topic() {
+        ensure!(
+            locator_hint.is_none_or(|locator| locator == PoolLocator::V3(log.address)),
+            "Uniswap V3 Swap topic does not match its routed pool provider"
+        );
         ensure!(log.topics.len() == 3, "invalid V3 Swap topic count");
         ensure!(log.data.len() == 5 * 32, "invalid V3 Swap data length");
         return Ok(Some(DecodedPoolEvent {
@@ -155,12 +237,39 @@ pub fn decode_pool_event(log: &ChainLog) -> anyhow::Result<Option<DecodedPoolEve
             },
         }));
     }
+    if signature == pancake_v3_swap_topic() {
+        ensure!(
+            locator_hint.is_none_or(|locator| locator == PoolLocator::PancakeV3(log.address)),
+            "PancakeSwap V3 Swap topic does not match its routed pool provider"
+        );
+        ensure!(log.topics.len() == 3, "invalid Pancake V3 Swap topic count");
+        ensure!(
+            log.data.len() == 7 * 32,
+            "invalid Pancake V3 Swap data length"
+        );
+        if validate_receipt_fields {
+            // Validate Pancake's two trailing protocol-fee words in the same
+            // receipt pass without charging the WebSocket mirror hot path.
+            let _protocol_fee_0 = decode_u128(&log.data, 5)?;
+            let _protocol_fee_1 = decode_u128(&log.data, 6)?;
+        }
+        return Ok(Some(DecodedPoolEvent {
+            locator: PoolLocator::PancakeV3(log.address),
+            update: PoolUpdate::Swap {
+                sqrt_price_x96: decode_u256(&log.data, 2)?,
+                liquidity: decode_u128(&log.data, 3)?,
+                tick: decode_i24(&log.data, 4)?,
+                fee_pips: None,
+            },
+        }));
+    }
     if signature == v3_mint_topic() {
         ensure!(log.topics.len() == 4, "invalid V3 Mint topic count");
         ensure!(log.data.len() == 4 * 32, "invalid V3 Mint data length");
         let amount = decode_u128(&log.data, 1)?;
+        let locator = routed_v3_locator(log.address, locator_hint)?;
         return Ok(Some(DecodedPoolEvent {
-            locator: PoolLocator::V3(log.address),
+            locator,
             update: PoolUpdate::Liquidity {
                 tick_lower: decode_topic_i24(&log.topics[2]),
                 tick_upper: decode_topic_i24(&log.topics[3]),
@@ -173,8 +282,9 @@ pub fn decode_pool_event(log: &ChainLog) -> anyhow::Result<Option<DecodedPoolEve
         ensure!(log.data.len() == 3 * 32, "invalid V3 Burn data length");
         let amount = decode_u128(&log.data, 0)?;
         let amount = i128::try_from(amount).context("V3 Burn liquidity exceeds int128")?;
+        let locator = routed_v3_locator(log.address, locator_hint)?;
         return Ok(Some(DecodedPoolEvent {
-            locator: PoolLocator::V3(log.address),
+            locator,
             update: PoolUpdate::Liquidity {
                 tick_lower: decode_topic_i24(&log.topics[2]),
                 tick_upper: decode_topic_i24(&log.topics[3]),
@@ -216,24 +326,40 @@ pub fn decode_pool_event(log: &ChainLog) -> anyhow::Result<Option<DecodedPoolEve
     Ok(None)
 }
 
+fn routed_v3_locator(
+    address: Address,
+    locator_hint: Option<PoolLocator>,
+) -> anyhow::Result<PoolLocator> {
+    let locator = locator_hint.unwrap_or(PoolLocator::V3(address));
+    ensure!(
+        matches!(locator, PoolLocator::V3(pool) | PoolLocator::PancakeV3(pool) if pool == address),
+        "V3 liquidity event does not match its routed pool"
+    );
+    Ok(locator)
+}
+
 pub fn v3_swap_topic() -> B256 {
-    keccak256(V3_SWAP_SIGNATURE)
+    *V3_SWAP_TOPIC
+}
+
+pub fn pancake_v3_swap_topic() -> B256 {
+    *PANCAKE_V3_SWAP_TOPIC
 }
 
 pub fn v3_mint_topic() -> B256 {
-    keccak256(V3_MINT_SIGNATURE)
+    *V3_MINT_TOPIC
 }
 
 pub fn v3_burn_topic() -> B256 {
-    keccak256(V3_BURN_SIGNATURE)
+    *V3_BURN_TOPIC
 }
 
 pub fn v4_swap_topic() -> B256 {
-    keccak256(V4_SWAP_SIGNATURE)
+    *V4_SWAP_TOPIC
 }
 
 pub fn v4_modify_liquidity_topic() -> B256 {
-    keccak256(V4_MODIFY_LIQUIDITY_SIGNATURE)
+    *V4_MODIFY_LIQUIDITY_TOPIC
 }
 
 fn decode_word(data: &[u8], index: usize) -> anyhow::Result<&[u8]> {
@@ -288,11 +414,17 @@ fn decode_i256_as_i128(data: &[u8], index: usize) -> anyhow::Result<i128> {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+
     use alloy_primitives::{Address, B256, U256, address};
 
-    use crate::chain::logs::ChainLog;
+    use crate::{chain::logs::ChainLog, paired_benchmark::assert_paired_non_regression};
 
-    use super::{PoolLocator, PoolUpdate, decode_pool_event, v3_mint_topic, v4_swap_topic};
+    use super::{
+        PoolLocator, PoolUpdate, decode_pancake_v3_protocol_fees, decode_pool_event,
+        decode_pool_event_for_locator, pancake_v3_swap_topic, v3_mint_topic, v3_swap_topic,
+        v4_swap_topic,
+    };
 
     fn word_u128(value: u128) -> [u8; 32] {
         let mut word = [0_u8; 32];
@@ -369,8 +501,107 @@ mod tests {
                 sqrt_price_x96: U256::from(123_u64),
                 tick: -42,
                 liquidity: 456,
-                fee_pips: Some(3_000)
+                fee_pips: Some(3_000),
             }
+        );
+    }
+
+    #[test]
+    fn decodes_pancake_v3_swap_head_from_extended_event_layout() {
+        let pool = address!("0000000000000000000000000000000000000002");
+        let mut data = vec![0_u8; 224];
+        data[64..96].copy_from_slice(&U256::from(123_u64).to_be_bytes::<32>());
+        data[96..128].copy_from_slice(&word_u128(456));
+        data[128..160].copy_from_slice(&word_i32(-42));
+        data[160..192].copy_from_slice(&word_u128(7));
+        data[192..224].copy_from_slice(&word_u128(11));
+        let log = log(
+            pool,
+            vec![pancake_v3_swap_topic(), B256::ZERO, B256::ZERO],
+            data,
+        );
+        let event = decode_pool_event_for_locator(&log, PoolLocator::PancakeV3(pool))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.locator, PoolLocator::PancakeV3(pool));
+        assert_eq!(
+            event.update,
+            PoolUpdate::Swap {
+                sqrt_price_x96: U256::from(123_u64),
+                tick: -42,
+                liquidity: 456,
+                fee_pips: None,
+            }
+        );
+        assert_eq!(
+            decode_pancake_v3_protocol_fees(&log).unwrap(),
+            Some((7, 11))
+        );
+    }
+
+    #[test]
+    fn shared_mint_topic_retains_pancake_provider_identity() {
+        let pool = address!("0000000000000000000000000000000000000002");
+        let mut data = vec![0_u8; 128];
+        data[32..64].copy_from_slice(&word_u128(500));
+        let event = decode_pool_event_for_locator(
+            &log(
+                pool,
+                vec![
+                    v3_mint_topic(),
+                    B256::ZERO,
+                    B256::from(word_i32(-120)),
+                    B256::from(word_i32(120)),
+                ],
+                data,
+            ),
+            PoolLocator::PancakeV3(pool),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(event.locator, PoolLocator::PancakeV3(pool));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired V3 event decoder benchmark"]
+    fn benchmark_uniswap_and_pancake_swap_decoders() {
+        let pool = address!("0000000000000000000000000000000000000002");
+        let mut uniswap_data = vec![0_u8; 160];
+        uniswap_data[64..96].copy_from_slice(&U256::from(123_u64).to_be_bytes::<32>());
+        uniswap_data[96..128].copy_from_slice(&word_u128(456));
+        uniswap_data[128..160].copy_from_slice(&word_i32(-42));
+        let uniswap = log(
+            pool,
+            vec![v3_swap_topic(), B256::ZERO, B256::ZERO],
+            uniswap_data,
+        );
+        let mut pancake_data = vec![0_u8; 224];
+        pancake_data[..160].copy_from_slice(&uniswap.data);
+        pancake_data[160..192].copy_from_slice(&word_u128(7));
+        pancake_data[192..224].copy_from_slice(&word_u128(11));
+        let pancake = log(
+            pool,
+            vec![pancake_v3_swap_topic(), B256::ZERO, B256::ZERO],
+            pancake_data,
+        );
+
+        assert_paired_non_regression(
+            "v3_event_decode_benchmark",
+            1.10,
+            || {
+                black_box(decode_pool_event_for_locator(
+                    &uniswap,
+                    PoolLocator::V3(pool),
+                ))
+                .unwrap();
+            },
+            || {
+                black_box(decode_pool_event_for_locator(
+                    &pancake,
+                    PoolLocator::PancakeV3(pool),
+                ))
+                .unwrap();
+            },
         );
     }
 }

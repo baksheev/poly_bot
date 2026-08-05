@@ -11,8 +11,8 @@ use crate::{
 
 use super::{
     execution::{
-        DexExecutionService, DexExecutor, ExactInputSwapRequest, SwapExecutionOutcome, SwapRoute,
-        UniswapProtocol,
+        DexExecutionService, DexExecutor, DexProtocol, ExactInputSwapRequest, SwapExecutionOutcome,
+        SwapRoute,
     },
     hydration::{DexHydrator, HydratedDexState, PoolIdentity},
     pool_id::V4PoolKey,
@@ -35,7 +35,7 @@ pub struct TokenBalances {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoundTripOutcome {
-    pub protocol: UniswapProtocol,
+    pub protocol: DexProtocol,
     pub wallet: Address,
     pub amount_usdc_in: U256,
     pub amount_wld_received: U256,
@@ -48,7 +48,7 @@ pub struct RoundTripOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoverySellOutcome {
-    pub protocol: UniswapProtocol,
+    pub protocol: DexProtocol,
     pub wallet: Address,
     pub amount_wld_in: U256,
     pub amount_usdc_received: U256,
@@ -58,7 +58,7 @@ pub struct RecoverySellOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_round_trip(
     domain_config: &LoadedDomainConfig,
-    protocol: UniswapProtocol,
+    protocol: DexProtocol,
     amount_usdc_base_units: u64,
     slippage_bps: u16,
     additional_gas: u64,
@@ -248,7 +248,7 @@ pub async fn execute_round_trip(
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_recovery_sell(
     domain_config: &LoadedDomainConfig,
-    protocol: UniswapProtocol,
+    protocol: DexProtocol,
     amount_wld_in: U256,
     slippage_bps: u16,
     additional_gas: u64,
@@ -382,7 +382,7 @@ struct SelectedRoute {
 fn select_route(
     state: &HydratedDexState,
     pair: &PairConfig,
-    protocol: UniswapProtocol,
+    protocol: DexProtocol,
     token_in: Address,
     token_out: Address,
     amount_in: U256,
@@ -404,15 +404,17 @@ fn select_route(
             _ => continue,
         };
         let route = match (protocol, candidate.identity) {
-            (UniswapProtocol::V3, PoolIdentity::V3 { address, fee_pips }) => SwapRoute::V3 {
-                router: configured_address(
-                    "uniswap_v3_router_address",
-                    pair.chain.uniswap_v3_router_address.as_deref(),
-                )?,
-                pool: address,
-                fee_pips,
-            },
-            (UniswapProtocol::V4, PoolIdentity::V4 { pool_id, fee_pips }) => {
+            (DexProtocol::UniswapV3, PoolIdentity::V3 { address, fee_pips }) => {
+                SwapRoute::UniswapV3 {
+                    router: configured_address(
+                        "uniswap_v3_router_address",
+                        pair.chain.uniswap_v3_router_address.as_deref(),
+                    )?,
+                    pool: address,
+                    fee_pips,
+                }
+            }
+            (DexProtocol::UniswapV4, PoolIdentity::V4 { pool_id, fee_pips }) => {
                 let pool_key = pair
                     .dex
                     .uniswap_v4
@@ -551,7 +553,7 @@ fn only_pair(domain_config: &LoadedDomainConfig) -> anyhow::Result<&PairConfig> 
     Ok(&domain_config.snapshot().pairs[0])
 }
 
-fn validate_pair(pair: &PairConfig, protocol: UniswapProtocol) -> anyhow::Result<()> {
+fn validate_pair(pair: &PairConfig, protocol: DexProtocol) -> anyhow::Result<()> {
     ensure!(
         pair.chain.chain_id == WORLD_CHAIN_ID,
         "validation pair is not on World Chain"
@@ -569,8 +571,11 @@ fn validate_pair(pair: &PairConfig, protocol: UniswapProtocol) -> anyhow::Result
         "validation token_b is not WLD"
     );
     let provider = match protocol {
-        UniswapProtocol::V3 => DexProvider::UniswapV3,
-        UniswapProtocol::V4 => DexProvider::UniswapV4,
+        DexProtocol::UniswapV3 => DexProvider::UniswapV3,
+        DexProtocol::UniswapV4 => DexProvider::UniswapV4,
+        DexProtocol::PancakeSwapV3 => {
+            anyhow::bail!("PancakeSwap is outside the World Chain Uniswap validation command")
+        }
     };
     ensure!(
         pair.dex.allowed_providers.contains(&provider),

@@ -74,11 +74,12 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("[500,3000,10000]"));
     assert!(DEPLOY_WORKFLOW.contains("0x610e319b3a3ab56a0ed5562927d37c233774ba39"));
     assert!(
-        DEPLOY_WORKFLOW
-            .contains("arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool")
+        DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-arb-arbitrum-v3-pancakeswap-v3-shadow")
     );
     assert!(DEPLOY_WORKFLOW.contains("[500,3000]"));
     assert!(DEPLOY_WORKFLOW.contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"));
+    assert!(DEPLOY_WORKFLOW.contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"));
+    assert!(DEPLOY_WORKFLOW.contains("selection_enabled\":false"));
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("max_transport_silence_ms"));
