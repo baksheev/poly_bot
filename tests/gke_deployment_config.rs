@@ -135,8 +135,9 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("backlog_empty_before_ready"));
     assert!(MAIN.contains("on_startup_dex_event"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl exec"));
+    assert!(!DEPLOY_WORKFLOW.contains("kind: \"Job\""));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
-    assert!(DEPLOY_WORKFLOW.contains("kubectl logs job/\"${job}\""));
+    assert!(DEPLOY_WORKFLOW.contains("wait_operation_owner \"${bootstrap_owner}\" bootstrap"));
 }
 
 #[test]
