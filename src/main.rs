@@ -341,22 +341,24 @@ fn log_compiled_graph(summary: Option<&CompiledGraphSummary>) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let process_started_at = Instant::now();
-    // RUNTIME_READY_FILE is supplied by the production environment, so clear
-    // an emptyDir marker left by a crashed process before configuration,
-    // tracing, domain validation, or the first await.
-    let runtime_ready_path = runtime_ready_marker_path()?;
-    let mut runtime_ready_marked = runtime_ready_path
-        .as_ref()
-        .is_some_and(|path| path.exists());
-    sync_runtime_ready_marker(
-        runtime_ready_path.as_deref(),
-        &mut runtime_ready_marked,
-        false,
-    )?;
     load_dotenv()?;
     init_tracing();
 
     let cli = Cli::parse();
+    // Only the long-lived process that owns a readiness probe may clear a
+    // marker left in the Pod's shared emptyDir. Operator subcommands run in
+    // the live container too; they must never change the owner's readiness.
+    if command_owns_runtime_readiness(&cli.command) {
+        let runtime_ready_path = runtime_ready_marker_path()?;
+        let mut runtime_ready_marked = runtime_ready_path
+            .as_ref()
+            .is_some_and(|path| path.exists());
+        sync_runtime_ready_marker(
+            runtime_ready_path.as_deref(),
+            &mut runtime_ready_marked,
+            false,
+        )?;
+    }
     cli.config.validate()?;
 
     match cli.command {
@@ -681,6 +683,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn command_owns_runtime_readiness(command: &Command) -> bool {
+    matches!(command, Command::Run | Command::CollectPrices)
 }
 
 async fn arbitrage_emit_result(
@@ -6686,8 +6692,9 @@ mod tests {
     };
 
     use super::{
-        ACROSS_RECONCILIATION_INTERVAL, RebalanceDispatchOutcome, RebalanceExecutionTarget,
-        RebalanceExecutorCommand, StartupDexDrainStats, apply_rebalance_dispatch_outcome,
+        ACROSS_RECONCILIATION_INTERVAL, Command, RebalanceDispatchOutcome,
+        RebalanceExecutionTarget, RebalanceExecutorCommand, StartupDexDrainStats,
+        apply_rebalance_dispatch_outcome, command_owns_runtime_readiness,
         dispatch_across_reconciliation, esp_evm_journal_scope, rebalance_quote_retry_delay,
         sync_runtime_ready_marker, transient_capital_allocator_inventory_mismatch,
     };
@@ -6737,6 +6744,20 @@ mod tests {
 
         assert!(!marked);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn operator_subcommand_does_not_own_runtime_readiness() {
+        assert!(command_owns_runtime_readiness(&Command::Run));
+        assert!(command_owns_runtime_readiness(&Command::CollectPrices));
+        assert!(!command_owns_runtime_readiness(
+            &Command::BinanceCapitalRecovery {
+                coin: "USDC".to_owned(),
+                network: "OPTIMISM".to_owned(),
+                deposit_transaction_hash: Some("0x01".to_owned()),
+                withdraw_order_id: None,
+            }
+        ));
     }
 
     #[test]
