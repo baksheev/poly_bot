@@ -5,23 +5,26 @@
   "compiler_version": "production-v1",
   "sources": [
     {
-      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v1-six-usdc-detector",
-      "source_fingerprint_sha256": "04b109f6034a730f07c9b445acff5cb1d29784ec5f2985fbc2b9526239f351d4",
+      "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool",
+      "source_fingerprint_sha256": "37842505660a3e44fe7e2b950c4f545366506e54a76fb2900079ada1e9fb2885",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v1-six-usdc-detector",
+        "snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
           "rails_pair_candidate_id": 2694,
           "rails_pair_candidate_updated_at_utc": "2026-05-21T21:56:54.274070Z",
-          "captured_at_utc": "2026-08-05T05:54:11Z",
+          "captured_at_utc": "2026-08-05T08:29:32Z",
           "evidence": [
             "production PostgreSQL read-only PairCandidate export for ARBUSDC",
             "Binance Spot exchangeInfo and account commission filters for ARBUSDC",
             "canonical Uniswap V3 factory verification for the Arbitrum One 0.3% pool",
+            "canonical Uniswap V3 factory and pool-state verification for the Arbitrum One 0.05% pool at block 491301908",
+            "GeckoTerminal exact-pool OHLCV for 2026-07-06 through 2026-08-04 measured 66798.24 USD of 30-day volume for the 0.05% pool",
             "historical bucket replay recorded persistent 20 bps opportunities over the comparison period",
             "operator funded the isolated Rust Binance subaccount with 1000 USDC and approved permanent full-live ARB/USDC trading and rebalancing on 2026-08-05",
+            "operator approved the additive canonical Uniswap V3 0.05% ARB/USDC production route on 2026-08-05",
             "explicit operator decision: the detector/control notional is 6 USDC while adaptive execution remains capped at 200 USDC"
           ]
         },
@@ -120,6 +123,7 @@
               ],
               "uniswap_v3": {
                 "fee_tiers": [
+                  500,
                   3000
                 ]
               }
@@ -681,6 +685,17 @@
       "lifecycle": "execution_eligible"
     },
     {
+      "id": "eip155:42161:pool:V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }",
+      "pair_id": "arbitrum-usdc-arb",
+      "network_id": "eip155:42161",
+      "protocol": "uniswap_v3",
+      "canonical_identity": "V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }",
+      "fee_pips": 500,
+      "tick_spacing": null,
+      "hooks": null,
+      "lifecycle": "execution_eligible"
+    },
+    {
       "id": "eip155:480:pool:V3 { address: 0x02371da6173CF95623Da4189E68912233cc7107C, fee_pips: 500 }",
       "pair_id": "world-chain-usdc-wld",
       "network_id": "eip155:480",
@@ -740,7 +755,7 @@
     {
       "id": "strategy:arbitrum-usdc-arb",
       "pair_id": "arbitrum-usdc-arb",
-      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v1-six-usdc-detector",
+      "source_snapshot_id": "arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "network_id": "eip155:42161",
@@ -770,7 +785,8 @@
       "strategy_id": "strategy:arbitrum-usdc-arb",
       "instrument_id": "binance-spot:primary:ARBUSDC",
       "pool_ids": [
-        "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }"
+        "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }",
+        "eip155:42161:pool:V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }"
       ]
     },
     {
@@ -853,7 +869,8 @@
       "kind": "network_runtime",
       "owned_ids": [
         "eip155:42161:pool:V3 { address: 0x15eB51A325cbCE6C1Cc8202a6f8a76224c5b7540, fee_pips: 100 }",
-        "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }"
+        "eip155:42161:pool:V3 { address: 0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3, fee_pips: 3000 }",
+        "eip155:42161:pool:V3 { address: 0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8, fee_pips: 500 }"
       ]
     },
     {

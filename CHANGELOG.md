@@ -20,6 +20,10 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Add the canonical Arbitrum Uniswap V3 ARB/USDC 0.05% pool to the immutable
+  v2 production domain. The existing multi-pool local V3 curve, adaptive
+  selection, calldata, receipt, recovery, and shared ARB inventory paths are
+  reused unchanged alongside the 0.3% control pool.
 - Add ARB/USDC on the canonical Arbitrum Uniswap V3 0.3% pool as the third
   permanent adaptive `full_live` strategy. The release uses one idempotent,
   quiesced 500 USDC Binance inventory bootstrap, then the existing direct

@@ -5,7 +5,7 @@
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v14.json",
     "config/strategies/usdc-esp-arbitrum.v7.json",
-    "config/strategies/usdc-arb-arbitrum.v1.json"
+    "config/strategies/usdc-arb-arbitrum.v2.json"
   ],
   "accounts": [
     {
@@ -31,6 +31,12 @@
       "fee_pips": 100,
       "address": "0x15eb51a325cbce6c1cc8202a6f8a76224c5b7540",
       "lifecycle": "validated"
+    },
+    {
+      "pair_id": "arbitrum-usdc-arb",
+      "fee_pips": 500,
+      "address": "0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8",
+      "lifecycle": "execution_eligible"
     },
     {
       "pair_id": "arbitrum-usdc-arb",

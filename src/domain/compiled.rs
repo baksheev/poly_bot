@@ -2704,7 +2704,16 @@ mod tests {
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
         assert_eq!(bundle.strategies.len(), 3);
-        assert_eq!(bundle.pools.len(), 7);
+        assert_eq!(bundle.pools.len(), 8);
+        assert!(bundle.pools.iter().any(|pool| {
+            pool.pair_id == "arbitrum-usdc-arb"
+                && pool.protocol == PoolProtocol::UniswapV3
+                && pool.fee_pips == 500
+                && pool
+                    .canonical_identity
+                    .to_ascii_lowercase()
+                    .contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")
+        }));
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "world-chain-usdc-wld"
                 && pool.protocol == PoolProtocol::UniswapV3
@@ -2930,7 +2939,19 @@ mod tests {
             .unwrap();
         assert!(arb.observe && arb.plan && arb.execute);
         assert_eq!(arb.network_id.as_str(), "eip155:42161");
-        assert_eq!(arb.pool_ids.len(), 1);
+        assert_eq!(arb.pool_ids.len(), 2);
+        assert!(arb.pool_ids.iter().any(|pool_id| {
+            pool_id
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")
+        }));
+        assert!(arb.pool_ids.iter().any(|pool_id| {
+            pool_id
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")
+        }));
         assert!(arb.domain_config.snapshot().live_trading_enabled);
         assert_ne!(
             live.config.fingerprint_sha256(),

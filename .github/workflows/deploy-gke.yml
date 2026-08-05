@@ -148,6 +148,7 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
           arb='.sources[] | select(.snapshot.pairs[0].id == "arbitrum-usdc-arb") | .snapshot'
+          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v2-uniswap-v3-five-bps-pool
           test "$(jq -r "${arb} | .source.rails_pair_candidate_id" "${domain_config}")" = 2694
           test "$(jq -r "${arb} | .pairs[0].binance.symbol" "${domain_config}")" = ARBUSDC
           test "$(jq -r "${arb} | .pairs[0].binance.step_size" "${domain_config}")" = 0.10000000
@@ -159,8 +160,10 @@ jobs:
           test "$(jq -r "${arb} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
           test "$(jq -r "${arb} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
           test "$(jq -r "${arb} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-05T05:54:11Z
-          test "$(jq -c "${arb} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" = '[3000]'
+          test "$(jq -c "${arb} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" = '[500,3000]'
+          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 500 and ((.canonical_identity | ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 3000 and ((.canonical_identity | ascii_downcase) | contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
