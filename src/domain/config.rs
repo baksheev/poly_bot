@@ -310,16 +310,21 @@ impl FullLivePolicy {
             pair.execution_enabled
                 && pair.rebalance.enabled
                 && pair.chain.chain_id == 42_161
-                && pair.binance.symbol == "ESPUSDC",
-            "full-live policy is restricted to the reviewed ESPUSDC Arbitrum pair"
+                && matches!(pair.binance.symbol.as_str(), "ESPUSDC" | "ARBUSDC"),
+            "full-live policy is restricted to reviewed Arbitrum USDC pairs"
         );
         validate_non_empty(
             "full_live_policy.production_approval_actor",
             &self.production_approval_actor,
         )?;
+        let reviewed_approval = match pair.binance.symbol.as_str() {
+            "ESPUSDC" => "2026-07-31T11:00:00Z",
+            "ARBUSDC" => "2026-08-05T05:54:11Z",
+            _ => unreachable!("symbol was restricted above"),
+        };
         ensure!(
             self.production_approval_actor == "operator"
-                && self.production_approval_recorded_at_utc == "2026-07-31T11:00:00Z",
+                && self.production_approval_recorded_at_utc == reviewed_approval,
             "full-live production approval identity differs from the reviewed artifact"
         );
         ensure!(

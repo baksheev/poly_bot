@@ -13,16 +13,19 @@ settlement, reservations, rebalancing, or deployment.
 - One application Pod runs on the fixed `c4-highcpu-8` node in the private
   zonal GKE Standard cluster `arb-bot` in `asia-southeast1-b`.
 - Both runtime containers load one compiled multi-pair bundle. Its strict live
-  compatibility projection preserves the reviewed WLD/USDC v14 and ESP/USDC
-  v7 adaptive-live artifacts with arbitrage and rebalancing in `full_live`.
+  compatibility projection preserves the reviewed WLD/USDC v14, ESP/USDC v7,
+  and ARB/USDC v1 adaptive-live artifacts with arbitrage and rebalancing in
+  `full_live`.
 - The live container derives one shared Binance account runtime from that
-  bundle: a directly-polled stream shard carries WLDUSDC and ESPUSDC, one
+  bundle: a directly-polled stream shard carries WLDUSDC, ESPUSDC, and
+  ARBUSDC, one
   account generation hydrates all Spot assets and per-symbol metadata, and the
-  capability boundary authorizes only the two reviewed execution symbols.
+  capability boundary authorizes only the three reviewed execution symbols.
 - The same live projection derives one reusable `NetworkRuntime` for World
   Chain and one for Arbitrum. Startup pool and wallet reads are canonical
-  block-hash-pinned and priority-isolated; only World Chain has a reviewed
-  World Chain and Arbitrum each retain their reviewed mutation/gas policy.
+  block-hash-pinned and priority-isolated; World Chain and Arbitrum each retain
+  their reviewed mutation/gas policy. ESP and ARB share one Arbitrum
+  signer/nonce lane.
 - The stopped `arb-bot-rust-shadow-gce` VM is a rollback target only. It must
   never run while the GKE Deployment has a nonzero replica count.
 - Rails runs independently with separate mutable state. Rust never reads Rails

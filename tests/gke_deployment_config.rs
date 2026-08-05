@@ -63,6 +63,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains(".bundle_kind"));
     assert!(DEPLOY_WORKFLOW.contains(".capabilities"));
     assert!(DEPLOY_WORKFLOW.contains(".stream_shards"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:ARBUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:ESPUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:WLDUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("live_runtime"));
@@ -107,15 +108,21 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("portfolio_allocator_mode"));
     assert!(MAIN.contains("portfolio_external_mutation_authorized"));
     assert!(MAIN.contains("live_rebalance_adapter"));
-    assert!(MAIN.contains("ESP full-live production strategy configured"));
+    assert!(MAIN.contains("Arbitrum full-live production strategies configured"));
     assert!(MAIN.contains("shared_inventory_owner"));
     assert!(MAIN.contains("shared_binance_order_owner"));
     assert!(MAIN.contains("secondary_hot_path_rebalance_mutation_authorized"));
     assert!(MAIN.contains("report_strategy_dependency_faults"));
     assert!(MAIN.contains("engine.take_adaptive_sizing_jobs()"));
     assert!(MAIN.contains("esp_engine.take_adaptive_sizing_jobs()"));
+    assert!(MAIN.contains("arb_engine.take_adaptive_sizing_jobs()"));
     assert!(MAIN.contains("engine.on_adaptive_sizing_result(result)"));
     assert!(MAIN.contains("esp_engine.on_adaptive_sizing_result(result)"));
+    assert!(MAIN.contains("arb_engine.on_adaptive_sizing_result(result)"));
+    assert!(DEPLOY_WORKFLOW.contains("Bootstrap reviewed ARB inventory once"));
+    assert!(DEPLOY_WORKFLOW.contains("bootstrap-arb-inventory --quote-usdc 500"));
+    assert!(DEPLOY_WORKFLOW.contains("active_operation_count=0"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-inventory-bootstrap-v1=complete:"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
         .expect("startup DEX backlog drain is wired");
@@ -125,9 +132,9 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(startup_drain < readiness);
     assert!(MAIN.contains("backlog_empty_before_ready"));
     assert!(MAIN.contains("on_startup_dex_event"));
-    assert!(!DEPLOY_WORKFLOW.contains("kubectl exec"));
+    assert!(DEPLOY_WORKFLOW.contains("kubectl exec"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
-    assert!(!DEPLOY_WORKFLOW.contains("kubectl logs"));
+    assert!(DEPLOY_WORKFLOW.contains("kubectl logs job/\"${job}\""));
 }
 
 #[test]
@@ -160,9 +167,9 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
         DEPLOY_WORKFLOW
             .matches(".pairs[0].quote_sizing.token_a_base_units")
             .count(),
-        2
+        3
     );
-    assert_eq!(DEPLOY_WORKFLOW.matches("= 6000000").count(), 2);
+    assert_eq!(DEPLOY_WORKFLOW.matches("= 6000000").count(), 3);
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].full_live_policy.production_approval_actor"));
     assert!(DEPLOY_WORKFLOW.contains("arbitrum_max_fee_headroom_bps"));
     assert!(DEPLOY_WORKFLOW.contains("router_allowance_mode"));
@@ -180,7 +187,10 @@ fn gke_full_live_runtime_keeps_durable_state_and_safe_rollback_guards() {
     assert!(!DEPLOYMENT.contains("initContainers:"));
     assert!(DEPLOYMENT.contains("claimName: arb-bot-state"));
     assert!(!DEPLOYMENT.contains("kind: Job"));
-    assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
+    let rollout = DEPLOY_WORKFLOW
+        .find("Roll out on the fixed node")
+        .expect("rollout step exists");
+    assert!(!DEPLOY_WORKFLOW[rollout..].contains("kubectl scale"));
     assert!(!DEPLOY_WORKFLOW.contains("jobs.batch"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_a_fee_base_units"));
     assert!(DEPLOY_WORKFLOW.contains("maximum_rebalance_token_b_fee_base_units"));

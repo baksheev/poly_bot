@@ -31,6 +31,7 @@ use arb_bot::{
         select_capital_routes,
     },
     binance::{
+        bootstrap::bootstrap_arb_inventory,
         execution::{BinanceExecutionService, BinanceOrderRequest, BinanceOrderRequestKind},
         order_journal::{
             BinanceOrderIntent, BinanceOrderJournal, BinanceOrderJournalScope, BinanceOrderProgress,
@@ -143,15 +144,21 @@ fn allowance_operation_id(symbol: &str) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RebalanceExecutionTarget {
     Primary,
-    Arbitrum,
+    ArbitrumEsp,
+    ArbitrumArb,
 }
 
 impl RebalanceExecutionTarget {
     fn other(self) -> Self {
         match self {
-            Self::Primary => Self::Arbitrum,
-            Self::Arbitrum => Self::Primary,
+            Self::Primary => Self::ArbitrumEsp,
+            Self::ArbitrumEsp => Self::ArbitrumArb,
+            Self::ArbitrumArb => Self::Primary,
         }
+    }
+
+    fn is_arbitrum(self) -> bool {
+        matches!(self, Self::ArbitrumEsp | Self::ArbitrumArb)
     }
 }
 
@@ -212,7 +219,11 @@ fn rebalance_target(operation: &RebalanceExecutionOperation) -> RebalanceExecuti
         .as_ref()
         .is_some_and(|scope| scope.network_id == "chain:42161")
     {
-        RebalanceExecutionTarget::Arbitrum
+        if operation.intent.token_symbol == "ARB" {
+            RebalanceExecutionTarget::ArbitrumArb
+        } else {
+            RebalanceExecutionTarget::ArbitrumEsp
+        }
     } else {
         RebalanceExecutionTarget::Primary
     }
@@ -234,6 +245,14 @@ fn emit_rebalance_risk(telemetry: &TelemetryHandle, engine_id: &str, executor: &
                 "token_b_debit": risk.token_b_debit.to_string(),
                 "token_a_maximum_fee": risk.token_a_maximum_fee.to_string(),
                 "token_b_maximum_fee": risk.token_b_maximum_fee.to_string(),
+                "additional_token_debit": risk.additional_token_debit
+                    .iter()
+                    .map(|(symbol, amount)| (symbol, amount.to_string()))
+                    .collect::<BTreeMap<_, _>>(),
+                "additional_token_maximum_fee": risk.additional_token_maximum_fee
+                    .iter()
+                    .map(|(symbol, amount)| (symbol, amount.to_string()))
+                    .collect::<BTreeMap<_, _>>(),
                 "first_started_at_unix_ms": risk.first_started_at_unix_ms,
                 "outcome": "success",
             }),
@@ -261,7 +280,7 @@ fn emit_rebalance_saga(
     started_at: Instant,
     recovered: bool,
 ) {
-    if target != RebalanceExecutionTarget::Arbitrum {
+    if !target.is_arbitrum() {
         return;
     }
     let operation = result
@@ -516,6 +535,17 @@ async fn main() -> anyhow::Result<()> {
                 usdc_after = %outcome.after.usdc,
                 "Binance live validation evidence"
             );
+            Ok(())
+        }
+        Command::BootstrapArbInventory {
+            quote_usdc,
+            journal_path,
+            live_confirmation,
+        } => {
+            let quote_usdc =
+                Decimal::from_str(&quote_usdc).context("--quote-usdc must be an exact decimal")?;
+            bootstrap_arb_inventory(&cli.config, quote_usdc, journal_path, &live_confirmation)
+                .await?;
             Ok(())
         }
         Command::BinanceWithdrawalStatus {
@@ -2332,6 +2362,14 @@ async fn run(
             .find(|strategy| strategy.symbol == "ESPUSDC")
             .cloned()
     });
+    let arb_strategy_plan = hot_path_dependencies.as_ref().and_then(|dependencies| {
+        dependencies
+            .plan()
+            .strategies
+            .iter()
+            .find(|strategy| strategy.symbol == "ARBUSDC")
+            .cloned()
+    });
     if let Some(dependencies) = hot_path_dependencies.as_ref() {
         ensure!(
             dependencies
@@ -2340,8 +2378,8 @@ async fn run(
                 .iter()
                 .filter(|strategy| strategy.execute)
                 .count()
-                == 2,
-            "ESP production hot path requires exactly two executable strategies"
+                == 3,
+            "production hot path requires exactly three executable strategies"
         );
         ensure!(
             dependencies
@@ -2360,14 +2398,17 @@ async fn run(
             .filter(|strategy| strategy.execute)
             .collect::<Vec<_>>();
         ensure!(
-            executable.len() == 2
+            executable.len() == 3
                 && executable
                     .iter()
                     .any(|strategy| strategy.symbol == "WLDUSDC")
                 && executable
                     .iter()
-                    .any(|strategy| strategy.symbol == "ESPUSDC"),
-            "ESP permits execution only for WLDUSDC and ESPUSDC"
+                    .any(|strategy| strategy.symbol == "ESPUSDC")
+                && executable
+                    .iter()
+                    .any(|strategy| strategy.symbol == "ARBUSDC"),
+            "production permits execution only for WLDUSDC, ESPUSDC, and ARBUSDC"
         );
         let account_id = compiled_binance_runtime
             .as_ref()
@@ -2408,16 +2449,20 @@ async fn run(
             "scoped execution ownership graph validated"
         );
     }
-    let (initialized_dex, shadow_initialized_dex) =
-        if let Some(shadow) = shadow_strategy_plan.as_ref() {
-            let (primary, observed) = tokio::try_join!(
+    let (initialized_dex, shadow_initialized_dex, arb_initialized_dex) =
+        if let (Some(shadow), Some(arb)) =
+            (shadow_strategy_plan.as_ref(), arb_strategy_plan.as_ref())
+        {
+            let (primary, observed, arb) = tokio::try_join!(
                 initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()),
                 initialize_dex(&config, &shadow.domain_config, network_registry.as_ref()),
+                initialize_dex(&config, &arb.domain_config, network_registry.as_ref()),
             )?;
-            (primary, Some(observed))
+            (primary, Some(observed), Some(arb))
         } else {
             (
                 initialize_dex(&config, domain_config.as_ref(), network_registry.as_ref()).await?,
+                None,
                 None,
             )
         };
@@ -2467,10 +2512,11 @@ async fn run(
             "compiled Binance stream shard and account symbol registry differ"
         );
         ensure!(
-            runtime.executable_symbols.len() == 2
+            runtime.executable_symbols.len() == 3
                 && runtime.executable_symbols.contains(&pair.binance.symbol)
-                && runtime.executable_symbols.contains("ESPUSDC"),
-            "compiled Binance capabilities must enable the reviewed WLD and ESP symbols"
+                && runtime.executable_symbols.contains("ESPUSDC")
+                && runtime.executable_symbols.contains("ARBUSDC"),
+            "compiled Binance capabilities must enable WLD, ESP, and ARB symbols"
         );
     }
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
@@ -2484,6 +2530,11 @@ async fn run(
         .as_ref()
         .and_then(|strategy| strategy.domain_config.snapshot().pairs.first())
         .context("compiled ESP ESP strategy has no esp pair")?
+        .clone();
+    let arb_pair = arb_strategy_plan
+        .as_ref()
+        .and_then(|strategy| strategy.domain_config.snapshot().pairs.first())
+        .context("compiled ARB strategy has no pair")?
         .clone();
     match shared_binance_account
         .symbol(&esp_pair.binance.symbol)
@@ -2531,6 +2582,48 @@ async fn run(
             );
         }
     }
+    match shared_binance_account
+        .symbol(&arb_pair.binance.symbol)
+        .context("shared Binance account omitted ARBUSDC")
+        .and_then(|state| validate_binance_readiness(&arb_pair, state))
+    {
+        Ok(readiness) => telemetry.emit(
+            "live_readiness",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "stage": "binance_order_matrix",
+                "pair_id": arb_pair.id,
+                "network_id": "eip155:42161",
+                "symbol": readiness.symbol,
+                "buy_fee_bps": readiness.buy_fee_bps,
+                "sell_fee_bps": readiness.sell_fee_bps,
+                "validation_price": readiness.validation_price.to_string(),
+                "validation_quantity": readiness.validation_quantity.to_string(),
+                "configured_detector_notional": readiness.configured_detector_notional.to_string(),
+                "effective_detector_notional": readiness.effective_detector_notional.to_string(),
+                "request_fingerprints": readiness.request_fingerprints,
+                "request_count": 4,
+                "filters_ready": readiness.filters_ready,
+                "external_mutation_authorized": readiness.external_mutation_authorized,
+                "ready": true,
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(pair_id = arb_pair.id, error = %error, "ARB Binance readiness is incomplete; ARB fails closed");
+            telemetry.emit(
+                "live_readiness",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "stage": "binance_order_matrix",
+                    "pair_id": arb_pair.id,
+                    "network_id": "eip155:42161",
+                    "symbol": arb_pair.binance.symbol,
+                    "external_mutation_authorized": false,
+                    "ready": false,
+                }),
+            );
+        }
+    }
     let binance_account_generation = shared_binance_account.generation;
     let binance_account_snapshot_duration_us = shared_binance_account.account_snapshot_duration_us;
     let hydrated_binance_symbols: Vec<_> = shared_binance_account.symbols.keys().cloned().collect();
@@ -2548,6 +2641,7 @@ async fn run(
     };
     shared_binance_runtime.ensure_order_enabled(&pair.binance.symbol)?;
     shared_binance_runtime.ensure_order_enabled(&esp_pair.binance.symbol)?;
+    shared_binance_runtime.ensure_order_enabled(&arb_pair.binance.symbol)?;
     let esp_symbol_state = shared_binance_account
         .symbol(&esp_pair.binance.symbol)
         .context("shared Binance account omitted ESPUSDC")?;
@@ -2574,6 +2668,33 @@ async fn run(
             == Decimal::from_str(&esp_pair.binance.step_size)
                 .context("ESP ESP Binance step_size is invalid")?,
         "ESP ESP step_size differs from live LOT_SIZE"
+    );
+    let arb_symbol_state = shared_binance_account
+        .symbol(&arb_pair.binance.symbol)
+        .context("shared Binance account omitted ARBUSDC")?;
+    let arb_buy_fee_bps = arb_symbol_state
+        .commission
+        .conservative_taker_fee_bps("BUY")?;
+    let arb_sell_fee_bps = arb_symbol_state
+        .commission
+        .conservative_taker_fee_bps("SELL")?;
+    ensure!(
+        arb_symbol_state.symbol_rules.base_asset == arb_pair.binance.base_asset
+            && arb_symbol_state.symbol_rules.quote_asset == arb_pair.binance.quote_asset,
+        "ARBUSDC exchangeInfo assets differ from the ARB domain artifact"
+    );
+    let arb_execution_symbol_rules = arb_symbol_state
+        .symbol_rules
+        .with_compatible_price_step(
+            Decimal::from_str(&arb_pair.binance.tick_size)
+                .context("ARB Binance tick_size is invalid")?,
+        )
+        .context("ARB tick_size is incompatible with live PRICE_FILTER")?;
+    ensure!(
+        arb_symbol_state.symbol_rules.lot_size.step
+            == Decimal::from_str(&arb_pair.binance.step_size)
+                .context("ARB Binance step_size is invalid")?,
+        "ARB step_size differs from live LOT_SIZE"
     );
     let binance_account = shared_binance_account.into_symbol(&pair.binance.symbol)?;
     let binance_clock_sync_client = binance_account_client.clone();
@@ -2760,6 +2881,68 @@ async fn run(
         } else {
             RebalanceTracker::disabled()
         };
+    let arb_rebalance_tracker =
+        if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive {
+            ensure!(
+                arb_pair.rebalance.enabled,
+                "live rebalance allocator requires the ARB pair rebalance policy"
+            );
+            match validate_rebalance_readiness(&arb_pair, &capital_coins) {
+                Ok(readiness) => telemetry.emit(
+                    "live_readiness",
+                    serde_json::json!({
+                        "engine_id": config.engine_id,
+                        "stage": "arbitrum_rebalance_routes",
+                        "pair_id": arb_pair.id,
+                        "network_id": "eip155:42161",
+                        "binance_network": readiness.network,
+                        "asset_count": readiness.asset_count,
+                        "direct_route_count": readiness.direct_route_count,
+                        "deposit_enabled_assets": readiness.deposit_enabled_assets,
+                        "withdrawal_enabled_assets": readiness.withdrawal_enabled_assets,
+                        "external_mutation_authorized": readiness.external_mutation_authorized,
+                        "ready": readiness.ready,
+                    }),
+                ),
+                Err(error) => anyhow::bail!("ARB rebalance readiness failed: {error:#}"),
+            }
+            let token = &arb_pair.token_b;
+            let capital = select_capital_routes(
+                &capital_coins,
+                &token.symbol,
+                &arb_pair.chain.binance_network_name,
+                "OPTIMISM",
+            )?;
+            let direct = capital
+                .direct
+                .as_ref()
+                .filter(|route| route.network == arb_pair.chain.binance_network_name)
+                .context("ARB direct Arbitrum capital route is absent")?;
+            ensure!(
+                capital.deposit_all_enabled
+                    && capital.withdrawal_all_enabled
+                    && direct.deposit_available()
+                    && direct.withdrawal_available(),
+                "ARB direct Arbitrum capital route is not fully available"
+            );
+            let routes = BTreeMap::from([(
+                token.symbol.clone(),
+                route_candidates_from_capital(
+                    &CapitalRouteState {
+                        coin: capital.coin.clone(),
+                        deposit_all_enabled: capital.deposit_all_enabled,
+                        withdrawal_all_enabled: capital.withdrawal_all_enabled,
+                        direct: Some(direct.clone()),
+                        fallback: None,
+                    },
+                    token.decimals,
+                    ARBITRUM_CHAIN_ID,
+                )?,
+            )]);
+            RebalanceTracker::new_for_tokens(&arb_pair, routes, [&arb_pair.token_b.symbol])?
+        } else {
+            RebalanceTracker::disabled()
+        };
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -2887,6 +3070,46 @@ async fn run(
         Some(ChainReadinessStatus::Observed { ready: true, .. })
     )));
     let esp_market_data_ready = Arc::new(AtomicBool::new(true));
+    let (arb_chain_readiness_probe, arb_initial_chain_readiness_status) = if let Some(registry) =
+        network_registry.as_ref()
+    {
+        let runtime = registry.get_by_chain_id(ARBITRUM_CHAIN_ID)?;
+        let snapshot = portfolio_wallet_snapshots
+            .iter()
+            .find(|snapshot| snapshot.chain_id == ARBITRUM_CHAIN_ID)
+            .context("ARB Arbitrum wallet snapshot is missing")?;
+        let probe = ChainReadinessProbe::new(&arb_pair, runtime, wallet_owner)?;
+        match inspect_chain_readiness(&arb_pair, runtime, snapshot).await {
+            Ok(readiness) => {
+                emit_chain_readiness(
+                    &telemetry,
+                    &config.engine_id,
+                    &arb_pair,
+                    &readiness,
+                    "startup",
+                );
+                (Some(probe), Some(readiness.status()))
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "ARB chain readiness is incomplete; ARB fails closed");
+                emit_chain_readiness_failure(
+                    &telemetry,
+                    &config.engine_id,
+                    &arb_pair,
+                    "startup",
+                    &error,
+                );
+                (Some(probe), Some(ChainReadinessStatus::ProbeFailed))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let arb_execution_ready = Arc::new(AtomicBool::new(matches!(
+        arb_initial_chain_readiness_status,
+        Some(ChainReadinessStatus::Observed { ready: true, .. })
+    )));
+    let arb_market_data_ready = Arc::new(AtomicBool::new(true));
     let mut binance_asset_symbols = compiled_binance_runtime
         .as_ref()
         .map(|runtime| runtime.asset_symbols.clone())
@@ -2967,6 +3190,15 @@ async fn run(
                 })
                 .transpose()?
                 .unwrap_or(Decimal::ZERO);
+            let maximum_arb = capital_policy
+                .as_ref()
+                .filter(|policy| policy.external_mutation_authorized)
+                .and_then(|policy| policy.additional_tokens.get("ARB"))
+                .map(|policy| {
+                    rebalance_base_units_to_decimal(policy.maximum_debit, arb_pair.token_b.decimals)
+                })
+                .transpose()?
+                .unwrap_or(Decimal::ZERO);
             let mut executor = RebalanceExecutor::hydrate(
                 binance_account_client.clone(),
                 treasury_client,
@@ -2982,6 +3214,7 @@ async fn run(
                     maximum_wld: config.rebalance_max_wld_amount,
                     maximum_usdc: config.rebalance_max_usdc_amount,
                     maximum_esp,
+                    maximum_arb,
                     operation_timeout: Duration::from_secs(
                         config.rebalance_executor_timeout_seconds,
                     ),
@@ -3075,16 +3308,25 @@ async fn run(
         .find(|snapshot| snapshot.chain_id == 42_161)
         .context("ESP ESP execution has no Arbitrum wallet snapshot")?
         .clone();
+    let arb_initialized = arb_initialized_dex
+        .as_ref()
+        .context("ARB execution has no initialized Arbitrum DEX runtime")?;
+    let arb_initial_head = arb_initialized.mirror.latest_head();
+    let (arb_receipt_heads, _arb_receipt_head_receiver) =
+        tokio::sync::watch::channel(arb_initial_head);
+    let arb_initial_wallet_balances = esp_initial_wallet_balances.clone();
     let entry_preflight = EntryPreflightHandle::default();
     let primary_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
     let esp_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
+    let arb_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
     let mut shared_arbitrum_rebalance_owner_attached = false;
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
         ensure!(
             domain_config.snapshot().live_trading_enabled
                 && pair.execution_enabled
-                && esp_pair.execution_enabled,
-            "composed ESP live arbitrage requires both versioned execution gates"
+                && esp_pair.execution_enabled
+                && arb_pair.execution_enabled,
+            "composed live arbitrage requires all versioned execution gates"
         );
         ensure!(
             esp_execution_ready.load(Ordering::Acquire),
@@ -3125,6 +3367,7 @@ async fn run(
         };
         let trade_journal_scope = scope_for("WLDUSDC")?;
         let esp_journal_scope = scope_for("ESPUSDC")?;
+        let arb_journal_scope = scope_for("ARBUSDC")?;
         ensure!(
             EvmJournalScope {
                 schema_version: EvmJournalScope::SCHEMA_VERSION,
@@ -3273,17 +3516,26 @@ async fn run(
             .iter()
             .find(|token| token.symbol.as_ref() == esp_pair.token_b.symbol)
             .context("ESP startup wallet snapshot is missing token_b")?;
+        let arb_token = arb_initial_wallet_balances
+            .token_balances
+            .iter()
+            .find(|token| token.symbol.as_ref() == arb_pair.token_b.symbol)
+            .context("ARB startup wallet snapshot is missing ARB")?;
         {
-            let esp_allowances = [(token_a, U256::MAX), (token_b, U256::MAX)]
-                .into_iter()
-                .map(|(token, required)| AllowanceRequirement {
-                    operation_id: allowance_operation_id(token.symbol.as_ref()),
-                    protocol: UniswapProtocol::V3,
-                    token: token.contract,
-                    router: esp_router,
-                    required,
-                })
-                .collect::<Vec<_>>();
+            let esp_allowances = [
+                (token_a, U256::MAX),
+                (token_b, U256::MAX),
+                (arb_token, U256::MAX),
+            ]
+            .into_iter()
+            .map(|(token, required)| AllowanceRequirement {
+                operation_id: allowance_operation_id(token.symbol.as_ref()),
+                protocol: UniswapProtocol::V3,
+                token: token.contract,
+                router: esp_router,
+                required,
+            })
+            .collect::<Vec<_>>();
             esp_dex_executor
                 .prepare_and_lock_allowances(&esp_allowances)
                 .await?;
@@ -3291,10 +3543,10 @@ async fn run(
         esp_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
         esp_dex_executor.set_pretrade_cost_telemetry(esp_pretrade_cost_telemetry.clone());
         esp_dex_executor.spawn_pretrade_cost_receipt_bootstrap();
-        let esp_dex_service = DexExecutionService::spawn(
+        let esp_dex_service = Arc::new(DexExecutionService::spawn(
             esp_dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
-        )?;
+        )?);
         if let Some(executor) = full_rebalance_executor.as_mut() {
             executor
                 .attach_arbitrum_execution_owner(
@@ -3367,6 +3619,14 @@ async fn run(
                         strategy_id: esp_journal_scope.strategy_id.clone(),
                     },
                 ),
+                (
+                    arb_journal_scope.symbol.clone(),
+                    BinanceOrderJournalScope {
+                        schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
+                        account_id: arb_journal_scope.account_id.clone(),
+                        strategy_id: arb_journal_scope.strategy_id.clone(),
+                    },
+                ),
             ]),
         )
         .await?;
@@ -3378,6 +3638,13 @@ async fn run(
             DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
         );
         let (esp_dex_revert_diagnostics, esp_dex_revert_diagnostic_task) =
+            dex_revert_diagnostic_channel(
+                esp_wallet_rpc.clone(),
+                telemetry.clone(),
+                config.engine_id.clone(),
+                DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
+            );
+        let (arb_dex_revert_diagnostics, arb_dex_revert_diagnostic_task) =
             dex_revert_diagnostic_channel(
                 esp_wallet_rpc.clone(),
                 telemetry.clone(),
@@ -3402,7 +3669,7 @@ async fn run(
             },
         )?);
         let esp_executor = Arc::new(ComposedLiveLegExecutor::new(
-            esp_dex_service,
+            Arc::clone(&esp_dex_service),
             Arc::clone(&binance_service),
             ComposedLiveLegExecutorConfig {
                 rules: esp_execution_symbol_rules.clone(),
@@ -3418,14 +3685,36 @@ async fn run(
                 engine_id: config.engine_id.clone(),
             },
         )?);
+        let arb_executor = Arc::new(ComposedLiveLegExecutor::new(
+            Arc::clone(&esp_dex_service),
+            Arc::clone(&binance_service),
+            ComposedLiveLegExecutorConfig {
+                rules: arb_execution_symbol_rules.clone(),
+                base_asset: arb_pair.binance.base_asset.clone(),
+                base_decimals: arb_pair.token_b.decimals,
+                quote_asset: arb_pair.binance.quote_asset.clone(),
+                quote_decimals: arb_pair.token_a.decimals,
+                commission_asset: commission_asset.clone(),
+                commission_price_symbol: commission_price_symbol.clone(),
+                market_state: entry_preflight.clone(),
+                dex_revert_diagnostics: arb_dex_revert_diagnostics,
+                telemetry: telemetry.clone(),
+                engine_id: config.engine_id.clone(),
+            },
+        )?);
         let executor = RoutedLiveLegExecutor::new(BTreeMap::from([
             (pair.id.clone(), primary_executor),
             (esp_pair.id.clone(), esp_executor),
+            (arb_pair.id.clone(), arb_executor),
         ]))?;
         let full_live_sizing = esp_pair
             .adaptive_sizing
             .limits()
             .context("full-live adaptive sizing limits are missing")?;
+        let arb_live_sizing = arb_pair
+            .adaptive_sizing
+            .limits()
+            .context("ARB full-live adaptive sizing limits are missing")?;
         let parse_live_amount = |value: &str, label: &str| {
             value
                 .parse::<u128>()
@@ -3442,34 +3731,59 @@ async fn run(
                 binance_symbol: pair.binance.symbol.clone(),
                 binance_base_decimals: pair.token_b.decimals,
                 journal_scope: trade_journal_scope,
-                pair_policies: BTreeMap::from([(
-                    esp_pair.id.clone(),
-                    LivePairPolicy {
-                        journal_scope: esp_journal_scope,
-                        binance_base_decimals: esp_pair.token_b.decimals,
-                        maximum_trade_notional_token_a_base_units: parse_live_amount(
-                            full_live_sizing.max_trade_notional,
-                            "maximum trade notional",
-                        )?,
-                        maximum_unhedged_notional_token_a_base_units: parse_live_amount(
-                            full_live_sizing.max_unhedged_notional,
-                            "maximum unhedged notional",
-                        )?,
-                        maximum_realized_loss_token_a_base_units: parse_live_amount(
-                            full_live_sizing.max_recovery_loss,
-                            "maximum recovery loss",
-                        )?,
-                        maximum_concurrent_trades: 1,
-                        readiness: Arc::clone(&esp_execution_ready),
-                        market_data_readiness: Arc::clone(&esp_market_data_ready),
-                    },
-                )]),
+                pair_policies: BTreeMap::from([
+                    (
+                        esp_pair.id.clone(),
+                        LivePairPolicy {
+                            journal_scope: esp_journal_scope,
+                            binance_base_decimals: esp_pair.token_b.decimals,
+                            maximum_trade_notional_token_a_base_units: parse_live_amount(
+                                full_live_sizing.max_trade_notional,
+                                "maximum trade notional",
+                            )?,
+                            maximum_unhedged_notional_token_a_base_units: parse_live_amount(
+                                full_live_sizing.max_unhedged_notional,
+                                "maximum unhedged notional",
+                            )?,
+                            maximum_realized_loss_token_a_base_units: parse_live_amount(
+                                full_live_sizing.max_recovery_loss,
+                                "maximum recovery loss",
+                            )?,
+                            maximum_concurrent_trades: 1,
+                            readiness: Arc::clone(&esp_execution_ready),
+                            market_data_readiness: Arc::clone(&esp_market_data_ready),
+                        },
+                    ),
+                    (
+                        arb_pair.id.clone(),
+                        LivePairPolicy {
+                            journal_scope: arb_journal_scope,
+                            binance_base_decimals: arb_pair.token_b.decimals,
+                            maximum_trade_notional_token_a_base_units: parse_live_amount(
+                                arb_live_sizing.max_trade_notional,
+                                "ARB maximum trade notional",
+                            )?,
+                            maximum_unhedged_notional_token_a_base_units: parse_live_amount(
+                                arb_live_sizing.max_unhedged_notional,
+                                "ARB maximum unhedged notional",
+                            )?,
+                            maximum_realized_loss_token_a_base_units: parse_live_amount(
+                                arb_live_sizing.max_recovery_loss,
+                                "ARB maximum recovery loss",
+                            )?,
+                            maximum_concurrent_trades: 1,
+                            readiness: Arc::clone(&arb_execution_ready),
+                            market_data_readiness: Arc::clone(&arb_market_data_ready),
+                        },
+                    ),
+                ]),
             },
         )?;
         let diagnostic_task = tokio::spawn(async move {
             tokio::join!(
                 dex_revert_diagnostic_task.run(),
-                esp_dex_revert_diagnostic_task.run()
+                esp_dex_revert_diagnostic_task.run(),
+                arb_dex_revert_diagnostic_task.run()
             );
             Ok::<(), anyhow::Error>(())
         });
@@ -3510,6 +3824,14 @@ async fn run(
                 .contract
                 .parse()
                 .context("ESP token_b address is invalid")?,
+        },
+        TokenBalanceRequest {
+            symbol: arb_pair.token_b.symbol.clone(),
+            contract: arb_pair
+                .token_b
+                .contract
+                .parse()
+                .context("ARB token address is invalid")?,
         },
     ];
     let esp_wallet_reads = network_registry
@@ -3611,6 +3933,36 @@ async fn run(
         telemetry.clone(),
         V12RebalanceParityAdapter::new(esp_rebalance_tracker),
         arb_bot::engine::TradingExecutionHandles {
+            paper_trades: paper_trades.clone(),
+            entry_preflight: entry_preflight.clone(),
+            binance_asset_decimals: compiled_binance_runtime
+                .as_ref()
+                .map(|runtime| runtime.asset_decimals.clone())
+                .unwrap_or_default(),
+            portfolio_catalog: Arc::clone(&portfolio_catalog),
+            inventory: shared_inventory.clone(),
+            capital_allocator: portfolio_allocator.clone(),
+            pretrade_cost_telemetry: esp_pretrade_cost_telemetry,
+        },
+        BinanceFeeBps {
+            buy: esp_buy_fee_bps,
+            sell: esp_sell_fee_bps,
+        },
+    )?;
+    let arb_plan = arb_strategy_plan.context("compiled ARB hot path has no strategy")?;
+    let InitializedDex {
+        mirror: arb_mirror,
+        stream: arb_stream,
+        rpc: _arb_wallet_rpc,
+        timings: _arb_dex_timings,
+    } = arb_initialized_dex.context("compiled ARB strategy has no initialized DEX runtime")?;
+    let (mut arb_engine, arb_hot_telemetry) = TradingEngine::new(
+        config.clone(),
+        Arc::new(arb_plan.domain_config.clone()),
+        arb_mirror,
+        telemetry.clone(),
+        V12RebalanceParityAdapter::new(arb_rebalance_tracker),
+        arb_bot::engine::TradingExecutionHandles {
             paper_trades,
             entry_preflight: entry_preflight.clone(),
             binance_asset_decimals: compiled_binance_runtime
@@ -3620,11 +3972,11 @@ async fn run(
             portfolio_catalog: Arc::clone(&portfolio_catalog),
             inventory: shared_inventory.clone(),
             capital_allocator: portfolio_allocator,
-            pretrade_cost_telemetry: esp_pretrade_cost_telemetry,
+            pretrade_cost_telemetry: arb_pretrade_cost_telemetry,
         },
         BinanceFeeBps {
-            buy: esp_buy_fee_bps,
-            sell: esp_sell_fee_bps,
+            buy: arb_buy_fee_bps,
+            sell: arb_sell_fee_bps,
         },
     )?;
     let root_supervisor = RootSupervisorPolicy::new(
@@ -3656,6 +4008,7 @@ async fn run(
         binance_account_id = PRIMARY_BINANCE_ACCOUNT_ID,
         live_strategy_id = %engine.strategy_id().as_str(),
         esp_strategy_id = %shadow_plan.strategy_id.as_str(),
+        arb_strategy_id = %arb_plan.strategy_id.as_str(),
         esp_network_id = %shadow_plan.network_id.as_str(),
         esp_execution_lane_id = %execution_lane_id(shadow_pair.chain.chain_id),
         shared_inventory_owner = true,
@@ -3664,7 +4017,7 @@ async fn run(
             portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive,
         esp_external_mutation_authorized = true,
         root_supervisor_policy = "dependency_scoped_v1",
-        "ESP full-live production strategy configured"
+        "Arbitrum full-live production strategies configured"
     );
     if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive {
         ensure!(
@@ -3709,15 +4062,38 @@ async fn run(
             external_mutation_authorized = true,
             "ESP Arbitrum full-live execution configured"
     );
+    let arb_policy = arb_pair
+        .full_live_policy
+        .as_ref()
+        .context("ARB full-live policy is missing")?;
+    tracing::info!(
+        pair_id = arb_pair.id,
+        strategy_id = %arb_plan.strategy_id.as_str(),
+        production_approval_actor = arb_policy.production_approval_actor,
+        production_approval_recorded_at_utc = arb_policy.production_approval_recorded_at_utc,
+        max_trade_notional_token_a_base_units = arb_pair
+            .adaptive_sizing
+            .limits()
+            .map(|limits| limits.max_trade_notional),
+        shared_arbitrum_evm_owner = shared_arbitrum_rebalance_owner_attached,
+        external_mutation_authorized = true,
+        "ARB Arbitrum full-live execution configured"
+    );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
         task: mut shadow_dex_task,
     } = shadow_stream;
+    let AlchemyDexStream {
+        receiver: mut arb_dex_receiver,
+        task: mut arb_dex_task,
+    } = arb_stream;
     engine.on_binance_clock_sync(binance_account.clock_sync);
     esp_engine.on_binance_clock_sync(binance_account.clock_sync);
+    arb_engine.on_binance_clock_sync(binance_account.clock_sync);
     let hot_telemetry_task = tokio::spawn(hot_telemetry.run());
     let portfolio_allocator_task = tokio::spawn(portfolio_allocator_task.run());
     let esp_hot_telemetry_task = tokio::spawn(esp_hot_telemetry.run());
+    let arb_hot_telemetry_task = tokio::spawn(arb_hot_telemetry.run());
     let live_chain_readiness_task = live_chain_readiness_probe.map(|probe| {
         tokio::spawn(run_chain_readiness_refresh(
             probe,
@@ -3726,6 +4102,16 @@ async fn run(
             esp_pair.clone(),
             initial_chain_readiness_status,
             Arc::clone(&esp_execution_ready),
+        ))
+    });
+    let arb_chain_readiness_task = arb_chain_readiness_probe.map(|probe| {
+        tokio::spawn(run_chain_readiness_refresh(
+            probe,
+            telemetry.clone(),
+            config.engine_id.clone(),
+            arb_pair.clone(),
+            arb_initial_chain_readiness_status,
+            Arc::clone(&arb_execution_ready),
         ))
     });
     let (binance_clock_sync_sender, mut binance_clock_sync_receiver) =
@@ -3954,23 +4340,32 @@ async fn run(
             RebalanceExecutionTarget::Primary => {
                 engine.on_rebalance_token_quarantined(token, reason)?
             }
-            RebalanceExecutionTarget::Arbitrum => {
+            RebalanceExecutionTarget::ArbitrumEsp => {
                 esp_engine.on_rebalance_token_quarantined(token, reason)?
+            }
+            RebalanceExecutionTarget::ArbitrumArb => {
+                arb_engine.on_rebalance_token_quarantined(token, reason)?
             }
         }
     }
     if let Some(operation) = rebalance_recovery_operation.as_ref() {
         match rebalance_target(operation) {
             RebalanceExecutionTarget::Primary => engine.on_rebalance_recovery_started(operation)?,
-            RebalanceExecutionTarget::Arbitrum => {
+            RebalanceExecutionTarget::ArbitrumEsp => {
                 esp_engine.on_rebalance_recovery_started(operation)?
+            }
+            RebalanceExecutionTarget::ArbitrumArb => {
+                arb_engine.on_rebalance_recovery_started(operation)?
             }
         }
     }
     engine.on_balance_event(BalanceEvent::Binance(initial_binance_balances.clone()))?;
-    esp_engine.on_shared_binance_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
+    esp_engine
+        .on_shared_binance_balance_event(BalanceEvent::Binance(initial_binance_balances.clone()))?;
+    arb_engine.on_shared_binance_balance_event(BalanceEvent::Binance(initial_binance_balances))?;
     engine.on_balance_event(BalanceEvent::Wallet(initial_wallet_balances))?;
     esp_engine.on_balance_event(BalanceEvent::Wallet(esp_initial_wallet_balances.clone()))?;
+    arb_engine.on_balance_event(BalanceEvent::Wallet(arb_initial_wallet_balances.clone()))?;
     for snapshot in &portfolio_wallet_snapshots {
         if snapshot.chain_id != wallet_chain_id {
             engine.on_portfolio_wallet_snapshot(snapshot)?;
@@ -3978,6 +4373,7 @@ async fn run(
     }
     engine.on_user_data_connected(user_data_subscription_id);
     esp_engine.on_shared_user_data_connected();
+    arb_engine.on_shared_user_data_connected();
     // The executor and its durable journal are a single process-wide mutation
     // lane. Recovery owns that lane until it publishes a terminal result.
     let mut rebalance_lane_busy = rebalance_recovery_operation.is_some();
@@ -3991,9 +4387,11 @@ async fn run(
         &mut next_rebalance_target,
         &mut engine,
         &mut esp_engine,
+        &mut arb_engine,
         rebalance_sender.as_ref(),
         pair,
         &esp_pair,
+        &arb_pair,
         wallet_owner,
         portfolio_catalog.capital_policy(),
         &rebalance_risk_receiver,
@@ -4001,6 +4399,7 @@ async fn run(
     .await?;
     engine.start();
     esp_engine.start();
+    arb_engine.start();
     let mut first_ready_emitted = false;
     let mut longest_non_price_handler_us = 0_u128;
     let mut longest_non_price_handler = "none";
@@ -4037,6 +4436,26 @@ async fn run(
     if startup_shadow_dex.pool_build_count > 0 {
         esp_engine.evaluate_after_dex_refreshes()?;
     }
+    let mut startup_arb_event_count = 0_usize;
+    let mut startup_arb_pool_build_count = 0_usize;
+    while let Ok(event) = arb_dex_receiver.try_recv() {
+        startup_arb_event_count += 1;
+        let head = match &event {
+            DexStreamEvent::Head { head, .. } => Some(*head),
+            DexStreamEvent::Log { .. } => None,
+        };
+        if let Some(request) = arb_engine.on_dex_event(event)? {
+            build_prepared_pool_inline(&mut arb_engine, request)?;
+            startup_arb_pool_build_count += 1;
+        }
+        if let Some(head) = head {
+            esp_wallet_heads.send_replace(head);
+            arb_receipt_heads.send_replace(head);
+        }
+    }
+    if startup_arb_pool_build_count > 0 {
+        arb_engine.evaluate_after_dex_refreshes()?;
+    }
     telemetry.emit(
         "startup_dex_backlog_drain",
         serde_json::json!({
@@ -4046,6 +4465,8 @@ async fn run(
             "primary_max_queue_age_us": startup_primary_dex.max_queue_age_us,
             "esp_event_count": startup_shadow_dex.event_count,
             "esp_max_queue_age_us": startup_shadow_dex.max_queue_age_us,
+            "arb_event_count": startup_arb_event_count,
+            "arb_pool_build_count": startup_arb_pool_build_count,
             "backlog_empty_before_ready": true,
         }),
     );
@@ -4181,6 +4602,7 @@ async fn run(
     let mut gas_market_event = Box::pin(gas_price_feed.next_event());
     let mut commission_market_event = Box::pin(commission_price_feed.next_event());
     let mut shadow_dex_running = true;
+    let mut arb_dex_running = true;
 
     loop {
         tokio::select! {
@@ -4249,10 +4671,41 @@ async fn run(
                     handler_started_at.elapsed(),
                 );
             }
+            event = arb_dex_receiver.recv(), if arb_dex_running => {
+                let handler_started_at = Instant::now();
+                let Some(event) = event else {
+                    arb_market_data_ready.store(false, Ordering::Release);
+                    tracing::error!(
+                        strategy_id = %arb_plan.strategy_id.as_str(),
+                        "Arbitrum ARB DEX stream stopped; new ARB entries are disabled"
+                    );
+                    arb_dex_running = false;
+                    continue;
+                };
+                let head = match &event {
+                    DexStreamEvent::Head { head, .. } => Some(*head),
+                    DexStreamEvent::Log { .. } => None,
+                };
+                if let Some(request) = arb_engine.on_dex_event(event)? {
+                    build_prepared_pool_inline(&mut arb_engine, request)?;
+                    arb_engine.evaluate_after_dex_refreshes()?;
+                }
+                if let Some(head) = head {
+                    esp_wallet_heads.send_replace(head);
+                    arb_receipt_heads.send_replace(head);
+                }
+                record_longest_handler(
+                    &mut longest_non_price_handler_us,
+                    &mut longest_non_price_handler,
+                    "arb_dex",
+                    handler_started_at.elapsed(),
+                );
+            }
             scheduled_at = health_tick.tick() => {
                 let loop_lag_us = scheduled_at.elapsed().as_micros();
                 engine.refresh_health();
                 esp_engine.refresh_health();
+                arb_engine.refresh_health();
                 engine.record_owner_loop_health(
                     loop_lag_us,
                     longest_non_price_handler,
@@ -4268,9 +4721,11 @@ async fn run(
                     &mut next_rebalance_target,
                     &mut engine,
                     &mut esp_engine,
+                    &mut arb_engine,
                     rebalance_sender.as_ref(),
                     pair,
                     &esp_pair,
+                    &arb_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
                     &rebalance_risk_receiver,
@@ -4301,6 +4756,8 @@ async fn run(
                 let event_symbol = market_event_symbol(&event);
                 if event_symbol == shadow_plan.symbol {
                     esp_engine.on_market_event(event, None)?;
+                } else if event_symbol == arb_plan.symbol {
+                    arb_engine.on_market_event(event, None)?;
                 } else if engine.dependencies().for_symbol(event_symbol).next().is_some() {
                     let _summary =
                         engine.on_market_event(event, binance_feed.depth_book())?;
@@ -4322,7 +4779,8 @@ async fn run(
                 let handler_started_at = Instant::now();
                 drop(gas_market_event);
                 engine.on_gas_market_event(event.clone())?;
-                esp_engine.on_gas_market_event(event)?;
+                esp_engine.on_gas_market_event(event.clone())?;
+                arb_engine.on_gas_market_event(event)?;
                 gas_market_event = Box::pin(gas_price_feed.next_event());
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -4335,7 +4793,8 @@ async fn run(
                 let handler_started_at = Instant::now();
                 drop(commission_market_event);
                 engine.on_commission_market_event(event.clone())?;
-                esp_engine.on_commission_market_event(event)?;
+                esp_engine.on_commission_market_event(event.clone())?;
+                arb_engine.on_commission_market_event(event)?;
                 commission_market_event = Box::pin(commission_price_feed.next_event());
                 record_longest_handler(
                     &mut longest_non_price_handler_us,
@@ -4354,24 +4813,34 @@ async fn run(
                         esp_engine.on_user_data_event(event)?;
                     }
                     UserDataEvent::ExecutionReport(report)
+                        if report.symbol == arb_plan.symbol =>
+                    {
+                        arb_engine.on_user_data_event(event)?;
+                    }
+                    UserDataEvent::ExecutionReport(report)
                         if report.symbol == pair.binance.symbol =>
                     {
                         engine.on_user_data_event(event)?;
                     }
                     UserDataEvent::AccountPosition(_) | UserDataEvent::BalanceUpdate(_) => {
-                        engine.on_user_data_event(event)?;
+                        engine.on_user_data_event(event.clone())?;
+                        esp_engine.on_shared_user_data_dirty();
+                        arb_engine.on_shared_user_data_dirty();
                     }
                     UserDataEvent::ExecutionReport(_) => {
                         engine.on_user_data_event(event.clone())?;
                         esp_engine.on_shared_user_data_dirty();
+                        arb_engine.on_shared_user_data_dirty();
                     }
                     UserDataEvent::StreamTerminated { .. } => {
-                        engine.on_user_data_event(event)?;
+                        engine.on_user_data_event(event.clone())?;
                         esp_engine.on_shared_user_data_disconnected();
+                        arb_engine.on_shared_user_data_disconnected();
                     }
                     UserDataEvent::Other { .. } => {
-                        engine.on_user_data_event(event)?;
+                        engine.on_user_data_event(event.clone())?;
                         esp_engine.on_shared_user_data_dirty();
+                        arb_engine.on_shared_user_data_dirty();
                     }
                 }
                 record_longest_handler(
@@ -4387,10 +4856,12 @@ async fn run(
                     Some(Ok(clock_sync)) => {
                         engine.on_binance_clock_sync(clock_sync);
                         esp_engine.on_binance_clock_sync(clock_sync);
+                        arb_engine.on_binance_clock_sync(clock_sync);
                     }
                     Some(Err(error)) => {
                         engine.on_binance_clock_sync_failure(&error);
                         esp_engine.on_binance_clock_sync_failure(&error);
+                        arb_engine.on_binance_clock_sync_failure(&error);
                     }
                     None => {
                         binance_clock_sync_running = false;
@@ -4398,6 +4869,9 @@ async fn run(
                             "background Binance clock synchronization task stopped",
                         );
                         esp_engine.on_binance_clock_sync_failure(
+                            "background Binance clock synchronization task stopped",
+                        );
+                        arb_engine.on_binance_clock_sync_failure(
                             "background Binance clock synchronization task stopped",
                         );
                     }
@@ -4418,8 +4892,9 @@ async fn run(
                     BalanceEvent::Binance(snapshot) => {
                         engine.on_balance_event(BalanceEvent::Binance(snapshot.clone()))?;
                         esp_engine.on_shared_binance_balance_event(
-                            BalanceEvent::Binance(snapshot),
+                            BalanceEvent::Binance(snapshot.clone()),
                         )?;
+                        arb_engine.on_shared_binance_balance_event(BalanceEvent::Binance(snapshot))?;
                     }
                     BalanceEvent::Failed {
                         source: BalanceSource::Binance,
@@ -4433,6 +4908,11 @@ async fn run(
                         })?;
                         esp_engine.on_shared_binance_balance_event(BalanceEvent::Failed {
                             source: BalanceSource::Binance,
+                            error: error.clone(),
+                            observed_at,
+                        })?;
+                        arb_engine.on_shared_binance_balance_event(BalanceEvent::Failed {
+                            source: BalanceSource::Binance,
                             error,
                             observed_at,
                         })?;
@@ -4444,9 +4924,11 @@ async fn run(
                     &mut next_rebalance_target,
                     &mut engine,
                     &mut esp_engine,
+                    &mut arb_engine,
                     rebalance_sender.as_ref(),
                     pair,
                     &esp_pair,
+                    &arb_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
                     &rebalance_risk_receiver,
@@ -4464,15 +4946,18 @@ async fn run(
                 let Some(event) = event else {
                     bail!("Arbitrum wallet balance synchronization channel stopped unexpectedly");
                 };
-                esp_engine.on_balance_event(event)?;
+                esp_engine.on_balance_event(event.clone())?;
+                arb_engine.on_balance_event(event)?;
                 dispatch_next_rebalance_execution(
                     &mut rebalance_lane_busy,
                     &mut next_rebalance_target,
                     &mut engine,
                     &mut esp_engine,
+                    &mut arb_engine,
                     rebalance_sender.as_ref(),
                     pair,
                     &esp_pair,
+                    &arb_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
                     &rebalance_risk_receiver,
@@ -4521,8 +5006,11 @@ async fn run(
                         RebalanceExecutionTarget::Primary => {
                             engine.on_rebalance_recovery_started(operation)?
                         }
-                        RebalanceExecutionTarget::Arbitrum => {
+                        RebalanceExecutionTarget::ArbitrumEsp => {
                             esp_engine.on_rebalance_recovery_started(operation)?
+                        }
+                        RebalanceExecutionTarget::ArbitrumArb => {
+                            arb_engine.on_rebalance_recovery_started(operation)?
                         }
                     }
                 };
@@ -4539,12 +5027,18 @@ async fn run(
                         (RebalanceExecutionTarget::Primary, Err(error), blocked_token) => {
                             engine.on_rebalance_recovery_result(Err(&error), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Ok(operation), blocked_token) => {
+                        (RebalanceExecutionTarget::ArbitrumEsp, Ok(operation), blocked_token) => {
                             esp_engine
                                 .on_rebalance_recovery_result(Ok(&operation), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Err(error), blocked_token) => {
+                        (RebalanceExecutionTarget::ArbitrumEsp, Err(error), blocked_token) => {
                             esp_engine.on_rebalance_recovery_result(Err(&error), blocked_token)?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumArb, Ok(operation), blocked_token) => {
+                            arb_engine.on_rebalance_recovery_result(Ok(&operation), blocked_token)?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumArb, Err(error), blocked_token) => {
+                            arb_engine.on_rebalance_recovery_result(Err(&error), blocked_token)?
                         }
                     },
                     RebalanceExecutorEvent::Execution {
@@ -4559,12 +5053,18 @@ async fn run(
                         (RebalanceExecutionTarget::Primary, Err(error), blocked_token) => {
                             engine.on_rebalance_execution_result(Err(&error), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Ok(operation), blocked_token) => {
+                        (RebalanceExecutionTarget::ArbitrumEsp, Ok(operation), blocked_token) => {
                             esp_engine
                                 .on_rebalance_execution_result(Ok(&operation), blocked_token)?
                         }
-                        (RebalanceExecutionTarget::Arbitrum, Err(error), blocked_token) => {
+                        (RebalanceExecutionTarget::ArbitrumEsp, Err(error), blocked_token) => {
                             esp_engine.on_rebalance_execution_result(Err(&error), blocked_token)?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumArb, Ok(operation), blocked_token) => {
+                            arb_engine.on_rebalance_execution_result(Ok(&operation), blocked_token)?
+                        }
+                        (RebalanceExecutionTarget::ArbitrumArb, Err(error), blocked_token) => {
+                            arb_engine.on_rebalance_execution_result(Err(&error), blocked_token)?
                         }
                     },
                     RebalanceExecutorEvent::AcrossReconciliationIdle { attempted, error } => {
@@ -4591,8 +5091,11 @@ async fn run(
                         RebalanceExecutionTarget::Primary => {
                             engine.on_rebalance_recovery_started(operation)?
                         }
-                        RebalanceExecutionTarget::Arbitrum => {
+                        RebalanceExecutionTarget::ArbitrumEsp => {
                             esp_engine.on_rebalance_recovery_started(operation)?
+                        }
+                        RebalanceExecutionTarget::ArbitrumArb => {
+                            arb_engine.on_rebalance_recovery_started(operation)?
                         }
                     }
                 }
@@ -4602,9 +5105,11 @@ async fn run(
                     &mut next_rebalance_target,
                     &mut engine,
                     &mut esp_engine,
+                    &mut arb_engine,
                     rebalance_sender.as_ref(),
                     pair,
                     &esp_pair,
+                    &arb_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
                     &rebalance_risk_receiver,
@@ -4639,6 +5144,23 @@ async fn run(
                     esp_engine.on_paper_trade_event(event)?;
                     if prepared_dex || receipt_applied {
                         esp_engine.evaluate_after_dex_refreshes()?;
+                    }
+                } else if event.pair_id == arb_pair.id {
+                    let mut prepared_dex = false;
+                    while let Ok(dex_event) = arb_dex_receiver.try_recv() {
+                        if let Some(request) = arb_engine.on_dex_event(dex_event)? {
+                            build_prepared_pool_inline(&mut arb_engine, request)?;
+                            prepared_dex = true;
+                        }
+                    }
+                    let receipt_refresh = arb_engine.apply_arbitrage_receipt_settlement(&event)?;
+                    let receipt_applied = receipt_refresh.is_some();
+                    if let Some(refresh) = receipt_refresh {
+                        build_prepared_pool_inline(&mut arb_engine, refresh)?;
+                    }
+                    arb_engine.on_paper_trade_event(event)?;
+                    if prepared_dex || receipt_applied {
+                        arb_engine.evaluate_after_dex_refreshes()?;
                     }
                 } else {
                     drain_dex_events_inline(
@@ -4698,6 +5220,26 @@ async fn run(
                         esp_engine.evaluate_after_dex_refreshes()?;
                     }
                     esp_engine.on_adaptive_sizing_result(result)?;
+                } else if completed_strategy_id == arb_plan.strategy_id {
+                    let mut prepared_dex = false;
+                    while let Ok(dex_event) = arb_dex_receiver.try_recv() {
+                        let head = match &dex_event {
+                            DexStreamEvent::Head { head, .. } => Some(*head),
+                            DexStreamEvent::Log { .. } => None,
+                        };
+                        if let Some(request) = arb_engine.on_dex_event(dex_event)? {
+                            build_prepared_pool_inline(&mut arb_engine, request)?;
+                            prepared_dex = true;
+                        }
+                        if let Some(head) = head {
+                            esp_wallet_heads.send_replace(head);
+                            arb_receipt_heads.send_replace(head);
+                        }
+                    }
+                    if prepared_dex {
+                        arb_engine.evaluate_after_dex_refreshes()?;
+                    }
+                    arb_engine.on_adaptive_sizing_result(result)?;
                 } else if completed_strategy_id == engine.strategy_id() {
                     let (prepared_dex, _) = build_prepared_pools_interleaved(
                         &mut engine,
@@ -4740,6 +5282,15 @@ async fn run(
                 );
                 shadow_dex_running = false;
             }
+            result = &mut arb_dex_task, if arb_dex_running => {
+                arb_market_data_ready.store(false, Ordering::Release);
+                tracing::error!(
+                    strategy_id = %arb_plan.strategy_id.as_str(),
+                    result = ?result,
+                    "Arbitrum ARB DEX connector stopped; new ARB entries are disabled"
+                );
+                arb_dex_running = false;
+            }
             result = &mut binance_balance_task => {
                 result.context("Binance balance synchronization task failed")??;
                 bail!("Binance balance synchronization stopped unexpectedly");
@@ -4760,13 +5311,20 @@ async fn run(
         let adaptive_sizing_jobs = engine
             .take_adaptive_sizing_jobs()
             .into_iter()
-            .chain(esp_engine.take_adaptive_sizing_jobs());
+            .chain(esp_engine.take_adaptive_sizing_jobs())
+            .chain(arb_engine.take_adaptive_sizing_jobs());
         for job in adaptive_sizing_jobs {
             let strategy_id = job.strategy_id()?;
             let submission = adaptive_sizing_slots.submit(&strategy_id, job)?;
             if submission.replaced || submission.queued_behind_running {
                 if strategy_id == shadow_plan.strategy_id {
                     esp_engine.record_adaptive_sizing_overload(
+                        &strategy_id,
+                        submission.replaced,
+                        adaptive_sizing_slots.total_retained_work(),
+                    );
+                } else if strategy_id == arb_plan.strategy_id {
+                    arb_engine.record_adaptive_sizing_overload(
                         &strategy_id,
                         submission.replaced,
                         adaptive_sizing_slots.total_retained_work(),
@@ -4805,15 +5363,23 @@ async fn run(
     let _ = dex_task.await;
     shadow_dex_task.abort();
     let _ = shadow_dex_task.await;
+    arb_dex_task.abort();
+    let _ = arb_dex_task.await;
     if let Some(task) = live_chain_readiness_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = arb_chain_readiness_task {
         task.abort();
         let _ = task.await;
     }
     adaptive_sizing_tasks.abort_all();
     while adaptive_sizing_tasks.join_next().await.is_some() {}
     esp_engine.shutdown();
+    arb_engine.shutdown();
     drop(engine);
     drop(esp_engine);
+    drop(arb_engine);
     if let Some(task) = paper_trade_task.take() {
         task.await??;
     }
@@ -4822,6 +5388,7 @@ async fn run(
     }
     hot_telemetry_task.await??;
     esp_hot_telemetry_task.await??;
+    arb_hot_telemetry_task.await??;
     portfolio_allocator_task.await?;
     writer_task.await??;
     if let Some(path) = runtime_ready_file
@@ -5077,9 +5644,11 @@ async fn dispatch_next_rebalance_execution(
     next_target: &mut RebalanceExecutionTarget,
     primary_engine: &mut TradingEngine,
     arbitrum_engine: &mut TradingEngine,
+    arb_engine: &mut TradingEngine,
     sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutorCommand>>,
     primary_pair: &arb_bot::domain::config::PairConfig,
     arbitrum_pair: &arb_bot::domain::config::PairConfig,
+    arb_pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
     capital_policy: Option<&CompiledCapitalPolicy>,
     rebalance_risk: &tokio::sync::watch::Receiver<RebalanceRisk>,
@@ -5090,8 +5659,13 @@ async fn dispatch_next_rebalance_execution(
 
     primary_engine.refresh_pending_rebalance_execution();
     arbitrum_engine.refresh_pending_rebalance_execution();
+    arb_engine.refresh_pending_rebalance_execution();
 
-    for target in [*next_target, next_target.other()] {
+    for target in [
+        *next_target,
+        next_target.other(),
+        next_target.other().other(),
+    ] {
         let outcome = match target {
             RebalanceExecutionTarget::Primary => {
                 dispatch_rebalance_execution(
@@ -5105,11 +5679,23 @@ async fn dispatch_next_rebalance_execution(
                 )
                 .await?
             }
-            RebalanceExecutionTarget::Arbitrum => {
+            RebalanceExecutionTarget::ArbitrumEsp => {
                 dispatch_rebalance_execution(
                     arbitrum_engine,
                     sender,
                     arbitrum_pair,
+                    wallet_owner,
+                    target,
+                    capital_policy,
+                    Some(rebalance_risk),
+                )
+                .await?
+            }
+            RebalanceExecutionTarget::ArbitrumArb => {
+                dispatch_rebalance_execution(
+                    arb_engine,
+                    sender,
+                    arb_pair,
                     wallet_owner,
                     target,
                     capital_policy,
@@ -5138,7 +5724,7 @@ async fn dispatch_rebalance_execution(
     if engine.pending_rebalance_execution().is_none() {
         return Ok(RebalanceDispatchOutcome::NoWork);
     }
-    let rebalance_remaining = if target == RebalanceExecutionTarget::Arbitrum {
+    let rebalance_remaining = if target.is_arbitrum() {
         let Some(evaluation) = engine.pending_rebalance_execution() else {
             return Ok(RebalanceDispatchOutcome::NoWork);
         };
@@ -5177,7 +5763,7 @@ async fn dispatch_rebalance_execution(
         .action
         .clone()
         .context("rebalance execution evaluation has no action")?;
-    let maximum_fee = if target == RebalanceExecutionTarget::Arbitrum {
+    let maximum_fee = if target.is_arbitrum() {
         let policy = capital_policy.context("rebalance dispatch has no compiled capital policy")?;
         ensure!(
             policy.external_mutation_authorized,
@@ -5260,7 +5846,7 @@ async fn dispatch_rebalance_execution(
         request: Box::new(RebalanceExecutionRequest {
             authority: match target {
                 RebalanceExecutionTarget::Primary => RebalanceExecutionAuthority::WorldChainV12,
-                RebalanceExecutionTarget::Arbitrum => {
+                RebalanceExecutionTarget::ArbitrumEsp | RebalanceExecutionTarget::ArbitrumArb => {
                     ensure!(
                         capital_policy.is_some(),
                         "Arbitrum rebalance requires the permanent full-live capital policy"
@@ -5277,7 +5863,7 @@ async fn dispatch_rebalance_execution(
             wallet_balance_before: evaluation.plan.projected.wallet,
             revalidation_start_balance: evaluation.plan.start_balance,
             maximum_fee,
-            approval_session_id: if target == RebalanceExecutionTarget::Arbitrum {
+            approval_session_id: if target.is_arbitrum() {
                 Some(
                     capital_policy
                         .context("rebalance dispatch has no compiled capital policy")?
@@ -6150,27 +6736,27 @@ mod tests {
     #[test]
     fn deferred_rebalance_remains_retryable_and_success_rotates_lane_fairness() {
         let mut lane_busy = false;
-        let mut next_target = RebalanceExecutionTarget::Arbitrum;
+        let mut next_target = RebalanceExecutionTarget::ArbitrumEsp;
 
         assert!(!apply_rebalance_dispatch_outcome(
             &mut lane_busy,
             &mut next_target,
-            RebalanceExecutionTarget::Arbitrum,
+            RebalanceExecutionTarget::ArbitrumEsp,
             RebalanceDispatchOutcome::Deferred,
         ));
         assert!(!lane_busy);
-        assert_eq!(next_target, RebalanceExecutionTarget::Arbitrum);
+        assert_eq!(next_target, RebalanceExecutionTarget::ArbitrumEsp);
 
         // This is the next supervisor tick after a temporary reservation has
         // settled: the same target is still eligible and can now be submitted.
         assert!(apply_rebalance_dispatch_outcome(
             &mut lane_busy,
             &mut next_target,
-            RebalanceExecutionTarget::Arbitrum,
+            RebalanceExecutionTarget::ArbitrumEsp,
             RebalanceDispatchOutcome::Submitted,
         ));
         assert!(lane_busy);
-        assert_eq!(next_target, RebalanceExecutionTarget::Primary);
+        assert_eq!(next_target, RebalanceExecutionTarget::ArbitrumArb);
     }
 
     #[test]

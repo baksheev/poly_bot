@@ -26,6 +26,7 @@ pub const ARBITRUM_CHAIN_ID: u64 = 42_161;
 pub const ARBITRUM_SWAP_ROUTER_02: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
 pub const ARBITRUM_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 pub const ARBITRUM_ESP: &str = "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1";
+pub const ARBITRUM_ARB: &str = "0x912ce59144191c1204e64559fe8253a0e49e6548";
 pub const CHAIN_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -440,8 +441,21 @@ fn validate_readiness_pair(pair: &PairConfig) -> anyhow::Result<()> {
         .full_live_policy
         .as_ref()
         .context("Arbitrum full-live pair has no production policy")?;
+    let reviewed_pair = match pair.binance.symbol.as_str() {
+        "ESPUSDC" => {
+            pair.id == "arbitrum-usdc-esp"
+                && pair.token_b.symbol == "ESP"
+                && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
+        }
+        "ARBUSDC" => {
+            pair.id == "arbitrum-usdc-arb"
+                && pair.token_b.symbol == "ARB"
+                && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ARB)
+        }
+        _ => false,
+    };
     ensure!(
-        pair.id == "arbitrum-usdc-esp"
+        reviewed_pair
             && pair.chain.chain_id == ARBITRUM_CHAIN_ID
             && pair
                 .chain
@@ -449,7 +463,6 @@ fn validate_readiness_pair(pair: &PairConfig) -> anyhow::Result<()> {
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
             && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
-            && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
             && pair.full_live
             && pair.execution_enabled
             && pair.rebalance.enabled

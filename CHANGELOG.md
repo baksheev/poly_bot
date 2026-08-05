@@ -20,6 +20,12 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Add ARB/USDC on the canonical Arbitrum Uniswap V3 0.3% pool as the third
+  permanent adaptive `full_live` strategy. The release uses one idempotent,
+  quiesced 500 USDC Binance inventory bootstrap, then the existing direct
+  Arbitrum rebalance owner splits ARB inventory across Binance and the wallet.
+  ARB and ESP share one EVM signer/nonce lane, Binance account owner, trade
+  coordinator, 20 bps entry gate, and 200 USDC per-trade cap.
 - Add the canonical World Chain Uniswap V3 WLD/USDC 1% pool to the immutable
   v14 production domain. The existing local V3 curve, calldata, receipt,
   self-impact, recovery, and single-route selection paths are reused unchanged.

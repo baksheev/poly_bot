@@ -720,6 +720,10 @@ impl RebalanceExecutionJournal {
             let total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_debit,
                 "ESP" => &mut risk.token_b_debit,
+                "ARB" => risk
+                    .additional_token_debit
+                    .entry("ARB".to_owned())
+                    .or_insert(U256::ZERO),
                 _ => anyhow::bail!("rebalance journal contains an unapproved asset"),
             };
             *total = total
@@ -736,6 +740,10 @@ impl RebalanceExecutionJournal {
             let fee_total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_maximum_fee,
                 "ESP" => &mut risk.token_b_maximum_fee,
+                "ARB" => risk
+                    .additional_token_maximum_fee
+                    .entry("ARB".to_owned())
+                    .or_insert(U256::ZERO),
                 _ => unreachable!("asset was validated above"),
             };
             *fee_total = fee_total
@@ -947,6 +955,8 @@ pub struct RebalanceRisk {
     pub token_b_debit: U256,
     pub token_a_maximum_fee: U256,
     pub token_b_maximum_fee: U256,
+    pub additional_token_debit: BTreeMap<String, U256>,
+    pub additional_token_maximum_fee: BTreeMap<String, U256>,
     pub first_started_at_unix_ms: Option<u64>,
 }
 

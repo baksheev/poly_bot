@@ -87,6 +87,15 @@ pub enum Command {
         #[arg(long, env = "BINANCE_LIVE_CONFIRMATION", default_value = "")]
         live_confirmation: String,
     },
+    /// Idempotently buy the reviewed initial ARB inventory with exactly 500 USDC.
+    BootstrapArbInventory {
+        #[arg(long, default_value = "500")]
+        quote_usdc: String,
+        #[arg(long)]
+        journal_path: PathBuf,
+        #[arg(long, env = "BINANCE_LIVE_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
     /// Read one Binance withdrawal by its deterministic client id.
     BinanceWithdrawalStatus {
         #[arg(long)]

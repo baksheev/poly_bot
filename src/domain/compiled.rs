@@ -586,10 +586,18 @@ pub struct CompiledCapitalPolicy {
     pub maximum_token_b_debit: U256,
     pub maximum_token_a_fee: U256,
     pub maximum_token_b_fee: U256,
+    pub additional_tokens: BTreeMap<String, CompiledCapitalTokenPolicy>,
     pub maximum_unknown_reconciliation_queries: u16,
     pub direct_route_only: bool,
     pub bridge_mutations_enabled: bool,
     pub external_mutation_authorized: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledCapitalTokenPolicy {
+    pub economic_asset_id: EconomicAssetId,
+    pub maximum_debit: U256,
+    pub maximum_fee: U256,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1702,10 +1710,6 @@ impl CompiledDomainGraph {
             .flat_map(|source| source.snapshot.pairs.iter())
             .filter_map(|pair| pair.full_live_policy.as_ref().map(|policy| (pair, policy)))
             .collect::<Vec<_>>();
-        ensure!(
-            full_live_policies.len() <= 1,
-            "compiled portfolio has multiple full-live capital policies"
-        );
         let economic_asset_id = |symbol: &str| {
             self.bundle
                 .economic_assets
@@ -1715,8 +1719,52 @@ impl CompiledDomainGraph {
                 .with_context(|| format!("compiled capital token {symbol} has no economic asset"))
         };
         let capital_policy = full_live_policies
-            .first()
+            .iter()
+            .find(|(pair, _)| pair.binance.symbol == "ESPUSDC")
             .map(|(pair, policy)| {
+                for (other_pair, other_policy) in &full_live_policies {
+                    ensure!(
+                        other_pair.chain.chain_id == pair.chain.chain_id
+                            && other_policy.rebalance_binance_network
+                                == policy.rebalance_binance_network
+                            && other_policy.maximum_unknown_reconciliation_queries
+                                == policy.maximum_unknown_reconciliation_queries
+                            && other_policy.direct_route_only == policy.direct_route_only
+                            && other_policy.bridge_mutations_enabled
+                                == policy.bridge_mutations_enabled,
+                        "compiled full-live policies do not share one bounded Arbitrum lane"
+                    );
+                    ensure!(
+                        other_pair.token_a.symbol == pair.token_a.symbol
+                            && other_policy.maximum_rebalance_token_a_debit_base_units
+                                == policy.maximum_rebalance_token_a_debit_base_units
+                            && other_policy.maximum_rebalance_token_a_fee_base_units
+                                == policy.maximum_rebalance_token_a_fee_base_units,
+                        "compiled full-live policies disagree on shared quote-asset authority"
+                    );
+                }
+                let additional_tokens = full_live_policies
+                    .iter()
+                    .filter(|(other_pair, _)| other_pair.id != pair.id)
+                    .map(|(other_pair, other_policy)| {
+                        Ok((
+                            other_pair.token_b.symbol.clone(),
+                            CompiledCapitalTokenPolicy {
+                                economic_asset_id: economic_asset_id(&other_pair.token_b.symbol)?,
+                                maximum_debit: U256::from_str_radix(
+                                    &other_policy.maximum_rebalance_token_b_debit_base_units,
+                                    10,
+                                )
+                                .context("compiled additional full-live debit cap is invalid")?,
+                                maximum_fee: U256::from_str_radix(
+                                    &other_policy.maximum_rebalance_token_b_fee_base_units,
+                                    10,
+                                )
+                                .context("compiled additional full-live fee cap is invalid")?,
+                            },
+                        ))
+                    })
+                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
                 Ok::<_, anyhow::Error>(CompiledCapitalPolicy {
                     approval_session_id: "esp-usdc-arbitrum-full-live".to_owned(),
                     network_id: NetworkId::new(format!("eip155:{}", pair.chain.chain_id))?,
@@ -1746,6 +1794,7 @@ impl CompiledDomainGraph {
                         10,
                     )
                     .context("compiled full-live token_b fee cap is invalid")?,
+                    additional_tokens,
                     maximum_unknown_reconciliation_queries: policy
                         .maximum_unknown_reconciliation_queries,
                     direct_route_only: policy.direct_route_only,
@@ -2642,7 +2691,7 @@ mod tests {
                 .iter()
                 .map(|item| item.symbol.as_str())
                 .collect::<Vec<_>>(),
-            ["ESPUSDC", "WLDUSDC"]
+            ["ARBUSDC", "ESPUSDC", "WLDUSDC"]
         );
         assert_eq!(
             bundle
@@ -2654,8 +2703,8 @@ mod tests {
         );
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
-        assert_eq!(bundle.strategies.len(), 2);
-        assert_eq!(bundle.pools.len(), 6);
+        assert_eq!(bundle.strategies.len(), 3);
+        assert_eq!(bundle.pools.len(), 7);
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "world-chain-usdc-wld"
                 && pool.protocol == PoolProtocol::UniswapV3
@@ -2669,17 +2718,26 @@ mod tests {
             .unwrap()
             .binance_runtime_plan()
             .unwrap();
-        assert_eq!(runtime.symbols, ["ESPUSDC", "WLDUSDC"]);
+        assert_eq!(runtime.symbols, ["ARBUSDC", "ESPUSDC", "WLDUSDC"]);
         assert_eq!(runtime.stream_shards.len(), 1);
-        assert_eq!(runtime.stream_shards[0].symbols, ["ESPUSDC", "WLDUSDC"]);
+        assert_eq!(
+            runtime.stream_shards[0].symbols,
+            ["ARBUSDC", "ESPUSDC", "WLDUSDC"]
+        );
         assert_eq!(
             runtime.executable_symbols,
-            std::collections::BTreeSet::from(["ESPUSDC".to_owned(), "WLDUSDC".to_owned()])
+            std::collections::BTreeSet::from([
+                "ARBUSDC".to_owned(),
+                "ESPUSDC".to_owned(),
+                "WLDUSDC".to_owned(),
+            ])
         );
         assert!(runtime.asset_symbols.contains(&"BNB".to_owned()));
         assert!(runtime.asset_symbols.contains(&"ESP".to_owned()));
+        assert!(runtime.asset_symbols.contains(&"ARB".to_owned()));
         assert_eq!(runtime.asset_decimals["USDC"], 6);
         assert_eq!(runtime.asset_decimals["ESP"], 18);
+        assert_eq!(runtime.asset_decimals["ARB"], 18);
         assert_eq!(runtime.asset_decimals["WLD"], 18);
         assert_eq!(runtime.asset_decimals["BNB"], 8);
         assert_eq!(
@@ -2694,7 +2752,7 @@ mod tests {
             ]
         );
         assert_eq!(bundle.stream_shards.len(), 1);
-        assert_eq!(bundle.stream_shards[0].instrument_ids.len(), 2);
+        assert_eq!(bundle.stream_shards[0].instrument_ids.len(), 3);
         assert!(bundle.required_environment.iter().all(|requirement| {
             requirement.names.iter().all(|name| {
                 !["_SYMBOLS", "_PAIRS", "_POOLS", "_NETWORKS", "_ALLOWLIST"]
@@ -2707,6 +2765,13 @@ mod tests {
                 .pools
                 .iter()
                 .filter(|pool| pool.pair_id == "world-chain-usdc-wld")
+                .all(|pool| pool.lifecycle == PoolLifecycle::ExecutionEligible)
+        );
+        assert!(
+            bundle
+                .pools
+                .iter()
+                .filter(|pool| pool.pair_id == "arbitrum-usdc-arb")
                 .all(|pool| pool.lifecycle == PoolLifecycle::ExecutionEligible)
         );
         assert!(
@@ -2745,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_projections_round_trip_both_source_artifacts() {
+    fn compatibility_projections_round_trip_all_source_artifacts() {
         let (_, sources, bundle) = fixture();
         let graph = CompiledDomainGraph::from_bundle(bundle).unwrap();
         let live = graph
@@ -2839,7 +2904,7 @@ mod tests {
             collector.config.fingerprint_sha256()
         );
         let hot_path = live.hot_path_runtime.unwrap();
-        assert_eq!(hot_path.strategies.len(), 2);
+        assert_eq!(hot_path.strategies.len(), 3);
         let wld = hot_path
             .strategies
             .iter()
@@ -2858,6 +2923,15 @@ mod tests {
         assert_eq!(esp.network_id.as_str(), "eip155:42161");
         assert_eq!(esp.pool_ids.len(), 1);
         assert!(esp.domain_config.snapshot().live_trading_enabled);
+        let arb = hot_path
+            .strategies
+            .iter()
+            .find(|strategy| strategy.symbol == "ARBUSDC")
+            .unwrap();
+        assert!(arb.observe && arb.plan && arb.execute);
+        assert_eq!(arb.network_id.as_str(), "eip155:42161");
+        assert_eq!(arb.pool_ids.len(), 1);
+        assert!(arb.domain_config.snapshot().live_trading_enabled);
         assert_ne!(
             live.config.fingerprint_sha256(),
             original_live.fingerprint_sha256()
@@ -2872,8 +2946,9 @@ mod tests {
         assert!(capital_policy.external_mutation_authorized);
         assert!(capital_policy.direct_route_only);
         assert!(!capital_policy.bridge_mutations_enabled);
+        assert!(capital_policy.additional_tokens.contains_key("ARB"));
         assert_eq!(portfolio.live_rebalance_adapter, "world_chain_v12_parity");
-        assert_eq!(portfolio.assets.len(), 10);
+        assert_eq!(portfolio.assets.len(), 12);
         assert!(portfolio.assets.iter().any(|asset| {
             asset.symbol == "USDC"
                 && matches!(

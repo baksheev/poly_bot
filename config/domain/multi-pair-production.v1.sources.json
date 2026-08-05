@@ -4,7 +4,8 @@
   "compiler_version": "production-v1",
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v14.json",
-    "config/strategies/usdc-esp-arbitrum.v7.json"
+    "config/strategies/usdc-esp-arbitrum.v7.json",
+    "config/strategies/usdc-arb-arbitrum.v1.json"
   ],
   "accounts": [
     {
@@ -32,6 +33,12 @@
       "lifecycle": "validated"
     },
     {
+      "pair_id": "arbitrum-usdc-arb",
+      "fee_pips": 3000,
+      "address": "0xaebdca1bc8d89177ebe2308d62af5e74885dccc3",
+      "lifecycle": "execution_eligible"
+    },
+    {
       "pair_id": "world-chain-usdc-wld",
       "fee_pips": 500,
       "address": "0x02371da6173cf95623da4189e68912233cc7107c",
@@ -51,6 +58,7 @@
     }
   ],
   "reviewed_live_strategies": [
+    "strategy:arbitrum-usdc-arb",
     "strategy:arbitrum-usdc-esp",
     "strategy:world-chain-usdc-wld"
   ],

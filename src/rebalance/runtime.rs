@@ -22,7 +22,7 @@ use crate::{
     chain::rpc::{JsonRpcClient, TransactionReceipt},
     dex::execution::{EvmExecutionOwnerHandle, EvmExecutionRequest},
     domain::compiled::CompiledCapitalPolicy,
-    live_readiness::{ARBITRUM_CHAIN_ID, ARBITRUM_ESP, ARBITRUM_USDC},
+    live_readiness::{ARBITRUM_ARB, ARBITRUM_CHAIN_ID, ARBITRUM_ESP, ARBITRUM_USDC},
     portfolio::authorize_rebalance_request,
     telemetry::TelemetryHandle,
     wallet::{
@@ -55,6 +55,7 @@ pub struct RebalanceRuntimeLimits {
     pub maximum_wld: Decimal,
     pub maximum_usdc: Decimal,
     pub maximum_esp: Decimal,
+    pub maximum_arb: Decimal,
     pub operation_timeout: Duration,
 }
 
@@ -64,7 +65,8 @@ impl RebalanceRuntimeLimits {
             "WLD" => self.maximum_wld,
             "USDC" => self.maximum_usdc,
             "ESP" => self.maximum_esp,
-            _ => bail!("full rebalance executor only permits WLD, USDC, and ESP"),
+            "ARB" => self.maximum_arb,
+            _ => bail!("full rebalance executor only permits WLD, USDC, ESP, and ARB"),
         };
         ensure!(
             maximum > Decimal::ZERO,
@@ -3802,6 +3804,9 @@ fn token_on_chain(symbol: &str, chain_id: u64) -> anyhow::Result<Address> {
         ("ESP", ARBITRUM_CHAIN_ID) => {
             Address::from_str(ARBITRUM_ESP).context("approved Arbitrum ESP address is invalid")
         }
+        ("ARB", ARBITRUM_CHAIN_ID) => {
+            Address::from_str(ARBITRUM_ARB).context("approved Arbitrum ARB address is invalid")
+        }
         ("USDC", ARBITRUM_CHAIN_ID) => {
             Address::from_str(ARBITRUM_USDC).context("approved Arbitrum USDC address is invalid")
         }
@@ -3848,6 +3853,10 @@ fn validate_approved_asset(
         ("ESP", ARBITRUM_CHAIN_ID) => (
             18,
             Address::from_str(ARBITRUM_ESP).context("approved Arbitrum ESP address is invalid")?,
+        ),
+        ("ARB", ARBITRUM_CHAIN_ID) => (
+            18,
+            Address::from_str(ARBITRUM_ARB).context("approved Arbitrum ARB address is invalid")?,
         ),
         _ => bail!("rebalance token is not approved on chain {chain_id}"),
     };

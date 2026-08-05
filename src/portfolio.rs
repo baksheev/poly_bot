@@ -73,6 +73,17 @@ impl PortfolioCatalog {
                 "rebalance policy references a network outside the portfolio"
             );
             ensure!(
+                policy.additional_tokens.iter().all(|(symbol, token)| {
+                    economic_assets
+                        .values()
+                        .any(|asset| asset == token.economic_asset_id.as_str())
+                        && assets
+                            .keys()
+                            .any(|(_, asset_symbol)| asset_symbol == symbol)
+                }),
+                "additional rebalance policy references an asset outside the portfolio"
+            );
+            ensure!(
                 plan.allocator_mode != CompiledCapitalAllocatorMode::FullLive
                     || policy.external_mutation_authorized,
                 "live allocator has no explicit mutation approval"
@@ -420,8 +431,14 @@ fn validate_live_proposal(
             (policy.maximum_token_a_debit, policy.maximum_token_a_fee)
         } else if economic_asset == policy.token_b_economic_asset_id.as_str() {
             (policy.maximum_token_b_debit, policy.maximum_token_b_fee)
+        } else if let Some(token) = policy
+            .additional_tokens
+            .values()
+            .find(|token| economic_asset == token.economic_asset_id.as_str())
+        {
+            (token.maximum_debit, token.maximum_fee)
         } else {
-            anyhow::bail!("rebalance proposal uses an asset outside the approved canary");
+            anyhow::bail!("rebalance proposal uses an asset outside the approved portfolio");
         };
     ensure!(
         source_debit <= maximum_debit && intent.fee <= maximum_fee,
@@ -521,6 +538,8 @@ pub fn remaining_rebalance_authority(
         (policy.maximum_token_a_debit, policy.maximum_token_a_fee)
     } else if token_symbol == policy.token_b_symbol {
         (policy.maximum_token_b_debit, policy.maximum_token_b_fee)
+    } else if let Some(token) = policy.additional_tokens.get(token_symbol) {
+        (token.maximum_debit, token.maximum_fee)
     } else {
         anyhow::bail!("rebalance request uses an asset outside the production policy");
     };
@@ -971,6 +990,7 @@ mod tests {
                 * U256::from(10_u64).pow(U256::from(18_u64)),
             maximum_token_a_fee: U256::from(100_u64),
             maximum_token_b_fee: U256::from(2_000_000_000_000_000_000_u128),
+            additional_tokens: std::collections::BTreeMap::new(),
             maximum_unknown_reconciliation_queries: 1,
             direct_route_only: true,
             bridge_mutations_enabled: false,

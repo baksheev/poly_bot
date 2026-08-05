@@ -64,7 +64,7 @@ pub trait LiveLegExecutor: Send + Sync + 'static {
 }
 
 pub struct ComposedLiveLegExecutor {
-    dex: DexExecutionService,
+    dex: Arc<DexExecutionService>,
     binance: Arc<BinanceExecutionService>,
     rules: SymbolRules,
     base_asset: String,
@@ -172,7 +172,7 @@ impl LiveLegExecutor for RoutedLiveLegExecutor {
 
 impl ComposedLiveLegExecutor {
     pub fn new(
-        dex: DexExecutionService,
+        dex: impl Into<Arc<DexExecutionService>>,
         binance: Arc<BinanceExecutionService>,
         config: ComposedLiveLegExecutorConfig,
     ) -> anyhow::Result<Self> {
@@ -215,7 +215,7 @@ impl ComposedLiveLegExecutor {
         );
         ensure!(!engine_id.is_empty(), "live telemetry engine id is empty");
         Ok(Self {
-            dex,
+            dex: dex.into(),
             binance,
             rules,
             base_asset,

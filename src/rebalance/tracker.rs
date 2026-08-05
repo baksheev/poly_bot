@@ -96,12 +96,23 @@ impl RebalanceTracker {
         pair: &PairConfig,
         routes: BTreeMap<String, Vec<RouteCandidate>>,
     ) -> anyhow::Result<Self> {
+        Self::new_for_tokens(pair, routes, [&pair.token_a.symbol, &pair.token_b.symbol])
+    }
+
+    pub fn new_for_tokens<'a>(
+        pair: &PairConfig,
+        routes: BTreeMap<String, Vec<RouteCandidate>>,
+        symbols: impl IntoIterator<Item = &'a String>,
+    ) -> anyhow::Result<Self> {
         if !pair.rebalance.enabled {
             return Ok(Self::disabled());
         }
 
+        let selected = symbols.into_iter().collect::<BTreeSet<_>>();
+        ensure!(!selected.is_empty(), "rebalance token selection is empty");
         let tokens = [&pair.token_a, &pair.token_b]
             .into_iter()
+            .filter(|token| selected.contains(&token.symbol))
             .map(|token| {
                 let token_routes = routes
                     .get(&token.symbol)
@@ -121,6 +132,11 @@ impl RebalanceTracker {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(
+            tokens.len() == selected.len(),
+            "rebalance token selection contains an asset outside pair {}",
+            pair.id
+        );
 
         Ok(Self {
             enabled: true,

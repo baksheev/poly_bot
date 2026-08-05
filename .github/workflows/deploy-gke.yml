@@ -68,15 +68,15 @@ jobs:
           test "$(jq -r '.bundle_kind' "${domain_config}")" = compiled_multi_pair_domain
           test "$(jq -r '.bundle_id' "${domain_config}")" = arb-bot-production-multi-pair-v1
           test "$(jq -c '.instruments | map(.symbol)' "${domain_config}")" \
-            = '["ESPUSDC","WLDUSDC"]'
+            = '["ARBUSDC","ESPUSDC","WLDUSDC"]'
           test "$(jq -c '.stream_shards' "${domain_config}")" = \
-            '[{"id":"stream:binance-spot:primary:0","account_id":"binance-spot:primary","instrument_ids":["binance-spot:primary:ESPUSDC","binance-spot:primary:WLDUSDC"]}]'
+            '[{"id":"stream:binance-spot:primary:0","account_id":"binance-spot:primary","instrument_ids":["binance-spot:primary:ARBUSDC","binance-spot:primary:ESPUSDC","binance-spot:primary:WLDUSDC"]}]'
           test "$(jq -c '[.venue_assets[] | select(.kind == "binance_spot") | .symbol]' "${domain_config}")" \
-            = '["BNB","ESP","USDC","WLD"]'
+            = '["ARB","BNB","ESP","USDC","WLD"]'
           test "$(jq -c '.networks | map(.id)' "${domain_config}")" \
             = '["eip155:42161","eip155:480"]'
           test "$(jq -c '.capabilities' "${domain_config}")" = \
-            '[{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
+            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
           test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
             = arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool
           test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
@@ -147,6 +147,20 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_quoter_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
+          arb='.sources[] | select(.snapshot.pairs[0].id == "arbitrum-usdc-arb") | .snapshot'
+          test "$(jq -r "${arb} | .source.rails_pair_candidate_id" "${domain_config}")" = 2694
+          test "$(jq -r "${arb} | .pairs[0].binance.symbol" "${domain_config}")" = ARBUSDC
+          test "$(jq -r "${arb} | .pairs[0].binance.step_size" "${domain_config}")" = 0.10000000
+          test "$(jq -r "${arb} | .pairs[0].binance.tick_size" "${domain_config}")" = 0.00010000
+          test "$(jq -r "${arb} | .pairs[0].full_live" "${domain_config}")" = true
+          test "$(jq -r "${arb} | .pairs[0].rebalance.enabled" "${domain_config}")" = true
+          test "$(jq -r "${arb} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 6000000
+          test "$(jq -r "${arb} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
+          test "$(jq -r "${arb} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
+          test "$(jq -r "${arb} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
+          test "$(jq -r "${arb} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-05T05:54:11Z
+          test "$(jq -c "${arb} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" = '[3000]'
+          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 3000 and ((.canonical_identity | ascii_downcase) | contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -529,6 +543,159 @@ jobs:
             and .gate == "target_c4_replay_ready"
           ' <<<"${replay_report}" >/dev/null
           echo "${replay_report}"
+
+      - name: Bootstrap reviewed ARB inventory once
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+          marker="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -r '.metadata.annotations["arb-bot/arb-inventory-bootstrap-v1"] // empty')"
+          if [[ "${marker}" == complete:* ]]; then
+            echo "ARB inventory bootstrap is already durably marked complete."
+            exit 0
+          fi
+
+          test "$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.replicas}')" = 1
+          pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector='app.kubernetes.io/name=arb-bot' \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${pod}"
+          kubectl wait pod/"${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=Ready \
+            --timeout=60s
+          kubectl exec "${pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            -- /bin/sh -ec 'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"; : >"${ARBITRAGE_ENTRY_STOP_FILE}"'
+
+          safe=false
+          for _ in {1..900}; do
+            if kubectl exec "${pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --container arb-bot \
+              -- /bin/sh -ec 'test -s "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe" && grep -qx "active_operation_count=0" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'; then
+              safe=true
+              break
+            fi
+            sleep 1
+          done
+          test "${safe}" = true
+
+          job="arb-bot-arb-bootstrap-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          restore_old_owner=false
+          cleanup_bootstrap() {
+            status="$?"
+            trap - EXIT
+            kubectl delete job "${job}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --ignore-not-found \
+              --wait=false >/dev/null 2>&1 || true
+            if [[ "${restore_old_owner}" == true ]]; then
+              kubectl scale deployment arb-bot \
+                --namespace "${GKE_NAMESPACE}" \
+                --replicas=1 >/dev/null || true
+              kubectl rollout status deployment/arb-bot \
+                --namespace "${GKE_NAMESPACE}" \
+                --timeout=180s || true
+            fi
+            exit "${status}"
+          }
+          trap cleanup_bootstrap EXIT
+
+          kubectl scale deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --replicas=0
+          restore_old_owner=true
+          kubectl wait pod \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector='app.kubernetes.io/name=arb-bot' \
+            --for=delete \
+            --timeout=120s
+
+          template="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -c '.spec.template')"
+          jq -n \
+            --argjson template "${template}" \
+            --arg job "${job}" \
+            --arg image "${IMAGE}" \
+            '
+              {
+                apiVersion: "batch/v1",
+                kind: "Job",
+                metadata: {
+                  name: $job,
+                  labels: {"app.kubernetes.io/name": "arb-bot-arb-bootstrap"}
+                },
+                spec: {
+                  backoffLimit: 0,
+                  activeDeadlineSeconds: 600,
+                  ttlSecondsAfterFinished: 3600,
+                  template: (
+                    $template
+                    | .metadata.labels = {
+                        "app.kubernetes.io/name": "arb-bot-arb-bootstrap",
+                        "arb-bot/bootstrap-instance": $job
+                      }
+                    | .metadata.annotations = {}
+                    | .spec.restartPolicy = "Never"
+                    | .spec.containers = [
+                        .spec.containers[]
+                        | select(.name == "arb-bot")
+                        | .name = "bootstrap"
+                        | .image = $image
+                        | del(.startupProbe, .readinessProbe, .livenessProbe)
+                        | .command = ["/bin/sh", "-ec"]
+                        | .args = [
+                            "export BINANCE_API_KEY=\"$(cat /var/run/secrets/arb-bot/BINANCE_API_KEY)\"; export BINANCE_SECRET_KEY=\"$(cat /var/run/secrets/arb-bot/BINANCE_SECRET_KEY)\"; exec arb_bot bootstrap-arb-inventory --quote-usdc 500 --journal-path /var/lib/arb-bot/arb-bootstrap-binance.journal --live-confirmation BOOTSTRAP_ARB_WITH_500_USDC"
+                          ]
+                      ]
+                  )
+                }
+              }
+            ' | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+
+          if ! kubectl wait job/"${job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --for=condition=Complete \
+            --timeout=620s; then
+            kubectl logs job/"${job}" --namespace "${GKE_NAMESPACE}" || true
+            exit 1
+          fi
+          kubectl logs job/"${job}" --namespace "${GKE_NAMESPACE}"
+          kubectl scale deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --replicas=1
+          kubectl rollout status deployment/arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --timeout=180s
+          restored_pod="$(kubectl get pods \
+            --namespace "${GKE_NAMESPACE}" \
+            --selector='app.kubernetes.io/name=arb-bot' \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')"
+          test -n "${restored_pod}"
+          kubectl exec "${restored_pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            -- /bin/sh -ec 'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'
+          kubectl annotate deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            --overwrite \
+            "arb-bot/arb-inventory-bootstrap-v1=complete:${SOURCE_SHA}"
+          restore_old_owner=false
+          trap - EXIT
+          kubectl delete job "${job}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --ignore-not-found \
+            --wait=false >/dev/null 2>&1 || true
 
       - name: Roll out on the fixed node
         id: rollout
