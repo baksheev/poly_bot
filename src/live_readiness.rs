@@ -259,6 +259,16 @@ impl ChainReadiness {
             ready: self.ready,
         }
     }
+
+    /// Allowance bootstrap requires the reviewed contracts and a usable RPC,
+    /// but deliberately does not grant trading readiness from token funding.
+    pub const fn allowance_mutations_ready(&self) -> bool {
+        self.exact_token_contracts
+            && self.token_code_present
+            && self.router_code_present
+            && self.fresh_rpc_gas_price
+            && self.external_mutation_authorized
+    }
 }
 
 #[derive(Clone)]
@@ -828,6 +838,8 @@ mod tests {
             ready: false,
         };
         let mut later = readiness.clone();
+        assert!(readiness.allowance_mutations_ready());
+        assert!(!readiness.ready);
         later.block_number = 2;
         assert_eq!(readiness.status(), later.status());
 

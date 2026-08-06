@@ -3515,11 +3515,11 @@ async fn run(
         Some(ChainReadinessStatus::Observed { ready: true, .. })
     )));
     let arb_market_data_ready = Arc::new(AtomicBool::new(true));
-    let (linea_chain_readiness_probe, linea_initial_chain_readiness_status) = if let Some(
-        registry,
-    ) =
-        network_registry.as_ref()
-    {
+    let (
+        linea_chain_readiness_probe,
+        linea_initial_chain_readiness_status,
+        linea_allowance_mutations_ready,
+    ) = if let Some(registry) = network_registry.as_ref() {
         let runtime = registry.get_by_chain_id(LINEA_CHAIN_ID)?;
         let snapshot = portfolio_wallet_snapshots
             .iter()
@@ -3535,7 +3535,12 @@ async fn run(
                     &readiness,
                     "startup",
                 );
-                (Some(probe), Some(readiness.status()))
+                let allowance_mutations_ready = readiness.allowance_mutations_ready();
+                (
+                    Some(probe),
+                    Some(readiness.status()),
+                    allowance_mutations_ready,
+                )
             }
             Err(error) => {
                 tracing::warn!(error = %error, "Linea chain readiness is incomplete; Linea fails closed");
@@ -3546,11 +3551,11 @@ async fn run(
                     "startup",
                     &error,
                 );
-                (Some(probe), Some(ChainReadinessStatus::ProbeFailed))
+                (Some(probe), Some(ChainReadinessStatus::ProbeFailed), false)
             }
         }
     } else {
-        (None, None)
+        (None, None, false)
     };
     let linea_execution_ready = Arc::new(AtomicBool::new(matches!(
         linea_initial_chain_readiness_status,
@@ -3822,8 +3827,8 @@ async fn run(
             "ESP Arbitrum chain readiness must pass before allowance mutations"
         );
         ensure!(
-            linea_execution_ready.load(Ordering::Acquire),
-            "Linea chain readiness must pass before allowance mutations"
+            linea_allowance_mutations_ready,
+            "Linea contract and RPC readiness must pass before allowance mutations"
         );
         let account_id = compiled_binance_runtime
             .as_ref()

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "stage": "P8f_linea_unfunded_allowance_bootstrap",
+  "measured_at_utc": "2026-08-06T15:08:04Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "cold-start Linea allowance bootstrap readiness remains separate from token-funded trading readiness",
+  "control": {
+    "revision": "cbef5843cc16e5d5119d239f2ed4f6e7eff4b9c5",
+    "binary_sha256": "725355a5c2117a342d59908e8b3714c3c027e6c1961466812e48e900abcb80d2"
+  },
+  "candidate": {
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "safety_projection": {
+    "allowance_requires_exact_contracts": true,
+    "allowance_requires_token_code": true,
+    "allowance_requires_lynex_router_code": true,
+    "allowance_requires_fresh_rpc_gas_price": true,
+    "allowance_requires_versioned_mutation_authority": true,
+    "allowance_requires_token_funding": false,
+    "trading_requires_token_funding": true
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P8e-control then P8f-candidate binary runs",
+    "total_strategy_frames_per_binary_per_run": 2000000,
+    "control_frames_per_second": [
+      12805361,
+      14819338,
+      14726446,
+      14911291,
+      14201351
+    ],
+    "candidate_frames_per_second": [
+      12650034,
+      14779904,
+      14683164,
+      14892624,
+      14694681
+    ],
+    "control_frames_per_second_median": 14726446,
+    "candidate_frames_per_second_median": 14694681,
+    "candidate_to_control_throughput_ratio": 0.997842996199,
+    "minimum_acceptable_stage_ratio": 0.95,
+    "control_decision_p95_ns": [42, 42, 42, 42, 42],
+    "candidate_decision_p95_ns": [42, 42, 42, 42, 42],
+    "control_decision_p99_ns": [83, 42, 42, 42, 42],
+    "candidate_decision_p99_ns": [83, 42, 42, 42, 42],
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "gate": "pass_local_target_c4_required_before_rollout"
+}
