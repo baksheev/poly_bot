@@ -823,8 +823,17 @@ impl RebalanceExecutionJournal {
                     network_id: match &request.action.route {
                         Route::Direct { chain_id, .. } => format!("chain:{chain_id}"),
                         Route::Across {
-                            bridge_chain_id, ..
-                        } => format!("chain:{bridge_chain_id}"),
+                            bridge_chain_id,
+                            wallet_chain_id,
+                            ..
+                        } => format!(
+                            "chain:{}",
+                            if request.authority == RebalanceExecutionAuthority::LineaFullLive {
+                                wallet_chain_id
+                            } else {
+                                bridge_chain_id
+                            }
+                        ),
                     },
                     strategy_id: request.authority.strategy_id().to_owned(),
                 }),
@@ -1096,11 +1105,12 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
         ) => binance_network == "ARBITRUM",
         (
             RebalanceExecutionAuthority::LineaFullLive,
-            Route::Direct {
-                chain_id: 59_144,
+            Route::Across {
                 binance_network,
+                bridge_chain_id: 10,
+                wallet_chain_id: 59_144,
             },
-        ) => binance_network == "LINEA",
+        ) => binance_network == "OPTIMISM",
         _ => false,
     };
     ensure!(
@@ -1113,7 +1123,7 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
             RebalanceExecutionAuthority::ArbitrumFullLive
                 | RebalanceExecutionAuthority::LineaFullLive
         ) == (request.maximum_fee.is_some() && request.approval_session_id.is_some()),
-        "only direct production rebalance requests carry fee and approval-session authority"
+        "only production rebalance requests carry fee and approval-session authority"
     );
     ensure!(
         matches!(
@@ -2339,55 +2349,33 @@ mod tests {
     }
 
     #[test]
-    fn linea_full_live_scope_risk_and_unknown_deposit_reconciliation_are_typed() {
-        let path = path("linea-full-live-direct");
+    fn linea_full_live_scope_and_risk_are_typed_for_across() {
+        let path = path("linea-full-live-across");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
-        let mut request = request(Direction::WalletToBinance, direct_linea());
+        let mut request = request(
+            Direction::WalletToBinance,
+            Route::Across {
+                binance_network: "OPTIMISM".to_owned(),
+                bridge_chain_id: 10,
+                wallet_chain_id: 59_144,
+            },
+        );
         request.authority = RebalanceExecutionAuthority::LineaFullLive;
         request.token_symbol = "USDT".to_owned();
         request.maximum_fee = Some(U256::ZERO);
-        request.approval_session_id = Some("esp-usdc-arbitrum-full-live".to_owned());
+        request.approval_session_id = Some("linea-usdt-usdc-full-live".to_owned());
         let operation = journal.reserve(&request).unwrap();
         let scope = operation.intent.scope.as_ref().unwrap();
         assert_eq!(scope.network_id, "chain:59144");
         assert_eq!(scope.strategy_id, "rebalance-linea-usdt-usdc");
 
-        let risk = journal
-            .rebalance_risk("esp-usdc-arbitrum-full-live")
-            .unwrap();
+        let risk = journal.rebalance_risk("linea-usdt-usdc-full-live").unwrap();
         assert_eq!(risk.active_transfer_count, 1);
         assert_eq!(risk.additional_token_debit["USDT"], request.action.amount);
 
-        journal
-            .advance(
-                &operation.intent.operation_id,
-                RebalanceExecutionProgress::Quarantined {
-                    reason: "DEX outcome unknown: timed out".to_owned(),
-                },
-            )
-            .unwrap();
-        let quarantined = journal
-            .next_reconcilable_direct_deposit_quarantine(59_144, "LINEA")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            quarantined.intent.operation_id,
-            operation.intent.operation_id
-        );
-        let reconciled = journal
-            .record_reconciled_direct_deposit(
-                &operation.intent.operation_id,
-                59_144,
-                B256::repeat_byte(0x59),
-            )
-            .unwrap();
-        assert!(matches!(
-            reconciled.progress,
-            RebalanceExecutionProgress::DepositTransferMined {
-                chain_id: 59_144,
-                ..
-            }
-        ));
+        let mut direct = request.clone();
+        direct.action.route = direct_linea();
+        assert!(super::validate_request(&direct).is_err());
         drop(journal);
         fs::remove_file(path).unwrap();
     }

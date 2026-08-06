@@ -309,7 +309,7 @@ impl FullLivePolicy {
         let reviewed_approval = match (pair.chain.chain_id, pair.binance.symbol.as_str()) {
             (42_161, "ESPUSDC") => "2026-07-31T11:00:00Z",
             (42_161, "ARBUSDC") => "2026-08-05T05:54:11Z",
-            (59_144, "USDCUSDT") => "2026-08-06T07:44:34Z",
+            (59_144, "USDCUSDT") => "2026-08-06T13:17:14Z",
             _ => {
                 anyhow::bail!("full-live policy is restricted to reviewed Arbitrum and Linea pairs")
             }
@@ -335,12 +335,18 @@ impl FullLivePolicy {
             self.router_allowance_mode == FullLiveRouterAllowanceMode::MaxUint256ThenLocked,
             "full-live router allowance mode differs from the reviewed Rails-compatible policy"
         );
-        ensure!(
+        let reviewed_route = if pair.chain.chain_id == 59_144 {
+            self.rebalance_binance_network == "OPTIMISM"
+                && !self.direct_route_only
+                && self.bridge_mutations_enabled
+        } else {
             self.rebalance_binance_network == pair.chain.binance_network_name
-                && self.maximum_unknown_reconciliation_queries == 1
                 && self.direct_route_only
-                && !self.bridge_mutations_enabled,
-            "full-live rebalance must remain direct, single-query, and no-bridge"
+                && !self.bridge_mutations_enabled
+        };
+        ensure!(
+            reviewed_route && self.maximum_unknown_reconciliation_queries == 1,
+            "full-live rebalance route differs from the reviewed bounded policy"
         );
         let reviewed_caps = if pair.chain.chain_id == 59_144 {
             ("2600000000", "2600000000", "5000000", "5000000")

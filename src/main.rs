@@ -12,8 +12,9 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, bail, ensure};
 use arb_bot::{
     across::{
-        AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, WORLD_CHAIN_CHAIN_ID,
-        WORLD_CHAIN_USDC, is_retryable_quote_error, validate_quote,
+        AcrossClient, AcrossQuoteRequest, LINEA_USDC, LINEA_USDT, OPTIMISM_CHAIN_ID, OPTIMISM_USDC,
+        OPTIMISM_USDT, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, is_retryable_quote_error,
+        validate_quote,
     },
     arbitrage::{
         EntryPreflightHandle, ExecutionMode, LegRole, LegStatus, MAX_RECOVERY_ATTEMPTS,
@@ -628,6 +629,21 @@ async fn main() -> anyhow::Result<()> {
             origin_chain_id,
             amount,
         } => across_usdc_quote(&cli.config, origin_chain_id, amount).await,
+        Command::AcrossLineaCapitalQuote {
+            asset,
+            origin_chain_id,
+            amount,
+            wallet_address,
+        } => {
+            across_linea_capital_quote(
+                &cli.config,
+                &asset,
+                origin_chain_id,
+                amount,
+                &wallet_address,
+            )
+            .await
+        }
         Command::WalletAddress => {
             let wallet = EvmWallet::from_env()?;
             tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
@@ -1411,6 +1427,67 @@ async fn across_usdc_quote(
         approval_transactions = quote.approval_txns.len(),
         swap_target = %quote.swap_tx.to,
         "public unauthenticated Across quote validated"
+    );
+    Ok(())
+}
+
+async fn across_linea_capital_quote(
+    config: &config::AppConfig,
+    asset: &str,
+    origin_chain_id: u64,
+    amount: u128,
+    wallet_address: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        amount > 0 && amount <= 10_000_000_000,
+        "Across Linea capital quote must be between 1 base unit and 10,000 tokens"
+    );
+    let asset = asset.to_ascii_uppercase();
+    ensure!(
+        asset == "USDC" || asset == "USDT",
+        "asset must be USDC or USDT"
+    );
+    let destination_chain_id = match origin_chain_id {
+        OPTIMISM_CHAIN_ID => LINEA_CHAIN_ID,
+        LINEA_CHAIN_ID => OPTIMISM_CHAIN_ID,
+        _ => bail!("Across Linea capital quote only permits Optimism and Linea"),
+    };
+    let token = |chain_id| match (asset.as_str(), chain_id) {
+        ("USDC", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_USDC),
+        ("USDC", LINEA_CHAIN_ID) => Ok(LINEA_USDC),
+        ("USDT", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_USDT),
+        ("USDT", LINEA_CHAIN_ID) => Ok(LINEA_USDT),
+        _ => bail!("unsupported Across Linea capital asset or chain"),
+    };
+    let wallet = wallet_address
+        .parse::<Address>()
+        .context("invalid public wallet address")?;
+    ensure!(wallet != Address::ZERO, "public wallet address is zero");
+    let request = AcrossQuoteRequest {
+        origin_chain_id,
+        destination_chain_id,
+        input_token: token(origin_chain_id)?,
+        output_token: token(destination_chain_id)?,
+        amount,
+        depositor: wallet,
+        recipient: wallet,
+    };
+    let quote = AcrossClient::new(config)?.quote(&request).await?;
+    validate_quote(&request, &quote)?;
+    tracing::info!(
+        quote_id = %quote.id,
+        asset,
+        origin_chain_id,
+        destination_chain_id,
+        input_amount = %quote.input_amount,
+        expected_output_amount = %quote.expected_output_amount,
+        min_output_amount = %quote.min_output_amount,
+        fee_amount = %quote.fees.total.amount,
+        expected_fill_time_seconds = quote.expected_fill_time,
+        quote_expiry_timestamp = quote.quote_expiry_timestamp,
+        approval_transactions = quote.approval_txns.len(),
+        swap_target = %quote.swap_tx.to,
+        "Across V4 Linea capital quote validated"
     );
     Ok(())
 }
@@ -3118,25 +3195,6 @@ async fn run(
                 linea_pair.rebalance.enabled,
                 "live rebalance allocator requires the Linea pair rebalance policy"
             );
-            match validate_rebalance_readiness(&linea_pair, &capital_coins) {
-                Ok(readiness) => telemetry.emit(
-                    "live_readiness",
-                    serde_json::json!({
-                        "engine_id": config.engine_id,
-                        "stage": "linea_rebalance_routes",
-                        "pair_id": linea_pair.id,
-                        "network_id": "eip155:59144",
-                        "binance_network": readiness.network,
-                        "asset_count": readiness.asset_count,
-                        "direct_route_count": readiness.direct_route_count,
-                        "deposit_enabled_assets": readiness.deposit_enabled_assets,
-                        "withdrawal_enabled_assets": readiness.withdrawal_enabled_assets,
-                        "external_mutation_authorized": readiness.external_mutation_authorized,
-                        "ready": readiness.ready,
-                    }),
-                ),
-                Err(error) => anyhow::bail!("Linea rebalance readiness failed: {error:#}"),
-            }
             let mut routes = BTreeMap::new();
             for token in [&linea_pair.token_a, &linea_pair.token_b] {
                 let capital = select_capital_routes(
@@ -3145,17 +3203,17 @@ async fn run(
                     &linea_pair.chain.binance_network_name,
                     "OPTIMISM",
                 )?;
-                let direct = capital
-                    .direct
+                let fallback = capital
+                    .fallback
                     .as_ref()
-                    .filter(|route| route.network == linea_pair.chain.binance_network_name)
-                    .context("Linea direct capital route is absent")?;
+                    .filter(|route| route.network == "OPTIMISM")
+                    .context("Linea Optimism capital fallback is absent")?;
                 ensure!(
                     capital.deposit_all_enabled
                         && capital.withdrawal_all_enabled
-                        && direct.deposit_available()
-                        && direct.withdrawal_available(),
-                    "Linea direct capital route is not fully available"
+                        && fallback.deposit_available()
+                        && fallback.withdrawal_available(),
+                    "Linea Optimism capital fallback is not fully available"
                 );
                 routes.insert(
                     token.symbol.clone(),
@@ -3164,14 +3222,31 @@ async fn run(
                             coin: capital.coin.clone(),
                             deposit_all_enabled: capital.deposit_all_enabled,
                             withdrawal_all_enabled: capital.withdrawal_all_enabled,
-                            direct: Some(direct.clone()),
-                            fallback: None,
+                            direct: None,
+                            fallback: Some(fallback.clone()),
                         },
                         token.decimals,
                         LINEA_CHAIN_ID,
                     )?,
                 );
             }
+            telemetry.emit(
+                "live_readiness",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "stage": "linea_rebalance_routes",
+                    "pair_id": linea_pair.id,
+                    "network_id": "eip155:59144",
+                    "binance_network": "OPTIMISM",
+                    "asset_count": 2,
+                    "direct_route_count": 0,
+                    "bridge_route_count": 2,
+                    "deposit_enabled_assets": 2,
+                    "withdrawal_enabled_assets": 2,
+                    "external_mutation_authorized": true,
+                    "ready": true,
+                }),
+            );
             RebalanceTracker::new(&linea_pair, routes)?
         } else {
             RebalanceTracker::disabled()

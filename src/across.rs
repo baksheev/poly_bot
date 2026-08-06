@@ -9,10 +9,17 @@ use crate::config::AppConfig;
 
 pub const OPTIMISM_CHAIN_ID: u64 = 10;
 pub const WORLD_CHAIN_CHAIN_ID: u64 = 480;
+pub const LINEA_CHAIN_ID: u64 = 59_144;
 pub const OPTIMISM_USDC: Address =
     alloy_primitives::address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85");
 pub const WORLD_CHAIN_USDC: Address =
     alloy_primitives::address!("0x79A02482A880bCE3F13e09Da970dC34db4CD24d1");
+pub const LINEA_USDC: Address =
+    alloy_primitives::address!("0x176211869cA2b568f2A7D4EE941E073a821EE1ff");
+pub const OPTIMISM_USDT: Address =
+    alloy_primitives::address!("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58");
+pub const LINEA_USDT: Address =
+    alloy_primitives::address!("0xA219439258ca9da29E9Cc4cE5596924745e12B93");
 pub const OPTIMISM_WLD: Address =
     alloy_primitives::address!("0xdC6fF44d5d932Cbd77B52E5612Ba0529DC6226F1");
 pub const WORLD_CHAIN_WLD: Address =
@@ -20,6 +27,7 @@ pub const WORLD_CHAIN_WLD: Address =
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_QUOTE_EXPIRY_SECONDS: u64 = 7_200;
+const ACROSS_INTEGRATOR_ID: &str = "0x5042";
 const ACROSS_DEPOSIT_V3_SELECTOR: [u8; 4] = [0xad, 0x54, 0x25, 0xc6];
 const CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR: [u8; 4] = [0x8e, 0x02, 0x50, 0xee];
 const MAX_CCTP_TRAILING_INTEGRATOR_BYTES: usize = 32;
@@ -143,6 +151,7 @@ impl AcrossClient {
                 ("depositor", format!("{:#x}", request.depositor)),
                 ("recipient", format!("{:#x}", request.recipient)),
                 ("slippage", "auto".to_owned()),
+                ("integratorId", ACROSS_INTEGRATOR_ID.to_owned()),
             ])
             .send()
             .await
@@ -479,6 +488,8 @@ fn ensure_token(token: &AcrossToken, chain_id: u64, address: Address) -> anyhow:
 fn supported_erc20_pair(request: &AcrossQuoteRequest) -> anyhow::Result<(&'static str, u8)> {
     match (request.input_token, request.output_token) {
         (OPTIMISM_USDC, WORLD_CHAIN_USDC) | (WORLD_CHAIN_USDC, OPTIMISM_USDC) => Ok(("USDC", 6)),
+        (OPTIMISM_USDC, LINEA_USDC) | (LINEA_USDC, OPTIMISM_USDC) => Ok(("USDC", 6)),
+        (OPTIMISM_USDT, LINEA_USDT) | (LINEA_USDT, OPTIMISM_USDT) => Ok(("USDT", 6)),
         (OPTIMISM_WLD, WORLD_CHAIN_WLD) | (WORLD_CHAIN_WLD, OPTIMISM_WLD) => Ok(("WLD", 18)),
         _ => anyhow::bail!("Across token pair is not an approved rebalance route"),
     }
@@ -890,10 +901,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AcrossAllowanceCheck, AcrossBalanceCheck, AcrossChecks, AcrossDepositStatus, AcrossFee,
-        AcrossFees, AcrossHttpStatusError, AcrossOperation, AcrossQuote, AcrossQuoteRequest,
-        AcrossToken, AcrossTransaction, AcrossTransportError, AcrossTransportPhase,
-        OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WLD, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
+        ACROSS_INTEGRATOR_ID, AcrossAllowanceCheck, AcrossBalanceCheck, AcrossChecks,
+        AcrossDepositStatus, AcrossFee, AcrossFees, AcrossHttpStatusError, AcrossOperation,
+        AcrossQuote, AcrossQuoteRequest, AcrossToken, AcrossTransaction, AcrossTransportError,
+        AcrossTransportPhase, LINEA_CHAIN_ID, LINEA_USDC, LINEA_USDT, OPTIMISM_CHAIN_ID,
+        OPTIMISM_USDC, OPTIMISM_USDT, OPTIMISM_WLD, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC,
         WORLD_CHAIN_WLD, decode_calldata, is_retryable_quote_error, transaction_integer,
         u256_word_is_at_least_u128, validate_deposit_status, validate_quote,
     };
@@ -917,6 +929,11 @@ mod tests {
             depositor: DEPOSITOR,
             recipient: DEPOSITOR,
         }
+    }
+
+    #[test]
+    fn production_quotes_use_the_reviewed_poly_bot_integrator_id() {
+        assert_eq!(ACROSS_INTEGRATOR_ID, "0x5042");
     }
 
     fn valid_quote() -> AcrossQuote {
@@ -1173,6 +1190,70 @@ mod tests {
 
             let terms = validate_quote(&request, &quote).unwrap();
             assert_eq!(terms.minimum_output_amount, minimum);
+        }
+    }
+
+    #[test]
+    fn validates_linea_stablecoin_routes_in_both_directions() {
+        for (symbol, optimism_token, linea_token) in [
+            ("USDC", OPTIMISM_USDC, LINEA_USDC),
+            ("USDT", OPTIMISM_USDT, LINEA_USDT),
+        ] {
+            for (origin_chain_id, destination_chain_id, input_token, output_token) in [
+                (
+                    OPTIMISM_CHAIN_ID,
+                    LINEA_CHAIN_ID,
+                    optimism_token,
+                    linea_token,
+                ),
+                (
+                    LINEA_CHAIN_ID,
+                    OPTIMISM_CHAIN_ID,
+                    linea_token,
+                    optimism_token,
+                ),
+            ] {
+                let request = AcrossQuoteRequest {
+                    origin_chain_id,
+                    destination_chain_id,
+                    input_token,
+                    output_token,
+                    amount: 1_000_000_000,
+                    depositor: DEPOSITOR,
+                    recipient: DEPOSITOR,
+                };
+                let minimum = 999_000_000;
+                let mut quote = valid_quote();
+                quote.checks.allowance.token = format!("{input_token:#x}");
+                quote.checks.allowance.expected = request.amount.to_string();
+                quote.checks.balance.token = format!("{input_token:#x}");
+                quote.checks.balance.actual = request.amount.to_string();
+                quote.checks.balance.expected = request.amount.to_string();
+                quote.approval_txns[0].chain_id = origin_chain_id;
+                quote.approval_txns[0].to = format!("{input_token:#x}");
+                quote.input_token = AcrossToken {
+                    decimals: 6,
+                    symbol: symbol.to_owned(),
+                    address: format!("{input_token:#x}"),
+                    chain_id: origin_chain_id,
+                };
+                quote.output_token = AcrossToken {
+                    decimals: 6,
+                    symbol: symbol.to_owned(),
+                    address: format!("{output_token:#x}"),
+                    chain_id: destination_chain_id,
+                };
+                quote.fees.total.amount = "1000000".to_owned();
+                quote.input_amount = request.amount.to_string();
+                quote.max_input_amount = request.amount.to_string();
+                quote.expected_output_amount = minimum.to_string();
+                quote.min_output_amount = minimum.to_string();
+                quote.swap_tx.chain_id = origin_chain_id;
+                quote.swap_tx.data = swap_calldata(&request, minimum);
+
+                let terms = validate_quote(&request, &quote).unwrap();
+                assert_eq!(terms.minimum_output_amount, minimum);
+            }
         }
     }
 

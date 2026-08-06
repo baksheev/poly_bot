@@ -1750,11 +1750,8 @@ impl CompiledDomainGraph {
                 for (other_pair, other_policy) in &full_live_policies {
                     ensure!(
                         other_policy.maximum_unknown_reconciliation_queries
-                            == policy.maximum_unknown_reconciliation_queries
-                            && other_policy.direct_route_only == policy.direct_route_only
-                            && other_policy.bridge_mutations_enabled
-                                == policy.bridge_mutations_enabled,
-                        "compiled full-live policies do not share one bounded direct lane"
+                            == policy.maximum_unknown_reconciliation_queries,
+                        "compiled full-live policies do not share one bounded lane"
                     );
                     if other_pair.chain.chain_id == pair.chain.chain_id
                         && other_pair.token_a.symbol == pair.token_a.symbol
@@ -1882,8 +1879,12 @@ impl CompiledDomainGraph {
                     direct_networks,
                     maximum_unknown_reconciliation_queries: policy
                         .maximum_unknown_reconciliation_queries,
-                    direct_route_only: policy.direct_route_only,
-                    bridge_mutations_enabled: policy.bridge_mutations_enabled,
+                    direct_route_only: full_live_policies
+                        .iter()
+                        .all(|(_, policy)| policy.direct_route_only),
+                    bridge_mutations_enabled: full_live_policies
+                        .iter()
+                        .any(|(_, policy)| policy.bridge_mutations_enabled),
                     external_mutation_authorized: role == CompatibilityRole::LiveRuntime,
                 })
             })
@@ -3344,14 +3345,14 @@ mod tests {
         let capital_policy = portfolio.capital_policy.as_ref().unwrap();
         assert_eq!(capital_policy.network_id.as_str(), "eip155:42161");
         assert!(capital_policy.external_mutation_authorized);
-        assert!(capital_policy.direct_route_only);
-        assert!(!capital_policy.bridge_mutations_enabled);
+        assert!(!capital_policy.direct_route_only);
+        assert!(capital_policy.bridge_mutations_enabled);
         assert!(capital_policy.additional_tokens.contains_key("ARB"));
         assert!(capital_policy.additional_tokens.contains_key("USDT"));
         assert_eq!(capital_policy.direct_networks.len(), 2);
         assert_eq!(
             capital_policy.direct_networks[&59_144].binance_network,
-            "LINEA"
+            "OPTIMISM"
         );
         assert!(
             capital_policy.direct_networks[&59_144]

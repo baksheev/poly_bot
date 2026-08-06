@@ -443,7 +443,7 @@
     },
     {
       "snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-full-live-v1",
-      "source_fingerprint_sha256": "d8b2e01f0aef460939fed2dd55f6bc564eec4eb179fb93e5b4b29bea4b2e8447",
+      "source_fingerprint_sha256": "f0ff174369a6cace432c5fda371e6e195b3d2f7ab31bad227f4b73d2e66c7a51",
       "snapshot": {
         "schema_version": 1,
         "snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-full-live-v1",
@@ -457,7 +457,7 @@
             "production schema derived from the reviewed ARB/USDC control with explicit operator authority from the 2026-08-06 Linea launch request",
             "Linea chain and Lynex Algebra V1.9 identities pinned at block 31631634",
             "Binance Spot USDCUSDT was TRADING with one-USDC LOT_SIZE step, 0.00001 tick, and five-USDT minimum notional at serverTime 1785997605387",
-            "Lynex market data, DEX-first execution, bounded Binance recovery, and direct LINEA rebalancing are approved for full-live production"
+            "Lynex market data, DEX-first execution, bounded Binance recovery, and Optimism/Across V4 Linea rebalancing are approved for full-live production"
           ]
         },
         "live_trading_enabled": true,
@@ -469,17 +469,17 @@
             "full_live": true,
             "full_live_policy": {
               "production_approval_actor": "operator",
-              "production_approval_recorded_at_utc": "2026-08-06T07:44:34Z",
+              "production_approval_recorded_at_utc": "2026-08-06T13:17:14Z",
               "arbitrum_max_fee_headroom_bps": 12000,
               "router_allowance_mode": "max_uint256_then_locked",
-              "rebalance_binance_network": "LINEA",
+              "rebalance_binance_network": "OPTIMISM",
               "maximum_rebalance_token_a_debit_base_units": "2600000000",
               "maximum_rebalance_token_b_debit_base_units": "2600000000",
               "maximum_rebalance_token_a_fee_base_units": "5000000",
               "maximum_rebalance_token_b_fee_base_units": "5000000",
               "maximum_unknown_reconciliation_queries": 1,
-              "direct_route_only": true,
-              "bridge_mutations_enabled": false
+              "direct_route_only": false,
+              "bridge_mutations_enabled": true
             },
             "chain": {
               "name": "Linea Mainnet",

@@ -182,20 +182,27 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("\"path\":\"/spec/replicas\",\"value\":1"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
     assert!(DEPLOY_WORKFLOW.contains("wait_operation_owner \"${bootstrap_owner}\" bootstrap"));
-    assert!(DEPLOY_WORKFLOW.contains("Verify Binance LINEA direct capital routes read-only"));
+    assert!(
+        DEPLOY_WORKFLOW
+            .contains("Verify Binance Optimism and Across Linea capital routes read-only")
+    );
     assert!(DEPLOY_WORKFLOW.contains("for coin in USDC USDT; do"));
     assert!(
         DEPLOY_WORKFLOW
-            .contains("arb_bot binance-capital-recovery --coin \"${coin}\" --network LINEA")
+            .contains("arb_bot binance-capital-recovery --coin \"${coin}\" --network OPTIMISM")
     );
-    assert!(DEPLOY_WORKFLOW.contains("linea_%s_route=failed"));
+    assert!(DEPLOY_WORKFLOW.contains("optimism_%s_route=failed"));
+    assert!(DEPLOY_WORKFLOW.contains("arb_bot across-linea-capital-quote"));
+    assert!(DEPLOY_WORKFLOW.contains("for origin_chain_id in 10 59144; do"));
+    assert!(DEPLOY_WORKFLOW.contains("--wallet-address \"${wallet_address}\""));
+    assert!(DEPLOY_WORKFLOW.contains("across_%s_%s_route=failed"));
     assert!(!DEPLOY_WORKFLOW.contains("--container linea-capital-read"));
     assert!(DEPLOY_WORKFLOW.contains("secretProviderClass\": \"arb-bot-binance-capital-read"));
     let release_platform = DEPLOY_WORKFLOW
         .find("Apply release platform before production preflights")
         .expect("release platform is applied before production preflights");
     let linea_capital_preflight = DEPLOY_WORKFLOW
-        .find("Verify Binance LINEA direct capital routes read-only")
+        .find("Verify Binance Optimism and Across Linea capital routes read-only")
         .expect("LINEA capital preflight is configured");
     let rollout = DEPLOY_WORKFLOW
         .find("Roll out on the fixed node")

@@ -192,13 +192,13 @@ jobs:
           test "$(jq -r "${linea} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
           test "$(jq -r "${linea} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
           test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_actor" "${domain_config}")" = operator
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-06T07:44:34Z
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.rebalance_binance_network" "${domain_config}")" = LINEA
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-06T13:17:14Z
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.rebalance_binance_network" "${domain_config}")" = OPTIMISM
           test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_rebalance_token_a_debit_base_units" "${domain_config}")" = 2600000000
           test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_rebalance_token_b_debit_base_units" "${domain_config}")" = 2600000000
           test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_unknown_reconciliation_queries" "${domain_config}")" = 1
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.direct_route_only" "${domain_config}")" = true
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.bridge_mutations_enabled" "${domain_config}")" = false
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.direct_route_only" "${domain_config}")" = false
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.bridge_mutations_enabled" "${domain_config}")" = true
           test "$(jq -c "${linea} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["lynex_algebra_v1_9"]'
           test "$(jq -r "${linea} | .pairs[0].chain.lynex_algebra_v1_9_router_address" "${domain_config}")" = 0x3921e8cb45B17fC029A0a6dE958330ca4e583390
           test "$(jq -r '[.pools[] | select(.pair_id == "linea-usdt-usdc" and .protocol == "lynex_algebra_v1_9" and .fee_pips == null and .tick_spacing == 1 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b")))] | length' "${domain_config}")" = 1
@@ -647,7 +647,7 @@ jobs:
           ' <<<"${replay_report}" >/dev/null
           echo "${replay_report}"
 
-      - name: Verify Binance LINEA direct capital routes read-only
+      - name: Verify Binance Optimism and Across Linea capital routes read-only
         env:
           IMAGE: ${{ steps.image.outputs.image }}
         run: |
@@ -674,14 +674,28 @@ jobs:
           read -r -d '' preflight_command <<'SH' || true
           export BINANCE_API_KEY="$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_API_KEY)"
           export BINANCE_SECRET_KEY="$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_SECRET_KEY)"
+          wallet_address=0x90D990C81320221D2882De32beeA78923c1e77A3
           route_status=0
           for coin in USDC USDT; do
-            if arb_bot binance-capital-recovery --coin "${coin}" --network LINEA; then
-              printf 'linea_%s_route=verified\n' "${coin}"
+            if arb_bot binance-capital-recovery --coin "${coin}" --network OPTIMISM; then
+              printf 'optimism_%s_route=verified\n' "${coin}"
             else
-              printf 'linea_%s_route=failed\n' "${coin}" | tee -a /dev/termination-log >&2
+              printf 'optimism_%s_route=failed\n' "${coin}" | tee -a /dev/termination-log >&2
               route_status=1
             fi
+            for origin_chain_id in 10 59144; do
+              if arb_bot across-linea-capital-quote \
+                --asset "${coin}" \
+                --origin-chain-id "${origin_chain_id}" \
+                --amount 1000000000 \
+                --wallet-address "${wallet_address}"; then
+                printf 'across_%s_%s_route=verified\n' "${coin}" "${origin_chain_id}"
+              else
+                printf 'across_%s_%s_route=failed\n' "${coin}" "${origin_chain_id}" \
+                  | tee -a /dev/termination-log >&2
+                route_status=1
+              fi
+            done
           done
           test "${route_status}" -eq 0
           printf 'linea_capital_routes=verified\n' | tee /dev/termination-log

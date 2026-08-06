@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "stage": "P8c_linea_optimism_across_v4_capital_route",
+  "measured_at_utc": "2026-08-06T13:17:14Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "cold-path Linea USDC/USDT Binance Optimism plus Across V4 rebalance and deployment preflight",
+  "control": {
+    "revision": "37169394472fecbb3fbd29eeb07210afa0a9b90e",
+    "binary_sha256": "b1aa30a35e744146d16a86fc6514db20e257b6212104060244d6d7ff8d9d4060"
+  },
+  "candidate": {
+    "binary_sha256": "17dab742a22f355ab27a2723ffcc57afbef7541396a99699ac108ef20396012f"
+  },
+  "live_read_only_route_validation": {
+    "api": "https://app.across.to/api/swap/approval",
+    "integrator_id": "0x5042",
+    "amount_base_units": 1000000000,
+    "routes": [
+      "USDC:10->59144",
+      "USDC:59144->10",
+      "USDT:10->59144",
+      "USDT:59144->10"
+    ],
+    "validated_routes": 4,
+    "network_mutations": 0,
+    "gate": "pass"
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P8b-control then P8c-candidate binary runs",
+    "total_strategy_frames_per_binary_per_run": 2000000,
+    "control_frames_per_second": [
+      14617536,
+      15297463,
+      14861026,
+      15068992,
+      14982377
+    ],
+    "candidate_frames_per_second": [
+      14941043,
+      14936343,
+      15043305,
+      14887658,
+      14859733
+    ],
+    "control_frames_per_second_median": 14982377,
+    "candidate_frames_per_second_median": 14936343,
+    "candidate_to_control_throughput_ratio": 0.996927456838124,
+    "candidate_to_frozen_p0_throughput_ratio": 1.17138830560016,
+    "minimum_acceptable_stage_ratio": 0.95,
+    "control_decision_p95_ns_median": 42,
+    "candidate_decision_p95_ns_median": 42,
+    "control_decision_p99_ns_median": 42,
+    "candidate_decision_p99_ns_median": 42,
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "paired_lynex_benchmarks": {
+    "rounds": 32,
+    "prepared_quote_maximum_ratio": 1.05,
+    "prepared_quote_maximum_observed_p95_ratio": 1.008657740885564,
+    "prepared_quote_maximum_observed_p99_ratio": 0.997512358239293,
+    "curve_build_maximum_ratio": 1.05,
+    "curve_build_maximum_observed_p95_ratio": 1.013267526402378,
+    "curve_build_maximum_observed_p99_ratio": 1.020238289846555,
+    "event_decode_maximum_ratio": 1.10,
+    "event_decode_p95_ratio": 0.980424439374847,
+    "event_decode_p99_ratio": 0.97686996547756,
+    "calldata_maximum_ratio": 1.10,
+    "calldata_p95_ratio": 0.932503350424985,
+    "calldata_p99_ratio": 0.853665594716368,
+    "plan_maximum_ratio": 1.10,
+    "plan_p95_ratio": 0.973801445654562,
+    "plan_p99_ratio": 0.96864750020649,
+    "receipt_maximum_ratio": 1.10,
+    "receipt_p95_ratio": 1.027304770180003,
+    "receipt_p99_ratio": 1.026271946170607,
+    "gate": "pass"
+  },
+  "gate": "pass_local_target_c4_required_before_rollout"
+}

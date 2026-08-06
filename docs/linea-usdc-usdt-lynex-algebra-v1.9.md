@@ -1,7 +1,7 @@
 # Linea USDC/USDT Lynex Algebra V1.9 production support specification
 
-Status: proposed for direct full-live production; implementation and release
-evidence are not yet complete
+Status: approved for full-live production; implementation and release evidence
+are in progress
 
 Last reviewed: 2026-08-06
 
@@ -36,7 +36,7 @@ flow.
 
 Skipping paper and canary does not skip correctness evidence. All identity,
 quote parity, event replay, calldata simulation, receipt proof, unknown-outcome
-recovery, performance, funding, direct rebalance-route, and deployment gates in
+recovery, performance, funding, exact capital-route, and deployment gates in
 this document must pass before the production artifact can select the pool.
 
 The strategy uses the same reviewed economics as ARB/USDC:
@@ -104,10 +104,10 @@ External identity references:
 - Circle's Linea USDC address list:
   <https://developers.circle.com/stablecoins/usdc-contract-addresses>.
 
-The production artifact must also prove through authenticated Binance capital
-metadata that its Linea deposit/withdraw route maps USDC and USDT to these
-exact token contracts. Symbol equality alone is insufficient, especially for
-bridged stablecoins.
+The production artifact must prove through authenticated Binance capital
+metadata that both assets have enabled Optimism deposit and withdrawal routes.
+It must independently validate Across V4 calldata between Optimism and Linea
+against these exact token mappings; symbol equality alone is insufficient.
 
 ## Protocol compatibility boundary
 
@@ -296,7 +296,7 @@ multi-pair production bundle. A representative source shape is:
 ```
 
 Field names and schema version may change during P1, but the semantic identity
-must not. The source records the explicit operator decision for direct
+must not. The source records the explicit operator decision for immediate
 full-live deployment without paper/canary, exact pre-release evidence, and the
 production approval timestamp. Historical artifacts remain immutable.
 
@@ -447,23 +447,35 @@ approved.
 ## Full-live rebalancing and capital
 
 Rebalancing is `full_live` from the first production revision, matching the
-requested ARB/USDC operating model. It is direct-route only and has no bridge
-mutation fallback.
+requested ARB/USDC operating model. Binance Linea deposit and withdrawal are
+not assumed to exist. The singular reviewed route is Binance Optimism plus
+Across V4 between chain `10` and Linea chain `59144`, in both directions.
 
 Before release, authenticated Binance capital metadata must prove for both
 USDC and USDT:
 
-- network name and chain ID map to Linea;
-- deposit and withdrawal addresses/contracts map to the exact artifact token;
+- network name is exactly `OPTIMISM` and the route is available for chain 10;
 - deposit and withdrawal are enabled for the production subaccount;
 - precision, minimum withdrawal, fee, confirmations, and address format are
   represented exactly;
 - deposit and withdrawal reconciliation use deterministic durable IDs;
 - an Unknown outcome never authorizes a second withdrawal or transfer.
 
-If either token lacks an exact direct Binance-Linea route, the release is
-blocked. The runtime must not silently substitute Ethereum, Arbitrum, another
-USDT representation, Across, CCTP, or any other bridge.
+The approved Across token map is exact and bidirectional:
+
+| Asset | Optimism (`10`) | Linea (`59144`) |
+| --- | --- | --- |
+| USDC | `0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85` | `0x176211869cA2b568f2A7D4EE941E073a821EE1ff` |
+| USDT | `0x94b008aA00579c1307B0EF2c499aD98a8ce58e58` | `0xA219439258ca9da29E9Cc4cE5596924745e12B93` |
+
+Every quote uses the reviewed Poly Bot Across integrator ID `0x5042`. Before
+rollout, a read-only production preflight requests and strictly validates all
+four asset/direction combinations. Validation pins exact input, depositor,
+recipient, origin/destination chains, token addresses, allowance spender,
+approval, `depositV3` calldata, minimum output, deadline, zero native value,
+and bounded response size/fill time. A missing or changed route blocks rollout.
+The runtime must not silently substitute Ethereum, Arbitrum, World Chain,
+another stablecoin representation, CCTP, or any other bridge route.
 
 Capital remains in the existing inventory ledger. Reservations cover only the
 exact primary DEX input token; there is no legacy `3x` multiplier, native-gas
@@ -471,9 +483,10 @@ reservation, hypothetical recovery reservation, or stablecoin-parity netting.
 USDC on Linea, USDC on other chains, Binance USDC, Linea USDT, and Binance USDT
 remain distinct venue assets joined only by explicit economic-asset mappings.
 
-Production limits for direct withdrawals/deposits, fees, cumulative authority,
-and one-operation-at-a-time ownership must be explicitly approved in the v1
-full-live policy. They are not inferred from ARB/USDC amounts.
+Production limits for Binance transfers, Across bridge transactions, fees,
+cumulative authority, and one-operation-at-a-time ownership must be explicitly
+approved in the v1 full-live policy. They are not inferred from ARB/USDC
+amounts.
 
 ## Performance preservation contract
 
@@ -623,12 +636,13 @@ calldata, estimation, and fee-field evidence pass.
 - Prove positional Fee/Swap, wallet deltas, gas/data-fee accounting, direct
   mirror settlement, known revert, timeout, Unknown outcome, restart, DEX-
   success/Binance-partial recovery, and one-query Binance Unknown placement.
-- Validate authenticated direct rebalancing metadata without making a transfer.
+- Validate authenticated Binance Optimism metadata and strict Across quotes in
+  both directions without making a transfer.
 
 Exit: receipt-to-lane-release and recovery tests pass with no second log wait,
 no duplicate order/transaction authority, and no external mutation.
 
-### P8 — Direct full-live production rollout
+### P8 — Full-live production rollout
 
 - Record the operator approval, all P0-P7 evidence, exact capital and allowance
   limits, funded isolated Linea wallet, funded Binance balances/BNB, previous
@@ -637,7 +651,8 @@ no duplicate order/transaction authority, and no external mutation.
   execute, and rebalance all true.
 - Add exact deployment assertions for chain, strategy, tokens, symbol, provider,
   pool, contracts, 6-USDT detector, 20 bps gate, 200-USDT cap, full-live policy,
-  journals, required Linea environment, and direct rebalance routes.
+  journals, required Linea environment, Binance Optimism routes, and all four
+  exact Across Linea quote routes.
 - Build and test through `.github/workflows/deploy-gke.yml` on `main`, obtain
   production approval, and roll the exact digest onto the existing node.
 - During startup, reconcile journals and balances, prepare and lock exactly two
@@ -674,7 +689,8 @@ reconciliation before rollout of the rollback revision:
   query, or journal/nonce ownership mismatch;
 - relevant queue drop, failed allowance lock, hard latency ceiling, repeatable
   performance regression, or runtime resource failure;
-- inability to prove exact direct Linea rebalancing routes for both assets.
+- inability to prove exact Binance Optimism and Across Linea routes for both
+  assets and both directions.
 
 Already granted router allowances remain inert and locked; rollback does not
 introduce a new allowance mutation path. Active operations are reconciled by
@@ -686,7 +702,7 @@ their immutable journal identities before the old artifact can own new work.
 - No Lynex V2, Algebra Integral/V2, aggregator, multi-hop, or split execution.
 - No additional DEX pools in the first release.
 - No stablecoin depeg oracle or one-dollar clamp.
-- No bridge-based rebalancing fallback.
+- No bridge route other than the exact reviewed Optimism/Across V4/Linea path.
 - No Postgres, ClickHouse, Rails, or remote Quoter in the critical path.
 - No second application Pod, active GCE owner, local production build, or
   workstation deployment.

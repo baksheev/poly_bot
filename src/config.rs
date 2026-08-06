@@ -172,6 +172,21 @@ pub enum Command {
         #[arg(long)]
         amount: u128,
     },
+    /// Fetch and validate an approved Linea/Optimism Across capital-route quote.
+    AcrossLineaCapitalQuote {
+        /// Asset: USDC or USDT.
+        #[arg(long)]
+        asset: String,
+        /// Origin chain: 10 (Optimism) or 59144 (Linea).
+        #[arg(long)]
+        origin_chain_id: u64,
+        /// Exact input in six-decimal base units.
+        #[arg(long)]
+        amount: u128,
+        /// Public production wallet address used as depositor and recipient.
+        #[arg(long)]
+        wallet_address: String,
+    },
     /// Derive and print only the public address of the configured EVM wallet.
     WalletAddress,
     /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.

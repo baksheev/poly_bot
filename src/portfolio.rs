@@ -346,9 +346,9 @@ impl CapitalAllocator {
             ensure!(
                 policy.external_mutation_authorized
                     && policy.maximum_concurrent_transfers == 1
-                    && policy.direct_route_only
-                    && !policy.bridge_mutations_enabled,
-                "live allocator policy is not mutation-authorized or direct-only"
+                    && (policy.direct_route_only || policy.bridge_mutations_enabled)
+                    && !(policy.direct_route_only && policy.bridge_mutations_enabled),
+                "live allocator policy has no singular reviewed route mode"
             );
             ensure!(
                 in_flight.len() < usize::from(policy.maximum_concurrent_transfers),
@@ -509,20 +509,33 @@ pub fn authorize_rebalance_request(
         policy.external_mutation_authorized
             && policy.maximum_concurrent_transfers == 1
             && policy.maximum_unknown_reconciliation_queries == 1
-            && policy.direct_route_only
-            && !policy.bridge_mutations_enabled,
-        "rebalance policy has no bounded direct mutation authority"
+            && (policy.direct_route_only || policy.bridge_mutations_enabled)
+            && !(policy.direct_route_only && policy.bridge_mutations_enabled),
+        "rebalance policy has no bounded mutation authority"
     );
     ensure!(
         request.approval_session_id.as_deref() == Some(policy.approval_session_id.as_str()),
         "rebalance request approval session differs from the compiled policy"
     );
-    let (chain_id, binance_network) = match &request.action.route {
+    let (chain_id, binance_network, is_bridge) = match &request.action.route {
         Route::Direct {
             chain_id,
             binance_network,
-        } => (*chain_id, binance_network),
-        _ => anyhow::bail!("production rebalance request is not direct"),
+        } => (*chain_id, binance_network, false),
+        Route::Across {
+            binance_network,
+            bridge_chain_id,
+            wallet_chain_id,
+        } => {
+            ensure!(
+                policy.bridge_mutations_enabled
+                    && *bridge_chain_id == 10
+                    && *wallet_chain_id == 59_144
+                    && binance_network == "OPTIMISM",
+                "production Across route differs from the reviewed Linea fallback"
+            );
+            (*wallet_chain_id, binance_network, true)
+        }
     };
     let expected_authority = match chain_id {
         42_161 => RebalanceExecutionAuthority::ArbitrumFullLive,
@@ -531,7 +544,7 @@ pub fn authorize_rebalance_request(
     };
     ensure!(
         request.authority == expected_authority,
-        "direct request has the wrong execution authority"
+        "rebalance request has the wrong execution authority"
     );
     let approved_network = policy.direct_networks.get(&chain_id);
     ensure!(
@@ -539,7 +552,15 @@ pub fn authorize_rebalance_request(
             || (policy.direct_networks.is_empty()
                 && chain_id == 42_161
                 && binance_network == &policy.binance_network),
-        "rebalance request is not pinned to an approved direct route"
+        "rebalance request is not pinned to an approved route"
+    );
+    ensure!(
+        !is_bridge || request.authority == RebalanceExecutionAuthority::LineaFullLive,
+        "only Linea full-live authority may use the reviewed Across fallback"
+    );
+    ensure!(
+        chain_id != 59_144 || is_bridge,
+        "Linea full-live authority requires the reviewed Across route"
     );
     let maximum_fee = request
         .maximum_fee
@@ -586,9 +607,9 @@ pub fn remaining_rebalance_authority_on_chain(
         policy.external_mutation_authorized
             && policy.maximum_concurrent_transfers == 1
             && policy.maximum_unknown_reconciliation_queries == 1
-            && policy.direct_route_only
-            && !policy.bridge_mutations_enabled,
-        "rebalance policy has no bounded direct mutation authority"
+            && (policy.direct_route_only || policy.bridge_mutations_enabled)
+            && !(policy.direct_route_only && policy.bridge_mutations_enabled),
+        "rebalance policy has no bounded mutation authority"
     );
     if risk.active_transfer_count >= usize::from(policy.maximum_concurrent_transfers) {
         return Ok(None);
@@ -1230,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_linea_policy_authorizes_only_typed_linea_usdt_direct_requests() {
+    fn compiled_linea_policy_authorizes_only_typed_linea_usdt_across_requests() {
         let production = load_compatibility_domain(
             "config/domain/compiled-multi-pair-production.v1.json",
             CompatibilityRole::LiveRuntime,
@@ -1266,9 +1287,10 @@ mod tests {
             action: RebalanceAction {
                 direction: Direction::BinanceToWallet,
                 amount: U256::from(200_000_000_u64),
-                route: Route::Direct {
-                    binance_network: "LINEA".to_owned(),
-                    chain_id: 59_144,
+                route: Route::Across {
+                    binance_network: "OPTIMISM".to_owned(),
+                    bridge_chain_id: 10,
+                    wallet_chain_id: 59_144,
                 },
             },
             binance_balance_before: U256::from(1_000_000_000_u64),
@@ -1278,6 +1300,15 @@ mod tests {
             approval_session_id: Some(policy.approval_session_id.clone()),
         };
         authorize_rebalance_request(&policy, &RebalanceRisk::default(), &request).unwrap();
+
+        let mut direct_linea = request.clone();
+        direct_linea.action.route = Route::Direct {
+            binance_network: "OPTIMISM".to_owned(),
+            chain_id: 59_144,
+        };
+        assert!(
+            authorize_rebalance_request(&policy, &RebalanceRisk::default(), &direct_linea).is_err()
+        );
 
         let mut wrong_authority = request.clone();
         wrong_authority.authority = RebalanceExecutionAuthority::ArbitrumFullLive;

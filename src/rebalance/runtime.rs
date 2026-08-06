@@ -7,9 +7,9 @@ use std::{
 
 use crate::{
     across::{
-        AcrossClient, AcrossQuoteRequest, OPTIMISM_CHAIN_ID, OPTIMISM_USDC, OPTIMISM_WLD,
-        WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, swap_calldata_is_stale,
-        validate_deposit_status, validate_quote,
+        AcrossClient, AcrossQuoteRequest, LINEA_USDC, LINEA_USDT, OPTIMISM_CHAIN_ID, OPTIMISM_USDC,
+        OPTIMISM_USDT, OPTIMISM_WLD, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD,
+        swap_calldata_is_stale, validate_deposit_status, validate_quote,
     },
     binance::{
         account::{AccountInformation, BinanceAccountClient, BinanceApiError},
@@ -50,8 +50,6 @@ const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned
 const UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY: Duration = Duration::from_secs(5);
 const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 const LINEA_CHAIN_ID: u64 = 59_144;
-const LINEA_USDC: &str = "0x176211869cA2b568f2A7D4EE941E073a821EE1ff";
-const LINEA_USDT: &str = "0xA219439258ca9da29e9cC4cE5596924745e12B93";
 
 #[derive(Clone, Debug)]
 pub struct RebalanceRuntimeLimits {
@@ -1419,7 +1417,8 @@ impl RebalanceExecutor {
             _ => unreachable!(),
         };
         ensure!(
-            bridge_chain_id == OPTIMISM_CHAIN_ID && wallet_chain_id == WORLD_CHAIN_CHAIN_ID,
+            bridge_chain_id == OPTIMISM_CHAIN_ID
+                && matches!(wallet_chain_id, WORLD_CHAIN_CHAIN_ID | LINEA_CHAIN_ID),
             "unsupported Across route"
         );
         let withdrawal_submission_safe = created_here
@@ -1503,7 +1502,8 @@ impl RebalanceExecutor {
             _ => unreachable!(),
         };
         ensure!(
-            bridge_chain_id == OPTIMISM_CHAIN_ID && wallet_chain_id == WORLD_CHAIN_CHAIN_ID,
+            bridge_chain_id == OPTIMISM_CHAIN_ID
+                && matches!(wallet_chain_id, WORLD_CHAIN_CHAIN_ID | LINEA_CHAIN_ID),
             "unsupported Across route"
         );
         if matches!(
@@ -1513,7 +1513,7 @@ impl RebalanceExecutor {
                 | RebalanceExecutionProgress::BridgePrepared { .. }
         ) {
             self.verify_route(&operation, false).await?;
-            operation = self.bridge_across(operation, WORLD_CHAIN_CHAIN_ID).await?;
+            operation = self.bridge_across(operation, wallet_chain_id).await?;
         }
         if matches!(
             operation.progress,
@@ -1742,19 +1742,16 @@ impl RebalanceExecutor {
         Address,
     )> {
         let amount_u128 = u128::try_from(amount).context("Across amount exceeds u128")?;
-        let (destination_chain_id, input_token, output_token) = match origin_chain_id {
-            OPTIMISM_CHAIN_ID => (
-                WORLD_CHAIN_CHAIN_ID,
-                token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
-                token_on_chain(&operation.intent.token_symbol, WORLD_CHAIN_CHAIN_ID)?,
-            ),
-            WORLD_CHAIN_CHAIN_ID => (
-                OPTIMISM_CHAIN_ID,
-                token_on_chain(&operation.intent.token_symbol, WORLD_CHAIN_CHAIN_ID)?,
-                token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?,
-            ),
-            _ => bail!("unsupported Across origin chain"),
+        let (bridge_chain_id, wallet_chain_id) = across_route_chains(&operation.intent.route)?;
+        let destination_chain_id = if origin_chain_id == bridge_chain_id {
+            wallet_chain_id
+        } else if origin_chain_id == wallet_chain_id {
+            bridge_chain_id
+        } else {
+            bail!("Across origin chain differs from the durable route")
         };
+        let input_token = token_on_chain(&operation.intent.token_symbol, origin_chain_id)?;
+        let output_token = token_on_chain(&operation.intent.token_symbol, destination_chain_id)?;
         let request = AcrossQuoteRequest {
             origin_chain_id,
             destination_chain_id,
@@ -1786,6 +1783,12 @@ impl RebalanceExecutor {
             OPTIMISM_CHAIN_ID => {
                 self.evm
                     .rpc(OPTIMISM_CHAIN_ID)?
+                    .erc20_balance(output_token, operation.intent.wallet_owner)
+                    .await?
+            }
+            LINEA_CHAIN_ID => {
+                self.evm
+                    .rpc(LINEA_CHAIN_ID)?
                     .erc20_balance(output_token, operation.intent.wallet_owner)
                     .await?
             }
@@ -1844,18 +1847,10 @@ impl RebalanceExecutor {
                         &status,
                         origin_chain_id,
                         &format!("{transaction_hash:#x}"),
-                        if origin_chain_id == WORLD_CHAIN_CHAIN_ID {
-                            OPTIMISM_CHAIN_ID
-                        } else {
-                            WORLD_CHAIN_CHAIN_ID
-                        },
+                        across_destination_chain_id(&operation.intent.route, origin_chain_id)?,
                         token_on_chain(
                             &operation.intent.token_symbol,
-                            if origin_chain_id == WORLD_CHAIN_CHAIN_ID {
-                                OPTIMISM_CHAIN_ID
-                            } else {
-                                WORLD_CHAIN_CHAIN_ID
-                            },
+                            across_destination_chain_id(&operation.intent.route, origin_chain_id)?,
                         )?,
                         minimum,
                     )? =>
@@ -1866,11 +1861,8 @@ impl RebalanceExecutor {
                             .as_deref()
                             .context("Across fill has no transaction hash")?,
                     )?;
-                    let destination_chain_id = if origin_chain_id == WORLD_CHAIN_CHAIN_ID {
-                        OPTIMISM_CHAIN_ID
-                    } else {
-                        WORLD_CHAIN_CHAIN_ID
-                    };
+                    let destination_chain_id =
+                        across_destination_chain_id(&operation.intent.route, origin_chain_id)?;
                     let rpc = self.evm.rpc(destination_chain_id)?;
                     let token =
                         token_on_chain(&operation.intent.token_symbol, destination_chain_id)?;
@@ -1918,8 +1910,9 @@ impl RebalanceExecutor {
         else {
             return Ok(operation);
         };
+        let (_, wallet_chain_id) = across_route_chains(&operation.intent.route)?;
         let receipt = wait_receipt(
-            self.evm.rpc(WORLD_CHAIN_CHAIN_ID)?,
+            self.evm.rpc(wallet_chain_id)?,
             fill_transaction_hash,
             self.limits.operation_timeout,
         )
@@ -1933,7 +1926,7 @@ impl RebalanceExecutor {
         )?;
         let wallet_after = self
             .evm
-            .rpc(WORLD_CHAIN_CHAIN_ID)?
+            .rpc(wallet_chain_id)?
             .erc20_balance(
                 operation.intent.token_contract,
                 operation.intent.wallet_owner,
@@ -3283,8 +3276,17 @@ impl RebalanceExecutor {
                 binance_network, ..
             } => (binance_network.as_str(), binance_network.as_str()),
             Route::Across {
-                binance_network, ..
-            } => (binance_network.as_str(), "WLD"),
+                binance_network,
+                wallet_chain_id,
+                ..
+            } => (
+                binance_network.as_str(),
+                match *wallet_chain_id {
+                    WORLD_CHAIN_CHAIN_ID => "WLD",
+                    LINEA_CHAIN_ID => "LINEA",
+                    _ => bail!("unsupported Across wallet chain"),
+                },
+            ),
         };
         let coins = if withdrawal {
             self.treasury_binance.all_coin_information().await?
@@ -3333,12 +3335,9 @@ impl RebalanceExecutor {
                     == U256::ZERO,
                 "rebalance withdrawal violates live integer multiple"
             );
-            if operation
-                .intent
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.network_id == "chain:42161")
-            {
+            if operation.intent.scope.as_ref().is_some_and(|scope| {
+                matches!(scope.network_id.as_str(), "chain:42161" | "chain:59144")
+            }) {
                 let authorized_fee = operation
                     .intent
                     .maximum_fee_base_units
@@ -3866,12 +3865,9 @@ fn token_on_chain(symbol: &str, chain_id: u64) -> anyhow::Result<Address> {
         ("USDC", ARBITRUM_CHAIN_ID) => {
             Address::from_str(ARBITRUM_USDC).context("approved Arbitrum USDC address is invalid")
         }
-        ("USDC", LINEA_CHAIN_ID) => {
-            Address::from_str(LINEA_USDC).context("approved Linea USDC address is invalid")
-        }
-        ("USDT", LINEA_CHAIN_ID) => {
-            Address::from_str(LINEA_USDT).context("approved Linea USDT address is invalid")
-        }
+        ("USDC", LINEA_CHAIN_ID) => Ok(LINEA_USDC),
+        ("USDT", LINEA_CHAIN_ID) => Ok(LINEA_USDT),
+        ("USDT", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_USDT),
         ("USDC", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_USDC),
         ("USDC", WORLD_CHAIN_CHAIN_ID) => Ok(WORLD_CHAIN_USDC),
         ("WLD", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_WLD),
@@ -3886,6 +3882,34 @@ fn route_wallet_chain_id(route: &Route) -> u64 {
         Route::Across {
             wallet_chain_id, ..
         } => *wallet_chain_id,
+    }
+}
+
+fn across_route_chains(route: &Route) -> anyhow::Result<(u64, u64)> {
+    let Route::Across {
+        bridge_chain_id,
+        wallet_chain_id,
+        ..
+    } = route
+    else {
+        bail!("rebalance route is not Across")
+    };
+    ensure!(
+        *bridge_chain_id == OPTIMISM_CHAIN_ID
+            && matches!(*wallet_chain_id, WORLD_CHAIN_CHAIN_ID | LINEA_CHAIN_ID),
+        "unsupported Across route"
+    );
+    Ok((*bridge_chain_id, *wallet_chain_id))
+}
+
+fn across_destination_chain_id(route: &Route, origin_chain_id: u64) -> anyhow::Result<u64> {
+    let (bridge_chain_id, wallet_chain_id) = across_route_chains(route)?;
+    if origin_chain_id == bridge_chain_id {
+        Ok(wallet_chain_id)
+    } else if origin_chain_id == wallet_chain_id {
+        Ok(bridge_chain_id)
+    } else {
+        bail!("Across origin chain differs from the durable route")
     }
 }
 
@@ -3938,14 +3962,8 @@ fn validate_approved_asset(
             18,
             Address::from_str(ARBITRUM_ARB).context("approved Arbitrum ARB address is invalid")?,
         ),
-        ("USDC", LINEA_CHAIN_ID) => (
-            6,
-            Address::from_str(LINEA_USDC).context("approved Linea USDC address is invalid")?,
-        ),
-        ("USDT", LINEA_CHAIN_ID) => (
-            6,
-            Address::from_str(LINEA_USDT).context("approved Linea USDT address is invalid")?,
-        ),
+        ("USDC", LINEA_CHAIN_ID) => (6, LINEA_USDC),
+        ("USDT", LINEA_CHAIN_ID) => (6, LINEA_USDT),
         _ => bail!("rebalance token is not approved on chain {chain_id}"),
     };
     ensure!(
@@ -4499,8 +4517,8 @@ mod tests {
 
     #[test]
     fn permits_only_exact_linea_stablecoin_metadata() {
-        let usdc = Address::from_str(LINEA_USDC).unwrap();
-        let usdt = Address::from_str(LINEA_USDT).unwrap();
+        let usdc = LINEA_USDC;
+        let usdt = LINEA_USDT;
         validate_approved_asset("USDC", 6, usdc, LINEA_CHAIN_ID).unwrap();
         validate_approved_asset("USDT", 6, usdt, LINEA_CHAIN_ID).unwrap();
         assert!(validate_approved_asset("USDT", 18, usdt, LINEA_CHAIN_ID).is_err());
