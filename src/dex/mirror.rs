@@ -281,10 +281,12 @@ impl DexMirror {
         }
         if let Some(position) = self.last_positions.get(&event.locator) {
             if log.position() == *position {
-                ensure!(
-                    self.last_block_hashes.get(&event.locator) == Some(&log.block_hash),
-                    "duplicate pool position changed block hash; rehydration required"
-                );
+                if matches!(event.locator, PoolLocator::CamelotV3(_)) {
+                    ensure!(
+                        self.last_block_hashes.get(&event.locator) == Some(&log.block_hash),
+                        "duplicate pool position changed block hash; rehydration required"
+                    );
+                }
                 return Ok(LogApplyResult::Duplicate);
             }
             if log.position() < *position && !matches!(event.locator, PoolLocator::CamelotV3(_)) {
@@ -1016,9 +1018,13 @@ mod tests {
         assert_eq!(mirror.pool(0).unwrap().pool.tick, 1);
         assert_eq!(mirror.pool(0).unwrap().pool.liquidity, 2_000);
 
+        mirror.apply_head(block(12, 11), Instant::now()).unwrap();
         let mut changed_hash = receipt;
         changed_hash.block_hash = B256::repeat_byte(0xff);
-        assert!(mirror.apply_log(&changed_hash).is_err());
+        assert_eq!(
+            mirror.apply_log(&changed_hash).unwrap(),
+            LogApplyResult::Duplicate
+        );
     }
 
     #[test]
