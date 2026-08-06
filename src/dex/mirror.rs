@@ -54,6 +54,12 @@ pub enum LogApplyResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogOrigin {
+    CanonicalStream,
+    ReceiptSettlement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingCamelotFee {
     position: LogPosition,
     block_timestamp: u32,
@@ -125,7 +131,7 @@ impl DexMirror {
             !self.camelot_v3_indices.contains_key(&log.address),
             "Camelot V3 log requires its canonical block timestamp"
         );
-        self.apply_log_inner(log, None)
+        self.apply_log_inner(log, None, LogOrigin::CanonicalStream)
     }
 
     pub fn apply_log_at_timestamp(
@@ -133,7 +139,28 @@ impl DexMirror {
         log: &ChainLog,
         block_timestamp: u32,
     ) -> anyhow::Result<LogApplyResult> {
-        self.apply_log_inner(log, Some(block_timestamp))
+        self.apply_log_inner(log, Some(block_timestamp), LogOrigin::CanonicalStream)
+    }
+
+    /// Applies a static-fee Swap proven by a mined transaction receipt.
+    ///
+    /// Receipt settlement intentionally runs after the already-queued DEX
+    /// events are drained but before the corresponding `newHeads` notification
+    /// is guaranteed to arrive. It may therefore advance the pool's positional
+    /// frontier without advancing the mirror's canonical-head frontier. The
+    /// later WebSocket copy and older static-fee positions retain the existing
+    /// positional duplicate semantics. Camelot receipts use the
+    /// timestamp-bound Fee+Swap path and may not bypass canonical-head
+    /// validation.
+    pub fn apply_static_fee_receipt_log(
+        &mut self,
+        log: &ChainLog,
+    ) -> anyhow::Result<LogApplyResult> {
+        ensure!(
+            !self.camelot_v3_indices.contains_key(&log.address),
+            "Camelot V3 receipt requires its canonical Fee and block timestamp"
+        );
+        self.apply_log_inner(log, None, LogOrigin::ReceiptSettlement)
     }
 
     pub fn apply_camelot_fee_receipt(
@@ -206,9 +233,10 @@ impl DexMirror {
         &mut self,
         log: &ChainLog,
         block_timestamp: Option<u32>,
+        origin: LogOrigin,
     ) -> anyhow::Result<LogApplyResult> {
         ensure!(!log.removed, "received removed log; rehydration required");
-        if self.backfill_complete {
+        if self.backfill_complete && origin == LogOrigin::CanonicalStream {
             ensure!(
                 log.block_number <= self.latest_head.number,
                 "pool log arrived before its canonical head"
@@ -245,12 +273,21 @@ impl DexMirror {
         let Some(event) = decoded else {
             return Ok(LogApplyResult::Unknown);
         };
+        if origin == LogOrigin::ReceiptSettlement {
+            ensure!(
+                matches!(event.update, PoolUpdate::Swap { .. }),
+                "receipt settlement event is not a Swap"
+            );
+        }
         if let Some(position) = self.last_positions.get(&event.locator) {
             if log.position() == *position {
                 ensure!(
                     self.last_block_hashes.get(&event.locator) == Some(&log.block_hash),
                     "duplicate pool position changed block hash; rehydration required"
                 );
+                return Ok(LogApplyResult::Duplicate);
+            }
+            if log.position() < *position && !matches!(event.locator, PoolLocator::CamelotV3(_)) {
                 return Ok(LogApplyResult::Duplicate);
             }
             ensure!(
@@ -938,6 +975,50 @@ mod tests {
 
         mirror.finish_backfill(block(11, 10)).unwrap();
         assert_eq!(mirror.apply_log(&log).unwrap(), LogApplyResult::Duplicate);
+    }
+
+    #[test]
+    fn static_fee_receipt_can_lead_head_and_its_websocket_copy_is_bounded() {
+        let (mut mirror, address) = test_mirror();
+        mirror.finish_backfill(block(10, 9)).unwrap();
+        let mut receipt = swap_log(address, 11);
+        receipt.transaction_index = 2;
+
+        let stream_error = mirror.apply_log(&receipt).unwrap_err();
+        assert!(
+            stream_error
+                .to_string()
+                .contains("pool log arrived before its canonical head")
+        );
+        assert!(matches!(
+            mirror.apply_static_fee_receipt_log(&receipt).unwrap(),
+            LogApplyResult::Applied {
+                kind: "swap",
+                refresh_required: true,
+                ..
+            }
+        ));
+        assert_eq!(mirror.pool(0).unwrap().pool.tick, 1);
+        assert_eq!(mirror.pool(0).unwrap().pool.liquidity, 2_000);
+
+        mirror.apply_head(block(11, 10), Instant::now()).unwrap();
+        assert_eq!(
+            mirror.apply_log(&receipt).unwrap(),
+            LogApplyResult::Duplicate
+        );
+
+        let earlier = swap_log(address, 11);
+        assert!(earlier.position() < receipt.position());
+        assert_eq!(
+            mirror.apply_log(&earlier).unwrap(),
+            LogApplyResult::Duplicate
+        );
+        assert_eq!(mirror.pool(0).unwrap().pool.tick, 1);
+        assert_eq!(mirror.pool(0).unwrap().pool.liquidity, 2_000);
+
+        let mut changed_hash = receipt;
+        changed_hash.block_hash = B256::repeat_byte(0xff);
+        assert!(mirror.apply_log(&changed_hash).is_err());
     }
 
     #[test]

@@ -3826,7 +3826,7 @@ impl TradingEngine {
         let apply = if let Some(timestamp) = block_timestamp {
             self.dex.apply_log_at_timestamp(target, timestamp)?
         } else {
-            self.dex.apply_log(target)?
+            self.dex.apply_static_fee_receipt_log(target)?
         };
         match apply {
             LogApplyResult::Applied {
