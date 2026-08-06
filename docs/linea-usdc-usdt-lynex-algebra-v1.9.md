@@ -671,6 +671,33 @@ Exit: the workflow verifies startup fields and rollout health; GCE remains
 performance report must also pass the per-stage non-regression gate; otherwise
 new Linea entries close and the reviewed rollback path is used.
 
+### P8 rollout recovery evidence
+
+The first P8 rollout built and preflighted the intended image but failed closed
+before trading. Linea Alchemy URLs had been derived from the World Chain key;
+that key returned HTTP 403 for Linea. The corrected runtime uses one reviewed
+PublicNode Linea HTTP/WSS pair and the deployment now runs a read-only transport
+gate on the fixed Singapore C4 before rollout: ten HTTP chain/gas samples must
+have p95 at or below 500 ms, WSS log/head subscription must complete within
+three seconds, and a canonical head must arrive within eight seconds.
+
+The rollback also exposed a pre-existing Optimism rebalance journal collision.
+Local operation `rebalance-1516-6b2792a1b1a18931:deposit` had signed hash
+`0x34462b8a2f930da06b5196db6a4111b07941c25ecbe4e0ddc388716a4d41a482`
+at nonce 76 after that nonce had already been consumed by successful canonical
+transaction
+`0x2d22c304a0e0ca98e0684145dbff8a62925cb36c33b0af891dc56b8248fb73b4`.
+Startup may close only this exact local rejection after two observations prove
+the rejected hash and receipt absent, the replacement transaction and success
+receipt unchanged, the nonce consumed, and every journal identity/scope field
+unchanged. It never retries the rejected effect and grants no generic
+consumed-nonce recovery authority.
+
+The P8d local release A/B retained 42 ns decision p95 and improved median
+capacity throughput from 14,523,532 to 14,628,040 frames/s (`1.0072x`). Target
+C4 capacity and transport evidence remain mandatory before the corrected
+rollout can proceed.
+
 ## Rollback and stop conditions
 
 Rollback is a new reviewed `main` revision through `Deploy GKE`, not a local

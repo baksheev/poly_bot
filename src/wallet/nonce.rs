@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, ensure};
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 
@@ -194,6 +194,24 @@ pub struct ReviewedPrebroadcastRejection {
     pub wallet: Address,
     pub nonce: u64,
     pub transaction_hash: B256,
+    pub scope: EvmJournalScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewedConsumedNonceCollision {
+    pub operation_id: String,
+    pub chain_id: u64,
+    pub wallet: Address,
+    pub nonce: u64,
+    pub rejected_transaction_hash: B256,
+    pub purpose: String,
+    pub target: Address,
+    pub native_value: U256,
+    pub calldata_hash: B256,
+    pub replacement_transaction_hash: B256,
+    pub replacement_target: Address,
+    pub replacement_native_value: U256,
+    pub replacement_block_number: u64,
     pub scope: EvmJournalScope,
 }
 
@@ -629,6 +647,131 @@ pub async fn recover_exact_rejected_before_broadcast(
     Ok(true)
 }
 
+/// Closes one reviewed local pre-broadcast rejection after the nonce was
+/// consumed by a different canonical transaction. Both hashes and the exact
+/// journal intent are immutable incident evidence; this never authorizes a
+/// generic consumed-nonce recovery or retries the rejected local effect.
+pub async fn recover_exact_consumed_nonce_collision(
+    rpc: &JsonRpcClient,
+    journal_path: impl AsRef<Path>,
+    expected: &ReviewedConsumedNonceCollision,
+) -> anyhow::Result<bool> {
+    expected.scope.validate()?;
+    ensure!(
+        expected.chain_id > 0
+            && expected.wallet != Address::ZERO
+            && expected.target != Address::ZERO
+            && expected.replacement_target != Address::ZERO
+            && expected.rejected_transaction_hash != expected.replacement_transaction_hash,
+        "approved consumed-nonce recovery identity is invalid"
+    );
+    let mut journal = TransactionJournal::open(journal_path)?;
+    let operation = journal
+        .operation(&expected.operation_id)
+        .context("approved consumed-nonce recovery operation is absent")?
+        .clone();
+    ensure!(
+        operation.intent.identity.chain_id == expected.chain_id
+            && operation.intent.identity.wallet == expected.wallet
+            && operation.intent.identity.nonce == expected.nonce
+            && operation.intent.identity.scope.as_ref() == Some(&expected.scope)
+            && operation.intent.purpose == expected.purpose
+            && operation.intent.target == expected.target
+            && operation.intent.native_value == expected.native_value
+            && operation.intent.calldata_hash == expected.calldata_hash,
+        "approved consumed-nonce recovery journal intent changed"
+    );
+    match operation.status {
+        JournalStatus::RejectedBeforeBroadcast { transaction_hash } => {
+            ensure!(
+                transaction_hash == expected.rejected_transaction_hash,
+                "completed consumed-nonce recovery transaction hash changed"
+            );
+            return Ok(false);
+        }
+        JournalStatus::OutcomeUnknown {
+            transaction_hash,
+            reason: UnknownOutcomeReason::BroadcastRejected,
+        } => ensure!(
+            transaction_hash == expected.rejected_transaction_hash,
+            "approved consumed-nonce recovery rejected hash changed"
+        ),
+        _ => anyhow::bail!("approved consumed-nonce recovery journal state changed"),
+    }
+
+    for observation in 0..2 {
+        let (
+            latest_nonce,
+            pending_nonce,
+            rejected_receipt,
+            rejected_transaction,
+            replacement_receipt,
+            replacement_transaction,
+        ) = tokio::try_join!(
+            rpc.latest_nonce(expected.wallet),
+            rpc.pending_nonce(expected.wallet),
+            rpc.transaction_receipt(expected.rejected_transaction_hash),
+            rpc.transaction_by_hash(expected.rejected_transaction_hash),
+            rpc.transaction_receipt(expected.replacement_transaction_hash),
+            rpc.transaction_by_hash(expected.replacement_transaction_hash),
+        )?;
+        ensure!(
+            latest_nonce > expected.nonce && pending_nonce >= latest_nonce,
+            "approved consumed-nonce recovery nonce is not canonically consumed"
+        );
+        ensure!(
+            rejected_receipt.is_none() && rejected_transaction.is_none(),
+            "approved rejected transaction appeared onchain"
+        );
+        validate_consumed_nonce_replacement(
+            expected,
+            replacement_receipt.as_ref(),
+            replacement_transaction.as_ref(),
+        )?;
+        if observation == 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    journal.record_rejected_before_broadcast(
+        &operation.intent.identity,
+        expected.rejected_transaction_hash,
+    )?;
+    Ok(true)
+}
+
+fn validate_consumed_nonce_replacement(
+    expected: &ReviewedConsumedNonceCollision,
+    receipt: Option<&TransactionReceipt>,
+    transaction: Option<&RpcTransaction>,
+) -> anyhow::Result<()> {
+    let receipt = receipt.context("approved nonce replacement receipt is absent")?;
+    let transaction = transaction.context("approved nonce replacement transaction is absent")?;
+    ensure!(
+        receipt.transaction_hash == expected.replacement_transaction_hash
+            && receipt.status == 1
+            && receipt.block_number == expected.replacement_block_number,
+        "approved nonce replacement receipt changed"
+    );
+    ensure!(
+        transaction.hash == expected.replacement_transaction_hash
+            && transaction.chain_id == expected.chain_id
+            && transaction.nonce == expected.nonce
+            && transaction.from == expected.wallet
+            && transaction.to == Some(expected.replacement_target)
+            && transaction.value == expected.replacement_native_value
+            && transaction.block_number == Some(expected.replacement_block_number),
+        "approved nonce replacement transaction changed"
+    );
+    ensure!(
+        transaction.to != Some(expected.target)
+            || transaction.value != expected.native_value
+            || keccak256(&transaction.input) != expected.calldata_hash,
+        "approved nonce replacement unexpectedly matches the rejected local effect"
+    );
+    Ok(())
+}
+
 fn outcome_for_non_recovery_state(
     state: &NonceLaneState,
 ) -> anyhow::Result<NonceReconciliationOutcome> {
@@ -782,7 +925,10 @@ mod tests {
         },
     };
 
-    use super::{NonceLane, apply_recovery_observation};
+    use super::{
+        NonceLane, ReviewedConsumedNonceCollision, apply_recovery_observation,
+        validate_consumed_nonce_replacement,
+    };
 
     const PRIVATE_KEY: &str = "0x59c6995e998f97a5a0044976f7d04f8b2b7f4e5b5d5f3e49f2f4e7838a2b0c19";
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -1202,5 +1348,77 @@ mod tests {
         assert!(!reconciled.lane.ready());
         drop(journal);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn consumed_nonce_recovery_accepts_only_the_reviewed_replacement() {
+        let wallet = Address::repeat_byte(0x71);
+        let rejected_target = Address::repeat_byte(0x22);
+        let replacement_target = Address::repeat_byte(0x33);
+        let rejected_calldata = vec![0xaa, 0xbb];
+        let expected = ReviewedConsumedNonceCollision {
+            operation_id: "reviewed-collision".to_owned(),
+            chain_id: 10,
+            wallet,
+            nonce: 76,
+            rejected_transaction_hash: B256::repeat_byte(0x44),
+            purpose: "rebalance_bridge_to_binance".to_owned(),
+            target: rejected_target,
+            native_value: U256::ZERO,
+            calldata_hash: alloy_primitives::keccak256(rejected_calldata),
+            replacement_transaction_hash: B256::repeat_byte(0x55),
+            replacement_target,
+            replacement_native_value: U256::from(123_u64),
+            replacement_block_number: 155_207_427,
+            scope: crate::wallet::EvmJournalScope {
+                schema_version: crate::wallet::EvmJournalScope::SCHEMA_VERSION,
+                network_id: "optimism".to_owned(),
+                wallet_id: format!("wallet:{wallet:#x}"),
+                strategy_id: "rebalance-world-chain-v12".to_owned(),
+            },
+        };
+        let receipt = TransactionReceipt {
+            transaction_hash: expected.replacement_transaction_hash,
+            block_number: expected.replacement_block_number,
+            status: 1,
+            gas_used: 1,
+            effective_gas_price: 1,
+            l1_fee: 0,
+            logs: vec![],
+        };
+        let transaction = RpcTransaction {
+            hash: expected.replacement_transaction_hash,
+            chain_id: expected.chain_id,
+            nonce: expected.nonce,
+            from: expected.wallet,
+            to: Some(expected.replacement_target),
+            value: expected.replacement_native_value,
+            input: vec![0x60, 0x9e, 0xa0, 0x81],
+            block_number: Some(expected.replacement_block_number),
+            gas_limit: None,
+            transaction_type: Some(2),
+            gas_price: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        };
+
+        validate_consumed_nonce_replacement(&expected, Some(&receipt), Some(&transaction)).unwrap();
+
+        let mut wrong_nonce = transaction.clone();
+        wrong_nonce.nonce += 1;
+        assert!(
+            validate_consumed_nonce_replacement(&expected, Some(&receipt), Some(&wrong_nonce))
+                .is_err()
+        );
+        let mut missing_receipt = receipt;
+        missing_receipt.status = 0;
+        assert!(
+            validate_consumed_nonce_replacement(
+                &expected,
+                Some(&missing_receipt),
+                Some(&transaction),
+            )
+            .is_err()
+        );
     }
 }

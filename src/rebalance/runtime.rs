@@ -27,8 +27,9 @@ use crate::{
     telemetry::TelemetryHandle,
     wallet::{
         EvmJournalScope, EvmWallet, JournalStatus, NonceLane, NonceReconciliationOutcome,
-        PROCESS_NONCE_LOCK_TTL, TransactionJournal, UnknownOutcomeReason, WalletCall,
-        WalletTransactionParameters, acquire_process_nonce_lock, broadcast_signed_transaction,
+        PROCESS_NONCE_LOCK_TTL, ReviewedConsumedNonceCollision, TransactionJournal,
+        UnknownOutcomeReason, WalletCall, WalletTransactionParameters, acquire_process_nonce_lock,
+        broadcast_signed_transaction, recover_exact_consumed_nonce_collision,
     },
 };
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -271,6 +272,7 @@ impl RebalanceExecutor {
         wallet: EvmWallet,
         execution_journal_path: PathBuf,
         transaction_journal_path: PathBuf,
+        reviewed_consumed_nonce_collision: Option<ReviewedConsumedNonceCollision>,
         limits: RebalanceRuntimeLimits,
     ) -> anyhow::Result<Self> {
         ensure!(
@@ -354,6 +356,26 @@ impl RebalanceExecutor {
             .await?;
         validate_master_subaccount_view(&trading_account, &master_view.balances)?;
 
+        if let Some(recovery) = reviewed_consumed_nonce_collision.as_ref() {
+            let incident_present = TransactionJournal::open(&transaction_journal_path)?
+                .operation(&recovery.operation_id)
+                .is_some();
+            if incident_present {
+                let recovered = recover_exact_consumed_nonce_collision(
+                    &optimism,
+                    &transaction_journal_path,
+                    recovery,
+                )
+                .await?;
+                tracing::warn!(
+                    operation_id = recovery.operation_id,
+                    rejected_transaction_hash = %recovery.rejected_transaction_hash,
+                    replacement_transaction_hash = %recovery.replacement_transaction_hash,
+                    recovered,
+                    "reviewed Optimism consumed-nonce collision is terminal"
+                );
+            }
+        }
         let mut transaction_journal = TransactionJournal::open(transaction_journal_path)?;
         let (world_latest, world_pending, optimism_latest, optimism_pending) = tokio::try_join!(
             world.latest_nonce(owner),

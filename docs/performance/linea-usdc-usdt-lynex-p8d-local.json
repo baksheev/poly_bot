@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "stage": "P8d_linea_transport_and_consumed_nonce_recovery",
+  "measured_at_utc": "2026-08-06T14:08:30Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "cold-path exact Optimism consumed-nonce recovery, Linea PublicNode HTTP/WSS wiring, and fixed-C4 transport preflight",
+  "control": {
+    "revision": "81c0b6736951bae253dfa59fe6e8795d6dd318dc",
+    "binary_sha256": "17dab742a22f355ab27a2723ffcc57afbef7541396a99699ac108ef20396012f"
+  },
+  "candidate": {
+    "binary_sha256": "5251b7896f1799826b6f0fc650b865139e3403f6bcad66f26335ce036a6d3bc9"
+  },
+  "reviewed_nonce_collision": {
+    "chain_id": 10,
+    "nonce": 76,
+    "rejected_transaction_hash": "0x34462b8a2f930da06b5196db6a4111b07941c25ecbe4e0ddc388716a4d41a482",
+    "canonical_replacement_transaction_hash": "0x2d22c304a0e0ca98e0684145dbff8a62925cb36c33b0af891dc56b8248fb73b4",
+    "canonical_replacement_block_number": 155207427,
+    "rejected_hash_absent": true,
+    "replacement_receipt_success": true,
+    "generic_recovery_authorized": false
+  },
+  "local_linea_transport_preflight": {
+    "provider": "PublicNode",
+    "chain_id": 59144,
+    "http_sample_count": 10,
+    "http_p95_us": 857632,
+    "ws_subscribe_us": 993495,
+    "first_head_us": 4947702,
+    "network_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "target_c4_linea_transport_gate": {
+    "maximum_http_p95_ms": 500,
+    "maximum_ws_subscribe_ms": 3000,
+    "maximum_head_wait_ms": 8000,
+    "network_mutations": 0
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P8c-control then P8d-candidate binary runs",
+    "total_strategy_frames_per_binary_per_run": 2000000,
+    "control_frames_per_second": [14570657, 14523532, 14099860, 14510931, 14704688],
+    "candidate_frames_per_second": [12642691, 14691892, 14628040, 14622002, 14653942],
+    "control_frames_per_second_median": 14523532,
+    "candidate_frames_per_second_median": 14628040,
+    "candidate_to_control_throughput_ratio": 1.007195770285,
+    "minimum_acceptable_stage_ratio": 0.95,
+    "control_decision_p95_ns": [42, 42, 42, 42, 42],
+    "candidate_decision_p95_ns": [42, 42, 42, 42, 42],
+    "control_decision_p99_ns": [42, 42, 42, 42, 42],
+    "candidate_decision_p99_ns": [83, 42, 42, 42, 42],
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "gate": "pass_local_target_c4_required_before_rollout"
+}

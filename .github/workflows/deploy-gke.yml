@@ -524,7 +524,7 @@ jobs:
                   "imagePullPolicy": "IfNotPresent",
                   "command": ["/bin/sh", "-ec"],
                   "args": [
-                    "report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
+                    "transport=\"$(arb_bot linea-transport-preflight --rpc-url https://linea-rpc.publicnode.com --ws-url wss://linea-rpc.publicnode.com --maximum-http-p95-ms 500 --maximum-ws-subscribe-ms 3000 --maximum-head-wait-ms 8000)\"; printf \"%s\\n\" \"${transport}\"; report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
                   ],
                   "resources": {
                     "requests": {"cpu": "250m", "memory": "128Mi"},

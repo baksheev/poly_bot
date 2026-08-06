@@ -39,6 +39,19 @@ pub enum Command {
         #[arg(long)]
         target_cpu_class: Option<String>,
     },
+    /// Verify Linea HTTP and WSS transport latency without trading or signing.
+    LineaTransportPreflight {
+        #[arg(long, env = "LINEA_RPC_URL")]
+        rpc_url: String,
+        #[arg(long, env = "LINEA_WS_URL")]
+        ws_url: String,
+        #[arg(long, default_value_t = 500)]
+        maximum_http_p95_ms: u64,
+        #[arg(long, default_value_t = 3_000)]
+        maximum_ws_subscribe_ms: u64,
+        #[arg(long, default_value_t = 5_000)]
+        maximum_head_wait_ms: u64,
+    },
     /// Run the read-only market-data shadow service.
     Run,
     /// Collect public Binance and DEX prices without trading or signing credentials.

@@ -43,7 +43,10 @@ use arb_bot::{
         validation::{BinanceCanaryKind, execute_order_round_trip},
         ws_api::{BinanceWsApiClient, OrderResult, WsApiError},
     },
-    chain::rpc::{CanonicalBlock, JsonRpcClient},
+    chain::{
+        logs::EthLogFilter,
+        rpc::{CanonicalBlock, JsonRpcClient},
+    },
     config::{self, Cli, Command},
     dex::{
         events::build_log_filters,
@@ -109,8 +112,8 @@ use arb_bot::{
         TelemetryHandle, TelemetryWriter, execution_lane_id,
     },
     wallet::{
-        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, TokenBalanceRequest,
-        WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
+        EvmJournalScope, EvmWallet, OPTIMISM_RPC_URL_ENV, ReviewedConsumedNonceCollision,
+        TokenBalanceRequest, WALLET_JOURNAL_PATH_ENV, hydrate_chain_wallet,
     },
 };
 use clap::Parser;
@@ -418,6 +421,22 @@ async fn main() -> anyhow::Result<()> {
                     .context("failed to serialize capacity capacity replay report")?
             );
             Ok(())
+        }
+        Command::LineaTransportPreflight {
+            rpc_url,
+            ws_url,
+            maximum_http_p95_ms,
+            maximum_ws_subscribe_ms,
+            maximum_head_wait_ms,
+        } => {
+            linea_transport_preflight(
+                &rpc_url,
+                &ws_url,
+                maximum_http_p95_ms,
+                maximum_ws_subscribe_ms,
+                maximum_head_wait_ms,
+            )
+            .await
         }
         Command::Run => {
             let domain_validation_started_at = Instant::now();
@@ -732,6 +751,84 @@ async fn main() -> anyhow::Result<()> {
 
 fn command_owns_runtime_readiness(command: &Command) -> bool {
     matches!(command, Command::Run | Command::CollectPrices)
+}
+
+async fn linea_transport_preflight(
+    rpc_url: &str,
+    ws_url: &str,
+    maximum_http_p95_ms: u64,
+    maximum_ws_subscribe_ms: u64,
+    maximum_head_wait_ms: u64,
+) -> anyhow::Result<()> {
+    ensure!(
+        maximum_http_p95_ms > 0 && maximum_ws_subscribe_ms > 0 && maximum_head_wait_ms > 0,
+        "Linea transport latency limits must be positive"
+    );
+    let rpc = JsonRpcClient::new(rpc_url)?;
+    let mut http_samples_us = Vec::with_capacity(10);
+    for _ in 0..5 {
+        let started = Instant::now();
+        ensure!(
+            rpc.chain_id().await? == LINEA_CHAIN_ID,
+            "Linea RPC chain id mismatch"
+        );
+        http_samples_us.push(started.elapsed().as_micros());
+        let started = Instant::now();
+        ensure!(
+            rpc.gas_price().await? > 0,
+            "Linea RPC returned a zero gas price"
+        );
+        http_samples_us.push(started.elapsed().as_micros());
+    }
+    http_samples_us.sort_unstable();
+    let http_p95_us = http_samples_us[http_samples_us.len() - 1];
+    ensure!(
+        http_p95_us <= u128::from(maximum_http_p95_ms) * 1_000,
+        "Linea HTTP p95 exceeds the deployment latency limit"
+    );
+
+    let pool: Address = "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".parse()?;
+    let filter = EthLogFilter::new(vec![pool], vec![])?;
+    let ws_started = Instant::now();
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(maximum_ws_subscribe_ms),
+        connect_dex_stream(ws_url, &[filter], 16),
+    )
+    .await
+    .context("Linea WSS subscription timed out")??;
+    let ws_subscribe_us = ws_started.elapsed().as_micros();
+    let head_started = Instant::now();
+    let event = tokio::time::timeout(
+        Duration::from_millis(maximum_head_wait_ms),
+        stream.receiver.recv(),
+    )
+    .await
+    .context("Linea WSS first head timed out")?
+    .context("Linea WSS ended before its first head")?;
+    ensure!(
+        matches!(event, DexStreamEvent::Head { .. }),
+        "Linea WSS emitted a log before a canonical head"
+    );
+    let first_head_us = head_started.elapsed().as_micros();
+    stream.task.abort();
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "chain_id": LINEA_CHAIN_ID,
+            "http_sample_count": http_samples_us.len(),
+            "http_p95_us": http_p95_us,
+            "maximum_http_p95_ms": maximum_http_p95_ms,
+            "ws_subscribe_us": ws_subscribe_us,
+            "maximum_ws_subscribe_ms": maximum_ws_subscribe_ms,
+            "first_head_us": first_head_us,
+            "maximum_head_wait_ms": maximum_head_wait_ms,
+            "network_mutations": 0,
+            "gate": "pass"
+        }))?
+    );
+    Ok(())
 }
 
 async fn arbitrage_emit_result(
@@ -3560,6 +3657,33 @@ async fn run(
                 wallet,
                 config.rebalance_executor_journal_path.clone(),
                 transaction_journal_path.into(),
+                Some(ReviewedConsumedNonceCollision {
+                    operation_id: "rebalance-1516-6b2792a1b1a18931:deposit".to_owned(),
+                    chain_id: 10,
+                    wallet: wallet_owner,
+                    nonce: 76,
+                    rejected_transaction_hash:
+                        "0x34462b8a2f930da06b5196db6a4111b07941c25ecbe4e0ddc388716a4d41a482"
+                            .parse()?,
+                    purpose: "rebalance_bridge_to_binance".to_owned(),
+                    target: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse()?,
+                    native_value: U256::ZERO,
+                    calldata_hash:
+                        "0x510c0580cb373c283aec526a40c38da97f863cdcbfe61f6b0c4ceffde0938c0d"
+                            .parse()?,
+                    replacement_transaction_hash:
+                        "0x2d22c304a0e0ca98e0684145dbff8a62925cb36c33b0af891dc56b8248fb73b4"
+                            .parse()?,
+                    replacement_target: "0x97ccdbea4632140639ad5ea9b944aa034eb15fd4".parse()?,
+                    replacement_native_value: U256::from(26_138_677_603_673_219_u64),
+                    replacement_block_number: 155_207_427,
+                    scope: EvmJournalScope {
+                        schema_version: EvmJournalScope::SCHEMA_VERSION,
+                        network_id: "optimism".to_owned(),
+                        wallet_id: format!("wallet:{wallet_owner:#x}"),
+                        strategy_id: "rebalance-world-chain-v12".to_owned(),
+                    },
+                }),
                 RebalanceRuntimeLimits {
                     maximum_wld: config.rebalance_max_wld_amount,
                     maximum_usdc: config.rebalance_max_usdc_amount,

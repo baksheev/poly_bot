@@ -247,13 +247,13 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert_eq!(
         DEPLOYMENT
-            .matches("export LINEA_RPC_URL=\"https://linea-mainnet.g.alchemy.com/v2/")
+            .matches("export LINEA_RPC_URL=\"https://linea-rpc.publicnode.com\"")
             .count(),
         2
     );
     assert_eq!(
         DEPLOYMENT
-            .matches("export LINEA_WS_URL=\"wss://linea-mainnet.g.alchemy.com/v2/")
+            .matches("export LINEA_WS_URL=\"wss://linea-rpc.publicnode.com\"")
             .count(),
         2
     );
