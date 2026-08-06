@@ -186,6 +186,23 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("binance-capital-recovery --coin USDC --network LINEA"));
     assert!(DEPLOY_WORKFLOW.contains("binance-capital-recovery --coin USDT --network LINEA"));
     assert!(DEPLOY_WORKFLOW.contains("secretProviderClass\": \"arb-bot-binance-capital-read"));
+    let release_platform = DEPLOY_WORKFLOW
+        .find("Apply release platform before production preflights")
+        .expect("release platform is applied before production preflights");
+    let linea_capital_preflight = DEPLOY_WORKFLOW
+        .find("Verify Binance LINEA direct capital routes read-only")
+        .expect("LINEA capital preflight is configured");
+    let rollout = DEPLOY_WORKFLOW
+        .find("Roll out on the fixed node")
+        .expect("fixed-node rollout is configured");
+    assert!(release_platform < linea_capital_preflight);
+    assert!(linea_capital_preflight < rollout);
+    assert_eq!(
+        DEPLOY_WORKFLOW
+            .match_indices("infra/gcp/gke/release-platform.yaml")
+            .count(),
+        1
+    );
     assert!(!DEPLOY_WORKFLOW.contains("scripts/create-gke-node-pool"));
     assert!(!DEPLOY_WORKFLOW.contains("node-pools delete"));
     assert!(!DEPLOY_WORKFLOW.contains("delete persistentvolumeclaim arb-bot-state"));
