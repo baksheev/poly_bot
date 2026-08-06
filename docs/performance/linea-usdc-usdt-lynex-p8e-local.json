@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "stage": "P8e_linea_production_readiness",
+  "measured_at_utc": "2026-08-06T14:37:01Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "cold-start exact Linea USDCUSDT and Lynex Algebra V1.9 chain-readiness validation",
+  "control": {
+    "revision": "2f2795fab3577fabc798632b038ec6bb723c7a7e",
+    "binary_sha256": "5251b7896f1799826b6f0fc650b865139e3403f6bcad66f26335ce036a6d3bc9"
+  },
+  "candidate": {
+    "binary_sha256": "725355a5c2117a342d59908e8b3714c3c027e6c1961466812e48e900abcb80d2"
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P8d-control then P8e-candidate binary runs",
+    "total_strategy_frames_per_binary_per_run": 2000000,
+    "control_frames_per_second": [
+      13179806,
+      14876455,
+      14761650,
+      14558636,
+      14718725
+    ],
+    "candidate_frames_per_second": [
+      12591868,
+      14853631,
+      14770189,
+      14846432,
+      14728286
+    ],
+    "control_frames_per_second_median": 14718725,
+    "candidate_frames_per_second_median": 14770189,
+    "candidate_to_control_throughput_ratio": 1.003496498508,
+    "minimum_acceptable_stage_ratio": 0.95,
+    "control_decision_p95_ns": [42, 42, 42, 42, 42],
+    "candidate_decision_p95_ns": [42, 42, 42, 42, 42],
+    "control_decision_p99_ns": [42, 42, 42, 42, 42],
+    "candidate_decision_p99_ns": [83, 42, 42, 42, 42],
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "gate": "pass_local_target_c4_required_before_rollout"
+}

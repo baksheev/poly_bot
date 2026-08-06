@@ -27,6 +27,10 @@ pub const ARBITRUM_SWAP_ROUTER_02: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD866
 pub const ARBITRUM_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 pub const ARBITRUM_ESP: &str = "0x3b8db18e69d6686ad9371a423afe3dd1065c94f1";
 pub const ARBITRUM_ARB: &str = "0x912ce59144191c1204e64559fe8253a0e49e6548";
+pub const LINEA_CHAIN_ID: u64 = 59_144;
+pub const LINEA_LYNEX_ALGEBRA_V1_9_ROUTER: &str = "0x3921e8cb45B17fC029A0a6dE958330ca4e583390";
+pub const LINEA_USDT: &str = "0xA219439258ca9da29e9cC4cE5596924745e12B93";
+pub const LINEA_USDC: &str = "0x176211869cA2b568f2A7D4EE941E073a821EE1ff";
 pub const CHAIN_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,17 +58,17 @@ pub fn validate_binance_readiness(
             && rules.base_asset == pair.binance.base_asset
             && rules.quote_asset == pair.binance.quote_asset
             && rules.status == "TRADING",
-        "live Binance ESPUSDC identity or status differs from the readiness artifact"
+        "live Binance identity or status differs from the readiness artifact"
     );
     ensure!(
         rules.lot_size.step == Decimal::from_str(&pair.binance.step_size)?
             && rules.price.step == Decimal::from_str(&pair.binance.tick_size)?,
-        "live Binance ESPUSDC increments differ from the readiness artifact"
+        "live Binance increments differ from the readiness artifact"
     );
     let maximum_notional_base_units = pair
         .adaptive_sizing
         .limits()
-        .context("full-live ESP sizing limits are missing")?
+        .context("full-live sizing limits are missing")?
         .max_trade_notional;
     let maximum_notional = decimal_from_base_units(
         U256::from_str_radix(maximum_notional_base_units, 10)?
@@ -74,7 +78,7 @@ pub fn validate_binance_readiness(
     )?;
     ensure!(
         rules.min_notional > Decimal::ZERO && rules.min_notional <= maximum_notional,
-        "Binance minimum notional exceeds the ESP trade envelope"
+        "Binance minimum notional exceeds the trade envelope"
     );
 
     let validation_price = aligned_validation_price(rules)?;
@@ -89,11 +93,11 @@ pub fn validate_binance_readiness(
         quantity > Decimal::ZERO
             && quantity * validation_price <= maximum_notional
             && quantity <= rules.lot_size.max,
-        "no bounded ESP quantity satisfies the live Binance filters"
+        "no bounded quantity satisfies the live Binance filters"
     );
     let absolute_base_units = base_units_from_decimal(quantity, pair.token_b.decimals)?;
     let absolute_base_units =
-        i128::try_from(absolute_base_units).context("ESP validation quantity exceeds i128")?;
+        i128::try_from(absolute_base_units).context("validation quantity exceeds i128")?;
 
     let buy_ioc = plan_limit_ioc(
         "rustarb-esp-readiness-buy-ioc".to_owned(),
@@ -272,8 +276,8 @@ impl ChainReadinessProbe {
     ) -> anyhow::Result<Self> {
         validate_readiness_pair(pair)?;
         ensure!(
-            runtime.plan().chain_id == ARBITRUM_CHAIN_ID,
-            "chain-readiness probe requires the Arbitrum runtime"
+            runtime.plan().chain_id == pair.chain.chain_id,
+            "chain-readiness probe runtime differs from the reviewed pair"
         );
         Ok(Self {
             pair: pair.clone(),
@@ -301,7 +305,7 @@ impl ChainReadinessProbe {
         let snapshot = fetch_wallet_snapshot_coordinated(
             &self.reads,
             self.owner,
-            ARBITRUM_CHAIN_ID,
+            self.pair.chain.chain_id,
             &tokens,
             block,
         )
@@ -326,17 +330,12 @@ async fn inspect_chain_readiness_at(
 ) -> anyhow::Result<ChainReadiness> {
     validate_readiness_pair(pair)?;
     ensure!(
-        snapshot.chain_id == ARBITRUM_CHAIN_ID && snapshot.batch_complete,
-        "chain readiness requires one complete Arbitrum wallet batch"
+        snapshot.chain_id == pair.chain.chain_id && snapshot.batch_complete,
+        "chain readiness requires one complete wallet batch for the reviewed pair"
     );
     let token_a = Address::from_str(&pair.token_a.contract)?;
     let token_b = Address::from_str(&pair.token_b.contract)?;
-    let router = Address::from_str(
-        pair.chain
-            .uniswap_v3_router_address
-            .as_deref()
-            .context("Arbitrum router is missing")?,
-    )?;
+    let router = Address::from_str(reviewed_router(pair)?)?;
     let exact_token_contracts = snapshot.token_balances.iter().any(|balance| {
         balance.symbol.as_ref() == pair.token_a.symbol && balance.contract == token_a
     }) && snapshot.token_balances.iter().any(|balance| {
@@ -374,7 +373,7 @@ async fn inspect_chain_readiness_at(
         && token_b_funded
         && fresh_rpc_gas_price;
     Ok(ChainReadiness {
-        chain_id: ARBITRUM_CHAIN_ID,
+        chain_id: pair.chain.chain_id,
         block_number: block.number,
         exact_token_contracts,
         token_code_present,
@@ -405,7 +404,7 @@ pub fn validate_rebalance_readiness(
     pair: &PairConfig,
     coins: &[CoinInformation],
 ) -> anyhow::Result<RebalanceReadiness> {
-    validate_readiness_pair(pair)?;
+    validate_arbitrum_rebalance_pair(pair)?;
     let mut direct_route_count = 0;
     let mut deposit_enabled_assets = 0;
     let mut withdrawal_enabled_assets = 0;
@@ -440,38 +439,101 @@ fn validate_readiness_pair(pair: &PairConfig) -> anyhow::Result<()> {
     let policy = pair
         .full_live_policy
         .as_ref()
-        .context("Arbitrum full-live pair has no production policy")?;
+        .context("full-live pair has no production policy")?;
     let reviewed_pair = match pair.binance.symbol.as_str() {
         "ESPUSDC" => {
             pair.id == "arbitrum-usdc-esp"
+                && pair.chain.chain_id == ARBITRUM_CHAIN_ID
+                && pair
+                    .chain
+                    .uniswap_v3_router_address
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
+                && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
                 && pair.token_b.symbol == "ESP"
                 && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ESP)
+                && policy.rebalance_binance_network == "ARBITRUM"
+                && policy.direct_route_only
+                && !policy.bridge_mutations_enabled
         }
         "ARBUSDC" => {
             pair.id == "arbitrum-usdc-arb"
+                && pair.chain.chain_id == ARBITRUM_CHAIN_ID
+                && pair
+                    .chain
+                    .uniswap_v3_router_address
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
+                && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
                 && pair.token_b.symbol == "ARB"
                 && pair.token_b.contract.eq_ignore_ascii_case(ARBITRUM_ARB)
+                && policy.rebalance_binance_network == "ARBITRUM"
+                && policy.direct_route_only
+                && !policy.bridge_mutations_enabled
+        }
+        "USDCUSDT" => {
+            pair.id == "linea-usdt-usdc"
+                && pair.chain.chain_id == LINEA_CHAIN_ID
+                && pair.token_a.symbol == "USDT"
+                && pair.token_a.contract.eq_ignore_ascii_case(LINEA_USDT)
+                && pair.token_b.symbol == "USDC"
+                && pair.token_b.contract.eq_ignore_ascii_case(LINEA_USDC)
+                && pair
+                    .chain
+                    .lynex_algebra_v1_9_router_address
+                    .as_deref()
+                    .is_some_and(|value| {
+                        value.eq_ignore_ascii_case(LINEA_LYNEX_ALGEBRA_V1_9_ROUTER)
+                    })
+                && policy.rebalance_binance_network == "OPTIMISM"
+                && !policy.direct_route_only
+                && policy.bridge_mutations_enabled
         }
         _ => false,
     };
     ensure!(
-        reviewed_pair
-            && pair.chain.chain_id == ARBITRUM_CHAIN_ID
+        reviewed_pair && pair.full_live && pair.execution_enabled && pair.rebalance.enabled,
+        "pair identity or rebalance policy differs from the production artifact"
+    );
+    Ok(())
+}
+
+fn validate_arbitrum_rebalance_pair(pair: &PairConfig) -> anyhow::Result<()> {
+    validate_readiness_pair(pair)?;
+    let policy = pair
+        .full_live_policy
+        .as_ref()
+        .context("Arbitrum full-live pair has no production policy")?;
+    ensure!(
+        pair.chain.chain_id == ARBITRUM_CHAIN_ID
             && pair
                 .chain
                 .uniswap_v3_router_address
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case(ARBITRUM_SWAP_ROUTER_02))
             && pair.token_a.contract.eq_ignore_ascii_case(ARBITRUM_USDC)
-            && pair.full_live
-            && pair.execution_enabled
-            && pair.rebalance.enabled
             && policy.rebalance_binance_network == "ARBITRUM"
             && policy.direct_route_only
             && !policy.bridge_mutations_enabled,
         "Arbitrum pair identity or rebalance policy differs from the production artifact"
     );
     Ok(())
+}
+
+fn reviewed_router(pair: &PairConfig) -> anyhow::Result<&str> {
+    match pair.chain.chain_id {
+        ARBITRUM_CHAIN_ID => pair
+            .chain
+            .uniswap_v3_router_address
+            .as_deref()
+            .context("Arbitrum router is missing"),
+        LINEA_CHAIN_ID => pair
+            .chain
+            .lynex_algebra_v1_9_router_address
+            .as_deref()
+            .context("Linea Lynex Algebra V1.9 router is missing"),
+        chain_id => anyhow::bail!("chain readiness is not reviewed for chain {chain_id}"),
+    }
 }
 
 fn aligned_validation_price(
@@ -672,6 +734,40 @@ mod tests {
         assert!(first.request_fingerprints[1].contains("limit_ioc:SELL"));
         assert!(first.request_fingerprints[2].contains("market_buy_quantity"));
         assert!(first.request_fingerprints[3].contains("market_sell"));
+    }
+
+    #[test]
+    fn linea_binance_and_lynex_readiness_accepts_only_the_reviewed_pair() {
+        let domain =
+            LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v1.json").unwrap();
+        let pair = &domain.snapshot().pairs[0];
+        let mut linea_state = state();
+        linea_state.commission.symbol = "USDCUSDT".to_owned();
+        linea_state.symbol_rules.symbol = "USDCUSDT".to_owned();
+        linea_state.symbol_rules.base_asset = "USDC".to_owned();
+        linea_state.symbol_rules.quote_asset = "USDT".to_owned();
+
+        let readiness = validate_binance_readiness(pair, &linea_state).unwrap();
+        assert_eq!(readiness.symbol, "USDCUSDT");
+        assert!(readiness.filters_ready);
+        assert!(readiness.external_mutation_authorized);
+        assert_eq!(
+            super::reviewed_router(pair).unwrap(),
+            super::LINEA_LYNEX_ALGEBRA_V1_9_ROUTER
+        );
+
+        let mut wrong_router = pair.clone();
+        wrong_router.chain.lynex_algebra_v1_9_router_address =
+            Some(super::ARBITRUM_SWAP_ROUTER_02.to_owned());
+        assert!(validate_readiness_pair(&wrong_router).is_err());
+
+        let mut direct_only = pair.clone();
+        direct_only
+            .full_live_policy
+            .as_mut()
+            .unwrap()
+            .direct_route_only = true;
+        assert!(validate_readiness_pair(&direct_only).is_err());
     }
 
     #[test]
