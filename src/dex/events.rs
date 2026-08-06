@@ -18,6 +18,7 @@ const V4_SWAP_SIGNATURE: &str = "Swap(bytes32,address,int128,int128,uint160,uint
 const V4_MODIFY_LIQUIDITY_SIGNATURE: &str =
     "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)";
 const CAMELOT_FEE_SIGNATURE: &str = "Fee(uint16,uint16)";
+const LYNEX_ALGEBRA_V1_9_FEE_SIGNATURE: &str = "Fee(uint16)";
 const CAMELOT_TICK_SPACING_SIGNATURE: &str = "TickSpacing(int24)";
 const CAMELOT_INCENTIVE_SIGNATURE: &str = "Incentive(address)";
 
@@ -30,6 +31,8 @@ static V4_SWAP_TOPIC: LazyLock<B256> = LazyLock::new(|| keccak256(V4_SWAP_SIGNAT
 static V4_MODIFY_LIQUIDITY_TOPIC: LazyLock<B256> =
     LazyLock::new(|| keccak256(V4_MODIFY_LIQUIDITY_SIGNATURE));
 static CAMELOT_FEE_TOPIC: LazyLock<B256> = LazyLock::new(|| keccak256(CAMELOT_FEE_SIGNATURE));
+static LYNEX_ALGEBRA_V1_9_FEE_TOPIC: LazyLock<B256> =
+    LazyLock::new(|| keccak256(LYNEX_ALGEBRA_V1_9_FEE_SIGNATURE));
 static CAMELOT_TICK_SPACING_TOPIC: LazyLock<B256> =
     LazyLock::new(|| keccak256(CAMELOT_TICK_SPACING_SIGNATURE));
 static CAMELOT_INCENTIVE_TOPIC: LazyLock<B256> =
@@ -40,6 +43,7 @@ pub enum PoolLocator {
     V3(Address),
     PancakeV3(Address),
     CamelotV3(Address),
+    LynexAlgebraV1_9(Address),
     V4(B256),
 }
 
@@ -99,6 +103,73 @@ impl CamelotFeeReceiptProof {
     }
 }
 
+/// Allocation-free receipt acceleration proof for Lynex Algebra V1.9's
+/// single-value `Fee(uint16)` event. It is intentionally distinct from
+/// Camelot's directional fee proof so one provider's ABI can never be decoded
+/// under the other provider's semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LynexFeeReceiptProof {
+    pub pool: Address,
+    pub fee: u16,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub transaction_index: u64,
+    pub log_index: u64,
+}
+
+impl LynexFeeReceiptProof {
+    pub const fn position(self) -> crate::chain::logs::LogPosition {
+        crate::chain::logs::LogPosition {
+            block_number: self.block_number,
+            transaction_index: self.transaction_index,
+            log_index: self.log_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveFeeReceiptProof {
+    Camelot(CamelotFeeReceiptProof),
+    LynexAlgebraV1_9(LynexFeeReceiptProof),
+}
+
+impl AdaptiveFeeReceiptProof {
+    pub const fn pool(self) -> Address {
+        match self {
+            Self::Camelot(proof) => proof.pool,
+            Self::LynexAlgebraV1_9(proof) => proof.pool,
+        }
+    }
+
+    pub const fn block_number(self) -> u64 {
+        match self {
+            Self::Camelot(proof) => proof.block_number,
+            Self::LynexAlgebraV1_9(proof) => proof.block_number,
+        }
+    }
+
+    pub const fn block_hash(self) -> B256 {
+        match self {
+            Self::Camelot(proof) => proof.block_hash,
+            Self::LynexAlgebraV1_9(proof) => proof.block_hash,
+        }
+    }
+
+    pub const fn transaction_index(self) -> u64 {
+        match self {
+            Self::Camelot(proof) => proof.transaction_index,
+            Self::LynexAlgebraV1_9(proof) => proof.transaction_index,
+        }
+    }
+
+    pub const fn log_index(self) -> u64 {
+        match self {
+            Self::Camelot(proof) => proof.log_index,
+            Self::LynexAlgebraV1_9(proof) => proof.log_index,
+        }
+    }
+}
+
 impl DecodedPoolEvent {
     pub const fn kind(self) -> &'static str {
         match self.update {
@@ -120,6 +191,7 @@ pub fn build_log_filters(
     let mut v3_addresses = BTreeSet::new();
     let mut pancake_v3_addresses = BTreeSet::new();
     let mut camelot_v3_addresses = BTreeSet::new();
+    let mut lynex_algebra_v1_9_addresses = BTreeSet::new();
     let mut v4_pool_ids = BTreeSet::new();
     for pool in &hydrated.pools {
         match pool.identity {
@@ -132,13 +204,16 @@ pub fn build_log_filters(
             PoolIdentity::CamelotV3 { address } => {
                 camelot_v3_addresses.insert(address);
             }
+            PoolIdentity::LynexAlgebraV1_9 { address } => {
+                lynex_algebra_v1_9_addresses.insert(address);
+            }
             PoolIdentity::V4 { pool_id, .. } => {
                 v4_pool_ids.insert(pool_id);
             }
         }
     }
 
-    let mut filters = Vec::with_capacity(3);
+    let mut filters = Vec::with_capacity(5);
     if !v3_addresses.is_empty() {
         filters.push(EthLogFilter::new(
             v3_addresses.into_iter().collect(),
@@ -167,6 +242,19 @@ pub fn build_log_filters(
                 v3_mint_topic(),
                 v3_burn_topic(),
                 camelot_fee_topic(),
+                camelot_tick_spacing_topic(),
+                camelot_incentive_topic(),
+            ])],
+        )?);
+    }
+    if !lynex_algebra_v1_9_addresses.is_empty() {
+        filters.push(EthLogFilter::new(
+            lynex_algebra_v1_9_addresses.into_iter().collect(),
+            vec![Some(vec![
+                v3_swap_topic(),
+                v3_mint_topic(),
+                v3_burn_topic(),
+                lynex_algebra_v1_9_fee_topic(),
                 camelot_tick_spacing_topic(),
                 camelot_incentive_topic(),
             ])],
@@ -249,6 +337,23 @@ pub fn build_pool_log_filter(
                 ])],
             )
         }
+        PoolLocator::LynexAlgebraV1_9(pool) => {
+            ensure!(
+                event_address == pool,
+                "Lynex Algebra V1.9 event address differs from its pool"
+            );
+            EthLogFilter::new(
+                vec![pool],
+                vec![Some(vec![
+                    v3_swap_topic(),
+                    v3_mint_topic(),
+                    v3_burn_topic(),
+                    lynex_algebra_v1_9_fee_topic(),
+                    camelot_tick_spacing_topic(),
+                    camelot_incentive_topic(),
+                ])],
+            )
+        }
         PoolLocator::V4(pool_id) => EthLogFilter::new(
             vec![event_address],
             vec![
@@ -294,6 +399,17 @@ pub fn decode_camelot_pool_event(
     decode_pool_event_with_locator(log, Some(PoolLocator::CamelotV3(pool)))
 }
 
+pub fn decode_lynex_algebra_v1_9_pool_event(
+    log: &ChainLog,
+    pool: Address,
+) -> anyhow::Result<Option<DecodedPoolEvent>> {
+    ensure!(
+        log.address == pool,
+        "Lynex Algebra V1.9 event address differs from its pool"
+    );
+    decode_pool_event_with_locator(log, Some(PoolLocator::LynexAlgebraV1_9(pool)))
+}
+
 /// Receipt-only accounting for Pancake's two trailing protocol-fee words.
 /// The WebSocket mirror intentionally skips these fields in its hot path.
 pub fn decode_pancake_v3_protocol_fees(log: &ChainLog) -> anyhow::Result<Option<(u128, u128)>> {
@@ -318,11 +434,15 @@ fn decode_pool_event_with_locator(
         return Ok(None);
     };
     if signature == v3_swap_topic() {
-        if locator_hint == Some(PoolLocator::CamelotV3(log.address)) {
-            ensure!(log.topics.len() == 3, "invalid Camelot Swap topic count");
-            ensure!(log.data.len() == 5 * 32, "invalid Camelot Swap data length");
+        if matches!(
+            locator_hint,
+            Some(PoolLocator::CamelotV3(address) | PoolLocator::LynexAlgebraV1_9(address))
+                if address == log.address
+        ) {
+            ensure!(log.topics.len() == 3, "invalid Algebra Swap topic count");
+            ensure!(log.data.len() == 5 * 32, "invalid Algebra Swap data length");
             return Ok(Some(DecodedPoolEvent {
-                locator: PoolLocator::CamelotV3(log.address),
+                locator: locator_hint.expect("adaptive Algebra locator was matched"),
                 update: PoolUpdate::Swap {
                     sqrt_price_x96: decode_u256(&log.data, 2)?,
                     liquidity: decode_u128(&log.data, 3)?,
@@ -442,10 +562,30 @@ fn decode_pool_event_with_locator(
             },
         }));
     }
+    if signature == lynex_algebra_v1_9_fee_topic() {
+        ensure!(
+            locator_hint == Some(PoolLocator::LynexAlgebraV1_9(log.address)),
+            "Lynex Fee event lacks Lynex Algebra V1.9 provider routing"
+        );
+        ensure!(log.topics.len() == 1, "invalid Lynex Fee topic count");
+        ensure!(log.data.len() == 32, "invalid Lynex Fee data length");
+        let fee = decode_u16(&log.data, 0)?;
+        return Ok(Some(DecodedPoolEvent {
+            locator: PoolLocator::LynexAlgebraV1_9(log.address),
+            update: PoolUpdate::Fee {
+                zero_for_one: fee,
+                one_for_zero: fee,
+            },
+        }));
+    }
     if signature == camelot_tick_spacing_topic() {
         ensure!(
-            locator_hint == Some(PoolLocator::CamelotV3(log.address)),
-            "Camelot TickSpacing event lacks Camelot provider routing"
+            matches!(
+                locator_hint,
+                Some(PoolLocator::CamelotV3(address) | PoolLocator::LynexAlgebraV1_9(address))
+                    if address == log.address
+            ),
+            "Algebra TickSpacing event lacks adaptive provider routing"
         );
         ensure!(
             log.topics.len() == 1,
@@ -456,7 +596,7 @@ fn decode_pool_event_with_locator(
             "invalid Camelot TickSpacing data length"
         );
         return Ok(Some(DecodedPoolEvent {
-            locator: PoolLocator::CamelotV3(log.address),
+            locator: locator_hint.expect("adaptive Algebra locator was matched"),
             update: PoolUpdate::TickSpacing {
                 value: decode_i24(&log.data, 0)?,
             },
@@ -464,8 +604,12 @@ fn decode_pool_event_with_locator(
     }
     if signature == camelot_incentive_topic() {
         ensure!(
-            locator_hint == Some(PoolLocator::CamelotV3(log.address)),
-            "Camelot Incentive event lacks Camelot provider routing"
+            matches!(
+                locator_hint,
+                Some(PoolLocator::CamelotV3(address) | PoolLocator::LynexAlgebraV1_9(address))
+                    if address == log.address
+            ),
+            "Algebra Incentive event lacks adaptive provider routing"
         );
         ensure!(
             log.topics.len() == 2,
@@ -477,7 +621,7 @@ fn decode_pool_event_with_locator(
             "Camelot Incentive indexed address has non-zero padding"
         );
         return Ok(Some(DecodedPoolEvent {
-            locator: PoolLocator::CamelotV3(log.address),
+            locator: locator_hint.expect("adaptive Algebra locator was matched"),
             update: PoolUpdate::Incentive {
                 address: Address::from_slice(&log.topics[1].as_slice()[12..]),
             },
@@ -492,7 +636,7 @@ fn routed_v3_locator(
 ) -> anyhow::Result<PoolLocator> {
     let locator = locator_hint.unwrap_or(PoolLocator::V3(address));
     ensure!(
-        matches!(locator, PoolLocator::V3(pool) | PoolLocator::PancakeV3(pool) | PoolLocator::CamelotV3(pool) if pool == address),
+        matches!(locator, PoolLocator::V3(pool) | PoolLocator::PancakeV3(pool) | PoolLocator::CamelotV3(pool) | PoolLocator::LynexAlgebraV1_9(pool) if pool == address),
         "V3 liquidity event does not match its routed pool"
     );
     Ok(locator)
@@ -524,6 +668,10 @@ pub fn v4_modify_liquidity_topic() -> B256 {
 
 pub fn camelot_fee_topic() -> B256 {
     *CAMELOT_FEE_TOPIC
+}
+
+pub fn lynex_algebra_v1_9_fee_topic() -> B256 {
+    *LYNEX_ALGEBRA_V1_9_FEE_TOPIC
 }
 
 pub fn camelot_tick_spacing_topic() -> B256 {
@@ -614,13 +762,17 @@ mod tests {
 
     use alloy_primitives::{Address, B256, I256, U256, address};
 
-    use crate::{chain::logs::ChainLog, paired_benchmark::assert_paired_non_regression};
+    use crate::{
+        chain::logs::ChainLog,
+        paired_benchmark::{assert_named_paired_non_regression, assert_paired_non_regression},
+    };
 
     use super::{
         PoolLocator, PoolUpdate, camelot_fee_topic, camelot_incentive_topic,
         camelot_tick_spacing_topic, decode_camelot_pool_event, decode_camelot_v3_swap_amounts,
-        decode_pancake_v3_protocol_fees, decode_pool_event, decode_pool_event_for_locator,
-        pancake_v3_swap_topic, v3_mint_topic, v3_swap_topic, v4_swap_topic,
+        decode_lynex_algebra_v1_9_pool_event, decode_pancake_v3_protocol_fees, decode_pool_event,
+        decode_pool_event_for_locator, lynex_algebra_v1_9_fee_topic, pancake_v3_swap_topic,
+        v3_mint_topic, v3_swap_topic, v4_swap_topic,
     };
 
     fn word_u128(value: u128) -> [u8; 32] {
@@ -818,6 +970,68 @@ mod tests {
     }
 
     #[test]
+    fn lynex_single_fee_and_shared_swap_require_provider_routing() {
+        let pool = address!("0000000000000000000000000000000000000005");
+        let fee_log = log(
+            pool,
+            vec![lynex_algebra_v1_9_fee_topic()],
+            word_u16(50).to_vec(),
+        );
+        assert!(decode_pool_event(&fee_log).is_err());
+        assert_eq!(
+            decode_lynex_algebra_v1_9_pool_event(&fee_log, pool)
+                .unwrap()
+                .unwrap(),
+            super::DecodedPoolEvent {
+                locator: PoolLocator::LynexAlgebraV1_9(pool),
+                update: PoolUpdate::Fee {
+                    zero_for_one: 50,
+                    one_for_zero: 50,
+                },
+            }
+        );
+
+        let mut bad_padding = word_u16(50);
+        bad_padding[0] = 1;
+        assert!(
+            decode_lynex_algebra_v1_9_pool_event(
+                &log(
+                    pool,
+                    vec![lynex_algebra_v1_9_fee_topic()],
+                    bad_padding.to_vec(),
+                ),
+                pool,
+            )
+            .is_err()
+        );
+
+        let mut swap_data = vec![0_u8; 5 * 32];
+        swap_data[64..96].copy_from_slice(&word_u128(123));
+        swap_data[96..128].copy_from_slice(&word_u128(456));
+        swap_data[128..160].copy_from_slice(&word_i32(-42));
+        let swap = decode_lynex_algebra_v1_9_pool_event(
+            &log(
+                pool,
+                vec![v3_swap_topic(), B256::ZERO, B256::ZERO],
+                swap_data,
+            ),
+            pool,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(swap.locator, PoolLocator::LynexAlgebraV1_9(pool));
+        assert_eq!(
+            swap.update,
+            PoolUpdate::Swap {
+                sqrt_price_x96: U256::from(123_u64),
+                tick: -42,
+                liquidity: 456,
+                fee_pips: None,
+            }
+        );
+    }
+
+    #[test]
     fn shared_swap_topic_retains_camelot_provider_identity_and_amounts() {
         let pool = address!("0000000000000000000000000000000000000003");
         let mut data = vec![0_u8; 160];
@@ -886,6 +1100,34 @@ mod tests {
                 black_box(decode_pool_event_for_locator(
                     &pancake,
                     PoolLocator::PancakeV3(pool),
+                ))
+                .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Lynex/Uniswap event decoder benchmark"]
+    fn benchmark_uniswap_and_lynex_swap_decoders() {
+        let pool = address!("0000000000000000000000000000000000000005");
+        let mut data = vec![0_u8; 160];
+        data[64..96].copy_from_slice(&U256::from(123_u64).to_be_bytes::<32>());
+        data[96..128].copy_from_slice(&word_u128(456));
+        data[128..160].copy_from_slice(&word_i32(-42));
+        let swap = log(pool, vec![v3_swap_topic(), B256::ZERO, B256::ZERO], data);
+
+        assert_named_paired_non_regression(
+            "lynex_algebra_v1_9_event_decode_benchmark",
+            1.10,
+            "uniswap_v3",
+            "lynex_algebra_v1_9",
+            || {
+                black_box(decode_pool_event_for_locator(&swap, PoolLocator::V3(pool))).unwrap();
+            },
+            || {
+                black_box(decode_pool_event_for_locator(
+                    &swap,
+                    PoolLocator::LynexAlgebraV1_9(pool),
                 ))
                 .unwrap();
             },

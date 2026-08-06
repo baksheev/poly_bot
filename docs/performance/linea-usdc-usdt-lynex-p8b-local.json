@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "stage": "P8b_linea_full_live_rebalance_and_fixed_node_delivery",
+  "captured_at_utc": "2026-08-06T08:14:27Z",
+  "repository_head": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "environment": {
+    "os": "Darwin 25.3.0 arm64",
+    "profile": "release fat-LTO codegen-units=1",
+    "production_target_required": "c4-highcpu-8"
+  },
+  "functional_gate": {
+    "gke_deployment_config_tests": "5_passed_0_failed",
+    "capacity_reporting_tests": "2_passed_0_failed",
+    "main_runtime_tests": "9_passed_0_failed",
+    "linea_rebalance_authority": "typed_direct_eip155_59144_linea_only",
+    "linea_direct_assets": [
+      "USDC",
+      "USDT"
+    ],
+    "durable_unknown_deposit_queries": 1,
+    "rollout_node_policy": "reuse_single_running_c4_highcpu_8_pool_autoscaling_disabled",
+    "durable_pvc_replacement_allowed": false,
+    "binance_linea_route_preflight": "read_only_production_egress_before_rollout",
+    "network_io_performed_by_local_tests": false,
+    "external_mutations": 0,
+    "gate": "pass"
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P8a-control then P8b-candidate binary runs",
+    "total_strategy_frames_per_binary_per_run": 2000000,
+    "p8a_binary_sha256": "e7c67ede4b8b17534dbf56c5badd5d11bc7ca46f2f09e9f295ecd42af300560c",
+    "p8b_binary_sha256": "b1aa30a35e744146d16a86fc6514db20e257b6212104060244d6d7ff8d9d4060",
+    "p8a_frames_per_second": [
+      13669321,
+      13737663,
+      13642723,
+      13830593,
+      13788459
+    ],
+    "p8b_frames_per_second": [
+      13636522,
+      13678346,
+      13668441,
+      13728060,
+      13641870
+    ],
+    "p8a_frames_per_second_median": 13737663,
+    "p8b_frames_per_second_median": 13668441,
+    "p8b_to_p8a_throughput_ratio": 0.994961151689338,
+    "p8b_to_frozen_p0_throughput_ratio": 1.071952615388235,
+    "minimum_acceptable_stage_ratio": 0.95,
+    "p8a_decision_p95_ns_median": 42,
+    "p8b_decision_p95_ns_median": 42,
+    "p8a_decision_p99_ns_median": 42,
+    "p8b_decision_p99_ns_median": 42,
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "result": "pass"
+}

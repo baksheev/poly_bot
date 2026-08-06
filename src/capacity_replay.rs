@@ -83,6 +83,7 @@ pub enum CapacityDexProvider {
     #[serde(rename = "pancakeswap_v3")]
     PancakeSwapV3,
     CamelotV3,
+    LynexAlgebraV1_9,
 }
 
 impl CapacityDexProvider {
@@ -91,6 +92,7 @@ impl CapacityDexProvider {
             Self::UniswapV3 => "uniswap_v3",
             Self::PancakeSwapV3 => "pancakeswap_v3",
             Self::CamelotV3 => "camelot_v3",
+            Self::LynexAlgebraV1_9 => "lynex_algebra_v1_9",
         }
     }
 }
@@ -234,6 +236,14 @@ impl CapacityReplayArtifact {
                     CapacityDexProvider::CamelotV3,
                 ],
             "capacity ARB/USDC must exercise Uniswap, Pancake, and Camelot in stable order"
+        );
+        let linea = self
+            .mixed_provider_assignments
+            .get("capacity-linea-usdt-usdc")
+            .context("capacity Linea USDT/USDC provider assignment is missing")?;
+        ensure!(
+            linea == &[CapacityDexProvider::LynexAlgebraV1_9],
+            "capacity Linea USDT/USDC must exercise Lynex Algebra V1.9"
         );
         Ok(())
     }
@@ -806,14 +816,16 @@ fn exercise_rehydration(artifact: &CapacityReplayArtifact) -> anyhow::Result<Reh
                         decoded.liquidity,
                     )?
                 }
-                CapacityDexProvider::CamelotV3 => ClmmPool::new_algebra_v1_9(
-                    artifact.rehydration_fixture.fee_pips,
-                    artifact.rehydration_fixture.fee_pips,
-                    decoded.tick_spacing,
-                    decoded.sqrt_price_x96,
-                    decoded.tick,
-                    decoded.liquidity,
-                )?,
+                CapacityDexProvider::CamelotV3 | CapacityDexProvider::LynexAlgebraV1_9 => {
+                    ClmmPool::new_algebra_v1_9(
+                        artifact.rehydration_fixture.fee_pips,
+                        artifact.rehydration_fixture.fee_pips,
+                        decoded.tick_spacing,
+                        decoded.sqrt_price_x96,
+                        decoded.tick,
+                        decoded.liquidity,
+                    )?
+                }
             };
             build_latencies.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
 

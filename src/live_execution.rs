@@ -1057,7 +1057,8 @@ impl DexRevertContext {
         let pool_reference = match request.route {
             SwapRoute::UniswapV3 { pool, .. }
             | SwapRoute::PancakeSwapV3 { pool, .. }
-            | SwapRoute::CamelotV3 { pool, .. } => {
+            | SwapRoute::CamelotV3 { pool, .. }
+            | SwapRoute::LynexAlgebraV1_9 { pool, .. } => {
                 format!("{pool:#x}")
             }
             SwapRoute::V4 { pool_key, .. } => format!("{:#x}", pool_key.pool_id()),
@@ -2112,7 +2113,7 @@ fn dex_filled(operation: &TradeOperation) -> bool {
 
 #[derive(Default)]
 struct DexSettlementAcceleration {
-    fee: Option<crate::dex::events::CamelotFeeReceiptProof>,
+    fee: Option<crate::dex::events::AdaptiveFeeReceiptProof>,
     swap: Option<crate::chain::logs::ChainLog>,
 }
 
@@ -2352,6 +2353,44 @@ mod tests {
         }
     }
 
+    fn lynex_opportunity() -> PaperOpportunity {
+        let mut opportunity = opportunity();
+        opportunity.dex_pool_generation = 7;
+        opportunity.dex_fee_generation = 9;
+        opportunity.dex_plan = crate::execution_plan::DexSwapPlan {
+            route: crate::execution_plan::DexRoutePlan::LynexAlgebraV1_9 {
+                router: "0x3921e8cb45B17fC029A0a6dE958330ca4e583390".to_owned(),
+                pool_address: "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".to_owned(),
+                pool_generation: 7,
+                fee_generation: 9,
+                fee_current_pips: 50,
+                fee_envelope_pips: 50,
+                fee_horizon_first_unix_seconds: 1_800_000_000,
+                fee_horizon_last_unix_seconds: 3_000_000_000,
+            },
+            token_in: "0xA219439258ca9da29e9cC4cE5596924745e12B93".to_owned(),
+            token_out: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff".to_owned(),
+            amount_in_base_units: 1_000,
+            amount_out_minimum_base_units: 100,
+            deadline_unix_seconds: 3_000_000_000,
+        };
+        opportunity
+    }
+
+    fn lynex_risk_limits(stop_file: std::path::PathBuf) -> LiveRiskLimits {
+        let limits = risk_limits(stop_file);
+        limits.entry_preflight.update_dex_pool_with_fee_generation(
+            "world-chain-usdc-wld",
+            0,
+            7,
+            9,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
+        limits
+    }
+
     #[test]
     fn reservation_timestamp_does_not_change_plan_identity() {
         let mut first = opportunity();
@@ -2558,7 +2597,26 @@ mod tests {
             std::thread::current().name().unwrap_or("thread")
         ));
         let _ = fs::remove_file(&journal);
-        let opportunity = opportunity();
+        let mut opportunity = opportunity();
+        opportunity.dex_pool_generation = 7;
+        opportunity.dex_fee_generation = 9;
+        opportunity.dex_plan = crate::execution_plan::DexSwapPlan {
+            route: crate::execution_plan::DexRoutePlan::LynexAlgebraV1_9 {
+                router: "0x3921e8cb45B17fC029A0a6dE958330ca4e583390".to_owned(),
+                pool_address: "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".to_owned(),
+                pool_generation: 7,
+                fee_generation: 9,
+                fee_current_pips: 50,
+                fee_envelope_pips: 50,
+                fee_horizon_first_unix_seconds: 1_800_000_000,
+                fee_horizon_last_unix_seconds: 3_000_000_000,
+            },
+            token_in: "0xA219439258ca9da29e9cC4cE5596924745e12B93".to_owned(),
+            token_out: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff".to_owned(),
+            amount_in_base_units: 100,
+            amount_out_minimum_base_units: 90,
+            deadline_unix_seconds: 3_000_000_000,
+        };
         let plan_id = opportunity.plan_id();
         let mut coordinator = PaperTradeCoordinator::open(&journal).unwrap();
         coordinator
@@ -2935,6 +2993,25 @@ mod tests {
         let rejection = handle.check(&candidate).unwrap().unwrap();
 
         assert_eq!(rejection.reason, "preflight_spread_below_threshold");
+    }
+
+    #[test]
+    fn lynex_entry_preflight_rejects_a_changed_fee_generation_after_requote() {
+        let handle = default_preflight();
+        handle.update_dex_pool_with_fee_generation(
+            "world-chain-usdc-wld",
+            0,
+            7,
+            10,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
+        let candidate = lynex_opportunity();
+
+        let rejection = handle.check(&candidate).unwrap().unwrap();
+
+        assert_eq!(rejection.reason, "preflight_fee_generation_changed");
     }
 
     #[test]
@@ -4113,7 +4190,7 @@ mod tests {
         let stop_file = journal.with_extension("stop");
         let _ = fs::remove_file(&journal);
         let _ = fs::remove_file(&stop_file);
-        let opportunity = opportunity();
+        let opportunity = lynex_opportunity();
         let plan_id = opportunity.plan_id();
         let executor = ScriptedExecutor {
             results: Mutex::new(VecDeque::from([failed_with_gas(
@@ -4128,7 +4205,7 @@ mod tests {
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
-            risk_limits(stop_file),
+            lynex_risk_limits(stop_file),
         )
         .unwrap();
 
@@ -4290,7 +4367,26 @@ mod tests {
         let stop_file = journal.with_extension("stop");
         let _ = fs::remove_file(&journal);
         let _ = fs::remove_file(&stop_file);
-        let opportunity = opportunity();
+        let mut opportunity = opportunity();
+        opportunity.dex_pool_generation = 7;
+        opportunity.dex_fee_generation = 9;
+        opportunity.dex_plan = crate::execution_plan::DexSwapPlan {
+            route: crate::execution_plan::DexRoutePlan::LynexAlgebraV1_9 {
+                router: "0x3921e8cb45B17fC029A0a6dE958330ca4e583390".to_owned(),
+                pool_address: "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".to_owned(),
+                pool_generation: 7,
+                fee_generation: 9,
+                fee_current_pips: 50,
+                fee_envelope_pips: 50,
+                fee_horizon_first_unix_seconds: 1_800_000_000,
+                fee_horizon_last_unix_seconds: 3_000_000_000,
+            },
+            token_in: "0xA219439258ca9da29e9cC4cE5596924745e12B93".to_owned(),
+            token_out: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff".to_owned(),
+            amount_in_base_units: 100,
+            amount_out_minimum_base_units: 90,
+            deadline_unix_seconds: 3_000_000_000,
+        };
         let plan_id = opportunity.plan_id();
         let executor = ScriptedExecutor {
             results: Mutex::new(VecDeque::from([
@@ -4300,12 +4396,22 @@ mod tests {
                 result(-100, 990, 0, "cex:market-recovery"),
             ])),
         };
+        let limits = risk_limits(stop_file);
+        limits.entry_preflight.update_dex_pool_with_fee_generation(
+            "world-chain-usdc-wld",
+            0,
+            7,
+            9,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
         let (_handle, mut task, mut events) = live_trade_channel(
             &journal,
             executor,
             TelemetryHandle::disconnected_test_handle(),
             "test-engine".to_owned(),
-            risk_limits(stop_file),
+            limits,
         )
         .unwrap();
 

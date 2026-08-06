@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "artifact_id": "linea-usdc-usdt-lynex-p2-local",
+  "captured_at_utc": "2026-08-06T05:40:30Z",
+  "base_revision": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "measurement_scope": "p2_single_fee_algebra_v1_9_arithmetic_abi_and_curves_working_tree",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)"
+  },
+  "upstream_reference": {
+    "repository": "https://github.com/cryptoalgebra/AlgebraV1.9",
+    "revision": "779b5681395e2864ba6be9ff2adaa2870f6a600c",
+    "global_state_interface": "src/core/contracts/interfaces/pool/IAlgebraPoolState.sol",
+    "event_interface": "src/core/contracts/interfaces/pool/IAlgebraPoolEvents.sol",
+    "quoter_interface": "src/periphery/contracts/interfaces/IQuoter.sol",
+    "router_interface": "src/periphery/contracts/interfaces/ISwapRouter.sol"
+  },
+  "source_sha256": {
+    "src/dex/algebra_v1_9.rs": "66b038e4d1102af85f865f5e3551742c4e747bbe99d06a43eb8e721babc529f5",
+    "src/dex/clmm.rs": "8af2476af44d2609a7125afb5017e6d14b24a10cc55e35b0438b7bce9e0e9604",
+    "src/dex/calldata.rs": "1f78f44305e6a018fb190504301e202619eb027330c235beb6890cc5a2c635d6",
+    "src/dex/mod.rs": "cb4c69cca6b3e482d61547e15fad1b7aeb17b4f920d2c93bf7e1a81e87a0d8b3",
+    "docs/performance/linea-usdc-usdt-lynex-p1-local.json": "5b3215c8f06bf27887d55af98a445e08b1e308c2d5a711c474522b3040f698dd"
+  },
+  "correctness": {
+    "command": "scripts/quality.sh",
+    "lib_tests_discovered": 568,
+    "lib_tests_passed": 556,
+    "lib_tests_ignored": 12,
+    "failures": 0,
+    "new_p2_tests": 7,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "seven_word_global_state": "pass",
+    "single_fee_uint16_event": "pass",
+    "router_and_quoter_abi": "pass",
+    "adjacent_base_units_both_directions": "pass",
+    "all_prepared_boundaries_exact_in_and_exact_out": "pass",
+    "directional_and_single_fee_profiles_do_not_alias": "pass",
+    "gate": "pass"
+  },
+  "lynex_matched_provider_benchmark": {
+    "command": "cargo test --release benchmark_uniswap_and_lynex_single_fee_prepared_quote_and_build -- --ignored --nocapture --test-threads=1",
+    "control": "uniswap_v3",
+    "candidate": "lynex_algebra_v1_9",
+    "fee_pips": 50,
+    "tick_spacing": 1,
+    "rounds": 32,
+    "quote_iterations_per_provider": 8388608,
+    "curve_build_iterations_per_provider": 131072,
+    "maximum_ratio": 1.05,
+    "ratios": {
+      "prepared_exact_in_zero_for_one": { "p95": 1.0013176164316773, "p99": 0.8932868090643161 },
+      "prepared_exact_out_zero_for_one": { "p95": 1.0025147107255759, "p99": 1.0028073837403226 },
+      "curve_build_zero_for_one": { "p95": 1.0092691197794603, "p99": 1.0084284138748298 },
+      "prepared_exact_in_one_for_zero": { "p95": 0.9984357000034214, "p99": 1.000725904763199 },
+      "prepared_exact_out_one_for_zero": { "p95": 1.003294217931526, "p99": 1.0025147110615795 },
+      "curve_build_one_for_zero": { "p95": 0.9962992573943975, "p99": 0.9976041470311028 }
+    },
+    "worst_p95_ratio": 1.0092691197794603,
+    "worst_p99_ratio": 1.0084284138748298,
+    "gate": "pass"
+  },
+  "existing_paired_provider_controls": {
+    "successful_runs": 5,
+    "discarded_noisy_runs": 1,
+    "median_nanoseconds": {
+      "calldata_build": { "control_p95": 377.1263771057129, "control_p99": 380.8261528015137, "candidate_p95": 342.9811782836914, "candidate_p99": 344.86865997314453 },
+      "event_decode": { "control_p95": 8.583385467529297, "control_p99": 8.685111999511719, "candidate_p95": 8.87234878540039, "candidate_p99": 8.897144317626953 },
+      "receipt_proof": { "control_p95": 48.01527786254883, "control_p99": 48.41009521484375, "candidate_p95": 50.24385452270508, "candidate_p99": 50.34748458862305 },
+      "plan_materialization": { "control_p95": 72.58033752441406, "control_p99": 73.10676574707031, "candidate_p95": 72.46049118041992, "candidate_p99": 72.86612319946289 }
+    },
+    "worst_p2_to_p1_ratio": 1.0108824863584402,
+    "maximum_allowed_ratio": 1.05,
+    "gate": "pass"
+  },
+  "local_quote": {
+    "successful_runs": 5,
+    "nanoseconds_per_operation_median": {
+      "exact_in_no_cross_zero_for_one": 475.7,
+      "exact_in_no_cross_one_for_zero": 215.7,
+      "exact_out_no_cross_zero_for_one": 353.9,
+      "exact_out_no_cross_one_for_zero": 321.5,
+      "prepared_exact_in_no_cross_zero_for_one": 342.6,
+      "prepared_exact_in_no_cross_one_for_zero": 223.2,
+      "prepared_exact_out_no_cross_zero_for_one": 231.8,
+      "prepared_exact_out_no_cross_one_for_zero": 316.0,
+      "prepare_sparse_exact_input_curve": 12463.6,
+      "iterative_exact_out_above_sparse_capacity": 8086.4,
+      "prepared_exact_out_above_sparse_capacity": 31.5
+    },
+    "worst_p2_to_p1_ratio": 1.0194174757281553,
+    "maximum_allowed_ratio": 1.05,
+    "gate": "pass"
+  },
+  "capacity_replay": {
+    "successful_runs": 5,
+    "total_strategy_frames_per_run": 2000000,
+    "frames_per_second_median": 12907261,
+    "p2_to_p1_throughput_ratio": 0.9969511999668179,
+    "p2_to_p0_throughput_ratio": 1.012256788206392,
+    "decision_p95_ns_median": 42,
+    "decision_p99_ns_median": 42,
+    "decision_maximum_ns_worst": 21916,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "provider_parity_gate": "pass",
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "target_c4_measurement": "required_before_rollout",
+  "p2_gate": "pass"
+}

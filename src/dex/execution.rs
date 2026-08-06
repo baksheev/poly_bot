@@ -14,8 +14,9 @@ use crate::{
         rpc::{CanonicalBlock, JsonRpcClient, ReceiptLog, TransactionReceipt},
     },
     dex::events::{
-        CamelotFeeReceiptProof, PoolLocator, camelot_fee_topic, pancake_v3_swap_topic,
-        v3_swap_topic, v4_swap_topic,
+        AdaptiveFeeReceiptProof, CamelotFeeReceiptProof, LynexFeeReceiptProof, PoolLocator,
+        camelot_fee_topic, lynex_algebra_v1_9_fee_topic, pancake_v3_swap_topic, v3_swap_topic,
+        v4_swap_topic,
     },
     domain::compiled::CompiledNetworkGasPolicy,
     pretrade_cost::{
@@ -31,8 +32,9 @@ use crate::{
 };
 
 use super::calldata::{
-    camelot_v3_exact_input_single, decode_permit2_allowance, pancake_v3_exact_input_single,
-    permit2_allowance, permit2_approve, v3_exact_input, v4_exact_input_single,
+    camelot_v3_exact_input_single, decode_permit2_allowance, lynex_algebra_v1_9_exact_input_single,
+    pancake_v3_exact_input_single, permit2_allowance, permit2_approve, v3_exact_input,
+    v4_exact_input_single,
 };
 use super::pool_id::V4PoolKey;
 
@@ -54,6 +56,7 @@ const HISTORICAL_SWAP_GAS_LIMIT: u64 = 250_000;
 // observation when the immediate live path deliberately skips estimation;
 // only gas actually consumed is charged.
 const CAMELOT_V3_SWAP_GAS_LIMIT: u64 = 1_000_000;
+const LYNEX_ALGEBRA_V1_9_SWAP_GAS_LIMIT: u64 = 1_000_000;
 const RAILS_PERMIT2_APPROVAL_GAS_LIMIT: u64 = 120_000;
 const CAPITAL_TRANSFER_GAS_LIMIT: u64 = 200_000;
 const GAS_PRICE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -72,6 +75,7 @@ pub enum DexProtocol {
     UniswapV3,
     PancakeSwapV3,
     CamelotV3,
+    LynexAlgebraV1_9,
     UniswapV4,
 }
 
@@ -96,6 +100,7 @@ impl DexProtocol {
             Self::UniswapV3 => "uniswap_v3",
             Self::PancakeSwapV3 => "pancakeswap_v3",
             Self::CamelotV3 => "camelot_v3",
+            Self::LynexAlgebraV1_9 => "lynex_algebra_v1_9",
             Self::UniswapV4 => "uniswap_v4",
         }
     }
@@ -117,6 +122,10 @@ pub enum SwapRoute {
         router: Address,
         pool: Address,
     },
+    LynexAlgebraV1_9 {
+        router: Address,
+        pool: Address,
+    },
     V4 {
         router: Address,
         pool_key: V4PoolKey,
@@ -129,6 +138,7 @@ impl SwapRoute {
             Self::UniswapV3 { .. } => DexProtocol::UniswapV3,
             Self::PancakeSwapV3 { .. } => DexProtocol::PancakeSwapV3,
             Self::CamelotV3 { .. } => DexProtocol::CamelotV3,
+            Self::LynexAlgebraV1_9 { .. } => DexProtocol::LynexAlgebraV1_9,
             Self::V4 { .. } => DexProtocol::UniswapV4,
         }
     }
@@ -138,6 +148,7 @@ impl SwapRoute {
             Self::UniswapV3 { router, .. }
             | Self::PancakeSwapV3 { router, .. }
             | Self::CamelotV3 { router, .. }
+            | Self::LynexAlgebraV1_9 { router, .. }
             | Self::V4 { router, .. } => router,
         }
     }
@@ -202,6 +213,9 @@ impl ExactInputSwapRequest {
             SwapRoute::CamelotV3 { pool, .. } => {
                 ensure!(pool != Address::ZERO, "Camelot V3 pool is zero");
             }
+            SwapRoute::LynexAlgebraV1_9 { pool, .. } => {
+                ensure!(pool != Address::ZERO, "Lynex Algebra V1.9 pool is zero");
+            }
             SwapRoute::V4 { pool_key, .. } => {
                 ensure!(
                     pool_key.currency0 < pool_key.currency1,
@@ -254,18 +268,18 @@ pub struct SwapExecutionOutcome {
     pub l1_fee: u128,
     pub token_in_spent: U256,
     pub token_out_received: U256,
-    /// Camelot-only Fee event positionally preceding `settlement_log` in the
-    /// same successful transaction. Both are absent when the receipt cannot
-    /// provide a complete acceleration proof and the WebSocket mirror remains
-    /// the settlement fallback.
-    pub settlement_fee: Option<CamelotFeeReceiptProof>,
+    /// Provider-typed adaptive Algebra Fee event positionally preceding
+    /// `settlement_log` in the same successful transaction. Both are absent
+    /// when the receipt cannot provide a complete acceleration proof and the
+    /// WebSocket mirror remains the settlement fallback.
+    pub settlement_fee: Option<AdaptiveFeeReceiptProof>,
     pub settlement_log: Option<ChainLog>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ReceiptSettlementLogs {
-    fee: Option<CamelotFeeReceiptProof>,
-    swap: Option<ChainLog>,
+pub struct ReceiptSettlementLogs {
+    pub fee: Option<AdaptiveFeeReceiptProof>,
+    pub swap: Option<ChainLog>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,6 +359,12 @@ impl GasLimitPolicy {
                 default: CAMELOT_V3_SWAP_GAS_LIMIT,
                 additional,
             },
+            DexProtocol::LynexAlgebraV1_9 => Self {
+                multiplier: 2,
+                minimum: 0,
+                default: LYNEX_ALGEBRA_V1_9_SWAP_GAS_LIMIT,
+                additional,
+            },
             DexProtocol::UniswapV4 => Self {
                 multiplier: 4,
                 minimum: HISTORICAL_SWAP_GAS_LIMIT,
@@ -414,6 +434,7 @@ pub struct DexExecutor {
     gas_policy: CompiledNetworkGasPolicy,
     allowance_mutations_enabled: bool,
     camelot_submissions_enabled: bool,
+    lynex_submissions_enabled: bool,
     last_terminal_receipt: Option<TransactionReceipt>,
     receipt_heads: Option<watch::Receiver<CanonicalBlock>>,
     latency_telemetry: Option<ExecutionLatencyTelemetry>,
@@ -463,6 +484,7 @@ impl DexExecutor {
                 (&gas_policy, chain_id),
                 (CompiledNetworkGasPolicy::WorldChainV12 { .. }, 480)
                     | (CompiledNetworkGasPolicy::ArbitrumOne { .. }, 42_161)
+                    | (CompiledNetworkGasPolicy::LineaMainnet { .. }, 59_144)
             ),
             "DEX executor chain has no reviewed mutation fee policy"
         );
@@ -508,6 +530,7 @@ impl DexExecutor {
             gas_policy,
             allowance_mutations_enabled: true,
             camelot_submissions_enabled: false,
+            lynex_submissions_enabled: false,
             last_terminal_receipt: None,
             receipt_heads: None,
             latency_telemetry: None,
@@ -542,6 +565,7 @@ impl DexExecutor {
             CostTelemetryDexProtocol::UniswapV3,
             CostTelemetryDexProtocol::PancakeSwapV3,
             CostTelemetryDexProtocol::CamelotV3,
+            CostTelemetryDexProtocol::LynexAlgebraV1_9,
             CostTelemetryDexProtocol::UniswapV4,
         ] {
             let candidate = self
@@ -686,7 +710,10 @@ impl DexExecutor {
                 "DEX allowance amount is zero"
             );
             match requirement.protocol {
-                DexProtocol::UniswapV3 | DexProtocol::PancakeSwapV3 | DexProtocol::CamelotV3 => {
+                DexProtocol::UniswapV3
+                | DexProtocol::PancakeSwapV3
+                | DexProtocol::CamelotV3
+                | DexProtocol::LynexAlgebraV1_9 => {
                     self.ensure_erc20_allowance(
                         &format!(
                             "{}.{}-router-approval",
@@ -745,6 +772,21 @@ impl DexExecutor {
         Ok(())
     }
 
+    /// P6 keeps this gate closed. P8 may open it only after both exact Linea
+    /// token allowances to the reviewed Lynex router are prepared and locked.
+    pub fn enable_lynex_submissions_after_allowance_lock(&mut self) -> anyhow::Result<()> {
+        ensure!(
+            self.nonce_lane.chain_id() == 59_144,
+            "Lynex submission gate belongs only to the Linea nonce lane"
+        );
+        ensure!(
+            !self.allowance_mutations_enabled,
+            "Lynex submission cannot open before allowances are locked"
+        );
+        self.lynex_submissions_enabled = true;
+        Ok(())
+    }
+
     /// Runs only `eth_call` and `eth_estimateGas` against the exact locally
     /// built call. It never reserves a nonce, writes the journal, signs,
     /// broadcasts, or mutates an allowance.
@@ -800,11 +842,18 @@ impl DexExecutor {
                 "Camelot V3 broadcast is disabled until the direct-live allowance gate opens"
             );
         }
+        if protocol == DexProtocol::LynexAlgebraV1_9 && !request.reconciliation_only {
+            ensure!(
+                self.lynex_submissions_enabled,
+                "Lynex Algebra V1.9 broadcast is disabled until the direct-live allowance gate opens"
+            );
+        }
         let cost_route = DexRouteCostKey {
             pool: match request.route {
                 SwapRoute::UniswapV3 { pool, .. } => DexPoolCostKey::UniswapV3(pool),
                 SwapRoute::PancakeSwapV3 { pool, .. } => DexPoolCostKey::PancakeSwapV3(pool),
                 SwapRoute::CamelotV3 { pool, .. } => DexPoolCostKey::CamelotV3(pool),
+                SwapRoute::LynexAlgebraV1_9 { pool, .. } => DexPoolCostKey::LynexAlgebraV1_9(pool),
                 SwapRoute::V4 { pool_key, .. } => DexPoolCostKey::UniswapV4(pool_key.pool_id()),
             },
             token_in: request.token_in,
@@ -812,7 +861,10 @@ impl DexExecutor {
         if !request.reconciliation_only
             && matches!(
                 protocol,
-                DexProtocol::PancakeSwapV3 | DexProtocol::CamelotV3 | DexProtocol::UniswapV4
+                DexProtocol::PancakeSwapV3
+                    | DexProtocol::CamelotV3
+                    | DexProtocol::LynexAlgebraV1_9
+                    | DexProtocol::UniswapV4
             )
         {
             ensure!(
@@ -998,6 +1050,18 @@ impl DexExecutor {
             SwapRoute::CamelotV3 { router, .. } => {
                 self.ensure_erc20_allowance(
                     &format!("{}.camelot-v3-router-approval", request.operation_id),
+                    request.token_in,
+                    router,
+                    request.amount_in,
+                )
+                .await
+            }
+            SwapRoute::LynexAlgebraV1_9 { router, .. } => {
+                self.ensure_erc20_allowance(
+                    &format!(
+                        "{}.lynex-algebra-v1-9-router-approval",
+                        request.operation_id
+                    ),
                     request.token_in,
                     router,
                     request.amount_in,
@@ -1449,15 +1513,21 @@ impl DexExecutor {
     fn accounted_l1_fee(&self, receipt_l1_fee: u128) -> u128 {
         match self.gas_policy {
             CompiledNetworkGasPolicy::WorldChainV12 {
-                includes_l1_fee: true,
-                ..
-            } => receipt_l1_fee,
-            CompiledNetworkGasPolicy::ArbitrumOne {
-                includes_l1_fee: false,
-                ..
+                includes_l1_fee, ..
             }
-            | CompiledNetworkGasPolicy::ReadOnly => 0,
-            _ => receipt_l1_fee,
+            | CompiledNetworkGasPolicy::ArbitrumOne {
+                includes_l1_fee, ..
+            }
+            | CompiledNetworkGasPolicy::LineaMainnet {
+                includes_l1_fee, ..
+            } => {
+                if includes_l1_fee {
+                    receipt_l1_fee
+                } else {
+                    0
+                }
+            }
+            CompiledNetworkGasPolicy::ReadOnly => 0,
         }
     }
 
@@ -1496,9 +1566,13 @@ impl DexExecutor {
             CompiledNetworkGasPolicy::ArbitrumOne {
                 requires_fresh_rpc_gas_price: true,
                 ..
-            } => anyhow::bail!(
-                "fresh Arbitrum eth_gasPrice sample is unavailable; transaction fails closed"
-            ),
+            }
+            | CompiledNetworkGasPolicy::LineaMainnet {
+                requires_fresh_rpc_gas_price: true,
+                ..
+            } => {
+                anyhow::bail!("fresh eth_gasPrice sample is unavailable; transaction fails closed")
+            }
             _ => anyhow::bail!("network has no executable gas-price policy"),
         }
     }
@@ -1544,10 +1618,9 @@ impl DexExecutor {
                 }
                 (RAILS_FALLBACK_GAS_PRICE_WEI, GasPriceSource::RailsFallback)
             }
-            Ok(_) => anyhow::bail!("Arbitrum eth_gasPrice returned zero; no fallback is permitted"),
+            Ok(_) => anyhow::bail!("eth_gasPrice returned zero; no fallback is permitted"),
             Err(error) => {
-                return Err(error)
-                    .context("Arbitrum eth_gasPrice refresh failed; no fallback is permitted");
+                return Err(error).context("eth_gasPrice refresh failed; no fallback is permitted");
             }
         };
         self.gas_price = Some(GasPriceSample {
@@ -1582,6 +1655,7 @@ fn allowance_grant_for_policy(policy: &CompiledNetworkGasPolicy, required: U256)
     match policy {
         CompiledNetworkGasPolicy::WorldChainV12 { .. } => U256::MAX,
         CompiledNetworkGasPolicy::ArbitrumOne { .. } => required,
+        CompiledNetworkGasPolicy::LineaMainnet { .. } => U256::MAX,
         CompiledNetworkGasPolicy::ReadOnly => U256::ZERO,
     }
 }
@@ -1617,6 +1691,27 @@ fn transaction_fees_for_policy(
                 .context("Arbitrum maximum fee headroom overflow")?
                 / 10_000;
             Ok((maximum, 0))
+        }
+        CompiledNetworkGasPolicy::LineaMainnet {
+            requires_fresh_rpc_gas_price,
+            max_priority_fee_equals_gas_price,
+            max_fee_headroom_bps,
+            ..
+        } => {
+            ensure!(
+                *requires_fresh_rpc_gas_price && *max_priority_fee_equals_gas_price,
+                "reviewed Linea policy requires a fresh suggested gas price as priority fee"
+            );
+            ensure!(
+                (10_000..=15_000).contains(max_fee_headroom_bps),
+                "Linea maximum-fee headroom is outside the reviewed bounds"
+            );
+            let maximum = gas_price
+                .checked_mul(u128::from(*max_fee_headroom_bps))
+                .and_then(|scaled| scaled.checked_add(9_999))
+                .context("Linea maximum fee headroom overflow")?
+                / 10_000;
+            Ok((maximum, gas_price))
         }
         CompiledNetworkGasPolicy::ReadOnly => {
             anyhow::bail!("read-only network cannot construct transaction fees")
@@ -1661,6 +1756,14 @@ fn exact_input_calldata(
             request.amount_in,
             request.amount_out_minimum,
         ),
+        SwapRoute::LynexAlgebraV1_9 { .. } => lynex_algebra_v1_9_exact_input_single(
+            request.token_in,
+            request.token_out,
+            recipient,
+            request.deadline_unix_seconds,
+            request.amount_in,
+            request.amount_out_minimum,
+        ),
         SwapRoute::V4 { pool_key, .. } => v4_exact_input_single(
             pool_key,
             request.token_in == pool_key.currency0,
@@ -1681,7 +1784,7 @@ fn settlement_log_for_route(
     Ok(settlement_logs_for_route(receipt, route)?.swap)
 }
 
-fn settlement_logs_for_route(
+pub fn settlement_logs_for_route(
     receipt: &TransactionReceipt,
     route: SwapRoute,
 ) -> anyhow::Result<ReceiptSettlementLogs> {
@@ -1689,6 +1792,7 @@ fn settlement_logs_for_route(
         SwapRoute::UniswapV3 { pool, .. } => PoolLocator::V3(pool),
         SwapRoute::PancakeSwapV3 { pool, .. } => PoolLocator::PancakeV3(pool),
         SwapRoute::CamelotV3 { pool, .. } => PoolLocator::CamelotV3(pool),
+        SwapRoute::LynexAlgebraV1_9 { pool, .. } => PoolLocator::LynexAlgebraV1_9(pool),
         SwapRoute::V4 { pool_key, .. } => PoolLocator::V4(pool_key.pool_id()),
     };
     let mut matched_fee = None;
@@ -1705,6 +1809,7 @@ fn settlement_logs_for_route(
             PoolLocator::V3(pool)
                 | PoolLocator::PancakeV3(pool)
                 | PoolLocator::CamelotV3(pool)
+                | PoolLocator::LynexAlgebraV1_9(pool)
                 if receipt_log.address != pool
         ) {
             continue;
@@ -1720,15 +1825,36 @@ fn settlement_logs_for_route(
                 );
                 let position = receipt_log
                     .position
-                    .context("Camelot receipt Fee has no canonical position")?;
-                matched_fee = Some(CamelotFeeReceiptProof {
-                    pool: receipt_log.address,
-                    zero_for_one: u16::from_be_bytes([receipt_log.data[30], receipt_log.data[31]]),
-                    one_for_zero: u16::from_be_bytes([receipt_log.data[62], receipt_log.data[63]]),
-                    block_number: position.block_number,
-                    block_hash: position.block_hash,
-                    transaction_index: position.transaction_index,
-                    log_index: position.log_index,
+                    .context("adaptive Algebra receipt Fee has no canonical position")?;
+                matched_fee = Some(match expected {
+                    PoolLocator::CamelotV3(_) => {
+                        AdaptiveFeeReceiptProof::Camelot(CamelotFeeReceiptProof {
+                            pool: receipt_log.address,
+                            zero_for_one: u16::from_be_bytes([
+                                receipt_log.data[30],
+                                receipt_log.data[31],
+                            ]),
+                            one_for_zero: u16::from_be_bytes([
+                                receipt_log.data[62],
+                                receipt_log.data[63],
+                            ]),
+                            block_number: position.block_number,
+                            block_hash: position.block_hash,
+                            transaction_index: position.transaction_index,
+                            log_index: position.log_index,
+                        })
+                    }
+                    PoolLocator::LynexAlgebraV1_9(_) => {
+                        AdaptiveFeeReceiptProof::LynexAlgebraV1_9(LynexFeeReceiptProof {
+                            pool: receipt_log.address,
+                            fee: u16::from_be_bytes([receipt_log.data[30], receipt_log.data[31]]),
+                            block_number: position.block_number,
+                            block_hash: position.block_hash,
+                            transaction_index: position.transaction_index,
+                            log_index: position.log_index,
+                        })
+                    }
+                    _ => anyhow::bail!("static-fee route receipt contains an adaptive Fee event"),
                 });
             }
             ReceiptSettlementKind::Swap => {
@@ -1743,17 +1869,20 @@ fn settlement_logs_for_route(
             }
         }
     }
-    if matches!(expected, PoolLocator::CamelotV3(_)) {
+    if matches!(
+        expected,
+        PoolLocator::CamelotV3(_) | PoolLocator::LynexAlgebraV1_9(_)
+    ) {
         let (Some(fee), Some(swap)) = (matched_fee.take(), matched_swap.take()) else {
             return Ok(ReceiptSettlementLogs::default());
         };
         ensure!(
-            fee.pool == swap.address
-                && fee.block_number == swap.block_number
-                && fee.block_hash == swap.block_hash
-                && fee.transaction_index == swap.transaction_index
-                && fee.log_index < swap.log_index,
-            "Camelot receipt Fee is not positionally before Swap in one transaction"
+            fee.pool() == swap.address
+                && fee.block_number() == swap.block_number
+                && fee.block_hash() == swap.block_hash
+                && fee.transaction_index() == swap.transaction_index
+                && fee.log_index() < swap.log_index,
+            "adaptive Algebra receipt Fee is not positionally before Swap in one transaction"
         );
         return Ok(ReceiptSettlementLogs {
             fee: Some(fee),
@@ -1762,7 +1891,7 @@ fn settlement_logs_for_route(
     }
     ensure!(
         matched_fee.is_none(),
-        "static-fee route receipt contains a Camelot Fee event"
+        "static-fee route receipt contains an adaptive Algebra Fee event"
     );
     Ok(ReceiptSettlementLogs {
         fee: None,
@@ -1779,17 +1908,28 @@ fn receipt_settlement_kind(
     };
     ensure!(
         !matches!(expected, PoolLocator::V3(_))
-            || (signature != pancake_v3_swap_topic() && signature != camelot_fee_topic()),
+            || (signature != pancake_v3_swap_topic()
+                && signature != camelot_fee_topic()
+                && signature != lynex_algebra_v1_9_fee_topic()),
         "receipt event topic does not match its routed Uniswap V3 provider"
     );
     ensure!(
         !matches!(expected, PoolLocator::PancakeV3(_))
-            || (signature != v3_swap_topic() && signature != camelot_fee_topic()),
+            || (signature != v3_swap_topic()
+                && signature != camelot_fee_topic()
+                && signature != lynex_algebra_v1_9_fee_topic()),
         "receipt event topic does not match its routed Pancake V3 provider"
     );
     ensure!(
-        !matches!(expected, PoolLocator::CamelotV3(_)) || signature != pancake_v3_swap_topic(),
+        !matches!(expected, PoolLocator::CamelotV3(_))
+            || (signature != pancake_v3_swap_topic()
+                && signature != lynex_algebra_v1_9_fee_topic()),
         "receipt event topic does not match its routed Camelot V3 provider"
+    );
+    ensure!(
+        !matches!(expected, PoolLocator::LynexAlgebraV1_9(_))
+            || (signature != pancake_v3_swap_topic() && signature != camelot_fee_topic()),
+        "receipt event topic does not match its routed Lynex Algebra V1.9 provider"
     );
     match expected {
         PoolLocator::V3(_) if signature == v3_swap_topic() => {
@@ -1824,6 +1964,20 @@ fn receipt_settlement_kind(
             ensure!(log.data.len() == 5 * 32, "invalid Camelot Swap data length");
             Ok(Some(ReceiptSettlementKind::Swap))
         }
+        PoolLocator::LynexAlgebraV1_9(_) if signature == v3_swap_topic() => {
+            ensure!(log.topics.len() == 3, "invalid Lynex Swap topic count");
+            ensure!(log.data.len() == 5 * 32, "invalid Lynex Swap data length");
+            Ok(Some(ReceiptSettlementKind::Swap))
+        }
+        PoolLocator::LynexAlgebraV1_9(_) if signature == lynex_algebra_v1_9_fee_topic() => {
+            ensure!(log.topics.len() == 1, "invalid Lynex Fee topic count");
+            ensure!(log.data.len() == 32, "invalid Lynex Fee data length");
+            ensure!(
+                log.data[..30] == [0_u8; 30],
+                "Lynex Fee does not fit uint16"
+            );
+            Ok(Some(ReceiptSettlementKind::Fee))
+        }
         PoolLocator::V4(pool_id) if signature == v4_swap_topic() => {
             ensure!(log.topics.len() == 3, "invalid V4 Swap topic count");
             ensure!(log.data.len() == 6 * 32, "invalid V4 Swap data length");
@@ -1832,11 +1986,12 @@ fn receipt_settlement_kind(
         PoolLocator::V3(_)
         | PoolLocator::PancakeV3(_)
         | PoolLocator::CamelotV3(_)
+        | PoolLocator::LynexAlgebraV1_9(_)
         | PoolLocator::V4(_) => Ok(None),
     }
 }
 
-fn wallet_transfer_totals(
+pub fn wallet_transfer_totals(
     logs: &[ReceiptLog],
     token: Address,
     wallet: Address,
@@ -2371,14 +2526,18 @@ mod tests {
     use super::{
         CAMELOT_V3_SWAP_GAS_LIMIT, DexExecutionService, DexExecutionServiceError, DexExecutor,
         DexProtocol, EvmExecutionRequest, ExactInputSwapRequest, ExecuteCallPolicy, GasLimitPolicy,
-        MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy, allowance_grant_for_policy,
-        exact_input_calldata, is_definitive_prebroadcast_rejection, settlement_log_for_route,
-        settlement_logs_for_route, transaction_fees_for_policy, wallet_transfer_totals,
+        LYNEX_ALGEBRA_V1_9_SWAP_GAS_LIMIT, MAX_GAS_LIMIT, SwapRoute, SwapSubmissionPolicy,
+        allowance_grant_for_policy, exact_input_calldata, is_definitive_prebroadcast_rejection,
+        settlement_log_for_route, settlement_logs_for_route, transaction_fees_for_policy,
+        wallet_transfer_totals,
     };
     use crate::dex::pool_id::V4PoolKey;
     use crate::{
         chain::rpc::{JsonRpcClient, ReceiptLog, ReceiptLogPosition, TransactionReceipt},
-        dex::events::{camelot_fee_topic, pancake_v3_swap_topic, v3_swap_topic},
+        dex::events::{
+            AdaptiveFeeReceiptProof, LynexFeeReceiptProof, camelot_fee_topic,
+            lynex_algebra_v1_9_fee_topic, pancake_v3_swap_topic, v3_swap_topic,
+        },
         domain::compiled::CompiledNetworkGasPolicy,
         paired_benchmark::{assert_named_paired_non_regression, assert_paired_non_regression},
         wallet::{
@@ -2455,6 +2614,46 @@ mod tests {
         assert_ne!(
             transaction_fees_for_policy(&world, 12_345).unwrap(),
             (12_345, 0)
+        );
+    }
+
+    #[test]
+    fn linea_lynex_policy_is_typed_fail_closed_and_uses_the_exact_direct_call() {
+        let policy = CompiledNetworkGasPolicy::LineaMainnet {
+            requires_fresh_rpc_gas_price: true,
+            max_priority_fee_equals_gas_price: true,
+            max_fee_headroom_bps: 12_000,
+            includes_l1_fee: false,
+        };
+        assert_eq!(
+            transaction_fees_for_policy(&policy, 810_000_000).unwrap(),
+            (972_000_000, 810_000_000)
+        );
+        assert_eq!(allowance_grant_for_policy(&policy, U256::ONE), U256::MAX);
+        assert!(transaction_fees_for_policy(&policy, 0).is_err());
+
+        let request = ExactInputSwapRequest::with_rails_defaults(
+            "linea-lynex-read-only",
+            SwapRoute::LynexAlgebraV1_9 {
+                router: address!("3921e8cb45B17fC029A0a6dE958330ca4e583390"),
+                pool: address!("6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"),
+            },
+            address!("A219439258ca9da29e9cC4cE5596924745e12B93"),
+            address!("176211869cA2b568f2A7D4EE941E073a821EE1ff"),
+            U256::from(6_000_000_u64),
+            U256::from(5_900_000_u64),
+            1_900_000_002,
+        );
+        let recipient = Address::repeat_byte(0x59);
+        let calldata = exact_input_calldata(&request, recipient).unwrap();
+        assert_eq!(&calldata[..4], &[0xbc, 0x65, 0x11, 0x88]);
+        assert_eq!(calldata.len(), 4 + 7 * 32);
+        assert_eq!(&calldata[4 + 2 * 32 + 12..4 + 3 * 32], recipient.as_slice());
+        assert_eq!(
+            GasLimitPolicy::for_swap(DexProtocol::LynexAlgebraV1_9, 0)
+                .resolve_without_estimate(None)
+                .unwrap(),
+            LYNEX_ALGEBRA_V1_9_SWAP_GAS_LIMIT
         );
     }
 
@@ -2654,7 +2853,7 @@ mod tests {
             pool,
         };
         let proof = settlement_logs_for_route(&receipt, route).unwrap();
-        assert_eq!(proof.fee.as_ref().unwrap().log_index, 17);
+        assert_eq!(proof.fee.as_ref().unwrap().log_index(), 17);
         assert_eq!(proof.swap.as_ref().unwrap().log_index, 21);
         assert_eq!(
             wallet_transfer_totals(&receipt.logs, arb, wallet).unwrap(),
@@ -2673,6 +2872,84 @@ mod tests {
         assert_eq!(
             settlement_logs_for_route(&incomplete, route).unwrap(),
             super::ReceiptSettlementLogs::default()
+        );
+    }
+
+    #[test]
+    fn lynex_receipt_requires_one_typed_fee_positionally_before_swap() {
+        let pool = Address::repeat_byte(0x44);
+        let transaction_hash = B256::repeat_byte(0x55);
+        let block_hash = B256::repeat_byte(0x66);
+        let position = |log_index| {
+            Some(ReceiptLogPosition {
+                transaction_hash,
+                block_number: 123,
+                block_hash,
+                transaction_index: 7,
+                log_index,
+                removed: false,
+            })
+        };
+        let mut fee_data = vec![0_u8; 32];
+        fee_data[30..].copy_from_slice(&50_u16.to_be_bytes());
+        let mut swap_data = vec![0_u8; 5 * 32];
+        swap_data[95] = 1;
+        swap_data[112..128].copy_from_slice(&1_000_u128.to_be_bytes());
+        let fee_log = ReceiptLog {
+            address: pool,
+            topics: vec![lynex_algebra_v1_9_fee_topic()],
+            data: fee_data,
+            position: position(8),
+        };
+        let swap_log = ReceiptLog {
+            address: pool,
+            topics: vec![v3_swap_topic(), B256::ZERO, B256::ZERO],
+            data: swap_data,
+            position: position(9),
+        };
+        let receipt = |logs| TransactionReceipt {
+            transaction_hash,
+            block_number: 123,
+            status: 1,
+            gas_used: 90_000,
+            effective_gas_price: 1_000_000,
+            l1_fee: 0,
+            logs,
+        };
+        let route = SwapRoute::LynexAlgebraV1_9 {
+            router: Address::repeat_byte(0x33),
+            pool,
+        };
+
+        let proof =
+            settlement_logs_for_route(&receipt(vec![fee_log.clone(), swap_log.clone()]), route)
+                .unwrap();
+        assert_eq!(
+            proof.fee,
+            Some(AdaptiveFeeReceiptProof::LynexAlgebraV1_9(
+                LynexFeeReceiptProof {
+                    pool,
+                    fee: 50,
+                    block_number: 123,
+                    block_hash,
+                    transaction_index: 7,
+                    log_index: 8,
+                }
+            ))
+        );
+        assert_eq!(proof.swap.unwrap().log_index, 9);
+
+        assert_eq!(
+            settlement_logs_for_route(&receipt(vec![swap_log.clone()]), route).unwrap(),
+            super::ReceiptSettlementLogs::default()
+        );
+        let mut after_swap_fee = fee_log.clone();
+        after_swap_fee.position.as_mut().unwrap().log_index = 10;
+        assert!(
+            settlement_logs_for_route(&receipt(vec![swap_log, after_swap_fee]), route).is_err()
+        );
+        assert!(
+            settlement_logs_for_route(&receipt(vec![fee_log.clone(), fee_log]), route).is_err()
         );
     }
 
@@ -2821,15 +3098,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual release-mode paired Camelot/Uniswap receipt benchmark"]
-    fn benchmark_uniswap_and_camelot_v3_receipt_proof() {
+    #[ignore = "manual release-mode paired adaptive-Algebra/Uniswap receipt benchmark"]
+    fn benchmark_uniswap_and_adaptive_algebra_receipt_proof() {
         let pool = Address::repeat_byte(0x45);
         let token_in = Address::repeat_byte(0x02);
         let token_out = Address::repeat_byte(0x03);
         let wallet = Address::ZERO;
         let transfer_topic = keccak256("Transfer(address,address,uint256)");
-        let receipt = |camelot: bool| {
-            let transaction_hash = B256::repeat_byte(if camelot { 0x56 } else { 0x55 });
+        let receipt = |fee_topic: Option<(B256, usize)>, hash_byte| {
+            let transaction_hash = B256::repeat_byte(hash_byte);
             let position = |log_index| {
                 Some(ReceiptLogPosition {
                     transaction_hash,
@@ -2844,11 +3121,11 @@ mod tests {
             swap_data[95] = 1;
             swap_data[112..128].copy_from_slice(&1_000_u128.to_be_bytes());
             let mut logs = Vec::with_capacity(5);
-            if camelot {
+            if let Some((topic, words)) = fee_topic {
                 logs.push(ReceiptLog {
                     address: pool,
-                    topics: vec![camelot_fee_topic()],
-                    data: vec![0_u8; 2 * 32],
+                    topics: vec![topic],
+                    data: vec![0_u8; words * 32],
                     position: position(1),
                 });
             } else {
@@ -2885,14 +3162,19 @@ mod tests {
                 logs,
             }
         };
-        let uniswap = receipt(false);
-        let camelot = receipt(true);
+        let uniswap = receipt(None, 0x55);
+        let camelot = receipt(Some((camelot_fee_topic(), 2)), 0x56);
+        let lynex = receipt(Some((lynex_algebra_v1_9_fee_topic(), 1)), 0x57);
         let uniswap_route = SwapRoute::UniswapV3 {
             router: Address::repeat_byte(0x33),
             pool,
             fee_pips: 500,
         };
         let camelot_route = SwapRoute::CamelotV3 {
+            router: Address::repeat_byte(0x33),
+            pool,
+        };
+        let lynex_route = SwapRoute::LynexAlgebraV1_9 {
             router: Address::repeat_byte(0x33),
             pool,
         };
@@ -2910,6 +3192,22 @@ mod tests {
                 black_box(wallet_transfer_totals(&camelot.logs, token_in, wallet)).unwrap();
                 black_box(wallet_transfer_totals(&camelot.logs, token_out, wallet)).unwrap();
                 black_box(settlement_logs_for_route(&camelot, camelot_route)).unwrap();
+            },
+        );
+        assert_named_paired_non_regression(
+            "lynex_algebra_v1_9_receipt_accounting_and_proof_benchmark",
+            1.10,
+            "uniswap_v3",
+            "lynex_algebra_v1_9",
+            || {
+                black_box(wallet_transfer_totals(&uniswap.logs, token_in, wallet)).unwrap();
+                black_box(wallet_transfer_totals(&uniswap.logs, token_out, wallet)).unwrap();
+                black_box(settlement_logs_for_route(&uniswap, uniswap_route)).unwrap();
+            },
+            || {
+                black_box(wallet_transfer_totals(&lynex.logs, token_in, wallet)).unwrap();
+                black_box(wallet_transfer_totals(&lynex.logs, token_out, wallet)).unwrap();
+                black_box(settlement_logs_for_route(&lynex, lynex_route)).unwrap();
             },
         );
     }

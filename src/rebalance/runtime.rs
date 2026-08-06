@@ -49,6 +49,9 @@ const TRAVEL_RULE_REQUIRED_API_MODE: &str = "travel_rule_required_after_standard
 const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned";
 const UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY: Duration = Duration::from_secs(5);
 const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
+const LINEA_CHAIN_ID: u64 = 59_144;
+const LINEA_USDC: &str = "0x176211869cA2b568f2A7D4EE941E073a821EE1ff";
+const LINEA_USDT: &str = "0xA219439258ca9da29e9cC4cE5596924745e12B93";
 
 #[derive(Clone, Debug)]
 pub struct RebalanceRuntimeLimits {
@@ -63,10 +66,10 @@ impl RebalanceRuntimeLimits {
     fn maximum_for(&self, symbol: &str) -> anyhow::Result<Decimal> {
         let maximum = match symbol {
             "WLD" => self.maximum_wld,
-            "USDC" => self.maximum_usdc,
+            "USDC" | "USDT" => self.maximum_usdc,
             "ESP" => self.maximum_esp,
             "ARB" => self.maximum_arb,
-            _ => bail!("full rebalance executor only permits WLD, USDC, ESP, and ARB"),
+            _ => bail!("full rebalance executor only permits WLD, USDC, USDT, ESP, and ARB"),
         };
         ensure!(
             maximum > Decimal::ZERO,
@@ -120,7 +123,7 @@ struct RebalanceEvmExecutionOwner {
     transaction_journal: TransactionJournal,
     world_nonce: NonceLane,
     optimism_nonce: NonceLane,
-    arbitrum: Option<EvmExecutionOwnerHandle>,
+    direct_execution_owners: BTreeMap<u64, EvmExecutionOwnerHandle>,
 }
 
 impl RebalanceEvmExecutionOwner {
@@ -146,29 +149,31 @@ impl RebalanceEvmExecutionOwner {
         }
     }
 
-    async fn attach_arbitrum(
+    async fn attach_direct(
         &mut self,
         owner: EvmExecutionOwnerHandle,
         rpc: JsonRpcClient,
     ) -> anyhow::Result<()> {
+        let chain_id = owner.chain_id();
         ensure!(
-            owner.chain_id() == ARBITRUM_CHAIN_ID,
-            "shared Arbitrum EVM owner returned the wrong chain id"
+            matches!(chain_id, ARBITRUM_CHAIN_ID | 59_144),
+            "shared direct EVM owner returned an unapproved chain id"
         );
         ensure!(
             owner.wallet_address() == self.wallet.address(),
-            "shared Arbitrum EVM owner returned a different wallet"
+            "shared direct EVM owner returned a different wallet"
         );
         ensure!(
-            rpc.chain_id().await? == ARBITRUM_CHAIN_ID,
-            "shared Arbitrum read RPC returned the wrong chain id"
+            rpc.chain_id().await? == chain_id,
+            "shared direct read RPC returned the wrong chain id"
         );
         ensure!(
-            !self.direct_read_rpcs.contains_key(&ARBITRUM_CHAIN_ID) && self.arbitrum.is_none(),
-            "shared Arbitrum EVM owner was attached twice"
+            !self.direct_read_rpcs.contains_key(&chain_id)
+                && !self.direct_execution_owners.contains_key(&chain_id),
+            "shared direct EVM owner was attached twice"
         );
-        self.direct_read_rpcs.insert(ARBITRUM_CHAIN_ID, rpc);
-        self.arbitrum = Some(owner);
+        self.direct_read_rpcs.insert(chain_id, rpc);
+        self.direct_execution_owners.insert(chain_id, owner);
         Ok(())
     }
 
@@ -180,11 +185,8 @@ impl RebalanceEvmExecutionOwner {
         call: &WalletCall,
         timeout: Duration,
     ) -> anyhow::Result<B256> {
-        if chain_id == ARBITRUM_CHAIN_ID {
-            let receipt = self
-                .arbitrum
-                .as_ref()
-                .context("rebalance EVM owner has no shared Arbitrum execution lane")?
+        if let Some(owner) = self.direct_execution_owners.get(&chain_id) {
+            let receipt = owner
                 .execute(EvmExecutionRequest {
                     operation_id,
                     purpose: purpose.to_owned(),
@@ -213,16 +215,19 @@ impl RebalanceEvmExecutionOwner {
         .await
     }
 
-    async fn reconcile_arbitrum(
+    async fn reconcile_direct(
         &mut self,
+        chain_id: u64,
         operation_id: String,
         purpose: &str,
         call: &WalletCall,
         timeout: Duration,
     ) -> anyhow::Result<TransactionReceipt> {
-        self.arbitrum
-            .as_ref()
-            .context("rebalance EVM owner has no shared Arbitrum execution lane")?
+        self.direct_execution_owners
+            .get(&chain_id)
+            .with_context(|| {
+                format!("rebalance EVM owner has no shared execution lane for chain {chain_id}")
+            })?
             .reconcile(EvmExecutionRequest {
                 operation_id,
                 purpose: purpose.to_owned(),
@@ -245,7 +250,10 @@ impl std::fmt::Debug for RebalanceExecutor {
             .field("wallet", &self.evm.wallet_address())
             .field("world_nonce", &self.evm.nonce_state(WORLD_CHAIN_CHAIN_ID))
             .field("optimism_nonce", &self.evm.nonce_state(OPTIMISM_CHAIN_ID))
-            .field("arbitrum_shared_owner", &self.evm.arbitrum.is_some())
+            .field(
+                "direct_shared_owner_count",
+                &self.evm.direct_execution_owners.len(),
+            )
             .field("capital_policy", &self.capital_policy)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -415,7 +423,7 @@ impl RebalanceExecutor {
                 transaction_journal,
                 world_nonce,
                 optimism_nonce,
-                arbitrum: None,
+                direct_execution_owners: BTreeMap::new(),
             },
             limits,
             capital_policy: None,
@@ -444,7 +452,23 @@ impl RebalanceExecutor {
         owner: EvmExecutionOwnerHandle,
         rpc: JsonRpcClient,
     ) -> anyhow::Result<()> {
-        self.evm.attach_arbitrum(owner, rpc).await
+        ensure!(
+            owner.chain_id() == ARBITRUM_CHAIN_ID,
+            "shared Arbitrum EVM owner returned the wrong chain id"
+        );
+        self.evm.attach_direct(owner, rpc).await
+    }
+
+    pub async fn attach_linea_execution_owner(
+        &mut self,
+        owner: EvmExecutionOwnerHandle,
+        rpc: JsonRpcClient,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            owner.chain_id() == 59_144,
+            "shared Linea EVM owner returned the wrong chain id"
+        );
+        self.evm.attach_direct(owner, rpc).await
     }
 
     pub fn active_operation(&self) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
@@ -483,9 +507,28 @@ impl RebalanceExecutor {
     pub async fn reconcile_next_arbitrum_deposit_quarantine(
         &mut self,
     ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        self.reconcile_next_direct_deposit_quarantine(ARBITRUM_CHAIN_ID, "ARBITRUM")
+            .await
+    }
+
+    pub async fn reconcile_next_linea_deposit_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        self.reconcile_next_direct_deposit_quarantine(59_144, "LINEA")
+            .await
+    }
+
+    async fn reconcile_next_direct_deposit_quarantine(
+        &mut self,
+        expected_chain_id: u64,
+        expected_binance_network: &str,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
         let Some(operation) = self
             .execution_journal
-            .next_reconcilable_arbitrum_deposit_quarantine()?
+            .next_reconcilable_direct_deposit_quarantine(
+                expected_chain_id,
+                expected_binance_network,
+            )?
             .cloned()
         else {
             return Ok(None);
@@ -498,8 +541,8 @@ impl RebalanceExecutor {
             _ => unreachable!("reconcilable deposit quarantine must be direct"),
         };
         ensure!(
-            chain_id == ARBITRUM_CHAIN_ID,
-            "reconcilable deposit quarantine is not on Arbitrum"
+            chain_id == expected_chain_id && binance_network == expected_binance_network,
+            "reconcilable deposit quarantine is on the wrong direct network"
         );
         let address = self
             .trading_binance
@@ -512,7 +555,8 @@ impl RebalanceExecutor {
         )?;
         let receipt = self
             .evm
-            .reconcile_arbitrum(
+            .reconcile_direct(
+                chain_id,
                 format!("{}:deposit", operation.intent.operation_id),
                 "rebalance_wallet_to_binance",
                 &call,
@@ -521,10 +565,11 @@ impl RebalanceExecutor {
             .await?;
         ensure!(
             receipt.status == 1,
-            "reconciled Arbitrum rebalance deposit reverted"
+            "reconciled direct rebalance deposit reverted"
         );
-        let reconciled = self.execution_journal.record_reconciled_arbitrum_deposit(
+        let reconciled = self.execution_journal.record_reconciled_direct_deposit(
             &operation.intent.operation_id,
+            chain_id,
             receipt.transaction_hash,
         )?;
         tracing::warn!(
@@ -532,7 +577,7 @@ impl RebalanceExecutor {
             token = reconciled.intent.token_symbol,
             transaction_hash = %receipt.transaction_hash,
             block_number = receipt.block_number,
-            "reconciled quarantined Arbitrum deposit from the exact mined EVM transaction"
+            "reconciled quarantined direct deposit from the exact mined EVM transaction"
         );
         Ok(Some(reconciled))
     }
@@ -688,7 +733,7 @@ impl RebalanceExecutor {
             .intent
             .scope
             .as_ref()
-            .is_none_or(|scope| scope.network_id != "chain:42161")
+            .is_none_or(|scope| !matches!(scope.network_id.as_str(), "chain:42161" | "chain:59144"))
         {
             return;
         }
@@ -699,7 +744,7 @@ impl RebalanceExecutor {
             "rebalance_child",
             serde_json::json!({
                 "engine_id": telemetry.engine_id,
-                "strategy_id": "rebalance-arbitrum-usdc-esp",
+                "strategy_id": operation.intent.scope.as_ref().map(|scope| scope.strategy_id.as_str()),
                 "approval_session_id": operation.intent.approval_session_id,
                 "operation_id": operation.intent.operation_id,
                 "owner": "binance_capital",
@@ -1026,7 +1071,11 @@ impl RebalanceExecutor {
             requested <= self.limits.maximum_for(&request.token_symbol)?,
             "rebalance request exceeds the configured live maximum"
         );
-        if request.authority == super::RebalanceExecutionAuthority::ArbitrumFullLive {
+        if matches!(
+            request.authority,
+            super::RebalanceExecutionAuthority::ArbitrumFullLive
+                | super::RebalanceExecutionAuthority::LineaFullLive
+        ) {
             let policy = self
                 .capital_policy
                 .as_ref()
@@ -1107,7 +1156,10 @@ impl RebalanceExecutor {
             _ => unreachable!(),
         };
         ensure!(
-            matches!(chain_id, WORLD_CHAIN_CHAIN_ID | ARBITRUM_CHAIN_ID),
+            matches!(
+                chain_id,
+                WORLD_CHAIN_CHAIN_ID | ARBITRUM_CHAIN_ID | LINEA_CHAIN_ID
+            ),
             "direct rebalance target chain is not approved"
         );
         let withdrawal_submission_safe = created_here
@@ -1275,17 +1327,20 @@ impl RebalanceExecutor {
             _ => unreachable!(),
         };
         ensure!(
-            matches!(chain_id, WORLD_CHAIN_CHAIN_ID | ARBITRUM_CHAIN_ID),
+            matches!(
+                chain_id,
+                WORLD_CHAIN_CHAIN_ID | ARBITRUM_CHAIN_ID | LINEA_CHAIN_ID
+            ),
             "direct rebalance source chain is not approved"
         );
-        if chain_id == ARBITRUM_CHAIN_ID {
+        if matches!(chain_id, ARBITRUM_CHAIN_ID | LINEA_CHAIN_ID) {
             ensure!(
                 operation
                     .intent
                     .scope
                     .as_ref()
-                    .is_some_and(|scope| scope.network_id == "chain:42161"),
-                "Arbitrum wallet-to-Binance transfer lacks rebalance authority"
+                    .is_some_and(|scope| scope.network_id == format!("chain:{chain_id}")),
+                "direct wallet-to-Binance transfer lacks rebalance authority"
             );
         }
         if matches!(
@@ -3811,6 +3866,12 @@ fn token_on_chain(symbol: &str, chain_id: u64) -> anyhow::Result<Address> {
         ("USDC", ARBITRUM_CHAIN_ID) => {
             Address::from_str(ARBITRUM_USDC).context("approved Arbitrum USDC address is invalid")
         }
+        ("USDC", LINEA_CHAIN_ID) => {
+            Address::from_str(LINEA_USDC).context("approved Linea USDC address is invalid")
+        }
+        ("USDT", LINEA_CHAIN_ID) => {
+            Address::from_str(LINEA_USDT).context("approved Linea USDT address is invalid")
+        }
         ("USDC", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_USDC),
         ("USDC", WORLD_CHAIN_CHAIN_ID) => Ok(WORLD_CHAIN_USDC),
         ("WLD", OPTIMISM_CHAIN_ID) => Ok(OPTIMISM_WLD),
@@ -3876,6 +3937,14 @@ fn validate_approved_asset(
         ("ARB", ARBITRUM_CHAIN_ID) => (
             18,
             Address::from_str(ARBITRUM_ARB).context("approved Arbitrum ARB address is invalid")?,
+        ),
+        ("USDC", LINEA_CHAIN_ID) => (
+            6,
+            Address::from_str(LINEA_USDC).context("approved Linea USDC address is invalid")?,
+        ),
+        ("USDT", LINEA_CHAIN_ID) => (
+            6,
+            Address::from_str(LINEA_USDT).context("approved Linea USDT address is invalid")?,
         ),
         _ => bail!("rebalance token is not approved on chain {chain_id}"),
     };
@@ -4088,15 +4157,15 @@ mod tests {
     };
 
     use super::{
-        ARBITRUM_CHAIN_ID, WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD,
-        WithdrawalAbsenceEvidence, account_asset_balance_or_zero, base_units_to_decimal,
-        current_required_withdrawal, decimal_to_base_units, decimal_to_base_units_floor,
-        deposit_questionnaire_chain_id, matches_travel_rule_record_identity_without_client_id,
-        merge_travel_rule_withdrawal_detail, reconcile_approved_travel_rule_rejection,
-        route_wallet_chain_id, shared_evm_confirmation_timeout, validate_across_fill_receipt,
-        validate_approved_asset, validate_direct_withdrawal_receipt,
-        verified_self_owned_evm_address_record, withdrawal_received_base_units,
-        withdrawal_requested_base_units, withdrawal_retry_is_stale,
+        ARBITRUM_CHAIN_ID, LINEA_CHAIN_ID, LINEA_USDC, LINEA_USDT, WORLD_CHAIN_CHAIN_ID,
+        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, WithdrawalAbsenceEvidence,
+        account_asset_balance_or_zero, base_units_to_decimal, current_required_withdrawal,
+        decimal_to_base_units, decimal_to_base_units_floor, deposit_questionnaire_chain_id,
+        matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
+        reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
+        shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
+        validate_direct_withdrawal_receipt, verified_self_owned_evm_address_record,
+        withdrawal_received_base_units, withdrawal_requested_base_units, withdrawal_retry_is_stale,
     };
 
     #[test]
@@ -4426,6 +4495,16 @@ mod tests {
             validate_approved_asset("USDT", 6, Address::repeat_byte(1), WORLD_CHAIN_CHAIN_ID)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn permits_only_exact_linea_stablecoin_metadata() {
+        let usdc = Address::from_str(LINEA_USDC).unwrap();
+        let usdt = Address::from_str(LINEA_USDT).unwrap();
+        validate_approved_asset("USDC", 6, usdc, LINEA_CHAIN_ID).unwrap();
+        validate_approved_asset("USDT", 6, usdt, LINEA_CHAIN_ID).unwrap();
+        assert!(validate_approved_asset("USDT", 18, usdt, LINEA_CHAIN_ID).is_err());
+        assert!(validate_approved_asset("USDC", 6, usdt, LINEA_CHAIN_ID).is_err());
     }
 
     #[test]

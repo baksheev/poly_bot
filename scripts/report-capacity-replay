@@ -27,9 +27,10 @@ jq -e \
     and .mode == "capacity_replay_only"
     and .pair_count == 20
     and .pool_count == 25
-    and .provider_pool_counts.uniswap_v3 == 23
+    and .provider_pool_counts.uniswap_v3 == 22
     and .provider_pool_counts.pancakeswap_v3 == 1
     and .provider_pool_counts.camelot_v3 == 1
+    and .provider_pool_counts.lynex_algebra_v1_9 == 1
     and .frames_per_pair >= 100000
     and .total_strategy_frames == (.pair_count * .frames_per_pair)
     and .reconnect_bursts >= 4

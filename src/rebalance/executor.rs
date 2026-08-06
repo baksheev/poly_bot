@@ -47,6 +47,7 @@ pub struct RebalanceExecutionRequest {
 pub enum RebalanceExecutionAuthority {
     WorldChainV12,
     ArbitrumFullLive,
+    LineaFullLive,
 }
 
 impl RebalanceExecutionAuthority {
@@ -54,6 +55,7 @@ impl RebalanceExecutionAuthority {
         match self {
             Self::WorldChainV12 => "rebalance-world-chain-v12",
             Self::ArbitrumFullLive => "rebalance-arbitrum-usdc-esp",
+            Self::LineaFullLive => "rebalance-linea-usdt-usdc",
         }
     }
 }
@@ -486,6 +488,14 @@ impl RebalanceExecutionJournal {
     pub fn next_reconcilable_arbitrum_deposit_quarantine(
         &self,
     ) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
+        self.next_reconcilable_direct_deposit_quarantine(42_161, "ARBITRUM")
+    }
+
+    pub fn next_reconcilable_direct_deposit_quarantine(
+        &self,
+        expected_chain_id: u64,
+        expected_binance_network: &str,
+    ) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
         if self.active_operation()?.is_some() {
             return Ok(None);
         }
@@ -498,9 +508,10 @@ impl RebalanceExecutionJournal {
                 && matches!(
                     &operation.intent.route,
                     Route::Direct {
-                        chain_id: 42_161,
+                        chain_id,
                         binance_network,
-                    } if binance_network == "ARBITRUM"
+                    } if *chain_id == expected_chain_id
+                        && binance_network == expected_binance_network
                 )
                 && self
                     .progress_before_quarantine
@@ -541,6 +552,15 @@ impl RebalanceExecutionJournal {
         operation_id: &str,
         transaction_hash: B256,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
+        self.record_reconciled_direct_deposit(operation_id, 42_161, transaction_hash)
+    }
+
+    pub fn record_reconciled_direct_deposit(
+        &mut self,
+        operation_id: &str,
+        chain_id: u64,
+        transaction_hash: B256,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
         let current = self
             .operations
             .get(operation_id)
@@ -548,15 +568,15 @@ impl RebalanceExecutionJournal {
         ensure!(
             self.progress_before_quarantine.get(operation_id)
                 == Some(&RebalanceExecutionProgress::IntentRecorded),
-            "reconciled Arbitrum deposit quarantine did not follow an exact recorded intent"
+            "reconciled direct deposit quarantine did not follow an exact recorded intent"
         );
         let progress = RebalanceExecutionProgress::DepositTransferMined {
-            chain_id: 42_161,
+            chain_id,
             transaction_hash,
         };
         ensure!(
-            reconciled_arbitrum_deposit_transition(&current.intent, &current.progress, &progress,),
-            "rebalance quarantine is not an approved reconciled Arbitrum deposit"
+            reconciled_direct_deposit_transition(&current.intent, &current.progress, &progress,),
+            "rebalance quarantine is not an approved reconciled direct deposit"
         );
         let next = RebalanceExecutionOperation {
             intent: current.intent.clone(),
@@ -704,12 +724,9 @@ impl RebalanceExecutionJournal {
     pub fn rebalance_risk(&self, approval_session_id: &str) -> anyhow::Result<RebalanceRisk> {
         let mut risk = RebalanceRisk::default();
         for operation in self.operations.values().filter(|operation| {
-            operation
-                .intent
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.network_id == "chain:42161")
-                && operation.intent.approval_session_id.as_deref() == Some(approval_session_id)
+            operation.intent.scope.as_ref().is_some_and(|scope| {
+                matches!(scope.network_id.as_str(), "chain:42161" | "chain:59144")
+            }) && operation.intent.approval_session_id.as_deref() == Some(approval_session_id)
         }) {
             risk.transfer_count = risk
                 .transfer_count
@@ -724,11 +741,10 @@ impl RebalanceExecutionJournal {
             let total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_debit,
                 "ESP" => &mut risk.token_b_debit,
-                "ARB" => risk
+                symbol => risk
                     .additional_token_debit
-                    .entry("ARB".to_owned())
+                    .entry(symbol.to_owned())
                     .or_insert(U256::ZERO),
-                _ => anyhow::bail!("rebalance journal contains an unapproved asset"),
             };
             *total = total
                 .checked_add(operation.intent.amount)
@@ -744,11 +760,10 @@ impl RebalanceExecutionJournal {
             let fee_total = match operation.intent.token_symbol.as_str() {
                 "USDC" => &mut risk.token_a_maximum_fee,
                 "ESP" => &mut risk.token_b_maximum_fee,
-                "ARB" => risk
+                symbol => risk
                     .additional_token_maximum_fee
-                    .entry("ARB".to_owned())
+                    .entry(symbol.to_owned())
                     .or_insert(U256::ZERO),
-                _ => unreachable!("asset was validated above"),
             };
             *fee_total = fee_total
                 .checked_add(maximum_fee)
@@ -773,12 +788,9 @@ impl RebalanceExecutionJournal {
         self.operations
             .values()
             .filter(|operation| {
-                operation
-                    .intent
-                    .scope
-                    .as_ref()
-                    .is_some_and(|scope| scope.network_id == "chain:42161")
-                    && operation.intent.approval_session_id.as_deref() == Some(approval_session_id)
+                operation.intent.scope.as_ref().is_some_and(|scope| {
+                    matches!(scope.network_id.as_str(), "chain:42161" | "chain:59144")
+                }) && operation.intent.approval_session_id.as_deref() == Some(approval_session_id)
             })
             .max_by_key(|operation| {
                 (
@@ -1082,6 +1094,13 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
                 binance_network,
             },
         ) => binance_network == "ARBITRUM",
+        (
+            RebalanceExecutionAuthority::LineaFullLive,
+            Route::Direct {
+                chain_id: 59_144,
+                binance_network,
+            },
+        ) => binance_network == "LINEA",
         _ => false,
     };
     ensure!(
@@ -1089,14 +1108,20 @@ fn validate_request(request: &RebalanceExecutionRequest) -> anyhow::Result<()> {
         "rebalance execution authority does not own the selected route"
     );
     ensure!(
-        (request.authority == RebalanceExecutionAuthority::ArbitrumFullLive)
-            == (request.maximum_fee.is_some() && request.approval_session_id.is_some()),
-        "only Arbitrum production rebalance requests carry fee and approval-session authority"
+        matches!(
+            request.authority,
+            RebalanceExecutionAuthority::ArbitrumFullLive
+                | RebalanceExecutionAuthority::LineaFullLive
+        ) == (request.maximum_fee.is_some() && request.approval_session_id.is_some()),
+        "only direct production rebalance requests carry fee and approval-session authority"
     );
     ensure!(
-        request.authority == RebalanceExecutionAuthority::ArbitrumFullLive
-            || (request.maximum_fee.is_none() && request.approval_session_id.is_none()),
-        "non-Arbitrum rebalance request carries Arbitrum production authority"
+        matches!(
+            request.authority,
+            RebalanceExecutionAuthority::ArbitrumFullLive
+                | RebalanceExecutionAuthority::LineaFullLive
+        ) || (request.maximum_fee.is_none() && request.approval_session_id.is_none()),
+        "non-production rebalance request carries direct production authority"
     );
     if let Some(maximum_fee) = request.maximum_fee {
         ensure!(
@@ -1213,11 +1238,10 @@ fn validate_operation(operation: &RebalanceExecutionOperation) -> anyhow::Result
             "rebalance canary Binance withdrawal maximum fee is zero"
         );
         ensure!(
-            intent
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.network_id == "chain:42161"),
-            "Arbitrum rebalance fee authority has the wrong journal scope"
+            intent.scope.as_ref().is_some_and(|scope| {
+                matches!(scope.network_id.as_str(), "chain:42161" | "chain:59144")
+            }),
+            "direct rebalance fee authority has the wrong journal scope"
         );
         if let Some(approval_session_id) = intent.approval_session_id.as_deref() {
             ensure!(
@@ -1313,7 +1337,7 @@ fn across_fill_timeout_quarantine(reason: &str) -> bool {
     reason == "timed out waiting for Across fill"
 }
 
-fn reconciled_arbitrum_deposit_transition(
+fn reconciled_direct_deposit_transition(
     intent: &RebalanceExecutionIntent,
     previous: &RebalanceExecutionProgress,
     next: &RebalanceExecutionProgress,
@@ -1322,16 +1346,20 @@ fn reconciled_arbitrum_deposit_transition(
         (&intent.route, intent.direction, previous, next),
         (
             Route::Direct {
-                chain_id: 42_161,
+                chain_id,
                 binance_network,
             },
             Direction::WalletToBinance,
             RebalanceExecutionProgress::Quarantined { reason },
             RebalanceExecutionProgress::DepositTransferMined {
-                chain_id: 42_161,
+                chain_id: mined_chain_id,
                 transaction_hash,
             },
-        ) if binance_network == "ARBITRUM"
+        ) if matches!(
+                (*chain_id, binance_network.as_str()),
+                (42_161, "ARBITRUM") | (59_144, "LINEA")
+            )
+            && chain_id == mined_chain_id
             && reason.starts_with("DEX outcome unknown:")
             && *transaction_hash != B256::ZERO
     )
@@ -1432,7 +1460,7 @@ fn validate_transition(
             RebalanceExecutionProgress::IntentRecorded,
         ) if reason
             == "rebalance intent has no indexed Binance master transfer; operator review required"
-    ) || reconciled_arbitrum_deposit_transition(
+    ) || reconciled_direct_deposit_transition(
         intent, previous, next,
     ) || reconciled_across_fill_transition(intent, previous, next)
         || matches!(previous, RebalanceExecutionProgress::Quarantined { reason }
@@ -2301,6 +2329,67 @@ mod tests {
             binance_network: "ARBITRUM".to_owned(),
             chain_id: 42_161,
         }
+    }
+
+    fn direct_linea() -> Route {
+        Route::Direct {
+            binance_network: "LINEA".to_owned(),
+            chain_id: 59_144,
+        }
+    }
+
+    #[test]
+    fn linea_full_live_scope_risk_and_unknown_deposit_reconciliation_are_typed() {
+        let path = path("linea-full-live-direct");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let mut request = request(Direction::WalletToBinance, direct_linea());
+        request.authority = RebalanceExecutionAuthority::LineaFullLive;
+        request.token_symbol = "USDT".to_owned();
+        request.maximum_fee = Some(U256::ZERO);
+        request.approval_session_id = Some("esp-usdc-arbitrum-full-live".to_owned());
+        let operation = journal.reserve(&request).unwrap();
+        let scope = operation.intent.scope.as_ref().unwrap();
+        assert_eq!(scope.network_id, "chain:59144");
+        assert_eq!(scope.strategy_id, "rebalance-linea-usdt-usdc");
+
+        let risk = journal
+            .rebalance_risk("esp-usdc-arbitrum-full-live")
+            .unwrap();
+        assert_eq!(risk.active_transfer_count, 1);
+        assert_eq!(risk.additional_token_debit["USDT"], request.action.amount);
+
+        journal
+            .advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "DEX outcome unknown: timed out".to_owned(),
+                },
+            )
+            .unwrap();
+        let quarantined = journal
+            .next_reconcilable_direct_deposit_quarantine(59_144, "LINEA")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            quarantined.intent.operation_id,
+            operation.intent.operation_id
+        );
+        let reconciled = journal
+            .record_reconciled_direct_deposit(
+                &operation.intent.operation_id,
+                59_144,
+                B256::repeat_byte(0x59),
+            )
+            .unwrap();
+        assert!(matches!(
+            reconciled.progress,
+            RebalanceExecutionProgress::DepositTransferMined {
+                chain_id: 59_144,
+                ..
+            }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
     }
 
     fn advance_to_across_deposit(

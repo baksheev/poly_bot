@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "stage": "P6_disabled_executor_calldata_gas_allowance_and_journals",
+  "captured_at_utc": "2026-08-06T07:16:30Z",
+  "repository_head": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "environment": {
+    "os": "Darwin 25.3.0 arm64",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)",
+    "profile": "release fat-LTO codegen-units=1",
+    "production_target_required": "c4-highcpu-8"
+  },
+  "read_only_execution_evidence": {
+    "chain_id": 59144,
+    "router": "0x3921e8cb45B17fC029A0a6dE958330ca4e583390",
+    "pool": "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b",
+    "selector": "0xbc651188",
+    "block_number": 28694095,
+    "block_hash": "0x46bda9a8412b54375a839207138e2aa843bf977894956280da9a07678b71e503",
+    "parent_hash": "0x256837e35f0b9bfc9cc5edb6f163ba1aff5f40e1532e298001847b561950b84b",
+    "sender": "0xd82def4400793894fb175f3b1ba6e4402c92c98c",
+    "amount_in_base_units": 6000000,
+    "directions": [
+      {
+        "token_in": "USDT",
+        "token_out": "USDC",
+        "eth_call_amount_out": 5995292,
+        "eth_estimate_gas": 311190
+      },
+      {
+        "token_in": "USDC",
+        "token_out": "USDT",
+        "eth_call_amount_out": 6004110,
+        "eth_estimate_gas": 315170
+      }
+    ],
+    "signing": false,
+    "broadcast": false,
+    "allowance_mutation": false,
+    "external_mutations": 0
+  },
+  "linea_fee_policy_evidence": {
+    "transaction_hash": "0x2af4f98a942fc5d1acb6c0fbd16e78e472719c11d13530042bf8a2a49fda48ab",
+    "transaction_type": 2,
+    "gas_price_wei": 36213382,
+    "max_fee_per_gas_wei": 36213382,
+    "max_priority_fee_per_gas_wei": 36213375,
+    "gas_used": 831878,
+    "effective_gas_price_wei": 36213382,
+    "additional_receipt_l1_fee_wei": 0,
+    "compiled_policy": "linea_mainnet_fresh_eth_gasPrice_2s_cache_fail_closed_12000bps_headroom"
+  },
+  "paired_plan_benchmark": {
+    "control": "uniswap_v3",
+    "candidate": "lynex_algebra_v1_9",
+    "rounds": 32,
+    "iterations_per_provider": 8388608,
+    "control_p95_ns": 89.88030624389648,
+    "candidate_p95_ns": 77.98496627807617,
+    "p95_ratio": 0.8676535443310409,
+    "control_p99_ns": 106.9242172241211,
+    "candidate_p99_ns": 81.47223663330078,
+    "p99_ratio": 0.7619624323508389,
+    "maximum_ratio": 1.1,
+    "gate": "pass"
+  },
+  "paired_calldata_benchmark": {
+    "control": "uniswap_v3",
+    "candidate": "lynex_algebra_v1_9",
+    "rounds": 32,
+    "iterations_per_provider": 8388608,
+    "control_p95_ns": 388.9519386291504,
+    "candidate_p95_ns": 364.87706756591797,
+    "p95_ratio": 0.9381032238890913,
+    "control_p99_ns": 389.3944435119629,
+    "candidate_p99_ns": 365.6438179016113,
+    "p99_ratio": 0.9390062544392165,
+    "maximum_ratio": 1.1,
+    "gate": "pass"
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P5-control then P6-candidate binary runs",
+    "total_strategy_frames_per_binary_per_pair": 2000000,
+    "p5_binary_sha256": "a6408e5e7cde706b73f9c7c98c1877c3a7668da45b2c7a5af70868873cb7c2aa",
+    "p6_binary_sha256": "26c9fd1bbd493e2a3d0c98f35fdfd82fa1047a7b42b91010c9cf42ce88fc3243",
+    "p5_frames_per_second": [9978359, 10011039, 9853838, 9544735, 9540167],
+    "p6_frames_per_second": [12086694, 13616623, 13443788, 13585637, 13596285],
+    "p5_frames_per_second_median": 9853838,
+    "p6_frames_per_second_median": 13585637,
+    "p6_to_p5_throughput_ratio": 1.378715278249957,
+    "p6_to_frozen_p0_throughput_ratio": 1.0654586806106985,
+    "p5_decision_p95_ns_median": 84,
+    "p6_decision_p95_ns_median": 42,
+    "p5_decision_p99_ns_median": 84,
+    "p6_decision_p99_ns_median": 42,
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "rejected_performance_cohorts": [
+    {
+      "reason": "fat-LTO stopped inlining the unchanged single-symbol dispatch after P6 code growth",
+      "observed_p6_to_p5_throughput_ratio": 0.81,
+      "accepted": false,
+      "remediation": "forced the existing lookup/dispatch leaf functions inline and added an exact-one-route fast path preserving the multi-route fallback and dependency-fault semantics"
+    },
+    {
+      "reason": "inline-only remediation restored latency but one diagnostic pair remained below throughput gate",
+      "observed_p6_to_p5_throughput_ratio": 0.944,
+      "accepted": false,
+      "remediation": "added the exact-one-route fast path and reran five interleaved pairs"
+    }
+  ],
+  "result": "pass"
+}

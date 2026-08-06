@@ -38,12 +38,20 @@ pub struct ClmmPool {
     ticks: HashMap<i32, TickLiquidity>,
     word_boundary_sqrt_ratios: Arc<HashMap<i32, U256>>,
     tick_traversal: TickTraversal,
+    fee_profile: FeeProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TickTraversal {
     SpacingCompressed,
     AlgebraRaw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeeProfile {
+    Static,
+    AlgebraDirectional,
+    AlgebraSingle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +123,7 @@ impl ClmmPool {
             sqrt_price_x96,
             tick,
             liquidity,
-            TickTraversal::SpacingCompressed,
+            FeeProfile::Static,
         )
     }
 
@@ -136,7 +144,28 @@ impl ClmmPool {
             sqrt_price_x96,
             tick,
             liquidity,
-            TickTraversal::AlgebraRaw,
+            FeeProfile::AlgebraDirectional,
+        )
+    }
+
+    /// Constructs the seven-word, single-fee Algebra V1.9 profile used by the
+    /// reviewed Lynex deployment. Both directions consume the same uint16 fee;
+    /// directional fee updates are rejected for this profile.
+    pub fn new_single_fee_algebra_v1_9(
+        fee_pips: u16,
+        tick_spacing: i32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        liquidity: u128,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_profile(
+            u32::from(fee_pips),
+            u32::from(fee_pips),
+            tick_spacing,
+            sqrt_price_x96,
+            tick,
+            liquidity,
+            FeeProfile::AlgebraSingle,
         )
     }
 
@@ -147,7 +176,7 @@ impl ClmmPool {
         sqrt_price_x96: U256,
         tick: i32,
         liquidity: u128,
-        tick_traversal: TickTraversal,
+        fee_profile: FeeProfile,
     ) -> anyhow::Result<Self> {
         ensure!(
             fee_zero_for_one_pips < 1_000_000 && fee_one_for_zero_pips < 1_000_000,
@@ -163,6 +192,10 @@ impl ClmmPool {
             "sqrt price is out of range"
         );
         ensure!(liquidity > 0, "active liquidity must be positive");
+        let tick_traversal = match fee_profile {
+            FeeProfile::Static => TickTraversal::SpacingCompressed,
+            FeeProfile::AlgebraDirectional | FeeProfile::AlgebraSingle => TickTraversal::AlgebraRaw,
+        };
 
         Ok(Self {
             fee_pips: fee_zero_for_one_pips,
@@ -175,6 +208,7 @@ impl ClmmPool {
             ticks: HashMap::new(),
             word_boundary_sqrt_ratios: word_boundary_sqrt_ratios(tick_spacing, tick_traversal)?,
             tick_traversal,
+            fee_profile,
         })
     }
 
@@ -197,8 +231,9 @@ impl ClmmPool {
         fee_one_for_zero_pips: u32,
     ) -> anyhow::Result<()> {
         ensure!(
-            self.tick_traversal == TickTraversal::AlgebraRaw,
-            "directional fees require an Algebra V1.9 pool"
+            self.tick_traversal == TickTraversal::AlgebraRaw
+                && self.fee_profile == FeeProfile::AlgebraDirectional,
+            "directional fees require the directional Algebra V1.9 profile"
         );
         ensure!(
             fee_zero_for_one_pips < 1_000_000 && fee_one_for_zero_pips < 1_000_000,
@@ -206,6 +241,18 @@ impl ClmmPool {
         );
         self.fee_pips = fee_zero_for_one_pips;
         self.one_for_zero_fee_pips = fee_one_for_zero_pips;
+        Ok(())
+    }
+
+    pub fn set_algebra_single_fee(&mut self, fee_pips: u16) -> anyhow::Result<()> {
+        ensure!(
+            self.tick_traversal == TickTraversal::AlgebraRaw
+                && self.fee_profile == FeeProfile::AlgebraSingle,
+            "single fee requires the single-fee Algebra V1.9 profile"
+        );
+        let fee_pips = u32::from(fee_pips);
+        self.fee_pips = fee_pips;
+        self.one_for_zero_fee_pips = fee_pips;
         Ok(())
     }
 
@@ -1284,6 +1331,99 @@ mod tests {
     }
 
     #[test]
+    fn single_fee_algebra_preserves_both_directions_and_every_prepared_boundary() {
+        let mut pool = ClmmPool::new_single_fee_algebra_v1_9(
+            50,
+            1,
+            get_sqrt_ratio_at_tick(8).unwrap(),
+            8,
+            1_000_000_000_000,
+        )
+        .unwrap();
+        for (tick, net) in [
+            (-2, 500_000_000_i128),
+            (-1, 500_000_000_i128),
+            (10, -500_000_000_i128),
+            (11, -500_000_000_i128),
+        ] {
+            pool.set_tick(tick, net.unsigned_abs(), net).unwrap();
+        }
+        assert_eq!(pool.directional_fee_pips(), (50, 50));
+        assert!(pool.set_algebra_directional_fees(50, 51).is_err());
+
+        let maximum = U256::from(200_000_000_u64);
+        for zero_for_one in [true, false] {
+            let exact_in = pool
+                .prepare_exact_input_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let exact_out = pool
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            for amount in [
+                U256::ONE,
+                U256::from(2_u8),
+                U256::from(5_999_999_u64),
+                U256::from(6_000_000_u64),
+                U256::from(6_000_001_u64),
+                U256::from(49_999_999_u64),
+                U256::from(50_000_000_u64),
+                U256::from(50_000_001_u64),
+                maximum - U256::ONE,
+                maximum,
+            ] {
+                assert_eq!(
+                    exact_in.quote(amount).unwrap(),
+                    pool.quote_exact_in_amount_out(zero_for_one, amount)
+                        .unwrap(),
+                    "single-fee exact-input mismatch direction={zero_for_one} amount={amount}"
+                );
+                assert_eq!(
+                    exact_out.quote(amount).unwrap(),
+                    pool.quote_exact_out_amount_in(zero_for_one, amount)
+                        .unwrap(),
+                    "single-fee exact-output mismatch direction={zero_for_one} amount={amount}"
+                );
+            }
+
+            let mut specified_start = U256::ZERO;
+            for segment in &exact_in.segments {
+                for amount in boundary_samples(specified_start, segment.specified_end) {
+                    assert_eq!(
+                        exact_in.quote(amount).unwrap(),
+                        pool.quote_exact_in_amount_out(zero_for_one, amount)
+                            .unwrap()
+                    );
+                }
+                specified_start = segment.specified_end;
+            }
+            let mut specified_start = U256::ZERO;
+            for segment in &exact_out.segments {
+                for amount in boundary_samples(specified_start, segment.specified_end) {
+                    assert_eq!(
+                        exact_out.quote(amount).unwrap(),
+                        pool.quote_exact_out_amount_in(zero_for_one, amount)
+                            .unwrap()
+                    );
+                }
+                specified_start = segment.specified_end;
+            }
+        }
+
+        pool.set_algebra_single_fee(75).unwrap();
+        assert_eq!(pool.directional_fee_pips(), (75, 75));
+        let mut directional = ClmmPool::new_algebra_v1_9(
+            50,
+            51,
+            1,
+            get_sqrt_ratio_at_tick(8).unwrap(),
+            8,
+            1_000_000_000_000,
+        )
+        .unwrap();
+        assert!(directional.set_algebra_single_fee(50).is_err());
+    }
+
+    #[test]
     fn algebra_pools_share_the_immutable_word_boundary_cache() {
         let first =
             ClmmPool::new_algebra_v1_9(100, 100, 10, get_sqrt_ratio_at_tick(0).unwrap(), 0, 1_000)
@@ -1366,6 +1506,113 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Lynex/Uniswap single-fee Algebra benchmark"]
+    fn benchmark_uniswap_and_lynex_single_fee_prepared_quote_and_build() {
+        let mut uniswap = ClmmPool::new(
+            50,
+            1,
+            get_sqrt_ratio_at_tick(8).unwrap(),
+            8,
+            1_000_000_000_000,
+        )
+        .unwrap();
+        let mut lynex = ClmmPool::new_single_fee_algebra_v1_9(
+            50,
+            1,
+            get_sqrt_ratio_at_tick(8).unwrap(),
+            8,
+            1_000_000_000_000,
+        )
+        .unwrap();
+        for (tick, net) in [
+            (-512, 100_000_000_i128),
+            (-256, 100_000_000_i128),
+            (256, -100_000_000_i128),
+            (512, -100_000_000_i128),
+        ] {
+            uniswap.set_tick(tick, net.unsigned_abs(), net).unwrap();
+            lynex.set_tick(tick, net.unsigned_abs(), net).unwrap();
+        }
+
+        let maximum = U256::from(200_000_000_u64);
+        let probe = U256::from(50_000_000_u64);
+        for zero_for_one in [true, false] {
+            let direction = if zero_for_one {
+                "zero_for_one"
+            } else {
+                "one_for_zero"
+            };
+            let uniswap_exact_in = uniswap
+                .prepare_exact_input_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let lynex_exact_in = lynex
+                .prepare_exact_input_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let uniswap_exact_out = uniswap
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            let lynex_exact_out = lynex
+                .prepare_exact_output_curve_bounded(zero_for_one, maximum)
+                .unwrap();
+            assert_eq!(
+                uniswap_exact_in.quote(probe).unwrap(),
+                lynex_exact_in.quote(probe).unwrap()
+            );
+            assert_eq!(
+                uniswap_exact_out.quote(probe).unwrap(),
+                lynex_exact_out.quote(probe).unwrap()
+            );
+
+            crate::paired_benchmark::assert_named_paired_non_regression(
+                &format!("lynex_single_fee_prepared_exact_in_{direction}"),
+                1.05,
+                "uniswap_v3",
+                "lynex_algebra_v1_9",
+                || {
+                    black_box(uniswap_exact_in.quote(black_box(probe))).unwrap();
+                },
+                || {
+                    black_box(lynex_exact_in.quote(black_box(probe))).unwrap();
+                },
+            );
+            crate::paired_benchmark::assert_named_paired_non_regression(
+                &format!("lynex_single_fee_prepared_exact_out_{direction}"),
+                1.05,
+                "uniswap_v3",
+                "lynex_algebra_v1_9",
+                || {
+                    black_box(uniswap_exact_out.quote(black_box(probe))).unwrap();
+                },
+                || {
+                    black_box(lynex_exact_out.quote(black_box(probe))).unwrap();
+                },
+            );
+            crate::paired_benchmark::assert_named_paired_non_regression_with_work(
+                &format!("lynex_single_fee_curve_build_{direction}"),
+                1.05,
+                "uniswap_v3",
+                "lynex_algebra_v1_9",
+                32,
+                4_096,
+                || {
+                    black_box(
+                        uniswap
+                            .prepare_exact_input_curve_bounded(zero_for_one, black_box(maximum))
+                            .unwrap(),
+                    );
+                },
+                || {
+                    black_box(
+                        lynex
+                            .prepare_exact_input_curve_bounded(zero_for_one, black_box(maximum))
+                            .unwrap(),
+                    );
+                },
+            );
+        }
     }
 
     fn pool() -> ClmmPool {

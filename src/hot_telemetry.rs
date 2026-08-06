@@ -246,6 +246,7 @@ pub fn channel(
             PoolIdentity::V3 { address, .. } => DexPoolCostKey::UniswapV3(address),
             PoolIdentity::PancakeV3 { address, .. } => DexPoolCostKey::PancakeSwapV3(address),
             PoolIdentity::CamelotV3 { address } => DexPoolCostKey::CamelotV3(address),
+            PoolIdentity::LynexAlgebraV1_9 { address } => DexPoolCostKey::LynexAlgebraV1_9(address),
             PoolIdentity::V4 { pool_id, .. } => DexPoolCostKey::UniswapV4(pool_id),
         };
         pools.push(PoolTelemetryContext {

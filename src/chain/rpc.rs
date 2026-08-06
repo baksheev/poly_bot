@@ -128,6 +128,10 @@ pub struct RpcTransaction {
     pub input: Vec<u8>,
     pub block_number: Option<u64>,
     pub gas_limit: Option<u64>,
+    pub transaction_type: Option<u8>,
+    pub gas_price: Option<u128>,
+    pub max_fee_per_gas: Option<u128>,
+    pub max_priority_fee_per_gas: Option<u128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1037,14 @@ struct WireRpcTransaction {
     block_number: Option<String>,
     #[serde(default)]
     gas: Option<String>,
+    #[serde(default, rename = "type")]
+    transaction_type: Option<String>,
+    #[serde(default)]
+    gas_price: Option<String>,
+    #[serde(default)]
+    max_fee_per_gas: Option<String>,
+    #[serde(default)]
+    max_priority_fee_per_gas: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1103,6 +1115,26 @@ fn decode_rpc_transaction(value: Value) -> anyhow::Result<RpcTransaction> {
         gas_limit: transaction
             .gas
             .map(|gas| parse_quantity_u64("transaction.gas", &gas))
+            .transpose()?,
+        transaction_type: transaction
+            .transaction_type
+            .map(|value| {
+                parse_quantity_u64("transaction.type", &value).and_then(|value| {
+                    u8::try_from(value).context("transaction.type does not fit u8")
+                })
+            })
+            .transpose()?,
+        gas_price: transaction
+            .gas_price
+            .map(|value| parse_quantity_u128("transaction.gasPrice", &value))
+            .transpose()?,
+        max_fee_per_gas: transaction
+            .max_fee_per_gas
+            .map(|value| parse_quantity_u128("transaction.maxFeePerGas", &value))
+            .transpose()?,
+        max_priority_fee_per_gas: transaction
+            .max_priority_fee_per_gas
+            .map(|value| parse_quantity_u128("transaction.maxPriorityFeePerGas", &value))
             .transpose()?,
     })
 }

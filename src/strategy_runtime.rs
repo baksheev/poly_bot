@@ -90,6 +90,7 @@ impl CompiledStrategyDependencyIndex {
             .flat_map(|indices| indices.iter().copied())
     }
 
+    #[inline(always)]
     pub fn symbol_indices(&self, symbol: &str) -> &[usize] {
         self.by_symbol.get(symbol).map_or(&[], Vec::as_slice)
     }
@@ -101,6 +102,7 @@ impl CompiledStrategyDependencyIndex {
             .flat_map(|indices| indices.iter().copied())
     }
 
+    #[inline(always)]
     pub fn strategy_at(
         &self,
         index: usize,
@@ -278,6 +280,7 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
         })
     }
 
+    #[inline(always)]
     pub fn on_market_event(
         &mut self,
         event: MarketEvent,
@@ -294,6 +297,38 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
             dependencies,
         } = self;
         let indices = dependencies.symbol_indices(symbol);
+        if let [index] = indices {
+            let strategy = dependencies.strategy_at(*index)?;
+            let evaluation = if strategy.strategy_id == *primary_strategy_id {
+                primary.on_market_event(event, depth)?
+            } else if degraded_shadows.contains(&strategy.strategy_id) {
+                return Ok(summary);
+            } else {
+                let evaluator = shadows
+                    .get_mut(&strategy.strategy_id)
+                    .context("compiled shadow route has no evaluator")?;
+                match evaluator.on_market_event(event, None) {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        degraded_shadows.insert(strategy.strategy_id.clone());
+                        dependency_faults.push(StrategyDependencyFault {
+                            strategy_id: strategy.strategy_id.clone(),
+                            network_id: strategy.network_id.as_str().to_owned(),
+                            symbol: strategy.symbol.clone(),
+                            dependency: "strategy_evaluator",
+                            error,
+                        });
+                        return Ok(summary);
+                    }
+                }
+            };
+            summary.routed_strategies = 1;
+            summary.evaluated_strategies = u16::from(evaluation.evaluated);
+            summary.produced_candidates = u16::from(evaluation.candidate_produced);
+            summary.budget_exceeded = u16::from(evaluation.budget_exceeded());
+            summary.maximum_calculation_time_us = evaluation.calculation_time_us;
+            return Ok(summary);
+        }
         let mut event = Some(event);
         for (position, &index) in indices.iter().enumerate() {
             let strategy = dependencies.strategy_at(index)?;
@@ -1147,6 +1182,7 @@ pub(crate) fn evaluate_shadow_sizing(
     )
 }
 
+#[inline(always)]
 fn market_event_symbol(event: &MarketEvent) -> &str {
     match event {
         MarketEvent::FeedConnected { symbol, .. }

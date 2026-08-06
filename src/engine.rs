@@ -24,7 +24,10 @@ use crate::{
     },
     config::AppConfig,
     dex::{
-        events::{PoolLocator, PoolUpdate, decode_pool_event, decode_pool_event_for_locator},
+        events::{
+            AdaptiveFeeReceiptProof, PoolLocator, PoolUpdate, decode_pool_event,
+            decode_pool_event_for_locator,
+        },
         mirror::{DexMirror, LogApplyResult},
     },
     domain::config::{AdaptiveSizingConfig, DexProvider, LoadedDomainConfig},
@@ -704,6 +707,7 @@ impl TradingEngine {
                         DexProvider::UniswapV4 => "uniswap_v4",
                         DexProvider::PancakeSwapV3 => "pancakeswap_v3",
                         DexProvider::CamelotV3 => "camelot_v3",
+                        DexProvider::LynexAlgebraV1_9 => "lynex_algebra_v1_9",
                     },
                     "fee_pips": pool.fee_pips,
                     "address": pool.address.map(|address| format!("{address:?}")),
@@ -3724,9 +3728,15 @@ impl TradingEngine {
             .map(|freshness| freshness.pair_id.clone())
             .unwrap_or_else(|| event.pair_id.clone());
         let admission_generation = freshness.map(|freshness| freshness.pool_generation);
-        let is_camelot = self.dex.is_camelot_address(target.address);
-        let decoded = if is_camelot {
-            decode_pool_event_for_locator(target, PoolLocator::CamelotV3(target.address))?
+        let adaptive_locator = if self.dex.is_camelot_address(target.address) {
+            Some(PoolLocator::CamelotV3(target.address))
+        } else if self.dex.is_lynex_algebra_v1_9_address(target.address) {
+            Some(PoolLocator::LynexAlgebraV1_9(target.address))
+        } else {
+            None
+        };
+        let decoded = if let Some(locator) = adaptive_locator {
+            decode_pool_event_for_locator(target, locator)?
         } else {
             decode_pool_event(target)?
         }
@@ -3763,7 +3773,7 @@ impl TradingEngine {
             );
             return Ok(None);
         }
-        let block_timestamp = if is_camelot {
+        let block_timestamp = if let Some(locator) = adaptive_locator {
             let Some(fee) = event.dex_settlement_fee.as_ref() else {
                 self.telemetry.emit(
                     "arbitrage_receipt_settlement_unavailable",
@@ -3772,18 +3782,18 @@ impl TradingEngine {
                         "pair_id": pair_id,
                         "plan_id": event.plan_id,
                         "pool_index": pool_index,
-                        "reason": "camelot_receipt_fee_missing",
+                        "reason": "adaptive_algebra_receipt_fee_missing",
                     }),
                 );
                 return Ok(None);
             };
             ensure!(
-                fee.pool == target.address
-                    && fee.block_number == target.block_number
-                    && fee.block_hash == target.block_hash
-                    && fee.transaction_index == target.transaction_index
-                    && fee.log_index < target.log_index,
-                "Camelot receipt Fee is not positionally before Swap"
+                fee.pool() == target.address
+                    && fee.block_number() == target.block_number
+                    && fee.block_hash() == target.block_hash
+                    && fee.transaction_index() == target.transaction_index
+                    && fee.log_index() < target.log_index,
+                "adaptive Algebra receipt Fee is not positionally before Swap"
             );
             let Some(timestamp) = self.dex.canonical_timestamp_for_log(target) else {
                 self.telemetry.emit(
@@ -3798,7 +3808,19 @@ impl TradingEngine {
                 );
                 return Ok(None);
             };
-            match self.dex.apply_camelot_fee_receipt(*fee, timestamp)? {
+            let fee_apply = match (locator, *fee) {
+                (PoolLocator::CamelotV3(_), AdaptiveFeeReceiptProof::Camelot(proof)) => {
+                    self.dex.apply_camelot_fee_receipt(proof, timestamp)?
+                }
+                (
+                    PoolLocator::LynexAlgebraV1_9(_),
+                    AdaptiveFeeReceiptProof::LynexAlgebraV1_9(proof),
+                ) => self.dex.apply_lynex_fee_receipt(proof, timestamp)?,
+                _ => {
+                    anyhow::bail!("adaptive Algebra receipt Fee proof belongs to another provider")
+                }
+            };
+            match fee_apply {
                 LogApplyResult::Applied {
                     pool_index: applied_pool_index,
                     kind: "fee",
@@ -3809,17 +3831,17 @@ impl TradingEngine {
                 ),
                 LogApplyResult::Duplicate => {}
                 LogApplyResult::Applied { .. } => {
-                    anyhow::bail!("Camelot receipt Fee produced an invalid apply result")
+                    anyhow::bail!("adaptive Algebra receipt Fee produced an invalid apply result")
                 }
                 LogApplyResult::Unknown => {
-                    anyhow::bail!("Camelot receipt Fee targets an unknown pool")
+                    anyhow::bail!("adaptive Algebra receipt Fee targets an unknown pool")
                 }
             }
             Some(timestamp)
         } else {
             ensure!(
                 event.dex_settlement_fee.is_none(),
-                "static-fee receipt unexpectedly carries a Camelot Fee"
+                "static-fee receipt unexpectedly carries an adaptive Algebra Fee"
             );
             None
         };
@@ -3856,7 +3878,7 @@ impl TradingEngine {
                         "block_number": target.block_number,
                         "transaction_index": target.transaction_index,
                         "log_index": target.log_index,
-                        "fee_log_index": event.dex_settlement_fee.as_ref().map(|fee| fee.log_index),
+                        "fee_log_index": event.dex_settlement_fee.as_ref().map(|fee| fee.log_index()),
                         "source": "transaction_receipt",
                     }),
                 );

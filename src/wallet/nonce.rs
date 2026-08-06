@@ -872,6 +872,10 @@ mod tests {
             input: call.calldata().to_vec(),
             block_number: None,
             gas_limit: None,
+            transaction_type: Some(2),
+            gas_price: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
         }
     }
 

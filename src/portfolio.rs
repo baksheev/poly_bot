@@ -84,6 +84,27 @@ impl PortfolioCatalog {
                 "additional rebalance policy references an asset outside the portfolio"
             );
             ensure!(
+                policy.direct_networks.iter().all(|(chain_id, network)| {
+                    network.network_id.as_str() == format!("eip155:{chain_id}")
+                        && assets.keys().any(|(location, _)| {
+                            matches!(
+                                location,
+                                InventoryLocation::EvmWallet { network_id, .. }
+                                    if network_id == network.network_id.as_str()
+                            )
+                        })
+                        && network.tokens.iter().all(|(symbol, token)| {
+                            economic_assets
+                                .values()
+                                .any(|asset| asset == token.economic_asset_id.as_str())
+                                && assets
+                                    .keys()
+                                    .any(|(_, asset_symbol)| asset_symbol == symbol)
+                        })
+                }),
+                "direct rebalance network policy references an asset or network outside the portfolio"
+            );
+            ensure!(
                 plan.allocator_mode != CompiledCapitalAllocatorMode::FullLive
                     || policy.external_mutation_authorized,
                 "live allocator has no explicit mutation approval"
@@ -426,38 +447,55 @@ fn validate_live_proposal(
     source_debit: U256,
 ) -> anyhow::Result<()> {
     let economic_asset = intent.economic_asset_id.as_str();
-    let (maximum_debit, maximum_fee) =
-        if economic_asset == policy.token_a_economic_asset_id.as_str() {
-            (policy.maximum_token_a_debit, policy.maximum_token_a_fee)
-        } else if economic_asset == policy.token_b_economic_asset_id.as_str() {
-            (policy.maximum_token_b_debit, policy.maximum_token_b_fee)
-        } else if let Some(token) = policy
+    let route_network_id = match (&intent.source.location, &intent.destination.location) {
+        (
+            InventoryLocation::BinanceAccount { .. },
+            InventoryLocation::EvmWallet { network_id, .. },
+        )
+        | (
+            InventoryLocation::EvmWallet { network_id, .. },
+            InventoryLocation::BinanceAccount { .. },
+        ) => network_id.as_str(),
+        _ => anyhow::bail!("rebalance proposal is not a direct Binance/EVM route"),
+    };
+    let network_policy = policy
+        .direct_networks
+        .values()
+        .find(|network| network.network_id.as_str() == route_network_id);
+    let (maximum_debit, maximum_fee) = if let Some(network) = network_policy {
+        let token = network
+            .tokens
+            .values()
+            .find(|token| token.economic_asset_id.as_str() == economic_asset)
+            .context("rebalance proposal asset is not approved on the direct network")?;
+        (token.maximum_debit, token.maximum_fee)
+    } else if policy.direct_networks.is_empty()
+        && economic_asset == policy.token_a_economic_asset_id.as_str()
+    {
+        (policy.maximum_token_a_debit, policy.maximum_token_a_fee)
+    } else if policy.direct_networks.is_empty()
+        && economic_asset == policy.token_b_economic_asset_id.as_str()
+    {
+        (policy.maximum_token_b_debit, policy.maximum_token_b_fee)
+    } else if policy.direct_networks.is_empty()
+        && let Some(token) = policy
             .additional_tokens
             .values()
             .find(|token| economic_asset == token.economic_asset_id.as_str())
-        {
-            (token.maximum_debit, token.maximum_fee)
-        } else {
-            anyhow::bail!("rebalance proposal uses an asset outside the approved portfolio");
-        };
+    {
+        (token.maximum_debit, token.maximum_fee)
+    } else {
+        anyhow::bail!("rebalance proposal uses an asset outside the approved portfolio");
+    };
     ensure!(
         source_debit <= maximum_debit && intent.fee <= maximum_fee,
         "rebalance proposal exceeds the asset value or fee cap"
     );
-    let expected_network = policy.network_id.as_str();
-    let route_is_direct = matches!(
-        (&intent.source.location, &intent.destination.location),
-        (
-            InventoryLocation::BinanceAccount { .. },
-            InventoryLocation::EvmWallet { network_id, .. },
-        ) | (
-            InventoryLocation::EvmWallet { network_id, .. },
-            InventoryLocation::BinanceAccount { .. },
-        ) if network_id == expected_network
-    );
     ensure!(
-        route_is_direct,
-        "rebalance proposal is not a direct Binance/Arbitrum route"
+        network_policy.is_some()
+            || (policy.direct_networks.is_empty()
+                && route_network_id == policy.network_id.as_str()),
+        "rebalance proposal is not on an approved direct network"
     );
     Ok(())
 }
@@ -476,31 +514,42 @@ pub fn authorize_rebalance_request(
         "rebalance policy has no bounded direct mutation authority"
     );
     ensure!(
-        request.authority == RebalanceExecutionAuthority::ArbitrumFullLive,
-        "Arbitrum request has the wrong execution authority"
-    );
-    ensure!(
         request.approval_session_id.as_deref() == Some(policy.approval_session_id.as_str()),
         "rebalance request approval session differs from the compiled policy"
     );
+    let (chain_id, binance_network) = match &request.action.route {
+        Route::Direct {
+            chain_id,
+            binance_network,
+        } => (*chain_id, binance_network),
+        _ => anyhow::bail!("production rebalance request is not direct"),
+    };
+    let expected_authority = match chain_id {
+        42_161 => RebalanceExecutionAuthority::ArbitrumFullLive,
+        59_144 => RebalanceExecutionAuthority::LineaFullLive,
+        _ => anyhow::bail!("production rebalance request uses an unapproved chain"),
+    };
     ensure!(
-        matches!(
-            &request.action.route,
-            Route::Direct {
-                chain_id: 42_161,
-                binance_network,
-            } if binance_network == &policy.binance_network
-        ),
-        "rebalance request is not pinned to the approved direct Arbitrum route"
+        request.authority == expected_authority,
+        "direct request has the wrong execution authority"
+    );
+    let approved_network = policy.direct_networks.get(&chain_id);
+    ensure!(
+        approved_network.is_some_and(|network| &network.binance_network == binance_network)
+            || (policy.direct_networks.is_empty()
+                && chain_id == 42_161
+                && binance_network == &policy.binance_network),
+        "rebalance request is not pinned to an approved direct route"
     );
     let maximum_fee = request
         .maximum_fee
         .context("rebalance request has no maximum fee authority")?;
-    let remaining = remaining_rebalance_authority(
+    let remaining = remaining_rebalance_authority_on_chain(
         policy,
         risk,
         &request.token_symbol,
         request.action.direction,
+        chain_id,
     )?
     .context("rebalance concurrency, value, or fee stop condition is closed")?;
     ensure!(
@@ -523,6 +572,16 @@ pub fn remaining_rebalance_authority(
     token_symbol: &str,
     direction: crate::rebalance::Direction,
 ) -> anyhow::Result<Option<RemainingRebalanceAuthority>> {
+    remaining_rebalance_authority_on_chain(policy, risk, token_symbol, direction, 42_161)
+}
+
+pub fn remaining_rebalance_authority_on_chain(
+    policy: &CompiledCapitalPolicy,
+    risk: &RebalanceRisk,
+    token_symbol: &str,
+    direction: crate::rebalance::Direction,
+    chain_id: u64,
+) -> anyhow::Result<Option<RemainingRebalanceAuthority>> {
     ensure!(
         policy.external_mutation_authorized
             && policy.maximum_concurrent_transfers == 1
@@ -534,11 +593,19 @@ pub fn remaining_rebalance_authority(
     if risk.active_transfer_count >= usize::from(policy.maximum_concurrent_transfers) {
         return Ok(None);
     }
-    let (debit_cap, fee_cap) = if token_symbol == policy.token_a_symbol {
+    let network_token = policy
+        .direct_networks
+        .get(&chain_id)
+        .and_then(|network| network.tokens.get(token_symbol));
+    let (debit_cap, fee_cap) = if let Some(token) = network_token {
+        (token.maximum_debit, token.maximum_fee)
+    } else if policy.direct_networks.is_empty() && token_symbol == policy.token_a_symbol {
         (policy.maximum_token_a_debit, policy.maximum_token_a_fee)
-    } else if token_symbol == policy.token_b_symbol {
+    } else if policy.direct_networks.is_empty() && token_symbol == policy.token_b_symbol {
         (policy.maximum_token_b_debit, policy.maximum_token_b_fee)
-    } else if let Some(token) = policy.additional_tokens.get(token_symbol) {
+    } else if policy.direct_networks.is_empty()
+        && let Some(token) = policy.additional_tokens.get(token_symbol)
+    {
         (token.maximum_debit, token.maximum_fee)
     } else {
         anyhow::bail!("rebalance request uses an asset outside the production policy");
@@ -808,9 +875,10 @@ mod tests {
 
     use crate::{
         domain::compiled::{
-            BinanceAccountId, CompiledCapitalAllocatorMode, CompiledCapitalPolicy,
-            CompiledInventoryLocation, CompiledPortfolioAsset, CompiledPortfolioRuntimePlan,
-            EconomicAssetId, NetworkId, VenueAssetId, WalletLocationId,
+            BinanceAccountId, CompatibilityRole, CompiledCapitalAllocatorMode,
+            CompiledCapitalPolicy, CompiledInventoryLocation, CompiledPortfolioAsset,
+            CompiledPortfolioRuntimePlan, EconomicAssetId, NetworkId, VenueAssetId,
+            WalletLocationId, load_compatibility_domain,
         },
         inventory::{InventoryKey, InventoryLocation, InventoryReservations},
         rebalance::{
@@ -822,6 +890,7 @@ mod tests {
     use super::{
         AllocationIntent, CapitalAllocator, CapitalAllocatorHandle, InFlightTransfer,
         PortfolioCatalog, authorize_rebalance_request, remaining_rebalance_authority,
+        remaining_rebalance_authority_on_chain,
     };
 
     fn plan(wallets: u8) -> CompiledPortfolioRuntimePlan {
@@ -991,6 +1060,7 @@ mod tests {
             maximum_token_a_fee: U256::from(100_u64),
             maximum_token_b_fee: U256::from(2_000_000_000_000_000_000_u128),
             additional_tokens: std::collections::BTreeMap::new(),
+            direct_networks: std::collections::BTreeMap::new(),
             maximum_unknown_reconciliation_queries: 1,
             direct_route_only: true,
             bridge_mutations_enabled: false,
@@ -1155,6 +1225,64 @@ mod tests {
             .unwrap();
         assert!(
             authorize_rebalance_request(&full_live_policy, &historical_risk, &full_live_request,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compiled_linea_policy_authorizes_only_typed_linea_usdt_direct_requests() {
+        let production = load_compatibility_domain(
+            "config/domain/compiled-multi-pair-production.v1.json",
+            CompatibilityRole::LiveRuntime,
+            false,
+        )
+        .unwrap();
+        let policy = production
+            .portfolio_runtime
+            .unwrap()
+            .capital_policy
+            .unwrap();
+        let remaining = remaining_rebalance_authority_on_chain(
+            &policy,
+            &RebalanceRisk::default(),
+            "USDT",
+            Direction::BinanceToWallet,
+            59_144,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            remaining.maximum_source_debit,
+            U256::from(2_600_000_000_u64)
+        );
+        assert_eq!(remaining.maximum_fee, U256::from(5_000_000_u64));
+
+        let request = RebalanceExecutionRequest {
+            authority: RebalanceExecutionAuthority::LineaFullLive,
+            token_symbol: "USDT".to_owned(),
+            token_decimals: 6,
+            token_contract: Address::repeat_byte(0x59),
+            wallet_owner: Address::repeat_byte(0x22),
+            action: RebalanceAction {
+                direction: Direction::BinanceToWallet,
+                amount: U256::from(200_000_000_u64),
+                route: Route::Direct {
+                    binance_network: "LINEA".to_owned(),
+                    chain_id: 59_144,
+                },
+            },
+            binance_balance_before: U256::from(1_000_000_000_u64),
+            wallet_balance_before: U256::from(1_000_000_000_u64),
+            revalidation_start_balance: U256::from(500_000_000_u64),
+            maximum_fee: Some(U256::from(5_000_000_u64)),
+            approval_session_id: Some(policy.approval_session_id.clone()),
+        };
+        authorize_rebalance_request(&policy, &RebalanceRisk::default(), &request).unwrap();
+
+        let mut wrong_authority = request.clone();
+        wrong_authority.authority = RebalanceExecutionAuthority::ArbitrumFullLive;
+        assert!(
+            authorize_rebalance_request(&policy, &RebalanceRisk::default(), &wrong_authority)
                 .is_err()
         );
     }

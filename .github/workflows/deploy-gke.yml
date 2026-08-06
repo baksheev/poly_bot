@@ -24,7 +24,6 @@ env:
   GCE_INSTANCE: arb-bot-rust-shadow-gce
   ARTIFACT_REPOSITORY: poly-bot
   IMAGE_NAME: poly-bot
-  NODE_POOL_PREFIX: arb
   SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
@@ -68,15 +67,15 @@ jobs:
           test "$(jq -r '.bundle_kind' "${domain_config}")" = compiled_multi_pair_domain
           test "$(jq -r '.bundle_id' "${domain_config}")" = arb-bot-production-multi-pair-v1
           test "$(jq -c '.instruments | map(.symbol)' "${domain_config}")" \
-            = '["ARBUSDC","ESPUSDC","WLDUSDC"]'
+            = '["ARBUSDC","ESPUSDC","USDCUSDT","WLDUSDC"]'
           test "$(jq -c '.stream_shards' "${domain_config}")" = \
-            '[{"id":"stream:binance-spot:primary:0","account_id":"binance-spot:primary","instrument_ids":["binance-spot:primary:ARBUSDC","binance-spot:primary:ESPUSDC","binance-spot:primary:WLDUSDC"]}]'
+            '[{"id":"stream:binance-spot:primary:0","account_id":"binance-spot:primary","instrument_ids":["binance-spot:primary:ARBUSDC","binance-spot:primary:ESPUSDC","binance-spot:primary:USDCUSDT","binance-spot:primary:WLDUSDC"]}]'
           test "$(jq -c '[.venue_assets[] | select(.kind == "binance_spot") | .symbol]' "${domain_config}")" \
-            = '["ARB","BNB","ESP","USDC","WLD"]'
+            = '["ARB","BNB","ESP","USDC","USDT","WLD"]'
           test "$(jq -c '.networks | map(.id)' "${domain_config}")" \
-            = '["eip155:42161","eip155:480"]'
+            = '["eip155:42161","eip155:480","eip155:59144"]'
           test "$(jq -c '.capabilities' "${domain_config}")" = \
-            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
+            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:linea-usdt-usdc","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
           test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
             = arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool
           test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
@@ -178,6 +177,32 @@ jobs:
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"))] | length' "${domain_config}")" = 1
+          linea='.sources[] | select(.snapshot.pairs[0].id == "linea-usdt-usdc") | .snapshot'
+          test "$(jq -r "${linea} | .snapshot_id" "${domain_config}")" = linea-usdt-usdc-lynex-algebra-v1-9-full-live-v1
+          test "$(jq -r "${linea} | .live_trading_enabled" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0].chain.chain_id" "${domain_config}")" = 59144
+          test "$(jq -r "${linea} | .pairs[0].binance.symbol" "${domain_config}")" = USDCUSDT
+          test "$(jq -r "${linea} | .pairs[0].binance.step_size" "${domain_config}")" = 1.00000000
+          test "$(jq -r "${linea} | .pairs[0].binance.tick_size" "${domain_config}")" = 0.00001000
+          test "$(jq -r "${linea} | .pairs[0].execution_enabled" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0].full_live" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0].rebalance.enabled" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 6000000
+          test "$(jq -r "${linea} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
+          test "$(jq -r "${linea} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
+          test "$(jq -r "${linea} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_actor" "${domain_config}")" = operator
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-06T07:44:34Z
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.rebalance_binance_network" "${domain_config}")" = LINEA
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_rebalance_token_a_debit_base_units" "${domain_config}")" = 2600000000
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_rebalance_token_b_debit_base_units" "${domain_config}")" = 2600000000
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_unknown_reconciliation_queries" "${domain_config}")" = 1
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.direct_route_only" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0].full_live_policy.bridge_mutations_enabled" "${domain_config}")" = false
+          test "$(jq -c "${linea} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["lynex_algebra_v1_9"]'
+          test "$(jq -r "${linea} | .pairs[0].chain.lynex_algebra_v1_9_router_address" "${domain_config}")" = 0x3921e8cb45B17fC029A0a6dE958330ca4e583390
+          test "$(jq -r '[.pools[] | select(.pair_id == "linea-usdt-usdc" and .protocol == "lynex_algebra_v1_9" and .fee_pips == 50 and .tick_spacing == 1 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:linea-usdt-usdc") | .pool_ids[] | select((ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             successful_ci="$(gh run list \
@@ -211,6 +236,31 @@ jobs:
             --project="${GCP_PROJECT_ID}" \
             --format='value(status)')"
           test "${status}" = "TERMINATED"
+
+      - name: Verify operator-maintained Linea gas invariant read-only
+        env:
+          EVM_WALLET_ADDRESS: ${{ vars.EVM_WALLET_ADDRESS }}
+        run: |
+          set -euo pipefail
+          rpc_response=
+          for _ in 1 2 3; do
+            rpc_response="$(curl --fail --silent --show-error \
+              --connect-timeout 5 \
+              --max-time 15 \
+              --header 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBalance\",\"params\":[\"${EVM_WALLET_ADDRESS}\",\"latest\"]}" \
+              https://rpc.linea.build)" && break
+            sleep 2
+          done
+          balance_hex="$(jq -er '.result' <<<"${rpc_response}")"
+          [[ "${balance_hex}" =~ ^0x[0-9a-f]+$ ]]
+          balance_word="$(printf '%064s' "${balance_hex#0x}" | tr ' ' 0)"
+          minimum_word="$(printf '%064s' 2386f26fc10000 | tr ' ' 0)"
+          if [[ "${balance_word}" < "${minimum_word}" ]]; then
+            echo "::error::production wallet has less than the reviewed 0.01 ETH Linea operator gas reserve"
+            exit 1
+          fi
+          echo "Linea operator gas reserve is funded."
 
       - name: Build and push immutable image
         id: image
@@ -529,9 +579,10 @@ jobs:
             and .mode == "capacity_replay_only"
             and .pair_count == 20
             and .pool_count == 25
-            and .provider_pool_counts.uniswap_v3 == 23
+            and .provider_pool_counts.uniswap_v3 == 22
             and .provider_pool_counts.pancakeswap_v3 == 1
             and .provider_pool_counts.camelot_v3 == 1
+            and .provider_pool_counts.lynex_algebra_v1_9 == 1
             and .frames_per_pair == 100000
             and .total_strategy_frames == 2000000
             and .reconnect_bursts == 4
@@ -577,6 +628,139 @@ jobs:
             and .gate == "target_c4_replay_ready"
           ' <<<"${replay_report}" >/dev/null
           echo "${replay_report}"
+
+      - name: Verify Binance LINEA direct capital routes read-only
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+          node_pool="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+          test -n "${node_pool}"
+          preflight_deployment="arb-bot-linea-capital-read-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup_preflight() {
+            kubectl delete deployment "${preflight_deployment}" \
+              --namespace "${GKE_NAMESPACE}" \
+              --ignore-not-found \
+              --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup_preflight EXIT
+
+          deployment_json="$(kubectl create deployment "${preflight_deployment}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --image="${IMAGE}" \
+            --dry-run=client \
+            -o json \
+            -- /bin/sh -ec 'sleep 300')"
+          jq \
+            --arg node_pool "${node_pool}" \
+            --arg preflight_instance "${preflight_deployment}" \
+            --arg image "${IMAGE}" \
+            '
+              .metadata.labels["app.kubernetes.io/name"] = "arb-bot-linea-capital-read"
+              | .metadata.labels["arb-bot/preflight-instance"] = $preflight_instance
+              | .spec.replicas = 1
+              | .spec.revisionHistoryLimit = 0
+              | .spec.strategy = {"type": "Recreate"}
+              | .spec.selector.matchLabels = {
+                  "app.kubernetes.io/name": "arb-bot-linea-capital-read",
+                  "arb-bot/preflight-instance": $preflight_instance
+                }
+              | .spec.template.metadata.labels["app.kubernetes.io/name"] = "arb-bot-linea-capital-read"
+              | .spec.template.metadata.labels["arb-bot/preflight-instance"] = $preflight_instance
+              | .spec.template.spec.serviceAccountName = "arb-bot-runtime"
+              | .spec.template.spec.automountServiceAccountToken = false
+              | .spec.template.spec.nodeSelector = {
+                  "cloud.google.com/gke-nodepool": $node_pool
+                }
+              | .spec.template.spec.securityContext = {
+                  "runAsNonRoot": true,
+                  "runAsUser": 65532,
+                  "runAsGroup": 65532,
+                  "seccompProfile": {"type": "RuntimeDefault"}
+                }
+              | .spec.template.spec.containers[0].name = "hold"
+              | .spec.template.spec.containers[0].resources = {
+                  "requests": {"cpu": "5m", "memory": "8Mi"},
+                  "limits": {"cpu": "20m", "memory": "16Mi"}
+                }
+              | .spec.template.spec.containers[0].securityContext = {
+                  "allowPrivilegeEscalation": false,
+                  "readOnlyRootFilesystem": true,
+                  "capabilities": {"drop": ["ALL"]}
+                }
+              | .spec.template.spec.initContainers = [{
+                  "name": "linea-capital-read",
+                  "image": $image,
+                  "imagePullPolicy": "IfNotPresent",
+                  "command": ["/bin/sh", "-ec"],
+                  "args": [
+                    "export BINANCE_API_KEY=\"$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_API_KEY)\"; export BINANCE_SECRET_KEY=\"$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_SECRET_KEY)\"; arb_bot binance-capital-recovery --coin USDC --network LINEA; arb_bot binance-capital-recovery --coin USDT --network LINEA; printf \"linea_capital_routes=verified\\n\" | tee /dev/termination-log"
+                  ],
+                  "resources": {
+                    "requests": {"cpu": "20m", "memory": "32Mi"},
+                    "limits": {"cpu": "250m", "memory": "128Mi"}
+                  },
+                  "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": {"drop": ["ALL"]}
+                  },
+                  "terminationMessagePath": "/dev/termination-log",
+                  "terminationMessagePolicy": "File",
+                  "volumeMounts": [{
+                    "name": "binance-capital-read-secrets",
+                    "mountPath": "/var/run/secrets/arb-bot-binance-read",
+                    "readOnly": true
+                  }]
+                }]
+              | .spec.template.spec.volumes = [{
+                  "name": "binance-capital-read-secrets",
+                  "csi": {
+                    "driver": "secrets-store-gke.csi.k8s.io",
+                    "readOnly": true,
+                    "volumeAttributes": {
+                      "secretProviderClass": "arb-bot-binance-capital-read"
+                    }
+                  }
+                }]
+            ' <<<"${deployment_json}" \
+            | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
+
+          preflight_pod=
+          for _ in {1..60}; do
+            preflight_pod="$(kubectl get pods \
+              --namespace "${GKE_NAMESPACE}" \
+              --selector="arb-bot/preflight-instance=${preflight_deployment}" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            test -z "${preflight_pod}" || break
+            sleep 2
+          done
+          test -n "${preflight_pod}"
+
+          preflight_reason=
+          for _ in {1..90}; do
+            preflight_reason="$(kubectl get pod "${preflight_pod}" \
+              --namespace "${GKE_NAMESPACE}" \
+              -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' \
+              2>/dev/null || true)"
+            case "${preflight_reason}" in
+              Completed) break ;;
+              Error)
+                kubectl logs "${preflight_pod}" \
+                  --namespace "${GKE_NAMESPACE}" \
+                  --container linea-capital-read || true
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+          test "${preflight_reason}" = Completed
+          test "$(kubectl get pod "${preflight_pod}" \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -r '.status.initContainerStatuses[0].state.terminated.message')" \
+            = linea_capital_routes=verified
 
       - name: Bootstrap reviewed ARB inventory once
         env:
@@ -814,10 +998,11 @@ jobs:
           REBALANCE_MAX_USDC_AMOUNT: ${{ vars.REBALANCE_MAX_USDC_AMOUNT }}
         run: |
           set -Eeuo pipefail
-          release_id="${SOURCE_SHA:0:12}"
-          new_pool="${NODE_POOL_PREFIX}-${release_id}"
-          had_previous=false
-          previous_pool=""
+          had_previous=true
+          fixed_pool="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
+          test -n "${fixed_pool}"
           previous_runtime_data="null"
           previous_durable_schema_version=0
           durable_schema_version=2
@@ -825,24 +1010,28 @@ jobs:
           rollout_applied=false
           rollout_succeeded=false
 
-          if kubectl get deployment arb-bot --namespace "${GKE_NAMESPACE}" >/dev/null 2>&1; then
-            had_previous=true
-            previous_pool="$(kubectl get deployment arb-bot \
-              --namespace "${GKE_NAMESPACE}" \
-              -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
-            test -n "${previous_pool}"
-            new_pool="${previous_pool}"
-            previous_runtime_data="$(kubectl get configmap arb-bot-runtime \
-              --namespace "${GKE_NAMESPACE}" \
-              -o json | jq -c '.data')"
-            previous_durable_schema_version="$(kubectl get deployment arb-bot \
-              --namespace "${GKE_NAMESPACE}" \
-              -o json | jq -r '.metadata.annotations["arb-bot/durable-state-schema-version"] // "1"')"
-            [[ "${previous_durable_schema_version}" =~ ^[0-9]+$ ]]
-            if (( previous_durable_schema_version >= durable_schema_version )); then
-              automatic_rollback_allowed=true
-            fi
+          previous_runtime_data="$(kubectl get configmap arb-bot-runtime \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -c '.data')"
+          previous_durable_schema_version="$(kubectl get deployment arb-bot \
+            --namespace "${GKE_NAMESPACE}" \
+            -o json | jq -r '.metadata.annotations["arb-bot/durable-state-schema-version"] // "1"')"
+          [[ "${previous_durable_schema_version}" =~ ^[0-9]+$ ]]
+          if (( previous_durable_schema_version >= durable_schema_version )); then
+            automatic_rollback_allowed=true
           fi
+
+          pool_json="$(gcloud container node-pools describe "${fixed_pool}" \
+            --project="${GCP_PROJECT_ID}" \
+            --cluster="${GKE_CLUSTER}" \
+            --zone="${GKE_ZONE}" \
+            --format=json)"
+          test "$(jq -r '.config.machineType' <<<"${pool_json}")" = c4-highcpu-8
+          test "$(jq -r '.status' <<<"${pool_json}")" = RUNNING
+          test "$(jq -r '.autoscaling.enabled // false' <<<"${pool_json}")" = false
+          test "$(kubectl get nodes \
+            --selector="cloud.google.com/gke-nodepool=${fixed_pool}" \
+            -o json | jq '.items | length')" = 1
 
           restore_on_failure() {
             status="$?"
@@ -873,51 +1062,11 @@ jobs:
                 else
                   echo "::error::automatic rollback refused: durable state schema ${durable_schema_version} is not readable by previous schema ${previous_durable_schema_version}; leaving the exact forward revision and runtime projection in place"
                 fi
-              else
-                kubectl delete deployment arb-bot \
-                  --namespace "${GKE_NAMESPACE}" \
-                  --ignore-not-found || true
               fi
-            fi
-
-            if [[ "${new_pool}" != "${previous_pool}" ]]; then
-              gcloud container node-pools delete "${new_pool}" \
-                --project="${GCP_PROJECT_ID}" \
-                --cluster="${GKE_CLUSTER}" \
-                --zone="${GKE_ZONE}" \
-                --quiet || true
             fi
             exit "${status}"
           }
           trap restore_on_failure EXIT
-
-          # Cancelled deployments can leave immutable release pools behind.
-          # Remove only pools that are not selected by the current Deployment
-          # before creating the next one, so quota cleanup cannot evict the
-          # active workload.
-          while IFS= read -r pool; do
-            if [[ -n "${pool}" \
-              && "${pool}" != "${previous_pool}" \
-              && "${pool}" != "${new_pool}" \
-              && "${pool}" == arb-* ]]; then
-              gcloud container node-pools delete "${pool}" \
-                --project="${GCP_PROJECT_ID}" \
-                --cluster="${GKE_CLUSTER}" \
-                --zone="${GKE_ZONE}" \
-                --quiet
-            fi
-          done < <(gcloud container node-pools list \
-            --project="${GCP_PROJECT_ID}" \
-            --cluster="${GKE_CLUSTER}" \
-            --zone="${GKE_ZONE}" \
-            --format='value(name)')
-
-          GCP_PROJECT_ID="${GCP_PROJECT_ID}" \
-          GKE_CLUSTER="${GKE_CLUSTER}" \
-          GKE_ZONE="${GKE_ZONE}" \
-          GKE_RELEASE_ID="${release_id}" \
-          GCLOUD_BIN=gcloud \
-            scripts/create-gke-node-pool "${new_pool}"
 
           sed \
             -e "s|__GCP_PROJECT_ID__|${GCP_PROJECT_ID}|g" \
@@ -926,23 +1075,14 @@ jobs:
             infra/gcp/gke/release-platform.yaml \
             | kubectl apply -f -
 
-          if kubectl get persistentvolumeclaim arb-bot-state \
-            --namespace "${GKE_NAMESPACE}" >/dev/null 2>&1; then
-            existing_storage_class="$(kubectl get persistentvolumeclaim arb-bot-state \
-              --namespace "${GKE_NAMESPACE}" \
-              -o jsonpath='{.spec.storageClassName}')"
-            if [[ "${existing_storage_class}" != dynamic-rwo ]]; then
-              test "${had_previous}" = false
-              kubectl delete persistentvolumeclaim arb-bot-state \
-                --namespace "${GKE_NAMESPACE}" \
-                --wait=true
-            fi
-          fi
+          test "$(kubectl get persistentvolumeclaim arb-bot-state \
+            --namespace "${GKE_NAMESPACE}" \
+            -o jsonpath='{.spec.storageClassName}')" = dynamic-rwo
 
           sed \
             -e "s|__IMAGE__|${IMAGE}|g" \
             -e "s|__SOURCE_REVISION__|${SOURCE_SHA}|g" \
-            -e "s|__NODE_POOL__|${new_pool}|g" \
+            -e "s|__NODE_POOL__|${fixed_pool}|g" \
             -e "s|__REBALANCE_MAX_WLD_AMOUNT__|${REBALANCE_MAX_WLD_AMOUNT}|g" \
             -e "s|__REBALANCE_MAX_USDC_AMOUNT__|${REBALANCE_MAX_USDC_AMOUNT}|g" \
             infra/gcp/gke/deployment.yaml \
@@ -1004,7 +1144,7 @@ jobs:
           selected_pool="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.nodeSelector.cloud\.google\.com/gke-nodepool}')"
-          test "${selected_pool}" = "${new_pool}"
+          test "${selected_pool}" = "${fixed_pool}"
           kubectl get pods \
             --namespace "${GKE_NAMESPACE}" \
             --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
@@ -1059,21 +1199,7 @@ jobs:
           test "${rebalance_mode}" = full_live
           rollout_succeeded=true
 
-          while IFS= read -r pool; do
-            if [[ -n "${pool}" && "${pool}" != "${new_pool}" && "${pool}" == arb-* ]]; then
-              gcloud container node-pools delete "${pool}" \
-                --project="${GCP_PROJECT_ID}" \
-                --cluster="${GKE_CLUSTER}" \
-                --zone="${GKE_ZONE}" \
-                --quiet
-            fi
-          done < <(gcloud container node-pools list \
-            --project="${GCP_PROJECT_ID}" \
-            --cluster="${GKE_CLUSTER}" \
-            --zone="${GKE_ZONE}" \
-            --format='value(name)')
-
-          echo "node_pool=${new_pool}" >>"${GITHUB_OUTPUT}"
+          echo "node_pool=${fixed_pool}" >>"${GITHUB_OUTPUT}"
           trap - EXIT
 
       - name: Apply rebalance monitoring

@@ -10,7 +10,7 @@ pub const GAS_PRICE_HISTORY_DEPTH: usize = 8;
 pub const NATIVE_CONVERSION_HISTORY_DEPTH: usize = 32;
 pub const RECEIPT_HISTORY_DEPTH: usize = 4;
 const MAX_RECEIPT_ROUTES: usize = 16;
-const DEX_PROTOCOL_COUNT: usize = 4;
+const DEX_PROTOCOL_COUNT: usize = 5;
 
 /// Diagnostic-only inputs for the pre-trade cost model. The trading owner
 /// never reads this state: producers publish into it and the background hot
@@ -27,6 +27,7 @@ pub enum DexProtocol {
     UniswapV4,
     PancakeSwapV3,
     CamelotV3,
+    LynexAlgebraV1_9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub enum DexPoolCostKey {
     UniswapV4(B256),
     PancakeSwapV3(Address),
     CamelotV3(Address),
+    LynexAlgebraV1_9(Address),
 }
 
 impl DexPoolCostKey {
@@ -44,6 +46,7 @@ impl DexPoolCostKey {
             Self::UniswapV4(_) => DexProtocol::UniswapV4,
             Self::PancakeSwapV3(_) => DexProtocol::PancakeSwapV3,
             Self::CamelotV3(_) => DexProtocol::CamelotV3,
+            Self::LynexAlgebraV1_9(_) => DexProtocol::LynexAlgebraV1_9,
         }
     }
 
@@ -53,6 +56,7 @@ impl DexPoolCostKey {
             Self::UniswapV4(pool_id) => format!("uniswap_v4:{pool_id:#x}"),
             Self::PancakeSwapV3(address) => format!("pancakeswap_v3:{address:#x}"),
             Self::CamelotV3(address) => format!("camelot_v3:{address:#x}"),
+            Self::LynexAlgebraV1_9(address) => format!("lynex_algebra_v1_9:{address:#x}"),
         }
     }
 }
@@ -85,6 +89,7 @@ impl DexProtocol {
             Self::UniswapV4 => "uniswap_v4",
             Self::PancakeSwapV3 => "pancakeswap_v3",
             Self::CamelotV3 => "camelot_v3",
+            Self::LynexAlgebraV1_9 => "lynex_algebra_v1_9",
         }
     }
 
@@ -94,6 +99,7 @@ impl DexProtocol {
             Self::UniswapV4 => 1,
             Self::PancakeSwapV3 => 2,
             Self::CamelotV3 => 3,
+            Self::LynexAlgebraV1_9 => 4,
         }
     }
 }

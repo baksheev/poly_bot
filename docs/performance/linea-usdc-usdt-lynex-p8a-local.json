@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "stage": "P8a_fourth_full_live_arbitrage_runtime",
+  "captured_at_utc": "2026-08-06T07:59:50Z",
+  "repository_head": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "environment": {
+    "os": "Darwin 25.3.0 arm64",
+    "profile": "release fat-LTO codegen-units=1",
+    "production_target_required": "c4-highcpu-8"
+  },
+  "functional_gate": {
+    "cargo_check_all_targets": "pass",
+    "compiled_domain_tests": "9_passed_0_failed",
+    "main_runtime_tests": "9_passed_0_failed",
+    "compiled_executable_strategies": 4,
+    "linea_execution_lane": "eip155:59144:evm-wallet:primary",
+    "linea_binance_symbol": "USDCUSDT",
+    "linea_gas_policy": "fresh_type2_eth_gas_price_fail_closed_no_fallback",
+    "linea_allowance_policy": "max_uint256_then_locked",
+    "network_io_performed_by_tests": false,
+    "external_mutations": 0,
+    "gate": "pass"
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P7-control then P8a-candidate binary runs",
+    "total_strategy_frames_per_binary_per_run": 2000000,
+    "p7_binary_sha256": "7afdf6a58ba76f4dfc1bc5ab37201b4746fcd20fb201d3e111eb667dce21c317",
+    "p8a_binary_sha256": "e7c67ede4b8b17534dbf56c5badd5d11bc7ca46f2f09e9f295ecd42af300560c",
+    "p7_frames_per_second": [
+      12129638,
+      13810739,
+      13703064,
+      13877204,
+      13757117
+    ],
+    "p8a_frames_per_second": [
+      12060549,
+      13613626,
+      13622300,
+      13785770,
+      13707525
+    ],
+    "p7_frames_per_second_median": 13757117,
+    "p8a_frames_per_second_median": 13622300,
+    "p8a_to_p7_throughput_ratio": 0.9902001996493888,
+    "p8a_to_frozen_p0_throughput_ratio": 1.0683457201038207,
+    "minimum_acceptable_stage_ratio": 0.95,
+    "p7_decision_p95_ns_median": 42,
+    "p8a_decision_p95_ns_median": 42,
+    "p7_decision_p99_ns_median": 42,
+    "p8a_decision_p99_ns_median": 42,
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "result": "pass"
+}

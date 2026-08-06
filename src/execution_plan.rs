@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     arbitrage::ArbitrageDirection,
     dex::{
-        execution::{ExactInputSwapRequest, SwapRoute, SwapSubmissionPolicy},
+        execution::{
+            AllowanceRequirement, DexProtocol, ExactInputSwapRequest, SwapRoute,
+            SwapSubmissionPolicy,
+        },
         hydration::{HydratedPool, PoolIdentity},
         pool_id::V4PoolKey,
     },
@@ -16,6 +19,54 @@ use crate::{
 };
 
 pub const DEX_PLAN_TTL_SECONDS: u64 = 30;
+
+/// Exact startup-only allowance set for the first reviewed Linea Lynex route.
+/// Building this value is read-only; P6 never passes it to an executor capable
+/// of approval writes. P8 may do so only under the durable startup gate.
+pub fn linea_lynex_allowance_requirements(
+    pair: &PairConfig,
+) -> anyhow::Result<[AllowanceRequirement; 2]> {
+    ensure!(
+        pair.id == "linea-usdt-usdc",
+        "unexpected Lynex allowance pair"
+    );
+    ensure!(
+        pair.chain.chain_id == 59_144,
+        "Lynex allowance pair is not on Linea"
+    );
+    ensure!(
+        pair.dex
+            .allowed_providers
+            .contains(&crate::domain::config::DexProvider::LynexAlgebraV1_9),
+        "Lynex allowance provider is not enabled"
+    );
+    let router = required_address(
+        "lynex_algebra_v1_9_router_address",
+        pair.chain.lynex_algebra_v1_9_router_address.as_deref(),
+    )?;
+    let token_a = parse_address("Linea Lynex token A", &pair.token_a.contract)?;
+    let token_b = parse_address("Linea Lynex token B", &pair.token_b.contract)?;
+    ensure!(
+        token_a != token_b,
+        "Linea Lynex allowance tokens are identical"
+    );
+    Ok([
+        AllowanceRequirement {
+            operation_id: "rustarb-linea-usdt-usdc-USDT-max-allowance".to_owned(),
+            protocol: DexProtocol::LynexAlgebraV1_9,
+            token: token_a,
+            router,
+            required: U256::MAX,
+        },
+        AllowanceRequirement {
+            operation_id: "rustarb-linea-usdt-usdc-USDC-max-allowance".to_owned(),
+            protocol: DexProtocol::LynexAlgebraV1_9,
+            token: token_b,
+            router,
+            required: U256::MAX,
+        },
+    ])
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
@@ -39,6 +90,16 @@ pub enum DexRoutePlan {
         fee_otz_current_pips: u16,
         fee_zto_envelope_pips: u16,
         fee_otz_envelope_pips: u16,
+        fee_horizon_first_unix_seconds: u32,
+        fee_horizon_last_unix_seconds: u32,
+    },
+    LynexAlgebraV1_9 {
+        router: String,
+        pool_address: String,
+        pool_generation: u64,
+        fee_generation: u64,
+        fee_current_pips: u16,
+        fee_envelope_pips: u16,
         fee_horizon_first_unix_seconds: u32,
         fee_horizon_last_unix_seconds: u32,
     },
@@ -133,6 +194,38 @@ impl DexSwapPlan {
                     fee_otz_current_pips: fee.state.current_fees.one_for_zero,
                     fee_zto_envelope_pips: fee.envelope.maximum.zero_for_one,
                     fee_otz_envelope_pips: fee.envelope.maximum.one_for_zero,
+                    fee_horizon_first_unix_seconds: fee.envelope.first_timestamp,
+                    fee_horizon_last_unix_seconds: fee.envelope.last_timestamp,
+                }
+            }
+            PoolIdentity::LynexAlgebraV1_9 { address } => {
+                ensure!(pool_generation > 0, "Lynex pool generation is zero");
+                ensure!(fee_generation > 0, "Lynex fee generation is zero");
+                let fee = pool
+                    .lynex_fee
+                    .as_ref()
+                    .context("Lynex fee state is unavailable for execution planning")?;
+                ensure!(
+                    fee.state.current_fees.zero_for_one == fee.state.current_fees.one_for_zero
+                        && fee.envelope.maximum.zero_for_one == fee.envelope.maximum.one_for_zero,
+                    "Lynex execution fee state became directional"
+                );
+                ensure!(
+                    deadline_unix_seconds >= u64::from(fee.envelope.first_timestamp)
+                        && deadline_unix_seconds <= u64::from(fee.envelope.last_timestamp),
+                    "Lynex deadline is outside the prepared fee horizon"
+                );
+                DexRoutePlan::LynexAlgebraV1_9 {
+                    router: required_address(
+                        "lynex_algebra_v1_9_router_address",
+                        pair.chain.lynex_algebra_v1_9_router_address.as_deref(),
+                    )?
+                    .to_string(),
+                    pool_address: address.to_string(),
+                    pool_generation,
+                    fee_generation,
+                    fee_current_pips: fee.state.current_fees.zero_for_one,
+                    fee_envelope_pips: fee.envelope.maximum.zero_for_one,
                     fee_horizon_first_unix_seconds: fee.envelope.first_timestamp,
                     fee_horizon_last_unix_seconds: fee.envelope.last_timestamp,
                 }
@@ -238,6 +331,37 @@ impl DexSwapPlan {
                     "DEX plan Camelot deadline is outside its fee horizon"
                 );
             }
+            DexRoutePlan::LynexAlgebraV1_9 {
+                router,
+                pool_address,
+                pool_generation,
+                fee_generation,
+                fee_current_pips,
+                fee_envelope_pips,
+                fee_horizon_first_unix_seconds,
+                fee_horizon_last_unix_seconds,
+            } => {
+                parse_address("DEX plan Lynex router", router)?;
+                parse_address("DEX plan Lynex pool", pool_address)?;
+                ensure!(
+                    *pool_generation > 0,
+                    "DEX plan Lynex pool generation is zero"
+                );
+                ensure!(*fee_generation > 0, "DEX plan Lynex fee generation is zero");
+                ensure!(
+                    fee_envelope_pips >= fee_current_pips,
+                    "DEX plan Lynex envelope is below its current fee"
+                );
+                ensure!(
+                    fee_horizon_last_unix_seconds >= fee_horizon_first_unix_seconds,
+                    "DEX plan Lynex fee horizon is reversed"
+                );
+                ensure!(
+                    self.deadline_unix_seconds >= u64::from(*fee_horizon_first_unix_seconds)
+                        && self.deadline_unix_seconds <= u64::from(*fee_horizon_last_unix_seconds),
+                    "DEX plan Lynex deadline is outside its fee horizon"
+                );
+            }
             DexRoutePlan::UniswapV4 {
                 router,
                 pool_id,
@@ -302,6 +426,14 @@ impl DexSwapPlan {
             } => SwapRoute::CamelotV3 {
                 router: parse_address("DEX plan Camelot V3 router", router)?,
                 pool: parse_address("DEX plan Camelot V3 pool", pool_address)?,
+            },
+            DexRoutePlan::LynexAlgebraV1_9 {
+                router,
+                pool_address,
+                ..
+            } => SwapRoute::LynexAlgebraV1_9 {
+                router: parse_address("DEX plan Lynex router", router)?,
+                pool: parse_address("DEX plan Lynex pool", pool_address)?,
             },
             DexRoutePlan::UniswapV4 {
                 router,
@@ -384,14 +516,35 @@ mod tests {
     use alloy_primitives::{Address, U256};
 
     use crate::dex::{
-        execution::{SwapRoute, SwapSubmissionPolicy},
+        execution::{DexProtocol, SwapRoute, SwapSubmissionPolicy},
         pool_id::V4PoolKey,
     };
+    use crate::domain::config::LoadedDomainConfig;
     use crate::paired_benchmark::{
         assert_named_paired_non_regression, assert_paired_non_regression,
     };
 
-    use super::{DexRoutePlan, DexSwapPlan};
+    use super::{DexRoutePlan, DexSwapPlan, linea_lynex_allowance_requirements};
+
+    #[test]
+    fn linea_lynex_allowance_set_is_exact_provider_scoped_and_read_only_to_build() {
+        let domain =
+            LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v1.json").unwrap();
+        let requirements = linea_lynex_allowance_requirements(&domain.snapshot().pairs[0]).unwrap();
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements[0].protocol, DexProtocol::LynexAlgebraV1_9);
+        assert_eq!(requirements[1].protocol, DexProtocol::LynexAlgebraV1_9);
+        assert_eq!(requirements[0].required, U256::MAX);
+        assert_eq!(requirements[1].required, U256::MAX);
+        assert_ne!(requirements[0].token, requirements[1].token);
+        assert_eq!(requirements[0].router, requirements[1].router);
+        assert_eq!(
+            requirements[0].router,
+            "0x3921e8cb45B17fC029A0a6dE958330ca4e583390"
+                .parse::<Address>()
+                .unwrap()
+        );
+    }
 
     #[test]
     fn v3_plan_round_trips_into_an_exact_input_request() {
@@ -463,6 +616,84 @@ mod tests {
             amount_out_minimum_base_units: 5_000_000,
             deadline_unix_seconds: 1_900_000_002,
         }
+    }
+
+    fn lynex_plan() -> DexSwapPlan {
+        DexSwapPlan {
+            route: DexRoutePlan::LynexAlgebraV1_9 {
+                router: "0x3921e8cb45B17fC029A0a6dE958330ca4e583390".to_owned(),
+                pool_address: "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".to_owned(),
+                pool_generation: 8,
+                fee_generation: 7,
+                fee_current_pips: 50,
+                fee_envelope_pips: 50,
+                fee_horizon_first_unix_seconds: 1_900_000_000,
+                fee_horizon_last_unix_seconds: 1_900_000_002,
+            },
+            token_in: "0xA219439258ca9da29e9cC4cE5596924745e12B93".to_owned(),
+            token_out: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff".to_owned(),
+            amount_in_base_units: 6_000_000,
+            amount_out_minimum_base_units: 5_900_000,
+            deadline_unix_seconds: 1_900_000_002,
+        }
+    }
+
+    #[test]
+    fn lynex_plan_binds_single_fee_horizon_and_provider_identity() {
+        let plan = lynex_plan();
+        let encoded = serde_json::to_value(&plan).unwrap();
+        assert_eq!(encoded["route"]["protocol"], "lynex_algebra_v1_9");
+        assert_eq!(encoded["route"]["fee_generation"], 7);
+        assert_eq!(encoded["route"]["fee_current_pips"], 50);
+        assert_eq!(encoded["route"]["fee_envelope_pips"], 50);
+
+        let request = plan.execution_request("rustarb-lynex-plan.dex").unwrap();
+        assert!(matches!(
+            request.route,
+            SwapRoute::LynexAlgebraV1_9 { router, pool }
+                if router
+                    == "0x3921e8cb45B17fC029A0a6dE958330ca4e583390"
+                        .parse::<Address>()
+                        .unwrap()
+                    && pool
+                        == "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"
+                            .parse::<Address>()
+                            .unwrap()
+        ));
+
+        let mut expired = plan;
+        expired.deadline_unix_seconds = 1_900_000_003;
+        assert!(expired.validate().is_err());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Lynex/Uniswap durable-plan benchmark"]
+    fn benchmark_uniswap_and_lynex_plan_materialization() {
+        let uniswap = DexSwapPlan {
+            route: DexRoutePlan::UniswapV3 {
+                router: Address::repeat_byte(0x11).to_string(),
+                pool_address: Address::repeat_byte(0x22).to_string(),
+                fee_pips: 500,
+            },
+            token_in: Address::repeat_byte(0x33).to_string(),
+            token_out: Address::repeat_byte(0x44).to_string(),
+            amount_in_base_units: 6_000_000,
+            amount_out_minimum_base_units: 5_900_000,
+            deadline_unix_seconds: 1_900_000_002,
+        };
+        let lynex = lynex_plan();
+        assert_named_paired_non_regression(
+            "lynex_algebra_v1_9_plan_materialization_benchmark",
+            1.10,
+            "uniswap_v3",
+            "lynex_algebra_v1_9",
+            || {
+                black_box(uniswap.execution_request("bench-uniswap")).unwrap();
+            },
+            || {
+                black_box(lynex.execution_request("bench-lynex")).unwrap();
+            },
+        );
     }
 
     #[test]

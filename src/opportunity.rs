@@ -1091,6 +1091,32 @@ impl PairRuntime {
                         .context("hydrated Pancake pool is absent from pair config")?
                         .selection_enabled
                 }
+                crate::dex::hydration::PoolIdentity::CamelotV3 { address } => {
+                    config
+                        .dex
+                        .camelot_v3
+                        .as_ref()
+                        .and_then(|configured| {
+                            configured.pools.iter().find(|candidate| {
+                                Address::from_str(&candidate.expected_address).ok() == Some(address)
+                            })
+                        })
+                        .context("hydrated Camelot pool is absent from pair config")?
+                        .selection_enabled
+                }
+                crate::dex::hydration::PoolIdentity::LynexAlgebraV1_9 { address } => {
+                    config
+                        .dex
+                        .lynex_algebra_v1_9
+                        .as_ref()
+                        .and_then(|configured| {
+                            configured.pools.iter().find(|candidate| {
+                                Address::from_str(&candidate.expected_address).ok() == Some(address)
+                            })
+                        })
+                        .context("hydrated Lynex pool is absent from pair config")?
+                        .selection_enabled
+                }
                 _ => true,
             };
             if selection_enabled {
@@ -1766,6 +1792,7 @@ mod tests {
                 token1: token_b,
                 pool,
                 camelot_fee: None,
+                lynex_fee: None,
             }],
             unavailable: vec![],
         })
@@ -1822,6 +1849,7 @@ mod tests {
                     token1,
                     pool: uniswap_pool,
                     camelot_fee: None,
+                    lynex_fee: None,
                 },
                 HydratedPool {
                     pair_id: "test-pair".into(),
@@ -1833,6 +1861,7 @@ mod tests {
                     token1,
                     pool: pancake_pool,
                     camelot_fee: None,
+                    lynex_fee: None,
                 },
             ],
             unavailable: vec![],
@@ -1919,6 +1948,7 @@ mod tests {
                     token1,
                     pool: base.pool.clone(),
                     camelot_fee: None,
+                    lynex_fee: None,
                 },
                 HydratedPool {
                     pair_id: "test-pair".into(),
@@ -1930,6 +1960,7 @@ mod tests {
                     token1,
                     pool: base.pool.clone(),
                     camelot_fee: None,
+                    lynex_fee: None,
                 },
                 HydratedPool {
                     pair_id: "test-pair".into(),
@@ -1944,6 +1975,7 @@ mod tests {
                         state,
                         envelope,
                     }),
+                    lynex_fee: None,
                 },
             ],
             unavailable: vec![],

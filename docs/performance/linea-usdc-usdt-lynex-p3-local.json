@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "artifact_id": "linea-usdc-usdt-lynex-p3-local",
+  "captured_at_utc": "2026-08-06T05:58:41Z",
+  "base_revision": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "measurement_scope": "p3_pinned_linea_lynex_discovery_hydration_and_quoter_parity_working_tree",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)"
+  },
+  "source_sha256": {
+    "src/dex/hydration.rs": "89274a14ea97688dc409eb026618adf5c407faab02fb2d09a63b813810342372",
+    "tests/linea_lynex_parity.rs": "7eddb97128425b6c7b11fea75b777f3e05a8307c6fb49a942c76756f2e3eddbe",
+    "config/strategies/usdt-usdc-linea-lynex.v1.read-only.json": "7b561c9bb5227d3aa23c1218a1e91964e1a636478f377d0fb9a466f950d59dd0",
+    "docs/performance/linea-usdc-usdt-lynex-p2-local.json": "3df2c7fdd85605416998e0f7b682ad64a43d48075e94c66b1cfc01668902b101"
+  },
+  "correctness": {
+    "quality_command": "scripts/quality.sh",
+    "lib_tests_discovered": 568,
+    "lib_tests_passed": 556,
+    "lib_tests_ignored": 12,
+    "failures": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "parity_command": "cargo test --test linea_lynex_parity -- --ignored --nocapture",
+    "parity_tests_passed": 1,
+    "gate": "pass"
+  },
+  "pinned_parity": {
+    "rpc_profile": "public_linea_fallback_read_only",
+    "chain_id": 59144,
+    "block_number": 31631634,
+    "block_hash": "0xd5bb0a033143a1f0dd7a3df0018349bb4cf8d2ae2bb3056c8021b076f0896ed5",
+    "parent_hash": "0x23c9e193be30d6f80834e400968c35aab0e460648c3082137c1dd081953bbd3f",
+    "pool": "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b",
+    "fee_pips": 50,
+    "tick": 8,
+    "liquidity": "80629033457457",
+    "exact_input_samples": 6,
+    "exact_output_samples": 6,
+    "exact_input": "byte_exact",
+    "exact_output": "byte_exact",
+    "prepared_boundaries": "byte_exact",
+    "code_hashes": {
+      "factory": "0xac02b99415a541f0b2af2d4c9adc8d01453b6326cdcc7ebfdcd476251fb46aec",
+      "pool_deployer": "0xce8356d888d759ae2054769f394fa65e0b1ffd6546204795888706c89f3ce3e5",
+      "router": "0x399402bce62254e77e3f04826786d52022a108faa81e307850e5cbb639616960",
+      "quoter": "0xcb9fc7bbe7aa1653c85fe95cdfe33103270504728fbd3a7d1f545d8074a031e3",
+      "pool": "0xe47e8b853488046e0f3f1435d31c39b9bf58051201cf42969ca50479e20de0a5",
+      "data_storage_operator": "0x8658e13281adbada01e6fe6f1cb616b7e9d5df8bcac17cd89c0493e5b35a7343",
+      "usdc": "0x469a90ba4c77663d6a9512da10e00f54cae91fda8007c53ad1ba2789457ea5fb",
+      "usdt": "0x4d9be648c5bf39973670d9f8b481d5d0b971e6a2db2deccc6b98cde21c5dd83e",
+      "multicall3": "0x8ec8aa5d07a37e47597b3a254f5cbf39fa2080526ae34db3a564fffed82b99ad"
+    },
+    "signing": false,
+    "broadcast": false,
+    "allowance_mutation": false,
+    "gate": "pass"
+  },
+  "lynex_matched_provider_benchmark": {
+    "command": "cargo test --release benchmark_uniswap_and_lynex_single_fee_prepared_quote_and_build -- --ignored --nocapture --test-threads=1",
+    "control": "uniswap_v3",
+    "candidate": "lynex_algebra_v1_9",
+    "maximum_ratio": 1.05,
+    "worst_p95_ratio": 1.0158107526881721,
+    "worst_p99_ratio": 1.0460455607310701,
+    "gate": "pass"
+  },
+  "existing_paired_provider_controls": {
+    "command": "scripts/report-paired-v3-benchmarks",
+    "successful_runs": 5,
+    "median_nanoseconds": {
+      "calldata_build": {
+        "control_p95": 377.02830505371094,
+        "control_p99": 378.8762092590332,
+        "candidate_p95": 341.51411056518555,
+        "candidate_p99": 342.55059814453125
+      },
+      "event_decode": {
+        "control_p95": 8.627254486083984,
+        "control_p99": 8.708000183105469,
+        "candidate_p95": 8.957862854003906,
+        "candidate_p99": 8.960567474365234
+      },
+      "receipt_proof": {
+        "control_p95": 48.19822311401367,
+        "control_p99": 49.08577346801758,
+        "candidate_p95": 51.30020523071289,
+        "candidate_p99": 51.580108642578125
+      },
+      "plan_materialization": {
+        "control_p95": 74.03961944580078,
+        "control_p99": 74.40503311157227,
+        "candidate_p95": 72.83815002441406,
+        "candidate_p99": 73.21294021606445
+      }
+    },
+    "worst_p3_to_p2_ratio": 1.0244823363873399,
+    "maximum_allowed_ratio": 1.05,
+    "gate": "pass"
+  },
+  "local_quote": {
+    "command": "cargo bench --bench local_quote",
+    "successful_runs": 5,
+    "nanoseconds_per_operation_median": {
+      "exact_in_no_cross_zero_for_one": 469.9,
+      "exact_in_no_cross_one_for_zero": 214.1,
+      "exact_out_no_cross_zero_for_one": 349.6,
+      "exact_out_no_cross_one_for_zero": 319.1,
+      "prepared_exact_in_no_cross_zero_for_one": 340.7,
+      "prepared_exact_in_no_cross_one_for_zero": 221.3,
+      "prepared_exact_out_no_cross_zero_for_one": 232.1,
+      "prepared_exact_out_no_cross_one_for_zero": 313.3,
+      "prepare_sparse_exact_input_curve": 12408.8,
+      "iterative_exact_out_above_sparse_capacity": 7996.2,
+      "prepared_exact_out_above_sparse_capacity": 30.9
+    },
+    "worst_p3_to_p2_ratio": 1.0012942191544434,
+    "maximum_allowed_ratio": 1.05,
+    "gate": "pass"
+  },
+  "capacity_replay": {
+    "command": "scripts/report-capacity-replay",
+    "successful_runs": 5,
+    "total_strategy_frames_per_run": 2000000,
+    "frames_per_second_median": 13321717,
+    "p3_to_p2_throughput_ratio": 1.0321102982267114,
+    "p3_to_p0_throughput_ratio": 1.044760655557712,
+    "decision_p95_ns_median": 42,
+    "decision_p99_ns_median": 42,
+    "decision_maximum_ns_worst": 56041,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "provider_parity_gate": "pass",
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "production_authority_added": false,
+  "target_c4_measurement": "required_before_rollout",
+  "p3_gate": "pass"
+}

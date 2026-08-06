@@ -37,6 +37,9 @@ fn gke_manifest_is_the_full_live_v14_adaptive_owner() {
         "ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-arbitrum-wallet.jsonl"
     ));
     assert!(RELEASE_PLATFORM.contains(
+        "ARBITRAGE_LINEA_WALLET_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-linea-wallet.jsonl"
+    ));
+    assert!(RELEASE_PLATFORM.contains(
         "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH: /var/lib/arb-bot/arbitrage-binance-orders.jsonl"
     ));
     assert!(
@@ -57,6 +60,10 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
         .unwrap()["snapshot"]["pairs"][0]["strategy"];
     assert!(live_strategy.get("balance_safety_multiplier").is_none());
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
+    assert!(DEPLOY_WORKFLOW.contains("Verify operator-maintained Linea gas invariant read-only"));
+    assert!(DEPLOY_WORKFLOW.contains("https://rpc.linea.build"));
+    assert!(DEPLOY_WORKFLOW.contains("2386f26fc10000"));
+    assert!(DEPLOY_WORKFLOW.contains("less than the reviewed 0.01 ETH Linea operator gas reserve"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains("compiled-multi-pair-production.v1.json"));
@@ -66,6 +73,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:ARBUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:ESPUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:WLDUSDC"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:USDCUSDT"));
+    assert!(DEPLOY_WORKFLOW.contains("strategy:linea-usdt-usdc"));
+    assert!(DEPLOY_WORKFLOW.contains("linea-usdt-usdc-lynex-algebra-v1-9-full-live-v1"));
+    assert!(DEPLOY_WORKFLOW.contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"));
+    assert!(DEPLOY_WORKFLOW.contains("lynex_algebra_v1_9"));
     assert!(DEPLOY_WORKFLOW.contains("live_runtime"));
     assert!(DEPLOY_WORKFLOW.contains("public_price_collector"));
     assert!(
@@ -131,9 +143,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("engine.take_adaptive_sizing_jobs()"));
     assert!(MAIN.contains("esp_engine.take_adaptive_sizing_jobs()"));
     assert!(MAIN.contains("arb_engine.take_adaptive_sizing_jobs()"));
+    assert!(MAIN.contains("linea_engine.take_adaptive_sizing_jobs()"));
     assert!(MAIN.contains("engine.on_adaptive_sizing_result(result)"));
     assert!(MAIN.contains("esp_engine.on_adaptive_sizing_result(result)"));
     assert!(MAIN.contains("arb_engine.on_adaptive_sizing_result(result)"));
+    assert!(MAIN.contains("linea_engine.on_adaptive_sizing_result(result)"));
     assert!(DEPLOY_WORKFLOW.contains("Bootstrap reviewed ARB inventory once"));
     assert!(DEPLOY_WORKFLOW.contains("bootstrap-arb-inventory --quote-usdc 500"));
     assert!(DEPLOY_WORKFLOW.contains("active_operation_count=0"));
@@ -156,6 +170,15 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("\"path\":\"/spec/replicas\",\"value\":1"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
     assert!(DEPLOY_WORKFLOW.contains("wait_operation_owner \"${bootstrap_owner}\" bootstrap"));
+    assert!(DEPLOY_WORKFLOW.contains("Verify Binance LINEA direct capital routes read-only"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-capital-recovery --coin USDC --network LINEA"));
+    assert!(DEPLOY_WORKFLOW.contains("binance-capital-recovery --coin USDT --network LINEA"));
+    assert!(DEPLOY_WORKFLOW.contains("secretProviderClass\": \"arb-bot-binance-capital-read"));
+    assert!(!DEPLOY_WORKFLOW.contains("scripts/create-gke-node-pool"));
+    assert!(!DEPLOY_WORKFLOW.contains("node-pools delete"));
+    assert!(!DEPLOY_WORKFLOW.contains("delete persistentvolumeclaim arb-bot-state"));
+    assert!(DEPLOY_WORKFLOW.contains(".config.machineType"));
+    assert!(DEPLOY_WORKFLOW.contains(".autoscaling.enabled // false"));
 }
 
 #[test]
@@ -181,6 +204,18 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
             .count(),
         2
     );
+    assert_eq!(
+        DEPLOYMENT
+            .matches("export LINEA_RPC_URL=\"https://linea-mainnet.g.alchemy.com/v2/")
+            .count(),
+        2
+    );
+    assert_eq!(
+        DEPLOYMENT
+            .matches("export LINEA_WS_URL=\"wss://linea-mainnet.g.alchemy.com/v2/")
+            .count(),
+        2
+    );
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/BINANCE_API_KEY"));
     assert!(!DEPLOYMENT.contains("/var/run/secrets/arb-bot-esp/EVM_WALLET_PRIVATE_KEY"));
     assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-esp-arbitrum-v7-six-usdc-detector"));
@@ -188,9 +223,9 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
         DEPLOY_WORKFLOW
             .matches(".pairs[0].quote_sizing.token_a_base_units")
             .count(),
-        3
+        4
     );
-    assert_eq!(DEPLOY_WORKFLOW.matches("= 6000000").count(), 3);
+    assert_eq!(DEPLOY_WORKFLOW.matches("= 6000000").count(), 4);
     assert!(DEPLOY_WORKFLOW.contains(".pairs[0].full_live_policy.production_approval_actor"));
     assert!(DEPLOY_WORKFLOW.contains("arbitrum_max_fee_headroom_bps"));
     assert!(DEPLOY_WORKFLOW.contains("router_allowance_mode"));
@@ -223,6 +258,8 @@ fn gke_full_live_runtime_keeps_durable_state_and_safe_rollback_guards() {
     assert!(DEPLOY_WORKFLOW.contains("previous_durable_schema_version >= durable_schema_version"));
     assert!(DEPLOY_WORKFLOW.contains("automatic rollback refused"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl rollout undo deployment/arb-bot"));
+    assert!(DEPLOY_WORKFLOW.contains("fixed_pool"));
+    assert!(!DEPLOY_WORKFLOW.contains("GKE_RELEASE_ID"));
 }
 
 #[test]

@@ -18,6 +18,9 @@
       "uniswap_v3",
       "pancakeswap_v3",
       "camelot_v3"
+    ],
+    "capacity-linea-usdt-usdc": [
+      "lynex_algebra_v1_9"
     ]
   },
   "rehydration_fixture": {
@@ -162,9 +165,9 @@
       "pool_count": 1
     },
     {
-      "pair_id": "capacity-bsc-usd1-usdc",
-      "symbol": "USD1USDC",
-      "network_id": "eip155:56",
+      "pair_id": "capacity-linea-usdt-usdc",
+      "symbol": "USDCUSDT",
+      "network_id": "eip155:59144",
       "candidate_ids": [3184],
       "pool_count": 1
     }

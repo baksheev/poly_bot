@@ -544,6 +544,8 @@ impl NetworkRuntimeRegistry {
                             CompiledNetworkGasPolicy::WorldChainV12 { .. } => "world_chain_v12",
                             CompiledNetworkGasPolicy::ArbitrumOne { .. } =>
                                 "arbitrum_one_fail_closed",
+                            CompiledNetworkGasPolicy::LineaMainnet { .. } =>
+                                "linea_mainnet_fail_closed",
                             CompiledNetworkGasPolicy::ReadOnly => "read_only",
                         },
                         "provider_capability_profile": reads.provider().id.as_str(),

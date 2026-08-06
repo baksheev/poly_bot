@@ -5,7 +5,8 @@
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v14.json",
     "config/strategies/usdc-esp-arbitrum.v7.json",
-    "config/strategies/usdc-arb-arbitrum.v5.json"
+    "config/strategies/usdc-arb-arbitrum.v5.json",
+    "config/strategies/usdt-usdc-linea-lynex.v1.json"
   ],
   "accounts": [
     {
@@ -66,6 +67,7 @@
   "reviewed_live_strategies": [
     "strategy:arbitrum-usdc-arb",
     "strategy:arbitrum-usdc-esp",
+    "strategy:linea-usdt-usdc",
     "strategy:world-chain-usdc-wld"
   ],
   "stream_shard_symbol_capacity": 20,
@@ -80,6 +82,7 @@
         "ARBITRUM_WS_URL",
         "ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH",
         "ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH",
+        "ARBITRAGE_LINEA_WALLET_JOURNAL_PATH",
         "ARBITRAGE_TRADE_JOURNAL_PATH",
         "ARBITRAGE_WALLET_JOURNAL_PATH",
         "BINANCE_API_KEY",
@@ -90,6 +93,8 @@
         "EVM_WALLET_ADDRESS",
         "EVM_WALLET_JOURNAL_PATH",
         "EVM_WALLET_PRIVATE_KEY",
+        "LINEA_RPC_URL",
+        "LINEA_WS_URL",
         "REBALANCE_EXECUTOR_JOURNAL_PATH"
       ]
     },
@@ -98,7 +103,9 @@
       "names": [
         "ARBITRUM_RPC_URL",
         "ARBITRUM_WS_URL",
-        "EVM_WALLET_ADDRESS"
+        "EVM_WALLET_ADDRESS",
+        "LINEA_RPC_URL",
+        "LINEA_WS_URL"
       ]
     }
   ],
@@ -118,6 +125,10 @@
     {
       "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",
       "path_env": "ARBITRAGE_WALLET_JOURNAL_PATH"
+    },
+    {
+      "owner_id": "owner:evm-execution:eip155:59144:evm-wallet:primary",
+      "path_env": "ARBITRAGE_LINEA_WALLET_JOURNAL_PATH"
     },
     {
       "owner_id": "owner:evm-execution:eip155:480:evm-wallet:primary",

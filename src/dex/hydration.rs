@@ -6,6 +6,7 @@ use anyhow::{Context, ensure};
 use crate::{
     chain::rpc::{CanonicalBlock, EthCall, JsonRpcClient},
     dex::{
+        algebra_v1_9::decode_single_fee_global_state,
         camelot_fee::{
             AdaptiveFeeConfiguration, DirectionalFees, FeeEnvelope, FeeProjectionState, Timepoint,
         },
@@ -13,13 +14,17 @@ use crate::{
         pool_id::V4PoolKey,
     },
     domain::config::{
-        CamelotV3PoolConfig, DexProvider, DomainSnapshot, PairConfig, UniswapV4PoolConfig,
+        CamelotV3PoolConfig, DexProvider, DomainSnapshot, LynexAlgebraV1_9PoolConfig, PairConfig,
+        UniswapV4PoolConfig,
     },
     network_runtime::{NetworkReadClass, NetworkReadCoordinator},
 };
 
 const MIN_TICK: i32 = -887_272;
 const MAX_TICK: i32 = 887_272;
+// Keep aggregate calldata below conservative public/provider request limits.
+// This is startup-only hydration and never runs in the trading hot path.
+const ALGEBRA_MULTICALL_CHUNK_SIZE: usize = 100;
 
 #[derive(Debug)]
 pub struct HydratedDexState {
@@ -36,10 +41,18 @@ pub struct HydratedPool {
     pub token1: Address,
     pub pool: ClmmPool,
     pub camelot_fee: Option<HydratedCamelotFee>,
+    pub lynex_fee: Option<HydratedLynexFee>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HydratedCamelotFee {
+    pub data_storage_operator: Address,
+    pub state: FeeProjectionState,
+    pub envelope: FeeEnvelope,
+}
+
+#[derive(Debug, Clone)]
+pub struct HydratedLynexFee {
     pub data_storage_operator: Address,
     pub state: FeeProjectionState,
     pub envelope: FeeEnvelope,
@@ -107,6 +120,7 @@ pub enum PoolIdentity {
     V3 { address: Address, fee_pips: u32 },
     PancakeV3 { address: Address, fee_pips: u32 },
     CamelotV3 { address: Address },
+    LynexAlgebraV1_9 { address: Address },
     V4 { pool_id: B256, fee_pips: u32 },
 }
 
@@ -194,7 +208,7 @@ impl<'client> DexHydrator<'client> {
         block: CanonicalBlock,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
         let aggregate_calls: Vec<_> = calls
-            .chunks(500)
+            .chunks(ALGEBRA_MULTICALL_CHUNK_SIZE)
             .map(|chunk| EthCall {
                 to: multicall,
                 data: encode_multicall3_aggregate(chunk),
@@ -202,7 +216,10 @@ impl<'client> DexHydrator<'client> {
             .collect();
         let aggregate_outputs = self.read_batch(&aggregate_calls, block).await?;
         let mut outputs = Vec::with_capacity(calls.len());
-        for (chunk, encoded) in calls.chunks(500).zip(aggregate_outputs) {
+        for (chunk, encoded) in calls
+            .chunks(ALGEBRA_MULTICALL_CHUNK_SIZE)
+            .zip(aggregate_outputs)
+        {
             outputs.extend(decode_multicall3_aggregate(&encoded, chunk.len())?);
         }
         ensure!(
@@ -249,6 +266,17 @@ impl<'client> DexHydrator<'client> {
                 self.hydrate_camelot_v3(pair, block, &mut pools, &mut unavailable)
                     .await
                     .with_context(|| format!("failed to hydrate Camelot V3 pair {}", pair.id))?;
+            }
+            if pair
+                .dex
+                .allowed_providers
+                .contains(&DexProvider::LynexAlgebraV1_9)
+            {
+                self.hydrate_lynex_algebra_v1_9(pair, block, &mut pools, &mut unavailable)
+                    .await
+                    .with_context(|| {
+                        format!("failed to hydrate Lynex Algebra V1.9 pair {}", pair.id)
+                    })?;
             }
             if pair.dex.allowed_providers.contains(&DexProvider::UniswapV4) {
                 self.hydrate_v4(pair, block, &mut pools, &mut unavailable)
@@ -511,6 +539,7 @@ impl<'client> DexHydrator<'client> {
                 token1,
                 pool,
                 camelot_fee: None,
+                lynex_fee: None,
             });
         }
         Ok(())
@@ -890,6 +919,367 @@ impl<'client> DexHydrator<'client> {
                 state: fee_state,
                 envelope,
             }),
+            lynex_fee: None,
+        });
+        Ok(())
+    }
+
+    async fn hydrate_lynex_algebra_v1_9(
+        &self,
+        pair: &PairConfig,
+        block: CanonicalBlock,
+        pools: &mut Vec<HydratedPool>,
+        unavailable: &mut Vec<UnavailablePool>,
+    ) -> anyhow::Result<()> {
+        let factory = parse_address(
+            "lynex_algebra_v1_9_factory_address",
+            pair.chain
+                .lynex_algebra_v1_9_factory_address
+                .as_deref()
+                .context("missing Lynex Algebra V1.9 factory")?,
+        )?;
+        let pool_deployer = parse_address(
+            "lynex_algebra_v1_9_pool_deployer_address",
+            pair.chain
+                .lynex_algebra_v1_9_pool_deployer_address
+                .as_deref()
+                .context("missing Lynex Algebra V1.9 pool deployer")?,
+        )?;
+        let router = parse_address(
+            "lynex_algebra_v1_9_router_address",
+            pair.chain
+                .lynex_algebra_v1_9_router_address
+                .as_deref()
+                .context("missing Lynex Algebra V1.9 router")?,
+        )?;
+        let quoter = parse_address(
+            "lynex_algebra_v1_9_quoter_address",
+            pair.chain
+                .lynex_algebra_v1_9_quoter_address
+                .as_deref()
+                .context("missing Lynex Algebra V1.9 Quoter")?,
+        )?;
+        let multicall = parse_address("multicall3_address", &pair.chain.multicall3_address)?;
+        let config = pair
+            .dex
+            .lynex_algebra_v1_9
+            .as_ref()
+            .context("missing Lynex Algebra V1.9 config")?;
+        let token_a = parse_address("token_a", &pair.token_a.contract)?;
+        let token_b = parse_address("token_b", &pair.token_b.contract)?;
+        let (token0, token1) = sort_tokens(token_a, token_b);
+        let head_timestamp = u32::try_from(self.rpc().canonical_block_timestamp(block).await?)
+            .context("Lynex canonical block timestamp exceeds uint32")?;
+
+        for configured_pool in &config.pools {
+            self.hydrate_lynex_pool(
+                pair,
+                configured_pool,
+                block,
+                head_timestamp,
+                factory,
+                pool_deployer,
+                router,
+                quoter,
+                multicall,
+                token0,
+                token1,
+                pools,
+                unavailable,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hydrate_lynex_pool(
+        &self,
+        pair: &PairConfig,
+        configured_pool: &LynexAlgebraV1_9PoolConfig,
+        block: CanonicalBlock,
+        head_timestamp: u32,
+        factory: Address,
+        pool_deployer: Address,
+        router: Address,
+        quoter: Address,
+        multicall: Address,
+        token0: Address,
+        token1: Address,
+        pools: &mut Vec<HydratedPool>,
+        unavailable: &mut Vec<UnavailablePool>,
+    ) -> anyhow::Result<()> {
+        let expected_pool = parse_address(
+            "Lynex Algebra V1.9 expected pool",
+            &configured_pool.expected_address,
+        )?;
+        let required_incentive = parse_address(
+            "Lynex Algebra V1.9 required active incentive",
+            &configured_pool.required_active_incentive,
+        )?;
+        let identity = self
+            .read_batch(
+                &[
+                    EthCall {
+                        to: factory,
+                        data: encode_call(
+                            "poolByPair(address,address)",
+                            &[word_address(token0), word_address(token1)],
+                        ),
+                    },
+                    EthCall {
+                        to: factory,
+                        data: encode_call("poolDeployer()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("token0()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("token1()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("factory()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("dataStorageOperator()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("tickSpacing()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("globalState()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("liquidity()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("activeIncentive()", &[]),
+                    },
+                    EthCall {
+                        to: expected_pool,
+                        data: encode_call("liquidityCooldown()", &[]),
+                    },
+                    EthCall {
+                        to: router,
+                        data: encode_call("factory()", &[]),
+                    },
+                    EthCall {
+                        to: router,
+                        data: encode_call("poolDeployer()", &[]),
+                    },
+                    EthCall {
+                        to: quoter,
+                        data: encode_call("factory()", &[]),
+                    },
+                    EthCall {
+                        to: quoter,
+                        data: encode_call("poolDeployer()", &[]),
+                    },
+                ],
+                block,
+            )
+            .await?;
+        ensure!(identity.len() == 15, "partial Lynex identity batch");
+        let discovered_pool = decode_address(&identity[0], 0)?;
+        if discovered_pool.is_zero() {
+            unavailable.push(UnavailablePool {
+                pair_id: pair.id.clone(),
+                protocol: DexProvider::LynexAlgebraV1_9,
+                fee_pips: None,
+                address: None,
+                pool_id: None,
+                reason: UnavailableReason::NotCreated,
+            });
+            return Ok(());
+        }
+        ensure!(
+            discovered_pool == expected_pool,
+            "Lynex factory result differs from expected pool address"
+        );
+        ensure!(
+            decode_address(&identity[1], 0)? == pool_deployer,
+            "Lynex factory pool deployer differs from configuration"
+        );
+        ensure!(
+            decode_address(&identity[2], 0)? == token0
+                && decode_address(&identity[3], 0)? == token1,
+            "Lynex pool tokens differ from configured pair"
+        );
+        ensure!(
+            decode_address(&identity[4], 0)? == factory,
+            "Lynex pool factory differs from configuration"
+        );
+        let data_storage_operator = decode_address(&identity[5], 0)?;
+        ensure!(
+            !data_storage_operator.is_zero(),
+            "Lynex data storage operator is zero"
+        );
+        let tick_spacing = decode_i24(&identity[6], 0)?;
+        ensure!(
+            tick_spacing == configured_pool.expected_tick_spacing,
+            "Lynex tick spacing differs from configuration"
+        );
+        let head = decode_single_fee_global_state(&identity[7])?;
+        let liquidity = decode_u128(&identity[8], 0)?;
+        ensure!(
+            decode_address(&identity[9], 0)? == required_incentive,
+            "Lynex active incentive differs from required value"
+        );
+        ensure!(
+            decode_u32(&identity[10], 0)? == 0,
+            "Lynex liquidity cooldown is unsupported"
+        );
+        ensure!(
+            decode_address(&identity[11], 0)? == factory
+                && decode_address(&identity[13], 0)? == factory,
+            "Lynex router or Quoter factory differs from pool factory"
+        );
+        ensure!(
+            decode_address(&identity[12], 0)? == pool_deployer
+                && decode_address(&identity[14], 0)? == pool_deployer,
+            "Lynex router or Quoter pool deployer differs from configuration"
+        );
+
+        for (name, address) in [
+            ("factory", factory),
+            ("pool deployer", pool_deployer),
+            ("pool", expected_pool),
+            ("router", router),
+            ("Quoter", quoter),
+            ("data storage operator", data_storage_operator),
+            ("Multicall3", multicall),
+            ("token0", token0),
+            ("token1", token1),
+        ] {
+            ensure!(
+                !self
+                    .rpc()
+                    .contract_code_at(address, block)
+                    .await?
+                    .is_empty(),
+                "Lynex {name} has no bytecode at pinned block"
+            );
+        }
+
+        if head.sqrt_price_x96.is_zero() {
+            unavailable.push(UnavailablePool {
+                pair_id: pair.id.clone(),
+                protocol: DexProvider::LynexAlgebraV1_9,
+                fee_pips: None,
+                address: Some(expected_pool),
+                pool_id: None,
+                reason: UnavailableReason::Uninitialized,
+            });
+            return Ok(());
+        }
+        if liquidity == 0 {
+            unavailable.push(UnavailablePool {
+                pair_id: pair.id.clone(),
+                protocol: DexProvider::LynexAlgebraV1_9,
+                fee_pips: None,
+                address: Some(expected_pool),
+                pool_id: None,
+                reason: UnavailableReason::ZeroLiquidity,
+            });
+            return Ok(());
+        }
+
+        let packed_liquidity = self
+            .rpc()
+            .storage_at(expected_pool, U256::from(3_u8), block)
+            .await?;
+        let stored_liquidity: u128 = (packed_liquidity & U256::from(u128::MAX))
+            .try_into()
+            .context("Lynex packed liquidity does not fit uint128")?;
+        ensure!(
+            stored_liquidity == liquidity,
+            "Lynex PoolState storage layout does not match reviewed V1.9 layout"
+        );
+        let volume_per_liquidity_in_block: u128 = (packed_liquidity >> 128_usize)
+            .try_into()
+            .context("Lynex packed volume does not fit uint128")?;
+
+        let fee_config = self
+            .read_batch(
+                &[EthCall {
+                    to: data_storage_operator,
+                    data: encode_call("feeConfig()", &[]),
+                }],
+                block,
+            )
+            .await?
+            .pop()
+            .context("Lynex fee configuration is missing")?;
+        let fee_config = decode_fee_configuration(&fee_config)?.validate()?;
+        let horizon = u32::try_from(configured_pool.dynamic_fee_horizon_seconds)
+            .context("Lynex fee horizon exceeds uint32")?;
+        let (oldest_index, timepoints) = self
+            .hydrate_camelot_timepoints(
+                expected_pool,
+                head.timepoint_index,
+                head_timestamp,
+                horizon,
+                block,
+            )
+            .await?;
+        let fee_state = FeeProjectionState {
+            head_timestamp,
+            latest_timepoint_timestamp: timepoints
+                .get(&head.timepoint_index)
+                .context("Lynex latest timepoint is missing after hydration")?
+                .block_timestamp,
+            tick: head.tick,
+            liquidity,
+            index: head.timepoint_index,
+            oldest_index,
+            current_fees: DirectionalFees {
+                zero_for_one: head.fee_pips,
+                one_for_zero: head.fee_pips,
+            },
+            volume_per_liquidity_in_block,
+            zero_for_one_config: fee_config,
+            one_for_zero_config: fee_config,
+            timepoints,
+        };
+        let envelope = fee_state.envelope(horizon)?;
+        ensure!(
+            envelope.current.zero_for_one == envelope.current.one_for_zero
+                && envelope.maximum.zero_for_one == envelope.maximum.one_for_zero,
+            "Lynex single-fee projection became directional"
+        );
+        let ticks = self
+            .hydrate_camelot_ticks(expected_pool, multicall, tick_spacing, block)
+            .await?;
+        let mut pool = ClmmPool::new_single_fee_algebra_v1_9(
+            envelope.maximum.zero_for_one,
+            tick_spacing,
+            head.sqrt_price_x96,
+            head.tick,
+            liquidity,
+        )?;
+        install_ticks(&mut pool, ticks)?;
+        pools.push(HydratedPool {
+            pair_id: pair.id.clone(),
+            identity: PoolIdentity::LynexAlgebraV1_9 {
+                address: expected_pool,
+            },
+            token0,
+            token1,
+            pool,
+            camelot_fee: None,
+            lynex_fee: Some(HydratedLynexFee {
+                data_storage_operator,
+                state: fee_state,
+                envelope,
+            }),
         });
         Ok(())
     }
@@ -1148,6 +1538,7 @@ impl<'client> DexHydrator<'client> {
                 token1: key.currency1,
                 pool,
                 camelot_fee: None,
+                lynex_fee: None,
             });
         }
         Ok(())

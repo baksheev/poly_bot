@@ -229,6 +229,47 @@ pub fn decode_camelot_v3_quote(encoded: &[u8]) -> anyhow::Result<(U256, u16)> {
     Ok((U256::from_be_slice(&encoded[..WORD_BYTES]), fee))
 }
 
+/// Lynex uses the upstream single-fee Algebra V1.9 router tuple. Keep a typed
+/// entry point even though its bytes match the reviewed Camelot router today;
+/// provider selection must never infer ABI compatibility from that coincidence.
+pub fn lynex_algebra_v1_9_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    recipient: Address,
+    deadline: u64,
+    amount_in: U256,
+    amount_out_minimum: U256,
+) -> anyhow::Result<Vec<u8>> {
+    camelot_v3_exact_input_single(
+        token_in,
+        token_out,
+        recipient,
+        deadline,
+        amount_in,
+        amount_out_minimum,
+    )
+}
+
+pub fn lynex_algebra_v1_9_quote_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> anyhow::Result<Vec<u8>> {
+    camelot_v3_quote_exact_input_single(token_in, token_out, amount_in)
+}
+
+pub fn lynex_algebra_v1_9_quote_exact_output_single(
+    token_in: Address,
+    token_out: Address,
+    amount_out: U256,
+) -> anyhow::Result<Vec<u8>> {
+    camelot_v3_quote_exact_output_single(token_in, token_out, amount_out)
+}
+
+pub fn decode_lynex_algebra_v1_9_quote(encoded: &[u8]) -> anyhow::Result<(U256, u16)> {
+    decode_camelot_v3_quote(encoded)
+}
+
 pub fn v4_exact_input_single(
     pool_key: V4PoolKey,
     zero_for_one: bool,
@@ -494,9 +535,12 @@ mod tests {
 
     use super::{
         camelot_v3_exact_input_single, camelot_v3_quote_exact_input_single,
-        camelot_v3_quote_exact_output_single, decode_camelot_v3_quote, decode_permit2_allowance,
-        decode_v3_quote_exact_input_single, pancake_v3_exact_input_single, permit2_approve,
-        v3_exact_input, v3_quote_exact_input_single, v4_exact_input_single,
+        camelot_v3_quote_exact_output_single, decode_camelot_v3_quote,
+        decode_lynex_algebra_v1_9_quote, decode_permit2_allowance,
+        decode_v3_quote_exact_input_single, lynex_algebra_v1_9_exact_input_single,
+        lynex_algebra_v1_9_quote_exact_input_single, lynex_algebra_v1_9_quote_exact_output_single,
+        pancake_v3_exact_input_single, permit2_approve, v3_exact_input,
+        v3_quote_exact_input_single, v4_exact_input_single,
     };
     use crate::dex::pool_id::V4PoolKey;
 
@@ -631,6 +675,91 @@ mod tests {
             U256::from(1_900_000_002_u64)
         );
         assert_eq!(U256::from_be_slice(&calldata[196..228]), U256::ZERO);
+    }
+
+    #[test]
+    fn lynex_single_fee_algebra_router_and_quoter_abis_are_byte_exact() {
+        let usdc = address("0x176211869cA2b568f2A7D4EE941E073a821EE1ff");
+        let usdt = address("0xA219439258ca9da29e9cC4cE5596924745e12B93");
+        let recipient = Address::repeat_byte(0x59);
+        let amount_in = U256::from(200_000_000_u64);
+        let minimum_out = U256::from(199_000_000_u64);
+
+        let swap = lynex_algebra_v1_9_exact_input_single(
+            usdc,
+            usdt,
+            recipient,
+            1_900_000_003,
+            amount_in,
+            minimum_out,
+        )
+        .unwrap();
+        let quote_in = lynex_algebra_v1_9_quote_exact_input_single(usdc, usdt, amount_in).unwrap();
+        let quote_out =
+            lynex_algebra_v1_9_quote_exact_output_single(usdc, usdt, minimum_out).unwrap();
+
+        assert_eq!(&swap[..4], &[0xbc, 0x65, 0x11, 0x88]);
+        assert_eq!(&quote_in[..4], &[0x2d, 0x9e, 0xbd, 0x1d]);
+        assert_eq!(&quote_out[..4], &[0x9e, 0x73, 0xc8, 0x1d]);
+        assert_eq!(swap.len(), 4 + 7 * 32);
+        assert_eq!(quote_in.len(), 4 + 4 * 32);
+        assert_eq!(quote_out.len(), 4 + 4 * 32);
+        assert_eq!(&swap[4 + 12..4 + 32], usdc.as_slice());
+        assert_eq!(&swap[4 + 32 + 12..4 + 2 * 32], usdt.as_slice());
+        assert_eq!(
+            U256::from_be_slice(&swap[4 + 4 * 32..4 + 5 * 32]),
+            amount_in
+        );
+        assert_eq!(
+            U256::from_be_slice(&swap[4 + 5 * 32..4 + 6 * 32]),
+            minimum_out
+        );
+
+        let mut response = vec![0_u8; 64];
+        response[..32].copy_from_slice(&U256::from(199_500_000_u64).to_be_bytes::<32>());
+        response[32..].copy_from_slice(&U256::from(50_u8).to_be_bytes::<32>());
+        assert_eq!(
+            decode_lynex_algebra_v1_9_quote(&response).unwrap(),
+            (U256::from(199_500_000_u64), 50)
+        );
+        response[32] = 1;
+        assert!(decode_lynex_algebra_v1_9_quote(&response).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired Lynex/Uniswap calldata benchmark"]
+    fn benchmark_uniswap_and_lynex_calldata_builders() {
+        let usdc = address("0x176211869cA2b568f2A7D4EE941E073a821EE1ff");
+        let usdt = address("0xA219439258ca9da29e9cC4cE5596924745e12B93");
+        let recipient = Address::repeat_byte(0x59);
+        assert_named_paired_non_regression(
+            "lynex_algebra_v1_9_calldata_build_benchmark",
+            1.10,
+            "uniswap_v3",
+            "lynex_algebra_v1_9",
+            || {
+                black_box(v3_exact_input(
+                    usdt,
+                    usdc,
+                    50,
+                    recipient,
+                    U256::from(6_000_000_u64),
+                    U256::from(5_900_000_u64),
+                ))
+                .unwrap();
+            },
+            || {
+                black_box(lynex_algebra_v1_9_exact_input_single(
+                    usdt,
+                    usdc,
+                    recipient,
+                    1_900_000_002,
+                    U256::from(6_000_000_u64),
+                    U256::from(5_900_000_u64),
+                ))
+                .unwrap();
+            },
+        );
     }
 
     #[test]

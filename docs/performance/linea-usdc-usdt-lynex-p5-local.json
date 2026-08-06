@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "stage": "P5_market_data_selection_and_maximum_capacity",
+  "captured_at_utc": "2026-08-06T06:42:26Z",
+  "repository_head": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "environment": {
+    "os": "Darwin 25.3.0 arm64",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)",
+    "target_cpu_class": "local_apple_silicon",
+    "production_target_required": "c4-highcpu-8"
+  },
+  "scope": {
+    "pair": "linea-usdt-usdc",
+    "binance_symbol": "USDCUSDT",
+    "chain_id": 59144,
+    "provider": "lynex_algebra_v1_9",
+    "selection_enabled": true,
+    "execution_enabled": false,
+    "rebalance_enabled": false,
+    "maximum_capacity_pair_count": 20,
+    "maximum_capacity_pool_count": 25,
+    "provider_pool_counts": {
+      "uniswap_v3": 22,
+      "pancakeswap_v3": 1,
+      "camelot_v3": 1,
+      "lynex_algebra_v1_9": 1
+    }
+  },
+  "verification": {
+    "domain_compiler_tests": "9 passed",
+    "capacity_replay_tests": "4 passed",
+    "capacity_reporting_tests": "2 passed",
+    "full_frames_per_revision_per_pair": 2000000,
+    "interleaved_pairs": 5,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P4-control then P5-candidate binary runs on the same host frequency session",
+    "p4_binary_sha256": "8690e0b37dec3941b0fbc2b03ca8aad569b7e4d529644de5648458b44f7b74bd",
+    "p5_binary_sha256": "a6408e5e7cde706b73f9c7c98c1877c3a7668da45b2c7a5af70868873cb7c2aa",
+    "p4_frames_per_second": [9796470, 10033109, 9987571, 9956638, 10036375],
+    "p5_frames_per_second": [10191677, 9901382, 10080706, 9963564, 10001604],
+    "p4_frames_per_second_median": 9987571,
+    "p5_frames_per_second_median": 10001604,
+    "p5_to_p4_throughput_ratio": 1.001405045571137,
+    "p4_decision_p95_ns_median": 84,
+    "p5_decision_p95_ns_median": 84,
+    "p4_decision_p99_ns_median": 84,
+    "p5_decision_p99_ns_median": 84,
+    "maximum_allowed_regression_ratio": 0.9,
+    "gate": "pass"
+  },
+  "absolute_local_gate": {
+    "successful_runs": 5,
+    "frames_per_second_median": 10221434,
+    "decision_p95_ns_median": 84,
+    "decision_p99_ns_median": 84,
+    "hard_decision_p99_ns": 25000,
+    "provider_parity_gate": "pass",
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "result": "pass"
+}

@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "artifact_id": "linea-usdc-usdt-lynex-p4-local",
+  "captured_at_utc": "2026-08-06T06:25:16Z",
+  "base_revision": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "measurement_scope": "p4_linea_canonical_ingestion_and_lynex_single_fee_mirror_working_tree",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)"
+  },
+  "source_sha256": {
+    "src/dex/events.rs": "b07f9a99d822c4de4f9cf85fdc8825a30fb5f0a050dda87f77b86609a224459b",
+    "src/dex/mirror.rs": "0be3f5f5096284dba74ddfe93c617a5e110a58c9da8af6a7b6d189b0284276fa",
+    "src/dex/hydration.rs": "89274a14ea97688dc409eb026618adf5c407faab02fb2d09a63b813810342372",
+    "src/main.rs": "9c9a24508dfecf778c718edadbce08a3048800ba2142799a3e95d8fd22fbdbb2",
+    "tests/linea_lynex_parity.rs": "2359af67677ecad8fe9a03de61dd7e7a6e4a7945c1472ad426e2d4b57abc6d8f",
+    "docs/performance/linea-usdc-usdt-lynex-p3-local.json": "3879aa8f57dc054a5e6c8692d658053b96a4ba46fd37a5bdec93cbe548b9f1f7"
+  },
+  "correctness": {
+    "quality_command": "scripts/quality.sh",
+    "lib_tests_discovered": 570,
+    "lib_tests_passed": 557,
+    "lib_tests_ignored": 13,
+    "failures": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "event_replay_command": "cargo test --test linea_lynex_parity linea_lynex_transition_events_reproduce_pinned_post_state -- --ignored --nocapture",
+    "event_replay": {
+      "block_number": 31630242,
+      "block_hash": "0x1aac8782da68d166c9557442342bd4e02c9818e19094c9f3e94e11ffe6ea5ea8",
+      "logs": 2,
+      "ordered_kinds": ["fee", "swap"],
+      "fee_before_swap": true,
+      "post_state_parity": "byte_exact"
+    },
+    "provider_routing_and_uint16_padding": "pass",
+    "existing_gap_duplicate_reorder_removed_parent_and_reconnect_matrix": "pass",
+    "gate": "pass"
+  },
+  "lynex_event_decoder_benchmark": {
+    "command": "cargo test --release benchmark_uniswap_and_lynex_swap_decoders -- --ignored --nocapture --test-threads=1",
+    "control": "uniswap_v3",
+    "candidate": "lynex_algebra_v1_9",
+    "rounds": 32,
+    "iterations_per_provider": 8388608,
+    "maximum_ratio": 1.10,
+    "p95_ratio": 1.0291327885597548,
+    "p99_ratio": 0.8787570924960948,
+    "gate": "pass"
+  },
+  "existing_paired_provider_controls": {
+    "command": "scripts/report-paired-v3-benchmarks",
+    "successful_runs": 5,
+    "median_nanoseconds": {
+      "calldata_build": [379.05105209350586, 387.66447830200195, 342.1335220336914, 349.36046600341797],
+      "event_decode": [8.27169418334961, 8.513450622558594, 8.92575454711914, 8.97439193725586],
+      "receipt_proof": [49.532413482666016, 49.74285888671875, 50.43920135498047, 50.54887008666992],
+      "plan_materialization": [74.38278198242188, 74.80366897583008, 73.06051254272461, 73.76988983154297]
+    },
+    "array_order": ["control_p95", "control_p99", "candidate_p95", "candidate_p99"],
+    "worst_p4_to_p3_ratio": 1.0276813185726017,
+    "maximum_allowed_ratio": 1.05,
+    "gate": "pass"
+  },
+  "local_quote": {
+    "command": "cargo bench --bench local_quote",
+    "successful_runs": 5,
+    "nanoseconds_per_operation_median": {
+      "exact_in_no_cross_zero_for_one": 472.3,
+      "exact_in_no_cross_one_for_zero": 215.3,
+      "exact_out_no_cross_zero_for_one": 353.1,
+      "exact_out_no_cross_one_for_zero": 321.4,
+      "prepared_exact_in_no_cross_zero_for_one": 342.8,
+      "prepared_exact_in_no_cross_one_for_zero": 222.5,
+      "prepared_exact_out_no_cross_zero_for_one": 232.7,
+      "prepared_exact_out_no_cross_one_for_zero": 315.1,
+      "prepare_sparse_exact_input_curve": 12497.4,
+      "iterative_exact_out_above_sparse_capacity": 8042.1,
+      "prepared_exact_out_above_sparse_capacity": 30.8
+    },
+    "worst_p4_to_p3_ratio": 1.0100114416475972,
+    "maximum_allowed_ratio": 1.05,
+    "gate": "pass"
+  },
+  "capacity_replay": {
+    "build_commands": [
+      "cargo build --release --bin arb_bot",
+      "git worktree add --detach <temporary-p0-worktree> HEAD",
+      "cargo build --release --bin arb_bot"
+    ],
+    "method": "five interleaved p0_then_p4 pairs on the same host frequency state",
+    "successful_pairs": 5,
+    "total_strategy_frames_per_binary_per_pair": 2000000,
+    "p0_frames_per_second_median": 12289922,
+    "p4_frames_per_second_median": 12271930,
+    "p4_to_p0_throughput_ratio": 0.9985360362742741,
+    "p0_decision_p95_ns_median": 42,
+    "p4_decision_p95_ns_median": 42,
+    "p0_decision_p99_ns_median": 83,
+    "p4_decision_p99_ns_median": 83,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "provider_parity_gate": "pass",
+    "discarded_unpaired_frequency_cohort": {
+      "reason": "host timer/frequency step changed all absolute latencies together; replaced by interleaved exact-binary A/B",
+      "used_for_gate": false
+    },
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "production_authority_added": false,
+  "target_c4_measurement": "required_before_rollout",
+  "p4_gate": "pass"
+}

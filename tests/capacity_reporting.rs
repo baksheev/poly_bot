@@ -11,6 +11,7 @@ fn report_enforces_the_full_read_only_capacity_gate() {
 
     assert!(report.contains(".pair_count == 20"));
     assert!(report.contains(".provider_pool_counts.camelot_v3 == 1"));
+    assert!(report.contains(".provider_pool_counts.lynex_algebra_v1_9 == 1"));
     assert!(report.contains(".provider_parity.prepared_quote.p99_ratio_bps <= 10500"));
     assert!(report.contains(".provider_parity.prepared_curve_build.p99_ratio_bps <= 12000"));
     assert!(report.contains(".frames_per_pair >= 100000"));
@@ -34,6 +35,8 @@ fn report_enforces_the_full_read_only_capacity_gate() {
     assert!(artifact.contains("\"symbol\": \"ARBUSDC\""));
     assert!(artifact.contains("\"pancakeswap_v3\""));
     assert!(artifact.contains("\"camelot_v3\""));
+    assert!(artifact.contains("\"lynex_algebra_v1_9\""));
+    assert!(artifact.contains("\"pair_id\": \"capacity-linea-usdt-usdc\""));
 }
 
 #[test]
@@ -56,6 +59,7 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(DEPLOY_WORKFLOW.contains(".total_strategy_frames == 2000000"));
     assert!(DEPLOY_WORKFLOW.contains(".pool_count == 25"));
     assert!(DEPLOY_WORKFLOW.contains(".provider_pool_counts.camelot_v3 == 1"));
+    assert!(DEPLOY_WORKFLOW.contains(".provider_pool_counts.lynex_algebra_v1_9 == 1"));
     assert!(DEPLOY_WORKFLOW.contains(".provider_parity.prepared_quote.p99_ratio_bps <= 10500"));
     assert!(
         DEPLOY_WORKFLOW.contains(".provider_parity.prepared_curve_build.p99_ratio_bps <= 12000")

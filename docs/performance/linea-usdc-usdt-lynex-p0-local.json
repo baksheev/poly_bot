@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "artifact_id": "linea-usdc-usdt-lynex-p0-local",
+  "captured_at_utc": "2026-08-06T04:57:23Z",
+  "base_revision": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "measurement_scope": "working_tree_with_spec_only_before_p1",
+  "profile": "release",
+  "host": {
+    "architecture": "arm64",
+    "kernel": "Darwin 25.3.0",
+    "cpu": "Apple M4 Max",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)"
+  },
+  "quality_gate": {
+    "command": "scripts/quality.sh",
+    "lib_tests_discovered": 559,
+    "lib_tests_passed": 548,
+    "lib_tests_ignored": 11,
+    "failures": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "paired_provider_controls": {
+    "command": "scripts/report-paired-v3-benchmarks",
+    "test_filter": "benchmark_uniswap_and_pancake",
+    "rounds": 32,
+    "iterations_per_provider": 8388608,
+    "maximum_ratio": 1.1,
+    "cold_first_run": {
+      "event_decode_control_p95_ns": 9.178958892822266,
+      "event_decode_candidate_p95_ns": 10.53158187866211,
+      "event_decode_p95_ratio": 1.1473612641295914,
+      "outcome": "rejected_as_noisy_and_rerun_without_widening_gate"
+    },
+    "accepted_warm_run": {
+      "calldata_build": {
+        "control_p95_ns": 377.589542388916,
+        "control_p99_ns": 390.42933654785156,
+        "candidate_p95_ns": 340.03543853759766,
+        "candidate_p99_ns": 342.9141044616699,
+        "p95_ratio": 0.9005425213481211,
+        "p99_ratio": 0.8783000465428444
+      },
+      "event_decode": {
+        "control_p95_ns": 8.758228302001953,
+        "control_p99_ns": 8.824348449707031,
+        "candidate_p95_ns": 8.98727035522461,
+        "candidate_p99_ns": 9.084381103515625,
+        "p95_ratio": 1.0261516422414225,
+        "p99_ratio": 1.0294676321193126
+      },
+      "receipt_proof": {
+        "control_p95_ns": 47.90464782714844,
+        "control_p99_ns": 47.98523712158203,
+        "candidate_p95_ns": 50.98851776123047,
+        "candidate_p99_ns": 51.178932189941406,
+        "p95_ratio": 1.064375171803984,
+        "p99_ratio": 1.0665557838188313
+      },
+      "plan_materialization": {
+        "control_p95_ns": 76.97041702270508,
+        "control_p99_ns": 84.14411544799805,
+        "candidate_p95_ns": 75.3232650756836,
+        "candidate_p99_ns": 75.42355728149414,
+        "p95_ratio": 0.9786001945846857,
+        "p99_ratio": 0.8963616395505006
+      },
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "local_quote": {
+    "command": "cargo bench --bench local_quote",
+    "nanoseconds_per_operation": {
+      "exact_in_no_cross_zero_for_one": 490.3,
+      "exact_in_no_cross_one_for_zero": 217.8,
+      "exact_out_no_cross_zero_for_one": 356.9,
+      "exact_out_no_cross_one_for_zero": 319.0,
+      "prepared_exact_in_no_cross_zero_for_one": 341.5,
+      "prepared_exact_in_no_cross_one_for_zero": 227.0,
+      "prepared_exact_out_no_cross_zero_for_one": 233.0,
+      "prepared_exact_out_no_cross_one_for_zero": 316.1,
+      "prepare_sparse_exact_input_curve": 12705.4,
+      "iterative_exact_out_above_sparse_capacity": 8138.4,
+      "prepared_exact_out_above_sparse_capacity": 29.2
+    },
+    "gate": "baseline_recorded"
+  },
+  "capacity_replay": {
+    "command": "scripts/report-capacity-replay",
+    "pair_count": 20,
+    "pool_count": 25,
+    "total_strategy_frames": 2000000,
+    "decision_p95_ns": 42,
+    "decision_p99_ns": 83,
+    "decision_maximum_ns": 3500,
+    "frames_per_second": 12750975,
+    "pool_build_p95_ns": 42,
+    "pool_build_p99_ns": 19417,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "provider_parity_gate": "pass",
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "robust_remeasurement": {
+    "reason": "replace single-point comparisons with five successful warm samples after observed nanosecond-scale tail noise",
+    "captured_window_utc": {
+      "started_at": "2026-08-06T05:14:52Z",
+      "ended_at": "2026-08-06T05:16:00Z"
+    },
+    "exact_revision": "12582d23affbeb39bb5e556c40090489ce8d3987",
+    "isolated_detached_worktree": true,
+    "paired_provider_controls": {
+      "successful_runs": 5,
+      "rounds_per_run": 32,
+      "iterations_per_provider_per_run": 8388608,
+      "discarded_noisy_runs": 2,
+      "median_nanoseconds": {
+        "calldata_build": {
+          "control_p95": 376.61727142333984,
+          "control_p99": 384.5570869445801,
+          "candidate_p95": 366.0996742248535,
+          "candidate_p99": 366.9285774230957
+        },
+        "event_decode": {
+          "control_p95": 8.68844985961914,
+          "control_p99": 8.75393295288086,
+          "candidate_p95": 8.93243408203125,
+          "candidate_p99": 9.095035552978516
+        },
+        "receipt_proof": {
+          "control_p95": 50.585269927978516,
+          "control_p99": 52.989959716796875,
+          "candidate_p95": 52.863121032714844,
+          "candidate_p99": 53.50335693359375
+        },
+        "plan_materialization": {
+          "control_p95": 76.07078552246094,
+          "control_p99": 79.19200134277344,
+          "candidate_p95": 77.10488510131836,
+          "candidate_p99": 77.53547286987305
+        }
+      },
+      "gate": "pass"
+    },
+    "local_quote": {
+      "successful_runs": 5,
+      "nanoseconds_per_operation_median": {
+        "exact_in_no_cross_zero_for_one": 483.5,
+        "exact_in_no_cross_one_for_zero": 218.1,
+        "exact_out_no_cross_zero_for_one": 357.0,
+        "exact_out_no_cross_one_for_zero": 321.7,
+        "prepared_exact_in_no_cross_zero_for_one": 346.0,
+        "prepared_exact_in_no_cross_one_for_zero": 227.7,
+        "prepared_exact_out_no_cross_zero_for_one": 234.2,
+        "prepared_exact_out_no_cross_one_for_zero": 320.0,
+        "prepare_sparse_exact_input_curve": 12681.0,
+        "iterative_exact_out_above_sparse_capacity": 8132.2,
+        "prepared_exact_out_above_sparse_capacity": 30.9
+      },
+      "gate": "pass"
+    },
+    "gate": "pass"
+  },
+  "p0_gate": "pass"
+}

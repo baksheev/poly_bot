@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "stage": "P7_receipt_settlement_restart_unknown_and_recovery",
+  "captured_at_utc": "2026-08-06T07:39:11Z",
+  "repository_head": "12582d23affbeb39bb5e556c40090489ce8d3987",
+  "environment": {
+    "os": "Darwin 25.3.0 arm64",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)",
+    "profile": "release fat-LTO codegen-units=1",
+    "production_target_required": "c4-highcpu-8"
+  },
+  "quality_gate": {
+    "command": "scripts/quality.sh",
+    "lib_tests_passed": 563,
+    "lib_tests_ignored": 15,
+    "main_tests_passed": 8,
+    "failures": 0,
+    "cargo_audit": "pass_with_3_allowed_unmaintained_warnings",
+    "gate": "pass"
+  },
+  "successful_receipt_evidence": {
+    "command": "cargo test --test linea_lynex_parity linea_lynex_successful_receipts_prove_typed_fee_and_both_swap_directions -- --ignored --exact --nocapture",
+    "chain_id": 59144,
+    "pool": "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b",
+    "typed_fee": "lynex_algebra_v1_9_fee_uint16",
+    "fee_pips": 50,
+    "receipts": [
+      {
+        "transaction_hash": "0x2af4f98a942fc5d1acb6c0fbd16e78e472719c11d13530042bf8a2a49fda48ab",
+        "block_number": 31631452,
+        "direction": "usdt_to_usdc",
+        "fee_log_index": 7,
+        "swap_log_index": 11
+      },
+      {
+        "transaction_hash": "0xa4bd7e210af4c0fe7640c553e4ba4ab7df1df14bd7b118efe7b8cb1c803a2f1b",
+        "block_number": 31630542,
+        "direction": "usdc_to_usdt",
+        "fee_log_index": 8,
+        "swap_log_index": 11
+      }
+    ],
+    "fee_positionally_before_swap": true,
+    "both_directions_proven": true,
+    "external_mutations": 0,
+    "gate": "pass"
+  },
+  "recovery_contract_evidence": {
+    "lynex_receipt_acceleration_matches_canonical_fee_swap_replay": "pass",
+    "changed_fee_generation_fails_entry_preflight": "pass",
+    "known_dex_revert_finishes_without_cex_dispatch": "pass",
+    "unknown_primary_cex_reconciles_before_market_recovery": "pass",
+    "proven_absent_zero_fill_recovery_retries": 3,
+    "persisted_backoff_ms": [250, 500],
+    "lynex_plan_survives_restart": true,
+    "immutable_recovery_target": true,
+    "gate": "pass"
+  },
+  "paired_receipt_benchmark": {
+    "label": "lynex_algebra_v1_9_receipt_accounting_and_proof_benchmark",
+    "control": "uniswap_v3",
+    "candidate": "lynex_algebra_v1_9",
+    "rounds": 32,
+    "iterations_per_provider": 8388608,
+    "control_p95_ns": 419.66724395751953,
+    "candidate_p95_ns": 429.80925369262695,
+    "p95_ratio": 1.0241667890004158,
+    "control_p99_ns": 421.25638580322266,
+    "candidate_p99_ns": 430.53293228149414,
+    "p99_ratio": 1.0220211414969618,
+    "maximum_ratio": 1.1,
+    "gate": "pass"
+  },
+  "paired_capacity_replay": {
+    "method": "five interleaved exact P6-control then P7-candidate binary runs",
+    "total_strategy_frames_per_binary_per_pair": 2000000,
+    "p6_binary_sha256": "26c9fd1bbd493e2a3d0c98f35fdfd82fa1047a7b42b91010c9cf42ce88fc3243",
+    "p7_binary_sha256": "7afdf6a58ba76f4dfc1bc5ab37201b4746fcd20fb201d3e111eb667dce21c317",
+    "p6_frames_per_second": [13378515, 13596246, 13493645, 13518015, 13432472],
+    "p7_frames_per_second": [12823009, 13561268, 13569756, 13561739, 13632757],
+    "p6_frames_per_second_median": 13493645,
+    "p7_frames_per_second_median": 13561739,
+    "p7_to_p6_throughput_ratio": 1.0050463755345571,
+    "p7_to_frozen_p0_throughput_ratio": 1.063584470991434,
+    "p6_decision_p95_ns_median": 42,
+    "p7_decision_p95_ns_median": 42,
+    "p6_decision_p99_ns_median": 42,
+    "p7_decision_p99_ns_median": 42,
+    "hard_decision_p99_ns": 25000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "network_io_performed": false,
+    "external_mutations": 0,
+    "gate": "pass_local_target_c4_required_before_rollout"
+  },
+  "result": "pass"
+}

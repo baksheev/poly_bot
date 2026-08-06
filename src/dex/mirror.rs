@@ -14,9 +14,9 @@ use crate::{
     dex::{
         camelot_fee::DirectionalFees,
         events::{
-            CamelotFeeReceiptProof, PoolLocator, PoolUpdate, decode_camelot_pool_event,
-            decode_camelot_v3_swap_amounts_after_event_validation, decode_pool_event,
-            decode_pool_event_for_locator,
+            CamelotFeeReceiptProof, LynexFeeReceiptProof, PoolLocator, PoolUpdate,
+            decode_camelot_pool_event, decode_camelot_v3_swap_amounts_after_event_validation,
+            decode_lynex_algebra_v1_9_pool_event, decode_pool_event, decode_pool_event_for_locator,
         },
         hydration::{HydratedDexState, HydratedPool, PoolIdentity, UnavailablePool},
     },
@@ -30,10 +30,11 @@ pub struct DexMirror {
     v3_indices: HashMap<Address, usize>,
     pancake_v3_indices: HashMap<Address, usize>,
     camelot_v3_indices: HashMap<Address, usize>,
+    lynex_algebra_v1_9_indices: HashMap<Address, usize>,
     v4_indices: HashMap<B256, usize>,
     last_positions: HashMap<PoolLocator, LogPosition>,
     last_block_hashes: HashMap<PoolLocator, B256>,
-    pending_camelot_fees: Vec<Option<PendingCamelotFee>>,
+    pending_adaptive_fees: Vec<Option<PendingAdaptiveFee>>,
     backfilled_through: u64,
     backfill_complete: bool,
     latest_head: CanonicalBlock,
@@ -60,7 +61,7 @@ enum LogOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingCamelotFee {
+struct PendingAdaptiveFee {
     position: LogPosition,
     block_timestamp: u32,
 }
@@ -76,6 +77,7 @@ impl DexMirror {
         let mut v3_indices = HashMap::new();
         let mut pancake_v3_indices = HashMap::new();
         let mut camelot_v3_indices = HashMap::new();
+        let mut lynex_algebra_v1_9_indices = HashMap::new();
         let mut v4_indices = HashMap::new();
         for (index, pool) in hydrated.pools.iter().enumerate() {
             let previous = match pool.identity {
@@ -84,19 +86,23 @@ impl DexMirror {
                     pancake_v3_indices.insert(address, index)
                 }
                 PoolIdentity::CamelotV3 { address } => camelot_v3_indices.insert(address, index),
+                PoolIdentity::LynexAlgebraV1_9 { address } => {
+                    lynex_algebra_v1_9_indices.insert(address, index)
+                }
                 PoolIdentity::V4 { pool_id, .. } => v4_indices.insert(pool_id, index),
             };
             ensure!(previous.is_none(), "duplicate hydrated pool identity");
         }
-        let mut camelot_timestamps = hydrated.pools.iter().filter_map(|pool| {
+        let mut adaptive_timestamps = hydrated.pools.iter().filter_map(|pool| {
             pool.camelot_fee
                 .as_ref()
                 .map(|fee| fee.state.head_timestamp)
+                .or_else(|| pool.lynex_fee.as_ref().map(|fee| fee.state.head_timestamp))
         });
-        let latest_head_timestamp = camelot_timestamps.next();
+        let latest_head_timestamp = adaptive_timestamps.next();
         ensure!(
-            camelot_timestamps.all(|timestamp| Some(timestamp) == latest_head_timestamp),
-            "hydrated Camelot pools disagree on canonical head timestamp"
+            adaptive_timestamps.all(|timestamp| Some(timestamp) == latest_head_timestamp),
+            "hydrated adaptive Algebra pools disagree on canonical head timestamp"
         );
         let pool_count = hydrated.pools.len();
         let mut recent_head_timestamps = VecDeque::with_capacity(RECENT_CANONICAL_TIMESTAMPS);
@@ -113,10 +119,11 @@ impl DexMirror {
             v3_indices,
             pancake_v3_indices,
             camelot_v3_indices,
+            lynex_algebra_v1_9_indices,
             v4_indices,
             last_positions: HashMap::new(),
             last_block_hashes: HashMap::new(),
-            pending_camelot_fees: vec![None; pool_count],
+            pending_adaptive_fees: vec![None; pool_count],
             backfilled_through: hydrated.block.number,
             backfill_complete: false,
             latest_head: hydrated.block,
@@ -128,8 +135,8 @@ impl DexMirror {
 
     pub fn apply_log(&mut self, log: &ChainLog) -> anyhow::Result<LogApplyResult> {
         ensure!(
-            !self.camelot_v3_indices.contains_key(&log.address),
-            "Camelot V3 log requires its canonical block timestamp"
+            !self.is_adaptive_algebra_address(log.address),
+            "adaptive Algebra log requires its canonical block timestamp"
         );
         self.apply_log_inner(log, None, LogOrigin::CanonicalStream)
     }
@@ -157,8 +164,8 @@ impl DexMirror {
         log: &ChainLog,
     ) -> anyhow::Result<LogApplyResult> {
         ensure!(
-            !self.camelot_v3_indices.contains_key(&log.address),
-            "Camelot V3 receipt requires its canonical Fee and block timestamp"
+            !self.is_adaptive_algebra_address(log.address),
+            "adaptive Algebra receipt requires its canonical Fee and block timestamp"
         );
         self.apply_log_inner(log, None, LogOrigin::ReceiptSettlement)
     }
@@ -201,8 +208,8 @@ impl DexMirror {
             );
         }
         ensure!(
-            self.pending_camelot_fees[pool_index].is_none(),
-            "Camelot Fee was not consumed by the preceding pool action"
+            self.pending_adaptive_fees[pool_index].is_none(),
+            "adaptive Algebra Fee was not consumed by the preceding pool action"
         );
         self.pools[pool_index]
             .camelot_fee
@@ -216,7 +223,73 @@ impl DexMirror {
                     one_for_zero: proof.one_for_zero,
                 },
             )?;
-        self.pending_camelot_fees[pool_index] = Some(PendingCamelotFee {
+        self.pending_adaptive_fees[pool_index] = Some(PendingAdaptiveFee {
+            position: proof.position(),
+            block_timestamp,
+        });
+        self.last_positions.insert(locator, proof.position());
+        self.last_block_hashes.insert(locator, proof.block_hash);
+        Ok(LogApplyResult::Applied {
+            pool_index,
+            kind: "fee",
+            refresh_required: false,
+        })
+    }
+
+    pub fn apply_lynex_fee_receipt(
+        &mut self,
+        proof: LynexFeeReceiptProof,
+        block_timestamp: u32,
+    ) -> anyhow::Result<LogApplyResult> {
+        if self.backfill_complete {
+            ensure!(
+                proof.block_number <= self.latest_head.number,
+                "receipt Fee arrived before its canonical head"
+            );
+            if proof.block_number == self.latest_head.number {
+                ensure!(
+                    proof.block_hash == self.latest_head.hash,
+                    "receipt Fee block hash differs from canonical head"
+                );
+            }
+        }
+        if proof.block_number <= self.backfilled_through {
+            return Ok(LogApplyResult::Duplicate);
+        }
+        let locator = PoolLocator::LynexAlgebraV1_9(proof.pool);
+        let Some(pool_index) = self.lynex_algebra_v1_9_indices.get(&proof.pool).copied() else {
+            return Ok(LogApplyResult::Unknown);
+        };
+        if let Some(position) = self.last_positions.get(&locator) {
+            if proof.position() == *position {
+                ensure!(
+                    self.last_block_hashes.get(&locator) == Some(&proof.block_hash),
+                    "duplicate receipt Fee position changed block hash; rehydration required"
+                );
+                return Ok(LogApplyResult::Duplicate);
+            }
+            ensure!(
+                proof.position() > *position,
+                "receipt Fee arrived out of canonical order; rehydration required"
+            );
+        }
+        ensure!(
+            self.pending_adaptive_fees[pool_index].is_none(),
+            "adaptive Algebra Fee was not consumed by the preceding pool action"
+        );
+        self.pools[pool_index]
+            .lynex_fee
+            .as_mut()
+            .context("Lynex hydrated fee state is missing")?
+            .state
+            .apply_fee_timepoint(
+                block_timestamp,
+                DirectionalFees {
+                    zero_for_one: proof.fee,
+                    one_for_zero: proof.fee,
+                },
+            )?;
+        self.pending_adaptive_fees[pool_index] = Some(PendingAdaptiveFee {
             position: proof.position(),
             block_timestamp,
         });
@@ -264,9 +337,17 @@ impl DexMirror {
                 self.camelot_v3_indices
                     .contains_key(&log.address)
                     .then_some(PoolLocator::CamelotV3(log.address))
+            })
+            .or_else(|| {
+                self.lynex_algebra_v1_9_indices
+                    .contains_key(&log.address)
+                    .then_some(PoolLocator::LynexAlgebraV1_9(log.address))
             });
         let decoded = match locator_hint {
             Some(PoolLocator::CamelotV3(address)) => decode_camelot_pool_event(log, address)?,
+            Some(PoolLocator::LynexAlgebraV1_9(address)) => {
+                decode_lynex_algebra_v1_9_pool_event(log, address)?
+            }
             Some(locator) => decode_pool_event_for_locator(log, locator)?,
             None => decode_pool_event(log)?,
         };
@@ -281,7 +362,10 @@ impl DexMirror {
         }
         if let Some(position) = self.last_positions.get(&event.locator) {
             if log.position() == *position {
-                if matches!(event.locator, PoolLocator::CamelotV3(_)) {
+                if matches!(
+                    event.locator,
+                    PoolLocator::CamelotV3(_) | PoolLocator::LynexAlgebraV1_9(_)
+                ) {
                     ensure!(
                         self.last_block_hashes.get(&event.locator) == Some(&log.block_hash),
                         "duplicate pool position changed block hash; rehydration required"
@@ -289,7 +373,12 @@ impl DexMirror {
                 }
                 return Ok(LogApplyResult::Duplicate);
             }
-            if log.position() < *position && !matches!(event.locator, PoolLocator::CamelotV3(_)) {
+            if log.position() < *position
+                && !matches!(
+                    event.locator,
+                    PoolLocator::CamelotV3(_) | PoolLocator::LynexAlgebraV1_9(_)
+                )
+            {
                 return Ok(LogApplyResult::Duplicate);
             }
             ensure!(
@@ -301,6 +390,9 @@ impl DexMirror {
             PoolLocator::V3(address) => self.v3_indices.get(&address).copied(),
             PoolLocator::PancakeV3(address) => self.pancake_v3_indices.get(&address).copied(),
             PoolLocator::CamelotV3(address) => self.camelot_v3_indices.get(&address).copied(),
+            PoolLocator::LynexAlgebraV1_9(address) => {
+                self.lynex_algebra_v1_9_indices.get(&address).copied()
+            }
             PoolLocator::V4(pool_id) => self.v4_indices.get(&pool_id).copied(),
         };
         let Some(pool_index) = pool_index else {
@@ -321,26 +413,41 @@ impl DexMirror {
                         "V4 Swap fee differs from hydrated static fee"
                     );
                 }
-                if let PoolLocator::CamelotV3(_) = event.locator {
+                if matches!(
+                    event.locator,
+                    PoolLocator::CamelotV3(_) | PoolLocator::LynexAlgebraV1_9(_)
+                ) {
                     let timestamp = block_timestamp
-                        .context("Camelot V3 log has no canonical block timestamp")?;
+                        .context("adaptive Algebra log has no canonical block timestamp")?;
                     let (amount0, amount1) =
                         decode_camelot_v3_swap_amounts_after_event_validation(log);
-                    let HydratedPool {
-                        pool, camelot_fee, ..
-                    } = hydrated;
-                    let state = &mut camelot_fee
-                        .as_mut()
-                        .context("Camelot hydrated fee state is missing")?
-                        .state;
-                    validate_camelot_timepoint_link(
-                        &mut self.pending_camelot_fees[pool_index],
+                    let state = match event.locator {
+                        PoolLocator::CamelotV3(_) => {
+                            &mut hydrated
+                                .camelot_fee
+                                .as_mut()
+                                .context("Camelot hydrated fee state is missing")?
+                                .state
+                        }
+                        PoolLocator::LynexAlgebraV1_9(_) => {
+                            &mut hydrated
+                                .lynex_fee
+                                .as_mut()
+                                .context("Lynex hydrated fee state is missing")?
+                                .state
+                        }
+                        _ => unreachable!("adaptive Algebra locator was matched"),
+                    };
+                    validate_adaptive_timepoint_link(
+                        &mut self.pending_adaptive_fees[pool_index],
                         log,
                         timestamp,
                         state.latest_timepoint_timestamp,
                         true,
                     )?;
-                    pool.apply_swap_head(sqrt_price_x96, tick, liquidity)?;
+                    hydrated
+                        .pool
+                        .apply_swap_head(sqrt_price_x96, tick, liquidity)?;
                     state.apply_swap_after_timepoint_validation(
                         timestamp, amount0, amount1, tick, liquidity,
                     )?;
@@ -355,20 +462,36 @@ impl DexMirror {
                 tick_upper,
                 delta,
             } => {
-                if let PoolLocator::CamelotV3(_) = event.locator {
+                if matches!(
+                    event.locator,
+                    PoolLocator::CamelotV3(_) | PoolLocator::LynexAlgebraV1_9(_)
+                ) {
                     let timestamp = block_timestamp
-                        .context("Camelot V3 log has no canonical block timestamp")?;
+                        .context("adaptive Algebra log has no canonical block timestamp")?;
                     let active = delta != 0
                         && tick_lower <= hydrated.pool.tick
                         && hydrated.pool.tick < tick_upper;
-                    let latest_timestamp = hydrated
-                        .camelot_fee
-                        .as_ref()
-                        .context("Camelot hydrated fee state is missing")?
-                        .state
-                        .latest_timepoint_timestamp;
-                    validate_camelot_timepoint_link(
-                        &mut self.pending_camelot_fees[pool_index],
+                    let latest_timestamp = match event.locator {
+                        PoolLocator::CamelotV3(_) => {
+                            hydrated
+                                .camelot_fee
+                                .as_ref()
+                                .context("Camelot hydrated fee state is missing")?
+                                .state
+                                .latest_timepoint_timestamp
+                        }
+                        PoolLocator::LynexAlgebraV1_9(_) => {
+                            hydrated
+                                .lynex_fee
+                                .as_ref()
+                                .context("Lynex hydrated fee state is missing")?
+                                .state
+                                .latest_timepoint_timestamp
+                        }
+                        _ => unreachable!("adaptive Algebra locator was matched"),
+                    };
+                    validate_adaptive_timepoint_link(
+                        &mut self.pending_adaptive_fees[pool_index],
                         log,
                         timestamp,
                         latest_timestamp,
@@ -378,11 +501,23 @@ impl DexMirror {
                         .pool
                         .apply_liquidity_delta(tick_lower, tick_upper, delta)?;
                     if active {
-                        let state = &mut hydrated
-                            .camelot_fee
-                            .as_mut()
-                            .context("Camelot hydrated fee state is missing")?
-                            .state;
+                        let state = match event.locator {
+                            PoolLocator::CamelotV3(_) => {
+                                &mut hydrated
+                                    .camelot_fee
+                                    .as_mut()
+                                    .context("Camelot hydrated fee state is missing")?
+                                    .state
+                            }
+                            PoolLocator::LynexAlgebraV1_9(_) => {
+                                &mut hydrated
+                                    .lynex_fee
+                                    .as_mut()
+                                    .context("Lynex hydrated fee state is missing")?
+                                    .state
+                            }
+                            _ => unreachable!("adaptive Algebra locator was matched"),
+                        };
                         state.apply_liquidity_head(
                             timestamp,
                             hydrated.pool.tick,
@@ -399,39 +534,61 @@ impl DexMirror {
                 zero_for_one,
                 one_for_zero,
             } => {
-                let PoolLocator::CamelotV3(_) = event.locator else {
-                    anyhow::bail!("Camelot Fee was routed to another provider")
-                };
                 ensure!(
-                    self.pending_camelot_fees[pool_index].is_none(),
-                    "Camelot Fee was not consumed by the preceding pool action"
+                    matches!(
+                        event.locator,
+                        PoolLocator::CamelotV3(_) | PoolLocator::LynexAlgebraV1_9(_)
+                    ),
+                    "adaptive Algebra Fee was routed to another provider"
                 );
-                let timestamp =
-                    block_timestamp.context("Camelot V3 log has no canonical block timestamp")?;
-                hydrated
-                    .camelot_fee
-                    .as_mut()
-                    .context("Camelot hydrated fee state is missing")?
-                    .state
-                    .apply_fee_timepoint(
-                        timestamp,
-                        DirectionalFees {
-                            zero_for_one,
-                            one_for_zero,
-                        },
-                    )?;
-                self.pending_camelot_fees[pool_index] = Some(PendingCamelotFee {
+                if matches!(event.locator, PoolLocator::LynexAlgebraV1_9(_)) {
+                    ensure!(
+                        zero_for_one == one_for_zero,
+                        "Lynex single-fee event became directional"
+                    );
+                }
+                ensure!(
+                    self.pending_adaptive_fees[pool_index].is_none(),
+                    "adaptive Algebra Fee was not consumed by the preceding pool action"
+                );
+                let timestamp = block_timestamp
+                    .context("adaptive Algebra log has no canonical block timestamp")?;
+                let state = match event.locator {
+                    PoolLocator::CamelotV3(_) => {
+                        &mut hydrated
+                            .camelot_fee
+                            .as_mut()
+                            .context("Camelot hydrated fee state is missing")?
+                            .state
+                    }
+                    PoolLocator::LynexAlgebraV1_9(_) => {
+                        &mut hydrated
+                            .lynex_fee
+                            .as_mut()
+                            .context("Lynex hydrated fee state is missing")?
+                            .state
+                    }
+                    _ => unreachable!("adaptive Algebra locator was checked"),
+                };
+                state.apply_fee_timepoint(
+                    timestamp,
+                    DirectionalFees {
+                        zero_for_one,
+                        one_for_zero,
+                    },
+                )?;
+                self.pending_adaptive_fees[pool_index] = Some(PendingAdaptiveFee {
                     position: log.position(),
                     block_timestamp: timestamp,
                 });
                 refresh_required = false;
             }
             PoolUpdate::TickSpacing { value } => {
-                anyhow::bail!("Camelot TickSpacing changed to {value}; pinned rehydration required")
+                anyhow::bail!("Algebra TickSpacing changed to {value}; pinned rehydration required")
             }
             PoolUpdate::Incentive { address } => {
                 anyhow::bail!(
-                    "Camelot Incentive changed to {address:#x}; pinned rehydration required"
+                    "Algebra Incentive changed to {address:#x}; pinned rehydration required"
                 )
             }
         }
@@ -446,8 +603,8 @@ impl DexMirror {
 
     pub fn finish_backfill(&mut self, head: CanonicalBlock) -> anyhow::Result<()> {
         ensure!(
-            self.camelot_v3_indices.is_empty(),
-            "Camelot V3 backfill requires the canonical head timestamp"
+            !self.has_adaptive_algebra_pools(),
+            "adaptive Algebra backfill requires the canonical head timestamp"
         );
         self.finish_backfill_at(head, None)
     }
@@ -462,21 +619,21 @@ impl DexMirror {
             "backfill head predates hydration block"
         );
         ensure!(
-            self.pending_camelot_fees.iter().all(Option::is_none),
+            self.pending_adaptive_fees.iter().all(Option::is_none),
             "backfill ended with an unconsumed Camelot Fee"
         );
         self.backfilled_through = head.number;
         self.backfill_complete = true;
         self.latest_head = head;
         self.latest_head_received_at = Instant::now();
-        if !self.camelot_v3_indices.is_empty() {
+        if self.has_adaptive_algebra_pools() {
             self.latest_head_timestamp = timestamp;
             self.record_canonical_timestamp(
                 head,
-                timestamp.context("Camelot backfill head timestamp is missing")?,
+                timestamp.context("adaptive Algebra backfill head timestamp is missing")?,
             )?;
-            self.refresh_camelot_heads(
-                timestamp.context("Camelot backfill head timestamp is missing")?,
+            self.refresh_adaptive_algebra_heads(
+                timestamp.context("adaptive Algebra backfill head timestamp is missing")?,
             )?;
         }
         Ok(())
@@ -488,8 +645,8 @@ impl DexMirror {
         received_at: Instant,
     ) -> anyhow::Result<bool> {
         ensure!(
-            self.camelot_v3_indices.is_empty(),
-            "Camelot V3 head requires its canonical timestamp"
+            !self.has_adaptive_algebra_pools(),
+            "adaptive Algebra head requires its canonical timestamp"
         );
         Ok(self.apply_head_at(head, None, received_at)?.advanced)
     }
@@ -511,14 +668,14 @@ impl DexMirror {
                 head.hash == self.latest_head.hash,
                 "same-height World Chain head changed; rehydration required"
             );
-            if !self.camelot_v3_indices.is_empty() {
+            if self.has_adaptive_algebra_pools() {
                 ensure!(
                     timestamp == self.latest_head_timestamp,
-                    "same-height Camelot head changed timestamp; rehydration required"
+                    "same-height adaptive Algebra head changed timestamp; rehydration required"
                 );
                 self.record_canonical_timestamp(
                     head,
-                    timestamp.context("Camelot canonical head timestamp is missing")?,
+                    timestamp.context("adaptive Algebra canonical head timestamp is missing")?,
                 )?;
             }
             self.latest_head_received_at = received_at;
@@ -538,12 +695,13 @@ impl DexMirror {
         self.latest_head = head;
         self.latest_head_timestamp = timestamp;
         self.latest_head_received_at = received_at;
-        let refresh_pool_index = if self.camelot_v3_indices.is_empty() {
+        let refresh_pool_index = if !self.has_adaptive_algebra_pools() {
             None
         } else {
-            let timestamp = timestamp.context("Camelot canonical head timestamp is missing")?;
+            let timestamp =
+                timestamp.context("adaptive Algebra canonical head timestamp is missing")?;
             self.record_canonical_timestamp(head, timestamp)?;
-            self.refresh_camelot_heads(timestamp)?
+            self.refresh_adaptive_algebra_heads(timestamp)?
         };
         Ok(HeadApplyResult {
             advanced: true,
@@ -551,20 +709,29 @@ impl DexMirror {
         })
     }
 
-    fn refresh_camelot_heads(&mut self, timestamp: u32) -> anyhow::Result<Option<usize>> {
+    fn refresh_adaptive_algebra_heads(&mut self, timestamp: u32) -> anyhow::Result<Option<usize>> {
         let mut changed = None;
-        for index in self.camelot_v3_indices.values().copied() {
+        for index in self
+            .camelot_v3_indices
+            .values()
+            .chain(self.lynex_algebra_v1_9_indices.values())
+            .copied()
+        {
             let hydrated = &mut self.pools[index];
-            hydrated
-                .camelot_fee
-                .as_mut()
-                .context("Camelot hydrated fee state is missing")?
-                .state
-                .advance_head(timestamp)?;
-            if refresh_camelot_envelope(hydrated)? {
+            if let Some(fee) = hydrated.camelot_fee.as_mut() {
+                fee.state.advance_head(timestamp)?;
+            } else {
+                hydrated
+                    .lynex_fee
+                    .as_mut()
+                    .context("adaptive Algebra hydrated fee state is missing")?
+                    .state
+                    .advance_head(timestamp)?;
+            }
+            if refresh_adaptive_algebra_envelope(hydrated)? {
                 ensure!(
                     changed.replace(index).is_none(),
-                    "one head changed multiple Camelot fee envelopes"
+                    "one head changed multiple adaptive Algebra fee envelopes"
                 );
             }
         }
@@ -585,8 +752,20 @@ impl DexMirror {
         self.camelot_v3_indices.contains_key(&address)
     }
 
+    pub fn is_lynex_algebra_v1_9_address(&self, address: Address) -> bool {
+        self.lynex_algebra_v1_9_indices.contains_key(&address)
+    }
+
+    pub fn is_adaptive_algebra_address(&self, address: Address) -> bool {
+        self.is_camelot_address(address) || self.is_lynex_algebra_v1_9_address(address)
+    }
+
     pub fn has_camelot_pools(&self) -> bool {
         !self.camelot_v3_indices.is_empty()
+    }
+
+    pub fn has_adaptive_algebra_pools(&self) -> bool {
+        !self.camelot_v3_indices.is_empty() || !self.lynex_algebra_v1_9_indices.is_empty()
     }
 
     /// Fee projection and curve fee publication are intentionally separate
@@ -598,8 +777,8 @@ impl DexMirror {
             .pools
             .get_mut(index)
             .context("DEX pool index is invalid")?;
-        if hydrated.camelot_fee.is_some() {
-            refresh_camelot_envelope(hydrated)
+        if hydrated.camelot_fee.is_some() || hydrated.lynex_fee.is_some() {
+            refresh_adaptive_algebra_envelope(hydrated)
         } else {
             Ok(false)
         }
@@ -638,6 +817,9 @@ impl DexMirror {
             PoolLocator::V3(address) => self.v3_indices.get(&address).copied(),
             PoolLocator::PancakeV3(address) => self.pancake_v3_indices.get(&address).copied(),
             PoolLocator::CamelotV3(address) => self.camelot_v3_indices.get(&address).copied(),
+            PoolLocator::LynexAlgebraV1_9(address) => {
+                self.lynex_algebra_v1_9_indices.get(&address).copied()
+            }
             PoolLocator::V4(pool_id) => self.v4_indices.get(&pool_id).copied(),
         }
     }
@@ -673,8 +855,8 @@ impl DexMirror {
     }
 }
 
-fn validate_camelot_timepoint_link(
-    pending: &mut Option<PendingCamelotFee>,
+fn validate_adaptive_timepoint_link(
+    pending: &mut Option<PendingAdaptiveFee>,
     log: &ChainLog,
     timestamp: u32,
     latest_timestamp: u32,
@@ -684,12 +866,12 @@ fn validate_camelot_timepoint_link(
         if action_writes_timepoint {
             ensure!(
                 latest_timestamp == timestamp,
-                "Camelot pool action is missing its preceding Fee event"
+                "adaptive Algebra pool action is missing its preceding Fee event"
             );
         } else {
             ensure!(
                 latest_timestamp <= timestamp,
-                "Camelot pool action timestamp precedes latest timepoint"
+                "adaptive Algebra pool action timestamp precedes latest timepoint"
             );
         }
         return Ok(());
@@ -701,32 +883,49 @@ fn validate_camelot_timepoint_link(
             && fee.position.block_number == log.block_number
             && fee.position.transaction_index == log.transaction_index
             && fee.position < log.position(),
-        "Camelot Fee is not positionally linked to its pool action"
+        "adaptive Algebra Fee is not positionally linked to its pool action"
     );
     ensure!(
         latest_timestamp == timestamp,
-        "Camelot Fee did not install the action timepoint"
+        "adaptive Algebra Fee did not install the action timepoint"
     );
     Ok(())
 }
 
-fn refresh_camelot_envelope(hydrated: &mut HydratedPool) -> anyhow::Result<bool> {
-    let fee = hydrated
-        .camelot_fee
-        .as_mut()
-        .context("Camelot hydrated fee state is missing")?;
-    let horizon = fee
-        .envelope
-        .last_timestamp
-        .checked_sub(fee.envelope.first_timestamp)
-        .context("Camelot fee envelope timestamps are not ordered")?;
-    let previous = fee.envelope.maximum;
-    fee.envelope = fee.state.envelope(horizon)?;
-    hydrated.pool.set_algebra_directional_fees(
-        u32::from(fee.envelope.maximum.zero_for_one),
-        u32::from(fee.envelope.maximum.one_for_zero),
-    )?;
-    Ok(previous != fee.envelope.maximum)
+fn refresh_adaptive_algebra_envelope(hydrated: &mut HydratedPool) -> anyhow::Result<bool> {
+    if let Some(fee) = hydrated.camelot_fee.as_mut() {
+        let horizon = fee
+            .envelope
+            .last_timestamp
+            .checked_sub(fee.envelope.first_timestamp)
+            .context("Camelot fee envelope timestamps are not ordered")?;
+        let previous = fee.envelope.maximum;
+        fee.envelope = fee.state.envelope(horizon)?;
+        hydrated.pool.set_algebra_directional_fees(
+            u32::from(fee.envelope.maximum.zero_for_one),
+            u32::from(fee.envelope.maximum.one_for_zero),
+        )?;
+        return Ok(previous != fee.envelope.maximum);
+    }
+    if let Some(fee) = hydrated.lynex_fee.as_mut() {
+        let horizon = fee
+            .envelope
+            .last_timestamp
+            .checked_sub(fee.envelope.first_timestamp)
+            .context("Lynex fee envelope timestamps are not ordered")?;
+        let previous = fee.envelope.maximum;
+        fee.envelope = fee.state.envelope(horizon)?;
+        ensure!(
+            fee.envelope.current.zero_for_one == fee.envelope.current.one_for_zero
+                && fee.envelope.maximum.zero_for_one == fee.envelope.maximum.one_for_zero,
+            "Lynex single-fee projection became directional"
+        );
+        hydrated
+            .pool
+            .set_algebra_single_fee(fee.envelope.maximum.zero_for_one)?;
+        return Ok(previous != fee.envelope.maximum);
+    }
+    anyhow::bail!("adaptive Algebra hydrated fee state is missing")
 }
 
 #[cfg(test)]
@@ -747,10 +946,13 @@ mod tests {
             },
             clmm::ClmmPool,
             events::{
-                CamelotFeeReceiptProof, camelot_fee_topic, camelot_tick_spacing_topic,
-                v3_burn_topic, v3_mint_topic, v3_swap_topic,
+                CamelotFeeReceiptProof, LynexFeeReceiptProof, camelot_fee_topic,
+                camelot_tick_spacing_topic, lynex_algebra_v1_9_fee_topic, v3_burn_topic,
+                v3_mint_topic, v3_swap_topic,
             },
-            hydration::{HydratedCamelotFee, HydratedDexState, HydratedPool, PoolIdentity},
+            hydration::{
+                HydratedCamelotFee, HydratedDexState, HydratedLynexFee, HydratedPool, PoolIdentity,
+            },
         },
     };
 
@@ -783,6 +985,7 @@ mod tests {
                 token1: address,
                 pool,
                 camelot_fee: None,
+                lynex_fee: None,
             }],
             unavailable: Vec::new(),
         };
@@ -790,6 +993,14 @@ mod tests {
     }
 
     fn camelot_mirror() -> (DexMirror, Address) {
+        adaptive_mirror(false)
+    }
+
+    fn lynex_mirror() -> (DexMirror, Address) {
+        adaptive_mirror(true)
+    }
+
+    fn adaptive_mirror(lynex: bool) -> (DexMirror, Address) {
         let address = address!("0000000000000000000000000000000000000003");
         let config = AdaptiveFeeConfiguration {
             alpha1: 0,
@@ -832,22 +1043,50 @@ mod tests {
             timepoints,
         };
         let envelope = state.envelope(2).unwrap();
-        let pool =
+        let pool = if lynex {
+            ClmmPool::new_single_fee_algebra_v1_9(
+                100,
+                10,
+                get_sqrt_ratio_at_tick(0).unwrap(),
+                0,
+                1_000,
+            )
+            .unwrap()
+        } else {
             ClmmPool::new_algebra_v1_9(100, 100, 10, get_sqrt_ratio_at_tick(0).unwrap(), 0, 1_000)
-                .unwrap();
-        let hydrated = HydratedDexState {
-            block: block(10, 9),
-            pools: vec![HydratedPool {
-                pair_id: "camelot".into(),
-                identity: PoolIdentity::CamelotV3 { address },
-                token0: Address::ZERO,
-                token1: address,
-                pool,
-                camelot_fee: Some(HydratedCamelotFee {
+                .unwrap()
+        };
+        let (identity, camelot_fee, lynex_fee) = if lynex {
+            (
+                PoolIdentity::LynexAlgebraV1_9 { address },
+                None,
+                Some(HydratedLynexFee {
                     data_storage_operator: address!("0000000000000000000000000000000000000004"),
                     state,
                     envelope,
                 }),
+            )
+        } else {
+            (
+                PoolIdentity::CamelotV3 { address },
+                Some(HydratedCamelotFee {
+                    data_storage_operator: address!("0000000000000000000000000000000000000004"),
+                    state,
+                    envelope,
+                }),
+                None,
+            )
+        };
+        let hydrated = HydratedDexState {
+            block: block(10, 9),
+            pools: vec![HydratedPool {
+                pair_id: "camelot".into(),
+                identity,
+                token0: Address::ZERO,
+                token1: address,
+                pool,
+                camelot_fee,
+                lynex_fee,
             }],
             unavailable: Vec::new(),
         };
@@ -861,6 +1100,21 @@ mod tests {
         ChainLog {
             address,
             topics: vec![camelot_fee_topic()],
+            data,
+            block_number,
+            block_hash: hash(block_number),
+            transaction_index,
+            log_index: 1,
+            removed: false,
+        }
+    }
+
+    fn lynex_fee_log(address: Address, block_number: u64, transaction_index: u64) -> ChainLog {
+        let mut data = vec![0_u8; 32];
+        data[30..32].copy_from_slice(&100_u16.to_be_bytes());
+        ChainLog {
+            address,
+            topics: vec![lynex_algebra_v1_9_fee_topic()],
             data,
             block_number,
             block_hash: hash(block_number),
@@ -1194,6 +1448,51 @@ mod tests {
         assert_eq!(receipt_pool.pool.liquidity, canonical_pool.pool.liquidity);
         let canonical_fee = canonical_pool.camelot_fee.as_ref().unwrap();
         let receipt_fee = receipt_pool.camelot_fee.as_ref().unwrap();
+        assert_eq!(receipt_fee.state, canonical_fee.state);
+        assert_eq!(receipt_fee.envelope, canonical_fee.envelope);
+    }
+
+    #[test]
+    fn lynex_compact_receipt_fee_apply_matches_canonical_fee_log_apply() {
+        let (mut canonical, address) = lynex_mirror();
+        let (mut receipt, _) = lynex_mirror();
+        for mirror in [&mut canonical, &mut receipt] {
+            mirror.finish_backfill_at(block(10, 9), Some(100)).unwrap();
+            mirror
+                .apply_head_at(block(11, 10), Some(101), Instant::now())
+                .unwrap();
+        }
+        let fee = lynex_fee_log(address, 11, 3);
+        let swap = camelot_swap_log(address, 11, 3, 2, 1);
+        canonical.apply_log_at_timestamp(&fee, 101).unwrap();
+        canonical.apply_log_at_timestamp(&swap, 101).unwrap();
+        receipt
+            .apply_lynex_fee_receipt(
+                LynexFeeReceiptProof {
+                    pool: address,
+                    fee: 100,
+                    block_number: 11,
+                    block_hash: hash(11),
+                    transaction_index: 3,
+                    log_index: 1,
+                },
+                101,
+            )
+            .unwrap();
+        receipt.apply_log_at_timestamp(&swap, 101).unwrap();
+        canonical.refresh_pool_for_publication(0).unwrap();
+        receipt.refresh_pool_for_publication(0).unwrap();
+
+        let canonical_pool = canonical.pool(0).unwrap();
+        let receipt_pool = receipt.pool(0).unwrap();
+        assert_eq!(
+            receipt_pool.pool.sqrt_price_x96,
+            canonical_pool.pool.sqrt_price_x96
+        );
+        assert_eq!(receipt_pool.pool.tick, canonical_pool.pool.tick);
+        assert_eq!(receipt_pool.pool.liquidity, canonical_pool.pool.liquidity);
+        let canonical_fee = canonical_pool.lynex_fee.as_ref().unwrap();
+        let receipt_fee = receipt_pool.lynex_fee.as_ref().unwrap();
         assert_eq!(receipt_fee.state, canonical_fee.state);
         assert_eq!(receipt_fee.envelope, canonical_fee.envelope);
     }

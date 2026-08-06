@@ -409,6 +409,7 @@ pub enum PoolProtocol {
     UniswapV4,
     PancakeSwapV3,
     CamelotV3,
+    LynexAlgebraV1_9,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -419,8 +420,8 @@ pub struct PoolNode {
     pub network_id: NetworkId,
     pub protocol: PoolProtocol,
     pub canonical_identity: String,
-    /// Static fee for fee-tier protocols. Camelot V3 keeps this absent because
-    /// its two directional fees are dynamic pool state, not pool identity.
+    /// Static fee for fee-tier protocols. Algebra dynamic-fee deployments keep
+    /// this absent because their runtime fee state is not pool identity.
     pub fee_pips: Option<u32>,
     pub tick_spacing: Option<i32>,
     pub hooks: Option<String>,
@@ -591,10 +592,18 @@ pub struct CompiledCapitalPolicy {
     pub maximum_token_a_fee: U256,
     pub maximum_token_b_fee: U256,
     pub additional_tokens: BTreeMap<String, CompiledCapitalTokenPolicy>,
+    pub direct_networks: BTreeMap<u64, CompiledCapitalNetworkPolicy>,
     pub maximum_unknown_reconciliation_queries: u16,
     pub direct_route_only: bool,
     pub bridge_mutations_enabled: bool,
     pub external_mutation_authorized: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompiledCapitalNetworkPolicy {
+    pub network_id: NetworkId,
+    pub binance_network: String,
+    pub tokens: BTreeMap<String, CompiledCapitalTokenPolicy>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -693,6 +702,12 @@ pub enum CompiledNetworkGasPolicy {
     ArbitrumOne {
         requires_fresh_rpc_gas_price: bool,
         max_priority_fee_per_gas_wei: u128,
+        max_fee_headroom_bps: u16,
+        includes_l1_fee: bool,
+    },
+    LineaMainnet {
+        requires_fresh_rpc_gas_price: bool,
+        max_priority_fee_equals_gas_price: bool,
         max_fee_headroom_bps: u16,
         includes_l1_fee: bool,
     },
@@ -1497,6 +1512,12 @@ impl CompiledDomainGraph {
                         includes_l1_fee: false,
                     }
                 }
+                (59_144, true) => CompiledNetworkGasPolicy::LineaMainnet {
+                    requires_fresh_rpc_gas_price: true,
+                    max_priority_fee_equals_gas_price: true,
+                    max_fee_headroom_bps: 12_000,
+                    includes_l1_fee: false,
+                },
                 (_, false) => CompiledNetworkGasPolicy::ReadOnly,
                 _ => anyhow::bail!(
                     "network {} has no reviewed live gas policy",
@@ -1728,47 +1749,106 @@ impl CompiledDomainGraph {
             .map(|(pair, policy)| {
                 for (other_pair, other_policy) in &full_live_policies {
                     ensure!(
-                        other_pair.chain.chain_id == pair.chain.chain_id
-                            && other_policy.rebalance_binance_network
-                                == policy.rebalance_binance_network
-                            && other_policy.maximum_unknown_reconciliation_queries
-                                == policy.maximum_unknown_reconciliation_queries
+                        other_policy.maximum_unknown_reconciliation_queries
+                            == policy.maximum_unknown_reconciliation_queries
                             && other_policy.direct_route_only == policy.direct_route_only
                             && other_policy.bridge_mutations_enabled
                                 == policy.bridge_mutations_enabled,
-                        "compiled full-live policies do not share one bounded Arbitrum lane"
+                        "compiled full-live policies do not share one bounded direct lane"
                     );
-                    ensure!(
-                        other_pair.token_a.symbol == pair.token_a.symbol
-                            && other_policy.maximum_rebalance_token_a_debit_base_units
+                    if other_pair.chain.chain_id == pair.chain.chain_id
+                        && other_pair.token_a.symbol == pair.token_a.symbol
+                    {
+                        ensure!(
+                            other_policy.maximum_rebalance_token_a_debit_base_units
                                 == policy.maximum_rebalance_token_a_debit_base_units
-                            && other_policy.maximum_rebalance_token_a_fee_base_units
-                                == policy.maximum_rebalance_token_a_fee_base_units,
-                        "compiled full-live policies disagree on shared quote-asset authority"
-                    );
+                                && other_policy.maximum_rebalance_token_a_fee_base_units
+                                    == policy.maximum_rebalance_token_a_fee_base_units,
+                            "compiled full-live policies disagree on shared quote-asset authority"
+                        );
+                    }
                 }
-                let additional_tokens = full_live_policies
-                    .iter()
-                    .filter(|(other_pair, _)| other_pair.id != pair.id)
-                    .map(|(other_pair, other_policy)| {
-                        Ok((
-                            other_pair.token_b.symbol.clone(),
-                            CompiledCapitalTokenPolicy {
-                                economic_asset_id: economic_asset_id(&other_pair.token_b.symbol)?,
-                                maximum_debit: U256::from_str_radix(
-                                    &other_policy.maximum_rebalance_token_b_debit_base_units,
-                                    10,
-                                )
+                let mut additional_tokens = BTreeMap::new();
+                for (other_pair, other_policy) in &full_live_policies {
+                    for (token, debit, fee) in [
+                        (
+                            &other_pair.token_a,
+                            &other_policy.maximum_rebalance_token_a_debit_base_units,
+                            &other_policy.maximum_rebalance_token_a_fee_base_units,
+                        ),
+                        (
+                            &other_pair.token_b,
+                            &other_policy.maximum_rebalance_token_b_debit_base_units,
+                            &other_policy.maximum_rebalance_token_b_fee_base_units,
+                        ),
+                    ] {
+                        if token.symbol == pair.token_a.symbol
+                            || token.symbol == pair.token_b.symbol
+                        {
+                            continue;
+                        }
+                        let token_policy = CompiledCapitalTokenPolicy {
+                            economic_asset_id: economic_asset_id(&token.symbol)?,
+                            maximum_debit: U256::from_str_radix(debit, 10)
                                 .context("compiled additional full-live debit cap is invalid")?,
-                                maximum_fee: U256::from_str_radix(
-                                    &other_policy.maximum_rebalance_token_b_fee_base_units,
-                                    10,
-                                )
+                            maximum_fee: U256::from_str_radix(fee, 10)
                                 .context("compiled additional full-live fee cap is invalid")?,
-                            },
-                        ))
-                    })
-                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+                        };
+                        if let Some(existing) =
+                            additional_tokens.insert(token.symbol.clone(), token_policy.clone())
+                        {
+                            ensure!(
+                                existing == token_policy,
+                                "compiled additional token has inconsistent authority"
+                            );
+                        }
+                    }
+                }
+                let mut direct_networks = BTreeMap::<u64, CompiledCapitalNetworkPolicy>::new();
+                for (network_pair, network_policy) in &full_live_policies {
+                    let chain_id = network_pair.chain.chain_id;
+                    let network = direct_networks.entry(chain_id).or_insert_with(|| {
+                        CompiledCapitalNetworkPolicy {
+                            network_id: NetworkId::new(format!("eip155:{chain_id}"))
+                                .expect("validated chain id produces a runtime id"),
+                            binance_network: network_policy.rebalance_binance_network.clone(),
+                            tokens: BTreeMap::new(),
+                        }
+                    });
+                    ensure!(
+                        network.binance_network == network_policy.rebalance_binance_network,
+                        "compiled full-live network has inconsistent Binance route identity"
+                    );
+                    for (token, debit, fee) in [
+                        (
+                            &network_pair.token_a,
+                            &network_policy.maximum_rebalance_token_a_debit_base_units,
+                            &network_policy.maximum_rebalance_token_a_fee_base_units,
+                        ),
+                        (
+                            &network_pair.token_b,
+                            &network_policy.maximum_rebalance_token_b_debit_base_units,
+                            &network_policy.maximum_rebalance_token_b_fee_base_units,
+                        ),
+                    ] {
+                        let token_policy = CompiledCapitalTokenPolicy {
+                            economic_asset_id: economic_asset_id(&token.symbol)?,
+                            maximum_debit: U256::from_str_radix(debit, 10)
+                                .context("compiled direct-network debit cap is invalid")?,
+                            maximum_fee: U256::from_str_radix(fee, 10)
+                                .context("compiled direct-network fee cap is invalid")?,
+                        };
+                        if let Some(existing) = network
+                            .tokens
+                            .insert(token.symbol.clone(), token_policy.clone())
+                        {
+                            ensure!(
+                                existing == token_policy,
+                                "compiled full-live network has inconsistent token authority"
+                            );
+                        }
+                    }
+                }
                 Ok::<_, anyhow::Error>(CompiledCapitalPolicy {
                     approval_session_id: "esp-usdc-arbitrum-full-live".to_owned(),
                     network_id: NetworkId::new(format!("eip155:{}", pair.chain.chain_id))?,
@@ -1799,6 +1879,7 @@ impl CompiledDomainGraph {
                     )
                     .context("compiled full-live token_b fee cap is invalid")?,
                     additional_tokens,
+                    direct_networks,
                     maximum_unknown_reconciliation_queries: policy
                         .maximum_unknown_reconciliation_queries,
                     direct_route_only: policy.direct_route_only,
@@ -2312,6 +2393,29 @@ pub fn compile_domain(
                 strategy_pool_ids.push(pool_id);
             }
         }
+        if let Some(lynex) = &pair.dex.lynex_algebra_v1_9 {
+            for configured_pool in &lynex.pools {
+                let address = parse_address(&configured_pool.expected_address)?;
+                let identity = format!("LynexAlgebraV1_9 {{ address: {address} }}");
+                let pool_id = PoolId(format!("{}:pool:{identity}", network_id.as_str()));
+                pools.push(PoolNode {
+                    id: pool_id.clone(),
+                    pair_id: pair.id.clone(),
+                    network_id: network_id.clone(),
+                    protocol: PoolProtocol::LynexAlgebraV1_9,
+                    canonical_identity: identity,
+                    fee_pips: None,
+                    tick_spacing: Some(configured_pool.expected_tick_spacing),
+                    hooks: None,
+                    lifecycle: if pair.execution_enabled && configured_pool.selection_enabled {
+                        PoolLifecycle::ExecutionEligible
+                    } else {
+                        PoolLifecycle::Validated
+                    },
+                });
+                strategy_pool_ids.push(pool_id);
+            }
+        }
         strategy_pool_ids.sort();
         dependencies.push(StrategyDependency {
             strategy_id,
@@ -2709,6 +2813,8 @@ where
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use serde_json::Value;
+
     use super::{
         CompatibilityRole, CompiledCapitalAllocatorMode, CompiledDomainBundle, CompiledDomainGraph,
         CompiledInventoryLocation, CompiledNetworkGasPolicy, DomainCompilerManifest, PoolLifecycle,
@@ -2735,6 +2841,68 @@ mod tests {
         (manifest, sources, bundle)
     }
 
+    fn linea_lynex_source() -> LoadedDomainConfig {
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../config/strategies/usdc-arb-arbitrum.v5.json"
+        ))
+        .unwrap();
+        value["snapshot_id"] = serde_json::json!("linea-usdt-usdc-lynex-algebra-v1-9-read-only-p1");
+        value["live_trading_enabled"] = serde_json::json!(false);
+        let pair = &mut value["pairs"][0];
+        pair["id"] = serde_json::json!("linea-usdt-usdc");
+        pair["execution_enabled"] = serde_json::json!(false);
+        pair["full_live"] = serde_json::json!(false);
+        pair.as_object_mut().unwrap().remove("full_live_policy");
+        pair["chain"] = serde_json::json!({
+            "name": "Linea Mainnet",
+            "chain_id": 59144,
+            "rpc_url_env": "LINEA_RPC_URL",
+            "ws_url_env": "LINEA_WS_URL",
+            "binance_network_name": "LINEA",
+            "gas_symbol": "ETH",
+            "gas_decimals": 18,
+            "gas_price_binance_symbol": "ETHUSDT",
+            "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+            "lynex_algebra_v1_9_factory_address": "0x622b2c98123D303ae067DB4925CD6282B3A08D0F",
+            "lynex_algebra_v1_9_pool_deployer_address": "0x9A89490F1056A7BC607EC53F93b921fE666A2C48",
+            "lynex_algebra_v1_9_quoter_address": "0x851d97Fd7823E44193d227682e32234ef8CaC83e",
+            "lynex_algebra_v1_9_router_address": "0x3921e8cb45B17fC029A0a6dE958330ca4e583390"
+        });
+        pair["token_a"] = serde_json::json!({
+            "symbol": "USDT",
+            "contract": "0xA219439258ca9da29e9cC4cE5596924745e12B93",
+            "decimals": 6
+        });
+        pair["token_b"] = serde_json::json!({
+            "symbol": "USDC",
+            "contract": "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
+            "decimals": 6
+        });
+        pair["binance"]["symbol"] = serde_json::json!("USDCUSDT");
+        pair["binance"]["base_asset"] = serde_json::json!("USDC");
+        pair["binance"]["quote_asset"] = serde_json::json!("USDT");
+        pair["binance"]["step_size"] = serde_json::json!("1.00000000");
+        pair["binance"]["tick_size"] = serde_json::json!("0.00001000");
+        pair["rebalance"] = serde_json::json!({
+            "enabled": false,
+            "start_threshold_bps": 2500
+        });
+        pair["dex"] = serde_json::json!({
+            "allowed_providers": ["lynex_algebra_v1_9"],
+            "lynex_algebra_v1_9": {
+                "pools": [{
+                    "expected_address": "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b",
+                    "selection_enabled": false,
+                    "required_active_incentive": "0x0000000000000000000000000000000000000000",
+                    "expected_tick_spacing": 1,
+                    "dynamic_fee_horizon_seconds": 2
+                }]
+            }
+        });
+        let bytes = serde_json::to_vec(&value).unwrap();
+        LoadedDomainConfig::from_bytes(PathBuf::from("linea-lynex-p1.json"), &bytes).unwrap()
+    }
+
     #[test]
     fn compiles_exact_existing_pair_graph_and_typed_compatibility_ids() {
         let (_, _, bundle) = fixture();
@@ -2744,7 +2912,7 @@ mod tests {
                 .iter()
                 .map(|item| item.symbol.as_str())
                 .collect::<Vec<_>>(),
-            ["ARBUSDC", "ESPUSDC", "WLDUSDC"]
+            ["ARBUSDC", "ESPUSDC", "USDCUSDT", "WLDUSDC"]
         );
         assert_eq!(
             bundle
@@ -2752,12 +2920,12 @@ mod tests {
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
-            ["eip155:42161", "eip155:480"]
+            ["eip155:42161", "eip155:480", "eip155:59144"]
         );
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
-        assert_eq!(bundle.strategies.len(), 3);
-        assert_eq!(bundle.pools.len(), 10);
+        assert_eq!(bundle.strategies.len(), 4);
+        assert_eq!(bundle.pools.len(), 11);
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "arbitrum-usdc-arb"
                 && pool.protocol == PoolProtocol::UniswapV3
@@ -2801,17 +2969,21 @@ mod tests {
             .unwrap()
             .binance_runtime_plan()
             .unwrap();
-        assert_eq!(runtime.symbols, ["ARBUSDC", "ESPUSDC", "WLDUSDC"]);
+        assert_eq!(
+            runtime.symbols,
+            ["ARBUSDC", "ESPUSDC", "USDCUSDT", "WLDUSDC"]
+        );
         assert_eq!(runtime.stream_shards.len(), 1);
         assert_eq!(
             runtime.stream_shards[0].symbols,
-            ["ARBUSDC", "ESPUSDC", "WLDUSDC"]
+            ["ARBUSDC", "ESPUSDC", "USDCUSDT", "WLDUSDC"]
         );
         assert_eq!(
             runtime.executable_symbols,
             std::collections::BTreeSet::from([
                 "ARBUSDC".to_owned(),
                 "ESPUSDC".to_owned(),
+                "USDCUSDT".to_owned(),
                 "WLDUSDC".to_owned(),
             ])
         );
@@ -2831,11 +3003,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "eip155:42161:evm-wallet:primary",
-                "eip155:480:evm-wallet:primary"
+                "eip155:480:evm-wallet:primary",
+                "eip155:59144:evm-wallet:primary"
             ]
         );
         assert_eq!(bundle.stream_shards.len(), 1);
-        assert_eq!(bundle.stream_shards[0].instrument_ids.len(), 3);
+        assert_eq!(bundle.stream_shards[0].instrument_ids.len(), 4);
         assert!(bundle.required_environment.iter().all(|requirement| {
             requirement.names.iter().all(|name| {
                 !["_SYMBOLS", "_PAIRS", "_POOLS", "_NETWORKS", "_ALLOWLIST"]
@@ -2861,7 +3034,7 @@ mod tests {
                     | PoolProtocol::CamelotV3 => {
                         pool.lifecycle == PoolLifecycle::ExecutionEligible
                     }
-                    PoolProtocol::UniswapV4 => false,
+                    PoolProtocol::UniswapV4 | PoolProtocol::LynexAlgebraV1_9 => false,
                 })
         );
         assert!(
@@ -2901,9 +3074,85 @@ mod tests {
             bundle
                 .pools
                 .iter()
-                .filter(|pool| pool.protocol != PoolProtocol::CamelotV3)
+                .filter(|pool| {
+                    !matches!(
+                        pool.protocol,
+                        PoolProtocol::CamelotV3 | PoolProtocol::LynexAlgebraV1_9
+                    )
+                })
                 .all(|pool| pool.fee_pips.is_some())
         );
+    }
+
+    #[test]
+    fn compiler_preserves_typed_linea_lynex_full_live_identity() {
+        let (_, sources, bundle) = fixture();
+        let legacy_read_only_fixture = linea_lynex_source();
+        assert!(!legacy_read_only_fixture.snapshot().live_trading_enabled);
+        assert!(sources.iter().any(|source| {
+            source
+                .snapshot()
+                .pairs
+                .iter()
+                .any(|pair| pair.id == "linea-usdt-usdc")
+        }));
+        let pool = bundle
+            .pools
+            .iter()
+            .find(|pool| pool.protocol == PoolProtocol::LynexAlgebraV1_9)
+            .unwrap();
+        assert_eq!(pool.pair_id, "linea-usdt-usdc");
+        assert_eq!(
+            pool.canonical_identity,
+            "LynexAlgebraV1_9 { address: 0x6E9AD0B8A41E2c148e7B0385d3EcBFDb8A216a9B }"
+        );
+        assert_eq!(pool.fee_pips, None);
+        assert_eq!(pool.tick_spacing, Some(1));
+        assert_eq!(pool.lifecycle, PoolLifecycle::ExecutionEligible);
+        let pool_id = pool.id.clone();
+
+        let dependency = bundle
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.strategy_id.as_str() == "strategy:linea-usdt-usdc")
+            .unwrap();
+        assert_eq!(
+            dependency.pool_ids.as_slice(),
+            std::slice::from_ref(&pool_id)
+        );
+        let capability = bundle
+            .capabilities
+            .iter()
+            .find(|capability| capability.strategy_id.as_str() == "strategy:linea-usdt-usdc")
+            .unwrap();
+        assert!(capability.observe);
+        assert!(capability.plan);
+        assert!(capability.execute);
+        assert!(capability.rebalance);
+
+        let graph = CompiledDomainGraph::from_bundle(bundle).unwrap();
+        let binance = graph.binance_runtime_plan().unwrap();
+        assert!(binance.symbols.contains(&"USDCUSDT".to_owned()));
+        assert!(binance.executable_symbols.contains("USDCUSDT"));
+        let network = graph
+            .network_runtime_plan(CompatibilityRole::LiveRuntime)
+            .unwrap()
+            .networks
+            .into_iter()
+            .find(|network| network.chain_id == 59_144)
+            .unwrap();
+        assert_eq!(network.network_id.as_str(), "eip155:59144");
+        assert_eq!(network.pool_ids, [pool_id]);
+        assert_eq!(
+            network.gas_policy,
+            CompiledNetworkGasPolicy::LineaMainnet {
+                requires_fresh_rpc_gas_price: true,
+                max_priority_fee_equals_gas_price: true,
+                max_fee_headroom_bps: 12_000,
+                includes_l1_fee: false,
+            }
+        );
+        assert!(network.execution_enabled);
     }
 
     #[test]
@@ -2983,7 +3232,7 @@ mod tests {
                 .iter()
                 .map(|network| network.chain_id)
                 .collect::<Vec<_>>(),
-            [42_161, 480]
+            [42_161, 480, 59_144]
         );
         let world = live_networks
             .networks
@@ -3028,7 +3277,16 @@ mod tests {
             collector.config.fingerprint_sha256()
         );
         let hot_path = live.hot_path_runtime.unwrap();
-        assert_eq!(hot_path.strategies.len(), 3);
+        assert_eq!(hot_path.strategies.len(), 4);
+        let linea = hot_path
+            .strategies
+            .iter()
+            .find(|strategy| strategy.symbol == "USDCUSDT")
+            .unwrap();
+        assert!(linea.observe && linea.plan && linea.execute);
+        assert_eq!(linea.network_id.as_str(), "eip155:59144");
+        assert_eq!(linea.pool_ids.len(), 1);
+        assert!(linea.domain_config.snapshot().live_trading_enabled);
         let wld = hot_path
             .strategies
             .iter()
@@ -3089,13 +3347,39 @@ mod tests {
         assert!(capital_policy.direct_route_only);
         assert!(!capital_policy.bridge_mutations_enabled);
         assert!(capital_policy.additional_tokens.contains_key("ARB"));
+        assert!(capital_policy.additional_tokens.contains_key("USDT"));
+        assert_eq!(capital_policy.direct_networks.len(), 2);
+        assert_eq!(
+            capital_policy.direct_networks[&59_144].binance_network,
+            "LINEA"
+        );
+        assert!(
+            capital_policy.direct_networks[&59_144]
+                .tokens
+                .contains_key("USDC")
+        );
+        assert!(
+            capital_policy.direct_networks[&59_144]
+                .tokens
+                .contains_key("USDT")
+        );
         assert_eq!(portfolio.live_rebalance_adapter, "world_chain_v12_parity");
-        assert_eq!(portfolio.assets.len(), 12);
+        assert_eq!(portfolio.assets.len(), 16);
         assert!(portfolio.assets.iter().any(|asset| {
             asset.symbol == "USDC"
                 && matches!(
                     &asset.location,
                     CompiledInventoryLocation::EvmWallet { chain_id: 480, .. }
+                )
+        }));
+        assert!(portfolio.assets.iter().any(|asset| {
+            asset.symbol == "USDC"
+                && matches!(
+                    &asset.location,
+                    CompiledInventoryLocation::EvmWallet {
+                        chain_id: 59_144,
+                        ..
+                    }
                 )
         }));
         assert!(portfolio.assets.iter().any(|asset| {

@@ -306,22 +306,22 @@ pub enum FullLiveRouterAllowanceMode {
 
 impl FullLivePolicy {
     fn validate(&self, pair: &PairConfig) -> anyhow::Result<()> {
+        let reviewed_approval = match (pair.chain.chain_id, pair.binance.symbol.as_str()) {
+            (42_161, "ESPUSDC") => "2026-07-31T11:00:00Z",
+            (42_161, "ARBUSDC") => "2026-08-05T05:54:11Z",
+            (59_144, "USDCUSDT") => "2026-08-06T07:44:34Z",
+            _ => {
+                anyhow::bail!("full-live policy is restricted to reviewed Arbitrum and Linea pairs")
+            }
+        };
         ensure!(
-            pair.execution_enabled
-                && pair.rebalance.enabled
-                && pair.chain.chain_id == 42_161
-                && matches!(pair.binance.symbol.as_str(), "ESPUSDC" | "ARBUSDC"),
-            "full-live policy is restricted to reviewed Arbitrum USDC pairs"
+            pair.execution_enabled && pair.rebalance.enabled,
+            "full-live policy requires execution and rebalancing"
         );
         validate_non_empty(
             "full_live_policy.production_approval_actor",
             &self.production_approval_actor,
         )?;
-        let reviewed_approval = match pair.binance.symbol.as_str() {
-            "ESPUSDC" => "2026-07-31T11:00:00Z",
-            "ARBUSDC" => "2026-08-05T05:54:11Z",
-            _ => unreachable!("symbol was restricted above"),
-        };
         ensure!(
             self.production_approval_actor == "operator"
                 && self.production_approval_recorded_at_utc == reviewed_approval,
@@ -329,7 +329,7 @@ impl FullLivePolicy {
         );
         ensure!(
             (11_000..=15_000).contains(&self.arbitrum_max_fee_headroom_bps),
-            "full-live Arbitrum maximum-fee headroom is outside the reviewed bounds"
+            "full-live EVM maximum-fee headroom is outside the reviewed bounds"
         );
         ensure!(
             self.router_allowance_mode == FullLiveRouterAllowanceMode::MaxUint256ThenLocked,
@@ -342,11 +342,21 @@ impl FullLivePolicy {
                 && !self.bridge_mutations_enabled,
             "full-live rebalance must remain direct, single-query, and no-bridge"
         );
+        let reviewed_caps = if pair.chain.chain_id == 59_144 {
+            ("2600000000", "2600000000", "5000000", "5000000")
+        } else {
+            (
+                "2600000000",
+                "10000000000000000000000",
+                "5000000",
+                "2000000000000000000",
+            )
+        };
         ensure!(
-            self.maximum_rebalance_token_a_debit_base_units == "2600000000"
-                && self.maximum_rebalance_token_b_debit_base_units == "10000000000000000000000"
-                && self.maximum_rebalance_token_a_fee_base_units == "5000000"
-                && self.maximum_rebalance_token_b_fee_base_units == "2000000000000000000",
+            self.maximum_rebalance_token_a_debit_base_units == reviewed_caps.0
+                && self.maximum_rebalance_token_b_debit_base_units == reviewed_caps.1
+                && self.maximum_rebalance_token_a_fee_base_units == reviewed_caps.2
+                && self.maximum_rebalance_token_b_fee_base_units == reviewed_caps.3,
             "full-live rebalance per-operation caps differ from the reviewed artifact"
         );
         let sizing = pair
@@ -629,6 +639,14 @@ pub struct ChainConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camelot_v3_router_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub lynex_algebra_v1_9_factory_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lynex_algebra_v1_9_pool_deployer_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lynex_algebra_v1_9_quoter_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lynex_algebra_v1_9_router_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_quoter_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4_router_address: Option<String>,
@@ -690,6 +708,22 @@ impl ChainConfig {
         validate_optional_address(
             "chain.camelot_v3_router_address",
             self.camelot_v3_router_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.lynex_algebra_v1_9_factory_address",
+            self.lynex_algebra_v1_9_factory_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.lynex_algebra_v1_9_pool_deployer_address",
+            self.lynex_algebra_v1_9_pool_deployer_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.lynex_algebra_v1_9_quoter_address",
+            self.lynex_algebra_v1_9_quoter_address.as_deref(),
+        )?;
+        validate_optional_address(
+            "chain.lynex_algebra_v1_9_router_address",
+            self.lynex_algebra_v1_9_router_address.as_deref(),
         )?;
         validate_optional_address(
             "chain.uniswap_v4_quoter_address",
@@ -941,6 +975,8 @@ pub struct DexConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camelot_v3: Option<CamelotV3Config>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub lynex_algebra_v1_9: Option<LynexAlgebraV1_9Config>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uniswap_v4: Option<UniswapV4Config>,
 }
 
@@ -1043,6 +1079,38 @@ impl DexConfig {
                 "dex.camelot_v3 is configured but not allowed"
             );
         }
+
+        if unique.contains(&DexProvider::LynexAlgebraV1_9) {
+            ensure!(
+                chain.chain_id == 59_144,
+                "Lynex Algebra V1.9 is restricted to reviewed Linea chain 59144"
+            );
+            ensure!(
+                chain.lynex_algebra_v1_9_factory_address.is_some(),
+                "Lynex Algebra V1.9 requires chain.lynex_algebra_v1_9_factory_address"
+            );
+            ensure!(
+                chain.lynex_algebra_v1_9_pool_deployer_address.is_some(),
+                "Lynex Algebra V1.9 requires chain.lynex_algebra_v1_9_pool_deployer_address"
+            );
+            ensure!(
+                chain.lynex_algebra_v1_9_quoter_address.is_some(),
+                "Lynex Algebra V1.9 requires chain.lynex_algebra_v1_9_quoter_address"
+            );
+            ensure!(
+                chain.lynex_algebra_v1_9_router_address.is_some(),
+                "Lynex Algebra V1.9 requires chain.lynex_algebra_v1_9_router_address"
+            );
+            self.lynex_algebra_v1_9
+                .as_ref()
+                .context("Lynex Algebra V1.9 provider requires dex.lynex_algebra_v1_9")?
+                .validate()?;
+        } else {
+            ensure!(
+                self.lynex_algebra_v1_9.is_none(),
+                "dex.lynex_algebra_v1_9 is configured but not allowed"
+            );
+        }
         Ok(())
     }
 }
@@ -1055,6 +1123,7 @@ pub enum DexProvider {
     UniswapV4,
     PancakeSwapV3,
     CamelotV3,
+    LynexAlgebraV1_9,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -1158,6 +1227,70 @@ pub struct CamelotV3PoolConfig {
     pub required_active_incentive: String,
     pub expected_tick_spacing: i32,
     pub dynamic_fee_horizon_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LynexAlgebraV1_9Config {
+    pub pools: Vec<LynexAlgebraV1_9PoolConfig>,
+}
+
+impl LynexAlgebraV1_9Config {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.pools.is_empty(),
+            "Lynex Algebra V1.9 pools must not be empty"
+        );
+        let unique_addresses: HashSet<_> = self
+            .pools
+            .iter()
+            .map(|pool| pool.expected_address.to_ascii_lowercase())
+            .collect();
+        ensure!(
+            unique_addresses.len() == self.pools.len(),
+            "Lynex Algebra V1.9 pools contain duplicate expected addresses"
+        );
+        for pool in &self.pools {
+            pool.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LynexAlgebraV1_9PoolConfig {
+    pub expected_address: String,
+    pub selection_enabled: bool,
+    pub required_active_incentive: String,
+    pub expected_tick_spacing: i32,
+    pub dynamic_fee_horizon_seconds: u64,
+}
+
+impl LynexAlgebraV1_9PoolConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        validate_evm_address(
+            "Lynex Algebra V1.9 expected_address",
+            &self.expected_address,
+        )?;
+        validate_evm_address(
+            "Lynex Algebra V1.9 required_active_incentive",
+            &self.required_active_incentive,
+        )?;
+        ensure!(
+            self.required_active_incentive == "0x0000000000000000000000000000000000000000",
+            "initial Lynex Algebra V1.9 route requires a zero active incentive"
+        );
+        ensure!(
+            self.expected_tick_spacing > 0,
+            "Lynex Algebra V1.9 expected_tick_spacing must be positive"
+        );
+        ensure!(
+            (1..=30).contains(&self.dynamic_fee_horizon_seconds),
+            "Lynex Algebra V1.9 dynamic_fee_horizon_seconds must be between 1 and 30"
+        );
+        Ok(())
+    }
 }
 
 impl CamelotV3PoolConfig {
@@ -1374,6 +1507,64 @@ mod tests {
         serde_json::to_vec(&value).unwrap()
     }
 
+    fn linea_lynex_fixture() -> Value {
+        let mut value: Value = serde_json::from_str(ARB_PRODUCTION_CONFIG).unwrap();
+        value["snapshot_id"] = serde_json::json!("linea-usdt-usdc-lynex-algebra-v1-9-read-only-p1");
+        value["live_trading_enabled"] = serde_json::json!(false);
+        let pair = &mut value["pairs"][0];
+        pair["id"] = serde_json::json!("linea-usdt-usdc");
+        pair["execution_enabled"] = serde_json::json!(false);
+        pair["full_live"] = serde_json::json!(false);
+        pair.as_object_mut().unwrap().remove("full_live_policy");
+        pair["chain"] = serde_json::json!({
+            "name": "Linea Mainnet",
+            "chain_id": 59144,
+            "rpc_url_env": "LINEA_RPC_URL",
+            "ws_url_env": "LINEA_WS_URL",
+            "binance_network_name": "LINEA",
+            "gas_symbol": "ETH",
+            "gas_decimals": 18,
+            "gas_price_binance_symbol": "ETHUSDT",
+            "multicall3_address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+            "lynex_algebra_v1_9_factory_address": "0x622b2c98123D303ae067DB4925CD6282B3A08D0F",
+            "lynex_algebra_v1_9_pool_deployer_address": "0x9A89490F1056A7BC607EC53F93b921fE666A2C48",
+            "lynex_algebra_v1_9_quoter_address": "0x851d97Fd7823E44193d227682e32234ef8CaC83e",
+            "lynex_algebra_v1_9_router_address": "0x3921e8cb45B17fC029A0a6dE958330ca4e583390"
+        });
+        pair["token_a"] = serde_json::json!({
+            "symbol": "USDT",
+            "contract": "0xA219439258ca9da29e9cC4cE5596924745e12B93",
+            "decimals": 6
+        });
+        pair["token_b"] = serde_json::json!({
+            "symbol": "USDC",
+            "contract": "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
+            "decimals": 6
+        });
+        pair["binance"]["symbol"] = serde_json::json!("USDCUSDT");
+        pair["binance"]["base_asset"] = serde_json::json!("USDC");
+        pair["binance"]["quote_asset"] = serde_json::json!("USDT");
+        pair["binance"]["step_size"] = serde_json::json!("1.00000000");
+        pair["binance"]["tick_size"] = serde_json::json!("0.00001000");
+        pair["rebalance"] = serde_json::json!({
+            "enabled": false,
+            "start_threshold_bps": 2500
+        });
+        pair["dex"] = serde_json::json!({
+            "allowed_providers": ["lynex_algebra_v1_9"],
+            "lynex_algebra_v1_9": {
+                "pools": [{
+                    "expected_address": "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b",
+                    "selection_enabled": false,
+                    "required_active_incentive": "0x0000000000000000000000000000000000000000",
+                    "expected_tick_spacing": 1,
+                    "dynamic_fee_horizon_seconds": 2
+                }]
+            }
+        });
+        value
+    }
+
     #[test]
     fn committed_production_snapshot_is_valid_and_typed() {
         let loaded = load(CONFIG.as_bytes()).unwrap();
@@ -1433,6 +1624,57 @@ mod tests {
             value["pairs"][0]["dex"]["camelot_v3"]["pools"][0][field] = invalid;
             assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn lynex_algebra_v1_9_schema_is_typed_linea_only_and_fails_closed() {
+        let fixture = linea_lynex_fixture();
+        let loaded = load(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let pair = &loaded.snapshot().pairs[0];
+        assert_eq!(pair.id, "linea-usdt-usdc");
+        assert_eq!(pair.chain.chain_id, 59_144);
+        assert_eq!(pair.binance.symbol, "USDCUSDT");
+        assert_eq!(pair.binance.base_asset, "USDC");
+        assert_eq!(pair.binance.quote_asset, "USDT");
+        assert_eq!(pair.token_a.symbol, "USDT");
+        assert_eq!(pair.token_b.symbol, "USDC");
+        assert_eq!(pair.dex.allowed_providers, [DexProvider::LynexAlgebraV1_9]);
+        let pool = &pair.dex.lynex_algebra_v1_9.as_ref().unwrap().pools[0];
+        assert_eq!(pool.expected_tick_spacing, 1);
+        assert_eq!(pool.dynamic_fee_horizon_seconds, 2);
+        assert!(!pool.selection_enabled);
+        assert!(!pair.execution_enabled);
+
+        for missing in [
+            "lynex_algebra_v1_9_factory_address",
+            "lynex_algebra_v1_9_pool_deployer_address",
+            "lynex_algebra_v1_9_quoter_address",
+            "lynex_algebra_v1_9_router_address",
+        ] {
+            let mut value = fixture.clone();
+            value["pairs"][0]["chain"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+
+        for (path, invalid) in [
+            ("expected_tick_spacing", serde_json::json!(0)),
+            ("dynamic_fee_horizon_seconds", serde_json::json!(31)),
+            (
+                "required_active_incentive",
+                serde_json::json!("0x0000000000000000000000000000000000000001"),
+            ),
+        ] {
+            let mut value = fixture.clone();
+            value["pairs"][0]["dex"]["lynex_algebra_v1_9"]["pools"][0][path] = invalid;
+            assert!(load(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+
+        let mut wrong_chain = fixture;
+        wrong_chain["pairs"][0]["chain"]["chain_id"] = serde_json::json!(42161);
+        assert!(load(&serde_json::to_vec(&wrong_chain).unwrap()).is_err());
     }
 
     #[test]

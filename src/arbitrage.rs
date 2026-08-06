@@ -24,7 +24,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::{
     binance::order_plan::recovery_client_order_id,
     chain::logs::ChainLog,
-    dex::{clmm::PreparedQuoteCurve, events::CamelotFeeReceiptProof},
+    dex::{clmm::PreparedQuoteCurve, events::AdaptiveFeeReceiptProof},
     execution_plan::{DexRoutePlan, DexSwapPlan},
     state::TopOfBook,
     telemetry::TelemetryHandle,
@@ -370,7 +370,7 @@ pub struct LegResult {
     /// The durable coordinator journal deliberately excludes this acceleration
     /// hint; restart recovery falls back to normal WebSocket settlement.
     #[serde(skip)]
-    pub dex_settlement_fee: Option<CamelotFeeReceiptProof>,
+    pub dex_settlement_fee: Option<AdaptiveFeeReceiptProof>,
     #[serde(skip)]
     pub dex_settlement_log: Option<ChainLog>,
 }
@@ -850,15 +850,20 @@ impl PaperOpportunity {
             pool_generation,
             fee_generation,
             ..
+        }
+        | DexRoutePlan::LynexAlgebraV1_9 {
+            pool_generation,
+            fee_generation,
+            ..
         } = &self.dex_plan.route
         {
             ensure!(
                 *pool_generation == self.dex_pool_generation,
-                "Camelot plan pool generation differs from opportunity"
+                "adaptive Algebra plan pool generation differs from opportunity"
             );
             ensure!(
                 *fee_generation == self.dex_fee_generation,
-                "Camelot plan fee generation differs from opportunity"
+                "adaptive Algebra plan fee generation differs from opportunity"
             );
         } else {
             ensure!(
@@ -1285,7 +1290,10 @@ impl EntryPreflightHandle {
             ArbitrageDirection::BuyTokenBOnDexSellOnCex => quote.bid_price,
             ArbitrageDirection::BuyTokenBOnCexSellOnDex => quote.ask_price,
         };
-        if matches!(&opportunity.dex_plan.route, DexRoutePlan::CamelotV3 { .. }) {
+        if matches!(
+            &opportunity.dex_plan.route,
+            DexRoutePlan::CamelotV3 { .. } | DexRoutePlan::LynexAlgebraV1_9 { .. }
+        ) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .context("system clock is before Unix epoch")?
@@ -1293,7 +1301,7 @@ impl EntryPreflightHandle {
             if now > opportunity.dex_plan.deadline_unix_seconds {
                 return Ok(Some(EntryPreflightRejection {
                     reason: "preflight_fee_horizon_expired",
-                    detail: "Camelot transaction deadline is outside the live fee horizon"
+                    detail: "adaptive Algebra transaction deadline is outside the live fee horizon"
                         .to_owned(),
                 }));
             }
@@ -1362,13 +1370,15 @@ impl EntryPreflightHandle {
                 ),
             }));
         }
-        if matches!(&opportunity.dex_plan.route, DexRoutePlan::CamelotV3 { .. })
-            && pool.fee_generation != opportunity.dex_fee_generation
+        if matches!(
+            &opportunity.dex_plan.route,
+            DexRoutePlan::CamelotV3 { .. } | DexRoutePlan::LynexAlgebraV1_9 { .. }
+        ) && pool.fee_generation != opportunity.dex_fee_generation
         {
             return Ok(Some(EntryPreflightRejection {
                 reason: "preflight_fee_generation_changed",
                 detail: format!(
-                    "Camelot fee generation advanced from {} to {}",
+                    "adaptive Algebra fee generation advanced from {} to {}",
                     opportunity.dex_fee_generation, pool.fee_generation
                 ),
             }));
@@ -1465,7 +1475,7 @@ pub struct PaperTradeEvent {
     /// represented by freshly hydrated chain state from a missing live proof.
     pub resumed_after_restart: bool,
     pub dex_filled: bool,
-    pub dex_settlement_fee: Option<CamelotFeeReceiptProof>,
+    pub dex_settlement_fee: Option<AdaptiveFeeReceiptProof>,
     pub dex_settlement_log: Option<ChainLog>,
     pub terminal_observed_at: Instant,
 }
@@ -3463,6 +3473,26 @@ mod tests {
         }
     }
 
+    fn lynex_plan() -> crate::execution_plan::DexSwapPlan {
+        crate::execution_plan::DexSwapPlan {
+            route: crate::execution_plan::DexRoutePlan::LynexAlgebraV1_9 {
+                router: "0x3921e8cb45B17fC029A0a6dE958330ca4e583390".to_owned(),
+                pool_address: "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".to_owned(),
+                pool_generation: 7,
+                fee_generation: 9,
+                fee_current_pips: 50,
+                fee_envelope_pips: 50,
+                fee_horizon_first_unix_seconds: 1_800_000_000,
+                fee_horizon_last_unix_seconds: 3_000_000_000,
+            },
+            token_in: "0xA219439258ca9da29e9cC4cE5596924745e12B93".to_owned(),
+            token_out: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff".to_owned(),
+            amount_in_base_units: 100,
+            amount_out_minimum_base_units: 90,
+            deadline_unix_seconds: 3_000_000_000,
+        }
+    }
+
     #[test]
     fn trade_parent_scope_survives_parent_fsync_and_restart() {
         let path = path("scoped-scoped-parent");
@@ -4032,7 +4062,9 @@ mod tests {
         let path = path("bounded-market-recovery-retries");
         let _ = fs::remove_file(&path);
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
-        let trade_intent = intent(ExecutionMode::DexFirst);
+        let mut trade_intent = intent(ExecutionMode::DexFirst);
+        let expected_plan = lynex_plan();
+        trade_intent.dex_plan = Some(expected_plan.clone());
         let plan_id = trade_intent.plan_id.clone();
         coordinator.admit(trade_intent).unwrap();
         coordinator.take_commands(&plan_id).unwrap();
@@ -4064,6 +4096,10 @@ mod tests {
 
         std::thread::sleep(delay + Duration::from_millis(2));
         let mut coordinator = PaperTradeCoordinator::open(&path).unwrap();
+        assert_eq!(
+            coordinator.operation(&plan_id).unwrap().intent.dex_plan,
+            Some(expected_plan)
+        );
         assert!(matches!(
             coordinator.take_commands(&plan_id).unwrap().as_slice(),
             [CoordinatorCommand::RecoverCex {
