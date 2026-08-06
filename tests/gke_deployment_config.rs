@@ -78,6 +78,18 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("linea-usdt-usdc-lynex-algebra-v1-9-full-live-v1"));
     assert!(DEPLOY_WORKFLOW.contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"));
     assert!(DEPLOY_WORKFLOW.contains("lynex_algebra_v1_9"));
+    let linea_pool = compiled["pools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pool| pool["pair_id"] == "linea-usdt-usdc")
+        .expect("compiled Linea pool exists");
+    assert_eq!(linea_pool["protocol"], "lynex_algebra_v1_9");
+    assert!(linea_pool["fee_pips"].is_null());
+    assert_eq!(linea_pool["tick_spacing"], 1);
+    assert!(DEPLOY_WORKFLOW.contains(
+        "protocol == \"lynex_algebra_v1_9\" and .fee_pips == null and .tick_spacing == 1"
+    ));
     assert!(DEPLOY_WORKFLOW.contains("live_runtime"));
     assert!(DEPLOY_WORKFLOW.contains("public_price_collector"));
     assert!(

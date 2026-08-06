@@ -201,7 +201,7 @@ jobs:
           test "$(jq -r "${linea} | .pairs[0].full_live_policy.bridge_mutations_enabled" "${domain_config}")" = false
           test "$(jq -c "${linea} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["lynex_algebra_v1_9"]'
           test "$(jq -r "${linea} | .pairs[0].chain.lynex_algebra_v1_9_router_address" "${domain_config}")" = 0x3921e8cb45B17fC029A0a6dE958330ca4e583390
-          test "$(jq -r '[.pools[] | select(.pair_id == "linea-usdt-usdc" and .protocol == "lynex_algebra_v1_9" and .fee_pips == 50 and .tick_spacing == 1 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.pair_id == "linea-usdt-usdc" and .protocol == "lynex_algebra_v1_9" and .fee_pips == null and .tick_spacing == 1 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:linea-usdt-usdc") | .pool_ids[] | select((ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
