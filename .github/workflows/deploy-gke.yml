@@ -671,10 +671,26 @@ jobs:
             --dry-run=client \
             -o json \
             -- /bin/sh -ec 'sleep 300')"
+          read -r -d '' preflight_command <<'SH' || true
+          export BINANCE_API_KEY="$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_API_KEY)"
+          export BINANCE_SECRET_KEY="$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_SECRET_KEY)"
+          route_status=0
+          for coin in USDC USDT; do
+            if arb_bot binance-capital-recovery --coin "${coin}" --network LINEA; then
+              printf 'linea_%s_route=verified\n' "${coin}"
+            else
+              printf 'linea_%s_route=failed\n' "${coin}" | tee -a /dev/termination-log >&2
+              route_status=1
+            fi
+          done
+          test "${route_status}" -eq 0
+          printf 'linea_capital_routes=verified\n' | tee /dev/termination-log
+          SH
           jq \
             --arg node_pool "${node_pool}" \
             --arg preflight_instance "${preflight_deployment}" \
             --arg image "${IMAGE}" \
+            --arg preflight_command "${preflight_command}" \
             '
               .metadata.labels["app.kubernetes.io/name"] = "arb-bot-linea-capital-read"
               | .metadata.labels["arb-bot/preflight-instance"] = $preflight_instance
@@ -711,11 +727,9 @@ jobs:
               | .spec.template.spec.initContainers = [{
                   "name": "linea-capital-read",
                   "image": $image,
-                  "imagePullPolicy": "IfNotPresent",
-                  "command": ["/bin/sh", "-ec"],
-                  "args": [
-                    "export BINANCE_API_KEY=\"$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_API_KEY)\"; export BINANCE_SECRET_KEY=\"$(cat /var/run/secrets/arb-bot-binance-read/BINANCE_SECRET_KEY)\"; arb_bot binance-capital-recovery --coin USDC --network LINEA; arb_bot binance-capital-recovery --coin USDT --network LINEA; printf \"linea_capital_routes=verified\\n\" | tee /dev/termination-log"
-                  ],
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/bin/sh", "-ec"],
+                "args": [$preflight_command],
                   "resources": {
                     "requests": {"cpu": "20m", "memory": "32Mi"},
                     "limits": {"cpu": "250m", "memory": "128Mi"}
@@ -766,9 +780,11 @@ jobs:
             case "${preflight_reason}" in
               Completed) break ;;
               Error)
-                kubectl logs "${preflight_pod}" \
+                kubectl get pod "${preflight_pod}" \
                   --namespace "${GKE_NAMESPACE}" \
-                  --container linea-capital-read || true
+                  -o json | jq -r \
+                    '.status.initContainerStatuses[0].state.terminated.message // "LINEA capital preflight failed without a termination message"' \
+                    >&2
                 exit 1
                 ;;
             esac

@@ -183,8 +183,13 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
     assert!(DEPLOY_WORKFLOW.contains("wait_operation_owner \"${bootstrap_owner}\" bootstrap"));
     assert!(DEPLOY_WORKFLOW.contains("Verify Binance LINEA direct capital routes read-only"));
-    assert!(DEPLOY_WORKFLOW.contains("binance-capital-recovery --coin USDC --network LINEA"));
-    assert!(DEPLOY_WORKFLOW.contains("binance-capital-recovery --coin USDT --network LINEA"));
+    assert!(DEPLOY_WORKFLOW.contains("for coin in USDC USDT; do"));
+    assert!(
+        DEPLOY_WORKFLOW
+            .contains("arb_bot binance-capital-recovery --coin \"${coin}\" --network LINEA")
+    );
+    assert!(DEPLOY_WORKFLOW.contains("linea_%s_route=failed"));
+    assert!(!DEPLOY_WORKFLOW.contains("--container linea-capital-read"));
     assert!(DEPLOY_WORKFLOW.contains("secretProviderClass\": \"arb-bot-binance-capital-read"));
     let release_platform = DEPLOY_WORKFLOW
         .find("Apply release platform before production preflights")
