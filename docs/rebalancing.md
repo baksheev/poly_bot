@@ -335,9 +335,11 @@ outcome. An unindexed Binance withdrawal is the narrow exception where absence
 can be proved without an operator: the standard and network-wide Travel Rule
 histories must contain no viable submission, the deterministic master transfer
 must be uniquely indexed as successful, the master account must retain the
-exact transferred amount as free inventory with zero locked inventory, and
+transferred amount within its free inventory with zero locked inventory, and
 that Binance evidence must remain identical across two reads five seconds
-apart. The destination-chain balance is recorded as diagnostic evidence but is
+apart. Unrelated pre-existing master free inventory is excluded from the
+operation's midpoint revalidation and is never returned to the subaccount.
+The destination-chain balance is recorded as diagnostic evidence but is
 not an absence gate because normal trading can change it independently of the
 withdrawal. Only then does the executor fsync a
 `binance_withdrawal_retry_authorized` record and resubmit the same deterministic
@@ -414,9 +416,9 @@ children use the same execution owner, nonce lane, signer, gas policy, and
 transaction journal as ESP trades and allowances. Binance withdrawal intent
 is fsynced before submission. After an ambiguous standard or Travel Rule
 withdrawal, one bounded reconciliation cycle first discovers an existing result
-or uses exact free/unlocked master-inventory evidence to durably prove that no
-Binance debit or lock occurred before authorizing a deterministic retry. The
-destination balance remains diagnostic because trades can change it. A
+or uses stable, sufficient free/unlocked master-inventory evidence to durably
+prove that no Binance debit or lock occurred before authorizing a deterministic
+retry. The destination balance remains diagnostic because trades can change it. A
 contradictory outcome quarantines only that token; the shared mutation lane
 remains serialized but can execute a different token. Wallet deposits
 persist the exact deposit/questionnaire identity before conditional Travel Rule

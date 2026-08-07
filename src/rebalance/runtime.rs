@@ -1137,10 +1137,6 @@ impl RebalanceExecutor {
                 "reconciled the indexed unbroadcast Travel Rule submission"
             );
             if record.is_approved_without_withdrawal() {
-                let requested = base_units_to_decimal(
-                    operation.intent.amount,
-                    operation.intent.token_decimals,
-                )?;
                 let account = self.treasury_binance.account_information().await?;
                 let balance = account
                     .balances
@@ -1150,8 +1146,14 @@ impl RebalanceExecutor {
                         "approved Travel Rule rejection asset is absent from the master account",
                     )?;
                 ensure!(
-                    balance.free == requested && balance.locked == Decimal::ZERO,
-                    "approved Travel Rule rejection did not preserve the exact master balance"
+                    decimal_to_base_units_floor(balance.free, operation.intent.token_decimals)?
+                        >= operation.intent.amount
+                        && decimal_to_base_units_floor(
+                            balance.locked,
+                            operation.intent.token_decimals
+                        )?
+                        .is_zero(),
+                    "approved Travel Rule rejection did not preserve sufficient unlocked master inventory"
                 );
                 tracing::info!(
                     operation_id = operation.intent.operation_id,
@@ -2240,7 +2242,6 @@ impl RebalanceExecutor {
         let second = self
             .observe_unindexed_master_transfer_absence(operation)
             .await?;
-        validate_unindexed_master_transfer_absence(first, second, operation.intent.amount)?;
         tracing::warn!(
             operation_id = operation.intent.operation_id,
             token = operation.intent.token_symbol,
@@ -2250,8 +2251,9 @@ impl RebalanceExecutor {
             first_master_locked_base_units = first.1.to_string(),
             second_master_locked_base_units = second.1.to_string(),
             target_base_units = operation.intent.amount.to_string(),
-            "accepted stable sub-target Binance master inventory as unrelated recovery evidence"
+            "observed stable Binance master inventory while proving deterministic transfer absence"
         );
+        validate_unindexed_master_transfer_absence(first, second, operation.intent.amount)?;
         tracing::warn!(
             operation_id = operation.intent.operation_id,
             token = operation.intent.token_symbol,
@@ -2505,7 +2507,8 @@ impl RebalanceExecutor {
         confirmation: WithdrawalAbsenceConfirmation,
     ) -> anyhow::Result<RebalanceExecutionOperation> {
         ensure!(confirmation.stale, "current withdrawal retry is not stale");
-        let current_binance_balance = current_binance_balance(confirmation.evidence)?;
+        let current_binance_balance =
+            current_binance_balance(confirmation.evidence, operation.intent.amount)?;
         let client_transaction_id =
             super::executor::stale_master_return_client_id(&operation.intent);
         let operation = self.execution_journal.advance(
@@ -2657,8 +2660,8 @@ impl RebalanceExecutor {
             .context("stale withdrawal asset is absent from the master account")?;
         ensure!(
             decimal_to_base_units_floor(balance.free, operation.intent.token_decimals)?
-                == operation.intent.amount,
-            "stale withdrawal master return did not preserve exact free inventory"
+                >= operation.intent.amount,
+            "stale withdrawal master return did not preserve sufficient free inventory"
         );
         ensure!(
             balance.locked == Decimal::ZERO,
@@ -2875,8 +2878,8 @@ impl RebalanceExecutor {
             same_withdrawal_retry_authority(first, second),
             "Binance withdrawal absence evidence changed during confirmation"
         );
-        let first_required = current_required_withdrawal(first)?;
-        let second_required = current_required_withdrawal(second)?;
+        let first_required = current_required_withdrawal(first, operation.intent.amount)?;
+        let second_required = current_required_withdrawal(second, operation.intent.amount)?;
         let first_stale = withdrawal_retry_is_stale(operation, first, first_required);
         let second_stale = withdrawal_retry_is_stale(operation, second, second_required);
         let stale = first_stale && second_stale;
@@ -3000,8 +3003,8 @@ impl RebalanceExecutor {
         let master_locked_base_units =
             decimal_to_base_units_floor(balance.locked, operation.intent.token_decimals)?;
         ensure!(
-            master_free_base_units == operation.intent.amount,
-            "unindexed Binance withdrawal retry did not preserve the exact master balance"
+            master_free_base_units >= operation.intent.amount,
+            "unindexed Binance withdrawal retry did not preserve sufficient master inventory"
         );
         ensure!(
             master_locked_base_units.is_zero(),
@@ -3916,17 +3919,22 @@ fn validate_master_return_record(
     Ok(())
 }
 
-fn current_binance_balance(evidence: WithdrawalAbsenceEvidence) -> anyhow::Result<U256> {
-    evidence
-        .master_free_base_units
+fn current_binance_balance(
+    evidence: WithdrawalAbsenceEvidence,
+    staged_master_amount: U256,
+) -> anyhow::Result<U256> {
+    std::cmp::min(evidence.master_free_base_units, staged_master_amount)
         .checked_add(evidence.master_locked_base_units)
         .and_then(|balance| balance.checked_add(evidence.trading_free_base_units))
         .and_then(|balance| balance.checked_add(evidence.trading_locked_base_units))
         .context("current aggregate Binance balance overflow")
 }
 
-fn current_required_withdrawal(evidence: WithdrawalAbsenceEvidence) -> anyhow::Result<U256> {
-    let binance = current_binance_balance(evidence)?;
+fn current_required_withdrawal(
+    evidence: WithdrawalAbsenceEvidence,
+    staged_master_amount: U256,
+) -> anyhow::Result<U256> {
+    let binance = current_binance_balance(evidence, staged_master_amount)?;
     let total = binance
         .checked_add(evidence.wallet_balance_base_units)
         .context("current rebalance inventory overflow")?;
@@ -4057,14 +4065,10 @@ fn validate_unindexed_master_transfer_absence(
         first.1.is_zero() && second.1.is_zero(),
         "unindexed Binance master-transfer retry found locked master inventory"
     );
-    // A universal transfer is atomic and must equal the immutable target. A
-    // stable free balance strictly below that target therefore cannot be this
-    // operation's completed transfer. Preserve it as unrelated account
-    // inventory instead of requiring the shared master account to be empty.
-    ensure!(
-        first.0 < target && second.0 < target,
-        "unindexed Binance master-transfer retry found staged master inventory"
-    );
+    // The master account is shared capital and need not be empty. Operation
+    // identity comes from the deterministic client id, whose history was
+    // observed empty twice before this proof. Requiring the unrelated free
+    // balance to be zero (or below the target) creates a false quarantine.
     ensure!(
         first.2 >= target && second.2 >= target,
         "unindexed Binance master-transfer retry lacks sufficient source inventory"
@@ -4468,45 +4472,37 @@ mod tests {
     };
 
     #[test]
-    fn unindexed_master_transfer_accepts_only_stable_sub_target_free_inventory() {
+    fn unindexed_master_transfer_accepts_stable_unlocked_shared_master_inventory() {
         let target = U256::from(126_845_916_u64);
-        let dust = U256::from(7_u64);
-        let source = U256::from(368_228_498_u64);
+        let master = U256::from(2_000_000_000_u64);
+        let source = U256::from(1_635_421_513_u64);
 
         validate_unindexed_master_transfer_absence(
-            (dust, U256::ZERO, source),
-            (dust, U256::ZERO, source),
+            (master, U256::ZERO, source),
+            (master, U256::ZERO, source),
             target,
         )
         .unwrap();
         assert!(
             validate_unindexed_master_transfer_absence(
-                (dust, U256::ZERO, source),
-                (dust + U256::ONE, U256::ZERO, source),
+                (master, U256::ZERO, source),
+                (master + U256::ONE, U256::ZERO, source),
                 target,
             )
             .is_err()
         );
         assert!(
             validate_unindexed_master_transfer_absence(
-                (target, U256::ZERO, source),
-                (target, U256::ZERO, source),
+                (master, U256::ONE, source),
+                (master, U256::ONE, source),
                 target,
             )
             .is_err()
         );
         assert!(
             validate_unindexed_master_transfer_absence(
-                (dust, U256::ONE, source),
-                (dust, U256::ONE, source),
-                target,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_unindexed_master_transfer_absence(
-                (dust, U256::ZERO, target - U256::ONE),
-                (dust, U256::ZERO, target - U256::ONE),
+                (master, U256::ZERO, target - U256::ONE),
+                (master, U256::ZERO, target - U256::ONE),
                 target,
             )
             .is_err()
@@ -4543,26 +4539,32 @@ mod tests {
 
     #[test]
     fn midpoint_revalidation_cancels_the_production_round_trip_shape() {
-        let required = current_required_withdrawal(WithdrawalAbsenceEvidence {
-            master_free_base_units: U256::from(2_994_u64),
-            master_locked_base_units: U256::ZERO,
-            trading_free_base_units: U256::from(808_u64),
-            trading_locked_base_units: U256::ZERO,
-            wallet_balance_base_units: U256::from(6_210_u64),
-        })
+        let required = current_required_withdrawal(
+            WithdrawalAbsenceEvidence {
+                master_free_base_units: U256::from(2_000_000_000_u64),
+                master_locked_base_units: U256::ZERO,
+                trading_free_base_units: U256::from(808_u64),
+                trading_locked_base_units: U256::ZERO,
+                wallet_balance_base_units: U256::from(6_210_u64),
+            },
+            U256::from(2_994_u64),
+        )
         .unwrap();
         assert_eq!(required, U256::ZERO);
     }
 
     #[test]
     fn midpoint_revalidation_preserves_a_still_needed_withdrawal() {
-        let required = current_required_withdrawal(WithdrawalAbsenceEvidence {
-            master_free_base_units: U256::from(2_000_u64),
-            master_locked_base_units: U256::ZERO,
-            trading_free_base_units: U256::from(6_000_u64),
-            trading_locked_base_units: U256::ZERO,
-            wallet_balance_base_units: U256::from(2_000_u64),
-        })
+        let required = current_required_withdrawal(
+            WithdrawalAbsenceEvidence {
+                master_free_base_units: U256::from(2_000_u64),
+                master_locked_base_units: U256::ZERO,
+                trading_free_base_units: U256::from(6_000_u64),
+                trading_locked_base_units: U256::ZERO,
+                wallet_balance_base_units: U256::from(2_000_u64),
+            },
+            U256::from(2_000_u64),
+        )
         .unwrap();
         assert_eq!(required, U256::from(3_000_u64));
     }
@@ -4600,7 +4602,7 @@ mod tests {
             },
             progress: RebalanceExecutionProgress::IntentRecorded,
         };
-        let required = current_required_withdrawal(evidence).unwrap();
+        let required = current_required_withdrawal(evidence, operation.intent.amount).unwrap();
         assert_eq!(required, U256::from(2_000_u64));
         assert!(withdrawal_retry_is_stale(&operation, evidence, required));
     }

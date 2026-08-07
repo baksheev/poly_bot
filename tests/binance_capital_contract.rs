@@ -125,9 +125,13 @@ fn withdrawal_unknown_outcome_requires_composite_absence_proof_before_retry() {
     assert!(begin.contains("CancelledStale"));
     assert!(begin.contains("standard_history.is_empty()"));
     assert!(begin.contains("travel_rule_withdrawal_history_v2_for_network"));
-    assert!(begin.contains("master_free_base_units == operation.intent.amount"));
+    assert!(begin.contains("master_free_base_units >= operation.intent.amount"));
     assert!(begin.contains("master_locked_base_units.is_zero()"));
     assert!(begin.contains("same_withdrawal_retry_authority"));
+    assert!(
+        REBALANCE_RUNTIME
+            .contains("std::cmp::min(evidence.master_free_base_units, staged_master_amount)")
+    );
     assert!(!begin.contains("wallet_balance == bridge_balance_before"));
     assert!(begin.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
     assert!(begin.contains("is_terminal_binance_withdrawal_rejection(&error)"));
@@ -162,8 +166,8 @@ fn unindexed_master_transfer_reuses_its_id_only_after_two_phase_absence_proof() 
     assert!(implementation.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
     assert!(implementation.contains("history.is_empty()"));
     assert!(implementation.contains("validate_unindexed_master_transfer_absence"));
-    assert!(REBALANCE_RUNTIME.contains("first.0 < target"));
-    assert!(REBALANCE_RUNTIME.contains("second.0 < target"));
+    assert!(REBALANCE_RUNTIME.contains("first.0 == second.0"));
+    assert!(REBALANCE_RUNTIME.contains("first.1.is_zero()"));
     assert!(REBALANCE_RUNTIME.contains("second.2 >= target"));
     assert!(implementation.contains("client_transaction_id"));
     assert!(implementation.contains("validate_master_transfer_record"));

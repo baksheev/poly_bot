@@ -23,7 +23,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
 const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 4;
 const MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS: u8 = 5;
-const MAX_UNINDEXED_MASTER_TRANSFER_REOPENS: u8 = 1;
+const MAX_UNINDEXED_MASTER_TRANSFER_REOPENS: u8 = 2;
 pub const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES: u8 = 3;
 const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS: u8 =
     MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES - 1;
@@ -2074,8 +2074,8 @@ fn validate_progress_evidence(
                 "rebalance Binance withdrawal retry API mode is invalid"
             );
             ensure!(
-                *master_free_base_units == intent.amount,
-                "rebalance Binance withdrawal retry did not preserve exact master inventory"
+                *master_free_base_units >= intent.amount,
+                "rebalance Binance withdrawal retry did not preserve sufficient master inventory"
             );
             ensure!(
                 master_locked_base_units.is_zero(),
@@ -2420,10 +2420,10 @@ mod tests {
     use alloy_primitives::{Address, B256, U256, keccak256};
 
     use super::{
-        MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS, RebalanceExecutionAuthority,
-        RebalanceExecutionJournal, RebalanceExecutionProgress, RebalanceExecutionRequest,
-        TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE, WirePayload, WireRecord,
-        stale_master_return_client_id,
+        MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS, MAX_UNINDEXED_MASTER_TRANSFER_REOPENS,
+        RebalanceExecutionAuthority, RebalanceExecutionJournal, RebalanceExecutionProgress,
+        RebalanceExecutionRequest, TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE, WirePayload,
+        WireRecord, stale_master_return_client_id,
     };
     use crate::rebalance::{Direction, RebalanceAction, Route};
 
@@ -2925,7 +2925,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_free_unlocked_master_balance_durably_authorizes_one_withdrawal_retry() {
+    fn sufficient_unlocked_shared_master_balance_durably_authorizes_one_withdrawal_retry() {
         let path = path("balance-proven-withdrawal-retry");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -2933,6 +2933,7 @@ mod tests {
             .unwrap();
         let operation_id = operation.intent.operation_id;
         let amount = operation.intent.amount;
+        let shared_master_balance = amount + U256::from(2_000_000_000_u64);
         let wallet_before = U256::from(7_000_000_u64);
         journal
             .advance(
@@ -2978,7 +2979,7 @@ mod tests {
                 RebalanceExecutionProgress::BinanceWithdrawalRetryAuthorized {
                     api_mode: "travel_rule_ae_self_owned".to_owned(),
                     bridge_balance_before: wallet_before,
-                    master_free_base_units: amount,
+                    master_free_base_units: shared_master_balance,
                     master_locked_base_units: U256::ZERO,
                     wallet_balance_base_units: wallet_before,
                 },
@@ -3085,7 +3086,7 @@ mod tests {
                     wallet_balance_base_units: U256::from(10),
                 },
             )
-            .expect("wallet movement is diagnostic when the exact master amount remains free");
+            .expect("wallet movement is diagnostic when sufficient shared master inventory remains free");
         drop(journal);
         fs::remove_file(path).unwrap();
     }
@@ -3809,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_master_inventory_gets_one_reopen_independent_of_preflight_budget() {
+    fn staged_master_inventory_gets_two_bounded_reopens_independent_of_preflight_budget() {
         let path = path("staged-master-inventory-independent-reopen");
         let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
         let operation = journal
@@ -3843,23 +3844,26 @@ mod tests {
         drop(journal);
 
         let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
-        let reopened = replayed
-            .reopen_next_retryable_quarantine()
-            .unwrap()
-            .expect("staged-master correction has an independent one-shot reopen");
-        assert_eq!(
-            reopened.progress,
-            RebalanceExecutionProgress::IntentRecorded
-        );
-        replayed
-            .advance(
-                &operation_id,
-                RebalanceExecutionProgress::Quarantined {
-                    reason: "unindexed Binance master-transfer retry found staged master inventory"
-                        .to_owned(),
-                },
-            )
-            .unwrap();
+        for _ in 0..MAX_UNINDEXED_MASTER_TRANSFER_REOPENS {
+            let reopened = replayed
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .expect("staged-master correction has an independent bounded reopen");
+            assert_eq!(
+                reopened.progress,
+                RebalanceExecutionProgress::IntentRecorded
+            );
+            replayed
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Quarantined {
+                        reason:
+                            "unindexed Binance master-transfer retry found staged master inventory"
+                                .to_owned(),
+                    },
+                )
+                .unwrap();
+        }
         assert!(
             replayed
                 .reopen_next_retryable_quarantine()
