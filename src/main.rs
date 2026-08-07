@@ -3647,6 +3647,31 @@ async fn run(
             .await?
         }
     };
+    let capital_policy = portfolio_catalog.capital_policy().cloned();
+    let maximum_esp = capital_policy
+        .as_ref()
+        .filter(|policy| policy.external_mutation_authorized)
+        .map(|policy| {
+            rebalance_base_units_to_decimal(policy.maximum_token_b_debit, esp_pair.token_b.decimals)
+        })
+        .transpose()?
+        .unwrap_or(Decimal::ZERO);
+    let maximum_arb = capital_policy
+        .as_ref()
+        .filter(|policy| policy.external_mutation_authorized)
+        .and_then(|policy| policy.additional_tokens.get("ARB"))
+        .map(|policy| {
+            rebalance_base_units_to_decimal(policy.maximum_debit, arb_pair.token_b.decimals)
+        })
+        .transpose()?
+        .unwrap_or(Decimal::ZERO);
+    let rebalance_runtime_limits = RebalanceRuntimeLimits {
+        maximum_wld: config.rebalance_max_wld_amount,
+        maximum_usdc: config.rebalance_max_usdc_amount,
+        maximum_esp,
+        maximum_arb,
+        operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
+    };
     let (mut full_rebalance_executor, rebalance_recovery_operation, quarantined_rebalance_tokens) =
         if config.rebalance_execution_mode == "full_live" {
             let wallet = EvmWallet::from_env()?;
@@ -3662,27 +3687,6 @@ async fn run(
                 .context("full rebalance requires BINANCE_SUBACCOUNT_EMAIL")?;
             let treasury_client = BinanceAccountClient::from_treasury_env(&config)?;
             let rebalance_journal_started_at = Instant::now();
-            let capital_policy = portfolio_catalog.capital_policy().cloned();
-            let maximum_esp = capital_policy
-                .as_ref()
-                .filter(|policy| policy.external_mutation_authorized)
-                .map(|policy| {
-                    rebalance_base_units_to_decimal(
-                        policy.maximum_token_b_debit,
-                        esp_pair.token_b.decimals,
-                    )
-                })
-                .transpose()?
-                .unwrap_or(Decimal::ZERO);
-            let maximum_arb = capital_policy
-                .as_ref()
-                .filter(|policy| policy.external_mutation_authorized)
-                .and_then(|policy| policy.additional_tokens.get("ARB"))
-                .map(|policy| {
-                    rebalance_base_units_to_decimal(policy.maximum_debit, arb_pair.token_b.decimals)
-                })
-                .transpose()?
-                .unwrap_or(Decimal::ZERO);
             let mut executor = RebalanceExecutor::hydrate(
                 binance_account_client.clone(),
                 treasury_client,
@@ -3721,18 +3725,10 @@ async fn run(
                         strategy_id: "rebalance-world-chain-v12".to_owned(),
                     },
                 }),
-                RebalanceRuntimeLimits {
-                    maximum_wld: config.rebalance_max_wld_amount,
-                    maximum_usdc: config.rebalance_max_usdc_amount,
-                    maximum_esp,
-                    maximum_arb,
-                    operation_timeout: Duration::from_secs(
-                        config.rebalance_executor_timeout_seconds,
-                    ),
-                },
+                rebalance_runtime_limits.clone(),
             )
             .await?;
-            executor.set_capital_policy(capital_policy)?;
+            executor.set_capital_policy(capital_policy.clone())?;
             executor.set_telemetry(telemetry.clone(), config.engine_id.clone());
             match executor.reconcile_next_across_fill_quarantine().await {
                 Ok(Some(operation)) => tracing::warn!(
@@ -5354,6 +5350,7 @@ async fn run(
         &linea_pair,
         wallet_owner,
         portfolio_catalog.capital_policy(),
+        &rebalance_runtime_limits,
         &rebalance_risk_receiver,
     )
     .await?;
@@ -5742,6 +5739,7 @@ async fn run(
                     &linea_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
+                    &rebalance_runtime_limits,
                     &rebalance_risk_receiver,
                 )
                 .await?;
@@ -5973,6 +5971,7 @@ async fn run(
                     &linea_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
+                    &rebalance_runtime_limits,
                     &rebalance_risk_receiver,
                 )
                 .await?;
@@ -6004,6 +6003,7 @@ async fn run(
                     &linea_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
+                    &rebalance_runtime_limits,
                     &rebalance_risk_receiver,
                 )
                 .await?;
@@ -6034,6 +6034,7 @@ async fn run(
                     &linea_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
+                    &rebalance_runtime_limits,
                     &rebalance_risk_receiver,
                 )
                 .await?;
@@ -6208,6 +6209,7 @@ async fn run(
                     &linea_pair,
                     wallet_owner,
                     portfolio_catalog.capital_policy(),
+                    &rebalance_runtime_limits,
                     &rebalance_risk_receiver,
                 )
                 .await?;
@@ -6814,6 +6816,7 @@ async fn dispatch_next_rebalance_execution(
     linea_pair: &arb_bot::domain::config::PairConfig,
     wallet_owner: Address,
     capital_policy: Option<&CompiledCapitalPolicy>,
+    runtime_limits: &RebalanceRuntimeLimits,
     rebalance_risk: &tokio::sync::watch::Receiver<RebalanceRisk>,
 ) -> anyhow::Result<()> {
     if *lane_busy {
@@ -6841,6 +6844,7 @@ async fn dispatch_next_rebalance_execution(
                     target,
                     None,
                     None,
+                    runtime_limits,
                 )
                 .await?
             }
@@ -6853,6 +6857,7 @@ async fn dispatch_next_rebalance_execution(
                     target,
                     capital_policy,
                     Some(rebalance_risk),
+                    runtime_limits,
                 )
                 .await?
             }
@@ -6865,6 +6870,7 @@ async fn dispatch_next_rebalance_execution(
                     target,
                     capital_policy,
                     Some(rebalance_risk),
+                    runtime_limits,
                 )
                 .await?
             }
@@ -6877,6 +6883,7 @@ async fn dispatch_next_rebalance_execution(
                     target,
                     capital_policy,
                     Some(rebalance_risk),
+                    runtime_limits,
                 )
                 .await?
             }
@@ -6888,6 +6895,7 @@ async fn dispatch_next_rebalance_execution(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_rebalance_execution(
     engine: &mut TradingEngine,
     sender: Option<&tokio::sync::mpsc::Sender<RebalanceExecutorCommand>>,
@@ -6896,11 +6904,20 @@ async fn dispatch_rebalance_execution(
     target: RebalanceExecutionTarget,
     capital_policy: Option<&CompiledCapitalPolicy>,
     rebalance_risk: Option<&tokio::sync::watch::Receiver<RebalanceRisk>>,
+    runtime_limits: &RebalanceRuntimeLimits,
 ) -> anyhow::Result<RebalanceDispatchOutcome> {
     engine.refresh_pending_rebalance_execution();
     if engine.pending_rebalance_execution().is_none() {
         return Ok(RebalanceDispatchOutcome::NoWork);
     }
+    let runtime_maximum = {
+        let evaluation = engine
+            .pending_rebalance_execution()
+            .context("rebalance pending work disappeared before runtime limit")?;
+        runtime_limits
+            .maximum_base_units_for(&evaluation.token_symbol, evaluation.token_decimals)?
+    };
+    engine.cap_pending_rebalance_amount(runtime_maximum)?;
     let rebalance_remaining = if target.is_direct_full_live() {
         let Some(evaluation) = engine.pending_rebalance_execution() else {
             return Ok(RebalanceDispatchOutcome::NoWork);

@@ -460,6 +460,57 @@ mod tests {
     }
 
     #[test]
+    fn six_hundred_usdc_cap_clears_each_post_deposit_wallet_threshold_once() {
+        let cases = [
+            ("World Chain", 2_500_u16, 3_424_067_267_u64, 579_591_254_u64),
+            ("Arbitrum", 2_500_u16, 3_424_067_267_u64, 1_124_235_490_u64),
+            ("Linea", 2_000_u16, 3_424_067_267_u64, 241_304_872_u64),
+        ];
+        let operation_cap = U256::from(600_000_000_u64);
+        let worst_reviewed_fee = U256::from(5_000_000_u64);
+
+        for (network, threshold_bps, binance, wallet) in cases {
+            let mut policy = direct_policy();
+            policy.token_symbol = "USDC".to_owned();
+            policy.reference_inventory = U256::from(binance) + U256::from(wallet);
+            policy.start_threshold_bps = threshold_bps;
+            policy.routes[0].withdrawal.minimum = U256::ONE;
+            policy.routes[0].withdrawal.maximum = U256::from(2_600_000_000_u64);
+            policy.routes[0].withdrawal.multiple = U256::ONE;
+
+            let initial = plan_rebalance(
+                &policy,
+                BalanceSnapshot {
+                    binance: U256::from(binance),
+                    wallet: U256::from(wallet),
+                },
+                &[],
+            )
+            .unwrap();
+            let requested = initial.action.expect("wallet refill is required").amount;
+            assert!(
+                requested > operation_cap,
+                "{network} refill must exercise the cap"
+            );
+
+            let credited = operation_cap - worst_reviewed_fee;
+            let after_one = plan_rebalance(
+                &policy,
+                BalanceSnapshot {
+                    binance: U256::from(binance) - operation_cap,
+                    wallet: U256::from(wallet) + credited,
+                },
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                after_one.action, None,
+                "{network} must not enqueue a second refill after one capped operation"
+            );
+        }
+    }
+
+    #[test]
     fn raises_small_withdrawal_to_exchange_minimum_when_surplus_allows_it() {
         let plan = plan_rebalance(
             &direct_policy(),

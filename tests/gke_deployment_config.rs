@@ -106,7 +106,8 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:WLDUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:USDCUSDT"));
     assert!(DEPLOY_WORKFLOW.contains("strategy:linea-usdt-usdc"));
-    assert!(DEPLOY_WORKFLOW.contains("linea-usdt-usdc-lynex-algebra-v1-9-full-live-v1"));
+    assert!(DEPLOY_WORKFLOW.contains("linea-usdt-usdc-lynex-algebra-v1-9-full-live-v2"));
+    assert!(DEPLOY_WORKFLOW.contains("test \"${REBALANCE_MAX_USDC_AMOUNT}\" = 600"));
     assert!(DEPLOY_WORKFLOW.contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"));
     assert!(DEPLOY_WORKFLOW.contains("lynex_algebra_v1_9"));
     let linea_pool = compiled["pools"]

@@ -212,7 +212,7 @@ async fn linea_lynex_direct_exact_input_simulates_both_directions_without_mutati
 #[tokio::test]
 #[ignore = "explicit Linea Lynex Algebra V1.9 archival-RPC amount and fee parity gate"]
 async fn linea_lynex_usdc_usdt_matches_quoter_at_reviewed_block() -> anyhow::Result<()> {
-    let domain = LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v1.json")?;
+    let domain = LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v2.json")?;
     let snapshot = domain.snapshot();
     let pair = &snapshot.pairs[0];
     let token_a = Address::from_str(&pair.token_a.contract)?;
@@ -491,7 +491,7 @@ fn top_of_book(bid: &str, ask: &str) -> anyhow::Result<TopOfBook> {
 #[tokio::test]
 #[ignore = "explicit Linea Lynex Algebra V1.9 canonical Fee-before-Swap replay gate"]
 async fn linea_lynex_transition_events_reproduce_pinned_post_state() -> anyhow::Result<()> {
-    let domain = LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v1.json")?;
+    let domain = LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v2.json")?;
     let snapshot = domain.snapshot();
     let endpoint =
         std::env::var("LINEA_RPC_URL").unwrap_or_else(|_| "https://rpc.linea.build".to_owned());

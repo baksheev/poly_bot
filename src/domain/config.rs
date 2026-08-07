@@ -309,7 +309,7 @@ impl FullLivePolicy {
         let reviewed_approval = match (pair.chain.chain_id, pair.binance.symbol.as_str()) {
             (42_161, "ESPUSDC") => "2026-07-31T11:00:00Z",
             (42_161, "ARBUSDC") => "2026-08-05T05:54:11Z",
-            (59_144, "USDCUSDT") => "2026-08-06T13:17:14Z",
+            (59_144, "USDCUSDT") => "2026-08-07T15:18:11Z",
             _ => {
                 anyhow::bail!("full-live policy is restricted to reviewed Arbitrum and Linea pairs")
             }
@@ -373,7 +373,12 @@ impl FullLivePolicy {
             sizing.max_trade_notional == "200000000"
                 && sizing.max_unhedged_notional == "220000000"
                 && sizing.max_recovery_loss == "2000000"
-                && pair.rebalance.start_threshold_bps == 2_500,
+                && pair.rebalance.start_threshold_bps
+                    == if pair.chain.chain_id == 59_144 {
+                        2_000
+                    } else {
+                        2_500
+                    },
             "full-live trade or rebalance envelope differs from the reviewed artifact"
         );
         for (name, value) in [

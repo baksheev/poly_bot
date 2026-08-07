@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn linea_lynex_allowance_set_is_exact_provider_scoped_and_read_only_to_build() {
         let domain =
-            LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v1.json").unwrap();
+            LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v2.json").unwrap();
         let requirements = linea_lynex_allowance_requirements(&domain.snapshot().pairs[0]).unwrap();
         assert_eq!(requirements.len(), 2);
         assert_eq!(requirements[0].protocol, DexProtocol::LynexAlgebraV1_9);

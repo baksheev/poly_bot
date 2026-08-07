@@ -86,6 +86,10 @@ impl RebalanceRuntimeLimits {
         );
         Ok(maximum)
     }
+
+    pub fn maximum_base_units_for(&self, symbol: &str, decimals: u8) -> anyhow::Result<U256> {
+        decimal_to_base_units(self.maximum_for(symbol)?, decimals)
+    }
 }
 
 pub struct RebalanceExecutor {
@@ -4458,8 +4462,8 @@ mod tests {
     };
 
     use super::{
-        ARBITRUM_CHAIN_ID, LINEA_CHAIN_ID, LINEA_USDC, LINEA_USDT, WORLD_CHAIN_CHAIN_ID,
-        WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, WithdrawalAbsenceEvidence,
+        ARBITRUM_CHAIN_ID, LINEA_CHAIN_ID, LINEA_USDC, LINEA_USDT, RebalanceRuntimeLimits,
+        WORLD_CHAIN_CHAIN_ID, WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, WithdrawalAbsenceEvidence,
         account_asset_balance_or_zero, base_units_to_decimal, current_required_withdrawal,
         decimal_multiple_to_base_unit_step, decimal_to_base_units, decimal_to_base_units_ceil,
         decimal_to_base_units_floor, deposit_questionnaire_chain_id,
@@ -5043,6 +5047,26 @@ mod tests {
         assert!(
             validate_across_fill_receipt(&receipt, fill_hash, token, wallet, received + U256::ONE,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_limit_projects_exact_usdc_dispatch_cap() {
+        let limits = RebalanceRuntimeLimits {
+            maximum_wld: Decimal::from(7_000),
+            maximum_usdc: Decimal::from(600),
+            maximum_esp: Decimal::from(10_000),
+            maximum_arb: Decimal::from(10_000),
+            operation_timeout: Duration::from_secs(1_800),
+        };
+
+        assert_eq!(
+            limits.maximum_base_units_for("USDC", 6).unwrap(),
+            U256::from(600_000_000_u64)
+        );
+        assert_eq!(
+            limits.maximum_base_units_for("USDT", 6).unwrap(),
+            U256::from(600_000_000_u64)
         );
     }
 }
