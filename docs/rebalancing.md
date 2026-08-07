@@ -359,7 +359,12 @@ precedes quarantine, the pinned Binance route is still available, and two
 unchanged destination-wallet balance observations retain the full received
 amount. Recovery creates `:deposit:retry-1` and then `:deposit:retry-2`; three
 total pre-broadcast attempts are the hard limit. Any missing or contradictory
-evidence leaves the token quarantined.
+evidence leaves the token quarantined. If a read-only Binance route or deposit
+address preflight fails after reopening, the next quarantine preserves the
+consumed-nonce recovery lineage. The periodic reconciler may retry that
+preflight without spending a transaction attempt; it still cannot create the
+next child unless every existing child remains rejected-before-broadcast and
+the route and two-observation balance proof pass again.
 
 ## M10 Arbitrum rebalance canary
 

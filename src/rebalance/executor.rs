@@ -1404,7 +1404,15 @@ fn across_fill_timeout_quarantine(reason: &str) -> bool {
 }
 
 fn consumed_nonce_deposit_quarantine(reason: &str) -> bool {
-    reason.to_ascii_lowercase().contains("nonce too low")
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("nonce too low")
+        || reason.starts_with("consumed-nonce deposit recovery attempt failed:")
+        // Compatibility for the first production recovery revision: it
+        // reopened the proven nonce collision, then replaced the quarantine
+        // reason when this read-only Binance preflight failed. The runtime
+        // still requires exact rejected-before-broadcast children and two
+        // unchanged balance observations before this transition is allowed.
+        || reason.starts_with("binance capital configuration request failed:")
 }
 
 fn reconciled_direct_deposit_transition(
@@ -3276,6 +3284,91 @@ mod tests {
         assert!(
             journal
                 .record_reconciled_consumed_nonce_deposit(&operation.intent.operation_id)
+                .is_err()
+        );
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn consumed_nonce_recovery_lineage_survives_a_prebroadcast_preflight_failure() {
+        for (case, reason) in [
+            (
+                "preserved-lineage",
+                "consumed-nonce deposit recovery attempt failed: deposit address request failed: transport closed",
+            ),
+            (
+                "first-revision-compatibility",
+                "Binance capital configuration request failed: error sending request",
+            ),
+        ] {
+            let path = path(case);
+            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+            let operation = journal
+                .reserve(&request(Direction::WalletToBinance, across()))
+                .unwrap();
+            let operation_id = operation.intent.operation_id;
+            advance_to_across_fill(&mut journal, &operation_id);
+            let across_fill = journal
+                .operations()
+                .get(&operation_id)
+                .unwrap()
+                .progress
+                .clone();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Quarantined {
+                        reason: reason.to_owned(),
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(
+                journal
+                    .next_reconcilable_consumed_nonce_deposit_quarantine()
+                    .unwrap()
+                    .unwrap()
+                    .intent
+                    .operation_id,
+                operation_id
+            );
+            let reopened = journal
+                .record_reconciled_consumed_nonce_deposit(&operation_id)
+                .unwrap();
+            assert_eq!(reopened.progress, across_fill);
+            drop(journal);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn unrelated_across_fill_quarantine_cannot_enter_consumed_nonce_recovery() {
+        let path = path("unrelated-consumed-nonce-recovery");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        advance_to_across_fill(&mut journal, &operation_id);
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unrelated operator quarantine".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            journal
+                .next_reconcilable_consumed_nonce_deposit_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .record_reconciled_consumed_nonce_deposit(&operation_id)
                 .is_err()
         );
         drop(journal);

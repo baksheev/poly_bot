@@ -5077,8 +5077,11 @@ async fn run(
                                     let result =
                                         recover_rebalance_with_quote_retries(&mut executor).await;
                                     let blocked_token = if let Err(error) = &result {
+                                        let quarantine_reason = format!(
+                                            "consumed-nonce deposit recovery attempt failed: {error:#}"
+                                        );
                                         executor
-                                            .quarantine_active_operation(error)?
+                                            .quarantine_active_operation(&quarantine_reason)?
                                             .map(|operation| operation.intent.token_symbol)
                                     } else {
                                         None

@@ -697,6 +697,9 @@ historical journal entry. Later nonce-too-low incidents use the generic bounded
 recovery: canonical absence closes the rejected child, the shared allocator is
 advanced, and the parent may create a fresh deterministic deposit child only
 after the bridged token balance and pinned Binance route are revalidated.
+Read-only Binance preflight failures preserve that recovery lineage so a later
+periodic pass can repeat the proof without authorizing an extra transaction
+attempt.
 
 The P8d local release A/B retained 42 ns decision p95 and improved median
 capacity throughput from 14,523,532 to 14,628,040 frames/s (`1.0072x`). Target
