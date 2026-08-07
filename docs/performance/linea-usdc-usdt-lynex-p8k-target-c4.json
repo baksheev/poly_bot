@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "stage": "P8k_target_c4_transport_and_self_contained_gate",
+  "measured_at_utc": "2026-08-07T06:32:20Z",
+  "host": "gke_c4_highcpu_8_asia_southeast1_b",
+  "build_profile": "release",
+  "source_revision": "391e273050320117bc7949d31d726f399bd4540a",
+  "image_digest": "sha256:a6ef01256c5c7f05967c441b73fbd4ce51470cc3674432c6533217d0be8b639d",
+  "change_scope": "workflow-only removal of an unavailable jq binary from the target-image preflight; the application now enforces the unchanged HTTP p95 limit directly",
+  "control": {
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "candidate": {
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "target_c4_samples": [
+    {
+      "http_p95_us": 273847,
+      "ws_subscribe_us": 107230,
+      "first_head_us": 210410
+    },
+    {
+      "http_p95_us": 295300,
+      "ws_subscribe_us": 87514,
+      "first_head_us": 218250
+    }
+  ],
+  "verification": {
+    "binary_byte_identical": true,
+    "hot_path_changed": false,
+    "expected_throughput_ratio": 1.0,
+    "target_c4_http_p95_limit_us": 500000,
+    "target_c4_limit_changed": false,
+    "maximum_observed_http_p95_us": 295300,
+    "minimum_headroom_to_limit_us": 204700,
+    "minimum_headroom_percent": 40.94,
+    "network_mutations": 0
+  },
+  "gate": "pass_target_c4_transport_with_unchanged_limit_and_byte_identical_release_binary"
+}

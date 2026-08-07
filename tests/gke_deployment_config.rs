@@ -73,8 +73,9 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("https://rpc.linea.build"));
     assert!(DEPLOY_WORKFLOW.contains("wss://linea.drpc.org"));
     assert!(!DEPLOY_WORKFLOW.contains("linea-rpc.publicnode.com"));
-    assert!(DEPLOY_WORKFLOW.contains(".http_p95_us <= 500000"));
-    assert!(!DEPLOY_WORKFLOW.contains("jq -e '.http_p95_us"));
+    assert!(DEPLOY_WORKFLOW.contains("--maximum-http-p95-ms 500"));
+    assert!(!DEPLOY_WORKFLOW.contains("--maximum-http-p95-ms 5000"));
+    assert!(!DEPLOY_WORKFLOW.contains(".http_p95_us <= 500000"));
     assert!(DEPLOY_WORKFLOW.contains("capacity preflight failed without a termination message"));
     assert!(DEPLOY_WORKFLOW.contains("2386f26fc10000"));
     assert!(DEPLOY_WORKFLOW.contains("less than the reviewed 0.01 ETH Linea operator gas reserve"));
