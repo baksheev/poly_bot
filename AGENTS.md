@@ -53,8 +53,8 @@ a time.
 - Deliver every production application revision through
   `.github/workflows/deploy-gke.yml` on `main`. The GitHub Action must build and
   push the production image, resolve its immutable digest, and roll that exact
-  digest out to the existing fixed GKE node only after CI passes and the
-  `production` environment is approved.
+  digest out to the existing fixed GKE node automatically after CI passes. The
+  routine deployment workflow must not require a manual environment approval.
 - Do not open a pull request for routine production changes. After the intended
   scope is committed and `scripts/quality.sh` passes, fetch `origin/main`,
   require a clean fast-forward integration, push the resulting commit directly

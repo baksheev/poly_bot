@@ -7,6 +7,15 @@ const COMPILED_DOMAIN: &str =
     include_str!("../config/domain/compiled-multi-pair-production.v1.json");
 
 #[test]
+fn gke_deploys_main_automatically_after_successful_ci() {
+    assert!(DEPLOY_WORKFLOW.contains("workflow_run:"));
+    assert!(DEPLOY_WORKFLOW.contains("workflows: [CI]"));
+    assert!(DEPLOY_WORKFLOW.contains("branches: [main]"));
+    assert!(DEPLOY_WORKFLOW.contains("github.event.workflow_run.conclusion == 'success'"));
+    assert!(!DEPLOY_WORKFLOW.contains("environment: production"));
+}
+
+#[test]
 fn gke_manifest_is_the_full_live_v14_adaptive_owner() {
     assert!(
         RELEASE_PLATFORM

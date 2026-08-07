@@ -45,8 +45,9 @@ Throughput must never be increased by weakening items 1–3.
 - Rails remains independent and controls different wallets, Binance
   credentials, orders, journals, nonces, and inventory.
 - Production application delivery goes only through
-  `.github/workflows/deploy-gke.yml` from `main`, after CI and production
-  approval. Workstations do not build or roll out production images.
+  `.github/workflows/deploy-gke.yml` from `main`, automatically after CI passes
+  and without manual environment approval. Workstations do not build or roll
+  out production images.
 - ClickHouse, Postgres, and Rails services are outside the critical trading
   path.
 
