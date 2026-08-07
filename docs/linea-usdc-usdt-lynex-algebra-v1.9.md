@@ -692,8 +692,11 @@ transaction
 Startup may close only this exact local rejection after two observations prove
 the rejected hash and receipt absent, the replacement transaction and success
 receipt unchanged, the nonce consumed, and every journal identity/scope field
-unchanged. It never retries the rejected effect and grants no generic
-consumed-nonce recovery authority.
+unchanged. That reviewed migration remains the one-time evidence for the
+historical journal entry. Later nonce-too-low incidents use the generic bounded
+recovery: canonical absence closes the rejected child, the shared allocator is
+advanced, and the parent may create a fresh deterministic deposit child only
+after the bridged token balance and pinned Binance route are revalidated.
 
 The P8d local release A/B retained 42 ns decision p95 and improved median
 capacity throughput from 14,523,532 to 14,628,040 frames/s (`1.0072x`). Target

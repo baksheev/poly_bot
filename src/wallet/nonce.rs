@@ -52,6 +52,10 @@ impl ProcessNonceGuard {
             .context("process nonce allocator overflow after broadcast")?;
         Ok(())
     }
+
+    pub fn advance_to_at_least(&mut self, next_nonce: u64) {
+        self.guard.next_nonce = self.guard.next_nonce.max(next_nonce);
+    }
 }
 
 pub async fn acquire_process_nonce_lock(
@@ -576,6 +580,36 @@ impl NonceLane {
         };
         Ok(())
     }
+
+    pub fn record_consumed_nonce_rejection(
+        &mut self,
+        journal: &mut TransactionJournal,
+        transaction_hash: B256,
+        next_nonce: u64,
+    ) -> anyhow::Result<()> {
+        let identity = match &self.state {
+            NonceLaneState::RecoveryRequired {
+                identity,
+                transaction_hash: Some(expected),
+            } => {
+                ensure!(
+                    *expected == transaction_hash,
+                    "consumed-nonce rejection hash does not match the signed transaction"
+                );
+                identity.clone()
+            }
+            _ => anyhow::bail!(
+                "consumed-nonce rejection requires a recovery-blocked signed transaction"
+            ),
+        };
+        ensure!(
+            next_nonce > identity.nonce,
+            "consumed-nonce recovery did not advance past the rejected nonce"
+        );
+        journal.record_rejected_before_broadcast(&identity, transaction_hash)?;
+        self.state = NonceLaneState::Ready { next_nonce };
+        Ok(())
+    }
 }
 
 /// Closes one explicitly reviewed legacy RPC rejection only after two
@@ -738,6 +772,68 @@ pub async fn recover_exact_consumed_nonce_collision(
         expected.rejected_transaction_hash,
     )?;
     Ok(true)
+}
+
+/// Closes a nonce-too-low rejection only after two canonical observations
+/// prove that the signed hash never appeared and the account nonce has moved
+/// past it. The caller may then revalidate the higher-level effect and create
+/// a new deterministic child operation; this function never retries a call.
+pub async fn recover_proven_nonce_too_low(
+    rpc: &JsonRpcClient,
+    lane: &mut NonceLane,
+    journal: &mut TransactionJournal,
+) -> anyhow::Result<Option<u64>> {
+    let (identity, transaction_hash) = match lane.state() {
+        NonceLaneState::RecoveryRequired {
+            identity,
+            transaction_hash: Some(transaction_hash),
+        } => (identity.clone(), *transaction_hash),
+        _ => return Ok(None),
+    };
+    let Some(operation) = journal.operation(&identity.operation_id) else {
+        anyhow::bail!("nonce-too-low recovery journal operation disappeared")
+    };
+    if !matches!(
+        &operation.status,
+        JournalStatus::OutcomeUnknown {
+            transaction_hash: journaled_hash,
+            reason: UnknownOutcomeReason::NonceTooLow,
+        } if *journaled_hash == transaction_hash
+    ) {
+        return Ok(None);
+    }
+
+    let mut proven_next_nonce = None;
+    for observation in 0..2 {
+        let (latest_nonce, pending_nonce, receipt, transaction) = tokio::try_join!(
+            rpc.latest_nonce(identity.wallet),
+            rpc.pending_nonce(identity.wallet),
+            rpc.transaction_receipt(transaction_hash),
+            rpc.transaction_by_hash(transaction_hash),
+        )?;
+        ensure!(
+            latest_nonce > identity.nonce && pending_nonce >= latest_nonce,
+            "nonce-too-low rejection is not yet canonically consumed"
+        );
+        ensure!(
+            receipt.is_none() && transaction.is_none(),
+            "nonce-too-low signed transaction appeared onchain"
+        );
+        if let Some(previous) = proven_next_nonce {
+            ensure!(
+                pending_nonce >= previous,
+                "nonce-too-low recovery pending nonce moved backwards"
+            );
+        }
+        proven_next_nonce = Some(pending_nonce);
+        if observation == 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    let next_nonce = proven_next_nonce.context("nonce-too-low recovery produced no observation")?;
+    lane.record_consumed_nonce_rejection(journal, transaction_hash, next_nonce)?;
+    Ok(Some(next_nonce))
 }
 
 fn validate_consumed_nonce_replacement(
@@ -1147,6 +1243,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumed_nonce_proof_raises_the_shared_allocator_floor() {
+        let wallet = Address::repeat_byte(0x73);
+        let mut first = super::acquire_process_nonce_lock(10, wallet, 76)
+            .await
+            .unwrap();
+        assert_eq!(first.nonce(), 76);
+        first.advance_to_at_least(77);
+        drop(first);
+
+        let second = super::acquire_process_nonce_lock(10, wallet, 76)
+            .await
+            .unwrap();
+        assert_eq!(second.nonce(), 77);
+    }
+
+    #[tokio::test]
     async fn process_nonce_owner_isolated_by_chain_for_the_same_wallet() {
         let wallet = Address::repeat_byte(0x72);
         let world = super::acquire_process_nonce_lock(480, wallet, 11)
@@ -1420,5 +1532,45 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn proven_nonce_too_low_releases_lane_only_above_consumed_nonce() {
+        let path = journal_path("proven-nonce-too-low");
+        let wallet = EvmWallet::from_private_key(PRIVATE_KEY).unwrap();
+        let call = WalletCall::native_transfer(Address::repeat_byte(0x44), U256::ONE).unwrap();
+        let mut journal = TransactionJournal::open(&path).unwrap();
+        let mut lane = NonceLane::hydrate(10, wallet.address(), 76, 76, &journal).unwrap();
+        let identity = lane
+            .reserve(&mut journal, "nonce-too-low:1", "test", &call)
+            .unwrap();
+        let transaction = wallet
+            .sign_call(
+                &call,
+                WalletTransactionParameters {
+                    chain_id: 10,
+                    nonce: identity.nonce,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 1,
+                },
+            )
+            .unwrap();
+        lane.record_signed(&mut journal, &transaction).unwrap();
+        lane.record_unknown_outcome(&mut journal, UnknownOutcomeReason::NonceTooLow)
+            .unwrap();
+        assert!(
+            lane.record_consumed_nonce_rejection(&mut journal, transaction.hash, 76)
+                .is_err()
+        );
+        lane.record_consumed_nonce_rejection(&mut journal, transaction.hash, 77)
+            .unwrap();
+        assert_eq!(lane.state(), &NonceLaneState::Ready { next_nonce: 77 });
+        assert!(matches!(
+            journal.operation("nonce-too-low:1").unwrap().status,
+            crate::wallet::JournalStatus::RejectedBeforeBroadcast { .. }
+        ));
+        drop(journal);
+        fs::remove_file(path).unwrap();
     }
 }

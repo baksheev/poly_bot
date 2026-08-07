@@ -69,6 +69,7 @@ pub struct JournalIntent {
 pub enum UnknownOutcomeReason {
     BroadcastTransport,
     BroadcastRejected,
+    NonceTooLow,
     ConfirmationTimeout,
     ProcessInterrupted,
 }
@@ -657,6 +658,10 @@ fn apply_transition(operation: &mut JournalOperation, event: &WireEvent) -> anyh
                     JournalStatus::Signed { .. }
                         | JournalStatus::OutcomeUnknown {
                             reason: UnknownOutcomeReason::BroadcastRejected,
+                            ..
+                        }
+                        | JournalStatus::OutcomeUnknown {
+                            reason: UnknownOutcomeReason::NonceTooLow,
                             ..
                         }
                 ),

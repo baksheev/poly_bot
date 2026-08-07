@@ -540,6 +540,33 @@ impl RebalanceExecutionJournal {
         }))
     }
 
+    pub fn next_reconcilable_consumed_nonce_deposit_quarantine(
+        &self,
+    ) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
+        if self.active_operation()?.is_some() {
+            return Ok(None);
+        }
+        Ok(self.operations.values().find(|operation| {
+            let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
+                return false;
+            };
+            consumed_nonce_deposit_quarantine(reason)
+                && operation.intent.direction == Direction::WalletToBinance
+                && matches!(
+                    &operation.intent.route,
+                    Route::Across {
+                        bridge_chain_id: 10,
+                        ..
+                    }
+                )
+                && matches!(
+                    self.progress_before_quarantine
+                        .get(&operation.intent.operation_id),
+                    Some(RebalanceExecutionProgress::AcrossFilled { .. })
+                )
+        }))
+    }
+
     pub fn progress_before_quarantine(
         &self,
         operation_id: &str,
@@ -618,6 +645,35 @@ impl RebalanceExecutionJournal {
         ensure!(
             reconciled_across_fill_transition(&current.intent, &current.progress, &progress),
             "rebalance quarantine is not an approved reconciled Across fill"
+        );
+        let next = RebalanceExecutionOperation {
+            intent: current.intent.clone(),
+            progress,
+        };
+        self.append(next.clone())?;
+        Ok(next)
+    }
+
+    pub fn record_reconciled_consumed_nonce_deposit(
+        &mut self,
+        operation_id: &str,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let current = self
+            .operations
+            .get(operation_id)
+            .with_context(|| format!("unknown rebalance operation {operation_id}"))?;
+        let progress = self
+            .progress_before_quarantine
+            .get(operation_id)
+            .context("consumed-nonce deposit quarantine has no prior durable progress")?
+            .clone();
+        ensure!(
+            reconciled_consumed_nonce_deposit_transition(
+                &current.intent,
+                &current.progress,
+                &progress,
+            ),
+            "rebalance quarantine is not an approved consumed-nonce deposit retry"
         );
         let next = RebalanceExecutionOperation {
             intent: current.intent.clone(),
@@ -1347,6 +1403,10 @@ fn across_fill_timeout_quarantine(reason: &str) -> bool {
     reason == "timed out waiting for Across fill"
 }
 
+fn consumed_nonce_deposit_quarantine(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("nonce too low")
+}
+
 fn reconciled_direct_deposit_transition(
     intent: &RebalanceExecutionIntent,
     previous: &RebalanceExecutionProgress,
@@ -1390,6 +1450,30 @@ fn reconciled_across_fill_transition(
                 received_base_units,
             },
         ) if across_fill_timeout_quarantine(reason)
+            && *fill_transaction_hash != B256::ZERO
+            && !received_base_units.is_zero()
+    )
+}
+
+fn reconciled_consumed_nonce_deposit_transition(
+    intent: &RebalanceExecutionIntent,
+    previous: &RebalanceExecutionProgress,
+    next: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        (&intent.route, intent.direction, previous, next),
+        (
+            Route::Across {
+                bridge_chain_id: 10,
+                ..
+            },
+            Direction::WalletToBinance,
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::AcrossFilled {
+                fill_transaction_hash,
+                received_base_units,
+            },
+        ) if consumed_nonce_deposit_quarantine(reason)
             && *fill_transaction_hash != B256::ZERO
             && !received_base_units.is_zero()
     )
@@ -1473,6 +1557,7 @@ fn validate_transition(
     ) || reconciled_direct_deposit_transition(
         intent, previous, next,
     ) || reconciled_across_fill_transition(intent, previous, next)
+        || reconciled_consumed_nonce_deposit_transition(intent, previous, next)
         || matches!(previous, RebalanceExecutionProgress::Quarantined { reason }
             if corrected_across_deposit_chain_quarantine(intent, reason, next));
     ensure!(
@@ -2380,11 +2465,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    fn advance_to_across_deposit(
-        journal: &mut RebalanceExecutionJournal,
-        operation_id: &str,
-        deposit_chain_id: u64,
-    ) {
+    fn advance_to_across_fill(journal: &mut RebalanceExecutionJournal, operation_id: &str) {
         journal
             .advance(
                 operation_id,
@@ -2419,6 +2500,14 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn advance_to_across_deposit(
+        journal: &mut RebalanceExecutionJournal,
+        operation_id: &str,
+        deposit_chain_id: u64,
+    ) {
+        advance_to_across_fill(journal, operation_id);
         journal
             .advance(
                 operation_id,
@@ -3105,6 +3194,91 @@ mod tests {
                 .is_none()
         );
         drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn proven_consumed_nonce_deposit_reopens_exact_across_fill() {
+        let path = path("consumed-nonce-deposit-reconciliation");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        advance_to_across_fill(&mut journal, &operation_id);
+        let across_fill = journal
+            .operations()
+            .get(&operation_id)
+            .unwrap()
+            .progress
+            .clone();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "JSON-RPC error -32000: nonce too low: next nonce 77, tx nonce 76"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            journal
+                .next_reconcilable_consumed_nonce_deposit_quarantine()
+                .unwrap()
+                .unwrap()
+                .intent
+                .operation_id,
+            operation_id
+        );
+        let reopened = journal
+            .record_reconciled_consumed_nonce_deposit(&operation_id)
+            .unwrap();
+        assert_eq!(reopened.progress, across_fill);
+        drop(journal);
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert_eq!(
+            replayed.active_operation().unwrap().unwrap().progress,
+            reopened.progress
+        );
+        assert!(
+            replayed
+                .next_reconcilable_consumed_nonce_deposit_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn consumed_nonce_reason_cannot_reopen_before_an_across_fill() {
+        let path = path("consumed-nonce-wrong-progress");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, across()))
+            .unwrap();
+        journal
+            .advance(
+                &operation.intent.operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "nonce too low".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            journal
+                .next_reconcilable_consumed_nonce_deposit_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .record_reconciled_consumed_nonce_deposit(&operation.intent.operation_id)
+                .is_err()
+        );
+        drop(journal);
         fs::remove_file(path).unwrap();
     }
 

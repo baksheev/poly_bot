@@ -3714,6 +3714,21 @@ async fn run(
                     "quarantined Across timeout did not pass reconciliation-only recovery; token remains isolated"
                 ),
             }
+            match executor
+                .reconcile_next_consumed_nonce_deposit_quarantine()
+                .await
+            {
+                Ok(Some(operation)) => tracing::warn!(
+                    operation_id = %operation.intent.operation_id,
+                    progress = ?operation.progress,
+                    "recovered a proven consumed-nonce deposit for asynchronous journal completion"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "consumed-nonce deposit quarantine did not pass recovery proof; token remains isolated"
+                ),
+            }
             executor.reopen_next_retryable_quarantine()?;
             telemetry.emit(
                 "runtime_journal_recovery",
@@ -5053,6 +5068,76 @@ async fn run(
                         }
                         RebalanceExecutorCommand::ReconcileAcross => {
                             let reconciliation_started_at = Instant::now();
+                            match executor
+                                .reconcile_next_consumed_nonce_deposit_quarantine()
+                                .await
+                            {
+                                Ok(Some(reopened)) => {
+                                    let target = rebalance_target(&reopened);
+                                    let result =
+                                        recover_rebalance_with_quote_retries(&mut executor).await;
+                                    let blocked_token = if let Err(error) = &result {
+                                        executor
+                                            .quarantine_active_operation(error)?
+                                            .map(|operation| operation.intent.token_symbol)
+                                    } else {
+                                        None
+                                    };
+                                    emit_rebalance_saga(
+                                        &rebalance_telemetry,
+                                        &rebalance_engine_id,
+                                        target,
+                                        &result,
+                                        &executor,
+                                        reconciliation_started_at,
+                                        true,
+                                    );
+                                    emit_rebalance_risk(
+                                        &rebalance_telemetry,
+                                        &rebalance_engine_id,
+                                        &executor,
+                                    );
+                                    risk_sender.send_replace(executor.rebalance_risk()?);
+                                    let active_operation_after =
+                                        executor.active_operation()?.is_some();
+                                    if result_sender
+                                        .send(RebalanceExecutorEvent::Recovery {
+                                            target,
+                                            result,
+                                            active_operation_after,
+                                            blocked_token,
+                                            recovery_started: Some(Box::new(reopened)),
+                                            next_recovery: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    let error = format!("{error:#}");
+                                    tracing::warn!(
+                                        error,
+                                        retry_after_seconds =
+                                            ACROSS_RECONCILIATION_INTERVAL.as_secs(),
+                                        "consumed-nonce deposit quarantine reconciliation will be retried"
+                                    );
+                                    if result_sender
+                                        .send(RebalanceExecutorEvent::AcrossReconciliationIdle {
+                                            attempted: true,
+                                            error: Some(error),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                    continue;
+                                }
+                            }
                             if !executor.has_reconcilable_across_fill_quarantine()? {
                                 if result_sender
                                     .send(RebalanceExecutorEvent::AcrossReconciliationIdle {

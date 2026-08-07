@@ -20,7 +20,7 @@ pub use nonce::{
     NonceLane, NonceLaneState, NonceReconciliationOutcome, PROCESS_NONCE_LOCK_TTL,
     ReconciledNonceLane, ReviewedConsumedNonceCollision, ReviewedPrebroadcastRejection,
     acquire_process_nonce_lock, recover_exact_consumed_nonce_collision,
-    recover_exact_rejected_before_broadcast,
+    recover_exact_rejected_before_broadcast, recover_proven_nonce_too_low,
 };
 
 pub const WALLET_PRIVATE_KEY_ENV: &str = "EVM_WALLET_PRIVATE_KEY";

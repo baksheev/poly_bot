@@ -30,6 +30,7 @@ use crate::{
         PROCESS_NONCE_LOCK_TTL, ReviewedConsumedNonceCollision, TransactionJournal,
         UnknownOutcomeReason, WalletCall, WalletTransactionParameters, acquire_process_nonce_lock,
         broadcast_signed_transaction, recover_exact_consumed_nonce_collision,
+        recover_proven_nonce_too_low,
     },
 };
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -51,6 +52,15 @@ const TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE: &str = "travel_rule_ae_self_owned
 const UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY: Duration = Duration::from_secs(5);
 const SHARED_EVM_CONFIRMATION_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 const LINEA_CHAIN_ID: u64 = 59_144;
+const MAX_PREBROADCAST_ATTEMPTS: u8 = 3;
+
+fn prebroadcast_attempt_id(base_operation_id: &str, attempt: u8) -> String {
+    if attempt == 0 {
+        base_operation_id.to_owned()
+    } else {
+        format!("{base_operation_id}:retry-{attempt}")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RebalanceRuntimeLimits {
@@ -383,7 +393,7 @@ impl RebalanceExecutor {
             optimism.latest_nonce(owner),
             optimism.pending_nonce(owner),
         )?;
-        let world_reconciled = NonceLane::reconcile(
+        let mut world_reconciled = NonceLane::reconcile(
             &world,
             &mut transaction_journal,
             WORLD_CHAIN_CHAIN_ID,
@@ -392,7 +402,7 @@ impl RebalanceExecutor {
             world_pending,
         )
         .await?;
-        let optimism_reconciled = NonceLane::reconcile(
+        let mut optimism_reconciled = NonceLane::reconcile(
             &optimism,
             &mut transaction_journal,
             OPTIMISM_CHAIN_ID,
@@ -401,6 +411,32 @@ impl RebalanceExecutor {
             optimism_pending,
         )
         .await?;
+        if recover_proven_nonce_too_low(
+            &world,
+            &mut world_reconciled.lane,
+            &mut transaction_journal,
+        )
+        .await?
+        .is_some()
+        {
+            tracing::warn!(
+                chain_id = WORLD_CHAIN_CHAIN_ID,
+                "recovered a proven nonce-too-low wallet child without retrying its effect"
+            );
+        }
+        if recover_proven_nonce_too_low(
+            &optimism,
+            &mut optimism_reconciled.lane,
+            &mut transaction_journal,
+        )
+        .await?
+        .is_some()
+        {
+            tracing::warn!(
+                chain_id = OPTIMISM_CHAIN_ID,
+                "recovered a proven nonce-too-low wallet child without retrying its effect"
+            );
+        }
         let mut world_nonce = finish_known_pending_recovery(
             &world,
             &mut transaction_journal,
@@ -693,6 +729,108 @@ impl RebalanceExecutor {
             "reconciled quarantined Across timeout from the exact destination receipt"
         );
         Ok(Some(reconciled))
+    }
+
+    /// Reopens an Across wallet-to-Binance deposit only after the wallet
+    /// journal has durably proved every prior child attempt was rejected
+    /// before broadcast and two balance observations show the bridged funds
+    /// are still present. The next execution uses a new deterministic child
+    /// id and the refreshed nonce lane.
+    pub async fn reconcile_next_consumed_nonce_deposit_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        let Some(operation) = self
+            .execution_journal
+            .next_reconcilable_consumed_nonce_deposit_quarantine()?
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let RebalanceExecutionProgress::AcrossFilled {
+            received_base_units,
+            ..
+        } = self
+            .execution_journal
+            .progress_before_quarantine(&operation.intent.operation_id)
+            .context("consumed-nonce deposit quarantine lost its Across fill")?
+        else {
+            unreachable!("consumed-nonce deposit recovery requires an Across fill")
+        };
+        let received_base_units = *received_base_units;
+        let Route::Across {
+            binance_network,
+            bridge_chain_id,
+            ..
+        } = &operation.intent.route
+        else {
+            unreachable!("consumed-nonce deposit recovery requires an Across route")
+        };
+        ensure!(
+            *bridge_chain_id == OPTIMISM_CHAIN_ID,
+            "consumed-nonce deposit recovery is not on Optimism"
+        );
+        let deposit_address = self
+            .trading_binance
+            .evm_deposit_address(&operation.intent.token_symbol, binance_network)
+            .await?;
+        let token = token_on_chain(&operation.intent.token_symbol, OPTIMISM_CHAIN_ID)?;
+        let call = WalletCall::erc20_transfer(token, deposit_address.address, received_base_units)?;
+        let base_child_id = format!("{}:deposit", operation.intent.operation_id);
+        let mut rejected_attempts = 0_u8;
+        for attempt in 0..MAX_PREBROADCAST_ATTEMPTS {
+            let child_id = prebroadcast_attempt_id(&base_child_id, attempt);
+            let Some(child) = self.evm.transaction_journal.operation(&child_id) else {
+                break;
+            };
+            ensure!(
+                child.intent.identity.chain_id == OPTIMISM_CHAIN_ID
+                    && child.intent.identity.wallet == operation.intent.wallet_owner
+                    && child.intent.purpose == "rebalance_bridge_to_binance"
+                    && child.intent.target == call.target()
+                    && child.intent.native_value == call.value()
+                    && child.intent.calldata_hash == keccak256(call.calldata()),
+                "consumed-nonce deposit child intent changed"
+            );
+            ensure!(
+                matches!(child.status, JournalStatus::RejectedBeforeBroadcast { .. }),
+                "consumed-nonce deposit child is not proven rejected before broadcast"
+            );
+            rejected_attempts = rejected_attempts
+                .checked_add(1)
+                .context("consumed-nonce deposit retry count overflow")?;
+        }
+        ensure!(
+            rejected_attempts > 0 && rejected_attempts < MAX_PREBROADCAST_ATTEMPTS,
+            "consumed-nonce deposit has no remaining bounded attempt"
+        );
+        let first_balance = self
+            .evm
+            .rpc(OPTIMISM_CHAIN_ID)?
+            .erc20_balance(token, operation.intent.wallet_owner)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let second_balance = self
+            .evm
+            .rpc(OPTIMISM_CHAIN_ID)?
+            .erc20_balance(token, operation.intent.wallet_owner)
+            .await?;
+        ensure!(
+            first_balance == second_balance && second_balance >= received_base_units,
+            "consumed-nonce deposit funds are absent or changed during recovery proof"
+        );
+        self.verify_route(&operation, false).await?;
+        let reopened = self
+            .execution_journal
+            .record_reconciled_consumed_nonce_deposit(&operation.intent.operation_id)?;
+        tracing::warn!(
+            operation_id = reopened.intent.operation_id,
+            token = reopened.intent.token_symbol,
+            rejected_attempts,
+            wallet_balance_base_units = %second_balance,
+            retry_amount_base_units = %received_base_units,
+            "reopened proven consumed-nonce deposit with a fresh deterministic child"
+        );
+        Ok(Some(reopened))
     }
 
     pub fn quarantine_active_operation(
@@ -3404,7 +3542,12 @@ async fn execute_wallet_call(
     call: &WalletCall,
     timeout: Duration,
 ) -> anyhow::Result<B256> {
-    if let Some(existing) = journal.operation(&operation_id) {
+    let base_operation_id = operation_id;
+    let mut operation_id = base_operation_id.clone();
+    for attempt in 0..MAX_PREBROADCAST_ATTEMPTS {
+        let Some(existing) = journal.operation(&operation_id) else {
+            break;
+        };
         ensure!(
             existing.intent.identity.chain_id == nonce_lane.chain_id()
                 && existing.intent.identity.wallet == wallet.address()
@@ -3414,19 +3557,25 @@ async fn execute_wallet_call(
                 && existing.intent.calldata_hash == keccak256(call.calldata()),
             "journaled rebalance transaction intent does not match the requested call"
         );
-        return match existing.status {
+        match existing.status {
             JournalStatus::MinedSuccess {
                 transaction_hash, ..
-            } => Ok(transaction_hash),
+            } => return Ok(transaction_hash),
             JournalStatus::MinedReverted { .. } => {
                 bail!("journaled rebalance transaction reverted")
             }
-            JournalStatus::CancelledBeforeSigning
-            | JournalStatus::RejectedBeforeBroadcast { .. } => {
+            JournalStatus::CancelledBeforeSigning => {
                 bail!("journaled rebalance transaction was cancelled")
             }
+            JournalStatus::RejectedBeforeBroadcast { .. } => {
+                ensure!(
+                    attempt + 1 < MAX_PREBROADCAST_ATTEMPTS,
+                    "journaled rebalance transaction exhausted its bounded pre-broadcast attempts"
+                );
+                operation_id = prebroadcast_attempt_id(&base_operation_id, attempt + 1);
+            }
             _ => bail!("journaled rebalance transaction still requires recovery"),
-        };
+        }
     }
     ensure!(nonce_lane.ready(), "rebalance nonce lane is not ready");
     let rpc_call = call.rpc_call(wallet.address());
@@ -3467,8 +3616,13 @@ async fn execute_wallet_call(
             .context("ready nonce lane has no nonce")?,
     )
     .await?;
-    let identity =
-        nonce_lane.reserve_with_nonce(journal, operation_id, purpose, call, nonce_guard.nonce())?;
+    let identity = nonce_lane.reserve_with_nonce(
+        journal,
+        operation_id.clone(),
+        purpose,
+        call,
+        nonce_guard.nonce(),
+    )?;
     let signed = match wallet.sign_call(
         call,
         WalletTransactionParameters {
@@ -3491,12 +3645,41 @@ async fn execute_wallet_call(
     {
         Ok(Ok(hash)) => hash,
         Ok(Err(error)) => {
-            let reason = if error.to_string().starts_with("JSON-RPC error") {
+            let error_text = format!("{error:#}");
+            let nonce_too_low = error_text.to_ascii_lowercase().contains("nonce too low");
+            let reason = if nonce_too_low {
+                UnknownOutcomeReason::NonceTooLow
+            } else if error_text.starts_with("JSON-RPC error") {
                 UnknownOutcomeReason::BroadcastRejected
             } else {
                 UnknownOutcomeReason::BroadcastTransport
             };
             nonce_lane.record_unknown_outcome(journal, reason)?;
+            if nonce_too_low {
+                if let Ok(pending_nonce) = rpc.pending_nonce(wallet.address()).await {
+                    nonce_guard.advance_to_at_least(pending_nonce);
+                }
+                match recover_proven_nonce_too_low(rpc, nonce_lane, journal).await {
+                    Ok(Some(next_nonce)) => {
+                        nonce_guard.advance_to_at_least(next_nonce);
+                        tracing::warn!(
+                            operation_id,
+                            rejected_transaction_hash = %signed.hash,
+                            rejected_nonce = identity.nonce,
+                            next_nonce,
+                            "proved nonce-too-low child absent and advanced the shared nonce allocator"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(recovery_error) => tracing::warn!(
+                        operation_id,
+                        rejected_transaction_hash = %signed.hash,
+                        rejected_nonce = identity.nonce,
+                        error = %recovery_error,
+                        "nonce-too-low child remains recovery-blocked pending canonical evidence"
+                    ),
+                }
+            }
             return Err(error);
         }
         Err(_elapsed) => {
@@ -4202,11 +4385,27 @@ mod tests {
         account_asset_balance_or_zero, base_units_to_decimal, current_required_withdrawal,
         decimal_to_base_units, decimal_to_base_units_floor, deposit_questionnaire_chain_id,
         matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
-        reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
+        prebroadcast_attempt_id, reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
         shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
         validate_direct_withdrawal_receipt, verified_self_owned_evm_address_record,
         withdrawal_received_base_units, withdrawal_requested_base_units, withdrawal_retry_is_stale,
     };
+
+    #[test]
+    fn prebroadcast_retry_ids_are_deterministic_and_bounded() {
+        assert_eq!(
+            prebroadcast_attempt_id("rebalance-1:deposit", 0),
+            "rebalance-1:deposit"
+        );
+        assert_eq!(
+            prebroadcast_attempt_id("rebalance-1:deposit", 1),
+            "rebalance-1:deposit:retry-1"
+        );
+        assert_eq!(
+            prebroadcast_attempt_id("rebalance-1:deposit", 2),
+            "rebalance-1:deposit:retry-2"
+        );
+    }
 
     #[test]
     fn production_saga_timeout_is_bounded_for_one_shared_evm_child() {

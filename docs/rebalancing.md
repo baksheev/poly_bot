@@ -348,6 +348,19 @@ token's independent rebalance. The two reviewed false-positive guard
 corrections may each reopen the exact prior durable progress once; the bounded
 recovery cannot create a fresh operation or loop the same quarantine.
 
+An EVM `nonce too low` rejection is journaled separately from an ambiguous
+transport rejection. The wallet child is closed as rejected-before-broadcast
+only after two canonical RPC observations show that its hash and receipt are
+absent and the account nonce has advanced past the signed nonce. That proof
+also raises the process-wide nonce allocator floor. For an Across
+wallet-to-Binance deposit, the parent saga may reopen only when every earlier
+deterministic child is terminally rejected, the exact Across-filled progress
+precedes quarantine, the pinned Binance route is still available, and two
+unchanged destination-wallet balance observations retain the full received
+amount. Recovery creates `:deposit:retry-1` and then `:deposit:retry-2`; three
+total pre-broadcast attempts are the hard limit. Any missing or contradictory
+evidence leaves the token quarantined.
+
 ## M10 Arbitrum rebalance canary
 
 The operator explicitly approved the fixed M10 production canary on
