@@ -2240,13 +2240,17 @@ impl RebalanceExecutor {
         let second = self
             .observe_unindexed_master_transfer_absence(operation)
             .await?;
-        ensure!(
-            first.0.is_zero() && first.1.is_zero() && second.0.is_zero() && second.1.is_zero(),
-            "unindexed Binance master-transfer retry found staged master inventory"
-        );
-        ensure!(
-            first.2 >= operation.intent.amount && second.2 >= operation.intent.amount,
-            "unindexed Binance master-transfer retry lacks sufficient source inventory"
+        validate_unindexed_master_transfer_absence(first, second, operation.intent.amount)?;
+        tracing::warn!(
+            operation_id = operation.intent.operation_id,
+            token = operation.intent.token_symbol,
+            client_transaction_id = operation.intent.withdraw_order_id,
+            first_master_free_base_units = first.0.to_string(),
+            second_master_free_base_units = second.0.to_string(),
+            first_master_locked_base_units = first.1.to_string(),
+            second_master_locked_base_units = second.1.to_string(),
+            target_base_units = operation.intent.amount.to_string(),
+            "accepted stable sub-target Binance master inventory as unrelated recovery evidence"
         );
         tracing::warn!(
             operation_id = operation.intent.operation_id,
@@ -4040,6 +4044,34 @@ fn account_asset_balance_or_zero(account: &AccountInformation, asset: &str) -> (
         })
 }
 
+fn validate_unindexed_master_transfer_absence(
+    first: (U256, U256, U256),
+    second: (U256, U256, U256),
+    target: U256,
+) -> anyhow::Result<()> {
+    ensure!(
+        first.0 == second.0 && first.1 == second.1,
+        "unindexed Binance master-transfer absence evidence changed during confirmation"
+    );
+    ensure!(
+        first.1.is_zero() && second.1.is_zero(),
+        "unindexed Binance master-transfer retry found locked master inventory"
+    );
+    // A universal transfer is atomic and must equal the immutable target. A
+    // stable free balance strictly below that target therefore cannot be this
+    // operation's completed transfer. Preserve it as unrelated account
+    // inventory instead of requiring the shared master account to be empty.
+    ensure!(
+        first.0 < target && second.0 < target,
+        "unindexed Binance master-transfer retry found staged master inventory"
+    );
+    ensure!(
+        first.2 >= target && second.2 >= target,
+        "unindexed Binance master-transfer retry lacks sufficient source inventory"
+    );
+    Ok(())
+}
+
 fn withdrawal_received_base_units(record: &WithdrawalRecord, decimals: u8) -> anyhow::Result<U256> {
     ensure!(record.amount > Decimal::ZERO, "withdrawal receipt is zero");
     decimal_to_base_units(record.amount, decimals)
@@ -4430,9 +4462,56 @@ mod tests {
         matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
         prebroadcast_attempt_id, reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
         shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
-        validate_direct_withdrawal_receipt, verified_self_owned_evm_address_record,
-        withdrawal_received_base_units, withdrawal_requested_base_units, withdrawal_retry_is_stale,
+        validate_direct_withdrawal_receipt, validate_unindexed_master_transfer_absence,
+        verified_self_owned_evm_address_record, withdrawal_received_base_units,
+        withdrawal_requested_base_units, withdrawal_retry_is_stale,
     };
+
+    #[test]
+    fn unindexed_master_transfer_accepts_only_stable_sub_target_free_inventory() {
+        let target = U256::from(126_845_916_u64);
+        let dust = U256::from(7_u64);
+        let source = U256::from(368_228_498_u64);
+
+        validate_unindexed_master_transfer_absence(
+            (dust, U256::ZERO, source),
+            (dust, U256::ZERO, source),
+            target,
+        )
+        .unwrap();
+        assert!(
+            validate_unindexed_master_transfer_absence(
+                (dust, U256::ZERO, source),
+                (dust + U256::ONE, U256::ZERO, source),
+                target,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_unindexed_master_transfer_absence(
+                (target, U256::ZERO, source),
+                (target, U256::ZERO, source),
+                target,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_unindexed_master_transfer_absence(
+                (dust, U256::ONE, source),
+                (dust, U256::ONE, source),
+                target,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_unindexed_master_transfer_absence(
+                (dust, U256::ZERO, target - U256::ONE),
+                (dust, U256::ZERO, target - U256::ONE),
+                target,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn prebroadcast_retry_ids_are_deterministic_and_bounded() {

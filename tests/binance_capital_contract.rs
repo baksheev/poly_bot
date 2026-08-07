@@ -161,9 +161,10 @@ fn unindexed_master_transfer_reuses_its_id_only_after_two_phase_absence_proof() 
     assert!(proof < retry);
     assert!(implementation.contains("UNKNOWN_WITHDRAWAL_ABSENCE_CONFIRMATION_DELAY"));
     assert!(implementation.contains("history.is_empty()"));
-    assert!(implementation.contains("first.0.is_zero()"));
-    assert!(implementation.contains("second.0.is_zero()"));
-    assert!(implementation.contains("second.2 >= operation.intent.amount"));
+    assert!(implementation.contains("validate_unindexed_master_transfer_absence"));
+    assert!(REBALANCE_RUNTIME.contains("first.0 < target"));
+    assert!(REBALANCE_RUNTIME.contains("second.0 < target"));
+    assert!(REBALANCE_RUNTIME.contains("second.2 >= target"));
     assert!(implementation.contains("client_transaction_id"));
     assert!(implementation.contains("validate_master_transfer_record"));
 }

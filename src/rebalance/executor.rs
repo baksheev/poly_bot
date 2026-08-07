@@ -23,6 +23,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
 const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 4;
 const MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS: u8 = 5;
+const MAX_UNINDEXED_MASTER_TRANSFER_REOPENS: u8 = 1;
 pub const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES: u8 = 3;
 const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS: u8 =
     MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES - 1;
@@ -292,6 +293,7 @@ pub struct RebalanceExecutionJournal {
     operation_started_at_unix_ms: BTreeMap<String, u64>,
     progress_before_quarantine: BTreeMap<String, RebalanceExecutionProgress>,
     quarantine_reopen_counts: BTreeMap<String, u8>,
+    unindexed_master_transfer_reopen_counts: BTreeMap<String, u8>,
     travel_rule_ownership_reopen_counts: BTreeMap<String, u8>,
     next_sequence: u64,
     poisoned: bool,
@@ -366,6 +368,7 @@ impl RebalanceExecutionJournal {
         let mut operation_started_at_unix_ms = BTreeMap::new();
         let mut progress_before_quarantine = BTreeMap::new();
         let mut quarantine_reopen_counts = BTreeMap::new();
+        let mut unindexed_master_transfer_reopen_counts = BTreeMap::new();
         let mut travel_rule_ownership_reopen_counts = BTreeMap::new();
         let mut expected_sequence = 0_u64;
         let mut reader = BufReader::new(
@@ -436,6 +439,17 @@ impl RebalanceExecutionJournal {
                         .checked_add(1)
                         .context("Travel Rule ownership rejection reopen count overflow")?;
                 }
+                if retryable_unindexed_master_transfer_reopen(
+                    &previous.progress,
+                    &payload.operation.progress,
+                ) {
+                    let count = unindexed_master_transfer_reopen_counts
+                        .entry(payload.operation.intent.operation_id.clone())
+                        .or_insert(0_u8);
+                    *count = count
+                        .checked_add(1)
+                        .context("unindexed master-transfer reopen count overflow")?;
+                }
             }
             apply_snapshot(
                 &mut operations,
@@ -454,6 +468,7 @@ impl RebalanceExecutionJournal {
             operation_started_at_unix_ms,
             progress_before_quarantine,
             quarantine_reopen_counts,
+            unindexed_master_transfer_reopen_counts,
             travel_rule_ownership_reopen_counts,
             next_sequence: expected_sequence,
             poisoned: false,
@@ -720,19 +735,32 @@ impl RebalanceExecutionJournal {
             let previous = self
                 .progress_before_quarantine
                 .get(&operation.intent.operation_id)?;
-            let maximum_reopens =
-                if retryable_premutation_capital_preflight_quarantine(reason, previous) {
-                    MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS
-                } else {
-                    MAX_CORRECTED_QUARANTINE_REOPENS
-                };
-            if self
-                .quarantine_reopen_counts
-                .get(&operation.intent.operation_id)
-                .copied()
-                .unwrap_or(0)
-                >= maximum_reopens
-            {
+            let (reopen_count, maximum_reopens) = if unindexed_master_transfer_quarantine(reason) {
+                (
+                    self.unindexed_master_transfer_reopen_counts
+                        .get(&operation.intent.operation_id)
+                        .copied()
+                        .unwrap_or(0),
+                    MAX_UNINDEXED_MASTER_TRANSFER_REOPENS,
+                )
+            } else if retryable_premutation_capital_preflight_quarantine(reason, previous) {
+                (
+                    self.quarantine_reopen_counts
+                        .get(&operation.intent.operation_id)
+                        .copied()
+                        .unwrap_or(0),
+                    MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS,
+                )
+            } else {
+                (
+                    self.quarantine_reopen_counts
+                        .get(&operation.intent.operation_id)
+                        .copied()
+                        .unwrap_or(0),
+                    MAX_CORRECTED_QUARANTINE_REOPENS,
+                )
+            };
+            if reopen_count >= maximum_reopens {
                 return None;
             }
             if !corrected_guard_quarantine(reason)
@@ -1024,6 +1052,15 @@ impl RebalanceExecutionJournal {
                 *count = count
                     .checked_add(1)
                     .context("Travel Rule ownership rejection reopen count overflow")?;
+            }
+            if retryable_unindexed_master_transfer_reopen(&previous_progress, &appended_progress) {
+                let count = self
+                    .unindexed_master_transfer_reopen_counts
+                    .entry(appended_operation_id.clone())
+                    .or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .context("unindexed master-transfer reopen count overflow")?;
             }
         }
         self.operation_started_at_unix_ms = next_started_at;
@@ -1378,10 +1415,28 @@ fn retryable_travel_rule_ownership_reopen(
     )
 }
 
+fn unindexed_master_transfer_quarantine(reason: &str) -> bool {
+    reason == "unindexed Binance master-transfer retry found staged master inventory"
+}
+
+fn retryable_unindexed_master_transfer_reopen(
+    previous: &RebalanceExecutionProgress,
+    next: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        (previous, next),
+        (
+            RebalanceExecutionProgress::Quarantined { reason },
+            RebalanceExecutionProgress::IntentRecorded,
+        ) if unindexed_master_transfer_quarantine(reason)
+    )
+}
+
 fn corrected_guard_quarantine(reason: &str) -> bool {
     reason == "unindexed Binance withdrawal retry found a destination-wallet balance change"
         || reason
             == "rebalance intent has no indexed Binance master transfer; operator review required"
+        || unindexed_master_transfer_quarantine(reason)
         || ownership_guard_quarantine(reason)
         || signature_encoding_quarantine(reason)
 }
@@ -1585,6 +1640,7 @@ fn validate_transition(
             RebalanceExecutionProgress::IntentRecorded,
         ) if reason
             == "rebalance intent has no indexed Binance master transfer; operator review required"
+            || unindexed_master_transfer_quarantine(reason)
     ) || reconciled_direct_deposit_transition(
         intent, previous, next,
     ) || reconciled_across_fill_transition(intent, previous, next)
@@ -2364,9 +2420,10 @@ mod tests {
     use alloy_primitives::{Address, B256, U256, keccak256};
 
     use super::{
-        RebalanceExecutionAuthority, RebalanceExecutionJournal, RebalanceExecutionProgress,
-        RebalanceExecutionRequest, TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE, WirePayload,
-        WireRecord, stale_master_return_client_id,
+        MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS, RebalanceExecutionAuthority,
+        RebalanceExecutionJournal, RebalanceExecutionProgress, RebalanceExecutionRequest,
+        TRAVEL_RULE_BINANCE_WITHDRAWAL_API_MODE, WirePayload, WireRecord,
+        stale_master_return_client_id,
     };
     use crate::rebalance::{Direction, RebalanceAction, Route};
 
@@ -3746,6 +3803,68 @@ mod tests {
         assert_eq!(
             reopened.progress,
             RebalanceExecutionProgress::IntentRecorded
+        );
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn staged_master_inventory_gets_one_reopen_independent_of_preflight_budget() {
+        let path = path("staged-master-inventory-independent-reopen");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+
+        for _ in 0..MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS {
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Quarantined {
+                        reason: "decimal exceeds token precision".to_owned(),
+                    },
+                )
+                .unwrap();
+            journal
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .expect("pre-mutation retry budget should remain available");
+        }
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance master-transfer retry found staged master inventory"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("staged-master correction has an independent one-shot reopen");
+        assert_eq!(
+            reopened.progress,
+            RebalanceExecutionProgress::IntentRecorded
+        );
+        replayed
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "unindexed Binance master-transfer retry found staged master inventory"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(
+            replayed
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none()
         );
         drop(replayed);
         fs::remove_file(path).unwrap();
