@@ -675,8 +675,10 @@ new Linea entries close and the reviewed rollback path is used.
 
 The first P8 rollout built and preflighted the intended image but failed closed
 before trading. Linea Alchemy URLs had been derived from the World Chain key;
-that key returned HTTP 403 for Linea. The corrected runtime uses one reviewed
-PublicNode Linea HTTP/WSS pair and the deployment now runs a read-only transport
+that key returned HTTP 403 for Linea. PublicNode was then selected, but a later
+provider outage timed out both automatic rollout attempts before the capacity
+replay. The corrected runtime uses the official `rpc.linea.build` HTTP endpoint
+and the public dRPC Linea WSS endpoint. The deployment runs a read-only transport
 gate on the fixed Singapore C4 before rollout: ten HTTP chain/gas samples must
 have p95 at or below 500 ms, WSS log/head subscription must complete within
 three seconds, and a canonical head must arrive within eight seconds.

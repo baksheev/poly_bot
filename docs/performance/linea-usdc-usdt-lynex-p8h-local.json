@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "stage": "P8h_linea_transport_provider_recovery",
+  "measured_at_utc": "2026-08-07T04:18:24Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "deployment-only Linea HTTP/WSS provider recovery and failed-preflight log capture; no production Rust source or dependency change",
+  "control": {
+    "revision": "983c914720e85d61e51a2584e163e4b6f7cac0c6",
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "candidate": {
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "local_transport_diagnostic": {
+    "http_provider": "Linea official",
+    "rpc_url": "https://rpc.linea.build",
+    "wss_provider": "dRPC",
+    "ws_url": "wss://linea.drpc.org",
+    "chain_id": 59144,
+    "http_sample_count": 10,
+    "http_p95_us": 1845583,
+    "ws_subscribe_us": 1913785,
+    "first_head_us": 2564512,
+    "network_mutations": 0,
+    "gate": "pass_local_diagnostic_target_c4_required_before_rollout"
+  },
+  "performance_verification": {
+    "command": "cargo build --release --locked && shasum -a 256 target/release/arb_bot",
+    "binary_byte_identical": true,
+    "hot_path_changed": false,
+    "expected_throughput_ratio": 1.0,
+    "target_c4_gate_unchanged": true
+  },
+  "gate": "pass_byte_identical_release_binary_target_c4_required_before_rollout"
+}

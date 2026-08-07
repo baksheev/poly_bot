@@ -71,6 +71,10 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
     assert!(DEPLOY_WORKFLOW.contains("Verify operator-maintained Linea gas invariant read-only"));
     assert!(DEPLOY_WORKFLOW.contains("https://rpc.linea.build"));
+    assert!(DEPLOY_WORKFLOW.contains("wss://linea.drpc.org"));
+    assert!(!DEPLOY_WORKFLOW.contains("linea-rpc.publicnode.com"));
+    assert!(DEPLOY_WORKFLOW.contains("--container replay"));
+    assert!(DEPLOY_WORKFLOW.contains("--previous"));
     assert!(DEPLOY_WORKFLOW.contains("2386f26fc10000"));
     assert!(DEPLOY_WORKFLOW.contains("less than the reviewed 0.01 ETH Linea operator gas reserve"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
@@ -256,13 +260,13 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert_eq!(
         DEPLOYMENT
-            .matches("export LINEA_RPC_URL=\"https://linea-rpc.publicnode.com\"")
+            .matches("export LINEA_RPC_URL=\"https://rpc.linea.build\"")
             .count(),
         2
     );
     assert_eq!(
         DEPLOYMENT
-            .matches("export LINEA_WS_URL=\"wss://linea-rpc.publicnode.com\"")
+            .matches("export LINEA_WS_URL=\"wss://linea.drpc.org\"")
             .count(),
         2
     );
