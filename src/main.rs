@@ -790,12 +790,12 @@ async fn linea_transport_preflight(
     let pool: Address = "0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b".parse()?;
     let filter = EthLogFilter::new(vec![pool], vec![])?;
     let ws_started = Instant::now();
-    let mut stream = tokio::time::timeout(
+    let (mut stream, ws_connect_attempts) = tokio::time::timeout(
         Duration::from_millis(maximum_ws_subscribe_ms),
-        connect_dex_stream(ws_url, &[filter], 16),
+        connect_linea_transport_stream(ws_url, &filter),
     )
     .await
-    .context("Linea WSS subscription timed out")??;
+    .context("Linea WSS subscription retry budget timed out")??;
     let ws_subscribe_us = ws_started.elapsed().as_micros();
     let head_started = Instant::now();
     let event = tokio::time::timeout(
@@ -821,6 +821,7 @@ async fn linea_transport_preflight(
             "http_p95_us": http_p95_us,
             "maximum_http_p95_ms": maximum_http_p95_ms,
             "ws_subscribe_us": ws_subscribe_us,
+            "ws_connect_attempts": ws_connect_attempts,
             "maximum_ws_subscribe_ms": maximum_ws_subscribe_ms,
             "first_head_us": first_head_us,
             "maximum_head_wait_ms": maximum_head_wait_ms,
@@ -829,6 +830,37 @@ async fn linea_transport_preflight(
         }))?
     );
     Ok(())
+}
+
+const LINEA_TRANSPORT_SUBSCRIPTION_ATTEMPTS: u32 = 3;
+
+async fn connect_linea_transport_stream(
+    ws_url: &str,
+    filter: &EthLogFilter,
+) -> anyhow::Result<(AlchemyDexStream, u32)> {
+    let mut last_error = None;
+    for attempt in 1..=LINEA_TRANSPORT_SUBSCRIPTION_ATTEMPTS {
+        match connect_dex_stream(ws_url, std::slice::from_ref(filter), 16).await {
+            Ok(stream) => return Ok((stream, attempt)),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < LINEA_TRANSPORT_SUBSCRIPTION_ATTEMPTS {
+            tokio::time::sleep(linea_transport_subscription_retry_delay(attempt)).await;
+        }
+    }
+    Err(last_error.expect("at least one Linea subscription attempt ran")).with_context(|| {
+        format!(
+            "Linea WSS subscription failed after {LINEA_TRANSPORT_SUBSCRIPTION_ATTEMPTS} attempts"
+        )
+    })
+}
+
+fn linea_transport_subscription_retry_delay(completed_attempts: u32) -> Duration {
+    if completed_attempts <= 1 {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_millis(500)
+    }
 }
 
 async fn arbitrage_emit_result(
@@ -7839,8 +7871,8 @@ mod tests {
         RebalanceExecutionTarget, RebalanceExecutorCommand, StartupDexDrainStats,
         apply_rebalance_dispatch_outcome, command_owns_runtime_readiness,
         dispatch_across_reconciliation, esp_evm_journal_scope, linea_evm_journal_scope,
-        rebalance_quote_retry_delay, sync_runtime_ready_marker,
-        transient_capital_allocator_inventory_mismatch,
+        linea_transport_subscription_retry_delay, rebalance_quote_retry_delay,
+        sync_runtime_ready_marker, transient_capital_allocator_inventory_mismatch,
     };
 
     #[test]
@@ -7938,6 +7970,22 @@ mod tests {
         assert_eq!(rebalance_quote_retry_delay(4), Duration::from_secs(40));
         assert_eq!(rebalance_quote_retry_delay(5), Duration::from_secs(60));
         assert_eq!(rebalance_quote_retry_delay(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn linea_transport_subscription_retry_backoff_is_bounded() {
+        assert_eq!(
+            linea_transport_subscription_retry_delay(1),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            linea_transport_subscription_retry_delay(2),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            linea_transport_subscription_retry_delay(100),
+            Duration::from_millis(500)
+        );
     }
 
     #[tokio::test]

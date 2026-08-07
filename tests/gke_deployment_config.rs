@@ -80,9 +80,12 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(live_strategy.get("balance_safety_multiplier").is_none());
     assert!(DEPLOY_WORKFLOW.contains("Verify GCE live owner is stopped"));
     assert!(DEPLOY_WORKFLOW.contains("Verify operator-maintained Linea gas invariant read-only"));
-    assert!(DEPLOY_WORKFLOW.contains("https://rpc.linea.build"));
-    assert!(DEPLOY_WORKFLOW.contains("wss://linea.drpc.org"));
+    assert!(DEPLOY_WORKFLOW.contains("https://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}"));
+    assert!(DEPLOY_WORKFLOW.contains("wss://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}"));
+    assert!(DEPLOY_WORKFLOW.contains("secretProviderClass\": \"arb-bot-esp-market-data"));
+    assert!(DEPLOY_WORKFLOW.contains("/var/run/secrets/arb-bot-esp/ALCHEMY_WORLDCHAIN_RPC_URL"));
     assert!(!DEPLOY_WORKFLOW.contains("linea-rpc.publicnode.com"));
+    assert!(!DEPLOY_WORKFLOW.contains("wss://linea.drpc.org"));
     assert!(DEPLOY_WORKFLOW.contains("--maximum-http-p95-ms 500"));
     assert!(!DEPLOY_WORKFLOW.contains("--maximum-http-p95-ms 5000"));
     assert!(!DEPLOY_WORKFLOW.contains(".http_p95_us <= 500000"));
@@ -275,13 +278,17 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
     );
     assert_eq!(
         DEPLOYMENT
-            .matches("export LINEA_RPC_URL=\"https://rpc.linea.build\"")
+            .matches(
+                "export LINEA_RPC_URL=\"https://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}\""
+            )
             .count(),
         2
     );
     assert_eq!(
         DEPLOYMENT
-            .matches("export LINEA_WS_URL=\"wss://linea.drpc.org\"")
+            .matches(
+                "export LINEA_WS_URL=\"wss://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}\""
+            )
             .count(),
         2
     );

@@ -498,9 +498,20 @@ jobs:
               | .spec.template.metadata.labels["arb-bot/source-revision"] = $source_sha
               | .spec.template.metadata.labels["arb-bot/replay-instance"] = $replay_instance
               | .spec.template.spec.automountServiceAccountToken = false
+              | .spec.template.spec.serviceAccountName = "arb-bot-runtime"
               | .spec.template.spec.nodeSelector = {
                   "cloud.google.com/gke-nodepool": $node_pool
                 }
+              | .spec.template.spec.volumes = [{
+                  "name": "transport-secrets",
+                  "csi": {
+                    "driver": "secrets-store-gke.csi.k8s.io",
+                    "readOnly": true,
+                    "volumeAttributes": {
+                      "secretProviderClass": "arb-bot-esp-market-data"
+                    }
+                  }
+                }]
               | .spec.template.spec.securityContext = {
                   "runAsNonRoot": true,
                   "runAsUser": 65532,
@@ -523,8 +534,13 @@ jobs:
                   "imagePullPolicy": "IfNotPresent",
                   "command": ["/bin/sh", "-ec"],
                   "args": [
-                    "transport=\"$(arb_bot linea-transport-preflight --rpc-url https://rpc.linea.build --ws-url wss://linea.drpc.org --maximum-http-p95-ms 500 --maximum-ws-subscribe-ms 3000 --maximum-head-wait-ms 8000 2>&1)\" || { printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; exit 1; }; printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8 2>&1)\" || { printf \"%s\\n\" \"${report}\" | tee /dev/termination-log; exit 1; }; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
+                    "alchemy_rpc_url=\"$(cat /var/run/secrets/arb-bot-esp/ALCHEMY_WORLDCHAIN_RPC_URL)\"; alchemy_api_key=\"${alchemy_rpc_url##*/}\"; test -n \"${alchemy_api_key}\"; export LINEA_RPC_URL=\"https://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}\"; export LINEA_WS_URL=\"wss://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}\"; unset alchemy_rpc_url alchemy_api_key; transport=\"$(arb_bot linea-transport-preflight --maximum-http-p95-ms 500 --maximum-ws-subscribe-ms 3000 --maximum-head-wait-ms 8000 2>&1)\" || { printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; exit 1; }; unset LINEA_RPC_URL LINEA_WS_URL; printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8 2>&1)\" || { printf \"%s\\n\" \"${report}\" | tee /dev/termination-log; exit 1; }; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
                   ],
+                  "volumeMounts": [{
+                    "name": "transport-secrets",
+                    "mountPath": "/var/run/secrets/arb-bot-esp",
+                    "readOnly": true
+                  }],
                   "resources": {
                     "requests": {"cpu": "250m", "memory": "128Mi"},
                     "limits": {"cpu": "1", "memory": "256Mi"}

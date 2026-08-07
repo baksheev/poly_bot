@@ -80,8 +80,8 @@ spec:
               test -n "${alchemy_api_key}"
               export ARBITRUM_RPC_URL="https://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
               export ARBITRUM_WS_URL="wss://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
-              export LINEA_RPC_URL="https://rpc.linea.build"
-              export LINEA_WS_URL="wss://linea.drpc.org"
+              export LINEA_RPC_URL="https://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
+              export LINEA_WS_URL="wss://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
               unset alchemy_api_key
               export ENGINE_ID="arb-bot-rust-shadow-gke-${HOSTNAME}"
               exec arb_bot run
@@ -146,8 +146,8 @@ spec:
               test -n "${alchemy_api_key}"
               export ARBITRUM_RPC_URL="https://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
               export ARBITRUM_WS_URL="wss://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
-              export LINEA_RPC_URL="https://rpc.linea.build"
-              export LINEA_WS_URL="wss://linea.drpc.org"
+              export LINEA_RPC_URL="https://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
+              export LINEA_WS_URL="wss://linea-mainnet.g.alchemy.com/v2/${alchemy_api_key}"
               unset alchemy_rpc_url alchemy_api_key
               export ENGINE_ID="arb-bot-esp-shadow-gke-${HOSTNAME}"
               exec arb_bot collect-prices
