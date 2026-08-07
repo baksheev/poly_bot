@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "stage": "P8j_target_c4_evidence_shell_fix",
+  "measured_at_utc": "2026-08-07T06:16:01Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "workflow-only quoting correction and contract test; no production Rust source or dependency change",
+  "control": {
+    "revision": "609db7bc79694c6806b9cb2d39371b6e2b0065b7",
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "candidate": {
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "verification": {
+    "binary_byte_identical": true,
+    "hot_path_changed": false,
+    "expected_throughput_ratio": 1.0,
+    "target_c4_http_p95_limit_us": 500000,
+    "target_c4_limit_changed": false,
+    "workflow_contract_tests": "6_passed_0_failed"
+  },
+  "gate": "pass_byte_identical_release_binary_target_c4_measurement_required"
+}
