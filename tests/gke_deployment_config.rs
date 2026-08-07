@@ -86,6 +86,9 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("--maximum-http-p95-ms 500"));
     assert!(!DEPLOY_WORKFLOW.contains("--maximum-http-p95-ms 5000"));
     assert!(!DEPLOY_WORKFLOW.contains(".http_p95_us <= 500000"));
+    assert!(
+        DEPLOY_WORKFLOW.contains("replay-capacity --target-cpu-class c4-highcpu-8 2>&1)\\\" ||")
+    );
     assert!(DEPLOY_WORKFLOW.contains("capacity preflight failed without a termination message"));
     assert!(DEPLOY_WORKFLOW.contains("2386f26fc10000"));
     assert!(DEPLOY_WORKFLOW.contains("less than the reviewed 0.01 ETH Linea operator gas reserve"));

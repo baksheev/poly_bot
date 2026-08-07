@@ -523,7 +523,7 @@ jobs:
                   "imagePullPolicy": "IfNotPresent",
                   "command": ["/bin/sh", "-ec"],
                   "args": [
-                    "transport=\"$(arb_bot linea-transport-preflight --rpc-url https://rpc.linea.build --ws-url wss://linea.drpc.org --maximum-http-p95-ms 500 --maximum-ws-subscribe-ms 3000 --maximum-head-wait-ms 8000 2>&1)\" || { printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; exit 1; }; printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8)\"; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
+                    "transport=\"$(arb_bot linea-transport-preflight --rpc-url https://rpc.linea.build --ws-url wss://linea.drpc.org --maximum-http-p95-ms 500 --maximum-ws-subscribe-ms 3000 --maximum-head-wait-ms 8000 2>&1)\" || { printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; exit 1; }; printf \"%s\\n\" \"${transport}\" | tee /dev/termination-log; report=\"$(arb_bot replay-capacity --target-cpu-class c4-highcpu-8 2>&1)\" || { printf \"%s\\n\" \"${report}\" | tee /dev/termination-log; exit 1; }; printf \"%s\\n\" \"${report}\" | tee /dev/termination-log"
                   ],
                   "resources": {
                     "requests": {"cpu": "250m", "memory": "128Mi"},
