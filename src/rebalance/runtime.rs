@@ -551,7 +551,7 @@ impl RebalanceExecutor {
                 operation_id = operation.intent.operation_id,
                 token = operation.intent.token_symbol,
                 progress = ?operation.progress,
-                "reopened one previously quarantined rebalance after its false-positive guard was corrected"
+                "reopened one previously quarantined rebalance through an approved bounded recovery"
             );
         }
         Ok(reopened)

@@ -729,6 +729,7 @@ impl RebalanceExecutionJournal {
                 .progress_before_quarantine
                 .get(&operation.intent.operation_id)?;
             if !corrected_guard_quarantine(reason)
+                && !retryable_premutation_capital_preflight_quarantine(reason, previous)
                 && !corrected_across_deposit_chain_quarantine(&operation.intent, reason, previous)
             {
                 return None;
@@ -1378,6 +1379,18 @@ fn corrected_guard_quarantine(reason: &str) -> bool {
         || signature_encoding_quarantine(reason)
 }
 
+fn retryable_premutation_capital_preflight_quarantine(
+    reason: &str,
+    progress_before_quarantine: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        progress_before_quarantine,
+        RebalanceExecutionProgress::IntentRecorded
+    ) && reason
+        .to_ascii_lowercase()
+        .starts_with("binance capital configuration request failed:")
+}
+
 fn corrected_across_deposit_chain_quarantine(
     intent: &RebalanceExecutionIntent,
     reason: &str,
@@ -1566,6 +1579,13 @@ fn validate_transition(
         intent, previous, next,
     ) || reconciled_across_fill_transition(intent, previous, next)
         || reconciled_consumed_nonce_deposit_transition(intent, previous, next)
+        || matches!(
+            (previous, next),
+            (
+                RebalanceExecutionProgress::Quarantined { reason },
+                RebalanceExecutionProgress::IntentRecorded,
+            ) if retryable_premutation_capital_preflight_quarantine(reason, next)
+        )
         || matches!(previous, RebalanceExecutionProgress::Quarantined { reason }
             if corrected_across_deposit_chain_quarantine(intent, reason, next));
     ensure!(
@@ -3528,6 +3548,87 @@ mod tests {
             }
         );
         drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn premutation_capital_preflight_failure_reopens_only_the_exact_recorded_intent() {
+        let path = path("premutation-capital-preflight-reopen");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "Binance capital configuration request failed: error sending request"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+
+        let mut replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        let reopened = replayed
+            .reopen_next_retryable_quarantine()
+            .unwrap()
+            .expect("the pre-mutation read failure should reopen");
+        assert_eq!(
+            reopened.progress,
+            RebalanceExecutionProgress::IntentRecorded
+        );
+        assert_eq!(reopened.intent.operation_id, operation_id);
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capital_preflight_reason_after_mutation_cannot_reopen() {
+        let path = path("postmutation-capital-preflight-closed");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::DepositTransferMined {
+                    chain_id: 42_161,
+                    transaction_hash: B256::repeat_byte(0x98),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "Binance capital configuration request failed: error sending request"
+                        .to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            journal
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::DepositTransferMined {
+                        chain_id: 42_161,
+                        transaction_hash: B256::repeat_byte(0x98),
+                    },
+                )
+                .is_err()
+        );
+        drop(journal);
         fs::remove_file(path).unwrap();
     }
 

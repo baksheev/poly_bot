@@ -366,6 +366,13 @@ preflight without spending a transaction attempt; it still cannot create the
 next child unless every existing child remains rejected-before-broadcast and
 the route and two-observation balance proof pass again.
 
+A transport failure while reading Binance capital configuration at the initial
+`IntentRecorded` state is also a bounded recovery case: no wallet, bridge,
+withdrawal, or transfer mutation has yet been submitted, so the journal may
+reopen that exact durable intent and repeat normal route verification. The
+existing quarantine reopen counter caps this at four durable reopens. The same
+error after any mutation is not eligible for this recovery.
+
 ## M10 Arbitrum rebalance canary
 
 The operator explicitly approved the fixed M10 production canary on
