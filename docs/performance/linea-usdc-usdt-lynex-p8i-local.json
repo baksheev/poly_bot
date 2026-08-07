@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "stage": "P8i_target_c4_transport_evidence_capture",
+  "measured_at_utc": "2026-08-07T05:35:36Z",
+  "host": "local_arm64_macos",
+  "build_profile": "release",
+  "change_scope": "deployment-only target-C4 transport evidence persistence; the existing 500 ms HTTP p95 gate remains unchanged",
+  "control": {
+    "revision": "1b1428d3637b9808786cc2ed66233b973c48b807",
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "candidate": {
+    "binary_sha256": "85e530824785de28ca95298fd7eea8adb4c61f6797da95a59128ac2773084c89"
+  },
+  "verification": {
+    "binary_byte_identical": true,
+    "hot_path_changed": false,
+    "expected_throughput_ratio": 1.0,
+    "target_c4_http_p95_limit_us": 500000,
+    "target_c4_limit_changed": false,
+    "failed_preflight_evidence_persisted": true
+  },
+  "gate": "pass_byte_identical_release_binary_target_c4_measurement_required"
+}
