@@ -22,6 +22,7 @@ const VERSION: u16 = 1;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_REASON_BYTES: usize = 1_024;
 const MAX_CORRECTED_QUARANTINE_REOPENS: u8 = 4;
+const MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS: u8 = 5;
 pub const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES: u8 = 3;
 const MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_REOPENS: u8 =
     MAX_TRAVEL_RULE_OWNERSHIP_REJECTION_RETRIES - 1;
@@ -716,18 +717,24 @@ impl RebalanceExecutionJournal {
             let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
                 return None;
             };
+            let previous = self
+                .progress_before_quarantine
+                .get(&operation.intent.operation_id)?;
+            let maximum_reopens =
+                if retryable_premutation_capital_preflight_quarantine(reason, previous) {
+                    MAX_PREMUTATION_CAPITAL_PREFLIGHT_REOPENS
+                } else {
+                    MAX_CORRECTED_QUARANTINE_REOPENS
+                };
             if self
                 .quarantine_reopen_counts
                 .get(&operation.intent.operation_id)
                 .copied()
                 .unwrap_or(0)
-                >= MAX_CORRECTED_QUARANTINE_REOPENS
+                >= maximum_reopens
             {
                 return None;
             }
-            let previous = self
-                .progress_before_quarantine
-                .get(&operation.intent.operation_id)?;
             if !corrected_guard_quarantine(reason)
                 && !retryable_premutation_capital_preflight_quarantine(reason, previous)
                 && !corrected_across_deposit_chain_quarantine(&operation.intent, reason, previous)
@@ -3584,6 +3591,53 @@ mod tests {
         );
         assert_eq!(reopened.intent.operation_id, operation_id);
         drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn premutation_precision_recovery_has_one_separate_fifth_reopen() {
+        let path = path("premutation-precision-five-reopens");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::BinanceToWallet, across()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "decimal exceeds token precision".to_owned(),
+                },
+            )
+            .unwrap();
+
+        for reopen in 0..5 {
+            let reopened = journal
+                .reopen_next_retryable_quarantine()
+                .unwrap()
+                .expect("pre-mutation precision recovery should remain boundedly retryable");
+            assert_eq!(
+                reopened.progress,
+                RebalanceExecutionProgress::IntentRecorded
+            );
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Quarantined {
+                        reason: "decimal exceeds token precision".to_owned(),
+                    },
+                )
+                .unwrap();
+            if reopen == 4 {
+                assert!(
+                    journal
+                        .reopen_next_retryable_quarantine()
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+        drop(journal);
         fs::remove_file(path).unwrap();
     }
 

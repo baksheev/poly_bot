@@ -379,7 +379,11 @@ intersection between that decimal multiple and integer on-chain base units;
 for example a `0.00000001` Binance multiple on six-decimal USDC becomes one
 base unit, while `0.0000015` becomes three. Fee authority rounds a fractional
 base unit upward. A historical precision quarantine may reopen only from the
-unchanged pre-mutation `IntentRecorded` state.
+unchanged pre-mutation `IntentRecorded` state. Binance account free/locked
+balances are floored to the same on-chain base-unit precision for recovery
+evidence, so unspendable exchange dust cannot invalidate an otherwise exact
+absence proof. This class has one separate fifth durable reopen for the
+already-exhausted historical correction; other recovery limits remain four.
 
 ## M10 Arbitrum rebalance canary
 

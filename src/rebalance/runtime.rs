@@ -2281,9 +2281,9 @@ impl RebalanceExecutor {
         let (trading_free, _) =
             account_asset_balance_or_zero(&trading, &operation.intent.token_symbol);
         Ok((
-            decimal_to_base_units(master_free, operation.intent.token_decimals)?,
-            decimal_to_base_units(master_locked, operation.intent.token_decimals)?,
-            decimal_to_base_units(trading_free, operation.intent.token_decimals)?,
+            decimal_to_base_units_floor(master_free, operation.intent.token_decimals)?,
+            decimal_to_base_units_floor(master_locked, operation.intent.token_decimals)?,
+            decimal_to_base_units_floor(trading_free, operation.intent.token_decimals)?,
         ))
     }
 
@@ -2652,7 +2652,7 @@ impl RebalanceExecutor {
             .find(|balance| balance.asset == operation.intent.token_symbol)
             .context("stale withdrawal asset is absent from the master account")?;
         ensure!(
-            decimal_to_base_units(balance.free, operation.intent.token_decimals)?
+            decimal_to_base_units_floor(balance.free, operation.intent.token_decimals)?
                 == operation.intent.amount,
             "stale withdrawal master return did not preserve exact free inventory"
         );
@@ -2992,9 +2992,9 @@ impl RebalanceExecutor {
                 "unindexed Binance withdrawal retry asset is absent from the master account",
             )?;
         let master_free_base_units =
-            decimal_to_base_units(balance.free, operation.intent.token_decimals)?;
+            decimal_to_base_units_floor(balance.free, operation.intent.token_decimals)?;
         let master_locked_base_units =
-            decimal_to_base_units(balance.locked, operation.intent.token_decimals)?;
+            decimal_to_base_units_floor(balance.locked, operation.intent.token_decimals)?;
         ensure!(
             master_free_base_units == operation.intent.amount,
             "unindexed Binance withdrawal retry did not preserve the exact master balance"
@@ -3006,9 +3006,9 @@ impl RebalanceExecutor {
         let (trading_free, trading_locked) =
             account_asset_balance_or_zero(&trading_account, &operation.intent.token_symbol);
         let trading_free_base_units =
-            decimal_to_base_units(trading_free, operation.intent.token_decimals)?;
+            decimal_to_base_units_floor(trading_free, operation.intent.token_decimals)?;
         let trading_locked_base_units =
-            decimal_to_base_units(trading_locked, operation.intent.token_decimals)?;
+            decimal_to_base_units_floor(trading_locked, operation.intent.token_decimals)?;
         let _ = bridge_balance_before;
         Ok(WithdrawalAbsenceEvidence {
             master_free_base_units,
