@@ -299,7 +299,7 @@ fn route_candidate(
     across: bool,
 ) -> anyhow::Result<RouteCandidate> {
     let multiple =
-        decimal_to_base_units(network.withdraw_integer_multiple, token_decimals)?.max(U256::ONE);
+        decimal_multiple_to_base_unit_step(network.withdraw_integer_multiple, token_decimals)?;
     Ok(RouteCandidate {
         route,
         binance_deposit_enabled: capital.deposit_all_enabled && network.deposit_available(),
@@ -344,6 +344,32 @@ fn decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U
         .checked_mul(pow10(decimals.into())?)
         .context("decimal balance base-unit numerator overflow")?;
     Ok(numerator / pow10(value.scale())?)
+}
+
+fn decimal_multiple_to_base_unit_step(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
+    ensure!(
+        value >= Decimal::ZERO,
+        "decimal multiple must not be negative"
+    );
+    let mantissa = value.mantissa();
+    ensure!(mantissa >= 0, "decimal mantissa must not be negative");
+    if mantissa == 0 {
+        return Ok(U256::ONE);
+    }
+    let numerator = U256::from(mantissa as u128)
+        .checked_mul(pow10(decimals.into())?)
+        .context("decimal multiple base-unit numerator overflow")?;
+    let denominator = pow10(value.scale())?;
+    Ok(numerator / u256_gcd(numerator, denominator))
+}
+
+fn u256_gcd(mut left: U256, mut right: U256) -> U256 {
+    while right != U256::ZERO {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn pow10(exponent: u32) -> anyhow::Result<U256> {
@@ -601,6 +627,36 @@ mod tests {
             routes[0].withdrawal.multiple,
             U256::from(10_000_000_000_000_000_u64)
         );
+    }
+
+    #[test]
+    fn capital_routes_intersect_sub_base_unit_binance_multiples() {
+        let mut network = NetworkInformation {
+            network: "OPTIMISM".to_owned(),
+            name: "Optimism".to_owned(),
+            deposit_enable: true,
+            withdraw_enable: true,
+            busy: false,
+            withdraw_fee: Decimal::ZERO,
+            withdraw_min: Decimal::ONE,
+            withdraw_max: Decimal::from(10_000),
+            withdraw_integer_multiple: Decimal::from_str_exact("0.00000001").unwrap(),
+        };
+        let mut capital = CapitalRouteState {
+            coin: "USDC".to_owned(),
+            deposit_all_enabled: true,
+            withdrawal_all_enabled: true,
+            direct: None,
+            fallback: Some(network.clone()),
+        };
+
+        let routes = route_candidates_from_capital(&capital, 6, 59_144).unwrap();
+        assert_eq!(routes[0].withdrawal.multiple, U256::ONE);
+
+        network.withdraw_integer_multiple = Decimal::from_str_exact("0.0000015").unwrap();
+        capital.fallback = Some(network);
+        let routes = route_candidates_from_capital(&capital, 6, 59_144).unwrap();
+        assert_eq!(routes[0].withdrawal.multiple, U256::from(3));
     }
 
     #[test]

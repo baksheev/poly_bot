@@ -373,6 +373,14 @@ reopen that exact durable intent and repeat normal route verification. The
 existing quarantine reopen counter caps this at four durable reopens. The same
 error after any mutation is not eligible for this recovery.
 
+Binance may publish a withdrawal integer multiple or fee with finer decimal
+precision than the destination token. Route validation computes the exact
+intersection between that decimal multiple and integer on-chain base units;
+for example a `0.00000001` Binance multiple on six-decimal USDC becomes one
+base unit, while `0.0000015` becomes three. Fee authority rounds a fractional
+base unit upward. A historical precision quarantine may reopen only from the
+unchanged pre-mutation `IntentRecorded` state.
+
 ## M10 Arbitrum rebalance canary
 
 The operator explicitly approved the fixed M10 production canary on

@@ -3486,12 +3486,11 @@ impl RebalanceExecutor {
                 "rebalance withdrawal is outside live limits"
             );
             ensure!(
-                decimal_to_base_units(amount, operation.intent.token_decimals)?
-                    % decimal_to_base_units(
+                operation.intent.amount
+                    % decimal_multiple_to_base_unit_step(
                         selected.withdraw_integer_multiple,
                         operation.intent.token_decimals
                     )?
-                    .max(U256::ONE)
                     == U256::ZERO,
                 "rebalance withdrawal violates live integer multiple"
             );
@@ -3506,8 +3505,10 @@ impl RebalanceExecutor {
                     .and_then(|value| {
                         U256::from_str(value).context("rebalance fee authority is not a uint256")
                     })?;
-                let current_fee =
-                    decimal_to_base_units(selected.withdraw_fee, operation.intent.token_decimals)?;
+                let current_fee = decimal_to_base_units_ceil(
+                    selected.withdraw_fee,
+                    operation.intent.token_decimals,
+                )?;
                 ensure!(
                     current_fee <= authorized_fee,
                     "live Binance withdrawal fee exceeds rebalance durable authority"
@@ -4203,6 +4204,47 @@ fn decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U
     Ok(numerator / pow10(value.scale())?)
 }
 
+fn decimal_to_base_units_ceil(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
+    ensure!(value >= Decimal::ZERO, "decimal amount is negative");
+    let mantissa = value.mantissa();
+    ensure!(mantissa >= 0, "decimal mantissa is negative");
+    let numerator = U256::from(mantissa as u128)
+        .checked_mul(pow10(decimals.into())?)
+        .context("decimal base-unit overflow")?;
+    let denominator = pow10(value.scale())?;
+    let quotient = numerator / denominator;
+    if numerator % denominator == U256::ZERO {
+        Ok(quotient)
+    } else {
+        quotient
+            .checked_add(U256::ONE)
+            .context("decimal base-unit ceiling overflow")
+    }
+}
+
+fn decimal_multiple_to_base_unit_step(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
+    ensure!(value >= Decimal::ZERO, "decimal multiple is negative");
+    let mantissa = value.mantissa();
+    ensure!(mantissa >= 0, "decimal multiple mantissa is negative");
+    if mantissa == 0 {
+        return Ok(U256::ONE);
+    }
+    let numerator = U256::from(mantissa as u128)
+        .checked_mul(pow10(decimals.into())?)
+        .context("decimal multiple base-unit overflow")?;
+    let denominator = pow10(value.scale())?;
+    Ok(numerator / u256_gcd(numerator, denominator))
+}
+
+fn u256_gcd(mut left: U256, mut right: U256) -> U256 {
+    while right != U256::ZERO {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 pub fn rebalance_decimal_to_base_units_floor(value: Decimal, decimals: u8) -> anyhow::Result<U256> {
     decimal_to_base_units_floor(value, decimals)
 }
@@ -4383,7 +4425,8 @@ mod tests {
         ARBITRUM_CHAIN_ID, LINEA_CHAIN_ID, LINEA_USDC, LINEA_USDT, WORLD_CHAIN_CHAIN_ID,
         WORLD_CHAIN_USDC, WORLD_CHAIN_WLD, WithdrawalAbsenceEvidence,
         account_asset_balance_or_zero, base_units_to_decimal, current_required_withdrawal,
-        decimal_to_base_units, decimal_to_base_units_floor, deposit_questionnaire_chain_id,
+        decimal_multiple_to_base_unit_step, decimal_to_base_units, decimal_to_base_units_ceil,
+        decimal_to_base_units_floor, deposit_questionnaire_chain_id,
         matches_travel_rule_record_identity_without_client_id, merge_travel_rule_withdrawal_detail,
         prebroadcast_attempt_id, reconcile_approved_travel_rule_rejection, route_wallet_chain_id,
         shared_evm_confirmation_timeout, validate_across_fill_receipt, validate_approved_asset,
@@ -4754,6 +4797,26 @@ mod tests {
             U256::from(6_170_807_271_u64)
         );
         assert!(decimal_to_base_units(balance, 6).is_err());
+    }
+
+    #[test]
+    fn rounds_sub_base_unit_fees_up_and_intersects_decimal_multiples_exactly() {
+        let sub_base = Decimal::from_str_exact("0.00000001").unwrap();
+        assert_eq!(decimal_to_base_units_ceil(sub_base, 6).unwrap(), U256::ONE);
+        assert_eq!(
+            decimal_multiple_to_base_unit_step(sub_base, 6).unwrap(),
+            U256::ONE
+        );
+
+        let one_and_a_half_base_units = Decimal::from_str_exact("0.0000015").unwrap();
+        assert_eq!(
+            decimal_multiple_to_base_unit_step(one_and_a_half_base_units, 6).unwrap(),
+            U256::from(3)
+        );
+        assert_eq!(
+            decimal_to_base_units_ceil(one_and_a_half_base_units, 6).unwrap(),
+            U256::from(2)
+        );
     }
 
     #[test]

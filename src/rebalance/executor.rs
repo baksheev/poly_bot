@@ -1383,12 +1383,15 @@ fn retryable_premutation_capital_preflight_quarantine(
     reason: &str,
     progress_before_quarantine: &RebalanceExecutionProgress,
 ) -> bool {
-    matches!(
+    let pre_mutation = matches!(
         progress_before_quarantine,
         RebalanceExecutionProgress::IntentRecorded
-    ) && reason
-        .to_ascii_lowercase()
-        .starts_with("binance capital configuration request failed:")
+    );
+    pre_mutation
+        && (reason
+            .to_ascii_lowercase()
+            .starts_with("binance capital configuration request failed:")
+            || reason == "decimal exceeds token precision")
 }
 
 fn corrected_across_deposit_chain_quarantine(
