@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "stage": "P8l_linea_stream_fail_fast_rehydration",
+  "measured_at_utc": "2026-08-07T08:29:15Z",
+  "host": "local_arm64_macos_with_gke_c4_control",
+  "build_profile": "release",
+  "control_revision": "68d40932bac62a25968772109184cfa9b52f6f70",
+  "change_scope": "Linea WSS terminal branches only; steady-state event processing and strategy hot path are unchanged",
+  "control_target_c4": {
+    "frames_per_second": 7121860,
+    "decision_owner_p50_ns": 68,
+    "decision_owner_p95_ns": 78,
+    "decision_owner_p99_ns": 91,
+    "total_strategy_frames": 2000000,
+    "route_failures": 0,
+    "dependency_faults": 0,
+    "gate": "target_c4_replay_ready"
+  },
+  "candidate_expectation": {
+    "binary_sha256": "48438b96a730908c34543ffca3e208f88c9f6741d61634d28506d0382de23cb0",
+    "steady_state_hot_path_changed": false,
+    "added_steady_state_work": false,
+    "stream_failure_behavior": "exit_single_owner_then_kubernetes_restart_and_full_startup_rehydration",
+    "local_frames_per_second": 13985015,
+    "local_decision_owner_p50_ns": 41,
+    "local_decision_owner_p95_ns": 42,
+    "local_decision_owner_p99_ns": 42,
+    "local_route_failures": 0,
+    "local_dependency_faults": 0,
+    "local_provider_parity_gate": "pass",
+    "local_gate": "local_replay_ready_target_c4_required"
+  },
+  "gate": "requires_ci_and_target_c4_replay_before_rollout"
+}

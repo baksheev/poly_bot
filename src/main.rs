@@ -5466,7 +5466,7 @@ async fn run(
     let mut commission_market_event = Box::pin(commission_price_feed.next_event());
     let mut shadow_dex_running = true;
     let mut arb_dex_running = true;
-    let mut linea_dex_running = true;
+    let linea_dex_running = true;
 
     loop {
         tokio::select! {
@@ -5569,12 +5569,9 @@ async fn run(
                 let handler_started_at = Instant::now();
                 let Some(event) = event else {
                     linea_market_data_ready.store(false, Ordering::Release);
-                    tracing::error!(
-                        strategy_id = %linea_plan.strategy_id.as_str(),
-                        "Linea Lynex DEX stream stopped; new Linea entries are disabled"
+                    bail!(
+                        "Linea Lynex DEX stream stopped; process restart will rehydrate state"
                     );
-                    linea_dex_running = false;
-                    continue;
                 };
                 let head = match &event {
                     DexStreamEvent::Head { head, .. } => Some(*head),
@@ -6310,12 +6307,8 @@ async fn run(
             }
             result = &mut linea_dex_task, if linea_dex_running => {
                 linea_market_data_ready.store(false, Ordering::Release);
-                tracing::error!(
-                    strategy_id = %linea_plan.strategy_id.as_str(),
-                    result = ?result,
-                    "Linea Lynex DEX connector stopped; new Linea entries are disabled"
-                );
-                linea_dex_running = false;
+                result.context("Linea Lynex DEX connector task failed")??;
+                bail!("Linea Lynex DEX connector stopped; process restart will rehydrate state");
             }
             result = &mut binance_balance_task => {
                 result.context("Binance balance synchronization task failed")??;

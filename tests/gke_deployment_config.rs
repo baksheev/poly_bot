@@ -16,6 +16,16 @@ fn gke_deploys_main_automatically_after_successful_ci() {
 }
 
 #[test]
+fn linea_stream_failure_restarts_the_single_owner_for_rehydration() {
+    assert!(MAIN.contains("Linea Lynex DEX stream stopped; process restart will rehydrate state"));
+    assert!(MAIN.contains("Linea Lynex DEX connector task failed"));
+    assert!(
+        MAIN.contains("Linea Lynex DEX connector stopped; process restart will rehydrate state")
+    );
+    assert!(!MAIN.contains("new Linea entries are disabled"));
+}
+
+#[test]
 fn gke_manifest_is_the_full_live_v14_adaptive_owner() {
     assert!(
         RELEASE_PLATFORM
