@@ -492,6 +492,17 @@ retries the narrowly classified `header not found` propagation race twice
 against the same canonical block hash; it never falls back to an unpinned
 `latest` read.
 
+If that propagation race survives the bounded read retry only after an exact
+Binance deposit has already been durably recorded as credited, the operation
+remains asset-scoped and quarantined without becoming an unknown transfer.
+Startup and the 30-second reconciliation poll may refresh the terminal Binance
+and block-pinned wallet balances and advance that same operation to completed.
+This recovery is available only from the exact durable `BinanceCredited`
+progress and the reviewed `-32000` block-unavailable errors. It never reserves
+a nonce, signs, broadcasts, repeats a wallet transfer, or queries a different
+economic identity. A failure leaves the token quarantined for the next
+read-only poll.
+
 `scripts/apply-gcp-rebalance-monitoring` idempotently provisions the rebalance
 log-based metrics, Cloud Monitoring alert policies, and the operator email
 channel:

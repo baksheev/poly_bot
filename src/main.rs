@@ -4224,23 +4224,6 @@ async fn run(
             match executor.reconcile_next_arbitrum_deposit_quarantine().await {
                 Ok(Some(operation)) => {
                     rebalance_recovery_operation = Some(operation);
-                    quarantined_rebalance_tokens = executor
-                        .quarantined_operations()
-                        .map(|operation| {
-                            (
-                                rebalance_target(operation),
-                                operation.intent.token_symbol.clone(),
-                                match &operation.progress {
-                                    arb_bot::rebalance::RebalanceExecutionProgress::Quarantined {
-                                        reason,
-                                    } => reason.clone(),
-                                    _ => unreachable!(
-                                        "quarantined operation iterator returned another state"
-                                    ),
-                                },
-                            )
-                        })
-                        .collect();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -4260,23 +4243,6 @@ async fn run(
             match executor.reconcile_next_linea_deposit_quarantine().await {
                 Ok(Some(operation)) => {
                     rebalance_recovery_operation = Some(operation);
-                    quarantined_rebalance_tokens = executor
-                        .quarantined_operations()
-                        .map(|operation| {
-                            (
-                                rebalance_target(operation),
-                                operation.intent.token_symbol.clone(),
-                                match &operation.progress {
-                                    arb_bot::rebalance::RebalanceExecutionProgress::Quarantined {
-                                        reason,
-                                    } => reason.clone(),
-                                    _ => unreachable!(
-                                        "quarantined operation iterator returned another state"
-                                    ),
-                                },
-                            )
-                        })
-                        .collect();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -4286,6 +4252,38 @@ async fn run(
                     );
                 }
             }
+            match executor
+                .reconcile_next_post_credit_settlement_quarantine()
+                .await
+            {
+                Ok(Some(operation)) => tracing::warn!(
+                    operation_id = %operation.intent.operation_id,
+                    progress = ?operation.progress,
+                    "completed a proven post-credit settlement quarantine during startup"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "post-credit settlement quarantine did not pass read-only reconciliation; token remains isolated"
+                ),
+            }
+            quarantined_rebalance_tokens = executor
+                .quarantined_operations()
+                .map(|operation| {
+                    (
+                        rebalance_target(operation),
+                        operation.intent.token_symbol.clone(),
+                        match &operation.progress {
+                            arb_bot::rebalance::RebalanceExecutionProgress::Quarantined {
+                                reason,
+                            } => reason.clone(),
+                            _ => unreachable!(
+                                "quarantined operation iterator returned another state"
+                            ),
+                        },
+                    )
+                })
+                .collect();
         }
         telemetry.emit(
             "runtime_journal_recovery",
@@ -5096,6 +5094,54 @@ async fn run(
                         }
                         RebalanceExecutorCommand::ReconcileAcross => {
                             let reconciliation_started_at = Instant::now();
+                            match executor
+                                .reconcile_next_post_credit_settlement_quarantine()
+                                .await
+                            {
+                                Ok(Some(completed)) => {
+                                    let target = rebalance_target(&completed);
+                                    let result = Ok(completed);
+                                    emit_rebalance_saga(
+                                        &rebalance_telemetry,
+                                        &rebalance_engine_id,
+                                        target,
+                                        &result,
+                                        &executor,
+                                        reconciliation_started_at,
+                                        true,
+                                    );
+                                    emit_rebalance_risk(
+                                        &rebalance_telemetry,
+                                        &rebalance_engine_id,
+                                        &executor,
+                                    );
+                                    risk_sender.send_replace(executor.rebalance_risk()?);
+                                    if result_sender
+                                        .send(RebalanceExecutorEvent::Recovery {
+                                            target,
+                                            result,
+                                            active_operation_after: false,
+                                            blocked_token: None,
+                                            recovery_started: None,
+                                            next_recovery: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %format!("{error:#}"),
+                                        retry_after_seconds =
+                                            ACROSS_RECONCILIATION_INTERVAL.as_secs(),
+                                        "post-credit settlement quarantine reconciliation will be retried"
+                                    );
+                                }
+                            }
                             match executor
                                 .reconcile_next_consumed_nonce_deposit_quarantine()
                                 .await

@@ -583,6 +583,47 @@ impl RebalanceExecutionJournal {
         }))
     }
 
+    pub fn next_reconcilable_post_credit_settlement_quarantine(
+        &self,
+    ) -> anyhow::Result<Option<&RebalanceExecutionOperation>> {
+        if self.active_operation()?.is_some() {
+            return Ok(None);
+        }
+        Ok(self.operations.values().find(|operation| {
+            let RebalanceExecutionProgress::Quarantined { reason } = &operation.progress else {
+                return false;
+            };
+            self.progress_before_quarantine
+                .get(&operation.intent.operation_id)
+                .is_some_and(|progress| {
+                    retryable_post_credit_settlement_quarantine(reason, progress)
+                })
+        }))
+    }
+
+    pub fn reopen_post_credit_settlement_quarantine(
+        &mut self,
+        operation_id: &str,
+    ) -> anyhow::Result<RebalanceExecutionOperation> {
+        let current = self
+            .operations
+            .get(operation_id)
+            .with_context(|| format!("unknown rebalance operation {operation_id}"))?;
+        let RebalanceExecutionProgress::Quarantined { reason } = &current.progress else {
+            anyhow::bail!("rebalance operation is not quarantined")
+        };
+        let progress = self
+            .progress_before_quarantine
+            .get(operation_id)
+            .context("post-credit settlement quarantine has no prior durable progress")?
+            .clone();
+        ensure!(
+            retryable_post_credit_settlement_quarantine(reason, &progress),
+            "rebalance quarantine is not an approved post-credit settlement retry"
+        );
+        self.advance(operation_id, progress)
+    }
+
     pub fn progress_before_quarantine(
         &self,
         operation_id: &str,
@@ -1456,6 +1497,20 @@ fn retryable_premutation_capital_preflight_quarantine(
             || reason == "decimal exceeds token precision")
 }
 
+fn retryable_post_credit_settlement_quarantine(
+    reason: &str,
+    progress_before_quarantine: &RebalanceExecutionProgress,
+) -> bool {
+    matches!(
+        progress_before_quarantine,
+        RebalanceExecutionProgress::BinanceCredited { .. }
+    ) && matches!(
+        reason,
+        "JSON-RPC error -32000: header not found"
+            | "JSON-RPC error -32000: requested block ahead of current block and the hash is not currently canonical"
+    )
+}
+
 fn corrected_across_deposit_chain_quarantine(
     intent: &RebalanceExecutionIntent,
     reason: &str,
@@ -1645,6 +1700,17 @@ fn validate_transition(
         intent, previous, next,
     ) || reconciled_across_fill_transition(intent, previous, next)
         || reconciled_consumed_nonce_deposit_transition(intent, previous, next)
+        || matches!(
+            (previous, next),
+            (
+                RebalanceExecutionProgress::Quarantined { reason },
+                RebalanceExecutionProgress::BinanceCredited { .. },
+            ) if matches!(
+                reason.as_str(),
+                "JSON-RPC error -32000: header not found"
+                    | "JSON-RPC error -32000: requested block ahead of current block and the hash is not currently canonical"
+            )
+        )
         || matches!(
             (previous, next),
             (
@@ -4150,6 +4216,126 @@ mod tests {
         let quarantined = journal.quarantined_operations().collect::<Vec<_>>();
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].intent.token_symbol, "USDC");
+        drop(journal);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_credit_rpc_quarantine_reopens_only_the_exact_durable_credit() {
+        let path = path("post-credit-rpc-quarantine");
+        let operation_id;
+        {
+            let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+            let operation = journal
+                .reserve(&request(Direction::WalletToBinance, direct_arbitrum()))
+                .unwrap();
+            operation_id = operation.intent.operation_id.clone();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::DepositTransferMined {
+                        chain_id: 42_161,
+                        transaction_hash: B256::repeat_byte(0x71),
+                    },
+                )
+                .unwrap();
+            let credited = RebalanceExecutionProgress::BinanceCredited {
+                deposit_id: "5170555690645282817".to_owned(),
+                credited_base_units: U256::from(4_072_949_992_640_u64),
+            };
+            journal.advance(&operation_id, credited.clone()).unwrap();
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Quarantined {
+                        reason: "JSON-RPC error -32000: header not found".to_owned(),
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(
+                journal
+                    .next_reconcilable_post_credit_settlement_quarantine()
+                    .unwrap()
+                    .unwrap()
+                    .intent
+                    .operation_id,
+                operation_id
+            );
+            assert!(
+                journal
+                    .reopen_next_retryable_quarantine()
+                    .unwrap()
+                    .is_none()
+            );
+            let reopened = journal
+                .reopen_post_credit_settlement_quarantine(&operation_id)
+                .unwrap();
+            assert_eq!(reopened.progress, credited);
+            journal
+                .advance(
+                    &operation_id,
+                    RebalanceExecutionProgress::Completed {
+                        binance_balance_after: U256::from(12_072_949_u64),
+                        wallet_balance_after: U256::from(3_927_050_u64),
+                    },
+                )
+                .unwrap();
+        }
+
+        let replayed = RebalanceExecutionJournal::open(&path).unwrap();
+        assert!(replayed.active_operation().unwrap().is_none());
+        assert!(
+            replayed
+                .next_reconcilable_post_credit_settlement_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            replayed.operations()[&operation_id].progress,
+            RebalanceExecutionProgress::Completed { .. }
+        ));
+        drop(replayed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pre_credit_rpc_quarantine_cannot_enter_post_credit_settlement_recovery() {
+        let path = path("pre-credit-rpc-quarantine");
+        let mut journal = RebalanceExecutionJournal::open(&path).unwrap();
+        let operation = journal
+            .reserve(&request(Direction::WalletToBinance, direct_arbitrum()))
+            .unwrap();
+        let operation_id = operation.intent.operation_id;
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::DepositTransferMined {
+                    chain_id: 42_161,
+                    transaction_hash: B256::repeat_byte(0x72),
+                },
+            )
+            .unwrap();
+        journal
+            .advance(
+                &operation_id,
+                RebalanceExecutionProgress::Quarantined {
+                    reason: "JSON-RPC error -32000: header not found".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            journal
+                .next_reconcilable_post_credit_settlement_quarantine()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .reopen_post_credit_settlement_quarantine(&operation_id)
+                .is_err()
+        );
         drop(journal);
         fs::remove_file(path).unwrap();
     }

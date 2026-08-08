@@ -561,6 +561,80 @@ impl RebalanceExecutor {
         Ok(reopened)
     }
 
+    /// Completes a quarantined wallet-to-Binance operation only when Binance
+    /// credit was already durably recorded and the remaining failure was a
+    /// transient block-pinned wallet balance read. All external effects are
+    /// complete before this reconciliation starts; it only refreshes the two
+    /// terminal balance snapshots and advances the existing journal entry.
+    pub async fn reconcile_next_post_credit_settlement_quarantine(
+        &mut self,
+    ) -> anyhow::Result<Option<RebalanceExecutionOperation>> {
+        let Some(operation) = self
+            .execution_journal
+            .next_reconcilable_post_credit_settlement_quarantine()?
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let RebalanceExecutionProgress::BinanceCredited {
+            credited_base_units,
+            ..
+        } = self
+            .execution_journal
+            .progress_before_quarantine(&operation.intent.operation_id)
+            .cloned()
+            .context("post-credit settlement quarantine lost its Binance credit evidence")?
+        else {
+            unreachable!("post-credit settlement reconciliation requires Binance credit")
+        };
+
+        let binance_after = self.binance_balance(&operation).await?;
+        let expected_without_parallel_spend = operation
+            .intent
+            .binance_balance_before
+            .checked_add(credited_base_units)
+            .context("Binance balance target overflow")?;
+        if binance_after < expected_without_parallel_spend {
+            tracing::warn!(
+                operation_id = operation.intent.operation_id,
+                token = operation.intent.token_symbol,
+                binance_balance_after = binance_after.to_string(),
+                credited_base_units = credited_base_units.to_string(),
+                expected_without_parallel_spend = expected_without_parallel_spend.to_string(),
+                "Binance free balance is below pre-deposit balance plus credited deposit; treating durable Binance deposit history as settlement evidence because live trading may have consumed free balance"
+            );
+        }
+        let wallet_chain_id = route_wallet_chain_id(&operation.intent.route);
+        let wallet_after = self
+            .evm
+            .rpc(wallet_chain_id)?
+            .erc20_balance(
+                operation.intent.token_contract,
+                operation.intent.wallet_owner,
+            )
+            .await?;
+
+        self.execution_journal
+            .reopen_post_credit_settlement_quarantine(&operation.intent.operation_id)?;
+        let completed = self.execution_journal.advance(
+            &operation.intent.operation_id,
+            RebalanceExecutionProgress::Completed {
+                binance_balance_after: binance_after,
+                wallet_balance_after: wallet_after,
+            },
+        )?;
+        tracing::warn!(
+            operation_id = completed.intent.operation_id,
+            token = completed.intent.token_symbol,
+            wallet_chain_id,
+            binance_balance_after = binance_after.to_string(),
+            wallet_balance_after = wallet_after.to_string(),
+            external_mutation_authorized = false,
+            "completed quarantined post-credit settlement from fresh read-only balances"
+        );
+        Ok(Some(completed))
+    }
+
     /// Reconciles a quarantined Arbitrum wallet-to-Binance transfer against
     /// the shared EVM journal. The owner is explicitly reconciliation-only, so
     /// an absent or mismatched transaction cannot reserve a nonce or broadcast.
