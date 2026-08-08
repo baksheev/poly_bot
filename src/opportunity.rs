@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     str::FromStr,
     sync::{
         Arc,
@@ -210,10 +211,49 @@ pub struct PreparedPoolBuildBatch {
 pub struct PreparedPoolBuildResult {
     pool_index: usize,
     generation: u64,
-    prepared: PreparedPoolQuotes,
+    outcome: PreparedPoolBuildOutcome,
     build_time_us: u128,
     timing: PreparedPoolBuildTimingHandle,
 }
+
+// Boxing the prepared variant would add an allocation to every normal
+// latency-sensitive pool refresh just to optimize the rare unavailable case.
+#[allow(clippy::large_enum_variant)]
+enum PreparedPoolBuildOutcome {
+    Prepared(PreparedPoolQuotes),
+    // Mint/Burn logs from one transaction are delivered individually. An
+    // intermediate log can therefore remove all active liquidity before a
+    // later log restores it. Keep that pool unpublished until a subsequent
+    // generation builds instead of turning the fail-closed state into a
+    // process-level failure.
+    Unavailable(PreparedPoolUnavailable),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedPoolUnavailable {
+    DexBuyHasNoTokenBOutput,
+    DexSellHasNoTokenBInput,
+}
+
+impl PreparedPoolUnavailable {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DexBuyHasNoTokenBOutput => "dex_buy_has_no_token_b_output",
+            Self::DexSellHasNoTokenBInput => "dex_sell_has_no_token_b_input",
+        }
+    }
+}
+
+impl fmt::Display for PreparedPoolUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DexBuyHasNoTokenBOutput => "DEX-buy execution envelope has no token-B output",
+            Self::DexSellHasNoTokenBInput => "DEX-sell execution envelope has no token-B input",
+        })
+    }
+}
+
+impl std::error::Error for PreparedPoolUnavailable {}
 
 #[derive(Debug, Clone)]
 pub struct PreparedPoolBuildTimingHandle {
@@ -644,32 +684,56 @@ impl OpportunityEngine {
         if result.generation != expected_generation {
             return Ok(None);
         }
-        let exact_output_segments = result.prepared.by_direction[0].segment_count();
-        let exact_input_segments = result.prepared.by_direction[1].segment_count();
-        let token_a_exact_input_segments = result.prepared.token_a_exact_input.segment_count();
-        let token_a_limit = result.prepared.token_a_limit;
-        let exact_output_token_b_limit = result.prepared.exact_output_token_b_limit;
-        let exact_input_token_b_limit = result.prepared.exact_input_token_b_limit;
-        let fee_generation = if result.prepared.dynamic_fee {
-            result.generation
-        } else {
-            0
+        let PreparedPoolBuildResult {
+            pool_index,
+            generation,
+            outcome,
+            build_time_us,
+            timing,
+        } = result;
+        let prepared = match outcome {
+            PreparedPoolBuildOutcome::Prepared(prepared) => prepared,
+            PreparedPoolBuildOutcome::Unavailable(reason) => {
+                let pair_index = self
+                    .pair_index_by_pool
+                    .get(pool_index)
+                    .copied()
+                    .flatten()
+                    .context("unavailable prepared pool has no enabled pair")?;
+                let pair = self
+                    .pairs
+                    .get(pair_index)
+                    .context("unavailable prepared pool pair index is invalid")?;
+                tracing::warn!(
+                    pool_index,
+                    generation,
+                    pair_id = pair.pair_id,
+                    symbol = pair.symbol,
+                    reason = reason.as_str(),
+                    build_time_us,
+                    "prepared DEX pool is unavailable; keeping the pool fail-closed"
+                );
+                return Ok(None);
+            }
         };
-        let fee_zero_for_one_pips = result.prepared.fee_zero_for_one_pips;
-        let fee_one_for_zero_pips = result.prepared.fee_one_for_zero_pips;
-        let build_time_us = result.build_time_us;
-        let timing = result.timing.clone();
-        self.prepared_pools[result.pool_index] = Some(PreparedCurveGenerationHandle::new(
-            result.pool_index,
-            result.generation,
-            result.prepared,
+        let exact_output_segments = prepared.by_direction[0].segment_count();
+        let exact_input_segments = prepared.by_direction[1].segment_count();
+        let token_a_exact_input_segments = prepared.token_a_exact_input.segment_count();
+        let token_a_limit = prepared.token_a_limit;
+        let exact_output_token_b_limit = prepared.exact_output_token_b_limit;
+        let exact_input_token_b_limit = prepared.exact_input_token_b_limit;
+        let fee_generation = if prepared.dynamic_fee { generation } else { 0 };
+        let fee_zero_for_one_pips = prepared.fee_zero_for_one_pips;
+        let fee_one_for_zero_pips = prepared.fee_one_for_zero_pips;
+        self.prepared_pools[pool_index] = Some(PreparedCurveGenerationHandle::new(
+            pool_index, generation, prepared,
         ));
         timing.mark_published();
         timing.wait_for_result_send_finished();
         let stages = timing.snapshot();
         let refresh = PreparedPoolRefresh {
-            pool_index: result.pool_index,
-            generation: result.generation,
+            pool_index,
+            generation,
             exact_output_segments,
             exact_input_segments,
             token_a_exact_input_segments,
@@ -805,7 +869,7 @@ impl PreparedPoolBuildRequest {
         self.timing.mark_builder_received();
         self.timing.mark_build_started();
         let started = Instant::now();
-        let prepared = prepare_pool_quotes_from_pool(
+        let outcome = match prepare_pool_quotes_from_pool(
             &self.pool,
             self.exact_output_zero_for_one,
             self.exact_input_zero_for_one,
@@ -814,13 +878,19 @@ impl PreparedPoolBuildRequest {
             self.generation,
             self.previous_prepared
                 .map(PreparedCurveGenerationHandle::into_quotes),
-        )?;
+        ) {
+            Ok(prepared) => PreparedPoolBuildOutcome::Prepared(prepared),
+            Err(error) => match error.downcast_ref::<PreparedPoolUnavailable>() {
+                Some(reason) => PreparedPoolBuildOutcome::Unavailable(*reason),
+                None => return Err(error),
+            },
+        };
         let build_time_us = started.elapsed().as_micros();
         self.timing.mark_build_finished();
         Ok(PreparedPoolBuildResult {
             pool_index: self.pool_index,
             generation: self.generation,
-            prepared,
+            outcome,
             build_time_us,
             timing: self.timing,
         })
@@ -968,10 +1038,9 @@ fn prepare_pool_quotes_from_pool(
         pool.prepare_exact_input_curve_bounded(exact_output_zero_for_one, token_a_limit)?
     };
     let exact_output_token_b_limit = token_a_exact_input.result_capacity();
-    ensure!(
-        !exact_output_token_b_limit.is_zero(),
-        "DEX-buy execution envelope has no token-B output"
-    );
+    if exact_output_token_b_limit.is_zero() {
+        return Err(PreparedPoolUnavailable::DexBuyHasNoTokenBOutput.into());
+    }
 
     let exact_input = pool.prepare_exact_input_curve_bounded_by_exact_output_reusing(
         exact_input_zero_for_one,
@@ -979,10 +1048,9 @@ fn prepare_pool_quotes_from_pool(
         previous_exact_input,
     )?;
     let exact_input_token_b_limit = exact_input.specified_capacity();
-    ensure!(
-        !exact_input_token_b_limit.is_zero(),
-        "DEX-sell execution envelope has no token-B input"
-    );
+    if exact_input_token_b_limit.is_zero() {
+        return Err(PreparedPoolUnavailable::DexSellHasNoTokenBInput.into());
+    }
 
     let exact_output = if let Some(previous) = previous_exact_output {
         pool.prepare_exact_output_curve_bounded_reusing(
@@ -2486,6 +2554,40 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(engine.is_ready());
+    }
+
+    #[test]
+    fn zero_liquidity_refresh_keeps_only_the_pool_unavailable_until_recovery() {
+        let (pair, mirror) = mixed_v3_provider_fixture();
+        let mut engine = engine_for_pair(pair, &mirror);
+        assert!(engine.is_ready());
+
+        let mut zero_liquidity = engine.request_pool_refresh(0, &mirror).unwrap();
+        let liquidity = zero_liquidity.pool.liquidity;
+        zero_liquidity
+            .pool
+            .apply_liquidity_delta(-887_220, 887_220, -i128::try_from(liquidity).unwrap())
+            .unwrap();
+        assert_eq!(zero_liquidity.pool.liquidity, 0);
+
+        let unavailable = zero_liquidity
+            .build()
+            .expect("zero execution capacity is a contained pool state");
+        assert!(engine.finish_pool_refresh(unavailable).unwrap().is_none());
+        assert!(!engine.is_ready());
+        let evaluation = engine
+            .evaluate(&quote("1.10", "100", "1.11", "100"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(evaluation.dex_buy_cex_sell.baseline.unwrap().pool_index, 1);
+
+        let recovered = engine
+            .request_pool_refresh(0, &mirror)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(engine.finish_pool_refresh(recovered).unwrap().is_some());
         assert!(engine.is_ready());
     }
 

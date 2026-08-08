@@ -20,6 +20,11 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Keep a DEX pool fail-closed instead of terminating the multi-strategy process
+  when an on-chain liquidity update temporarily leaves its prepared execution
+  envelope with zero capacity. A later Mint or Swap rebuilds and republishes
+  the pool normally, while unrelated strategies and the ESP price collector
+  remain running.
 - Add the canonical Arbitrum Uniswap V3 ARB/USDC 0.05% pool to the immutable
   v2 production domain. The existing multi-pool local V3 curve, adaptive
   selection, calldata, receipt, recovery, and shared ARB inventory paths are
