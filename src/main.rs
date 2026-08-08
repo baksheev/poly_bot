@@ -1866,7 +1866,7 @@ async fn linea_return_capital(
         AcrossClient::new(config)?,
         world_rpc,
         optimism_rpc,
-        BTreeMap::from([(LINEA_CHAIN_ID, linea_rpc.clone())]),
+        BTreeMap::new(),
         EvmWallet::from_env()?,
         config.rebalance_executor_journal_path.clone(),
         rebalance_wallet_journal.into(),
