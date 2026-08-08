@@ -22,6 +22,12 @@ metadata:
     app.kubernetes.io/component: trading-shadow
   annotations:
     arb-bot/durable-state-schema-version: "2"
+    arb-bot/esp-switchback-pair-id: "arbitrum-usdc-esp"
+    arb-bot/esp-switchback-experiment-id: "esp-usdc-concurrent-full-live-v1"
+    arb-bot/esp-switchback-seed-version: "esp-usdc-switchback-seed-v1"
+    arb-bot/esp-switchback-start-unix-seconds: "1786158000"
+    arb-bot/esp-switchback-end-unix-seconds: "1786762800"
+    arb-bot/esp-switchback-block-duration-seconds: "1800"
 spec:
   replicas: 1
   revisionHistoryLimit: 5

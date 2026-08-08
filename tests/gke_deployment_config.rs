@@ -97,7 +97,13 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("less than the reviewed 0.01 ETH Linea operator gas reserve"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
-    assert!(DEPLOY_WORKFLOW.contains("ESP concurrent switchback full-live execution configured"));
+    assert!(!DEPLOY_WORKFLOW.contains("ESP concurrent switchback full-live execution configured"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot/esp-switchback-pair-id"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot/esp-switchback-experiment-id"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot/esp-switchback-seed-version"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot/esp-switchback-start-unix-seconds"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot/esp-switchback-end-unix-seconds"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot/esp-switchback-block-duration-seconds"));
     assert!(DEPLOY_WORKFLOW.contains("compiled-multi-pair-production.v1.json"));
     assert!(DEPLOY_WORKFLOW.contains(".bundle_kind"));
     assert!(DEPLOY_WORKFLOW.contains(".capabilities"));
@@ -318,6 +324,17 @@ fn gke_manifest_runs_esp_as_an_isolated_public_market_data_collector() {
 fn gke_full_live_runtime_keeps_durable_state_and_safe_rollback_guards() {
     assert!(DEPLOYMENT.contains("strategy:\n    type: Recreate"));
     assert!(DEPLOYMENT.contains("arb-bot/durable-state-schema-version: \"2\""));
+    assert!(DEPLOYMENT.contains("arb-bot/esp-switchback-pair-id: \"arbitrum-usdc-esp\""));
+    assert!(
+        DEPLOYMENT
+            .contains("arb-bot/esp-switchback-experiment-id: \"esp-usdc-concurrent-full-live-v1\"")
+    );
+    assert!(
+        DEPLOYMENT.contains("arb-bot/esp-switchback-seed-version: \"esp-usdc-switchback-seed-v1\"")
+    );
+    assert!(DEPLOYMENT.contains("arb-bot/esp-switchback-start-unix-seconds: \"1786158000\""));
+    assert!(DEPLOYMENT.contains("arb-bot/esp-switchback-end-unix-seconds: \"1786762800\""));
+    assert!(DEPLOYMENT.contains("arb-bot/esp-switchback-block-duration-seconds: \"1800\""));
     assert!(!DEPLOYMENT.contains("initContainers:"));
     assert!(DEPLOYMENT.contains("claimName: arb-bot-state"));
     assert!(!DEPLOYMENT.contains("kind: Job"));

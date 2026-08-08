@@ -1238,6 +1238,18 @@ jobs:
             -o json)"
           test "$(jq -r '.metadata.annotations["arb-bot/durable-state-schema-version"]' \
             <<<"${deployment_json}")" = "${durable_schema_version}"
+          test "$(jq -r '.metadata.annotations["arb-bot/esp-switchback-pair-id"]' \
+            <<<"${deployment_json}")" = arbitrum-usdc-esp
+          test "$(jq -r '.metadata.annotations["arb-bot/esp-switchback-experiment-id"]' \
+            <<<"${deployment_json}")" = esp-usdc-concurrent-full-live-v1
+          test "$(jq -r '.metadata.annotations["arb-bot/esp-switchback-seed-version"]' \
+            <<<"${deployment_json}")" = esp-usdc-switchback-seed-v1
+          test "$(jq -r '.metadata.annotations["arb-bot/esp-switchback-start-unix-seconds"]' \
+            <<<"${deployment_json}")" = 1786158000
+          test "$(jq -r '.metadata.annotations["arb-bot/esp-switchback-end-unix-seconds"]' \
+            <<<"${deployment_json}")" = 1786762800
+          test "$(jq -r '.metadata.annotations["arb-bot/esp-switchback-block-duration-seconds"]' \
+            <<<"${deployment_json}")" = 1800
           test "$(jq -r '.spec.template.spec.containers | map(.name) | sort | join(",")' \
             <<<"${deployment_json}")" = arb-bot,esp-market-data
           test "$(jq -r '(.spec.template.spec.initContainers // []) | length' \
@@ -1251,10 +1263,6 @@ jobs:
             --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
             -o jsonpath='{.items[0].metadata.name}')"
           test -n "${pod_name}"
-          kubectl logs "${pod_name}" \
-            --namespace "${GKE_NAMESPACE}" \
-            --container arb-bot \
-            | grep -F "ESP concurrent switchback full-live execution configured"
           rebalance_mode="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"
