@@ -66,7 +66,7 @@ use arb_bot::{
             CompiledNetworkRuntimePlan, CompiledPortfolioRuntimePlan, EconomicAssetId, NetworkId,
             compile_manifest_to_path, load_compatibility_domain,
         },
-        config::{DexProvider, LoadedDomainConfig},
+        config::{DexProvider, LoadedDomainConfig, PairConfig},
     },
     engine::{AdaptiveSizingJob, AdaptiveSizingTaskResult, BinanceFeeBps, TradingEngine},
     execution_accounting::{
@@ -797,6 +797,10 @@ async fn main() -> anyhow::Result<()> {
 
 fn command_owns_runtime_readiness(command: &Command) -> bool {
     matches!(command, Command::Run | Command::CollectPrices)
+}
+
+fn wallet_balance_sync_required(pair: &PairConfig) -> bool {
+    pair.execution_enabled || pair.rebalance.enabled
 }
 
 async fn linea_transport_preflight(
@@ -4590,42 +4594,54 @@ async fn run(
         esp_initial_head,
         config.balance_event_channel_capacity,
     );
-    let linea_wallet_tokens = vec![
-        TokenBalanceRequest {
-            symbol: linea_pair.token_a.symbol.clone(),
-            contract: linea_pair
-                .token_a
-                .contract
-                .parse()
-                .context("Linea token_a address is invalid")?,
-        },
-        TokenBalanceRequest {
-            symbol: linea_pair.token_b.symbol.clone(),
-            contract: linea_pair
-                .token_b
-                .contract
-                .parse()
-                .context("Linea token_b address is invalid")?,
-        },
-    ];
-    let linea_wallet_reads = network_registry
-        .as_ref()
-        .context("Linea requires its network runtime")?
-        .get_by_chain_id(LINEA_CHAIN_ID)?
-        .reads()
-        .clone();
-    let arb_bot::balances::WalletBalanceSync {
-        receiver: mut linea_wallet_balance_receiver,
-        heads: linea_wallet_heads,
-        task: mut linea_wallet_balance_task,
-    } = spawn_wallet_balance_sync(
-        WalletReadClient::Coordinated(linea_wallet_reads),
-        wallet_owner,
-        LINEA_CHAIN_ID,
-        linea_wallet_tokens,
-        linea_initial_head,
-        config.balance_event_channel_capacity,
-    );
+    let linea_wallet_balance_sync_enabled = wallet_balance_sync_required(&linea_pair);
+    let (mut linea_wallet_balance_receiver, linea_wallet_heads, mut linea_wallet_balance_task) =
+        if linea_wallet_balance_sync_enabled {
+            let linea_wallet_tokens = vec![
+                TokenBalanceRequest {
+                    symbol: linea_pair.token_a.symbol.clone(),
+                    contract: linea_pair
+                        .token_a
+                        .contract
+                        .parse()
+                        .context("Linea token_a address is invalid")?,
+                },
+                TokenBalanceRequest {
+                    symbol: linea_pair.token_b.symbol.clone(),
+                    contract: linea_pair
+                        .token_b
+                        .contract
+                        .parse()
+                        .context("Linea token_b address is invalid")?,
+                },
+            ];
+            let linea_wallet_reads = network_registry
+                .as_ref()
+                .context("Linea requires its network runtime")?
+                .get_by_chain_id(LINEA_CHAIN_ID)?
+                .reads()
+                .clone();
+            let sync = spawn_wallet_balance_sync(
+                WalletReadClient::Coordinated(linea_wallet_reads),
+                wallet_owner,
+                LINEA_CHAIN_ID,
+                linea_wallet_tokens,
+                linea_initial_head,
+                config.balance_event_channel_capacity,
+            );
+            (Some(sync.receiver), Some(sync.heads), Some(sync.task))
+        } else {
+            telemetry.emit(
+                "wallet_balance_sync_disabled",
+                serde_json::json!({
+                    "engine_id": config.engine_id,
+                    "pair_id": linea_pair.id,
+                    "chain_id": LINEA_CHAIN_ID,
+                    "reason": "pair_mutations_disabled",
+                }),
+            );
+            (None, None, None)
+        };
 
     let paper_mode = match config.arbitrage_execution_mode.as_str() {
         "disabled" => None,
@@ -5428,7 +5444,9 @@ async fn run(
             startup_linea_pool_build_count += 1;
         }
         if let Some(head) = head {
-            linea_wallet_heads.send_replace(head);
+            if let Some(heads) = linea_wallet_heads.as_ref() {
+                heads.send_replace(head);
+            }
             linea_receipt_heads.send_replace(head);
         }
     }
@@ -5700,7 +5718,9 @@ async fn run(
                     linea_engine.evaluate_after_dex_refreshes()?;
                 }
                 if let Some(head) = head {
-                    linea_wallet_heads.send_replace(head);
+                    if let Some(heads) = linea_wallet_heads.as_ref() {
+                        heads.send_replace(head);
+                    }
                     linea_receipt_heads.send_replace(head);
                 }
                 record_longest_handler(
@@ -6015,7 +6035,12 @@ async fn run(
                     handler_started_at.elapsed(),
                 );
             }
-            event = linea_wallet_balance_receiver.recv() => {
+            event = async {
+                match linea_wallet_balance_receiver.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let handler_started_at = Instant::now();
                 let Some(event) = event else {
                     bail!("Linea wallet balance synchronization channel stopped unexpectedly");
@@ -6369,7 +6394,9 @@ async fn run(
                             prepared_dex = true;
                         }
                         if let Some(head) = head {
-                            linea_wallet_heads.send_replace(head);
+                            if let Some(heads) = linea_wallet_heads.as_ref() {
+                                heads.send_replace(head);
+                            }
                             linea_receipt_heads.send_replace(head);
                         }
                     }
@@ -6445,7 +6472,12 @@ async fn run(
                 result.context("Arbitrum wallet balance synchronization task failed")??;
                 bail!("Arbitrum wallet balance synchronization stopped unexpectedly");
             }
-            result = &mut linea_wallet_balance_task => {
+            result = async {
+                match linea_wallet_balance_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 result.context("Linea wallet balance synchronization task failed")??;
                 bail!("Linea wallet balance synchronization stopped unexpectedly");
             }
@@ -6505,13 +6537,17 @@ async fn run(
     binance_balance_task.abort();
     wallet_balance_task.abort();
     esp_wallet_balance_task.abort();
-    linea_wallet_balance_task.abort();
+    if let Some(task) = linea_wallet_balance_task.as_ref() {
+        task.abort();
+    }
     binance_clock_sync_task.abort();
     resource_balance_task.abort();
     let _ = binance_balance_task.await;
     let _ = wallet_balance_task.await;
     let _ = esp_wallet_balance_task.await;
-    let _ = linea_wallet_balance_task.await;
+    if let Some(task) = linea_wallet_balance_task {
+        let _ = task.await;
+    }
     let _ = binance_clock_sync_task.await;
     let _ = resource_balance_task.await;
     dex_task.abort();
@@ -7887,6 +7923,7 @@ mod tests {
         dispatch_across_reconciliation, esp_evm_journal_scope, linea_evm_journal_scope,
         linea_transport_subscription_retry_delay, rebalance_quote_retry_delay,
         sync_runtime_ready_marker, transient_capital_allocator_inventory_mismatch,
+        wallet_balance_sync_required,
     };
 
     #[test]
@@ -7941,6 +7978,28 @@ mod tests {
         assert_eq!(runtime.network_id.as_str(), scope.network_id);
         assert_eq!(runtime.wallet_location_id.as_str(), scope.wallet_id);
         assert!(!runtime.execution_enabled);
+    }
+
+    #[test]
+    fn stopped_production_linea_does_not_require_continuous_wallet_sync() {
+        let production = load_compatibility_domain(
+            "config/domain/compiled-multi-pair-production.v1.json",
+            CompatibilityRole::LiveRuntime,
+            false,
+        )
+        .unwrap();
+        let linea = production
+            .hot_path_runtime
+            .unwrap()
+            .strategies
+            .into_iter()
+            .find(|strategy| strategy.pair_id == "linea-usdt-usdc")
+            .unwrap();
+        let pair = linea.domain_config.snapshot().pairs.first().unwrap();
+
+        assert!(!pair.execution_enabled);
+        assert!(!pair.rebalance.enabled);
+        assert!(!wallet_balance_sync_required(pair));
     }
 
     #[test]

@@ -114,6 +114,7 @@ pub struct TradingEngine {
     latest_sequence_matched_depth: BTreeMap<String, SpotDepthBook>,
     depth_health_by_symbol: BTreeMap<String, DepthHealthObservation>,
     strategy_price_transport_silence_limits_ms: BTreeMap<String, u64>,
+    balance_readiness_required: bool,
     gas_price_symbol: String,
     gas_price_connected: bool,
     gas_price_generation: u64,
@@ -516,12 +517,17 @@ impl RebalanceSettlementBarrier {
 #[derive(Debug, Clone, Copy)]
 struct TradingReadiness {
     dex_ready: bool,
-    balances_ready: bool,
+    balance_snapshot_ready: bool,
+    balances_gate_enabled: bool,
 }
 
 impl TradingReadiness {
+    const fn balances_ready(self) -> bool {
+        !self.balances_gate_enabled || self.balance_snapshot_ready
+    }
+
     const fn ready(self) -> bool {
-        self.dex_ready && self.balances_ready
+        self.dex_ready && self.balances_ready()
     }
 }
 
@@ -540,6 +546,11 @@ impl TradingEngine {
     ) -> anyhow::Result<(Self, HotTelemetryTask)> {
         let strategy_price_transport_silence_limits_ms =
             domain_config.strategy_price_transport_silence_limits_ms();
+        let balance_readiness_required = domain_config
+            .snapshot()
+            .pairs
+            .iter()
+            .any(|pair| pair.execution_enabled || pair.rebalance.enabled);
         let symbols = strategy_price_transport_silence_limits_ms
             .keys()
             .cloned()
@@ -665,6 +676,7 @@ impl TradingEngine {
                 latest_sequence_matched_depth: BTreeMap::new(),
                 depth_health_by_symbol: BTreeMap::new(),
                 strategy_price_transport_silence_limits_ms,
+                balance_readiness_required,
                 gas_price_symbol,
                 gas_price_connected: false,
                 gas_price_generation: 0,
@@ -728,6 +740,7 @@ impl TradingEngine {
                 "domain_config_sha256": self.domain_config.fingerprint_sha256(),
                 "domain_config_path": self.domain_config.path().display().to_string(),
                 "pair_ids": self.domain_config.pair_ids(),
+                "balances_gate_enabled": self.balance_readiness_required,
                 "binance_symbols": self.domain_config.binance_symbols(),
                 "dex_pools": self.dex.pool_count(),
                 "dex_unavailable_pools": self.dex.unavailable_count(),
@@ -4292,19 +4305,22 @@ impl TradingEngine {
         // misleading Ready->Degraded->Ready flap even though Kubernetes,
         // balances, user data, gas, and rebalance are all healthy.
         let dex_ready = dex_mirror_ready;
-        let balances_ready = self
+        let balance_snapshot_ready = self
             .state
             .balances
             .is_fresh(now, self.config.balance_max_age_ms);
         // User Data is an event-driven acceleration and diagnostic path. REST
-        // balance reconciliation is the recoverable account-state boundary:
-        // its successful snapshots restore health, while missing/stale balance
-        // generations close readiness. Concrete plans still reserve and check
-        // exact available inventory.
+        // Balance reconciliation is the recoverable account-state boundary for
+        // runtimes that can mutate inventory. Observe-only runtimes keep the raw
+        // snapshot health in telemetry but do not flap their phase when an
+        // otherwise-unused wallet snapshot ages out. Concrete plans still
+        // reserve and check exact available inventory.
         let trading_readiness = TradingReadiness {
             dex_ready,
-            balances_ready,
+            balance_snapshot_ready,
+            balances_gate_enabled: self.balance_readiness_required,
         };
+        let balances_ready = trading_readiness.balances_ready();
         let current = self
             .state
             .refresh_phase_from_inputs(binance_ready, trading_readiness.ready());
@@ -4317,18 +4333,21 @@ impl TradingEngine {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-            tracing::info!(?previous, ?current, "runtime phase changed");
+            let pair_ids = self.domain_config.pair_ids();
+            tracing::info!(?pair_ids, ?previous, ?current, "runtime phase changed");
             self.telemetry.emit(
                 "runtime_phase_changed",
                 json!({
                     "engine_id": self.config.engine_id,
+                    "pair_ids": pair_ids,
                     "previous": previous,
                     "current": current,
                     "binance_top_ready": binance_ready,
                     "dex_mirror_ready": dex_mirror_ready,
                     "dex_prepared_ready": dex_prepared_ready,
+                    "balance_snapshot_ready": balance_snapshot_ready,
                     "balances_ready": balances_ready,
-                    "balances_gate_enabled": true,
+                    "balances_gate_enabled": self.balance_readiness_required,
                     "binance_user_data_connected": self.binance_user_data_connected,
                     "binance_user_data_clean": self.binance_user_data_clean,
                     "binance_user_data_gate_enabled": false,
@@ -5227,7 +5246,8 @@ mod tests {
         assert!(
             TradingReadiness {
                 dex_ready: true,
-                balances_ready: true,
+                balance_snapshot_ready: true,
+                balances_gate_enabled: true,
             }
             .ready()
         );
@@ -5240,10 +5260,23 @@ mod tests {
         assert!(
             !TradingReadiness {
                 dex_ready: true,
-                balances_ready: false,
+                balance_snapshot_ready: false,
+                balances_gate_enabled: true,
             }
             .ready()
         );
+    }
+
+    #[test]
+    fn stale_balance_generations_do_not_degrade_stopped_observers() {
+        let readiness = TradingReadiness {
+            dex_ready: true,
+            balance_snapshot_ready: false,
+            balances_gate_enabled: false,
+        };
+
+        assert!(readiness.balances_ready());
+        assert!(readiness.ready());
     }
 
     #[test]
@@ -5251,7 +5284,8 @@ mod tests {
         assert!(
             TradingReadiness {
                 dex_ready: true,
-                balances_ready: true,
+                balance_snapshot_ready: true,
+                balances_gate_enabled: true,
             }
             .ready()
         );
@@ -5262,11 +5296,13 @@ mod tests {
         for readiness in [
             TradingReadiness {
                 dex_ready: false,
-                balances_ready: true,
+                balance_snapshot_ready: true,
+                balances_gate_enabled: true,
             },
             TradingReadiness {
                 dex_ready: true,
-                balances_ready: false,
+                balance_snapshot_ready: false,
+                balances_gate_enabled: true,
             },
         ] {
             assert!(!readiness.ready());
@@ -5278,7 +5314,8 @@ mod tests {
         assert!(
             TradingReadiness {
                 dex_ready: true,
-                balances_ready: true,
+                balance_snapshot_ready: true,
+                balances_gate_enabled: true,
             }
             .ready()
         );
@@ -5313,7 +5350,8 @@ mod tests {
         assert!(
             TradingReadiness {
                 dex_ready: true,
-                balances_ready: true,
+                balance_snapshot_ready: true,
+                balances_gate_enabled: true,
             }
             .ready()
         );
