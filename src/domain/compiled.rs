@@ -2926,7 +2926,7 @@ mod tests {
         assert_eq!(bundle.accounts[0].id.as_str(), "binance-spot:primary");
         assert_eq!(bundle.wallets[0].id.as_str(), "evm-wallet:primary");
         assert_eq!(bundle.strategies.len(), 4);
-        assert_eq!(bundle.pools.len(), 11);
+        assert_eq!(bundle.pools.len(), 9);
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "arbitrum-usdc-arb"
                 && pool.protocol == PoolProtocol::UniswapV3
@@ -2936,27 +2936,10 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")
         }));
-        assert!(bundle.pools.iter().any(|pool| {
-            pool.pair_id == "arbitrum-usdc-arb"
-                && pool.protocol == PoolProtocol::PancakeSwapV3
-                && pool.fee_pips == Some(500)
-                && pool.lifecycle == PoolLifecycle::ExecutionEligible
-                && pool
-                    .canonical_identity
-                    .to_ascii_lowercase()
-                    .contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")
-        }));
-        assert!(bundle.pools.iter().any(|pool| {
-            pool.pair_id == "arbitrum-usdc-arb"
-                && pool.protocol == PoolProtocol::CamelotV3
-                && pool.fee_pips.is_none()
-                && pool.tick_spacing == Some(10)
-                && pool.lifecycle == PoolLifecycle::ExecutionEligible
-                && pool
-                    .canonical_identity
-                    .to_ascii_lowercase()
-                    .contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1")
-        }));
+        assert!(!bundle.pools.iter().any(|pool| matches!(
+            pool.protocol,
+            PoolProtocol::PancakeSwapV3 | PoolProtocol::CamelotV3
+        )));
         assert!(bundle.pools.iter().any(|pool| {
             pool.pair_id == "world-chain-usdc-wld"
                 && pool.protocol == PoolProtocol::UniswapV3
@@ -2981,11 +2964,7 @@ mod tests {
         );
         assert_eq!(
             runtime.executable_symbols,
-            std::collections::BTreeSet::from([
-                "ARBUSDC".to_owned(),
-                "ESPUSDC".to_owned(),
-                "WLDUSDC".to_owned(),
-            ])
+            std::collections::BTreeSet::from(["ESPUSDC".to_owned(), "WLDUSDC".to_owned(),])
         );
         assert!(runtime.asset_symbols.contains(&"BNB".to_owned()));
         assert!(runtime.asset_symbols.contains(&"ESP".to_owned()));
@@ -3028,14 +3007,8 @@ mod tests {
                 .pools
                 .iter()
                 .filter(|pool| pool.pair_id == "arbitrum-usdc-arb")
-                .all(|pool| match pool.protocol {
-                    PoolProtocol::PancakeSwapV3
-                    | PoolProtocol::UniswapV3
-                    | PoolProtocol::CamelotV3 => {
-                        pool.lifecycle == PoolLifecycle::ExecutionEligible
-                    }
-                    PoolProtocol::UniswapV4 | PoolProtocol::LynexAlgebraV1_9 => false,
-                })
+                .all(|pool| pool.protocol == PoolProtocol::UniswapV3
+                    && pool.lifecycle == PoolLifecycle::Validated)
         );
         assert!(
             bundle
@@ -3047,41 +3020,19 @@ mod tests {
     }
 
     #[test]
-    fn production_bundle_compiles_camelot_dynamic_fee_identity() {
+    fn production_bundle_excludes_stopped_arb_mutation_providers() {
         let (_, _, bundle) = fixture();
-
-        let camelot = bundle
-            .pools
+        assert!(bundle.pools.iter().all(|pool| !matches!(
+            pool.protocol,
+            PoolProtocol::CamelotV3 | PoolProtocol::PancakeSwapV3
+        )));
+        let capability = bundle
+            .capabilities
             .iter()
-            .find(|pool| pool.protocol == PoolProtocol::CamelotV3)
+            .find(|capability| capability.strategy_id.as_str() == "strategy:arbitrum-usdc-arb")
             .unwrap();
-        assert_eq!(camelot.pair_id, "arbitrum-usdc-arb");
-        assert_eq!(
-            camelot.canonical_identity,
-            "CamelotV3 { address: 0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1 }"
-        );
-        assert_eq!(camelot.fee_pips, None);
-        assert_eq!(camelot.tick_spacing, Some(10));
-        assert_eq!(camelot.lifecycle, PoolLifecycle::ExecutionEligible);
-
-        let dependency = bundle
-            .dependencies
-            .iter()
-            .find(|dependency| dependency.strategy_id.as_str() == "strategy:arbitrum-usdc-arb")
-            .unwrap();
-        assert!(dependency.pool_ids.contains(&camelot.id));
-        assert!(
-            bundle
-                .pools
-                .iter()
-                .filter(|pool| {
-                    !matches!(
-                        pool.protocol,
-                        PoolProtocol::CamelotV3 | PoolProtocol::LynexAlgebraV1_9
-                    )
-                })
-                .all(|pool| pool.fee_pips.is_some())
-        );
+        assert!(capability.observe && capability.plan);
+        assert!(!capability.execute && !capability.rebalance);
     }
 
     #[test]
@@ -3302,9 +3253,9 @@ mod tests {
             .iter()
             .find(|strategy| strategy.symbol == "ARBUSDC")
             .unwrap();
-        assert!(arb.observe && arb.plan && arb.execute);
+        assert!(arb.observe && arb.plan && !arb.execute);
         assert_eq!(arb.network_id.as_str(), "eip155:42161");
-        assert_eq!(arb.pool_ids.len(), 4);
+        assert_eq!(arb.pool_ids.len(), 2);
         assert!(arb.pool_ids.iter().any(|pool_id| {
             pool_id
                 .as_str()
@@ -3317,13 +3268,7 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")
         }));
-        assert!(arb.pool_ids.iter().any(|pool_id| {
-            pool_id
-                .as_str()
-                .to_ascii_lowercase()
-                .contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1")
-        }));
-        assert!(arb.domain_config.snapshot().live_trading_enabled);
+        assert!(!arb.domain_config.snapshot().live_trading_enabled);
         assert_ne!(
             live.config.fingerprint_sha256(),
             original_live.fingerprint_sha256()
@@ -3338,7 +3283,7 @@ mod tests {
         assert!(capital_policy.external_mutation_authorized);
         assert!(capital_policy.direct_route_only);
         assert!(!capital_policy.bridge_mutations_enabled);
-        assert!(capital_policy.additional_tokens.contains_key("ARB"));
+        assert!(!capital_policy.additional_tokens.contains_key("ARB"));
         assert!(!capital_policy.additional_tokens.contains_key("USDT"));
         assert_eq!(capital_policy.direct_networks.len(), 1);
         assert!(!capital_policy.direct_networks.contains_key(&59_144));

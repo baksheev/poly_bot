@@ -75,7 +75,7 @@ jobs:
           test "$(jq -c '.networks | map(.id)' "${domain_config}")" \
             = '["eip155:42161","eip155:480","eip155:59144"]'
           test "$(jq -c '.capabilities' "${domain_config}")" = \
-            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:linea-usdt-usdc","observe":true,"plan":true,"execute":false,"rebalance":false},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
+            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":false,"rebalance":false},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:linea-usdt-usdc","observe":true,"plan":true,"execute":false,"rebalance":false},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
           test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
             = arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool
           test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
@@ -147,36 +147,28 @@ jobs:
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_pool_manager_address\")" "${domain_config}")" = false
           test "$(jq -r "${esp} | .pairs[0].chain | has(\"uniswap_v4_state_view_address\")" "${domain_config}")" = false
           arb='.sources[] | select(.snapshot.pairs[0].id == "arbitrum-usdc-arb") | .snapshot'
-          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live
+          test "$(jq -r "${arb} | .snapshot_id" "${domain_config}")" = arb-bot-production-usdc-arb-arbitrum-v6-stopped
           test "$(jq -r "${arb} | .source.rails_pair_candidate_id" "${domain_config}")" = 2694
           test "$(jq -r "${arb} | .pairs[0].binance.symbol" "${domain_config}")" = ARBUSDC
           test "$(jq -r "${arb} | .pairs[0].binance.step_size" "${domain_config}")" = 0.10000000
           test "$(jq -r "${arb} | .pairs[0].binance.tick_size" "${domain_config}")" = 0.00010000
-          test "$(jq -r "${arb} | .pairs[0].full_live" "${domain_config}")" = true
-          test "$(jq -r "${arb} | .pairs[0].rebalance.enabled" "${domain_config}")" = true
+          test "$(jq -r "${arb} | .live_trading_enabled" "${domain_config}")" = false
+          test "$(jq -r "${arb} | .pairs[0].market_data_enabled" "${domain_config}")" = true
+          test "$(jq -r "${arb} | .pairs[0].execution_enabled" "${domain_config}")" = false
+          test "$(jq -r "${arb} | .pairs[0].full_live" "${domain_config}")" = false
+          test "$(jq -r "${arb} | .pairs[0].rebalance.enabled" "${domain_config}")" = false
+          test "$(jq -r "${arb} | .pairs[0] | has(\"full_live_policy\")" "${domain_config}")" = false
           test "$(jq -r "${arb} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 6000000
           test "$(jq -r "${arb} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
           test "$(jq -r "${arb} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
           test "$(jq -r "${arb} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
-          test "$(jq -r "${arb} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-05T05:54:11Z
-          test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_factory_address" "${domain_config}")" = 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
-          test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_quoter_address" "${domain_config}")" = 0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
-          test "$(jq -r "${arb} | .pairs[0].chain.pancakeswap_v3_router_address" "${domain_config}")" = 0x1b81D678ffb9C0263b24A97847620C99d213eB14
-          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_factory_address" "${domain_config}")" = 0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B
-          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_pool_deployer_address" "${domain_config}")" = 0x6Dd3FB9653B10e806650F107C3B5A0a6fF974F65
-          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_quoter_address" "${domain_config}")" = 0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E
-          test "$(jq -r "${arb} | .pairs[0].chain.camelot_v3_router_address" "${domain_config}")" = 0x1F721E2E82F6676FCE4eA07A5958cF098D339e18
-          test "$(jq -c "${arb} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["uniswap_v3","pancake_swap_v3","camelot_v3"]'
+          test "$(jq -c "${arb} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["uniswap_v3"]'
           test "$(jq -c "${arb} | .pairs[0].dex.uniswap_v3.fee_tiers" "${domain_config}")" = '[500,3000]'
-          test "$(jq -c "${arb} | .pairs[0].dex.pancakeswap_v3.pools" "${domain_config}")" = '[{"fee_tier":500,"expected_address":"0x9ffca51d23ac7f7df82da414865ef1055e5afcc3","selection_enabled":true}]'
-          test "$(jq -c "${arb} | .pairs[0].dex.camelot_v3.pools" "${domain_config}")" = '[{"expected_address":"0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1","selection_enabled":true,"required_active_incentive":"0x0000000000000000000000000000000000000000","expected_tick_spacing":10,"dynamic_fee_horizon_seconds":2}]'
-          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 500 and ((.canonical_identity | ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")))] | length' "${domain_config}")" = 1
-          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 3000 and ((.canonical_identity | ascii_downcase) | contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")))] | length' "${domain_config}")" = 1
-          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "pancake_swap_v3" and .fee_pips == 500 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3")))] | length' "${domain_config}")" = 1
-          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "camelot_v3" and .fee_pips == null and .tick_spacing == 10 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 500 and .lifecycle == "validated" and ((.canonical_identity | ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.pair_id == "arbitrum-usdc-arb" and .protocol == "uniswap_v3" and .fee_pips == 3000 and .lifecycle == "validated" and ((.canonical_identity | ascii_downcase) | contains("0xaebdca1bc8d89177ebe2308d62af5e74885dccc3")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.protocol == "pancake_swap_v3" or .protocol == "camelot_v3")] | length' "${domain_config}")" = 0
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"))] | length' "${domain_config}")" = 1
-          test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"))] | length' "${domain_config}")" = 1
-          test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[]] | length' "${domain_config}")" = 2
           linea='.sources[] | select(.snapshot.pairs[0].id == "linea-usdt-usdc") | .snapshot'
           test "$(jq -r "${linea} | .snapshot_id" "${domain_config}")" = linea-usdt-usdc-lynex-algebra-v1-9-observe-only-v3
           test "$(jq -r "${linea} | .live_trading_enabled" "${domain_config}")" = false
@@ -823,231 +815,6 @@ jobs:
             --namespace "${GKE_NAMESPACE}" \
             -o json | jq -r '.status.initContainerStatuses[0].state.terminated.message')" \
             = linea_capital_routes=verified
-
-      - name: Bootstrap reviewed ARB inventory once
-        env:
-          IMAGE: ${{ steps.image.outputs.image }}
-        run: |
-          set -Eeuo pipefail
-          marker="$(kubectl get deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            -o json | jq -r '.metadata.annotations["arb-bot/arb-inventory-bootstrap-v1"] // empty')"
-          if [[ "${marker}" == complete:* ]]; then
-            echo "ARB inventory bootstrap is already durably marked complete."
-            exit 0
-          fi
-
-          test "$(kubectl get deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            -o jsonpath='{.spec.replicas}')" = 1
-          kubectl wait deployment/arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            --for=condition=Available \
-            --timeout=60s
-
-          template="$(kubectl get deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            -o json | jq -c '.spec.template')"
-          bootstrap_owner="arb-bot-arb-bootstrap-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          stop_owner="arb-bot-arb-entry-stop-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          clear_owner="arb-bot-arb-entry-clear-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          apply_operation_owner() {
-            owner="$1"
-            init_name="$2"
-            operation="$3"
-            jq -n \
-              --argjson template "${template}" \
-              --arg owner "${owner}" \
-              --arg init_name "${init_name}" \
-              --arg image "${IMAGE}" \
-              --arg operation "${operation}" \
-              '
-                ($template.spec.containers[] | select(.name == "arb-bot")) as $runtime
-                | {
-                    apiVersion: "apps/v1",
-                    kind: "Deployment",
-                    metadata: {
-                      name: $owner,
-                      labels: {"app.kubernetes.io/name": $owner}
-                    },
-                    spec: {
-                      replicas: 1,
-                      revisionHistoryLimit: 0,
-                      strategy: {type: "Recreate"},
-                      selector: {matchLabels: {"arb-bot/bootstrap-instance": $owner}},
-                      template: (
-                        $template
-                        | .metadata.labels = {
-                            "app.kubernetes.io/name": $owner,
-                            "arb-bot/bootstrap-instance": $owner
-                          }
-                        | .metadata.annotations = {}
-                        | .spec.automountServiceAccountToken = false
-                        | .spec.restartPolicy = "Always"
-                        | .spec.initContainers = [
-                            ($runtime
-                              | .name = $init_name
-                              | .image = $image
-                              | del(.startupProbe, .readinessProbe, .livenessProbe)
-                              | .resources = {
-                                  "requests": {"cpu": "20m", "memory": "32Mi"},
-                                  "limits": {"cpu": "250m", "memory": "256Mi"}
-                                }
-                              | .command = ["/bin/sh", "-ec"]
-                              | .args = [$operation]
-                              | .terminationMessagePath = "/dev/termination-log"
-                              | .terminationMessagePolicy = "File")
-                          ]
-                        | .spec.containers = [
-                            ($runtime
-                              | .name = "hold"
-                              | .image = $image
-                              | del(.startupProbe, .readinessProbe, .livenessProbe)
-                              | .resources = {
-                                  "requests": {"cpu": "5m", "memory": "8Mi"},
-                                  "limits": {"cpu": "20m", "memory": "16Mi"}
-                                }
-                              | .command = ["/bin/sh", "-ec"]
-                              | .args = ["sleep 3600"])
-                          ]
-                      )
-                    }
-                  }
-              ' | kubectl apply --namespace "${GKE_NAMESPACE}" -f -
-          }
-
-          wait_operation_owner() {
-            owner="$1"
-            init_name="$2"
-            maximum_polls="$3"
-            operation_pod=
-            for _ in {1..60}; do
-              operation_pod="$(kubectl get pods \
-                --namespace "${GKE_NAMESPACE}" \
-                --selector="arb-bot/bootstrap-instance=${owner}" \
-                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-              test -z "${operation_pod}" || break
-              sleep 2
-            done
-            test -n "${operation_pod}"
-
-            operation_reason=
-            for ((poll = 0; poll < maximum_polls; poll++)); do
-              operation_reason="$(kubectl get pod "${operation_pod}" \
-                --namespace "${GKE_NAMESPACE}" \
-                -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' \
-                2>/dev/null || true)"
-              case "${operation_reason}" in
-                Completed) break ;;
-                Error)
-                  kubectl logs "${operation_pod}" \
-                    --namespace "${GKE_NAMESPACE}" \
-                    --container "${init_name}" || true
-                  return 1
-                  ;;
-              esac
-              sleep 2
-            done
-            if test "${operation_reason}" != Completed; then
-              kubectl describe pod "${operation_pod}" \
-                --namespace "${GKE_NAMESPACE}" || true
-              return 1
-            fi
-            operation_message="$(kubectl get pod "${operation_pod}" \
-              --namespace "${GKE_NAMESPACE}" \
-              -o json \
-              | jq -r '.status.initContainerStatuses[0].state.terminated.message // empty')"
-            test -z "${operation_message}" || echo "${operation_message}"
-          }
-
-          delete_operation_owner() {
-            owner="$1"
-            kubectl delete deployment "${owner}" \
-              --namespace "${GKE_NAMESPACE}" \
-              --ignore-not-found \
-              --wait=false >/dev/null
-            kubectl wait pod \
-              --namespace "${GKE_NAMESPACE}" \
-              --selector="arb-bot/bootstrap-instance=${owner}" \
-              --for=delete \
-              --timeout=120s
-          }
-
-          restore_old_owner=false
-          cleanup_bootstrap() {
-            status="$?"
-            trap - EXIT
-            helpers_gone=true
-            for owner in "${bootstrap_owner}" "${stop_owner}" "${clear_owner}"; do
-              if ! delete_operation_owner "${owner}" >/dev/null 2>&1; then
-                helpers_gone=false
-              fi
-            done
-            if [[ "${restore_old_owner}" == true ]]; then
-              if [[ "${helpers_gone}" == true ]]; then
-                kubectl patch deployment arb-bot \
-                  --namespace "${GKE_NAMESPACE}" \
-                  --type=json \
-                  --patch='[{"op":"replace","path":"/spec/replicas","value":1}]' \
-                  >/dev/null || true
-                kubectl rollout status deployment/arb-bot \
-                  --namespace "${GKE_NAMESPACE}" \
-                  --timeout=180s || true
-              else
-                echo "::error::bootstrap helper still exists; refusing to restore a concurrent production owner"
-              fi
-            fi
-            exit "${status}"
-          }
-          trap cleanup_bootstrap EXIT
-
-          apply_operation_owner \
-            "${stop_owner}" \
-            entry-stop \
-            'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"; : >"${ARBITRAGE_ENTRY_STOP_FILE}"; attempts=0; while test "${attempts}" -lt 900; do if test -s "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe" && grep -qx "active_operation_count=0" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"; then exit 0; fi; attempts=$((attempts + 1)); sleep 1; done; exit 1'
-          wait_operation_owner "${stop_owner}" entry-stop 470
-          delete_operation_owner "${stop_owner}"
-
-          kubectl patch deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            --type=json \
-            --patch='[{"op":"replace","path":"/spec/replicas","value":0}]'
-          restore_old_owner=true
-          kubectl wait pod \
-            --namespace "${GKE_NAMESPACE}" \
-            --selector='app.kubernetes.io/name=arb-bot' \
-            --for=delete \
-            --timeout=120s
-
-          apply_operation_owner \
-            "${bootstrap_owner}" \
-            bootstrap \
-            'export BINANCE_API_KEY="$(cat /var/run/secrets/arb-bot/BINANCE_API_KEY)"; export BINANCE_SECRET_KEY="$(cat /var/run/secrets/arb-bot/BINANCE_SECRET_KEY)"; if report="$(arb_bot bootstrap-arb-inventory --quote-usdc 500 --journal-path /var/lib/arb-bot/arb-bootstrap-binance.journal --live-confirmation BOOTSTRAP_ARB_WITH_500_USDC 2>&1)"; then printf "%s\n" "${report}" | tee /dev/termination-log; else status=$?; printf "%s\n" "${report}" | tee /dev/termination-log; exit "${status}"; fi'
-          wait_operation_owner "${bootstrap_owner}" bootstrap 310
-          delete_operation_owner "${bootstrap_owner}"
-
-          kubectl patch deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            --type=json \
-            --patch='[{"op":"replace","path":"/spec/replicas","value":1}]'
-          kubectl rollout status deployment/arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            --timeout=180s
-
-          apply_operation_owner \
-            "${clear_owner}" \
-            entry-clear \
-            'rm -f "${ARBITRAGE_ENTRY_STOP_FILE}" "${ARBITRAGE_ENTRY_STOP_FILE}.recovery-safe"'
-          wait_operation_owner "${clear_owner}" entry-clear 70
-          delete_operation_owner "${clear_owner}"
-
-          kubectl annotate deployment arb-bot \
-            --namespace "${GKE_NAMESPACE}" \
-            --overwrite \
-            "arb-bot/arb-inventory-bootstrap-v1=complete:${SOURCE_SHA}"
-          restore_old_owner=false
-          trap - EXIT
 
       - name: Roll out on the fixed node
         id: rollout

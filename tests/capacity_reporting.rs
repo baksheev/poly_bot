@@ -47,10 +47,6 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     let rollout = DEPLOY_WORKFLOW
         .find("Roll out on the fixed node")
         .expect("rollout step must exist");
-    let bootstrap = DEPLOY_WORKFLOW
-        .find("Bootstrap reviewed ARB inventory once")
-        .expect("ARB bootstrap step must exist");
-
     assert!(gate < rollout);
     assert!(DEPLOY_WORKFLOW.contains("--target-cpu-class c4-highcpu-8"));
     assert!(DEPLOY_WORKFLOW.contains("tee /dev/termination-log"));
@@ -74,7 +70,7 @@ fn deployment_gates_the_exact_image_on_the_fixed_c4_before_rollout() {
     assert!(DEPLOY_WORKFLOW.contains(
         "replay_deployment=\"arb-bot-capacity-replay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\""
     ));
-    assert!(!DEPLOY_WORKFLOW[gate..bootstrap].contains("kubectl delete job"));
+    assert!(!DEPLOY_WORKFLOW[gate..rollout].contains("kubectl delete job"));
     assert!(DEPLOY_WORKFLOW.contains("kubectl delete deployment \"${replay_deployment}\""));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl get node "));
     assert!(!DEPLOY_WORKFLOW.contains(".spec.template.spec.activeDeadlineSeconds"));

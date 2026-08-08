@@ -136,13 +136,12 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     );
     assert!(DEPLOY_WORKFLOW.contains("[500,3000,10000]"));
     assert!(DEPLOY_WORKFLOW.contains("0x610e319b3a3ab56a0ed5562927d37c233774ba39"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-arb-arbitrum-v5-camelot-v3-live"));
+    assert!(DEPLOY_WORKFLOW.contains("arb-bot-production-usdc-arb-arbitrum-v6-stopped"));
     assert!(DEPLOY_WORKFLOW.contains("[500,3000]"));
     assert!(DEPLOY_WORKFLOW.contains("0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8"));
-    assert!(DEPLOY_WORKFLOW.contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"));
-    assert!(DEPLOY_WORKFLOW.contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"));
-    assert!(DEPLOY_WORKFLOW.contains("0x1F721E2E82F6676FCE4eA07A5958cF098D339e18"));
-    assert!(DEPLOY_WORKFLOW.contains("selection_enabled\":true"));
+    assert!(
+        DEPLOY_WORKFLOW.contains(".protocol == \"pancake_swap_v3\" or .protocol == \"camelot_v3\"")
+    );
     assert!(DEPLOY_WORKFLOW.contains("opportunity_threshold_bps"));
     assert!(DEPLOY_WORKFLOW.contains("max_quote_age_ms"));
     assert!(DEPLOY_WORKFLOW.contains("max_transport_silence_ms"));
@@ -178,17 +177,13 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("portfolio_allocator_mode"));
     assert!(MAIN.contains("portfolio_external_mutation_authorized"));
     assert!(MAIN.contains("live_rebalance_adapter"));
-    assert!(MAIN.contains("Arbitrum full-live production strategies configured"));
+    assert!(MAIN.contains("production strategies configured with ARB and Linea stopped"));
+    assert!(
+        MAIN.contains("ARB/USDC strategy is stopped and retained for read-only Uniswap telemetry")
+    );
     assert!(MAIN.contains("shared_inventory_owner"));
     assert!(MAIN.contains("shared_binance_order_owner"));
-    assert!(MAIN.contains("enable_camelot_submissions_after_allowance_lock"));
-    let camelot_allowance = MAIN
-        .find("protocol: DexProtocol::CamelotV3")
-        .expect("Camelot allowance is prepared by the Arbitrum execution owner");
-    let camelot_gate = MAIN
-        .find("enable_camelot_submissions_after_allowance_lock")
-        .expect("Camelot submission gate is wired");
-    assert!(camelot_allowance < camelot_gate);
+    assert!(!MAIN.contains("enable_camelot_submissions_after_allowance_lock"));
     assert!(MAIN.contains("secondary_hot_path_rebalance_mutation_authorized"));
     assert!(MAIN.contains("report_strategy_dependency_faults"));
     assert!(MAIN.contains("engine.take_adaptive_sizing_jobs()"));
@@ -199,12 +194,11 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(MAIN.contains("esp_engine.on_adaptive_sizing_result(result)"));
     assert!(MAIN.contains("arb_engine.on_adaptive_sizing_result(result)"));
     assert!(MAIN.contains("linea_engine.on_adaptive_sizing_result(result)"));
-    assert!(DEPLOY_WORKFLOW.contains("Bootstrap reviewed ARB inventory once"));
-    assert!(DEPLOY_WORKFLOW.contains("bootstrap-arb-inventory --quote-usdc 500"));
-    assert!(DEPLOY_WORKFLOW.contains("active_operation_count=0"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-inventory-bootstrap-v1=complete:"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-arb-entry-stop"));
-    assert!(DEPLOY_WORKFLOW.contains("arb-bot-arb-entry-clear"));
+    assert!(!DEPLOY_WORKFLOW.contains("Bootstrap reviewed ARB inventory once"));
+    assert!(!DEPLOY_WORKFLOW.contains("bootstrap-arb-inventory"));
+    assert!(!DEPLOY_WORKFLOW.contains("arb-inventory-bootstrap-v1"));
+    assert!(!DEPLOY_WORKFLOW.contains("arb-bot-arb-entry-stop"));
+    assert!(!DEPLOY_WORKFLOW.contains("arb-bot-arb-entry-clear"));
     let startup_drain = MAIN
         .find("drain_startup_dex_backlog(")
         .expect("startup DEX backlog drain is wired");
@@ -217,10 +211,9 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(!DEPLOY_WORKFLOW.contains("kubectl exec"));
     assert!(!DEPLOY_WORKFLOW.contains("kubectl scale"));
     assert!(!DEPLOY_WORKFLOW.contains("kind: \"Job\""));
-    assert!(DEPLOY_WORKFLOW.contains("\"path\":\"/spec/replicas\",\"value\":0"));
-    assert!(DEPLOY_WORKFLOW.contains("\"path\":\"/spec/replicas\",\"value\":1"));
+    assert!(!DEPLOY_WORKFLOW.contains("/spec/replicas"));
     assert!(!DEPLOY_WORKFLOW.contains("gcloud logging read"));
-    assert!(DEPLOY_WORKFLOW.contains("wait_operation_owner \"${bootstrap_owner}\" bootstrap"));
+    assert!(!DEPLOY_WORKFLOW.contains("bootstrap_owner"));
     assert!(
         DEPLOY_WORKFLOW
             .contains("Verify Binance Optimism and Across Linea capital routes read-only")

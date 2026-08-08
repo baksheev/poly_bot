@@ -5,7 +5,7 @@
   "source_paths": [
     "config/strategies/usdc-wld-world-chain.v14.json",
     "config/strategies/usdc-esp-arbitrum.v7.json",
-    "config/strategies/usdc-arb-arbitrum.v5.json",
+    "config/strategies/usdc-arb-arbitrum.v6.json",
     "config/strategies/usdt-usdc-linea-lynex.v2.json"
   ],
   "accounts": [
@@ -37,13 +37,13 @@
       "pair_id": "arbitrum-usdc-arb",
       "fee_pips": 500,
       "address": "0xb0f6ca40411360c03d41c5ffc5f179b8403cdcf8",
-      "lifecycle": "execution_eligible"
+      "lifecycle": "validated"
     },
     {
       "pair_id": "arbitrum-usdc-arb",
       "fee_pips": 3000,
       "address": "0xaebdca1bc8d89177ebe2308d62af5e74885dccc3",
-      "lifecycle": "execution_eligible"
+      "lifecycle": "validated"
     },
     {
       "pair_id": "world-chain-usdc-wld",
@@ -65,7 +65,6 @@
     }
   ],
   "reviewed_live_strategies": [
-    "strategy:arbitrum-usdc-arb",
     "strategy:arbitrum-usdc-esp",
     "strategy:world-chain-usdc-wld"
   ],
