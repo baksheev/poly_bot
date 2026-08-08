@@ -383,6 +383,10 @@ fn gke_recovery_workflow_enforces_a_quiescent_single_owner_handoff() {
 
     assert!(RECOVERY_WORKFLOW.contains("backoffLimit: 0"));
     assert!(RECOVERY_WORKFLOW.contains("activeDeadlineSeconds: 1200"));
+    assert!(RECOVERY_WORKFLOW.contains(
+        "select(.status == \"True\" and (.type == \"Complete\" or .type == \"Failed\"))"
+    ));
+    assert!(!RECOVERY_WORKFLOW.contains("select(.status == \"True\") | .type"));
     assert!(RECOVERY_WORKFLOW.contains("select(.name == \"arb-bot\")"));
     assert!(RECOVERY_WORKFLOW.contains(".spec.containers = ["));
     assert!(RECOVERY_WORKFLOW.contains("arb_bot arbitrage-record-operator-recovery"));

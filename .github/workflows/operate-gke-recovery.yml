@@ -294,7 +294,7 @@ jobs:
           for _ in {1..1200}; do
             terminal="$(kubectl get job "${job}" \
               --namespace "${GKE_NAMESPACE}" \
-              -o json | jq -r '[.status.conditions[]? | select(.status == "True") | .type][0] // empty')"
+              -o json | jq -r '[.status.conditions[]? | select(.status == "True" and (.type == "Complete" or .type == "Failed")) | .type][0] // empty')"
             test -z "${terminal}" || break
             sleep 1
           done
@@ -374,7 +374,7 @@ jobs:
           for _ in {1..7200}; do
             terminal="$(kubectl get job "${job}" \
               --namespace "${GKE_NAMESPACE}" \
-              -o json | jq -r '[.status.conditions[]? | select(.status == "True") | .type][0] // empty')"
+              -o json | jq -r '[.status.conditions[]? | select(.status == "True" and (.type == "Complete" or .type == "Failed")) | .type][0] // empty')"
             test -z "${terminal}" || break
             sleep 1
           done
