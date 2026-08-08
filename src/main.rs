@@ -107,6 +107,12 @@ use arb_bot::{
         StrategyDependencyFault, StrategyEvaluator,
     },
     supervision::{DependencyFaultClass, DependencyScope, RootSupervisorPolicy, SupervisorAction},
+    switchback::{
+        ESP_SWITCHBACK_BLOCK_DURATION_SECONDS, ESP_SWITCHBACK_END_UNIX_SECONDS,
+        ESP_SWITCHBACK_EXPERIMENT_ID, ESP_SWITCHBACK_HASH_ALGORITHM, ESP_SWITCHBACK_PAIR_ID,
+        ESP_SWITCHBACK_SEED_VERSION, ESP_SWITCHBACK_START_UNIX_SECONDS,
+        validate_production_switchback,
+    },
     telemetry::{
         ARBITRAGE_RESULT_KIND, ExecutionLatencyTelemetry, PRIMARY_BINANCE_ACCOUNT_ID,
         TelemetryHandle, TelemetryWriter, execution_lane_id,
@@ -3872,6 +3878,38 @@ async fn run(
         ensure!(
             linea_allowance_mutations_ready,
             "Linea contract and RPC readiness must pass before allowance mutations"
+        );
+        validate_production_switchback()?;
+        tracing::info!(
+            pair_id = ESP_SWITCHBACK_PAIR_ID,
+            experiment_id = ESP_SWITCHBACK_EXPERIMENT_ID,
+            seed_version = ESP_SWITCHBACK_SEED_VERSION,
+            hash_algorithm = ESP_SWITCHBACK_HASH_ALGORITHM,
+            starts_at_unix_seconds = ESP_SWITCHBACK_START_UNIX_SECONDS,
+            ends_at_unix_seconds = ESP_SWITCHBACK_END_UNIX_SECONDS,
+            block_duration_seconds = ESP_SWITCHBACK_BLOCK_DURATION_SECONDS,
+            control = "dex_first",
+            treatment = "concurrent_hedged",
+            sizing_policy = "production_adaptive_6_to_200_usdc",
+            "ESP concurrent switchback full-live execution configured"
+        );
+        telemetry.emit(
+            "arbitrage_switchback_configured",
+            serde_json::json!({
+                "engine_id": &config.engine_id,
+                "pair_id": ESP_SWITCHBACK_PAIR_ID,
+                "experiment_id": ESP_SWITCHBACK_EXPERIMENT_ID,
+                "seed_version": ESP_SWITCHBACK_SEED_VERSION,
+                "hash_algorithm": ESP_SWITCHBACK_HASH_ALGORITHM,
+                "starts_at_unix_seconds": ESP_SWITCHBACK_START_UNIX_SECONDS,
+                "ends_at_unix_seconds": ESP_SWITCHBACK_END_UNIX_SECONDS,
+                "block_duration_seconds": ESP_SWITCHBACK_BLOCK_DURATION_SECONDS,
+                "control": "dex_first",
+                "treatment": "concurrent_hedged",
+                "assignment_probability_bps": 5_000,
+                "sizing_policy": "production_adaptive_6_to_200_usdc",
+                "live_mutation_authorized": true,
+            }),
         );
         let account_id = compiled_binance_runtime
             .as_ref()

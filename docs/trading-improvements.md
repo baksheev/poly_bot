@@ -309,10 +309,9 @@ reviewed production scope and comparing its accumulated cohort with the prior
 `dex_first` production cohort at the same sizing policy.
 
 [`concurrent-execution.md`](concurrent-execution.md) remains the authoritative
-experiment design and currently requires paper/shadow stages before live. This
-roadmap does not silently override that document. Before direct `full_live`
-use, its rollout and analysis sections must be amended and reviewed to
-distinguish:
+experiment design. Its 2026-08-08 ESP/USDC v1 protocol authorizes a real-money
+randomized production switchback after the earlier paper-only implementation.
+The production revision distinguishes:
 
 - mandatory deterministic planner, request-construction, fault-injection, and
   restart verification;
@@ -328,13 +327,12 @@ MARKET recovery, exact reservations, and lane release rules. Exactly one
 versioned mode sends commands for a pair; the rollout never runs both modes
 against the same opportunity or liquidity.
 
-The concurrent revision starts directly in normal `full_live` at the resolved
-minimum sizing policy and continues trading under the existing risk,
-quarantine, recovery, entry-stop, and rollback controls. It adds no automatic
-stop or experiment scheduler. The report compares equal half-open production
-windows and explicitly treats the result as observational rather than a
-randomized causal estimate. DEX-first remains the rollback mode until the
-concurrent cohort has acceptable comparable PnL and safety tails.
+The concurrent revision starts directly in normal `full_live` with existing
+adaptive sizing and continues under the existing risk, quarantine, recovery,
+entry-stop, and rollback controls. A deterministic 30-minute `AB`/`BA`
+switchback assigns exactly one live mode per block. DEX-first remains the
+post-window and revision rollback mode until the treatment has acceptable
+comparable PnL and safety tails.
 
 ## M5: Binance IOC and recovery execution quality
 

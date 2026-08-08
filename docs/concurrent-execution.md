@@ -1,7 +1,53 @@
 # Concurrent DEX/CEX execution
 
-Status: proposed experiment; DEX-first remains the production control
-Last reviewed: 2026-07-26
+Status: ESP/USDC production switchback v1 active; DEX-first remains the control
+Last reviewed: 2026-08-08
+
+## ESP/USDC production protocol v1
+
+The operator approved real-money production enrollment for ESP/USDC on
+2026-08-08. This protocol does not use paper orders, a reduced canary notional,
+or a second trading process. Exactly one arm owns each time block inside the
+existing Rust process, wallet, Binance account, journals, reservations, nonce
+owner, and global execution lane.
+
+The protocol is frozen as follows:
+
+| Field | Frozen value |
+| --- | --- |
+| Experiment ID | `esp-usdc-concurrent-full-live-v1` |
+| Pair | `arbitrum-usdc-esp` / `ESPUSDC` |
+| Enrollment window | `[2026-08-08T03:00:00Z, 2026-08-15T03:00:00Z)` |
+| Block duration | 30 minutes |
+| Block pairs | 168 complete randomized `AB`/`BA` pairs |
+| Control | `dex_first` |
+| Treatment | `concurrent_hedged` |
+| Assignment | SHA-256 of the committed seed, experiment ID, and big-endian block-pair ID |
+| Sizing | normal production adaptive sizing, 6 USDC baseline through the existing 200 USDC cap |
+| Recovery | existing immutable mismatch target and bounded MARKET recovery state machine |
+| Post-window fallback | `dex_first` |
+
+The secret-free seed and exact byte encoding are committed in
+`src/switchback.rs`. Each pair of blocks contains each arm exactly once; the
+digest decides whether the pair is `AB` or `BA`. Assignment uses the persisted
+opportunity receive timestamp, so a restart cannot change an admitted parent's
+arm. The selected mode is persisted in the coordinator journal before either
+venue command is dispatched.
+
+All existing production limits, entry preflight, exact inventory reservations,
+Unknown reconciliation, deterministic order IDs, nonce ownership, recovery
+retries, entry-stop behavior, and restart recovery remain unchanged. The
+experiment adds no second wallet owner and never sends both policies for one
+opportunity. `concurrent_hedged` means the one assigned live policy journals
+both primary commands and releases their DEX and Binance futures together.
+
+`arbitrage_admitted` is the intent-to-treat envelope. It records the experiment,
+assigned mode, block and block-pair IDs, block position, pair order, seed
+version, and assignment digest prefix before execution. The live task emits
+`arbitrage_switchback_execution`, and terminal `arbitrage_result` retains the
+persisted execution mode and comparable PnL. Superseded or otherwise
+post-assignment unexecuted opportunities remain in the assigned arm with zero
+execution PnL in the primary report.
 
 This proposal is subordinate to `rust-production-architecture.md`. In
 particular, an unresolved parent may retain its own exposure and reservations
@@ -34,9 +80,9 @@ filled leg. It may be enabled only when the service can prove current balances,
 nonce ownership, Binance order state, full Spot depth, recovery liquidity, and
 all risk limits entirely from in-memory state.
 
-The first implementation is paper-only. It must not attach a wallet signer or a
-Binance key with trading permission, and it must not weaken the existing live
-trading gate.
+The historical first implementation was paper-only. The versioned ESP/USDC
+protocol above is the separately approved live gate; other pairs remain outside
+the treatment and retain their existing production ordering.
 
 ## Goals
 

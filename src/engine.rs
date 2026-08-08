@@ -52,6 +52,7 @@ use crate::{
     },
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
     strategy_runtime::{StrategyEvaluation, StrategyEvaluator, measure_strategy_evaluation},
+    switchback::production_execution_assignment,
     telemetry::{
         PRIMARY_BINANCE_ACCOUNT_ID, PRIMARY_EVM_WALLET_ID, TelemetryHandle, execution_lane_id,
         instrument_id, network_id, strategy_id, wallet_location_id,
@@ -3511,6 +3512,9 @@ impl TradingEngine {
             }
         }
         let mailbox_submit_us = duration_us(mailbox_submit_started.elapsed());
+        let production_assignment = (self.config.arbitrage_execution_mode == "full_live")
+            .then(|| production_execution_assignment(&pair_id, quote.received_unix_us))
+            .transpose()?;
         let admitted_payload = json!({
             "engine_id": self.config.engine_id,
             "plan_id": &plan_id,
@@ -3553,6 +3557,59 @@ impl TradingEngine {
             "price_unchanged_for_us": duration_us(quote.received_at.elapsed()),
             "dex_plan": dex_plan_telemetry_value(&dex_plan),
         });
+        let mut admitted_payload = admitted_payload;
+        if let Some(assignment) = production_assignment {
+            let object = admitted_payload
+                .as_object_mut()
+                .context("arbitrage admission telemetry is not an object")?;
+            object.insert(
+                "execution_mode_assignment".to_owned(),
+                Value::String(
+                    match assignment.execution_mode {
+                        crate::arbitrage::ExecutionMode::DexFirst => "dex_first",
+                        crate::arbitrage::ExecutionMode::ConcurrentHedged => "concurrent_hedged",
+                    }
+                    .to_owned(),
+                ),
+            );
+            object.insert(
+                "experiment_id".to_owned(),
+                assignment
+                    .experiment_id
+                    .map_or(Value::Null, |value| Value::String(value.to_owned())),
+            );
+            object.insert(
+                "experiment_enrollment_status".to_owned(),
+                Value::String(assignment.enrollment_status.to_owned()),
+            );
+            object.insert(
+                "experiment_seed_version".to_owned(),
+                assignment
+                    .seed_version
+                    .map_or(Value::Null, |value| Value::String(value.to_owned())),
+            );
+            object.insert("switchback_block_id".to_owned(), json!(assignment.block_id));
+            object.insert(
+                "switchback_block_pair_id".to_owned(),
+                json!(assignment.block_pair_id),
+            );
+            object.insert(
+                "switchback_block_position".to_owned(),
+                json!(assignment.block_position),
+            );
+            object.insert(
+                "switchback_pair_order".to_owned(),
+                assignment
+                    .pair_order
+                    .map_or(Value::Null, |value| Value::String(value.to_owned())),
+            );
+            object.insert(
+                "switchback_assignment_hash_prefix".to_owned(),
+                assignment
+                    .assignment_hash_prefix
+                    .map_or(Value::Null, Value::String),
+            );
+        }
         self.telemetry.emit("arbitrage_admitted", admitted_payload);
         Ok(false)
     }

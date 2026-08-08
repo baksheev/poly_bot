@@ -20,6 +20,11 @@ the exact artifact used by each rollout.
 
 ### Changed
 
+- Start the versioned ESP/USDC real-money production switchback between
+  `dex_first` and `concurrent_hedged`. Deterministic 30-minute SHA-256 `AB`/`BA`
+  blocks use the existing adaptive 6-200 USDC sizing, reservations, journals,
+  Unknown reconciliation, MARKET recovery, and entry-stop controls; WLD, ARB,
+  and Linea retain DEX-first execution.
 - Keep a DEX pool fail-closed instead of terminating the multi-strategy process
   when an on-chain liquidity update temporarily leaves its prepared execution
   envelope with zero capacity. A later Mint or Swap rebuilds and republishes

@@ -47,6 +47,7 @@ use crate::{
         CommissionAssetValuation, binance_leg_result, dex_leg_result,
         native_gas_to_token_a_base_units,
     },
+    switchback::production_execution_assignment,
     telemetry::{
         ARBITRAGE_BINANCE_ORDER_KIND, ARBITRAGE_DEX_REVERT_KIND, ARBITRAGE_EXECUTION_STAGE_KIND,
         ARBITRAGE_RESULT_KIND, ARBITRAGE_TERMINAL_STATE_KIND, TelemetryHandle,
@@ -1431,6 +1432,35 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
 
     async fn execute(&mut self, opportunity: PaperOpportunity) -> anyhow::Result<()> {
         let plan_id = opportunity.plan_id();
+        let execution_assignment =
+            production_execution_assignment(&opportunity.pair_id, opportunity.received_unix_us)?;
+        if execution_assignment.experiment_id.is_some() {
+            self.telemetry.emit(
+                "arbitrage_switchback_execution",
+                serde_json::json!({
+                    "engine_id": self.engine_id,
+                    "plan_id": &plan_id,
+                    "pair_id": &opportunity.pair_id,
+                    "opportunity_received_unix_us": opportunity.received_unix_us,
+                    "experiment_id": execution_assignment.experiment_id,
+                    "enrollment_status": execution_assignment.enrollment_status,
+                    "seed_version": execution_assignment.seed_version,
+                    "hash_algorithm": crate::switchback::ESP_SWITCHBACK_HASH_ALGORITHM,
+                    "block_duration_seconds": crate::switchback::ESP_SWITCHBACK_BLOCK_DURATION_SECONDS,
+                    "block_id": execution_assignment.block_id,
+                    "block_pair_id": execution_assignment.block_pair_id,
+                    "block_position": execution_assignment.block_position,
+                    "pair_order": execution_assignment.pair_order,
+                    "assignment_hash_prefix": execution_assignment.assignment_hash_prefix.as_deref(),
+                    "assignment_probability_bps": execution_assignment.is_enrolled().then_some(5_000_u16),
+                    "assigned_execution_mode": match execution_assignment.execution_mode {
+                        ExecutionMode::DexFirst => "dex_first",
+                        ExecutionMode::ConcurrentHedged => "concurrent_hedged",
+                    },
+                    "live_mutation_authorized": true,
+                }),
+            );
+        }
         let preflight_started = Instant::now();
         let preflight_result = opportunity
             .validate()
@@ -1457,7 +1487,7 @@ impl<E: LiveLegExecutor> LiveTradeTask<E> {
             None,
         );
         preflight_result?;
-        let mut intent = opportunity.intent(ExecutionMode::DexFirst);
+        let mut intent = opportunity.intent(execution_assignment.execution_mode);
         intent.journal_scope = Some(
             self.risk_limits
                 .pair_policies
@@ -2210,6 +2240,7 @@ mod tests {
 
     use alloy_primitives::U256;
     use rust_decimal::Decimal;
+    use tokio::sync::Barrier;
 
     use crate::{
         arbitrage::{
@@ -2225,6 +2256,10 @@ mod tests {
             LegFuture, LiveLegExecutor, LivePairPolicy, LiveRiskLimits,
             cap_dex_credit_to_execution_envelope, failed, failed_with_gas, live_trade_channel,
             terminal_state_payload, unknown,
+        },
+        switchback::{
+            ESP_SWITCHBACK_BLOCK_DURATION_SECONDS, ESP_SWITCHBACK_PAIR_ID,
+            ESP_SWITCHBACK_START_UNIX_SECONDS, production_execution_assignment,
         },
         telemetry::TelemetryHandle,
     };
@@ -2257,6 +2292,35 @@ mod tests {
     struct RecoveryRecordingExecutor {
         results: Mutex<VecDeque<LegResult>>,
         calls: Arc<Mutex<Vec<(LegRole, bool)>>>,
+    }
+
+    struct ConcurrentBarrierExecutor {
+        barrier: Arc<Barrier>,
+    }
+
+    impl LiveLegExecutor for ConcurrentBarrierExecutor {
+        fn execute<'a>(
+            &'a self,
+            _intent: &'a TradeIntent,
+            command: &'a CoordinatorCommand,
+        ) -> LegFuture<'a> {
+            let (role, result) = match command {
+                CoordinatorCommand::DispatchDex { .. } => {
+                    (LegRole::Dex, result(100, -1_000, 0, "dex:concurrent"))
+                }
+                CoordinatorCommand::DispatchCex { .. } => {
+                    (LegRole::Cex, result(-100, 1_030, 0, "cex:concurrent"))
+                }
+                CoordinatorCommand::RecoverCex { .. } => {
+                    failed(LegRole::RecoveryCex, "unexpected-recovery")
+                }
+            };
+            let barrier = Arc::clone(&self.barrier);
+            Box::pin(async move {
+                barrier.wait().await;
+                (role, result)
+            })
+        }
     }
 
     impl LiveLegExecutor for RecoveryRecordingExecutor {
@@ -3397,6 +3461,114 @@ mod tests {
         let mut concurrent = policy;
         concurrent.maximum_concurrent_trades = 2;
         assert!(concurrent.validate("arbitrum-usdc-esp").is_err());
+    }
+
+    #[tokio::test]
+    async fn enrolled_esp_parent_releases_dex_and_binance_futures_together() {
+        let journal = std::env::temp_dir().join(format!(
+            "poly-bot-esp-switchback-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("thread")
+        ));
+        let stop_file = journal.with_extension("stop");
+        let _ = fs::remove_file(&journal);
+        let _ = fs::remove_file(&stop_file);
+
+        let concurrent_block = (0_u64..336)
+            .find(|block_id| {
+                production_execution_assignment(
+                    ESP_SWITCHBACK_PAIR_ID,
+                    (ESP_SWITCHBACK_START_UNIX_SECONDS
+                        + block_id * ESP_SWITCHBACK_BLOCK_DURATION_SECONDS)
+                        * 1_000_000,
+                )
+                .is_ok_and(|assignment| {
+                    assignment.execution_mode == ExecutionMode::ConcurrentHedged
+                })
+            })
+            .unwrap();
+        let received_unix_us = (ESP_SWITCHBACK_START_UNIX_SECONDS
+            + concurrent_block * ESP_SWITCHBACK_BLOCK_DURATION_SECONDS
+            + 1)
+            * 1_000_000;
+        let mut esp = opportunity();
+        esp.pair_id = ESP_SWITCHBACK_PAIR_ID.to_owned();
+        esp.symbol = "ESPUSDC".to_owned();
+        esp.received_unix_us = received_unix_us;
+        esp.reservation_completed_unix_us = received_unix_us + 1;
+
+        let preflight = EntryPreflightHandle::default();
+        let mut quote = preflight_quote(Decimal::new(101, 2), Decimal::new(102, 2), 7);
+        quote.symbol = Arc::from("ESPUSDC");
+        preflight.update_quote(&quote);
+        preflight.configure_max_transport_silence("ESPUSDC", 30_000);
+        preflight.configure_dex_max_head_age(30_000);
+        preflight.update_dex_head(ESP_SWITCHBACK_PAIR_ID, std::time::Instant::now());
+        preflight.update_dex_pool(
+            ESP_SWITCHBACK_PAIR_ID,
+            0,
+            1,
+            0,
+            0,
+            preflight_curves(&preflight_pool(U256::ONE << 96, 0)),
+        );
+        let esp_scope = TradeJournalScope {
+            schema_version: TradeJournalScope::SCHEMA_VERSION,
+            account_id: "binance-account-main".to_owned(),
+            network_id: "arbitrum-one".to_owned(),
+            chain_id: 42_161,
+            wallet_id: "arbitrum-one:wallet-primary".to_owned(),
+            strategy_id: "strategy:arbitrum-usdc-esp".to_owned(),
+            symbol: "ESPUSDC".to_owned(),
+        };
+        let executor = ConcurrentBarrierExecutor {
+            barrier: Arc::new(Barrier::new(2)),
+        };
+        let (_handle, mut task, _events) = live_trade_channel(
+            &journal,
+            executor,
+            TelemetryHandle::disconnected_test_handle(),
+            "esp-switchback-test-engine".to_owned(),
+            LiveRiskLimits {
+                entry_stop_file: stop_file.clone(),
+                entry_preflight: preflight,
+                binance_symbol: "WLDUSDC".to_owned(),
+                binance_base_decimals: 18,
+                journal_scope: scope(),
+                pair_policies: BTreeMap::from([(
+                    ESP_SWITCHBACK_PAIR_ID.to_owned(),
+                    LivePairPolicy {
+                        journal_scope: esp_scope,
+                        binance_base_decimals: 18,
+                        maximum_trade_notional_token_a_base_units: 10_000_000,
+                        maximum_unhedged_notional_token_a_base_units: 10_000_000,
+                        maximum_realized_loss_token_a_base_units: 1_000_000,
+                        maximum_concurrent_trades: 1,
+                        readiness: Arc::new(AtomicBool::new(true)),
+                        market_data_readiness: Arc::new(AtomicBool::new(true)),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+        let plan_id = esp.plan_id();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), task.execute(esp))
+            .await
+            .expect("sequential leg execution would deadlock at the two-party barrier")
+            .unwrap();
+
+        let operation = task.coordinator.operation(&plan_id).unwrap();
+        assert_eq!(operation.intent.mode, ExecutionMode::ConcurrentHedged);
+        assert!(operation.dex_dispatched);
+        assert!(operation.cex_dispatched);
+        assert_eq!(
+            operation.result.as_ref().unwrap().outcome,
+            TerminalOutcome::BalancedProfit
+        );
+
+        drop(task);
+        fs::remove_file(journal).unwrap();
     }
 
     #[test]

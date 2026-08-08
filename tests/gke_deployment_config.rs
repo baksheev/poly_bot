@@ -97,6 +97,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("less than the reviewed 0.01 ETH Linea operator gas reserve"));
     assert!(DEPLOY_WORKFLOW.contains(".data.ARBITRAGE_EXECUTION_MODE"));
     assert!(DEPLOY_WORKFLOW.contains(".data.REBALANCE_EXECUTION_MODE"));
+    assert!(DEPLOY_WORKFLOW.contains("ESP concurrent switchback full-live execution configured"));
     assert!(DEPLOY_WORKFLOW.contains("compiled-multi-pair-production.v1.json"));
     assert!(DEPLOY_WORKFLOW.contains(".bundle_kind"));
     assert!(DEPLOY_WORKFLOW.contains(".capabilities"));

@@ -1251,6 +1251,10 @@ jobs:
             --selector="app.kubernetes.io/name=arb-bot,arb-bot/source-revision=${SOURCE_SHA}" \
             -o jsonpath='{.items[0].metadata.name}')"
           test -n "${pod_name}"
+          kubectl logs "${pod_name}" \
+            --namespace "${GKE_NAMESPACE}" \
+            --container arb-bot \
+            | grep -F "ESP concurrent switchback full-live execution configured"
           rebalance_mode="$(kubectl get deployment arb-bot \
             --namespace "${GKE_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REBALANCE_EXECUTION_MODE")].value}')"

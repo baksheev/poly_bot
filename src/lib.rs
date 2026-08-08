@@ -25,6 +25,7 @@ pub mod resource_balances;
 pub mod state;
 pub mod strategy_runtime;
 pub mod supervision;
+pub mod switchback;
 pub mod telemetry;
 pub mod wallet;
 
