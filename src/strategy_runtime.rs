@@ -229,6 +229,15 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
         shadows: Vec<Box<dyn StrategyEvaluator + Send>>,
         dependencies: CompiledStrategyDependencyIndex,
     ) -> anyhow::Result<Self> {
+        Self::new_with_externally_routed_observers(primary, shadows, Vec::new(), dependencies)
+    }
+
+    pub fn new_with_externally_routed_observers(
+        primary: P,
+        shadows: Vec<Box<dyn StrategyEvaluator + Send>>,
+        externally_routed_observers: Vec<StrategyId>,
+        dependencies: CompiledStrategyDependencyIndex,
+    ) -> anyhow::Result<Self> {
         let primary_strategy_id = primary.strategy_id();
         let primary_plan = dependencies.strategy(&primary_strategy_id)?;
         ensure!(
@@ -261,14 +270,36 @@ impl<P: StrategyEvaluator> HotPathDecisionOwner<P> {
                 strategy_id.as_str()
             );
         }
+        let mut external = BTreeSet::new();
+        for strategy_id in externally_routed_observers {
+            let plan = dependencies.strategy(&strategy_id)?;
+            ensure!(
+                plan.observe && !plan.execute,
+                "externally routed strategy {} is not an observe-only strategy",
+                strategy_id.as_str()
+            );
+            ensure!(
+                strategy_id != primary_strategy_id && !indexed_shadows.contains_key(&strategy_id),
+                "externally routed strategy {} already has a decision-owner evaluator",
+                strategy_id.as_str()
+            );
+            ensure!(
+                external.insert(strategy_id.clone()),
+                "duplicate externally routed strategy {}",
+                strategy_id.as_str()
+            );
+        }
         ensure!(
             dependencies
                 .plan()
                 .strategies
                 .iter()
                 .filter(|strategy| strategy.observe && !strategy.execute)
-                .all(|strategy| { indexed_shadows.contains_key(&strategy.strategy_id) }),
-            "one or more non-executable observable strategies have no hot-path evaluator"
+                .all(|strategy| {
+                    indexed_shadows.contains_key(&strategy.strategy_id)
+                        || external.contains(&strategy.strategy_id)
+                }),
+            "one or more non-executable observable strategies have no routed evaluator"
         );
         Ok(Self {
             primary_strategy_id,
@@ -1731,6 +1762,39 @@ mod tests {
         assert_eq!(wld_summary.routed_strategies, 1);
         assert_eq!(wld_count.load(Ordering::Relaxed), 1);
         assert_eq!(esp_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn owner_accepts_an_explicitly_external_observe_only_evaluator() {
+        let wld = strategy(
+            "strategy:world-chain-usdc-wld",
+            "WLDUSDC",
+            "eip155:480:pool:wld",
+            true,
+        );
+        let linea = strategy(
+            "strategy:linea-usdt-usdc",
+            "USDCUSDT",
+            "eip155:59144:pool:linea",
+            false,
+        );
+        let dependencies = CompiledStrategyDependencyIndex::new(CompiledHotPathRuntimePlan {
+            strategies: vec![linea.clone(), wld.clone()],
+        })
+        .unwrap();
+        let primary = CountingEvaluator {
+            strategy_id: wld.strategy_id,
+            symbol: wld.symbol,
+            evaluations: Arc::new(AtomicU64::new(0)),
+        };
+
+        HotPathDecisionOwner::new_with_externally_routed_observers(
+            primary,
+            Vec::new(),
+            vec![linea.strategy_id],
+            dependencies,
+        )
+        .unwrap();
     }
 
     #[test]

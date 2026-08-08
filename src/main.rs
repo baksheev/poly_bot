@@ -5061,7 +5061,12 @@ async fn run(
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
     )?;
-    let mut engine = HotPathDecisionOwner::new(primary_engine, Vec::new(), dependencies)?;
+    let mut engine = HotPathDecisionOwner::new_with_externally_routed_observers(
+        primary_engine,
+        Vec::new(),
+        vec![linea_plan.strategy_id.clone()],
+        dependencies,
+    )?;
     tracing::info!(
         binance_account_id = PRIMARY_BINANCE_ACCOUNT_ID,
         live_strategy_id = %engine.strategy_id().as_str(),
