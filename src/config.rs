@@ -200,6 +200,18 @@ pub enum Command {
         #[arg(long)]
         wallet_address: String,
     },
+    /// Return the stopped Linea USDT/USDC inventory to Binance through Across and Optimism.
+    LineaReturnCapital {
+        /// `dry-run` validates balances, routes, journals, and mutation authority; `execute` moves funds.
+        #[arg(long, default_value = "dry-run")]
+        mode: String,
+        /// Asset to return: USDT, USDC, or ALL (USDT followed by USDC).
+        #[arg(long, default_value = "ALL")]
+        asset: String,
+        /// Explicit live-capital acknowledgement.
+        #[arg(long, env = "LINEA_RETURN_CAPITAL_CONFIRMATION", default_value = "")]
+        live_confirmation: String,
+    },
     /// Derive and print only the public address of the configured EVM wallet.
     WalletAddress,
     /// Hydrate nonce, native gas, and WLD/USDC balances on World Chain and Optimism.

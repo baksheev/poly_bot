@@ -67,7 +67,6 @@
   "reviewed_live_strategies": [
     "strategy:arbitrum-usdc-arb",
     "strategy:arbitrum-usdc-esp",
-    "strategy:linea-usdt-usdc",
     "strategy:world-chain-usdc-wld"
   ],
   "stream_shard_symbol_capacity": 20,

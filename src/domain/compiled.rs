@@ -2984,7 +2984,6 @@ mod tests {
             std::collections::BTreeSet::from([
                 "ARBUSDC".to_owned(),
                 "ESPUSDC".to_owned(),
-                "USDCUSDT".to_owned(),
                 "WLDUSDC".to_owned(),
             ])
         );
@@ -3086,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn compiler_preserves_typed_linea_lynex_full_live_identity() {
+    fn compiler_preserves_typed_linea_lynex_observe_only_identity() {
         let (_, sources, bundle) = fixture();
         let legacy_read_only_fixture = linea_lynex_source();
         assert!(!legacy_read_only_fixture.snapshot().live_trading_enabled);
@@ -3109,7 +3108,7 @@ mod tests {
         );
         assert_eq!(pool.fee_pips, None);
         assert_eq!(pool.tick_spacing, Some(1));
-        assert_eq!(pool.lifecycle, PoolLifecycle::ExecutionEligible);
+        assert_eq!(pool.lifecycle, PoolLifecycle::Validated);
         let pool_id = pool.id.clone();
 
         let dependency = bundle
@@ -3128,13 +3127,13 @@ mod tests {
             .unwrap();
         assert!(capability.observe);
         assert!(capability.plan);
-        assert!(capability.execute);
-        assert!(capability.rebalance);
+        assert!(!capability.execute);
+        assert!(!capability.rebalance);
 
         let graph = CompiledDomainGraph::from_bundle(bundle).unwrap();
         let binance = graph.binance_runtime_plan().unwrap();
         assert!(binance.symbols.contains(&"USDCUSDT".to_owned()));
-        assert!(binance.executable_symbols.contains("USDCUSDT"));
+        assert!(!binance.executable_symbols.contains("USDCUSDT"));
         let network = graph
             .network_runtime_plan(CompatibilityRole::LiveRuntime)
             .unwrap()
@@ -3144,16 +3143,8 @@ mod tests {
             .unwrap();
         assert_eq!(network.network_id.as_str(), "eip155:59144");
         assert_eq!(network.pool_ids, [pool_id]);
-        assert_eq!(
-            network.gas_policy,
-            CompiledNetworkGasPolicy::LineaMainnet {
-                requires_fresh_rpc_gas_price: true,
-                max_priority_fee_equals_gas_price: true,
-                max_fee_headroom_bps: 12_000,
-                includes_l1_fee: false,
-            }
-        );
-        assert!(network.execution_enabled);
+        assert_eq!(network.gas_policy, CompiledNetworkGasPolicy::ReadOnly);
+        assert!(!network.execution_enabled);
     }
 
     #[test]
@@ -3284,10 +3275,10 @@ mod tests {
             .iter()
             .find(|strategy| strategy.symbol == "USDCUSDT")
             .unwrap();
-        assert!(linea.observe && linea.plan && linea.execute);
+        assert!(linea.observe && linea.plan && !linea.execute);
         assert_eq!(linea.network_id.as_str(), "eip155:59144");
         assert_eq!(linea.pool_ids.len(), 1);
-        assert!(linea.domain_config.snapshot().live_trading_enabled);
+        assert!(!linea.domain_config.snapshot().live_trading_enabled);
         let wld = hot_path
             .strategies
             .iter()
@@ -3345,25 +3336,12 @@ mod tests {
         let capital_policy = portfolio.capital_policy.as_ref().unwrap();
         assert_eq!(capital_policy.network_id.as_str(), "eip155:42161");
         assert!(capital_policy.external_mutation_authorized);
-        assert!(!capital_policy.direct_route_only);
-        assert!(capital_policy.bridge_mutations_enabled);
+        assert!(capital_policy.direct_route_only);
+        assert!(!capital_policy.bridge_mutations_enabled);
         assert!(capital_policy.additional_tokens.contains_key("ARB"));
-        assert!(capital_policy.additional_tokens.contains_key("USDT"));
-        assert_eq!(capital_policy.direct_networks.len(), 2);
-        assert_eq!(
-            capital_policy.direct_networks[&59_144].binance_network,
-            "OPTIMISM"
-        );
-        assert!(
-            capital_policy.direct_networks[&59_144]
-                .tokens
-                .contains_key("USDC")
-        );
-        assert!(
-            capital_policy.direct_networks[&59_144]
-                .tokens
-                .contains_key("USDT")
-        );
+        assert!(!capital_policy.additional_tokens.contains_key("USDT"));
+        assert_eq!(capital_policy.direct_networks.len(), 1);
+        assert!(!capital_policy.direct_networks.contains_key(&59_144));
         assert_eq!(portfolio.live_rebalance_adapter, "world_chain_v12_parity");
         assert_eq!(portfolio.assets.len(), 16);
         assert!(portfolio.assets.iter().any(|asset| {

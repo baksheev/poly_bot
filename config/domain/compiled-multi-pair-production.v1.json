@@ -442,11 +442,11 @@
       }
     },
     {
-      "snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-full-live-v2",
-      "source_fingerprint_sha256": "a706d665974bd776cab0cd4c8166c56f9911ccf15b98cfe491ca2bcccece5acb",
+      "snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-observe-only-v3",
+      "source_fingerprint_sha256": "16e3e0034c7e59b79cc16a7dd490f2f27fdbad8856478230593cd3f13d510659",
       "snapshot": {
         "schema_version": 1,
-        "snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-full-live-v2",
+        "snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-observe-only-v3",
         "source": {
           "repository": "baksheev/arb_bot",
           "revision": "ccd6813f2de18217b3da688670c7ae3dbd39aa05",
@@ -458,30 +458,17 @@
             "Linea chain and Lynex Algebra V1.9 identities pinned at block 31631634",
             "Binance Spot USDCUSDT was TRADING with one-USDC LOT_SIZE step, 0.00001 tick, and five-USDT minimum notional at serverTime 1785997605387",
             "Lynex market data, DEX-first execution, bounded Binance recovery, and Optimism/Across V4 Linea rebalancing are approved for full-live production",
-            "2026-08-07 operator capital distribution keeps the shared Binance reserve central, caps one USDC refill at 600 USDC, and uses a 20 percent Linea startup threshold so one refill clears the low-water mark"
+            "2026-08-07 operator capital distribution keeps the shared Binance reserve central, caps one USDC refill at 600 USDC, and uses a 20 percent Linea startup threshold so one refill clears the low-water mark",
+            "2026-08-08 operator decommission decision disables Linea execution and rebalancing while retaining read-only market telemetry"
           ]
         },
-        "live_trading_enabled": true,
+        "live_trading_enabled": false,
         "pairs": [
           {
             "id": "linea-usdt-usdc",
             "market_data_enabled": true,
-            "execution_enabled": true,
-            "full_live": true,
-            "full_live_policy": {
-              "production_approval_actor": "operator",
-              "production_approval_recorded_at_utc": "2026-08-07T15:18:11Z",
-              "arbitrum_max_fee_headroom_bps": 12000,
-              "router_allowance_mode": "max_uint256_then_locked",
-              "rebalance_binance_network": "OPTIMISM",
-              "maximum_rebalance_token_a_debit_base_units": "2600000000",
-              "maximum_rebalance_token_b_debit_base_units": "2600000000",
-              "maximum_rebalance_token_a_fee_base_units": "5000000",
-              "maximum_rebalance_token_b_fee_base_units": "5000000",
-              "maximum_unknown_reconciliation_queries": 1,
-              "direct_route_only": false,
-              "bridge_mutations_enabled": true
-            },
+            "execution_enabled": false,
+            "full_live": false,
             "chain": {
               "name": "Linea Mainnet",
               "chain_id": 59144,
@@ -548,7 +535,7 @@
               "slippage_profit_share_bps": 5000
             },
             "rebalance": {
-              "enabled": true,
+              "enabled": false,
               "start_threshold_bps": 2000
             },
             "dex": {
@@ -1025,7 +1012,7 @@
       "fee_pips": null,
       "tick_spacing": 1,
       "hooks": null,
-      "lifecycle": "execution_eligible"
+      "lifecycle": "validated"
     }
   ],
   "strategies": [
@@ -1050,7 +1037,7 @@
     {
       "id": "strategy:linea-usdt-usdc",
       "pair_id": "linea-usdt-usdc",
-      "source_snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-full-live-v2",
+      "source_snapshot_id": "linea-usdt-usdc-lynex-algebra-v1-9-observe-only-v3",
       "account_id": "binance-spot:primary",
       "instrument_id": "binance-spot:primary:USDCUSDT",
       "network_id": "eip155:59144",
@@ -1216,7 +1203,6 @@
       "owned_ids": [
         "strategy:arbitrum-usdc-arb",
         "strategy:arbitrum-usdc-esp",
-        "strategy:linea-usdt-usdc",
         "strategy:world-chain-usdc-wld"
       ]
     },
@@ -1280,8 +1266,8 @@
       "strategy_id": "strategy:linea-usdt-usdc",
       "observe": true,
       "plan": true,
-      "execute": true,
-      "rebalance": true
+      "execute": false,
+      "rebalance": false
     },
     {
       "strategy_id": "strategy:world-chain-usdc-wld",

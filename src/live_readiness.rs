@@ -658,7 +658,7 @@ mod tests {
                 SymbolRules,
             },
         },
-        domain::config::LoadedDomainConfig,
+        domain::config::{DomainSnapshot, LoadedDomainConfig},
     };
 
     use super::{
@@ -748,9 +748,11 @@ mod tests {
 
     #[test]
     fn linea_binance_and_lynex_readiness_accepts_only_the_reviewed_pair() {
-        let domain =
-            LoadedDomainConfig::load("config/strategies/usdt-usdc-linea-lynex.v2.json").unwrap();
-        let pair = &domain.snapshot().pairs[0];
+        let historical: DomainSnapshot = serde_json::from_slice(include_bytes!(
+            "../config/strategies/usdt-usdc-linea-lynex.v1.json"
+        ))
+        .unwrap();
+        let pair = &historical.pairs[0];
         let mut linea_state = state();
         linea_state.commission.symbol = "USDCUSDT".to_owned();
         linea_state.symbol_rules.symbol = "USDCUSDT".to_owned();

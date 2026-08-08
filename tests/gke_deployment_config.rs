@@ -113,7 +113,7 @@ fn gke_workflow_verifies_the_runtime_startup_mode() {
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:WLDUSDC"));
     assert!(DEPLOY_WORKFLOW.contains("binance-spot:primary:USDCUSDT"));
     assert!(DEPLOY_WORKFLOW.contains("strategy:linea-usdt-usdc"));
-    assert!(DEPLOY_WORKFLOW.contains("linea-usdt-usdc-lynex-algebra-v1-9-full-live-v2"));
+    assert!(DEPLOY_WORKFLOW.contains("linea-usdt-usdc-lynex-algebra-v1-9-observe-only-v3"));
     assert!(DEPLOY_WORKFLOW.contains("test \"${REBALANCE_MAX_USDC_AMOUNT}\" = 600"));
     assert!(DEPLOY_WORKFLOW.contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"));
     assert!(DEPLOY_WORKFLOW.contains("lynex_algebra_v1_9"));
@@ -388,7 +388,14 @@ fn gke_recovery_workflow_enforces_a_quiescent_single_owner_handoff() {
     assert!(RECOVERY_WORKFLOW.contains("arb_bot arbitrage-record-operator-recovery"));
     assert!(RECOVERY_WORKFLOW.contains("RECORD_LIVE_ARBITRAGE_OPERATOR_RECOVERY"));
     assert!(RECOVERY_WORKFLOW.contains("inputs.operation == 'recovery-execute'"));
-    assert!(RECOVERY_WORKFLOW.contains("if: success() && inputs.operation == 'recovery-execute'"));
+    assert!(RECOVERY_WORKFLOW.contains(
+        "if: success() && (inputs.operation == 'recovery-execute' || inputs.operation == 'linea-return-execute')"
+    ));
+    assert!(RECOVERY_WORKFLOW.contains("arb_bot linea-return-capital"));
+    assert!(RECOVERY_WORKFLOW.contains("RETURN_LINEA_USDT_USDC_TO_BINANCE"));
+    assert!(
+        RECOVERY_WORKFLOW.contains("if: success() && inputs.operation == 'linea-return-execute'")
+    );
     assert!(!RECOVERY_WORKFLOW.contains("confirmation=RELEASE"));
     assert!(RECOVERY_WORKFLOW.contains("test \"${RECOVERY_CONFIRMATION}\" = RELEASE"));
 }

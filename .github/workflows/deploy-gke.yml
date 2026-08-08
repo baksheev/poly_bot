@@ -75,7 +75,7 @@ jobs:
           test "$(jq -c '.networks | map(.id)' "${domain_config}")" \
             = '["eip155:42161","eip155:480","eip155:59144"]'
           test "$(jq -c '.capabilities' "${domain_config}")" = \
-            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:linea-usdt-usdc","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
+            '[{"strategy_id":"strategy:arbitrum-usdc-arb","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:arbitrum-usdc-esp","observe":true,"plan":true,"execute":true,"rebalance":true},{"strategy_id":"strategy:linea-usdt-usdc","observe":true,"plan":true,"execute":false,"rebalance":false},{"strategy_id":"strategy:world-chain-usdc-wld","observe":true,"plan":true,"execute":true,"rebalance":true}]'
           test "$(jq -r '.compatibility_projections[] | select(.role == "live_runtime") | .source_snapshot_id' "${domain_config}")" \
             = arb-bot-production-usdc-wld-world-chain-v14-v3-one-percent-pool
           test "$(jq -r '.compatibility_projections[] | select(.role == "public_price_collector") | .source_snapshot_id' "${domain_config}")" \
@@ -178,31 +178,24 @@ jobs:
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0x9ffca51d23ac7f7df82da414865ef1055e5afcc3"))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:arbitrum-usdc-arb") | .pool_ids[] | select((ascii_downcase) | contains("0xfae2ae0a9f87fd35b5b0e24b47bac796a7eefea1"))] | length' "${domain_config}")" = 1
           linea='.sources[] | select(.snapshot.pairs[0].id == "linea-usdt-usdc") | .snapshot'
-          test "$(jq -r "${linea} | .snapshot_id" "${domain_config}")" = linea-usdt-usdc-lynex-algebra-v1-9-full-live-v2
-          test "$(jq -r "${linea} | .live_trading_enabled" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .snapshot_id" "${domain_config}")" = linea-usdt-usdc-lynex-algebra-v1-9-observe-only-v3
+          test "$(jq -r "${linea} | .live_trading_enabled" "${domain_config}")" = false
           test "$(jq -r "${linea} | .pairs[0].chain.chain_id" "${domain_config}")" = 59144
           test "$(jq -r "${linea} | .pairs[0].binance.symbol" "${domain_config}")" = USDCUSDT
           test "$(jq -r "${linea} | .pairs[0].binance.step_size" "${domain_config}")" = 1.00000000
           test "$(jq -r "${linea} | .pairs[0].binance.tick_size" "${domain_config}")" = 0.00001000
-          test "$(jq -r "${linea} | .pairs[0].execution_enabled" "${domain_config}")" = true
-          test "$(jq -r "${linea} | .pairs[0].full_live" "${domain_config}")" = true
-          test "$(jq -r "${linea} | .pairs[0].rebalance.enabled" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0].execution_enabled" "${domain_config}")" = false
+          test "$(jq -r "${linea} | .pairs[0].full_live" "${domain_config}")" = false
+          test "$(jq -r "${linea} | .pairs[0].rebalance.enabled" "${domain_config}")" = false
           test "$(jq -r "${linea} | .pairs[0].rebalance.start_threshold_bps" "${domain_config}")" = 2000
           test "$(jq -r "${linea} | .pairs[0].quote_sizing.token_a_base_units" "${domain_config}")" = 6000000
           test "$(jq -r "${linea} | .pairs[0].adaptive_sizing.max_trade_notional_token_a_base_units" "${domain_config}")" = 200000000
           test "$(jq -r "${linea} | .pairs[0].strategy.opportunity_threshold_bps" "${domain_config}")" = 20
           test "$(jq -r "${linea} | .pairs[0].strategy.max_transport_silence_ms" "${domain_config}")" = 30000
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_actor" "${domain_config}")" = operator
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.production_approval_recorded_at_utc" "${domain_config}")" = 2026-08-07T15:18:11Z
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.rebalance_binance_network" "${domain_config}")" = OPTIMISM
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_rebalance_token_a_debit_base_units" "${domain_config}")" = 2600000000
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_rebalance_token_b_debit_base_units" "${domain_config}")" = 2600000000
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.maximum_unknown_reconciliation_queries" "${domain_config}")" = 1
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.direct_route_only" "${domain_config}")" = false
-          test "$(jq -r "${linea} | .pairs[0].full_live_policy.bridge_mutations_enabled" "${domain_config}")" = true
+          test "$(jq -r "${linea} | .pairs[0] | has(\"full_live_policy\")" "${domain_config}")" = false
           test "$(jq -c "${linea} | .pairs[0].dex.allowed_providers" "${domain_config}")" = '["lynex_algebra_v1_9"]'
           test "$(jq -r "${linea} | .pairs[0].chain.lynex_algebra_v1_9_router_address" "${domain_config}")" = 0x3921e8cb45B17fC029A0a6dE958330ca4e583390
-          test "$(jq -r '[.pools[] | select(.pair_id == "linea-usdt-usdc" and .protocol == "lynex_algebra_v1_9" and .fee_pips == null and .tick_spacing == 1 and .lifecycle == "execution_eligible" and ((.canonical_identity | ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b")))] | length' "${domain_config}")" = 1
+          test "$(jq -r '[.pools[] | select(.pair_id == "linea-usdt-usdc" and .protocol == "lynex_algebra_v1_9" and .fee_pips == null and .tick_spacing == 1 and .lifecycle == "validated" and ((.canonical_identity | ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b")))] | length' "${domain_config}")" = 1
           test "$(jq -r '[.dependencies[] | select(.strategy_id == "strategy:linea-usdt-usdc") | .pool_ids[] | select((ascii_downcase) | contains("0x6e9ad0b8a41e2c148e7b0385d3ecbfdb8a216a9b"))] | length' "${domain_config}")" = 1
           test "${GITHUB_REF}" = "refs/heads/main" || test "${GITHUB_EVENT_NAME}" = "workflow_run"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then

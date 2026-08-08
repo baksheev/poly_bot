@@ -26,7 +26,9 @@ use arb_bot::{
         binance_snapshot, fetch_wallet_snapshot, fetch_wallet_snapshot_coordinated,
         spawn_balance_sync, spawn_wallet_balance_sync,
     },
-    binance::account::{BinanceAccountClient, BinanceAccountState, BinanceClockSync},
+    binance::account::{
+        AccountInformation, BinanceAccountClient, BinanceAccountState, BinanceClockSync,
+    },
     binance::capital::{
         CapitalRecoverySnapshot, CapitalRouteState, TravelRuleWithdrawalRecord, WithdrawalRecord,
         select_capital_routes,
@@ -59,8 +61,9 @@ use arb_bot::{
     domain::{
         compiled::{
             CompatibilityRole, CompiledBinanceRuntimePlan, CompiledCapitalAllocatorMode,
-            CompiledCapitalPolicy, CompiledGraphSummary, CompiledHotPathRuntimePlan,
-            CompiledNetworkGasPolicy, CompiledNetworkRuntimePlan, CompiledPortfolioRuntimePlan,
+            CompiledCapitalNetworkPolicy, CompiledCapitalPolicy, CompiledCapitalTokenPolicy,
+            CompiledGraphSummary, CompiledHotPathRuntimePlan, CompiledNetworkGasPolicy,
+            CompiledNetworkRuntimePlan, CompiledPortfolioRuntimePlan, EconomicAssetId, NetworkId,
             compile_manifest_to_path, load_compatibility_domain,
         },
         config::{DexProvider, LoadedDomainConfig},
@@ -70,7 +73,6 @@ use arb_bot::{
         CommissionAssetValuation, binance_leg_result, dex_leg_result,
         native_gas_to_token_a_base_units,
     },
-    execution_plan::linea_lynex_allowance_requirements,
     hot_telemetry,
     inventory::SharedInventoryReservations,
     live_execution::{
@@ -96,9 +98,10 @@ use arb_bot::{
     },
     pretrade_cost::PreTradeCostTelemetry,
     rebalance::{
-        RebalanceExecutionAuthority, RebalanceExecutionOperation, RebalanceExecutionRequest,
-        RebalanceExecutor, RebalanceRisk, RebalanceRuntimeLimits, RebalanceTracker,
-        V12RebalanceParityAdapter, rebalance_base_units_to_decimal, route_candidates_from_capital,
+        Direction, RebalanceAction, RebalanceExecutionAuthority, RebalanceExecutionOperation,
+        RebalanceExecutionRequest, RebalanceExecutor, RebalanceRisk, RebalanceRuntimeLimits,
+        RebalanceTracker, Route, V12RebalanceParityAdapter, rebalance_base_units_to_decimal,
+        rebalance_decimal_to_base_units_floor, route_candidates_from_capital,
     },
     resource_balances::{EvmGasBalanceSource, RESOURCE_BALANCE_INTERVAL, ResourceBalanceMonitor},
     state::{QuoteApplyResult, RuntimePhase, RuntimeState, TopOfBook},
@@ -141,6 +144,9 @@ const REBALANCE_QUOTE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const REBALANCE_QUOTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const REBALANCE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 const ACROSS_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+const LINEA_DECOMMISSION_APPROVAL_SESSION_ID: &str = "linea-usdt-usdc-decommission-20260808";
+const LINEA_DECOMMISSION_MAXIMUM_BASE_UNITS: u64 = 2_600_000_000;
+const LINEA_DECOMMISSION_MAXIMUM_FEE_BASE_UNITS: u64 = 5_000_000;
 
 fn esp_evm_journal_scope(chain_id: u64) -> EvmJournalScope {
     let network_id = format!("eip155:{chain_id}");
@@ -160,6 +166,35 @@ fn linea_evm_journal_scope() -> EvmJournalScope {
         network_id,
         strategy_id: "strategy:linea-usdt-usdc".to_owned(),
     }
+}
+
+fn reviewed_rebalance_nonce_collision(
+    wallet_owner: Address,
+) -> anyhow::Result<ReviewedConsumedNonceCollision> {
+    Ok(ReviewedConsumedNonceCollision {
+        operation_id: "rebalance-1516-6b2792a1b1a18931:deposit".to_owned(),
+        chain_id: 10,
+        wallet: wallet_owner,
+        nonce: 76,
+        rejected_transaction_hash:
+            "0x34462b8a2f930da06b5196db6a4111b07941c25ecbe4e0ddc388716a4d41a482".parse()?,
+        purpose: "rebalance_bridge_to_binance".to_owned(),
+        target: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse()?,
+        native_value: U256::ZERO,
+        calldata_hash: "0x510c0580cb373c283aec526a40c38da97f863cdcbfe61f6b0c4ceffde0938c0d"
+            .parse()?,
+        replacement_transaction_hash:
+            "0x2d22c304a0e0ca98e0684145dbff8a62925cb36c33b0af891dc56b8248fb73b4".parse()?,
+        replacement_target: "0x97ccdbea4632140639ad5ea9b944aa034eb15fd4".parse()?,
+        replacement_native_value: U256::from(26_138_677_603_673_219_u64),
+        replacement_block_number: 155_207_427,
+        scope: EvmJournalScope {
+            schema_version: EvmJournalScope::SCHEMA_VERSION,
+            network_id: "optimism".to_owned(),
+            wallet_id: format!("wallet:{wallet_owner:#x}"),
+            strategy_id: "rebalance-world-chain-v12".to_owned(),
+        },
+    })
 }
 
 fn allowance_operation_id(symbol: &str) -> String {
@@ -669,6 +704,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::LineaReturnCapital {
+            mode,
+            asset,
+            live_confirmation,
+        } => linea_return_capital(&cli.config, &mode, &asset, &live_confirmation).await,
         Command::WalletAddress => {
             let wallet = EvmWallet::from_env()?;
             tracing::info!(address = %wallet.address(), "EVM test wallet loaded");
@@ -1624,6 +1664,332 @@ async fn across_linea_capital_quote(
         swap_target = %quote.swap_tx.to,
         "Across V4 Linea capital quote validated"
     );
+    Ok(())
+}
+
+fn linea_decommission_policy(
+    portfolio: &CompiledPortfolioRuntimePlan,
+) -> anyhow::Result<CompiledCapitalPolicy> {
+    let mut policy = portfolio
+        .capital_policy
+        .clone()
+        .context("Linea decommission requires the compiled production capital policy")?;
+    let economic_asset = |symbol: &str| -> anyhow::Result<EconomicAssetId> {
+        portfolio
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .map(|asset| asset.economic_asset_id.clone())
+            .with_context(|| format!("compiled portfolio has no {symbol} economic asset"))
+    };
+    let token_policy = |symbol: &str| -> anyhow::Result<CompiledCapitalTokenPolicy> {
+        Ok(CompiledCapitalTokenPolicy {
+            economic_asset_id: economic_asset(symbol)?,
+            maximum_debit: U256::from(LINEA_DECOMMISSION_MAXIMUM_BASE_UNITS),
+            maximum_fee: U256::from(LINEA_DECOMMISSION_MAXIMUM_FEE_BASE_UNITS),
+        })
+    };
+    policy.approval_session_id = LINEA_DECOMMISSION_APPROVAL_SESSION_ID.to_owned();
+    policy.maximum_concurrent_transfers = 1;
+    policy.maximum_unknown_reconciliation_queries = 1;
+    policy.direct_route_only = false;
+    policy.bridge_mutations_enabled = true;
+    policy.external_mutation_authorized = true;
+    policy.direct_networks.insert(
+        LINEA_CHAIN_ID,
+        CompiledCapitalNetworkPolicy {
+            network_id: NetworkId::new(format!("eip155:{LINEA_CHAIN_ID}"))?,
+            binance_network: "OPTIMISM".to_owned(),
+            tokens: BTreeMap::from([
+                ("USDC".to_owned(), token_policy("USDC")?),
+                ("USDT".to_owned(), token_policy("USDT")?),
+            ]),
+        },
+    );
+    Ok(policy)
+}
+
+fn account_balance_base_units(
+    account: &AccountInformation,
+    asset: &str,
+    decimals: u8,
+) -> anyhow::Result<U256> {
+    let balance = account
+        .balances
+        .iter()
+        .find(|balance| balance.asset == asset);
+    let total = balance.map_or(Decimal::ZERO, |balance| balance.free + balance.locked);
+    rebalance_decimal_to_base_units_floor(total, decimals)
+}
+
+async fn linea_return_capital(
+    config: &config::AppConfig,
+    mode: &str,
+    asset: &str,
+    live_confirmation: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        matches!(mode, "dry-run" | "execute"),
+        "--mode must be dry-run or execute"
+    );
+    let asset = asset.to_ascii_uppercase();
+    ensure!(
+        matches!(asset.as_str(), "USDT" | "USDC" | "ALL"),
+        "--asset must be USDT, USDC, or ALL"
+    );
+    let execute = mode == "execute";
+    if execute {
+        ensure!(
+            live_confirmation == "RETURN_LINEA_USDT_USDC_TO_BINANCE",
+            "Linea capital return requires LINEA_RETURN_CAPITAL_CONFIRMATION=RETURN_LINEA_USDT_USDC_TO_BINANCE"
+        );
+        ensure!(
+            config.arbitrage_entry_stop_file.exists(),
+            "Linea capital return requires the durable arbitrage entry-stop marker"
+        );
+    }
+
+    let selection = load_compatibility_domain(
+        &config.domain_config_path,
+        CompatibilityRole::LiveRuntime,
+        false,
+    )?;
+    let linea_strategy = selection
+        .hot_path_runtime
+        .as_ref()
+        .context("compiled domain has no hot-path runtime")?
+        .strategies
+        .iter()
+        .find(|strategy| strategy.pair_id == "linea-usdt-usdc")
+        .context("compiled domain has no Linea strategy")?;
+    let linea_pair = linea_strategy
+        .domain_config
+        .snapshot()
+        .pairs
+        .first()
+        .context("compiled Linea strategy has no pair")?;
+    ensure!(
+        linea_strategy.observe
+            && linea_strategy.plan
+            && !linea_strategy.execute
+            && linea_pair.market_data_enabled
+            && !linea_pair.execution_enabled
+            && !linea_pair.full_live
+            && linea_pair.full_live_policy.is_none()
+            && !linea_pair.rebalance.enabled,
+        "Linea capital return requires the deployed pair to be observe-only and mutation-disabled"
+    );
+    ensure!(
+        linea_pair.token_a.symbol == "USDT"
+            && linea_pair.token_a.decimals == 6
+            && linea_pair
+                .token_a
+                .contract
+                .eq_ignore_ascii_case(&format!("{LINEA_USDT:#x}"))
+            && linea_pair.token_b.symbol == "USDC"
+            && linea_pair.token_b.decimals == 6
+            && linea_pair
+                .token_b
+                .contract
+                .eq_ignore_ascii_case(&format!("{LINEA_USDC:#x}")),
+        "compiled stopped Linea token identity differs from the reviewed decommission route"
+    );
+    let portfolio = selection
+        .portfolio_runtime
+        .as_ref()
+        .context("compiled domain has no portfolio runtime")?;
+    let capital_policy = linea_decommission_policy(portfolio)?;
+
+    let wallet = EvmWallet::from_env()?;
+    let wallet_owner = wallet.address();
+    ensure!(
+        config.evm_wallet_address.parse::<Address>()? == wallet_owner,
+        "Linea decommission signer differs from EVM_WALLET_ADDRESS"
+    );
+    let linea_endpoint = std::env::var("LINEA_RPC_URL")
+        .context("LINEA_RPC_URL is required for Linea capital return")?;
+    let world_endpoint = std::env::var("ALCHEMY_WORLDCHAIN_RPC_URL")
+        .context("ALCHEMY_WORLDCHAIN_RPC_URL is required for Linea capital return")?;
+    let optimism_endpoint = std::env::var(OPTIMISM_RPC_URL_ENV)
+        .with_context(|| format!("{OPTIMISM_RPC_URL_ENV} is required for Linea capital return"))?;
+    let linea_rpc = JsonRpcClient::new(linea_endpoint)?;
+    let world_rpc = JsonRpcClient::new(world_endpoint)?;
+    let optimism_rpc = JsonRpcClient::new(optimism_endpoint)?;
+    ensure!(
+        linea_rpc.chain_id().await? == LINEA_CHAIN_ID,
+        "Linea capital return RPC has the wrong chain id"
+    );
+
+    let linea_wallet_journal = std::env::var(ARBITRAGE_LINEA_WALLET_JOURNAL_PATH_ENV)
+        .with_context(|| {
+            format!(
+                "{ARBITRAGE_LINEA_WALLET_JOURNAL_PATH_ENV} is required for Linea capital return"
+            )
+        })?;
+    let mut linea_dex_executor = DexExecutor::hydrate_with_gas_policy(
+        linea_rpc.clone(),
+        wallet,
+        LINEA_CHAIN_ID,
+        linea_wallet_journal.into(),
+        CompiledNetworkGasPolicy::LineaMainnet {
+            requires_fresh_rpc_gas_price: true,
+            max_priority_fee_equals_gas_price: true,
+            max_fee_headroom_bps: 12_000,
+            includes_l1_fee: false,
+        },
+    )
+    .await?;
+    linea_dex_executor.set_journal_scope(linea_evm_journal_scope())?;
+    let linea_execution_service = DexExecutionService::spawn(linea_dex_executor, 1)?;
+
+    let mut balance_client = BinanceAccountClient::from_env(config)?;
+    balance_client.synchronize_clock().await?;
+    let trading_client = balance_client.clone();
+    let treasury_client = BinanceAccountClient::from_treasury_env(config)?;
+    let subaccount_email = std::env::var("BINANCE_SUBACCOUNT_EMAIL")
+        .context("BINANCE_SUBACCOUNT_EMAIL is required for Linea capital return")?;
+    let rebalance_wallet_journal = std::env::var(WALLET_JOURNAL_PATH_ENV).with_context(|| {
+        format!("{WALLET_JOURNAL_PATH_ENV} is required for Linea capital return")
+    })?;
+    let maximum = Decimal::from(2_600_u64);
+    let limits = RebalanceRuntimeLimits {
+        maximum_wld: maximum,
+        maximum_usdc: maximum,
+        maximum_esp: maximum,
+        maximum_arb: maximum,
+        operation_timeout: Duration::from_secs(config.rebalance_executor_timeout_seconds),
+    };
+    let mut executor = RebalanceExecutor::hydrate(
+        trading_client,
+        treasury_client,
+        subaccount_email,
+        AcrossClient::new(config)?,
+        world_rpc,
+        optimism_rpc,
+        BTreeMap::from([(LINEA_CHAIN_ID, linea_rpc.clone())]),
+        EvmWallet::from_env()?,
+        config.rebalance_executor_journal_path.clone(),
+        rebalance_wallet_journal.into(),
+        Some(reviewed_rebalance_nonce_collision(wallet_owner)?),
+        limits,
+    )
+    .await?;
+    executor.set_capital_policy(Some(capital_policy))?;
+    executor
+        .attach_linea_execution_owner(
+            linea_execution_service.evm_execution_owner(),
+            linea_rpc.clone(),
+        )
+        .await?;
+
+    if execute {
+        if let Some(operation) = executor.recover_active().await? {
+            tracing::warn!(
+                operation_id = %operation.intent.operation_id,
+                token = operation.intent.token_symbol,
+                progress = ?operation.progress,
+                "recovered the previously active rebalance before Linea decommission"
+            );
+        }
+    } else {
+        ensure!(
+            executor.active_operation()?.is_none(),
+            "Linea capital return dry-run found an active rebalance operation"
+        );
+    }
+
+    let assets: &[&str] = match asset.as_str() {
+        "USDT" => &["USDT"],
+        "USDC" => &["USDC"],
+        "ALL" => &["USDT", "USDC"],
+        _ => unreachable!("validated Linea decommission asset"),
+    };
+    for symbol in assets {
+        let (origin_token, destination_token) = match *symbol {
+            "USDT" => (LINEA_USDT, OPTIMISM_USDT),
+            "USDC" => (LINEA_USDC, OPTIMISM_USDC),
+            _ => unreachable!("validated Linea decommission asset"),
+        };
+        let wallet_balance = linea_rpc.erc20_balance(origin_token, wallet_owner).await?;
+        if wallet_balance.is_zero() {
+            tracing::info!(asset = *symbol, "Linea capital balance is already zero");
+            continue;
+        }
+        ensure!(
+            wallet_balance <= U256::from(LINEA_DECOMMISSION_MAXIMUM_BASE_UNITS),
+            "{symbol} Linea balance exceeds the reviewed decommission cap"
+        );
+        let account = balance_client.account_information().await?;
+        let binance_balance = account_balance_base_units(&account, symbol, 6)?;
+        let quote_amount = u128::try_from(wallet_balance)
+            .context("Linea capital balance does not fit the Across quote amount")?;
+        let quote_request = AcrossQuoteRequest {
+            origin_chain_id: LINEA_CHAIN_ID,
+            destination_chain_id: OPTIMISM_CHAIN_ID,
+            input_token: origin_token,
+            output_token: destination_token,
+            amount: quote_amount,
+            depositor: wallet_owner,
+            recipient: wallet_owner,
+        };
+        let quote = AcrossClient::new(config)?.quote(&quote_request).await?;
+        validate_quote(&quote_request, &quote)?;
+        tracing::info!(
+            mode,
+            asset = *symbol,
+            wallet_balance_base_units = %wallet_balance,
+            binance_balance_base_units = %binance_balance,
+            expected_output_base_units = %quote.expected_output_amount,
+            minimum_output_base_units = %quote.min_output_amount,
+            quoted_fee_base_units = %quote.fees.total.amount,
+            expected_fill_time_seconds = quote.expected_fill_time,
+            "Linea capital return route validated"
+        );
+        if !execute {
+            continue;
+        }
+        let operation = executor
+            .execute(RebalanceExecutionRequest {
+                authority: RebalanceExecutionAuthority::LineaFullLive,
+                token_symbol: (*symbol).to_owned(),
+                token_decimals: 6,
+                token_contract: origin_token,
+                wallet_owner,
+                action: RebalanceAction {
+                    direction: Direction::WalletToBinance,
+                    amount: wallet_balance,
+                    route: Route::Across {
+                        binance_network: "OPTIMISM".to_owned(),
+                        bridge_chain_id: OPTIMISM_CHAIN_ID,
+                        wallet_chain_id: LINEA_CHAIN_ID,
+                    },
+                },
+                binance_balance_before: binance_balance,
+                wallet_balance_before: wallet_balance,
+                revalidation_start_balance: U256::ONE,
+                maximum_fee: Some(U256::ZERO),
+                approval_session_id: Some(LINEA_DECOMMISSION_APPROVAL_SESSION_ID.to_owned()),
+            })
+            .await?;
+        ensure!(
+            matches!(
+                operation.progress,
+                arb_bot::rebalance::RebalanceExecutionProgress::Completed { .. }
+            ),
+            "Linea capital return did not reach completed state"
+        );
+        let remaining = linea_rpc.erc20_balance(origin_token, wallet_owner).await?;
+        ensure!(
+            remaining.is_zero(),
+            "{symbol} remained on Linea after completed return"
+        );
+        tracing::info!(
+            operation_id = %operation.intent.operation_id,
+            asset = *symbol,
+            returned_base_units = %wallet_balance,
+            "Linea capital return completed and Binance credit was proven"
+        );
+    }
     Ok(())
 }
 
@@ -2631,17 +2997,12 @@ async fn run(
         );
         let linea = registry.get_by_chain_id(LINEA_CHAIN_ID)?;
         ensure!(
-            linea.execution().mutation_enabled()
+            !linea.execution().mutation_enabled()
                 && matches!(
                     linea.execution().gas_policy(),
-                    CompiledNetworkGasPolicy::LineaMainnet {
-                        requires_fresh_rpc_gas_price: true,
-                        max_priority_fee_equals_gas_price: true,
-                        max_fee_headroom_bps: 12_000,
-                        includes_l1_fee: false,
-                    }
+                    CompiledNetworkGasPolicy::ReadOnly
                 ),
-            "Linea execution policy must be mutation-enabled with fail-closed type-2 gas pricing"
+            "stopped Linea execution policy must remain read-only"
         );
     }
     let shadow_strategy_plan = hot_path_dependencies.as_ref().and_then(|dependencies| {
@@ -2676,8 +3037,8 @@ async fn run(
                 .iter()
                 .filter(|strategy| strategy.execute)
                 .count()
-                == 4,
-            "production hot path requires exactly four executable strategies"
+                == 3,
+            "production hot path requires exactly three executable strategies"
         );
         ensure!(
             dependencies
@@ -2686,8 +3047,8 @@ async fn run(
                 .iter()
                 .filter(|strategy| strategy.observe && !strategy.execute)
                 .count()
-                == 0,
-            "ESP production hot path cannot retain a non-mutating ESP shadow capability"
+                == 1,
+            "production hot path requires exactly one observe-only stopped strategy"
         );
         let executable = dependencies
             .plan()
@@ -2696,7 +3057,7 @@ async fn run(
             .filter(|strategy| strategy.execute)
             .collect::<Vec<_>>();
         ensure!(
-            executable.len() == 4
+            executable.len() == 3
                 && executable
                     .iter()
                     .any(|strategy| strategy.symbol == "WLDUSDC")
@@ -2706,10 +3067,10 @@ async fn run(
                 && executable
                     .iter()
                     .any(|strategy| strategy.symbol == "ARBUSDC")
-                && executable
-                    .iter()
-                    .any(|strategy| strategy.symbol == "USDCUSDT"),
-            "production permits execution only for WLDUSDC, ESPUSDC, ARBUSDC, and USDCUSDT"
+                && dependencies.plan().strategies.iter().any(|strategy| {
+                    strategy.symbol == "USDCUSDT" && strategy.observe && !strategy.execute
+                }),
+            "production permits execution only for WLDUSDC, ESPUSDC, and ARBUSDC; USDCUSDT must be observe-only"
         );
         let account_id = compiled_binance_runtime
             .as_ref()
@@ -2817,12 +3178,12 @@ async fn run(
             "compiled Binance stream shard and account symbol registry differ"
         );
         ensure!(
-            runtime.executable_symbols.len() == 4
+            runtime.executable_symbols.len() == 3
                 && runtime.executable_symbols.contains(&pair.binance.symbol)
                 && runtime.executable_symbols.contains("ESPUSDC")
                 && runtime.executable_symbols.contains("ARBUSDC")
-                && runtime.executable_symbols.contains("USDCUSDT"),
-            "compiled Binance capabilities must enable WLD, ESP, ARB, and Linea stablecoin symbols"
+                && !runtime.executable_symbols.contains("USDCUSDT"),
+            "compiled Binance capabilities must disable Linea stablecoin execution"
         );
     }
     let mut binance_account_client = BinanceAccountClient::from_env(&config)?;
@@ -2995,7 +3356,6 @@ async fn run(
     shared_binance_runtime.ensure_order_enabled(&pair.binance.symbol)?;
     shared_binance_runtime.ensure_order_enabled(&esp_pair.binance.symbol)?;
     shared_binance_runtime.ensure_order_enabled(&arb_pair.binance.symbol)?;
-    shared_binance_runtime.ensure_order_enabled(&linea_pair.binance.symbol)?;
     let esp_symbol_state = shared_binance_account
         .symbol(&esp_pair.binance.symbol)
         .context("shared Binance account omitted ESPUSDC")?;
@@ -3064,13 +3424,13 @@ async fn run(
             && linea_symbol_state.symbol_rules.quote_asset == linea_pair.binance.quote_asset,
         "USDCUSDT exchangeInfo assets differ from the Linea domain artifact"
     );
-    let linea_execution_symbol_rules = linea_symbol_state
+    linea_symbol_state
         .symbol_rules
         .with_compatible_price_step(
             Decimal::from_str(&linea_pair.binance.tick_size)
                 .context("Linea Binance tick_size is invalid")?,
         )
-        .context("Linea tick_size is incompatible with live PRICE_FILTER")?;
+        .context("Linea tick_size is incompatible with PRICE_FILTER")?;
     ensure!(
         linea_symbol_state.symbol_rules.lot_size.step
             == Decimal::from_str(&linea_pair.binance.step_size)
@@ -3324,68 +3684,66 @@ async fn run(
         } else {
             RebalanceTracker::disabled()
         };
-    let linea_rebalance_tracker =
-        if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive {
+    let linea_rebalance_tracker = if portfolio_catalog.allocator_mode()
+        == CompiledCapitalAllocatorMode::FullLive
+        && linea_pair.rebalance.enabled
+    {
+        let mut routes = BTreeMap::new();
+        for token in [&linea_pair.token_a, &linea_pair.token_b] {
+            let capital = select_capital_routes(
+                &capital_coins,
+                &token.symbol,
+                &linea_pair.chain.binance_network_name,
+                "OPTIMISM",
+            )?;
+            let fallback = capital
+                .fallback
+                .as_ref()
+                .filter(|route| route.network == "OPTIMISM")
+                .context("Linea Optimism capital fallback is absent")?;
             ensure!(
-                linea_pair.rebalance.enabled,
-                "live rebalance allocator requires the Linea pair rebalance policy"
+                capital.deposit_all_enabled
+                    && capital.withdrawal_all_enabled
+                    && fallback.deposit_available()
+                    && fallback.withdrawal_available(),
+                "Linea Optimism capital fallback is not fully available"
             );
-            let mut routes = BTreeMap::new();
-            for token in [&linea_pair.token_a, &linea_pair.token_b] {
-                let capital = select_capital_routes(
-                    &capital_coins,
-                    &token.symbol,
-                    &linea_pair.chain.binance_network_name,
-                    "OPTIMISM",
-                )?;
-                let fallback = capital
-                    .fallback
-                    .as_ref()
-                    .filter(|route| route.network == "OPTIMISM")
-                    .context("Linea Optimism capital fallback is absent")?;
-                ensure!(
-                    capital.deposit_all_enabled
-                        && capital.withdrawal_all_enabled
-                        && fallback.deposit_available()
-                        && fallback.withdrawal_available(),
-                    "Linea Optimism capital fallback is not fully available"
-                );
-                routes.insert(
-                    token.symbol.clone(),
-                    route_candidates_from_capital(
-                        &CapitalRouteState {
-                            coin: capital.coin.clone(),
-                            deposit_all_enabled: capital.deposit_all_enabled,
-                            withdrawal_all_enabled: capital.withdrawal_all_enabled,
-                            direct: None,
-                            fallback: Some(fallback.clone()),
-                        },
-                        token.decimals,
-                        LINEA_CHAIN_ID,
-                    )?,
-                );
-            }
-            telemetry.emit(
-                "live_readiness",
-                serde_json::json!({
-                    "engine_id": config.engine_id,
-                    "stage": "linea_rebalance_routes",
-                    "pair_id": linea_pair.id,
-                    "network_id": "eip155:59144",
-                    "binance_network": "OPTIMISM",
-                    "asset_count": 2,
-                    "direct_route_count": 0,
-                    "bridge_route_count": 2,
-                    "deposit_enabled_assets": 2,
-                    "withdrawal_enabled_assets": 2,
-                    "external_mutation_authorized": true,
-                    "ready": true,
-                }),
+            routes.insert(
+                token.symbol.clone(),
+                route_candidates_from_capital(
+                    &CapitalRouteState {
+                        coin: capital.coin.clone(),
+                        deposit_all_enabled: capital.deposit_all_enabled,
+                        withdrawal_all_enabled: capital.withdrawal_all_enabled,
+                        direct: None,
+                        fallback: Some(fallback.clone()),
+                    },
+                    token.decimals,
+                    LINEA_CHAIN_ID,
+                )?,
             );
-            RebalanceTracker::new(&linea_pair, routes)?
-        } else {
-            RebalanceTracker::disabled()
-        };
+        }
+        telemetry.emit(
+            "live_readiness",
+            serde_json::json!({
+                "engine_id": config.engine_id,
+                "stage": "linea_rebalance_routes",
+                "pair_id": linea_pair.id,
+                "network_id": "eip155:59144",
+                "binance_network": "OPTIMISM",
+                "asset_count": 2,
+                "direct_route_count": 0,
+                "bridge_route_count": 2,
+                "deposit_enabled_assets": 2,
+                "withdrawal_enabled_assets": 2,
+                "external_mutation_authorized": true,
+                "ready": true,
+            }),
+        );
+        RebalanceTracker::new(&linea_pair, routes)?
+    } else {
+        RebalanceTracker::disabled()
+    };
     let wallet_address = config.evm_wallet_address.trim();
     ensure!(
         !wallet_address.is_empty(),
@@ -3556,8 +3914,10 @@ async fn run(
     let (
         linea_chain_readiness_probe,
         linea_initial_chain_readiness_status,
-        linea_allowance_mutations_ready,
-    ) = if let Some(registry) = network_registry.as_ref() {
+        _linea_allowance_mutations_ready,
+    ) = if linea_pair.execution_enabled
+        && let Some(registry) = network_registry.as_ref()
+    {
         let runtime = registry.get_by_chain_id(LINEA_CHAIN_ID)?;
         let snapshot = portfolio_wallet_snapshots
             .iter()
@@ -3704,33 +4064,7 @@ async fn run(
                 wallet,
                 config.rebalance_executor_journal_path.clone(),
                 transaction_journal_path.into(),
-                Some(ReviewedConsumedNonceCollision {
-                    operation_id: "rebalance-1516-6b2792a1b1a18931:deposit".to_owned(),
-                    chain_id: 10,
-                    wallet: wallet_owner,
-                    nonce: 76,
-                    rejected_transaction_hash:
-                        "0x34462b8a2f930da06b5196db6a4111b07941c25ecbe4e0ddc388716a4d41a482"
-                            .parse()?,
-                    purpose: "rebalance_bridge_to_binance".to_owned(),
-                    target: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse()?,
-                    native_value: U256::ZERO,
-                    calldata_hash:
-                        "0x510c0580cb373c283aec526a40c38da97f863cdcbfe61f6b0c4ceffde0938c0d"
-                            .parse()?,
-                    replacement_transaction_hash:
-                        "0x2d22c304a0e0ca98e0684145dbff8a62925cb36c33b0af891dc56b8248fb73b4"
-                            .parse()?,
-                    replacement_target: "0x97ccdbea4632140639ad5ea9b944aa034eb15fd4".parse()?,
-                    replacement_native_value: U256::from(26_138_677_603_673_219_u64),
-                    replacement_block_number: 155_207_427,
-                    scope: EvmJournalScope {
-                        schema_version: EvmJournalScope::SCHEMA_VERSION,
-                        network_id: "optimism".to_owned(),
-                        wallet_id: format!("wallet:{wallet_owner:#x}"),
-                        strategy_id: "rebalance-world-chain-v12".to_owned(),
-                    },
-                }),
+                Some(reviewed_rebalance_nonce_collision(wallet_owner)?),
                 rebalance_runtime_limits.clone(),
             )
             .await?;
@@ -3845,10 +4179,9 @@ async fn run(
     let arb_initial_wallet_balances = esp_initial_wallet_balances.clone();
     let linea_initialized = linea_initialized_dex
         .as_ref()
-        .context("Linea execution has no initialized DEX runtime")?;
-    let linea_wallet_rpc = linea_initialized.rpc.clone();
+        .context("Linea observe-only strategy has no initialized DEX runtime")?;
     let linea_initial_head = linea_initialized.mirror.latest_head();
-    let (linea_receipt_heads, linea_receipt_head_receiver) =
+    let (linea_receipt_heads, _linea_receipt_head_receiver) =
         tokio::sync::watch::channel(linea_initial_head);
     let linea_initial_wallet_balances = portfolio_wallet_snapshots
         .iter()
@@ -3861,23 +4194,19 @@ async fn run(
     let arb_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
     let linea_pretrade_cost_telemetry = PreTradeCostTelemetry::default();
     let mut shared_arbitrum_rebalance_owner_attached = false;
-    let mut shared_linea_rebalance_owner_attached = false;
     let live_trade_runtime = if config.arbitrage_execution_mode == "full_live" {
         ensure!(
             domain_config.snapshot().live_trading_enabled
                 && pair.execution_enabled
                 && esp_pair.execution_enabled
                 && arb_pair.execution_enabled
-                && linea_pair.execution_enabled,
-            "composed live arbitrage requires all versioned execution gates"
+                && !linea_pair.execution_enabled
+                && !linea_pair.rebalance.enabled,
+            "composed live arbitrage requires three live pairs and a stopped Linea pair"
         );
         ensure!(
             esp_execution_ready.load(Ordering::Acquire),
             "ESP Arbitrum chain readiness must pass before allowance mutations"
-        );
-        ensure!(
-            linea_allowance_mutations_ready,
-            "Linea contract and RPC readiness must pass before allowance mutations"
         );
         validate_production_switchback()?;
         tracing::info!(
@@ -3947,7 +4276,6 @@ async fn run(
         let trade_journal_scope = scope_for("WLDUSDC")?;
         let esp_journal_scope = scope_for("ESPUSDC")?;
         let arb_journal_scope = scope_for("ARBUSDC")?;
-        let linea_journal_scope = scope_for("USDCUSDT")?;
         ensure!(
             EvmJournalScope {
                 schema_version: EvmJournalScope::SCHEMA_VERSION,
@@ -3956,15 +4284,6 @@ async fn run(
                 strategy_id: esp_journal_scope.strategy_id.clone(),
             } == esp_evm_journal_scope(ARBITRUM_CHAIN_ID),
             "compiled ESP journal identity differs from the production rebalance identity"
-        );
-        ensure!(
-            EvmJournalScope {
-                schema_version: EvmJournalScope::SCHEMA_VERSION,
-                network_id: linea_journal_scope.network_id.clone(),
-                wallet_id: linea_journal_scope.wallet_id.clone(),
-                strategy_id: linea_journal_scope.strategy_id.clone(),
-            } == linea_evm_journal_scope(),
-            "compiled Linea journal identity differs from the production identity"
         );
         let wallet = EvmWallet::from_env()?;
         ensure!(
@@ -3981,12 +4300,6 @@ async fn run(
             std::env::var(ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV).with_context(|| {
                 format!(
                     "required environment variable {ARBITRAGE_ARBITRUM_WALLET_JOURNAL_PATH_ENV} is not set"
-                )
-            })?;
-        let linea_wallet_journal_path =
-            std::env::var(ARBITRAGE_LINEA_WALLET_JOURNAL_PATH_ENV).with_context(|| {
-                format!(
-                    "required environment variable {ARBITRAGE_LINEA_WALLET_JOURNAL_PATH_ENV} is not set"
                 )
             })?;
         let binance_journal_path = std::env::var(ARBITRAGE_BINANCE_ORDER_JOURNAL_PATH_ENV)
@@ -4211,46 +4524,6 @@ async fn run(
             esp_dex_executor,
             config.arbitrage_leg_execution_channel_capacity,
         )?);
-        let linea_evm_journal_started_at = Instant::now();
-        let mut linea_dex_executor = DexExecutor::hydrate_with_gas_policy(
-            linea_wallet_rpc.clone(),
-            EvmWallet::from_env()?,
-            LINEA_CHAIN_ID,
-            linea_wallet_journal_path.into(),
-            CompiledNetworkGasPolicy::LineaMainnet {
-                requires_fresh_rpc_gas_price: true,
-                max_priority_fee_equals_gas_price: true,
-                max_fee_headroom_bps: 12_000,
-                includes_l1_fee: false,
-            },
-        )
-        .await?;
-        linea_dex_executor.set_journal_scope(linea_evm_journal_scope())?;
-        linea_dex_executor.set_receipt_heads(linea_receipt_head_receiver.clone());
-        let linea_allowances = linea_lynex_allowance_requirements(&linea_pair)?;
-        linea_dex_executor
-            .prepare_and_lock_allowances(&linea_allowances)
-            .await?;
-        linea_dex_executor.enable_lynex_submissions_after_allowance_lock()?;
-        linea_dex_executor.set_latency_telemetry(execution_latency_telemetry.clone());
-        linea_dex_executor.set_pretrade_cost_telemetry(linea_pretrade_cost_telemetry.clone());
-        linea_dex_executor.spawn_pretrade_cost_receipt_bootstrap();
-        let linea_dex_service = Arc::new(DexExecutionService::spawn(
-            linea_dex_executor,
-            config.arbitrage_leg_execution_channel_capacity,
-        )?);
-        telemetry.emit(
-            "runtime_journal_recovery",
-            serde_json::json!({
-                "engine_id": config.engine_id,
-                "owner": "evm_execution",
-                "journal_scope": arb_bot::telemetry::execution_lane_id(LINEA_CHAIN_ID),
-                "network_id": arb_bot::telemetry::network_id(LINEA_CHAIN_ID),
-                "wallet_id": arb_bot::telemetry::PRIMARY_EVM_WALLET_ID,
-                "duration_us": linea_evm_journal_started_at.elapsed().as_micros(),
-                "outcome": "success",
-            }),
-        );
         if let Some(executor) = full_rebalance_executor.as_mut() {
             executor
                 .attach_arbitrum_execution_owner(
@@ -4268,25 +4541,6 @@ async fn run(
                     tracing::error!(
                         error = %error,
                         "quarantined Arbitrum deposit did not pass reconciliation-only recovery; token remains isolated"
-                    );
-                }
-            }
-            executor
-                .attach_linea_execution_owner(
-                    linea_dex_service.evm_execution_owner(),
-                    linea_wallet_rpc.clone(),
-                )
-                .await?;
-            shared_linea_rebalance_owner_attached = true;
-            match executor.reconcile_next_linea_deposit_quarantine().await {
-                Ok(Some(operation)) => {
-                    rebalance_recovery_operation = Some(operation);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        "quarantined Linea deposit did not pass reconciliation-only recovery; token remains isolated"
                     );
                 }
             }
@@ -4365,14 +4619,6 @@ async fn run(
                         strategy_id: arb_journal_scope.strategy_id.clone(),
                     },
                 ),
-                (
-                    linea_journal_scope.symbol.clone(),
-                    BinanceOrderJournalScope {
-                        schema_version: BinanceOrderJournalScope::SCHEMA_VERSION,
-                        account_id: linea_journal_scope.account_id.clone(),
-                        strategy_id: linea_journal_scope.strategy_id.clone(),
-                    },
-                ),
             ]),
         )
         .await?;
@@ -4393,13 +4639,6 @@ async fn run(
         let (arb_dex_revert_diagnostics, arb_dex_revert_diagnostic_task) =
             dex_revert_diagnostic_channel(
                 esp_wallet_rpc.clone(),
-                telemetry.clone(),
-                config.engine_id.clone(),
-                DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
-            );
-        let (linea_dex_revert_diagnostics, linea_dex_revert_diagnostic_task) =
-            dex_revert_diagnostic_channel(
-                linea_wallet_rpc.clone(),
                 telemetry.clone(),
                 config.engine_id.clone(),
                 DEX_REVERT_DIAGNOSTIC_CHANNEL_CAPACITY,
@@ -4455,28 +4694,10 @@ async fn run(
                 engine_id: config.engine_id.clone(),
             },
         )?);
-        let linea_executor = Arc::new(ComposedLiveLegExecutor::new(
-            Arc::clone(&linea_dex_service),
-            Arc::clone(&binance_service),
-            ComposedLiveLegExecutorConfig {
-                rules: linea_execution_symbol_rules.clone(),
-                base_asset: linea_pair.binance.base_asset.clone(),
-                base_decimals: linea_pair.token_b.decimals,
-                quote_asset: linea_pair.binance.quote_asset.clone(),
-                quote_decimals: linea_pair.token_a.decimals,
-                commission_asset: commission_asset.clone(),
-                commission_price_symbol: commission_price_symbol.clone(),
-                market_state: entry_preflight.clone(),
-                dex_revert_diagnostics: linea_dex_revert_diagnostics,
-                telemetry: telemetry.clone(),
-                engine_id: config.engine_id.clone(),
-            },
-        )?);
         let executor = RoutedLiveLegExecutor::new(BTreeMap::from([
             (pair.id.clone(), primary_executor),
             (esp_pair.id.clone(), esp_executor),
             (arb_pair.id.clone(), arb_executor),
-            (linea_pair.id.clone(), linea_executor),
         ]))?;
         let full_live_sizing = esp_pair
             .adaptive_sizing
@@ -4486,10 +4707,6 @@ async fn run(
             .adaptive_sizing
             .limits()
             .context("ARB full-live adaptive sizing limits are missing")?;
-        let linea_live_sizing = linea_pair
-            .adaptive_sizing
-            .limits()
-            .context("Linea full-live adaptive sizing limits are missing")?;
         let parse_live_amount = |value: &str, label: &str| {
             value
                 .parse::<u128>()
@@ -4551,28 +4768,6 @@ async fn run(
                             market_data_readiness: Arc::clone(&arb_market_data_ready),
                         },
                     ),
-                    (
-                        linea_pair.id.clone(),
-                        LivePairPolicy {
-                            journal_scope: linea_journal_scope,
-                            binance_base_decimals: linea_pair.token_b.decimals,
-                            maximum_trade_notional_token_a_base_units: parse_live_amount(
-                                linea_live_sizing.max_trade_notional,
-                                "Linea maximum trade notional",
-                            )?,
-                            maximum_unhedged_notional_token_a_base_units: parse_live_amount(
-                                linea_live_sizing.max_unhedged_notional,
-                                "Linea maximum unhedged notional",
-                            )?,
-                            maximum_realized_loss_token_a_base_units: parse_live_amount(
-                                linea_live_sizing.max_recovery_loss,
-                                "Linea maximum recovery loss",
-                            )?,
-                            maximum_concurrent_trades: 1,
-                            readiness: Arc::clone(&linea_execution_ready),
-                            market_data_readiness: Arc::clone(&linea_market_data_ready),
-                        },
-                    ),
                 ]),
             },
         )?;
@@ -4580,8 +4775,7 @@ async fn run(
             tokio::join!(
                 dex_revert_diagnostic_task.run(),
                 esp_dex_revert_diagnostic_task.run(),
-                arb_dex_revert_diagnostic_task.run(),
-                linea_dex_revert_diagnostic_task.run()
+                arb_dex_revert_diagnostic_task.run()
             );
             Ok::<(), anyhow::Error>(())
         });
@@ -4886,10 +5080,8 @@ async fn run(
     );
     if portfolio_catalog.allocator_mode() == CompiledCapitalAllocatorMode::FullLive {
         ensure!(
-            shared_arbitrum_rebalance_owner_attached
-                && shared_linea_rebalance_owner_attached
-                && full_rebalance_executor.is_some(),
-            "live rebalance has no shared Arbitrum or Linea EVM execution owner"
+            shared_arbitrum_rebalance_owner_attached && full_rebalance_executor.is_some(),
+            "live rebalance has no shared Arbitrum EVM execution owner"
         );
     }
     let policy = esp_pair
@@ -4946,28 +5138,17 @@ async fn run(
         external_mutation_authorized = true,
         "ARB Arbitrum full-live execution configured"
     );
-    let linea_policy = linea_pair
-        .full_live_policy
-        .as_ref()
-        .context("Linea full-live policy is missing")?;
     tracing::info!(
         pair_id = linea_pair.id,
         strategy_id = %linea_plan.strategy_id.as_str(),
         network_id = %linea_plan.network_id.as_str(),
         chain_id = linea_pair.chain.chain_id,
-        production_approval_actor = linea_policy.production_approval_actor,
-        production_approval_recorded_at_utc = linea_policy.production_approval_recorded_at_utc,
-        max_trade_notional_token_a_base_units = linea_pair
-            .adaptive_sizing
-            .limits()
-            .map(|limits| limits.max_trade_notional),
-        gas_policy = "fresh_type2_eth_gas_price_fail_closed_no_fallback",
-        allowance_policy = "max_uint256_then_locked",
-        rebalance_policy = "continuous_direct_linea_per_operation_caps",
-        allocator_mode = ?portfolio_catalog.allocator_mode(),
-        binance_network = linea_policy.rebalance_binance_network,
-        external_mutation_authorized = true,
-        "Linea Lynex full-live execution configured"
+        observe = true,
+        plan = true,
+        execute = false,
+        rebalance = false,
+        external_mutation_authorized = false,
+        "Linea Lynex strategy is stopped and retained for read-only telemetry"
     );
     let AlchemyDexStream {
         receiver: mut shadow_dex_receiver,
@@ -8027,7 +8208,7 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.network_id.as_str(), scope.network_id);
         assert_eq!(runtime.wallet_location_id.as_str(), scope.wallet_id);
-        assert!(runtime.execution_enabled);
+        assert!(!runtime.execution_enabled);
     }
 
     #[test]

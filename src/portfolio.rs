@@ -1251,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_linea_policy_authorizes_only_typed_linea_usdt_across_requests() {
+    fn compiled_stopped_linea_policy_rejects_all_linea_mutation_requests() {
         let production = load_compatibility_domain(
             "config/domain/compiled-multi-pair-production.v1.json",
             CompatibilityRole::LiveRuntime,
@@ -1263,20 +1263,16 @@ mod tests {
             .unwrap()
             .capital_policy
             .unwrap();
-        let remaining = remaining_rebalance_authority_on_chain(
-            &policy,
-            &RebalanceRisk::default(),
-            "USDT",
-            Direction::BinanceToWallet,
-            59_144,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            remaining.maximum_source_debit,
-            U256::from(2_600_000_000_u64)
+        assert!(
+            remaining_rebalance_authority_on_chain(
+                &policy,
+                &RebalanceRisk::default(),
+                "USDT",
+                Direction::BinanceToWallet,
+                59_144,
+            )
+            .is_err()
         );
-        assert_eq!(remaining.maximum_fee, U256::from(5_000_000_u64));
 
         let request = RebalanceExecutionRequest {
             authority: RebalanceExecutionAuthority::LineaFullLive,
@@ -1299,7 +1295,7 @@ mod tests {
             maximum_fee: Some(U256::from(5_000_000_u64)),
             approval_session_id: Some(policy.approval_session_id.clone()),
         };
-        authorize_rebalance_request(&policy, &RebalanceRisk::default(), &request).unwrap();
+        assert!(authorize_rebalance_request(&policy, &RebalanceRisk::default(), &request).is_err());
 
         let mut direct_linea = request.clone();
         direct_linea.action.route = Route::Direct {
